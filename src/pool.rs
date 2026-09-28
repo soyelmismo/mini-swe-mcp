@@ -57,6 +57,16 @@ impl WorkerRecord {
     }
 }
 
+/// Result of a one-shot worker collection, detached from the live pool.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectedWorker {
+    pub id: String,
+    pub task: String,
+    pub model: String,
+    pub state: WorkerState,
+    pub logs: Vec<AgentStepLog>,
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
@@ -467,6 +477,37 @@ impl WorkerPool {
         } else {
             false
         }
+    }
+
+    /// Terminate every worker currently tracked by the pool.
+    pub async fn kill_all(&self) -> usize {
+        let mut lock = self.workers.write().await;
+        let mut count = 0usize;
+        for worker in lock.values_mut() {
+            if !matches!(worker.state, WorkerState::Running { .. } | WorkerState::Paused { .. }) {
+                continue;
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.abort();
+            }
+            worker.fail("Server shutting down (received SIGINT)");
+            count += 1;
+        }
+        count
+    }
+
+    /// Collect a worker's final result and release its in-memory resources.
+    pub async fn collect(&self, id: &str) -> Option<CollectedWorker> {
+        let mut lock = self.workers.write().await;
+        let record = lock.remove(id)?;
+        tracing::info!(worker = %id, "Worker collected and evicted from pool");
+        Some(CollectedWorker {
+            id: record.id,
+            task: record.task,
+            model: record.model,
+            state: record.state,
+            logs: record.logs,
+        })
     }
 }
 

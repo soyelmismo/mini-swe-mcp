@@ -328,12 +328,11 @@ impl McpServer {
 
             "collect" => {
                 let wid = Self::required_string(&args, "worker_id", action)?;
-                if let Some(state) = self.pool.get_worker_state(wid).await {
-                    let logs = self.pool.get_worker_logs(wid).await.unwrap_or_default();
+                if let Some(collected) = self.pool.collect(wid).await {
                     Ok(json!({
                         "worker_id": wid,
-                        "state": state,
-                        "logs": logs
+                        "state": collected.state,
+                        "logs": collected.logs
                     }))
                 } else {
                     anyhow::bail!("Worker not found: {}", wid)

@@ -249,6 +249,10 @@ async fn main() -> Result<()> {
         res = server.run_stdio() => res,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received SIGINT, shutting down stdio server");
+            let killed = pool.kill_all().await;
+            if killed > 0 {
+                tracing::info!(workers = killed, "Terminated active workers on shutdown");
+            }
             Ok(())
         }
     }
