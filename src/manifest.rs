@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::xdg_config_dir;
 
@@ -99,6 +99,9 @@ impl ModelManifest {
         match Self::from_file(path) {
             Ok(manifest) => {
                 info!(path = %path.display(), "Loaded model manifest from {source}");
+                for warning in manifest.validate() {
+                    warn!(path = %path.display(), "Model manifest warning: {warning}");
+                }
                 Some(manifest)
             }
             Err(e) => {
@@ -133,6 +136,44 @@ impl ModelManifest {
         }
 
         desc
+    }
+
+    /// Collect human-readable warnings about suspicious manifest entries.
+    ///
+    /// Validation is deliberately non-fatal: a manifest with warnings is still
+    /// served so that a typo in `models.yaml` degrades gracefully instead of
+    /// taking the server down. Callers surface the returned strings as warnings
+    /// (see [`ModelManifest::from_candidate`]).
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if let Some(name) = &self.default
+            && !self.models.contains_key(name)
+        {
+            warnings.push(format!("default model \"{name}\" not found in models"));
+        }
+
+        for (alias, def) in &self.models {
+            if def.id.trim().is_empty() {
+                warnings.push(format!("model \"{alias}\": id cannot be empty"));
+            }
+
+            if let Some(t) = def.temperature
+                && (!(0.0..=2.0).contains(&t) || t.is_nan())
+            {
+                warnings.push(format!(
+                    "model \"{alias}\": temperature {t} must be between 0.0 and 2.0"
+                ));
+            }
+
+            if def.max_turns == Some(0) {
+                warnings.push(format!(
+                    "model \"{alias}\": max_turns must be greater than 0"
+                ));
+            }
+        }
+
+        warnings
     }
 }
 

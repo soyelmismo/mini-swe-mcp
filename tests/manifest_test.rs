@@ -115,7 +115,10 @@ models:
 
     assert_eq!(manifest.default, Some("turbo".to_string()));
     assert_eq!(manifest.models.len(), 2);
-    assert!(!manifest.models.contains_key("ninja"), "custom manifest replaces defaults");
+    assert!(
+        !manifest.models.contains_key("ninja"),
+        "custom manifest replaces defaults"
+    );
 
     let turbo = manifest.models.get("turbo").expect("turbo entry");
     assert_eq!(turbo.id, "combo:turbo");
@@ -169,7 +172,10 @@ models:
 "#,
     );
 
-    assert_eq!(manifest.default, None, "a manifest without `default:` yields None");
+    assert_eq!(
+        manifest.default, None,
+        "a manifest without `default:` yields None"
+    );
     let bare = manifest.models.get("bare").expect("bare entry");
     assert_eq!(bare.role, None);
     assert_eq!(bare.temperature, None);
@@ -187,7 +193,10 @@ fn test_empty_manifest_is_valid() {
     let manifest = parse_manifest("{}");
     assert_eq!(manifest.default, None);
     assert!(manifest.models.is_empty());
-    assert_eq!(manifest.resolve_model("ninja"), ("ninja".to_string(), None, None));
+    assert_eq!(
+        manifest.resolve_model("ninja"),
+        ("ninja".to_string(), None, None)
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -350,9 +359,18 @@ fn test_resolve_model_unknown_falls_back_to_passthrough() {
         "",
     ] {
         let (id, temperature, max_turns) = manifest.resolve_model(unknown);
-        assert_eq!(id, unknown, "unknown model {unknown:?} must be passed through");
-        assert_eq!(temperature, None, "unknown model {unknown:?} has no temperature override");
-        assert_eq!(max_turns, None, "unknown model {unknown:?} has no turn override");
+        assert_eq!(
+            id, unknown,
+            "unknown model {unknown:?} must be passed through"
+        );
+        assert_eq!(
+            temperature, None,
+            "unknown model {unknown:?} has no temperature override"
+        );
+        assert_eq!(
+            max_turns, None,
+            "unknown model {unknown:?} has no turn override"
+        );
     }
 }
 
@@ -478,7 +496,448 @@ models:
         "- `a` (id: `vendor:a`): Role A.",
         "- `b` (id: `vendor:b`): Role B.",
     ] {
-        assert!(desc.contains(line), "description must contain {line:?}:\n{desc}");
+        assert!(
+            desc.contains(line),
+            "description must contain {line:?}:\n{desc}"
+        );
     }
-    assert!(!desc.contains("ninja"), "custom manifest must not leak defaults:\n{desc}");
+    assert!(
+        !desc.contains("ninja"),
+        "custom manifest must not leak defaults:\n{desc}"
+    );
+}
+
+// ----------
+// 5. validate()
+// ----------
+
+#[test]
+fn test_validate_default_manifest_has_no_warnings() {
+    let warnings = ModelManifest::default().validate();
+
+    assert!(
+        warnings.is_empty(),
+        "the built-in manifest must validate cleanly: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_validate_custom_manifest_has_no_warnings() {
+    let manifest = parse_manifest(
+        r#"
+default: turbo
+models:
+  turbo:
+    id: combo:turbo
+    role: "Blazing fast executor."
+    temperature: 0.05
+    max_turns: 12
+  oracle:
+    id: combo:oracle
+    temperature: 1.75
+    max_turns: 250
+  bare:
+    id: vendor:bare
+"#,
+    );
+
+    let warnings = manifest.validate();
+    assert!(
+        warnings.is_empty(),
+        "a sane manifest must not produce warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_validate_empty_manifest_has_no_warnings() {
+    // Neither a missing `default` nor an empty catalog is a validation error:
+    // the server simply serves whatever the requester asked for.
+    let manifest = parse_manifest("{}");
+
+    assert!(manifest.validate().is_empty());
+}
+
+// --- default resolution ---
+
+#[test]
+fn test_validate_flags_unknown_default_model() {
+    let manifest = parse_manifest(
+        r#"
+default: ninja
+models:
+  nerd:
+    id: combo:nerd
+"#,
+    );
+
+    assert_eq!(
+        manifest.validate(),
+        vec!["default model \"ninja\" not found in models".to_string()]
+    );
+}
+
+#[test]
+fn test_validate_accepts_default_pointing_at_existing_alias() {
+    let mut models = HashMap::new();
+    models.insert(
+        "solo".to_string(),
+        definition("vendor:solo", Some("Only model."), Some(0.5), Some(10)),
+    );
+    let manifest = ModelManifest {
+        default: Some("solo".to_string()),
+        models,
+    };
+
+    assert!(
+        manifest.validate().is_empty(),
+        "a default that resolves to a known alias is fine"
+    );
+}
+
+#[test]
+fn test_validate_without_default_reports_nothing() {
+    let manifest = parse_manifest(
+        r#"
+models:
+  lone:
+    id: vendor:lone
+"#,
+    );
+
+    assert!(manifest.validate().is_empty());
+}
+
+// --- empty ids ---
+
+#[test]
+fn test_validate_flags_empty_model_id() {
+    let manifest = parse_manifest(
+        r#"
+models:
+  blank:
+    id: ""
+"#,
+    );
+
+    assert_eq!(
+        manifest.validate(),
+        vec!["model \"blank\": id cannot be empty".to_string()]
+    );
+}
+
+#[test]
+fn test_validate_flags_whitespace_only_model_id() {
+    let manifest = parse_manifest(
+        r#"
+models:
+  padded:
+    id: "   "
+"#,
+    );
+
+    assert_eq!(
+        manifest.validate(),
+        vec!["model \"padded\": id cannot be empty".to_string()],
+        "an id made of whitespace only is as unusable as an empty one"
+    );
+}
+
+#[test]
+fn test_validate_accepts_non_empty_model_id() {
+    let mut models = HashMap::new();
+    models.insert(
+        "kept".to_string(),
+        definition("vendor:kept", None, Some(0.3), Some(4)),
+    );
+    let manifest = ModelManifest {
+        default: Some("kept".to_string()),
+        models,
+    };
+
+    assert!(manifest.validate().is_empty());
+}
+
+// --- temperature ---
+
+#[test]
+fn test_validate_flags_out_of_range_temperatures() {
+    let mut models = HashMap::new();
+    models.insert(
+        "hot".to_string(),
+        definition("vendor:hot", None, Some(2.5), Some(10)),
+    );
+    models.insert(
+        "cold".to_string(),
+        definition("vendor:cold", None, Some(-0.1), Some(10)),
+    );
+    let manifest = ModelManifest {
+        default: None,
+        models,
+    };
+
+    let warnings = manifest.validate();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "both bad temperatures must be reported: {warnings:?}"
+    );
+
+    assert!(
+        warnings
+            .contains(&"model \"hot\": temperature 2.5 must be between 0.0 and 2.0".to_string()),
+        "unexpected warnings: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .contains(&"model \"cold\": temperature -0.1 must be between 0.0 and 2.0".to_string()),
+        "unexpected warnings: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_validate_accepts_boundary_temperatures() {
+    for temperature in [0.0_f32, 0.5, 1.0, 2.0] {
+        let mut models = HashMap::new();
+        models.insert(
+            "ok".to_string(),
+            definition("vendor:ok", None, Some(temperature), Some(1)),
+        );
+        let manifest = ModelManifest {
+            default: Some("ok".to_string()),
+            models,
+        };
+
+        assert!(
+            manifest.validate().is_empty(),
+            "temperature {temperature} is within the allowed [0.0, 2.0] range"
+        );
+    }
+}
+
+#[test]
+fn test_validate_flags_nan_temperature() {
+    let mut models = HashMap::new();
+    models.insert(
+        "broken".to_string(),
+        definition("vendor:broken", None, Some(f32::NAN), Some(5)),
+    );
+    let manifest = ModelManifest {
+        default: None,
+        models,
+    };
+
+    let warnings = manifest.validate();
+    assert_eq!(warnings.len(), 1, "NaN must be rejected: {warnings:?}");
+    let warning = &warnings[0];
+    assert!(
+        warning.starts_with("model \"broken\": temperature "),
+        "unexpected warning: {warning}"
+    );
+    assert!(
+        warning.ends_with(" must be between 0.0 and 2.0"),
+        "unexpected warning: {warning}"
+    );
+}
+
+#[test]
+fn test_validate_ignores_missing_temperature() {
+    let mut models = HashMap::new();
+    models.insert(
+        "unset".to_string(),
+        definition("vendor:unset", None, None, Some(3)),
+    );
+    let manifest = ModelManifest {
+        default: Some("unset".to_string()),
+        models,
+    };
+
+    assert!(
+        manifest.validate().is_empty(),
+        "an unset temperature means \"use the provider default\""
+    );
+}
+
+// --- max_turns ---
+
+#[test]
+fn test_validate_flags_zero_max_turns() {
+    let mut models = HashMap::new();
+    models.insert(
+        "halt".to_string(),
+        definition("vendor:halt", None, Some(0.2), Some(0)),
+    );
+    let manifest = ModelManifest {
+        default: Some("halt".to_string()),
+        models,
+    };
+
+    assert_eq!(
+        manifest.validate(),
+        vec!["model \"halt\": max_turns must be greater than 0".to_string()]
+    );
+}
+
+#[test]
+fn test_validate_flags_zero_max_turns_parsed_from_yaml() {
+    let manifest = parse_manifest(
+        r#"
+default: stop
+models:
+  stop:
+    id: vendor:stop
+    max_turns: 0
+"#,
+    );
+
+    assert_eq!(
+        manifest.validate(),
+        vec!["model \"stop\": max_turns must be greater than 0".to_string()]
+    );
+}
+
+#[test]
+fn test_validate_ignores_missing_max_turns() {
+    let mut models = HashMap::new();
+    models.insert(
+        "unbounded".to_string(),
+        definition("vendor:unbounded", None, Some(0.4), None),
+    );
+    let manifest = ModelManifest {
+        default: Some("unbounded".to_string()),
+        models,
+    };
+
+    assert!(
+        manifest.validate().is_empty(),
+        "an unset turn budget means \"no manifest-imposed limit\""
+    );
+}
+
+// --- combinations ---
+
+#[test]
+fn test_validate_reports_every_problem_in_one_pass() {
+    let mut models = HashMap::new();
+    // Valid entry: must never be reported.
+    models.insert(
+        "good".to_string(),
+        definition("vendor:good", Some("Fine."), Some(0.4), Some(20)),
+    );
+    // Three independent problems on a single alias.
+    models.insert("bad".to_string(), definition("", None, Some(3.0), Some(0)));
+    let manifest = ModelManifest {
+        default: Some("ghost".to_string()),
+        models,
+    };
+
+    let warnings = manifest.validate();
+    assert_eq!(
+        warnings.len(),
+        4,
+        "all four problems must surface: {warnings:?}"
+    );
+
+    assert!(warnings.contains(&"default model \"ghost\" not found in models".to_string()));
+    assert!(warnings.contains(&"model \"bad\": id cannot be empty".to_string()));
+    assert!(
+        warnings.contains(&"model \"bad\": temperature 3 must be between 0.0 and 2.0".to_string())
+    );
+    assert!(warnings.contains(&"model \"bad\": max_turns must be greater than 0".to_string()));
+    assert!(
+        !warnings.iter().any(|w| w.contains("good")),
+        "a valid alias must stay silent: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_validate_is_deterministic_for_a_single_alias() {
+    let manifest = parse_manifest(
+        r#"
+default: missing
+models:
+  broken:
+    id: ""
+    temperature: 9.5
+    max_turns: 0
+"#,
+    );
+
+    let warnings = manifest.validate();
+    assert_eq!(
+        warnings,
+        vec![
+            "default model \"missing\" not found in models".to_string(),
+            "model \"broken\": id cannot be empty".to_string(),
+            "model \"broken\": temperature 9.5 must be between 0.0 and 2.0".to_string(),
+            "model \"broken\": max_turns must be greater than 0".to_string(),
+        ],
+        "warnings are emitted in a stable order: default first, then per-alias checks"
+    );
+
+    // Repeated calls must not mutate or accumulate state.
+    assert_eq!(manifest.validate(), warnings);
+}
+
+#[test]
+fn test_validate_does_not_mutate_the_manifest() {
+    let mut models = HashMap::new();
+    models.insert(
+        "kept".to_string(),
+        definition("vendor:kept", Some("Role."), Some(0.2), Some(9)),
+    );
+    let manifest = ModelManifest {
+        default: Some("kept".to_string()),
+        models,
+    };
+
+    let before = manifest.resolve_model("kept");
+    let _ = manifest.validate();
+    let after = manifest.resolve_model("kept");
+
+    assert_eq!(before, after, "validation is read-only");
+    assert_eq!(before, ("vendor:kept".to_string(), Some(0.2), Some(9)));
+}
+
+#[test]
+fn test_validate_does_not_filter_out_invalid_models() {
+    // Warnings are advisory: the offending entries must still be served so a
+    // user can see (and fix) what the manifest actually contains.
+    let manifest = parse_manifest(
+        r#"
+default: ghost
+models:
+  broken:
+    id: ""
+    temperature: 5.0
+    max_turns: 0
+"#,
+    );
+
+    assert!(!manifest.validate().is_empty());
+
+    assert!(manifest.models.contains_key("broken"));
+    assert_eq!(manifest.default, Some("ghost".to_string()));
+    assert_eq!(manifest.models.len(), 1);
+    assert_eq!(
+        manifest.build_tool_description().lines().count(),
+        2,
+        "the invalid entry is still listed in the tool description"
+    );
+}
+
+#[test]
+fn test_validate_is_available_on_the_shipped_models_yaml() {
+    // The repository's own `models.yaml` must validate cleanly, otherwise the
+    // server would log warnings on every start.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml");
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("models.yaml must be readable: {e}"));
+    let manifest: ModelManifest =
+        serde_yaml::from_str(&content).unwrap_or_else(|e| panic!("models.yaml must parse: {e}"));
+
+    let warnings = manifest.validate();
+    assert!(
+        warnings.is_empty(),
+        "models.yaml must validate cleanly: {warnings:?}"
+    );
 }
