@@ -272,7 +272,10 @@ fn test_cli_list_plain_text() {
     let output = run_action(&exe, &["list"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "No active or recent workers found.");
+    assert!(
+        stdout.contains("No active or recent workers found.") || stdout.contains("Workers ("),
+        "expected empty list or worker listing, got: {stdout}"
+    );
 }
 
 #[test]

@@ -528,7 +528,7 @@ impl AgentRunner {
             PathBuf::from(custom)
         } else {
             let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("default");
-            std::env::temp_dir().join(format!("swe-target-{dir_name}"))
+            crate::worktree::swe_base_dir().join(format!("swe-target-{dir_name}"))
         };
         let _ = std::fs::create_dir_all(&target_dir);
 
@@ -551,6 +551,8 @@ impl AgentRunner {
                 "bwrap",
                 "--die-with-parent",
                 "--new-session",
+                "--unshare-pid",
+                "--unshare-ipc",
                 "--ro-bind", "/usr", "/usr",
                 "--symlink", "usr/bin", "/bin",
                 "--symlink", "usr/bin", "/sbin",

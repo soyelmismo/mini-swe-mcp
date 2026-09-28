@@ -146,7 +146,7 @@ pub struct WorkerLaunchConfig {
 }
 
 pub fn registry_dir() -> PathBuf {
-    std::env::temp_dir().join("swe-registry")
+    crate::worktree::swe_base_dir().join("swe-registry")
 }
 
 pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
@@ -159,26 +159,32 @@ pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
 }
 
 pub fn remove_registry_entry(worker_id: &str) {
-    let path = registry_dir().join(format!("{worker_id}.json"));
-    let _ = std::fs::remove_file(path);
+    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
+        let path = dir.join(format!("{worker_id}.json"));
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
-    let dir = registry_dir();
     let mut entries = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(dir) {
-        for entry in read_dir.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Ok(content) = std::fs::read_to_string(&p)
-                && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
-            {
-                if (item.status == "running" || item.status == "paused")
-                    && !crate::worktree::is_process_alive(item.pid)
+    let mut seen_ids = std::collections::HashSet::new();
+
+    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json")
+                    && let Ok(content) = std::fs::read_to_string(&p)
+                    && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
+                    && seen_ids.insert(item.id.clone())
                 {
-                    item.status = "stopped".to_string();
+                    if (item.status == "running" || item.status == "paused")
+                        && !crate::worktree::is_process_alive(item.pid)
+                    {
+                        item.status = "stopped".to_string();
+                    }
+                    entries.push(item);
                 }
-                entries.push(item);
             }
         }
     }

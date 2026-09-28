@@ -19,10 +19,23 @@ fn git(dir: &Path, operation: &str, args: &[&str]) -> Result<std::process::Outpu
         .with_context(|| format!("Failed to execute git {operation}"))
 }
 
+pub fn swe_base_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SWE_TEMP_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let var_tmp = PathBuf::from("/var/tmp");
+        if var_tmp.is_dir() {
+            var_tmp
+        } else {
+            std::env::temp_dir()
+        }
+    }
+}
+
 impl WorktreeGuard {
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
         let branch = format!("worker-{}", worker_id);
-        let path = std::env::temp_dir().join(format!("swe-wt-{}", worker_id));
+        let path = swe_base_dir().join(format!("swe-wt-{}", worker_id));
 
         // Ensure target directory and branch don't exist
         if path.exists() {
@@ -206,9 +219,11 @@ fn prune_worktree_if_stale(
         }
         let _ = std::fs::remove_file(&pid_file);
         if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
-            let target_dir = std::env::temp_dir().join(format!("swe-target-{wt_name}"));
-            if target_dir.exists() {
-                let _ = std::fs::remove_dir_all(&target_dir);
+            for base in [swe_base_dir(), std::env::temp_dir()] {
+                let target_dir = base.join(format!("swe-target-{wt_name}"));
+                if target_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&target_dir);
+                }
             }
         }
     } else {
@@ -266,52 +281,54 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         }
     }
 
-    // 3. Prune orphaned swe-wt-* directories and .pid files in temp dir whose processes are dead
-    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                && name.starts_with("swe-wt-")
-            {
-                if p.is_dir() {
-                    let pid_file = format!("{}.pid", p.to_string_lossy());
-                    let is_stale = if let Ok(content) = std::fs::read_to_string(&pid_file) {
-                        content
+    // 3. Prune orphaned swe-wt-* directories and .pid files in base dirs whose processes are dead
+    for base in [swe_base_dir(), std::env::temp_dir()] {
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && name.starts_with("swe-wt-")
+                {
+                    if p.is_dir() {
+                        let pid_file = format!("{}.pid", p.to_string_lossy());
+                        let is_stale = if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                            content
+                                .trim()
+                                .parse::<u32>()
+                                .is_ok_and(|pid| !is_process_alive(pid))
+                        } else {
+                            false
+                        };
+                        if is_stale {
+                            let _ = std::fs::remove_dir_all(&p);
+                            let _ = std::fs::remove_file(&pid_file);
+                        }
+                    } else if name.ends_with(".pid")
+                        && let Ok(content) = std::fs::read_to_string(&p)
+                    {
+                        let is_stale = content
                             .trim()
                             .parse::<u32>()
-                            .is_ok_and(|pid| !is_process_alive(pid))
-                    } else {
-                        false
-                    };
-                    if is_stale {
-                        let _ = std::fs::remove_dir_all(&p);
-                        let _ = std::fs::remove_file(&pid_file);
-                    }
-                } else if name.ends_with(".pid")
-                    && let Ok(content) = std::fs::read_to_string(&p)
-                {
-                    let is_stale = content
-                        .trim()
-                        .parse::<u32>()
-                        .map_or(true, |pid| !is_process_alive(pid));
-                    if is_stale {
-                        let _ = std::fs::remove_file(&p);
+                            .map_or(true, |pid| !is_process_alive(pid));
+                        if is_stale {
+                            let _ = std::fs::remove_file(&p);
+                        }
                     }
                 }
             }
         }
-    }
 
-    // 4. Prune orphaned swe-target-* directories in temp dir whose worktrees are gone
-    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                && let Some(wt_name) = name.strip_prefix("swe-target-")
-            {
-                let wt_path = std::env::temp_dir().join(wt_name);
-                if !wt_path.exists() {
-                    let _ = std::fs::remove_dir_all(&p);
+        // 4. Prune orphaned swe-target-* directories in base dirs whose worktrees are gone
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && let Some(wt_name) = name.strip_prefix("swe-target-")
+                {
+                    let wt_path = base.join(wt_name);
+                    if !wt_path.exists() {
+                        let _ = std::fs::remove_dir_all(&p);
+                    }
                 }
             }
         }
@@ -364,9 +381,11 @@ impl Drop for WorktreeGuard {
 
         let dir_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if !dir_name.is_empty() {
-            let target_dir = std::env::temp_dir().join(format!("swe-target-{dir_name}"));
-            if target_dir.exists() {
-                let _ = std::fs::remove_dir_all(&target_dir);
+            for base in [swe_base_dir(), std::env::temp_dir()] {
+                let target_dir = base.join(format!("swe-target-{dir_name}"));
+                if target_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&target_dir);
+                }
             }
         }
     }
