@@ -64,6 +64,12 @@ impl McpServer {
                 }
             };
 
+            // JSON-RPC 2.0: Server MUST NOT reply to notifications (requests without an ID)
+            if req.id.is_none() {
+                info!(method = %req.method, "Received notification");
+                continue;
+            }
+
             let resp = self.handle_request(req).await;
             let serialized = serde_json::to_string(&resp)? + "\n";
             stdout.write_all(serialized.as_bytes()).await?;
@@ -76,6 +82,13 @@ impl McpServer {
     async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id;
         match req.method.as_str() {
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({})),
+                error: None,
+            },
+
             "initialize" => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
