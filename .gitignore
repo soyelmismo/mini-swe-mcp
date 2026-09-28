@@ -2,3 +2,7 @@
 .env
 .tmp-*/
 *.log
+/.agents/
+/audits/
+/reports/
+/artifacts/

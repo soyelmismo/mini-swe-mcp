@@ -73,6 +73,17 @@ impl WorktreeGuard {
         let pid_file = format!("{}.pid", path.to_string_lossy());
         let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
+        // Seed unversioned directories into the worktree so subagents can read them without git tracking
+        const SEED_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
+        for dir in SEED_DIRS {
+            let src = repo_root.join(dir);
+            if src.is_dir() {
+                let dst = path.join(dir);
+                let mut dummy = Vec::new();
+                let _ = copy_dir_all(&src, &dst, &mut dummy, repo_root);
+            }
+        }
+
         let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
         let base_commit = String::from_utf8_lossy(&base_commit_out.stdout)
             .trim()
