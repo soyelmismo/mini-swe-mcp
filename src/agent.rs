@@ -272,9 +272,9 @@ impl AgentRunner {
         };
 
         let mut attempts = 0;
-        let mut resp = loop {
+        let (content, accumulated_tools) = loop {
             attempts += 1;
-            match self
+            let mut resp = match self
                 .http_client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.api_key))
@@ -309,7 +309,7 @@ impl AgentRunner {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    break r;
+                    r
                 }
                 Err(_e) if attempts < 4 => {
                     let delay = Duration::from_millis(500 * (1 << (attempts - 1)));
@@ -322,81 +322,109 @@ impl AgentRunner {
                     continue;
                 }
                 Err(e) => return Err(e).context("Failed to send request to LLM API after retries"),
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("LLM API returned HTTP {}: {}", status, body);
             }
-        };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API returned HTTP {}: {}", status, body);
-        }
+            let mut content = String::new();
+            let mut accumulated_tools: Vec<(String, String, String)> = Vec::new();
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut stream_err = false;
 
-        let mut content = String::new();
-        let mut accumulated_tools: Vec<(String, String, String)> = Vec::new();
-        let mut buffer: Vec<u8> = Vec::new();
-
-        'stream: while let Some(bytes) = resp.chunk().await.context("Failed reading stream chunk")? {
-            buffer.extend_from_slice(&bytes);
-            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line_bytes);
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with(':') {
-                    continue;
-                }
-                let data = if let Some(d) = trimmed.strip_prefix("data:") {
-                    d.trim()
-                } else {
-                    continue;
-                };
-                if data == "[DONE]" {
-                    break 'stream;
-                }
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
-                    && let Some(choice) = chunk.choices.first()
-                {
-                    if let Some(c) = &choice.delta.content {
-                        content.push_str(c);
+            'stream: loop {
+                match resp.chunk().await {
+                    Ok(Some(bytes)) => {
+                        buffer.extend_from_slice(&bytes);
+                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() || trimmed.starts_with(':') {
+                                continue;
+                            }
+                            let data = if let Some(d) = trimmed.strip_prefix("data:") {
+                                d.trim()
+                            } else {
+                                continue;
+                            };
+                            if data == "[DONE]" {
+                                break 'stream;
+                            }
+                            if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
+                                && let Some(choice) = chunk.choices.first()
+                            {
+                                if let Some(c) = &choice.delta.content {
+                                    content.push_str(c);
+                                }
+                                for tc in &choice.delta.tool_calls {
+                                    if tc.index >= accumulated_tools.len() {
+                                        accumulated_tools.resize(
+                                            tc.index + 1,
+                                            (String::new(), String::new(), String::new()),
+                                        );
+                                    }
+                                    if let Some(id) = &tc.id {
+                                        accumulated_tools[tc.index].0 = id.clone();
+                                    }
+                                    if let Some(fn_info) = &tc.function {
+                                        if let Some(name) = &fn_info.name {
+                                            accumulated_tools[tc.index].1.push_str(name);
+                                        }
+                                        if let Some(args) = &fn_info.arguments {
+                                            accumulated_tools[tc.index].2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    for tc in &choice.delta.tool_calls {
-                        if tc.index >= accumulated_tools.len() {
-                            accumulated_tools.resize(
-                                tc.index + 1,
-                                (String::new(), String::new(), String::new()),
+                    Ok(None) => break 'stream,
+                    Err(e) => {
+                        if attempts < 4 {
+                            let delay = Duration::from_millis(500 * (1 << (attempts - 1)));
+                            tracing::warn!(
+                                attempt = attempts,
+                                delay_ms = delay.as_millis(),
+                                error = %e,
+                                "LLM SSE stream chunk read failed; retrying request with backoff"
                             );
-                        }
-                        if let Some(id) = &tc.id {
-                            accumulated_tools[tc.index].0 = id.clone();
-                        }
-                        if let Some(fn_info) = &tc.function {
-                            if let Some(name) = &fn_info.name {
-                                accumulated_tools[tc.index].1.push_str(name);
-                            }
-                            if let Some(args) = &fn_info.arguments {
-                                accumulated_tools[tc.index].2.push_str(args);
-                            }
+                            tokio::time::sleep(delay).await;
+                            stream_err = true;
+                            break 'stream;
+                        } else {
+                            return Err(e).context("Failed reading stream chunk after retries");
                         }
                     }
                 }
             }
-        }
 
-        // Fallback for non-streaming response if proxy ignored stream=true and sent raw JSON in remaining buffer
-        if content.is_empty() && accumulated_tools.is_empty() && !buffer.is_empty() {
-            let raw = String::from_utf8_lossy(&buffer);
-            if let Ok(result) = serde_json::from_str::<ChatCompletionResponse>(&raw)
-                && let Some(choice) = result.choices.first()
-            {
-                content = choice.message.content.clone().unwrap_or_default();
-                for tc in &choice.message.tool_calls {
-                    accumulated_tools.push((
-                        tc.id.clone(),
-                        tc.function.name.clone(),
-                        tc.function.arguments.clone(),
-                    ));
+            if stream_err {
+                continue;
+            }
+
+            // Fallback for non-streaming response if proxy ignored stream=true and sent raw JSON in remaining buffer
+            if content.is_empty() && accumulated_tools.is_empty() && !buffer.is_empty() {
+                let raw = String::from_utf8_lossy(&buffer);
+                if let Ok(result) = serde_json::from_str::<ChatCompletionResponse>(&raw)
+                    && let Some(choice) = result.choices.first()
+                {
+                    content = choice.message.content.clone().unwrap_or_default();
+                    for tc in &choice.message.tool_calls {
+                        accumulated_tools.push((
+                            tc.id.clone(),
+                            tc.function.name.clone(),
+                            tc.function.arguments.clone(),
+                        ));
+                    }
                 }
             }
-        }
+
+            break (content, accumulated_tools);
+        };
 
         // Priority 1: extract command from tool_calls (OpenAI function calling)
         let bash_tc = accumulated_tools
