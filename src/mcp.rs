@@ -196,10 +196,14 @@ impl McpServer {
                                     },
                                     "max_turns": {
                                         "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": crate::manifest::MAX_TURNS_LIMIT,
                                         "description": "Maximum bash exploration turns (overrides manifest default)."
                                     },
                                     "temperature": {
                                         "type": "number",
+                                        "minimum": crate::manifest::TEMPERATURE_RANGE.start(),
+                                        "maximum": crate::manifest::TEMPERATURE_RANGE.end(),
                                         "description": "Model sampling temperature (overrides manifest default)."
                                     }
                                 },
@@ -367,18 +371,20 @@ impl McpServer {
         let (resolved_model, def_temp, def_turns) =
             self.manifest.resolve_model(requested_model);
 
-        let temperature = args
+        // The manifest is sanitized at load time and the request arguments are
+        // sanitized here, so neither ingress can ship a value a provider would
+        // reject (or a `0` turn budget that would strand the worker).
+        let requested_temp = args
             .get("temperature")
             .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-            .or(def_temp);
+            .map(|v| v as f32);
+        let temperature = ModelManifest::sanitize_temperature(requested_temp.or(def_temp));
 
-        let max_turns = args
+        let requested_turns = args
             .get("max_turns")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .or(def_turns)
-            .unwrap_or(100);
+            .map(|v| v as usize);
+        let max_turns = ModelManifest::sanitize_max_turns(requested_turns, def_turns);
 
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         let group = args
