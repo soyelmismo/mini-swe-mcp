@@ -1,0 +1,14 @@
+default: ninja
+
+models:
+  ninja:
+    id: combo:ninja
+    role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
+    temperature: 0.2
+    max_turns: 50
+
+  nerd:
+    id: combo:nerd
+    role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
+    temperature: 0.6
+    max_turns: 100

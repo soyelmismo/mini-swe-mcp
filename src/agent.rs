@@ -61,11 +61,17 @@ pub struct AgentRunner {
     pub api_base: String,
     pub api_key: String,
     pub model: String,
+    pub temperature: Option<f32>,
     pub command_regex: Regex,
 }
 
 impl AgentRunner {
-    pub fn new(api_base: String, api_key: String, model: String) -> Self {
+    pub fn new(
+        api_base: String,
+        api_key: String,
+        model: String,
+        temperature: Option<f32>,
+    ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -78,6 +84,7 @@ impl AgentRunner {
             api_base,
             api_key,
             model,
+            temperature,
             command_regex,
         }
     }
@@ -96,7 +103,7 @@ impl AgentRunner {
         let temperature = if self.model.contains("kimi-k3") {
             None
         } else {
-            Some(0.2)
+            self.temperature.or(Some(0.2))
         };
 
         let payload = ChatCompletionRequest {

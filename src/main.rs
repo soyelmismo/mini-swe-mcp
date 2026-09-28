@@ -1,9 +1,11 @@
 mod agent;
+mod manifest;
 mod mcp;
 mod pool;
 mod worktree;
 
 use anyhow::{Context, Result};
+use manifest::ModelManifest;
 use pool::WorkerPool;
 use mcp::McpServer;
 use std::env;
@@ -58,8 +60,10 @@ async fn main() -> Result<()> {
     let api_key = env::var("OPENAI_API_KEY")
         .context("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.")?;
 
+    let manifest = ModelManifest::load();
+
     let default_model = env::var("DEFAULT_MODEL")
-        .unwrap_or_else(|_| "combo:ninja".to_string());
+        .unwrap_or_else(|_| manifest.default.clone().unwrap_or_else(|| "ninja".to_string()));
 
     let max_workers = env::var("MAX_CONCURRENT_WORKERS")
         .ok()
@@ -67,7 +71,7 @@ async fn main() -> Result<()> {
         .unwrap_or(64); // Supports up to 64 concurrent subagents out of the box
 
     let pool = WorkerPool::new(max_workers, api_base, api_key);
-    let server = McpServer::new(pool, default_model);
+    let server = McpServer::new(pool, default_model, manifest);
 
     server.run_stdio().await
 }

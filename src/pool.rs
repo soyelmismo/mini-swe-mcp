@@ -62,6 +62,7 @@ impl WorkerPool {
         &self,
         task: String,
         model: String,
+        temperature: Option<f32>,
         repo_path: PathBuf,
         max_turns: usize,
     ) -> Result<String> {
@@ -90,7 +91,7 @@ impl WorkerPool {
         let wid = worker_id.clone();
 
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = pool.run_worker(wid.clone(), task, model, repo_path, max_turns).await {
+            if let Err(e) = pool.run_worker(wid.clone(), task, model, temperature, repo_path, max_turns).await {
                 error!(worker = %wid, error = %e, "Worker failed with error");
                 let mut lock = pool.workers.write().await;
                 if let Some(w) = lock.get_mut(&wid) {
@@ -117,6 +118,7 @@ impl WorkerPool {
         worker_id: String,
         task: String,
         model: String,
+        temperature: Option<f32>,
         repo_path: PathBuf,
         max_turns: usize,
     ) -> Result<()> {
@@ -124,7 +126,7 @@ impl WorkerPool {
         info!(worker = %worker_id, model = %model, "Starting worker execution");
 
         let worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
-        let runner = AgentRunner::new(self.api_base.clone(), self.api_key.clone(), model);
+        let runner = AgentRunner::new(self.api_base.clone(), self.api_key.clone(), model, temperature);
 
         let mut messages = vec![
             ChatMessage {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
+use crate::manifest::ModelManifest;
 use crate::pool::WorkerPool;
 
 #[derive(Debug, Deserialize)]
@@ -30,13 +31,15 @@ struct JsonRpcResponse {
 pub struct McpServer {
     pool: Arc<WorkerPool>,
     default_model: String,
+    manifest: Arc<ModelManifest>,
 }
 
 impl McpServer {
-    pub fn new(pool: WorkerPool, default_model: String) -> Self {
+    pub fn new(pool: WorkerPool, default_model: String, manifest: ModelManifest) -> Self {
         Self {
             pool: Arc::new(pool),
             default_model,
+            manifest: Arc::new(manifest),
         }
     }
 
@@ -106,7 +109,7 @@ impl McpServer {
                                     },
                                     "model": {
                                         "type": "string",
-                                        "description": "Model to run (e.g. 'ninja' / 'combo:ninja' or 'nerd' / 'combo:nerd')"
+                                        "description": self.manifest.build_tool_description()
                                     },
                                     "repo_path": {
                                         "type": "string",
@@ -114,7 +117,11 @@ impl McpServer {
                                     },
                                     "max_turns": {
                                         "type": "integer",
-                                        "description": "Maximum bash exploration turns (default: 100)"
+                                        "description": "Maximum bash exploration turns (overrides manifest default)"
+                                    },
+                                    "temperature": {
+                                        "type": "number",
+                                        "description": "Model sampling temperature (overrides manifest default)"
                                     },
                                     "wait": {
                                         "type": "boolean",
@@ -122,6 +129,14 @@ impl McpServer {
                                     }
                                 },
                                 "required": ["task", "repo_path"]
+                            }
+                        },
+                        {
+                            "name": "get_model_manifest",
+                            "description": "Get the declarative catalog of available models, their specialized roles, and guidelines on when to use each.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
                             }
                         },
                         {
@@ -215,6 +230,13 @@ impl McpServer {
 
     async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         match name {
+            "get_model_manifest" => {
+                Ok(json!({
+                    "default_model": self.manifest.default,
+                    "models": self.manifest.models,
+                }))
+            }
+
             "dispatch_worker" => {
                 let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let repo_path = PathBuf::from(
@@ -222,22 +244,29 @@ impl McpServer {
                         .and_then(|v| v.as_str())
                         .unwrap_or("."),
                 );
-                let model = args
+                let requested_model = args
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(&self.default_model)
-                    .to_string();
-                let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                    .unwrap_or(&self.default_model);
+
+                let (resolved_model, def_temp, def_turns) = self.manifest.resolve_model(requested_model);
+
+                let temperature = args
+                    .get("temperature")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .or(def_temp);
+
+                let max_turns = args
+                    .get("max_turns")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .or(def_turns)
+                    .unwrap_or(100);
+
                 let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                // Map aliases
-                let mapped_model = match model.as_str() {
-                    "ninja" => "combo:ninja".to_string(),
-                    "nerd" => "combo:nerd".to_string(),
-                    other => other.to_string(),
-                };
-
-                let wid = self.pool.dispatch(task, mapped_model, repo_path, max_turns).await?;
+                let wid = self.pool.dispatch(task, resolved_model, temperature, repo_path, max_turns).await?;
 
                 if wait {
                     // Poll until completed or failed
