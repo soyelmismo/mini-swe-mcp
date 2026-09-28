@@ -4,6 +4,7 @@
 //! can also be exercised from integration tests in `tests/`.
 
 pub mod agent;
+pub mod cache;
 pub mod config;
 pub mod manifest;
 pub mod mcp;

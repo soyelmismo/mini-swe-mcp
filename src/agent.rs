@@ -605,6 +605,10 @@ impl AgentRunner {
             // Bind isolated build target directory read-write
             cmd.args(["--bind", &target_str, &target_str]);
 
+            // Modular shared package/compiler caches
+            let home_path = std::env::var_os("HOME").map(PathBuf::from);
+            crate::cache::append_bwrap_cache_args(&mut cmd, home_path.as_deref());
+
             // Working directory
             cmd.args(["--chdir", &dir_str]);
 
@@ -627,6 +631,9 @@ impl AgentRunner {
             .env("OPENBLAS_NUM_THREADS", &parallelism)
             .env("MKL_NUM_THREADS", &parallelism)
             .env("GOMAXPROCS", &parallelism);
+
+        // Modular shared compiler & package manager cache environment
+        crate::cache::apply_shared_cache_env(&mut cmd);
 
         let is_heavy = is_heavy_command(command);
         let default_timeout = if is_heavy {
