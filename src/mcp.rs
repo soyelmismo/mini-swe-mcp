@@ -205,7 +205,7 @@ impl McpServer {
         }
     }
 
-    async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
+    pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
         }

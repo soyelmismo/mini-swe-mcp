@@ -73,5 +73,64 @@ async fn main() -> Result<()> {
     let pool = WorkerPool::new(max_workers, api_base, api_key);
     let server = McpServer::new(pool, default_model, manifest);
 
+    let cli_args: Vec<String> = env::args().collect();
+    if cli_args.len() > 1 && cli_args[1] != "--stdio" {
+        let action = &cli_args[1];
+        let mut tool_args = serde_json::Map::new();
+        tool_args.insert("action".into(), serde_json::Value::String(action.clone()));
+
+        match action.as_str() {
+            "dispatch" => {
+                if cli_args.len() < 3 {
+                    eprintln!("Usage: mini-swe-mcp dispatch <task> [--model <model>] [--repo <repo>] [--wait]");
+                    return Ok(());
+                }
+                tool_args.insert("task".into(), serde_json::Value::String(cli_args[2].clone()));
+                let mut i = 3;
+                while i < cli_args.len() {
+                    match cli_args[i].as_str() {
+                        "--model" | "-m" => {
+                            if i + 1 < cli_args.len() {
+                                tool_args.insert("model".into(), serde_json::Value::String(cli_args[i + 1].clone()));
+                                i += 1;
+                            }
+                        }
+                        "--repo" | "-r" => {
+                            if i + 1 < cli_args.len() {
+                                tool_args.insert("repo_path".into(), serde_json::Value::String(cli_args[i + 1].clone()));
+                                i += 1;
+                            }
+                        }
+                        "--wait" | "-w" => {
+                            tool_args.insert("wait".into(), serde_json::Value::Bool(true));
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            "status" | "collect" | "kill" => {
+                if cli_args.len() > 2 {
+                    tool_args.insert("worker_id".into(), serde_json::Value::String(cli_args[2].clone()));
+                }
+            }
+            "steer" => {
+                if cli_args.len() > 3 {
+                    tool_args.insert("worker_id".into(), serde_json::Value::String(cli_args[2].clone()));
+                    tool_args.insert("message".into(), serde_json::Value::String(cli_args[3].clone()));
+                }
+            }
+            "manifest" | "list" => {}
+            _ => {
+                eprintln!("Unknown action: {}. Available: dispatch, status, steer, collect, list, kill, manifest", action);
+                return Ok(());
+            }
+        }
+
+        let result = server.execute_tool("worker", serde_json::Value::Object(tool_args)).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
     server.run_stdio().await
 }
