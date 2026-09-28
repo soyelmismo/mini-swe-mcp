@@ -179,6 +179,24 @@ impl McpServer {
                                 },
                                 "required": ["worker_id"]
                             }
+                        },
+                        {
+                            "name": "steer_worker",
+                            "description": "Inject a steering instruction, correction, or follow-up guidance into a running worker. It will be injected directly into the subagent's prompt on its next turn.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "worker_id": {
+                                        "type": "string",
+                                        "description": "ID of the running worker"
+                                    },
+                                    "message": {
+                                        "type": "string",
+                                        "description": "Steering prompt or follow-up guidance for the subagent"
+                                    }
+                                },
+                                "required": ["worker_id", "message"]
+                            }
                         }
                     ]
                 })),
@@ -331,6 +349,21 @@ impl McpServer {
                 let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
                 let killed = self.pool.kill(wid).await;
                 Ok(json!({ "worker_id": wid, "killed": killed }))
+            }
+
+            "steer_worker" => {
+                let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+                let message = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.pool.steer(wid, message).await?;
+                Ok(json!({
+                    "worker_id": wid,
+                    "status": "steered",
+                    "message": "Steering instruction queued for next turn"
+                }))
             }
 
             _ => anyhow::bail!("Unknown tool: {}", name),

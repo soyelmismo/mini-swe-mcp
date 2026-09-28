@@ -37,6 +37,7 @@ pub struct WorkerRecord {
     pub model: String,
     pub state: WorkerState,
     pub logs: Vec<AgentStepLog>,
+    pub pending_steer: Vec<String>,
     pub handle: Option<JoinHandle<()>>,
 }
 
@@ -82,6 +83,7 @@ impl WorkerPool {
                 started_at: now,
             },
             logs: Vec::new(),
+            pending_steer: Vec::new(),
             handle: None,
         };
 
@@ -143,6 +145,24 @@ impl WorkerPool {
 
         while step < max_turns {
             step += 1;
+
+            // Inject any steering instructions queued by the orchestrator
+            let steer_msgs: Vec<String> = {
+                let mut lock = self.workers.write().await;
+                if let Some(w) = lock.get_mut(&worker_id) {
+                    std::mem::take(&mut w.pending_steer)
+                } else {
+                    Vec::new()
+                }
+            };
+
+            for msg in steer_msgs {
+                info!(worker = %worker_id, "Injected steering message into subagent turn");
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: format!("STEER / ORCHESTRATOR GUIDANCE:\n{}", msg),
+                });
+            }
 
             let llm_reply = runner.run_step_llm(&messages).await?;
             let command = runner.extract_command(&llm_reply);
@@ -251,6 +271,21 @@ impl WorkerPool {
                 })
             })
             .collect()
+    }
+
+    pub async fn steer(&self, id: &str, message: String) -> Result<()> {
+        let mut lock = self.workers.write().await;
+        if let Some(w) = lock.get_mut(id) {
+            match w.state {
+                WorkerState::Running { .. } => {
+                    w.pending_steer.push(message);
+                    Ok(())
+                }
+                _ => anyhow::bail!("Worker {} is not in running state", id),
+            }
+        } else {
+            anyhow::bail!("Worker not found: {}", id)
+        }
     }
 
     pub async fn kill(&self, id: &str) -> bool {
