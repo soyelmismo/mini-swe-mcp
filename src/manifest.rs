@@ -57,22 +57,20 @@ impl ModelManifest {
         // 1. Explicit environment variable MODELS_FILE
         if let Ok(path) = env::var("MODELS_FILE") {
             let p = PathBuf::from(path);
-            if p.exists() {
-                if let Ok(manifest) = Self::from_file(&p) {
+            if p.exists()
+                && let Ok(manifest) = Self::from_file(&p) {
                     info!(path = %p.display(), "Loaded model manifest from MODELS_FILE");
                     return manifest;
                 }
-            }
         }
 
         // 2. Local working directory models.yaml
         let local_path = PathBuf::from("models.yaml");
-        if local_path.exists() {
-            if let Ok(manifest) = Self::from_file(&local_path) {
+        if local_path.exists()
+            && let Ok(manifest) = Self::from_file(&local_path) {
                 info!(path = %local_path.display(), "Loaded model manifest from current directory");
                 return manifest;
             }
-        }
 
         // 3. Standard XDG config directory (~/.config/mini-swe/models.yaml)
         let config_dir = env::var("XDG_CONFIG_HOME")
@@ -82,26 +80,23 @@ impl ModelManifest {
 
         if let Some(dir) = config_dir {
             let xdg_path = dir.join("mini-swe").join("models.yaml");
-            if xdg_path.exists() {
-                if let Ok(manifest) = Self::from_file(&xdg_path) {
+            if xdg_path.exists()
+                && let Ok(manifest) = Self::from_file(&xdg_path) {
                     info!(path = %xdg_path.display(), "Loaded model manifest from XDG config directory");
                     return manifest;
                 }
-            }
         }
 
         // 4. Alongside the executable
-        if let Ok(exe) = env::current_exe() {
-            if let Some(parent) = exe.parent() {
+        if let Ok(exe) = env::current_exe()
+            && let Some(parent) = exe.parent() {
                 let exe_model_path = parent.join("models.yaml");
-                if exe_model_path.exists() {
-                    if let Ok(manifest) = Self::from_file(&exe_model_path) {
+                if exe_model_path.exists()
+                    && let Ok(manifest) = Self::from_file(&exe_model_path) {
                         info!(path = %exe_model_path.display(), "Loaded model manifest from executable directory");
                         return manifest;
                     }
-                }
             }
-        }
 
         info!("No models.yaml found; using default built-in manifest (ninja & nerd)");
         Self::default()

@@ -77,10 +77,9 @@ impl Drop for WorktreeGuard {
             .args(["branch", "-D", &self.branch])
             .output();
 
-        if self.path.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+        if self.path.exists()
+            && let Err(e) = std::fs::remove_dir_all(&self.path) {
                 error!(error = %e, path = %self.path.display(), "Failed to delete leftover worktree directory");
             }
-        }
     }
 }

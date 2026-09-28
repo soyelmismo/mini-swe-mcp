@@ -36,23 +36,20 @@ async fn main() -> Result<()> {
     }
 
     // 3. Try loading alongside the executable or from ancestor folders
-    if env::var("OPENAI_API_KEY").is_err() {
-        if let Ok(exe) = env::current_exe() {
-            if let Some(parent) = exe.parent() {
+    if env::var("OPENAI_API_KEY").is_err()
+        && let Ok(exe) = env::current_exe()
+            && let Some(parent) = exe.parent() {
                 dotenvy::from_path(parent.join(".env")).ok();
                 if let Some(grandparent) = parent.parent().and_then(|p| p.parent()) {
                     dotenvy::from_path(grandparent.join(".env")).ok();
                 }
             }
-        }
-    }
 
     // 4. Try loading from explicitly specified ENV_FILE
-    if env::var("OPENAI_API_KEY").is_err() {
-        if let Ok(custom_env) = env::var("ENV_FILE") {
+    if env::var("OPENAI_API_KEY").is_err()
+        && let Ok(custom_env) = env::var("ENV_FILE") {
             dotenvy::from_path(custom_env).ok();
         }
-    }
 
     let api_base = env::var("OPENAI_API_BASE")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());

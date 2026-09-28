@@ -183,12 +183,11 @@ impl WorkerPool {
             // Update running state
             {
                 let mut lock = self.workers.write().await;
-                if let Some(w) = lock.get_mut(&worker_id) {
-                    if let WorkerState::Running { step: ref mut s, ref mut last_command, .. } = w.state {
+                if let Some(w) = lock.get_mut(&worker_id)
+                    && let WorkerState::Running { step: ref mut s, ref mut last_command, .. } = w.state {
                         *s = step;
                         *last_command = cmd_summary.clone();
                     }
-                }
             }
 
             if is_finish {
