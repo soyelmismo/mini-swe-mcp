@@ -41,7 +41,7 @@ for REPORT in "${REPORTS[@]}"; do
    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
   echo "Spawning worker for $REPORT -> $LOG_FILE"
-  nohup mini-swe-mcp dispatch "[$NAME] $TASK" --model ninja --repo "$REPO_DIR" --group "audits" --max-turns 200 --wait > "$LOG_FILE" 2>&1 &
+  setsid -f mini-swe-mcp dispatch "[$NAME] $TASK" --model ninja --repo "$REPO_DIR" --group "audits" --max-turns 200 --wait > "$LOG_FILE" 2>&1
   sleep 1
 done
 
