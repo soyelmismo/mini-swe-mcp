@@ -193,22 +193,14 @@ impl McpServer {
     }
 
     async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
-        let action = if name == "worker" {
-            args.get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-        } else {
-            match name {
-                "dispatch_worker" => "dispatch",
-                "worker_status" => "status",
-                "steer_worker" => "steer",
-                "collect_result" => "collect",
-                "list_workers" => "list",
-                "kill_worker" => "kill",
-                "get_model_manifest" => "manifest",
-                _ => name,
-            }
-        };
+        if name != "worker" {
+            anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
+        }
+
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match action {
             "manifest" => {
