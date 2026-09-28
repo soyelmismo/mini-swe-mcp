@@ -108,6 +108,7 @@ pub struct CollectedWorker {
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
     bash_semaphore: Arc<Semaphore>,
+    build_semaphore: Arc<Semaphore>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     api_base: String,
     api_key: String,
@@ -115,17 +116,28 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
-        let default_slots = std::thread::available_parallelism()
+        let default_build_slots = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).max(1))
             .unwrap_or(2);
+        let build_slots = std::env::var("BASH_BUILD_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_build_slots);
+
+        let default_bash_slots = max_concurrent.max(8);
         let bash_slots = std::env::var("BASH_CONCURRENT_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(default_slots);
-        info!(bash_slots, "Bash execution semaphore initialized");
+            .unwrap_or(default_bash_slots);
+
+        info!(
+            bash_slots,
+            build_slots, "Bash and build execution semaphores initialized"
+        );
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
+            build_semaphore: Arc::new(Semaphore::new(build_slots)),
             workers: Arc::new(RwLock::new(HashMap::new())),
             api_base,
             api_key,
@@ -322,7 +334,21 @@ impl WorkerPool {
             info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
 
             let (output, code) = {
-                let _bash_permit = self.bash_semaphore.acquire().await
+                let is_heavy = crate::agent::is_heavy_command(&cmd_str);
+                let _build_permit = if is_heavy {
+                    Some(
+                        self.build_semaphore
+                            .acquire()
+                            .await
+                            .context("Build semaphore closed")?,
+                    )
+                } else {
+                    None
+                };
+                let _bash_permit = self
+                    .bash_semaphore
+                    .acquire()
+                    .await
                     .context("Bash semaphore closed")?;
                 runner.execute_bash(&worktree.path, &cmd_str).await?
             };

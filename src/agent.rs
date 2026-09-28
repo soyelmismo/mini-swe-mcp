@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -523,13 +524,97 @@ impl AgentRunner {
             .unwrap_or(default_parallelism)
             .to_string();
 
+        let target_dir = if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
+            PathBuf::from(custom)
+        } else {
+            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("default");
+            std::env::temp_dir().join(format!("swe-target-{dir_name}"))
+        };
+        let _ = std::fs::create_dir_all(&target_dir);
+
         let mut cmd = Command::new("nice");
         cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        cmd.current_dir(dir)
-            .args(["-n", "10", "bash", "-c", command])
-            // Universal build and test parallelism caps
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let use_sandbox = has_bwrap() && std::env::var("SWE_DISABLE_SANDBOX").as_deref() != Ok("1");
+
+        if use_sandbox {
+            let dir_str = dir.to_string_lossy();
+            let target_str = target_dir.to_string_lossy();
+
+            cmd.args([
+                "-n", "10",
+                "bwrap",
+                "--die-with-parent",
+                "--new-session",
+                "--ro-bind", "/usr", "/usr",
+                "--symlink", "usr/bin", "/bin",
+                "--symlink", "usr/bin", "/sbin",
+                "--symlink", "usr/lib", "/lib",
+                "--symlink", "usr/lib", "/lib64",
+                "--ro-bind-try", "/etc", "/etc",
+                "--proc", "/proc",
+                "--dev", "/dev",
+                "--tmpfs", "/tmp",
+            ]);
+
+            // Isolate user home: mount empty tmpfs, expose only toolchain caches read-only
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                let home_str = home.to_string_lossy();
+                cmd.args(["--tmpfs", &home_str]);
+                for cache_dir in [".cargo", ".rustup", ".local/bin"] {
+                    let full = home.join(cache_dir);
+                    if full.exists() {
+                        let full_str = full.to_string_lossy();
+                        cmd.args(["--ro-bind-try", &full_str, &full_str]);
+                    }
+                }
+                let cache_tmp = home.join(".cache");
+                let cache_tmp_str = cache_tmp.to_string_lossy();
+                cmd.args(["--tmpfs", &cache_tmp_str]);
+            }
+
+            if let Some(cargo_home) = std::env::var_os("CARGO_HOME").map(PathBuf::from)
+                && cargo_home.exists()
+            {
+                let p = cargo_home.to_string_lossy();
+                cmd.args(["--ro-bind-try", &p, &p]);
+            }
+            if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME").map(PathBuf::from)
+                && rustup_home.exists()
+            {
+                let p = rustup_home.to_string_lossy();
+                cmd.args(["--ro-bind-try", &p, &p]);
+            }
+
+            // Expose the worktree directory read-write
+            cmd.args(["--bind", &dir_str, &dir_str]);
+
+            // If worktree points to a parent .git common directory, bind it read-write so git status/commit work
+            if let Some(common_git) = find_git_common_dir(dir) {
+                let git_str = common_git.to_string_lossy();
+                cmd.args(["--bind", &git_str, &git_str]);
+            }
+
+            // Bind isolated build target directory read-write
+            cmd.args(["--bind", &target_str, &target_str]);
+
+            // Working directory
+            cmd.args(["--chdir", &dir_str]);
+
+            // Bash command
+            cmd.args(["/usr/bin/bash", "-c", command]);
+        } else {
+            cmd.current_dir(dir)
+                .args(["-n", "10", "bash", "-c", command]);
+        }
+
+        // Universal build and test parallelism caps
+        cmd.env("CARGO_TARGET_DIR", &target_dir)
             .env("CARGO_BUILD_JOBS", &parallelism)
             .env("RUST_TEST_THREADS", &parallelism)
             .env("NEXTEST_TEST_THREADS", &parallelism)
@@ -541,14 +626,22 @@ impl AgentRunner {
             .env("MKL_NUM_THREADS", &parallelism)
             .env("GOMAXPROCS", &parallelism);
 
-        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-            cmd.env("CARGO_TARGET_DIR", "/tmp/swe-cargo-target");
-        }
-
+        let is_heavy = is_heavy_command(command);
+        let default_timeout = if is_heavy {
+            std::env::var("COMMAND_HEAVY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300)
+        } else {
+            std::env::var("COMMAND_LIGHT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+        };
         let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(600); // 10 minutes default for builds/tests
+            .unwrap_or(default_timeout);
         let timeout_duration = Duration::from_secs(timeout_secs);
         let child = cmd.spawn().context("Failed to spawn bash process")?;
         let child_pid = child.id();
@@ -649,6 +742,57 @@ pub fn validate_bash_command(command: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Distinguish CPU-heavy commands (compilations, test runners) from
+/// lightweight exploration commands (git status, cat, ls, grep, etc.).
+pub fn is_heavy_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if lower.starts_with("cargo") || lower.contains("cargo ") || lower.contains("cargo\t") {
+        return true;
+    }
+    if lower == "make"
+        || lower.starts_with("make ")
+        || lower.contains(" make ")
+        || lower.contains(" make\t")
+    {
+        return true;
+    }
+    const HEAVY_PATTERNS: &[&str] = &[
+        "rustc", "pytest", "unittest", "cmake", "ninja", "gcc", "g++", "clang", "npm ", "yarn ",
+        "pnpm ", "mvn ", "gradle", "go test", "go build",
+    ];
+    HEAVY_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+/// Check if the bubblewrap (`bwrap`) sandbox utility is available on this system.
+pub fn has_bwrap() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// If a worktree's `.git` is a gitdir reference pointing to a parent git directory,
+/// locate that common `.git` directory so bubblewrap can expose it to the sandbox.
+pub fn find_git_common_dir(worktree_dir: &Path) -> Option<PathBuf> {
+    let dot_git = worktree_dir.join(".git");
+    if dot_git.is_file()
+        && let Ok(content) = std::fs::read_to_string(&dot_git)
+        && let Some(gitdir_line) = content.lines().find(|l| l.starts_with("gitdir: "))
+    {
+        let gitdir_path = Path::new(gitdir_line.trim_start_matches("gitdir: ").trim());
+        for ancestor in gitdir_path.ancestors() {
+            if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::AgentRunner;
@@ -715,5 +859,57 @@ mod tests {
         assert!(validate_bash_command("find src -type f").is_ok());
         assert!(validate_bash_command("cd src && cargo test").is_ok());
         assert!(validate_bash_command("grep -rn 'WorkerState' src/").is_ok());
+    }
+
+    #[test]
+    fn test_is_heavy_command() {
+        use super::is_heavy_command;
+
+        assert!(is_heavy_command("cargo build"));
+        assert!(is_heavy_command("cargo test --all"));
+        assert!(is_heavy_command("cargo"));
+        assert!(is_heavy_command("pytest tests/"));
+        assert!(is_heavy_command("make -j4"));
+        assert!(is_heavy_command("make"));
+        assert!(is_heavy_command("gcc -O3 main.c"));
+
+        assert!(!is_heavy_command("git status"));
+        assert!(!is_heavy_command("git diff HEAD"));
+        assert!(!is_heavy_command("ls -la"));
+        assert!(!is_heavy_command("cat src/agent.rs"));
+        assert!(!is_heavy_command("find . -name '*.rs'"));
+        assert!(!is_heavy_command("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"));
+    }
+
+    #[test]
+    fn test_has_bwrap_returns_boolean() {
+        let _ = super::has_bwrap();
+    }
+
+    #[test]
+    fn test_find_git_common_dir_on_regular_dir() {
+        let tmp = std::env::temp_dir();
+        assert_eq!(super::find_git_common_dir(&tmp), None);
+    }
+
+    #[tokio::test]
+    async fn test_execute_bash_sandbox_runs_and_blocks_write() {
+        let tmp = std::env::temp_dir().join(format!("swe-test-bwrap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let r = runner();
+
+        // 1. Basic command within worktree succeeds
+        let (out, code) = r.execute_bash(&tmp, "echo 'hello from sandbox'").await.unwrap();
+        assert_eq!(code, Some(0));
+        assert!(out.contains("hello from sandbox"));
+
+        // 2. Writing to read-only host root /usr fails when bwrap is active
+        if super::has_bwrap() {
+            let (out, code) = r.execute_bash(&tmp, "touch /usr/forbidden_write_test 2>&1").await.unwrap();
+            assert_ne!(code, Some(0));
+            assert!(out.contains("Read-only") || out.contains("sólo lectura") || out.contains("Permission denied"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -205,6 +205,12 @@ fn prune_worktree_if_stale(
             let _ = std::fs::remove_dir_all(wt_path);
         }
         let _ = std::fs::remove_file(&pid_file);
+        if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
+            let target_dir = std::env::temp_dir().join(format!("swe-target-{wt_name}"));
+            if target_dir.exists() {
+                let _ = std::fs::remove_dir_all(&target_dir);
+            }
+        }
     } else {
         active_branches.push(br.to_string());
     }
@@ -296,6 +302,21 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         }
     }
 
+    // 4. Prune orphaned swe-target-* directories in temp dir whose worktrees are gone
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && let Some(wt_name) = name.strip_prefix("swe-target-")
+            {
+                let wt_path = std::env::temp_dir().join(wt_name);
+                if !wt_path.exists() {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 }
 
@@ -340,5 +361,13 @@ impl Drop for WorktreeGuard {
 
         let pid_file = format!("{}.pid", self.path.to_string_lossy());
         let _ = std::fs::remove_file(&pid_file);
+
+        let dir_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !dir_name.is_empty() {
+            let target_dir = std::env::temp_dir().join(format!("swe-target-{dir_name}"));
+            if target_dir.exists() {
+                let _ = std::fs::remove_dir_all(&target_dir);
+            }
+        }
     }
 }
