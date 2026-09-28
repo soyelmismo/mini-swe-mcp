@@ -96,6 +96,41 @@ struct ChatCompletionRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     tools: &'a [ToolDefinition],
+    stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamDelta {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: usize,
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunction {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,10 +260,11 @@ impl AgentRunner {
             messages,
             temperature,
             tools: &[bash_tool],
+            stream: true,
         };
 
         let mut attempts = 0;
-        let resp = loop {
+        let mut resp = loop {
             attempts += 1;
             match self
                 .http_client
@@ -254,28 +290,85 @@ impl AgentRunner {
             anyhow::bail!("LLM API returned HTTP {}: {}", status, body);
         }
 
-        let result: ChatCompletionResponse = resp
-            .json()
-            .await
-            .context("Failed to parse LLM JSON response")?;
+        let mut content = String::new();
+        let mut accumulated_tools: Vec<(String, String, String)> = Vec::new();
+        let mut buffer: Vec<u8> = Vec::new();
 
-        let choice = result.choices.first().context("Empty choices in LLM response")?;
-        let content = choice.message.content.clone().unwrap_or_default();
+        while let Some(bytes) = resp.chunk().await.context("Failed reading stream chunk")? {
+            buffer.extend_from_slice(&bytes);
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with(':') {
+                    continue;
+                }
+                let data = if let Some(d) = trimmed.strip_prefix("data:") {
+                    d.trim()
+                } else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    break;
+                }
+                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
+                    && let Some(choice) = chunk.choices.first()
+                {
+                    if let Some(c) = &choice.delta.content {
+                        content.push_str(c);
+                    }
+                    for tc in &choice.delta.tool_calls {
+                        if tc.index >= accumulated_tools.len() {
+                            accumulated_tools.resize(
+                                tc.index + 1,
+                                (String::new(), String::new(), String::new()),
+                            );
+                        }
+                        if let Some(id) = &tc.id {
+                            accumulated_tools[tc.index].0 = id.clone();
+                        }
+                        if let Some(fn_info) = &tc.function {
+                            if let Some(name) = &fn_info.name {
+                                accumulated_tools[tc.index].1.push_str(name);
+                            }
+                            if let Some(args) = &fn_info.arguments {
+                                accumulated_tools[tc.index].2.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback for non-streaming response if proxy ignored stream=true and sent raw JSON in remaining buffer
+        if content.is_empty() && accumulated_tools.is_empty() && !buffer.is_empty() {
+            let raw = String::from_utf8_lossy(&buffer);
+            if let Ok(result) = serde_json::from_str::<ChatCompletionResponse>(&raw)
+                && let Some(choice) = result.choices.first()
+            {
+                content = choice.message.content.clone().unwrap_or_default();
+                for tc in &choice.message.tool_calls {
+                    accumulated_tools.push((
+                        tc.id.clone(),
+                        tc.function.name.clone(),
+                        tc.function.arguments.clone(),
+                    ));
+                }
+            }
+        }
 
         // Priority 1: extract command from tool_calls (OpenAI function calling)
-        let bash_tc = choice
-            .message
-            .tool_calls
+        let bash_tc = accumulated_tools
             .iter()
-            .find(|tc| tc.function.name == "bash" || tc.function.name.is_empty());
+            .find(|(_, name, _)| name == "bash" || name.is_empty());
 
         let command = bash_tc
-            .and_then(|tc| {
-                serde_json::from_str::<BashArgs>(&tc.function.arguments)
-                    .map(|args| args.command)
+            .and_then(|(_, _, args)| {
+                serde_json::from_str::<BashArgs>(args)
+                    .map(|a| a.command)
                     .ok()
                     .or_else(|| {
-                        serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                        serde_json::from_str::<serde_json::Value>(args)
                             .ok()
                             .and_then(|v| {
                                 v.get("command")
@@ -289,39 +382,34 @@ impl AgentRunner {
             .or_else(|| self.extract_command(&content));
 
         // Convert API tool_calls to history-compatible format
-        let (tool_calls, tool_call_id) = if choice.message.tool_calls.is_empty() {
+        let (tool_calls, tool_call_id) = if accumulated_tools.is_empty() {
             (None, None)
         } else {
             let generated_id = format!("call_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            let tc_id = bash_tc.map(|tc| {
-                if tc.id.is_empty() {
+            let tc_id = bash_tc.map(|(id, _, _)| {
+                if id.is_empty() {
                     generated_id.clone()
                 } else {
-                    tc.id.clone()
+                    id.clone()
                 }
             });
-            let tcs: Vec<ToolCall> = choice
-                .message
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    let id = if tc.id.is_empty() {
+            let tcs: Vec<ToolCall> = accumulated_tools
+                .into_iter()
+                .map(|(id, name, arguments)| {
+                    let id = if id.is_empty() {
                         generated_id.clone()
                     } else {
-                        tc.id.clone()
+                        id
                     };
-                    let name = if tc.function.name.is_empty() {
+                    let name = if name.is_empty() {
                         "bash".to_string()
                     } else {
-                        tc.function.name.clone()
+                        name
                     };
                     ToolCall {
                         id,
                         r#type: "function".to_string(),
-                        function: ToolCallFn {
-                            name,
-                            arguments: tc.function.arguments.clone(),
-                        },
+                        function: ToolCallFn { name, arguments },
                     }
                 })
                 .collect();
