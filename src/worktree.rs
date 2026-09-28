@@ -108,7 +108,7 @@ fn prune_worktree_if_stale(
         content
             .trim()
             .parse::<u32>()
-            .map_or(true, |pid| !is_process_alive(pid))
+            .is_ok_and(|pid| !is_process_alive(pid))
     } else {
         // Directory exists but has no pid file: do not delete, assume active
         false
@@ -178,9 +178,9 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
                         content
                             .trim()
                             .parse::<u32>()
-                            .map_or(true, |pid| !is_process_alive(pid))
+                            .is_ok_and(|pid| !is_process_alive(pid))
                     } else {
-                        true
+                        false
                     };
                     if is_stale {
                         let _ = std::fs::remove_dir_all(&p);
