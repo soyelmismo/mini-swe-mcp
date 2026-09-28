@@ -283,9 +283,42 @@ impl AgentRunner {
                 .send()
                 .await
             {
-                Ok(r) => break r,
-                Err(_e) if attempts < 3 => {
-                    tokio::time::sleep(Duration::from_secs(2 * attempts)).await;
+                Ok(r) => {
+                    let status = r.status();
+                    let is_transient = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        || status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT;
+
+                    if is_transient && attempts < 4 {
+                        let delay = r
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| Duration::from_millis(500 * (1 << (attempts - 1))))
+                            .min(Duration::from_secs(10));
+
+                        tracing::warn!(
+                            status = %status,
+                            attempt = attempts,
+                            delay_ms = delay.as_millis(),
+                            "LLM API rate-limited or unavailable; retrying with backoff"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    break r;
+                }
+                Err(_e) if attempts < 4 => {
+                    let delay = Duration::from_millis(500 * (1 << (attempts - 1)));
+                    tracing::warn!(
+                        attempt = attempts,
+                        delay_ms = delay.as_millis(),
+                        "LLM API network error; retrying with backoff"
+                    );
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 Err(e) => return Err(e).context("Failed to send request to LLM API after retries"),
