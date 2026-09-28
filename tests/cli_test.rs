@@ -133,6 +133,42 @@ fn test_cli_unknown_action() {
         stderr.contains("Available:"),
         "stderr should list available actions: {stderr}"
     );
+    assert!(
+        !stderr.contains("Did you mean"),
+        "completely unknown action should not suggest anything: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_typo_suggestion() {
+    let exe = binary_path();
+    let output = Command::new(&exe)
+        .arg("statsu")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Did you mean 'status'?"),
+        "stderr should suggest 'status' for typo 'statsu': {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_prefix_suggestion() {
+    let exe = binary_path();
+    let output = Command::new(&exe)
+        .arg("disp")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Did you mean 'dispatch'?"),
+        "stderr should suggest 'dispatch' for prefix 'disp': {stderr}"
+    );
 }
 
 #[test]

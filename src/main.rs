@@ -217,10 +217,17 @@ where
             }
             "manifest" | "list" => {}
             _ => {
-                eprintln!(
-                    "Unknown action: {}. Available: dispatch, status, steer, collect, list, kill, manifest, prune",
-                    action
-                );
+                if let Some(suggestion) = suggest_action(action, AVAILABLE_ACTIONS) {
+                    eprintln!(
+                        "Unknown action: {action}. Did you mean '{suggestion}'?\nAvailable: {}",
+                        AVAILABLE_ACTIONS.join(", ")
+                    );
+                } else {
+                    eprintln!(
+                        "Unknown action: {action}. Available: {}",
+                        AVAILABLE_ACTIONS.join(", ")
+                    );
+                }
                 std::process::exit(1);
             }
         }
@@ -295,4 +302,42 @@ where
             Ok(())
         }
     }
+}
+
+const AVAILABLE_ACTIONS: &[&str] = &[
+    "dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune",
+];
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1)
+                .min(curr[j] + 1)
+                .min(prev[j] + cost);
+        }
+        prev.clone_from_slice(&curr);
+    }
+    prev[b.len()]
+}
+
+fn suggest_action<'a>(unknown: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let unknown_lower = unknown.to_lowercase();
+    // 1. Prefix match (min len 3 to avoid false positives)
+    if unknown_lower.len() >= 3
+        && let Some(&m) = candidates.iter().find(|&&c| c.starts_with(&unknown_lower))
+    {
+        return Some(m);
+    }
+    // 2. Levenshtein edit distance <= 2
+    candidates
+        .iter()
+        .map(|&c| (c, levenshtein(&unknown_lower, c)))
+        .filter(|&(_, dist)| dist <= 2)
+        .min_by_key(|&(_, dist)| dist)
+        .map(|(c, _)| c)
 }
