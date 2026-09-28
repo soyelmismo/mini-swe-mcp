@@ -34,7 +34,7 @@ impl Default for ModelManifest {
                 id: "combo:ninja".to_string(),
                 role: Some("Fast executor. Use for exploration, test runs, syntax fixes, and focused edits.".to_string()),
                 temperature: Some(0.2),
-                max_turns: Some(50),
+                max_turns: Some(100),
             },
         );
         models.insert(
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(ninja.id, "combo:ninja");
         assert!(ninja.role.as_deref().is_some_and(|r| !r.is_empty()));
         assert_eq!(ninja.temperature, Some(0.2));
-        assert_eq!(ninja.max_turns, Some(50));
+        assert_eq!(ninja.max_turns, Some(100));
 
         let nerd = manifest
             .models
@@ -174,7 +174,7 @@ mod tests {
         // Resolution by alias name
         assert_eq!(
             manifest.resolve_model("ninja"),
-            ("combo:ninja".to_string(), Some(0.2), Some(50))
+            ("combo:ninja".to_string(), Some(0.2), Some(100))
         );
         assert_eq!(
             manifest.resolve_model("nerd"),

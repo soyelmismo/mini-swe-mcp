@@ -5,7 +5,7 @@ models:
     id: combo:ninja
     role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
     temperature: 0.2
-    max_turns: 50
+    max_turns: 100
 
   nerd:
     id: combo:nerd
