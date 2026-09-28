@@ -110,7 +110,8 @@ fn prune_worktree_if_stale(
             .parse::<u32>()
             .map_or(true, |pid| !is_process_alive(pid))
     } else {
-        true
+        // Directory exists but has no pid file: do not delete, assume active
+        false
     };
 
     if is_stale {

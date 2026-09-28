@@ -45,9 +45,6 @@ async fn main() -> Result<()> {
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
-    // Safe startup cleanup: prune leftover zombie worktrees/branches from dead processes
-    worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
-
     // 1. Try loading from current working directory or ancestor directories
     dotenvy::dotenv().ok();
 
