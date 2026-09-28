@@ -356,7 +356,7 @@ impl WorkerPool {
             // 2. Check for REQUEST_TURNS sentinel in command or output
             if let Some(additional) = parse_request_turns(&cmd_str, &output) {
                 let old_max = current_max_turns;
-                current_max_turns = (current_max_turns + additional).min(150);
+                current_max_turns = (current_max_turns + additional).max(current_max_turns).min(500);
                 info!(
                     worker = %worker_id,
                     requested = additional,
