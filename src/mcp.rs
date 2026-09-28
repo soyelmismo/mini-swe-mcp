@@ -276,6 +276,19 @@ impl McpServer {
                                         "logs": logs
                                     }));
                                 }
+                                crate::pool::WorkerState::Paused {
+                                    ref question,
+                                    step,
+                                    ..
+                                } => {
+                                    return Ok(json!({
+                                        "worker_id": wid,
+                                        "status": "needs_input",
+                                        "question": question,
+                                        "step": step,
+                                        "message": "Worker is paused waiting for orchestrator steering."
+                                    }));
+                                }
                                 _ => {}
                             }
                         }

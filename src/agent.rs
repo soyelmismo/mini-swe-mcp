@@ -17,7 +17,12 @@ WORKFLOW:
 echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
 ```
 
-Do not ask for user confirmation. You are autonomous."#;
+COMMUNICATION WITH ORCHESTRATOR:
+- Need more turns: If you are close to finishing verification/refactoring and need more steps, execute:
+  echo "REQUEST_TURNS: <number>"
+- Ask orchestrator / Critical ambiguity: If you face critical blockers, breaking decisions, or require orchestrator confirmation, execute:
+  echo "ASK_ORCHESTRATOR: <your specific question>"
+  This will immediately pause execution until the orchestrator replies with guidance."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

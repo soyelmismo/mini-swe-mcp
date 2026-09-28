@@ -18,6 +18,11 @@ pub enum WorkerState {
         last_command: String,
         started_at: u64,
     },
+    Paused {
+        question: String,
+        step: usize,
+        paused_at: u64,
+    },
     Completed {
         turns: usize,
         diff: String,
@@ -38,6 +43,7 @@ pub struct WorkerRecord {
     pub state: WorkerState,
     pub logs: Vec<AgentStepLog>,
     pub pending_steer: Vec<String>,
+    pub resume_tx: Option<tokio::sync::mpsc::Sender<String>>,
     pub handle: Option<JoinHandle<()>>,
 }
 
@@ -91,6 +97,7 @@ impl WorkerPool {
             },
             logs: Vec::new(),
             pending_steer: Vec::new(),
+            resume_tx: None,
             handle: None,
         };
 
@@ -155,8 +162,9 @@ impl WorkerPool {
         ];
 
         let mut step = 0;
+        let mut current_max_turns = max_turns;
 
-        while step < max_turns {
+        while step < current_max_turns {
             step += 1;
 
             // Inject any steering instructions queued by the orchestrator
@@ -177,8 +185,22 @@ impl WorkerPool {
                 });
             }
 
-            let llm_reply = runner.run_step_llm(&messages).await?;
-            let command = runner.extract_command(&llm_reply);
+            // 1. Run LLM step with silent retry for empty / no-command responses
+            let mut llm_reply = runner.run_step_llm(&messages).await?;
+            let mut command = runner.extract_command(&llm_reply);
+
+            if command.is_none() {
+                info!(
+                    worker = %worker_id,
+                    "No bash block found or empty reply; discarding and silently retrying once without warning"
+                );
+                let retry_reply = runner.run_step_llm(&messages).await?;
+                let retry_cmd = runner.extract_command(&retry_reply);
+                if retry_cmd.is_some() {
+                    llm_reply = retry_reply;
+                    command = retry_cmd;
+                }
+            }
 
             let (cmd_str, is_finish) = match command {
                 Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
@@ -217,6 +239,63 @@ impl WorkerPool {
 
             let (output, code) = runner.execute_bash(&worktree.path, &cmd_str).await?;
 
+            // 2. Check for REQUEST_TURNS sentinel in command or output
+            if let Some(additional) = parse_request_turns(&cmd_str, &output) {
+                let old_max = current_max_turns;
+                current_max_turns = (current_max_turns + additional).min(150);
+                info!(
+                    worker = %worker_id,
+                    requested = additional,
+                    old_max,
+                    new_max = current_max_turns,
+                    "Subagent requested turn extension; granted"
+                );
+            }
+
+            // 3. Check for ASK_ORCHESTRATOR sentinel in command or output
+            if let Some(question) = parse_ask_orchestrator(&cmd_str, &output) {
+                info!(
+                    worker = %worker_id,
+                    question = %question,
+                    "Subagent paused waiting for orchestrator guidance"
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                let now = unix_timestamp();
+                {
+                    let mut lock = self.workers.write().await;
+                    if let Some(w) = lock.get_mut(&worker_id) {
+                        w.state = WorkerState::Paused {
+                            question: question.clone(),
+                            step,
+                            paused_at: now,
+                        };
+                        w.resume_tx = Some(tx);
+                    }
+                }
+
+                if let Some(answer) = rx.recv().await {
+                    info!(worker = %worker_id, "Worker resumed by orchestrator guidance");
+                    {
+                        let mut lock = self.workers.write().await;
+                        if let Some(w) = lock.get_mut(&worker_id) {
+                            w.state = WorkerState::Running {
+                                step,
+                                last_command: format!(
+                                    "resumed: {}",
+                                    summarize_command(&answer)
+                                ),
+                                started_at: now,
+                            };
+                            w.resume_tx = None;
+                        }
+                    }
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
+                    });
+                }
+            }
+
             let step_log = AgentStepLog {
                 step,
                 command: cmd_summary,
@@ -239,9 +318,15 @@ impl WorkerPool {
                 }
             }
 
+            let assistant_content = if llm_reply.trim().is_empty() {
+                "I will execute a bash command.".to_string()
+            } else {
+                llm_reply
+            };
+
             messages.push(ChatMessage {
                 role: "assistant".into(),
-                content: llm_reply,
+                content: assistant_content,
             });
 
             messages.push(ChatMessage {
@@ -297,12 +382,18 @@ impl WorkerPool {
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
         let mut lock = self.workers.write().await;
         if let Some(w) = lock.get_mut(id) {
-            match w.state {
+            match &mut w.state {
                 WorkerState::Running { .. } => {
                     w.pending_steer.push(message);
                     Ok(())
                 }
-                _ => anyhow::bail!("Worker {} is not in running state", id),
+                WorkerState::Paused { .. } => {
+                    if let Some(tx) = w.resume_tx.take() {
+                        let _ = tx.send(message).await;
+                    }
+                    Ok(())
+                }
+                _ => anyhow::bail!("Worker {} is not in a steerable state (running or paused)", id),
             }
         } else {
             anyhow::bail!("Worker not found: {}", id)
@@ -340,5 +431,69 @@ fn summarize_command(cmd: &str) -> String {
         joined
     } else {
         "bash".to_string()
+    }
+}
+
+fn parse_request_turns(cmd: &str, output: &str) -> Option<usize> {
+    for text in [output, cmd] {
+        if let Some(pos) = text.find("REQUEST_TURNS:") {
+            let rest = &text[pos + "REQUEST_TURNS:".len()..];
+            let num_str: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num_str.parse::<usize>()
+                && n > 0
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn parse_ask_orchestrator(cmd: &str, output: &str) -> Option<String> {
+    for text in [output, cmd] {
+        if let Some(pos) = text.find("ASK_ORCHESTRATOR:") {
+            let rest = &text[pos + "ASK_ORCHESTRATOR:".len()..];
+            let line = rest
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if !line.is_empty() {
+                return Some(line.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_request_turns() {
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20", ""), Some(20));
+        assert_eq!(parse_request_turns("", "REQUEST_TURNS: 15"), Some(15));
+        assert_eq!(parse_request_turns("echo nothing", "normal output"), None);
+        assert_eq!(parse_request_turns("REQUEST_TURNS: 0", ""), None);
+    }
+
+    #[test]
+    fn test_parse_ask_orchestrator() {
+        assert_eq!(
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'", ""),
+            Some("should I delete old code?".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("", "ASK_ORCHESTRATOR: \"is this ok?\"\nnext line"),
+            Some("is this ok?".to_string())
+        );
+        assert_eq!(parse_ask_orchestrator("ls -la", "total 12"), None);
     }
 }
