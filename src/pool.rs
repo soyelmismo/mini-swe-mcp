@@ -158,13 +158,15 @@ impl WorkerPool {
                 ),
             };
 
+            let cmd_summary = summarize_command(&cmd_str);
+
             // Update running state
             {
                 let mut lock = self.workers.write().await;
                 if let Some(w) = lock.get_mut(&worker_id) {
                     if let WorkerState::Running { step: ref mut s, ref mut last_command, .. } = w.state {
                         *s = step;
-                        *last_command = cmd_str.clone();
+                        *last_command = cmd_summary.clone();
                     }
                 }
             }
@@ -174,12 +176,18 @@ impl WorkerPool {
                 break;
             }
 
+            info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
+
             let (output, code) = runner.execute_bash(&worktree.path, &cmd_str).await?;
 
             let step_log = AgentStepLog {
                 step,
-                command: cmd_str,
-                output: output.clone(),
+                command: cmd_summary,
+                output: if output.len() > 500 {
+                    format!("{}... [{} bytes truncated]", &output[..500], output.len() - 500)
+                } else {
+                    output.clone()
+                },
                 exit_code: code,
             };
 
@@ -263,3 +271,17 @@ impl WorkerPool {
         }
     }
 }
+
+fn summarize_command(cmd: &str) -> String {
+    let first_line = cmd.lines().next().unwrap_or("").trim();
+    let words: Vec<&str> = first_line.split_whitespace().take(4).collect();
+    let joined = words.join(" ");
+    if joined.len() > 40 {
+        format!("{}...", &joined[..37])
+    } else if !joined.is_empty() {
+        joined
+    } else {
+        "bash".to_string()
+    }
+}
+

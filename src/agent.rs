@@ -146,10 +146,14 @@ impl AgentRunner {
         let mut cmd = Command::new("bash");
         cmd.current_dir(dir).args(["-c", command]);
 
-        let timeout_duration = Duration::from_secs(60);
+        let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600); // 10 minutes default for builds/tests
+        let timeout_duration = Duration::from_secs(timeout_secs);
         let output = tokio::time::timeout(timeout_duration, cmd.output())
             .await
-            .context("Command timed out after 60s")?
+            .context(format!("Command timed out after {}s", timeout_secs))?
             .context("Failed to spawn bash process")?;
 
         let mut combined = String::new();
