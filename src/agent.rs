@@ -2,9 +2,20 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
+
+/// Pattern used to recover a shell command from a ```bash/```sh fenced block
+/// when the model did not use the structured `bash` tool call.
+///
+/// The pattern is a compile-time constant (no interpolation), so the compiled
+/// program is memoized process-wide: it is built at most once, no matter how
+/// many `AgentRunner`s (one per worker) exist, and the compiled automaton's
+/// lazy DFA cache is shared instead of duplicated per worker.
+static BASH_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"```(?:bash|sh)\s*\n([\s\S]*?)\n```").expect("bash block regex must compile")
+});
 
 pub const SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering subagent running in a Linux bash environment.
 You are given a task to complete within a git repository.
@@ -205,23 +216,15 @@ pub struct AgentRunner {
     pub api_key: String,
     pub model: String,
     pub temperature: Option<f32>,
-    pub command_regex: Regex,
 }
 
 impl AgentRunner {
-    pub fn new(
-        api_base: String,
-        api_key: String,
-        model: String,
-        temperature: Option<f32>,
-    ) -> Self {
+    pub fn new(api_base: String, api_key: String, model: String, temperature: Option<f32>) -> Self {
         let http_client = reqwest::Client::builder()
             .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(120))
             .build()
             .expect("Failed to build HTTP client");
-
-        let command_regex = Regex::new(r"```(?:bash|sh)\s*\n([\s\S]*?)\n```").unwrap();
 
         Self {
             http_client,
@@ -229,12 +232,11 @@ impl AgentRunner {
             api_key,
             model,
             temperature,
-            command_regex,
         }
     }
 
     pub fn extract_command(&self, text: &str) -> Option<String> {
-        self.command_regex
+        BASH_BLOCK_RE
             .captures(text)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str().trim().to_string())
@@ -501,7 +503,12 @@ impl AgentRunner {
             (Some(tcs), tc_id)
         };
 
-        Ok(LlmResponse { content, command, tool_calls, tool_call_id })
+        Ok(LlmResponse {
+            content,
+            command,
+            tool_calls,
+            tool_call_id,
+        })
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
@@ -527,7 +534,10 @@ impl AgentRunner {
         let target_dir = if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
             PathBuf::from(custom)
         } else {
-            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("default");
+            let dir_name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default");
             crate::worktree::swe_base_dir().join(format!("swe-target-{dir_name}"))
         };
         let _ = std::fs::create_dir_all(&target_dir);
@@ -547,21 +557,37 @@ impl AgentRunner {
             let target_str = target_dir.to_string_lossy();
 
             cmd.args([
-                "-n", "10",
+                "-n",
+                "10",
                 "bwrap",
                 "--die-with-parent",
                 "--new-session",
                 "--unshare-pid",
                 "--unshare-ipc",
-                "--ro-bind", "/usr", "/usr",
-                "--symlink", "usr/bin", "/bin",
-                "--symlink", "usr/bin", "/sbin",
-                "--symlink", "usr/lib", "/lib",
-                "--symlink", "usr/lib", "/lib64",
-                "--ro-bind-try", "/etc", "/etc",
-                "--proc", "/proc",
-                "--dev", "/dev",
-                "--tmpfs", "/tmp",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/bin",
+                "/sbin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib",
+                "/lib64",
+                "--ro-bind-try",
+                "/etc",
+                "/etc",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
             ]);
 
             // Isolate user home: mount empty tmpfs, expose only toolchain caches read-only
@@ -677,7 +703,10 @@ impl AgentRunner {
                         .status();
                 }
                 return Ok((
-                    format!("Command timed out after {}s and was terminated.", timeout_secs),
+                    format!(
+                        "Command timed out after {}s and was terminated.",
+                        timeout_secs
+                    ),
                     Some(124),
                 ));
             }
@@ -738,25 +767,22 @@ pub fn validate_bash_command(command: &str) -> Result<(), &'static str> {
 
     for token in FORBIDDEN_SEARCHES {
         if trimmed.contains(token) {
-            return Err("Scanning root '/' or system directories is forbidden. Confine searches to the current repository ($PWD).");
+            return Err(
+                "Scanning root '/' or system directories is forbidden. Confine searches to the current repository ($PWD).",
+            );
         }
     }
 
     // 2. Block escaping to parent or root directory via cd
     const FORBIDDEN_CDS: &[&str] = &[
-        "cd / ",
-        "cd /;",
-        "cd /&&",
-        "cd /||",
-        "cd /home",
-        "cd ~",
-        "cd $HOME",
-        "cd /root",
+        "cd / ", "cd /;", "cd /&&", "cd /||", "cd /home", "cd ~", "cd $HOME", "cd /root",
     ];
 
     for token in FORBIDDEN_CDS {
         if trimmed.contains(token) || trimmed.ends_with("cd /") {
-            return Err("Navigating outside the repository with 'cd' is forbidden. All files are in $PWD.");
+            return Err(
+                "Navigating outside the repository with 'cd' is forbidden. All files are in $PWD.",
+            );
         }
     }
 
@@ -822,7 +848,7 @@ pub fn find_git_common_dir(worktree_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentRunner;
+    use super::{AgentRunner, BASH_BLOCK_RE};
 
     fn runner() -> AgentRunner {
         AgentRunner::new(
@@ -837,7 +863,10 @@ mod tests {
     fn extract_command_single_line_bash() {
         let reply = "Run this:\n```bash\necho hello\n```";
 
-        assert_eq!(runner().extract_command(reply), Some("echo hello".to_string()));
+        assert_eq!(
+            runner().extract_command(reply),
+            Some("echo hello".to_string())
+        );
     }
 
     #[test]
@@ -905,7 +934,9 @@ mod tests {
         assert!(!is_heavy_command("ls -la"));
         assert!(!is_heavy_command("cat src/agent.rs"));
         assert!(!is_heavy_command("find . -name '*.rs'"));
-        assert!(!is_heavy_command("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"));
+        assert!(!is_heavy_command(
+            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+        ));
     }
 
     #[test]
@@ -926,17 +957,68 @@ mod tests {
         let r = runner();
 
         // 1. Basic command within worktree succeeds
-        let (out, code) = r.execute_bash(&tmp, "echo 'hello from sandbox'").await.unwrap();
+        let (out, code) = r
+            .execute_bash(&tmp, "echo 'hello from sandbox'")
+            .await
+            .unwrap();
         assert_eq!(code, Some(0));
         assert!(out.contains("hello from sandbox"));
 
         // 2. Writing to read-only host root /usr fails when bwrap is active
         if super::has_bwrap() {
-            let (out, code) = r.execute_bash(&tmp, "touch /usr/forbidden_write_test 2>&1").await.unwrap();
+            let (out, code) = r
+                .execute_bash(&tmp, "touch /usr/forbidden_write_test 2>&1")
+                .await
+                .unwrap();
             assert_ne!(code, Some(0));
-            assert!(out.contains("Read-only") || out.contains("sólo lectura") || out.contains("Permission denied"));
+            assert!(
+                out.contains("Read-only")
+                    || out.contains("sólo lectura")
+                    || out.contains("Permission denied")
+            );
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bash_block_regex_is_a_process_wide_static() {
+        // The extractor pattern is a compile-time literal, so it is memoized in
+        // a `static LazyLock`: one compiled program for the whole process, shared
+        // by every `AgentRunner` (one per worker) instead of one per instance.
+        let a: &regex::Regex = &BASH_BLOCK_RE;
+        let b: &regex::Regex = &BASH_BLOCK_RE;
+        assert!(
+            std::ptr::eq(a, b),
+            "the memoized regex must be a single shared instance"
+        );
+        assert_eq!(a.as_str(), r"```(?:bash|sh)\s*\n([\s\S]*?)\n```");
+    }
+
+    #[test]
+    fn extract_command_is_instance_independent() {
+        // Separate `AgentRunner`s (as created per worker) must extract
+        // identically, since they all read the shared static.
+        let one = runner();
+        let two = AgentRunner::new(
+            "http://example.invalid".to_string(),
+            "other-key".to_string(),
+            "other-model".to_string(),
+            Some(0.7),
+        );
+
+        for reply in [
+            "```bash\necho one\n```",
+            "```sh\nmake test\n```",
+            "```bash\ncd /tmp\nls -la\n```",
+            "no block here",
+            "```rust\nfn main() {}\n```",
+        ] {
+            assert_eq!(
+                one.extract_command(reply),
+                two.extract_command(reply),
+                "extract_command must not depend on the runner instance: {reply}"
+            );
+        }
     }
 }
