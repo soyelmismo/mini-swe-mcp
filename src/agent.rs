@@ -511,6 +511,8 @@ impl AgentRunner {
 
         let mut cmd = Command::new("nice");
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd.current_dir(dir)
             .args(["-n", "10", "bash", "-c", command])
             // Universal build and test parallelism caps
@@ -534,10 +536,24 @@ impl AgentRunner {
             .and_then(|v| v.parse().ok())
             .unwrap_or(600); // 10 minutes default for builds/tests
         let timeout_duration = Duration::from_secs(timeout_secs);
-        let output = tokio::time::timeout(timeout_duration, cmd.output())
-            .await
-            .context(format!("Command timed out after {}s", timeout_secs))?
-            .context("Failed to spawn bash process")?;
+        let child = cmd.spawn().context("Failed to spawn bash process")?;
+        let child_pid = child.id();
+
+        let output_res = tokio::time::timeout(timeout_duration, child.wait_with_output()).await;
+
+        let output = match output_res {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(e).context("Failed waiting for bash process"),
+            Err(_) => {
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &format!("-{pid}")])
+                        .status();
+                }
+                anyhow::bail!("Command timed out after {}s", timeout_secs);
+            }
+        };
 
         let mut combined = String::new();
         if !output.stdout.is_empty() {

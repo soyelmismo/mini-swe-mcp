@@ -551,16 +551,28 @@ fn unix_timestamp() -> u64 {
 
 pub fn summarize_command(cmd: &str) -> String {
     let first_line = cmd.lines().next().unwrap_or("").trim();
-    let words: Vec<&str> = first_line.split_whitespace().take(4).collect();
-    let joined = words.join(" ");
-    if joined.len() > 40 {
-        let cut = joined.floor_char_boundary(37);
-        format!("{}...", &joined[..cut])
-    } else if !joined.is_empty() {
-        joined
-    } else {
-        "bash".to_string()
+    if first_line.is_empty() {
+        return "bash".to_string();
     }
+
+    let mut out = String::with_capacity(40);
+    let mut words = first_line.split_whitespace().take(4);
+
+    if let Some(first) = words.next() {
+        out.push_str(first);
+        for word in words {
+            out.push(' ');
+            out.push_str(word);
+        }
+    }
+
+    if out.len() > 40 {
+        let cut = out.floor_char_boundary(37);
+        out.truncate(cut);
+        out.push_str("...");
+    }
+
+    out
 }
 
 pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
