@@ -68,9 +68,13 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
-        let bash_slots = std::thread::available_parallelism()
+        let default_slots = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).max(1))
             .unwrap_or(2);
+        let bash_slots = std::env::var("BASH_CONCURRENT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_slots);
         info!(bash_slots, "Bash execution semaphore initialized");
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
@@ -212,15 +216,28 @@ impl WorkerPool {
                 }
             }
 
-            let (cmd_str, is_finish) = match llm_resp.command {
+            let cmd_str = match llm_resp.command {
                 Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
-                    (cmd.clone(), true)
+                    info!(worker = %worker_id, step = step, "Worker requested completion");
+                    break;
                 }
-                Some(ref cmd) => (cmd.clone(), false),
-                None => (
-                    "echo 'ERROR: No bash command found. Use the bash tool or a ```bash block.'".into(),
-                    false,
-                ),
+                Some(ref cmd) => cmd.clone(),
+                None => {
+                    info!(worker = %worker_id, step = step, "No bash command in response; prompting subagent directly");
+                    messages.push(ChatMessage::text(
+                        "assistant",
+                        if llm_resp.content.trim().is_empty() {
+                            "I will execute a bash command.".into()
+                        } else {
+                            llm_resp.content
+                        },
+                    ));
+                    messages.push(ChatMessage::text(
+                        "user",
+                        "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
+                    ));
+                    continue;
+                }
             };
 
             let cmd_summary = summarize_command(&cmd_str);
@@ -238,11 +255,6 @@ impl WorkerPool {
                     *s = step;
                     *last_command = cmd_summary.clone();
                 }
-            }
-
-            if is_finish {
-                info!(worker = %worker_id, step = step, "Worker requested completion");
-                break;
             }
 
             info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");

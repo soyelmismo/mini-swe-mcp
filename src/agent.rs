@@ -129,6 +129,7 @@ struct ToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct BashArgs {
+    #[serde(alias = "cmd")]
     command: String,
 }
 
@@ -266,11 +267,24 @@ impl AgentRunner {
             .message
             .tool_calls
             .iter()
-            .find(|tc| tc.function.name == "bash");
+            .find(|tc| tc.function.name == "bash" || tc.function.name.is_empty());
 
         let command = bash_tc
-            .and_then(|tc| serde_json::from_str::<BashArgs>(&tc.function.arguments).ok())
-            .map(|args| args.command)
+            .and_then(|tc| {
+                serde_json::from_str::<BashArgs>(&tc.function.arguments)
+                    .map(|args| args.command)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("command")
+                                    .or_else(|| v.get("cmd"))
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                    })
+            })
             // Priority 2: fallback to regex extraction from content (code block models)
             .or_else(|| self.extract_command(&content));
 
@@ -278,18 +292,37 @@ impl AgentRunner {
         let (tool_calls, tool_call_id) = if choice.message.tool_calls.is_empty() {
             (None, None)
         } else {
-            let tc_id = bash_tc.map(|tc| tc.id.clone());
+            let generated_id = format!("call_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let tc_id = bash_tc.map(|tc| {
+                if tc.id.is_empty() {
+                    generated_id.clone()
+                } else {
+                    tc.id.clone()
+                }
+            });
             let tcs: Vec<ToolCall> = choice
                 .message
                 .tool_calls
                 .iter()
-                .map(|tc| ToolCall {
-                    id: tc.id.clone(),
-                    r#type: "function".to_string(),
-                    function: ToolCallFn {
-                        name: tc.function.name.clone(),
-                        arguments: tc.function.arguments.clone(),
-                    },
+                .map(|tc| {
+                    let id = if tc.id.is_empty() {
+                        generated_id.clone()
+                    } else {
+                        tc.id.clone()
+                    };
+                    let name = if tc.function.name.is_empty() {
+                        "bash".to_string()
+                    } else {
+                        tc.function.name.clone()
+                    };
+                    ToolCall {
+                        id,
+                        r#type: "function".to_string(),
+                        function: ToolCallFn {
+                            name,
+                            arguments: tc.function.arguments.clone(),
+                        },
+                    }
                 })
                 .collect();
             (Some(tcs), tc_id)
@@ -299,20 +332,29 @@ impl AgentRunner {
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
-        let parallelism = std::thread::available_parallelism()
+        let default_parallelism = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).max(1))
-            .unwrap_or(2)
+            .unwrap_or(2);
+        let parallelism = std::env::var("BUILD_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_parallelism)
             .to_string();
 
         let mut cmd = Command::new("nice");
+        cmd.kill_on_drop(true);
         cmd.current_dir(dir)
             .args(["-n", "10", "bash", "-c", command])
-            // Universal build parallelism caps
+            // Universal build and test parallelism caps
             .env("CARGO_BUILD_JOBS", &parallelism)
+            .env("RUST_TEST_THREADS", &parallelism)
+            .env("NEXTEST_TEST_THREADS", &parallelism)
             .env("MAKEFLAGS", format!("-j{parallelism}"))
             .env("CMAKE_BUILD_PARALLEL_LEVEL", &parallelism)
             .env("RAYON_NUM_THREADS", &parallelism)
             .env("OMP_NUM_THREADS", &parallelism)
+            .env("OPENBLAS_NUM_THREADS", &parallelism)
+            .env("MKL_NUM_THREADS", &parallelism)
             .env("GOMAXPROCS", &parallelism);
 
         let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
