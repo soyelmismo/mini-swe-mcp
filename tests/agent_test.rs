@@ -11,8 +11,11 @@
 //! * [`AgentRunner::extract_command`] — the fallback parser that recovers a
 //!   bash command from a markdown fenced code block when the model did not
 //!   emit a structured `tool_calls` response.
+//! * [`ChatMessage`] / [`Role`] — the outbound conversation wire contract. The
+//!   role is a validated enum and the fields are private, so the serialized
+//!   shape of each message kind is the only observable behaviour left to pin.
 
-use mini_swe_mcp::agent::{truncate_output, AgentRunner};
+use mini_swe_mcp::agent::{truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn};
 
 /// The byte budget above which output is truncated, and the sizes of the
 /// head/tail slices that are retained when it is.
@@ -381,4 +384,92 @@ fn test_extract_command_edge_cases() {
         runner().extract_command("````bash\necho inner\n````"),
         Some("echo inner".to_string()),
     );
+}
+// ----------
+// ChatMessage wire contract (audits/overeng_01_agent_structs.md §1, §4)
+// ----------
+
+fn to_value(msg: &ChatMessage) -> serde_json::Value {
+    serde_json::from_str(&serde_json::to_string(msg).expect("ChatMessage must serialize"))
+        .expect("serialized ChatMessage must be valid JSON")
+}
+
+/// The role is now a `Role` enum, so the three lowercase wire strings the chat
+/// API accepts are pinned by construction rather than by stringly-typed callers.
+#[test]
+fn test_role_wire_strings_round_trip() {
+    for (role, expected) in [
+        (Role::System, "\"system\""),
+        (Role::User, "\"user\""),
+        (Role::Assistant, "\"assistant\""),
+        (Role::Tool, "\"tool\""),
+    ] {
+        assert_eq!(serde_json::to_string(&role).unwrap(), expected);
+        assert_eq!(role.as_wire_str(), expected.trim_matches('"'));
+        let back: Role = serde_json::from_str(expected).unwrap();
+        assert_eq!(back, role);
+    }
+}
+
+/// A plain `system`/`user`/`assistant` message carries `content` and omits every
+/// tool-only field.
+#[test]
+fn test_text_message_wire_shape() {
+    let msg = ChatMessage::text(Role::User, "TASK: do it");
+    assert_eq!(msg.role(), Role::User);
+    assert_eq!(msg.content(), Some("TASK: do it"));
+
+    let v = to_value(&msg);
+    assert_eq!(v["role"], "user");
+    assert_eq!(v["content"], "TASK: do it");
+    assert!(v.get("tool_calls").is_none(), "got {v}");
+    assert!(v.get("tool_call_id").is_none(), "got {v}");
+}
+
+/// A tool result is identified by its `tool_call_id` and never advertises
+/// `tool_calls` — the pairing the API requires after an assistant tool call.
+#[test]
+fn test_tool_result_message_wire_shape() {
+    let msg = ChatMessage::tool_result("call_abc".to_string(), "output text");
+    assert_eq!(msg.role(), Role::Tool);
+
+    let v = to_value(&msg);
+    assert_eq!(v["role"], "tool");
+    assert_eq!(v["tool_call_id"], "call_abc");
+    assert_eq!(v["content"], "output text");
+    assert!(v.get("tool_calls").is_none(), "got {v}");
+}
+
+/// An assistant turn that only calls a tool omits `content` entirely, and an
+/// empty `tool_calls` vector is normalised away rather than sent as `[]`.
+#[test]
+fn test_assistant_with_tool_calls_wire_shape() {
+    let tc = ToolCall {
+        id: "call_1".to_string(),
+        r#type: "function".to_string(),
+        function: ToolCallFn {
+            name: "bash".to_string(),
+            arguments: r#"{"command":"ls"}"#.to_string(),
+        },
+    };
+
+    let msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
+    assert_eq!(msg.role(), Role::Assistant);
+    let v = to_value(&msg);
+    assert_eq!(v["role"], "assistant");
+    assert!(v.get("content").is_none(), "got {v}");
+    assert!(v.get("tool_call_id").is_none(), "got {v}");
+    assert_eq!(v["tool_calls"][0]["id"], "call_1");
+    assert_eq!(v["tool_calls"][0]["type"], "function");
+    assert_eq!(v["tool_calls"][0]["function"]["name"], "bash");
+    assert_eq!(
+        v["tool_calls"][0]["function"]["arguments"],
+        r#"{"command":"ls"}"#
+    );
+
+    // Prose plus an empty call list must not emit `"tool_calls": []`.
+    let empty = ChatMessage::assistant_with_tool_calls(Some("prose".into()), Vec::new());
+    let v = to_value(&empty);
+    assert_eq!(v["content"], "prose");
+    assert!(v.get("tool_calls").is_none(), "got {v}");
 }

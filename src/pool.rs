@@ -8,7 +8,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::agent::{AgentRunner, AgentStepLog, ChatMessage, SYSTEM_PROMPT};
+use crate::agent::{AgentRunner, AgentStepLog, ChatMessage, Role, SYSTEM_PROMPT};
 use crate::worktree::WorktreeGuard;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -351,8 +351,8 @@ impl WorkerPool {
         );
 
         let mut messages = vec![
-            ChatMessage::text("system", SYSTEM_PROMPT),
-            ChatMessage::text("user", format!("TASK:\n{}\n\nBegin by exploring the repository.", task)),
+            ChatMessage::text(Role::System, SYSTEM_PROMPT),
+            ChatMessage::text(Role::User, format!("TASK:\n{}\n\nBegin by exploring the repository.", task)),
         ];
 
         let mut step = 0;
@@ -377,7 +377,7 @@ impl WorkerPool {
             for msg in steer_msgs {
                 info!(worker = %worker_id, "Injected steering message into subagent turn");
                 messages.push(ChatMessage::text(
-                    "user",
+                    Role::User,
                     format!("STEER / ORCHESTRATOR GUIDANCE:\n{}", msg),
                 ));
             }
@@ -387,7 +387,7 @@ impl WorkerPool {
             if remaining == 5 || remaining == 2 {
                 info!(worker = %worker_id, step, current_max_turns, "Injecting proactive turn limit warning");
                 messages.push(ChatMessage::text(
-                    "user",
+                    Role::User,
                     format!(
                         "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
                         step, current_max_turns, remaining
@@ -427,7 +427,7 @@ impl WorkerPool {
                 None => {
                     info!(worker = %worker_id, step = step, "No bash command in response; prompting subagent directly");
                     messages.push(ChatMessage::text(
-                        "assistant",
+                        Role::Assistant,
                         if llm_resp.content.trim().is_empty() {
                             "I will execute a bash command.".into()
                         } else {
@@ -435,7 +435,7 @@ impl WorkerPool {
                         },
                     ));
                     messages.push(ChatMessage::text(
-                        "user",
+                        Role::User,
                         "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
                     ));
                     if consecutive_no_cmd < 2 {
@@ -566,7 +566,7 @@ impl WorkerPool {
                         }
                     }
                     messages.push(ChatMessage::text(
-                        "user",
+                        Role::User,
                         format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
                     ));
                 }
@@ -617,8 +617,8 @@ impl WorkerPool {
                 } else {
                     llm_resp.content
                 };
-                messages.push(ChatMessage::text("assistant", assistant_content));
-                messages.push(ChatMessage::text("user", output_text));
+                messages.push(ChatMessage::text(Role::Assistant, assistant_content));
+                messages.push(ChatMessage::text(Role::User, output_text));
             }
         }
 
