@@ -339,10 +339,17 @@ impl AgentRunner {
                 match resp.chunk().await {
                     Ok(Some(bytes)) => {
                         buffer.extend_from_slice(&bytes);
-                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
-                            let line = String::from_utf8_lossy(&line_bytes);
-                            let trimmed = line.trim();
+                        let mut start = 0;
+                        while let Some(rel_pos) = buffer[start..].iter().position(|&b| b == b'\n') {
+                            let pos = start + rel_pos;
+                            let raw_line = &buffer[start..pos];
+                            start = pos + 1;
+
+                            let trimmed = match std::str::from_utf8(raw_line) {
+                                Ok(s) => s.trim(),
+                                Err(_) => continue,
+                            };
+
                             if trimmed.is_empty() || trimmed.starts_with(':') {
                                 continue;
                             }
@@ -352,6 +359,7 @@ impl AgentRunner {
                                 continue;
                             };
                             if data == "[DONE]" {
+                                buffer.drain(..start);
                                 break 'stream;
                             }
                             if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
@@ -380,6 +388,9 @@ impl AgentRunner {
                                     }
                                 }
                             }
+                        }
+                        if start > 0 {
+                            buffer.drain(..start);
                         }
                     }
                     Ok(None) => break 'stream,

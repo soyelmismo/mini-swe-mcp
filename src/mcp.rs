@@ -288,6 +288,30 @@ impl McpServer {
         PathBuf::from(repo_path_str)
     }
 
+    async fn emit_progress(
+        tx: Option<&mpsc::Sender<String>>,
+        token: Option<&Value>,
+        progress: usize,
+        total: usize,
+        message: impl std::fmt::Display,
+    ) {
+        if let (Some(token), Some(tx)) = (token, tx) {
+            let notif = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": token,
+                    "progress": progress,
+                    "total": total,
+                    "message": message.to_string(),
+                }
+            });
+            if let Ok(serialized) = serde_json::to_string(&notif) {
+                let _ = tx.send(serialized + "\n").await;
+            }
+        }
+    }
+
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         self.execute_tool_with_progress(name, args, None, None).await
     }
@@ -300,253 +324,225 @@ impl McpServer {
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> Result<Value> {
         if name != "worker" {
-            anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
+            anyhow::bail!("Unknown tool: '{name}'. Only 'worker' is supported.");
         }
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let token = progress_token.as_ref();
+        let tx = progress_tx.as_ref();
 
         match action {
-            "manifest" => Ok(json!({
-                "default_model": self.manifest.default,
-                "models": self.manifest.models,
-            })),
-
-            "dispatch" => {
-                let task = Self::required_string(&args, "task", action)?.to_string();
-                let repo_path = Self::get_repo_path(&args);
-                let requested_model = args
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&self.default_model);
-
-                let (resolved_model, def_temp, def_turns) =
-                    self.manifest.resolve_model(requested_model);
-
-                let temperature = args
-                    .get("temperature")
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as f32)
-                    .or(def_temp);
-
-                let max_turns = args
-                    .get("max_turns")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .or(def_turns)
-                    .unwrap_or(100);
-
-                let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                let wid = self
-                    .pool
-                    .dispatch(task, resolved_model, temperature, repo_path, max_turns)
-                    .await?;
-
-                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
-                    let notif = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/progress",
-                        "params": {
-                            "progressToken": token,
-                            "progress": 0,
-                            "total": max_turns,
-                            "message": format!("Worker {wid} dispatched in isolated worktree")
-                        }
-                    });
-                    if let Ok(serialized) = serde_json::to_string(&notif) {
-                        let _ = tx.send(serialized + "\n").await;
-                    }
-                }
-
-                if wait {
-                    let mut last_reported_step = 0;
-                    // Poll until completed or failed
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if let Some(state) = self.pool.get_worker_state(&wid).await {
-                            match state {
-                                crate::pool::WorkerState::Running {
-                                    step,
-                                    ref last_command,
-                                    ..
-                                } => {
-                                    if step > last_reported_step {
-                                        last_reported_step = step;
-                                        if let (Some(token), Some(tx)) =
-                                            (&progress_token, &progress_tx)
-                                        {
-                                            let notif = json!({
-                                                "jsonrpc": "2.0",
-                                                "method": "notifications/progress",
-                                                "params": {
-                                                    "progressToken": token,
-                                                    "progress": step,
-                                                    "total": max_turns,
-                                                    "message": format!("Step {step}/{max_turns}: {last_command}")
-                                                }
-                                            });
-                                            if let Ok(serialized) = serde_json::to_string(&notif) {
-                                                let _ = tx.send(serialized + "\n").await;
-                                            }
-                                        }
-                                    }
-                                }
-                                crate::pool::WorkerState::Completed { .. }
-                                | crate::pool::WorkerState::Failed { .. } => {
-                                    if let (Some(token), Some(tx)) =
-                                        (&progress_token, &progress_tx)
-                                    {
-                                        let notif = json!({
-                                            "jsonrpc": "2.0",
-                                            "method": "notifications/progress",
-                                            "params": {
-                                                "progressToken": token,
-                                                "progress": max_turns,
-                                                "total": max_turns,
-                                                "message": format!("Worker {wid} finished execution")
-                                            }
-                                        });
-                                        if let Ok(serialized) = serde_json::to_string(&notif) {
-                                            let _ = tx.send(serialized + "\n").await;
-                                        }
-                                    }
-                                    let logs =
-                                        self.pool.get_worker_logs(&wid).await.unwrap_or_default();
-                                    return Ok(json!({
-                                        "worker_id": wid,
-                                        "state": state,
-                                        "logs": logs
-                                    }));
-                                }
-                                crate::pool::WorkerState::Paused {
-                                    ref question,
-                                    step,
-                                    ..
-                                } => {
-                                    if let (Some(token), Some(tx)) =
-                                        (&progress_token, &progress_tx)
-                                    {
-                                        let notif = json!({
-                                            "jsonrpc": "2.0",
-                                            "method": "notifications/progress",
-                                            "params": {
-                                                "progressToken": token,
-                                                "progress": step,
-                                                "total": max_turns,
-                                                "message": format!("Worker {wid} paused: waiting for orchestrator steering")
-                                            }
-                                        });
-                                        if let Ok(serialized) = serde_json::to_string(&notif) {
-                                            let _ = tx.send(serialized + "\n").await;
-                                        }
-                                    }
-                                    return Ok(json!({
-                                        "worker_id": wid,
-                                        "status": "needs_input",
-                                        "question": question,
-                                        "step": step,
-                                        "message": "Worker is paused waiting for orchestrator steering."
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Ok(json!({
-                        "worker_id": wid,
-                        "status": "dispatched",
-                        "message": "Worker is executing in isolated worktree in background"
-                    }))
-                }
-            }
-
-            "status" => {
-                let wid = Self::get_worker_id(&args, action)?;
-                if let Some(state) = self.pool.get_worker_state(wid).await {
-                    Ok(json!({
-                        "worker_id": wid,
-                        "state": state
-                    }))
-                } else {
-                    anyhow::bail!("Worker not found: {}", wid)
-                }
-            }
-
-            "collect" => {
-                let wid = Self::get_worker_id(&args, action)?;
-                if let Some(collected) = self.pool.collect(wid).await {
-                    Ok(json!({
-                        "worker_id": wid,
-                        "state": collected.state,
-                        "logs": collected.logs
-                    }))
-                } else {
-                    anyhow::bail!("Worker not found: {}", wid)
-                }
-            }
-
-            "list" => {
-                let workers = self.pool.list_workers().await;
-                Ok(json!({ "workers": workers }))
-            }
-
-            "kill" => {
-                let wid = Self::get_worker_id(&args, action)?;
-                let killed = self.pool.kill(wid).await;
-                Ok(json!({ "worker_id": wid, "killed": killed }))
-            }
-
-            "steer" => {
-                let wid = Self::get_worker_id(&args, action)?;
-                let message = Self::required_string(&args, "message", action)?.to_string();
-                self.pool.steer(wid, message).await?;
-                Ok(json!({
-                    "worker_id": wid,
-                    "status": "steered",
-                    "message": "Steering instruction queued for next turn"
-                }))
-            }
-
-            "prune" => {
-                let repo_path = Self::get_repo_path(&args);
-                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
-                    let notif = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/progress",
-                        "params": {
-                            "progressToken": token,
-                            "progress": 0,
-                            "total": 1,
-                            "message": "Pruning stale worktrees and dead worker branches"
-                        }
-                    });
-                    if let Ok(serialized) = serde_json::to_string(&notif) {
-                        let _ = tx.send(serialized + "\n").await;
-                    }
-                }
-                crate::worktree::prune_stale_worktrees(&repo_path);
-                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
-                    let notif = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/progress",
-                        "params": {
-                            "progressToken": token,
-                            "progress": 1,
-                            "total": 1,
-                            "message": "Prune complete"
-                        }
-                    });
-                    if let Ok(serialized) = serde_json::to_string(&notif) {
-                        let _ = tx.send(serialized + "\n").await;
-                    }
-                }
-                Ok(json!({
-                    "status": "pruned",
-                    "message": "Stale worktrees and dead worker branches cleaned up"
-                }))
-            }
-
-            _ => anyhow::bail!("Unknown action or tool: {}", action),
+            "manifest" => self.handle_manifest(),
+            "dispatch" => self.handle_dispatch(&args, token, tx).await,
+            "status" => self.handle_status(&args).await,
+            "collect" => self.handle_collect(&args).await,
+            "list" => self.handle_list().await,
+            "kill" => self.handle_kill(&args).await,
+            "steer" => self.handle_steer(&args).await,
+            "prune" => self.handle_prune(&args, token, tx).await,
+            _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
+    }
+
+    fn handle_manifest(&self) -> Result<Value> {
+        Ok(json!({
+            "default_model": self.manifest.default,
+            "models": self.manifest.models,
+        }))
+    }
+
+    async fn handle_dispatch(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
+        let task = Self::required_string(args, "task", "dispatch")?.to_string();
+        let repo_path = Self::get_repo_path(args);
+        let requested_model = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.default_model);
+
+        let (resolved_model, def_temp, def_turns) =
+            self.manifest.resolve_model(requested_model);
+
+        let temperature = args
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .or(def_temp);
+
+        let max_turns = args
+            .get("max_turns")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .or(def_turns)
+            .unwrap_or(100);
+
+        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let wid = self
+            .pool
+            .dispatch(task, resolved_model, temperature, repo_path, max_turns)
+            .await?;
+
+        Self::emit_progress(
+            tx,
+            token,
+            0,
+            max_turns,
+            format!("Worker {wid} dispatched in isolated worktree"),
+        )
+        .await;
+
+        if wait {
+            self.wait_for_worker(&wid, max_turns, token, tx).await
+        } else {
+            Ok(json!({
+                "worker_id": wid,
+                "status": "dispatched",
+                "message": "Worker is executing in isolated worktree in background"
+            }))
+        }
+    }
+
+    async fn wait_for_worker(
+        &self,
+        wid: &str,
+        max_turns: usize,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
+        let mut last_reported_step = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some(state) = self.pool.get_worker_state(wid).await {
+                match state {
+                    crate::pool::WorkerState::Running {
+                        step,
+                        ref last_command,
+                        ..
+                    } => {
+                        if step > last_reported_step {
+                            last_reported_step = step;
+                            Self::emit_progress(
+                                tx,
+                                token,
+                                step,
+                                max_turns,
+                                format!("Step {step}/{max_turns}: {last_command}"),
+                            )
+                            .await;
+                        }
+                    }
+                    crate::pool::WorkerState::Completed { .. }
+                    | crate::pool::WorkerState::Failed { .. } => {
+                        Self::emit_progress(
+                            tx,
+                            token,
+                            max_turns,
+                            max_turns,
+                            format!("Worker {wid} finished execution"),
+                        )
+                        .await;
+                        let logs = self.pool.get_worker_logs(wid).await.unwrap_or_default();
+                        return Ok(json!({
+                            "worker_id": wid,
+                            "state": state,
+                            "logs": logs
+                        }));
+                    }
+                    crate::pool::WorkerState::Paused {
+                        ref question,
+                        step,
+                        ..
+                    } => {
+                        Self::emit_progress(
+                            tx,
+                            token,
+                            step,
+                            max_turns,
+                            format!("Worker {wid} paused: waiting for orchestrator steering"),
+                        )
+                        .await;
+                        return Ok(json!({
+                            "worker_id": wid,
+                            "status": "needs_input",
+                            "question": question,
+                            "step": step,
+                            "message": "Worker is paused waiting for orchestrator steering."
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_status(&self, args: &Value) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "status")?;
+        if let Some(state) = self.pool.get_worker_state(wid).await {
+            Ok(json!({ "worker_id": wid, "state": state }))
+        } else {
+            anyhow::bail!("Worker not found: {wid}")
+        }
+    }
+
+    async fn handle_collect(&self, args: &Value) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "collect")?;
+        if let Some(collected) = self.pool.collect(wid).await {
+            Ok(json!({
+                "worker_id": wid,
+                "state": collected.state,
+                "logs": collected.logs
+            }))
+        } else {
+            anyhow::bail!("Worker not found: {wid}")
+        }
+    }
+
+    async fn handle_list(&self) -> Result<Value> {
+        let workers = self.pool.list_workers().await;
+        Ok(json!({ "workers": workers }))
+    }
+
+    async fn handle_kill(&self, args: &Value) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "kill")?;
+        let killed = self.pool.kill(wid).await;
+        Ok(json!({ "worker_id": wid, "killed": killed }))
+    }
+
+    async fn handle_steer(&self, args: &Value) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "steer")?;
+        let message = Self::required_string(args, "message", "steer")?.to_string();
+        self.pool.steer(wid, message).await?;
+        Ok(json!({
+            "worker_id": wid,
+            "status": "steered",
+            "message": "Steering instruction queued for next turn"
+        }))
+    }
+
+    async fn handle_prune(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
+        let repo_path = Self::get_repo_path(args);
+        Self::emit_progress(
+            tx,
+            token,
+            0,
+            1,
+            "Pruning stale worktrees and dead worker branches",
+        )
+        .await;
+        crate::worktree::prune_stale_worktrees(&repo_path);
+        Self::emit_progress(tx, token, 1, 1, "Prune complete").await;
+        Ok(json!({
+            "status": "pruned",
+            "message": "Stale worktrees and dead worker branches cleaned up"
+        }))
     }
 }
