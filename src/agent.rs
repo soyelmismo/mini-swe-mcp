@@ -25,10 +25,10 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
 }
@@ -107,20 +107,31 @@ impl AgentRunner {
         };
 
         let payload = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: messages.to_vec(),
+            model: &self.model,
+            messages,
             temperature,
         };
 
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to send request to LLM API")?;
+        let mut attempts = 0;
+        let resp = loop {
+            attempts += 1;
+            match self
+                .http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => break r,
+                Err(_e) if attempts < 3 => {
+                    tokio::time::sleep(Duration::from_secs(2 * attempts)).await;
+                    continue;
+                }
+                Err(e) => return Err(e).context("Failed to send request to LLM API after retries"),
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
