@@ -130,8 +130,8 @@ impl McpServer {
                                 "properties": {
                                     "action": {
                                         "type": "string",
-                                        "enum": ["dispatch", "status", "steer", "collect", "list", "kill", "manifest"],
-                                        "description": "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'list' (list all workers), 'kill' (terminate worker), 'manifest' (models catalog)"
+                                        "enum": ["dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune"],
+                                        "description": "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'list' (list all workers), 'kill' (terminate worker), 'manifest' (models catalog), 'prune' (clean stale worktrees)"
                                     },
                                     "task": {
                                         "type": "string",
@@ -139,7 +139,11 @@ impl McpServer {
                                     },
                                     "repo_path": {
                                         "type": "string",
-                                        "description": "Absolute path to repository root. Required for 'dispatch'."
+                                        "description": "Absolute path to repository root (alias: 'path'). Required for 'dispatch'."
+                                    },
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Alias for repo_path."
                                     },
                                     "model": {
                                         "type": "string",
@@ -147,7 +151,11 @@ impl McpServer {
                                     },
                                     "worker_id": {
                                         "type": "string",
-                                        "description": "Target worker ID. Required for 'status', 'steer', 'collect', and 'kill'."
+                                        "description": "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'collect', and 'kill'."
+                                    },
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Alias for worker_id."
                                     },
                                     "message": {
                                         "type": "string",
@@ -224,6 +232,23 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("'{name}' is required for action '{action}'"))
     }
 
+    fn get_worker_id<'a>(args: &'a Value, action: &str) -> Result<&'a str> {
+        args.get("worker_id")
+            .or_else(|| args.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("'worker_id' (or 'id') is required for action '{action}'"))
+    }
+
+    fn get_repo_path(args: &Value) -> PathBuf {
+        let repo_path_str = args
+            .get("repo_path")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        PathBuf::from(repo_path_str)
+    }
+
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
@@ -239,11 +264,7 @@ impl McpServer {
 
             "dispatch" => {
                 let task = Self::required_string(&args, "task", action)?.to_string();
-                let repo_path = PathBuf::from(
-                    args.get("repo_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("."),
-                );
+                let repo_path = Self::get_repo_path(&args);
                 let requested_model = args
                     .get("model")
                     .and_then(|v| v.as_str())
@@ -281,7 +302,7 @@ impl McpServer {
                                 crate::pool::WorkerState::Completed { .. }
                                 | crate::pool::WorkerState::Failed { .. } => {
                                     let logs =
-                                        self.pool.get_worker_logs(&wid).await.unwrap_or_default();
+                                         self.pool.get_worker_logs(&wid).await.unwrap_or_default();
                                     return Ok(json!({
                                         "worker_id": wid,
                                         "state": state,
@@ -315,7 +336,7 @@ impl McpServer {
             }
 
             "status" => {
-                let wid = Self::required_string(&args, "worker_id", action)?;
+                let wid = Self::get_worker_id(&args, action)?;
                 if let Some(state) = self.pool.get_worker_state(wid).await {
                     Ok(json!({
                         "worker_id": wid,
@@ -327,7 +348,7 @@ impl McpServer {
             }
 
             "collect" => {
-                let wid = Self::required_string(&args, "worker_id", action)?;
+                let wid = Self::get_worker_id(&args, action)?;
                 if let Some(collected) = self.pool.collect(wid).await {
                     Ok(json!({
                         "worker_id": wid,
@@ -345,19 +366,28 @@ impl McpServer {
             }
 
             "kill" => {
-                let wid = Self::required_string(&args, "worker_id", action)?;
+                let wid = Self::get_worker_id(&args, action)?;
                 let killed = self.pool.kill(wid).await;
                 Ok(json!({ "worker_id": wid, "killed": killed }))
             }
 
             "steer" => {
-                let wid = Self::required_string(&args, "worker_id", action)?;
+                let wid = Self::get_worker_id(&args, action)?;
                 let message = Self::required_string(&args, "message", action)?.to_string();
                 self.pool.steer(wid, message).await?;
                 Ok(json!({
                     "worker_id": wid,
                     "status": "steered",
                     "message": "Steering instruction queued for next turn"
+                }))
+            }
+
+            "prune" => {
+                let repo_path = Self::get_repo_path(&args);
+                crate::worktree::prune_stale_worktrees(&repo_path);
+                Ok(json!({
+                    "status": "pruned",
+                    "message": "Stale worktrees and dead worker branches cleaned up"
                 }))
             }
 
