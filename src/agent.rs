@@ -8,12 +8,19 @@ use tokio::process::Command;
 pub const SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering subagent running in a Linux bash environment.
 You are given a task to complete within a git repository.
 
+LOCATION & SCOPE:
+- You are ALREADY located at the root of the repository worktree ($PWD).
+- Never execute `cd` to parent directories (like /home/rot, /repo, or /). All repository files are right here in the current directory.
+
 WORKFLOW:
-1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files.
+1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files in the current repository.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
 3. Every response MUST execute EXACTLY ONE command using the `bash` tool. If the bash tool is unavailable, use a ```bash ... ``` code block instead.
-4. When finished and verified, complete your work by executing:
-   echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+4. When finished:
+   - For code tasks: verify with tests and execute:
+     echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+   - For audit/analysis tasks: print your concise findings report to stdout and in the same or next turn execute:
+     echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
 
 COMMUNICATION WITH ORCHESTRATOR:
 - Need more turns: If you are close to finishing verification/refactoring and need more steps, execute:
@@ -466,14 +473,14 @@ impl AgentRunner {
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
         }
 
-        // Truncate output to 4096 chars if too long to prevent context explosion
-        if combined.len() > 4096 {
+        // Truncate output to 16384 chars if too long to prevent context explosion
+        if combined.len() > 16384 {
             let truncated = format!(
                 "\n... [Truncated {} bytes] ...\n{}",
-                combined.len() - 4096,
-                &combined[combined.len() - 2048..]
+                combined.len() - 16384,
+                &combined[combined.len() - 4096..]
             );
-            combined = format!("{}{}", &combined[..2048], truncated);
+            combined = format!("{}{}", &combined[..12288], truncated);
         }
 
         Ok((combined, output.status.code()))

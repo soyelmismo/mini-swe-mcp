@@ -167,6 +167,8 @@ impl WorkerPool {
 
         let mut step = 0;
         let mut current_max_turns = max_turns;
+        let mut consecutive_no_cmd = 0;
+        let mut last_assistant_text = String::new();
 
         while step < current_max_turns {
             step += 1;
@@ -221,7 +223,13 @@ impl WorkerPool {
                     info!(worker = %worker_id, step = step, "Worker requested completion");
                     break;
                 }
-                Some(ref cmd) => cmd.clone(),
+                Some(ref cmd) => {
+                    consecutive_no_cmd = 0;
+                    if !llm_resp.content.trim().is_empty() {
+                        last_assistant_text = llm_resp.content.clone();
+                    }
+                    cmd.clone()
+                }
                 None => {
                     info!(worker = %worker_id, step = step, "No bash command in response; prompting subagent directly");
                     messages.push(ChatMessage::text(
@@ -236,6 +244,10 @@ impl WorkerPool {
                         "user",
                         "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
                     ));
+                    if consecutive_no_cmd < 2 {
+                        consecutive_no_cmd += 1;
+                        step = step.saturating_sub(1);
+                    }
                     continue;
                 }
             };
@@ -374,12 +386,20 @@ impl WorkerPool {
         let diff = worktree.get_diff()?;
         let now = unix_timestamp();
 
+        let summary = if !diff.trim().is_empty() {
+            format!("Finished after {} turns. Produced git diff.", step)
+        } else if !last_assistant_text.trim().is_empty() {
+            last_assistant_text
+        } else {
+            format!("Finished after {} turns. Completed successfully.", step)
+        };
+
         let mut lock = self.workers.write().await;
         if let Some(w) = lock.get_mut(&worker_id) {
             w.state = WorkerState::Completed {
                 turns: step,
                 diff,
-                summary: format!("Finished after {} turns. Completed successfully.", step),
+                summary,
                 completed_at: now,
             };
         }
