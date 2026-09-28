@@ -224,13 +224,13 @@ impl Drop for WorktreeGuard {
         );
         let _ = git(
             &self.repo_root,
-            "branch -D",
-            &["branch", "-D", &self.branch],
+            "worktree prune",
+            &["worktree", "prune"],
         );
         let _ = git(
             &self.repo_root,
-            "worktree prune",
-            &["worktree", "prune"],
+            "branch -D",
+            &["branch", "-D", &self.branch],
         );
 
         if self.path.exists()
