@@ -7,6 +7,7 @@ pub struct WorktreeGuard {
     pub path: PathBuf,
     pub branch: String,
     pub repo_root: PathBuf,
+    pub base_commit: String,
     pub keep: bool,
     pub preserve_branch: bool,
 }
@@ -72,10 +73,16 @@ impl WorktreeGuard {
         let pid_file = format!("{}.pid", path.to_string_lossy());
         let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
+        let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
+        let base_commit = String::from_utf8_lossy(&base_commit_out.stdout)
+            .trim()
+            .to_string();
+
         Ok(Self {
             path,
             branch,
             repo_root: repo_root.to_path_buf(),
+            base_commit,
             keep: false,
             preserve_branch: false,
         })
@@ -85,9 +92,30 @@ impl WorktreeGuard {
         // Stage untracked files intent-to-add so git diff captures new files as well
         let _ = git(&self.path, "add", &["add", "-N", "."]);
 
-        let output = git(&self.path, "diff", &["diff", "HEAD"])?;
+        let output = git(&self.path, "diff HEAD", &["diff", "HEAD"])?;
+        if output.status.success() {
+            let diff = String::from_utf8_lossy(&output.stdout).to_string();
+            if !diff.trim().is_empty() {
+                return Ok(diff);
+            }
+        }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        // If working tree diff is empty, check if subagent committed changes to this branch
+        if !self.base_commit.is_empty() {
+            let output = git(
+                &self.path,
+                "diff base_commit..HEAD",
+                &["diff", &format!("{}..HEAD", self.base_commit)],
+            )?;
+            if output.status.success() {
+                let diff = String::from_utf8_lossy(&output.stdout).to_string();
+                if !diff.trim().is_empty() {
+                    return Ok(diff);
+                }
+            }
+        }
+
+        Ok(String::new())
     }
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
@@ -116,6 +144,27 @@ impl WorktreeGuard {
         // Check if there are changes to commit
         let status = git(&self.path, "status", &["status", "--porcelain"])?;
         if status.stdout.is_empty() {
+            // Even if working tree is clean, check if branch already has commits beyond base_commit
+            let has_commits = if !self.base_commit.is_empty() {
+                git(
+                    &self.repo_root,
+                    "rev-list",
+                    &["rev-list", "--count", &format!("{}..{}", self.base_commit, self.branch)],
+                )
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(0) > 0
+                })
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            if has_commits {
+                self.preserve_branch = true;
+                return Ok(Some(self.branch.clone()));
+            }
             return Ok(None);
         }
 
@@ -360,7 +409,25 @@ impl Drop for WorktreeGuard {
             "worktree prune",
             &["worktree", "prune"],
         );
-        if self.preserve_branch {
+        // If the branch has commits beyond base_commit, ALWAYS preserve it
+        let has_commits = if !self.base_commit.is_empty() {
+            git(
+                &self.repo_root,
+                "rev-list",
+                &["rev-list", "--count", &format!("{}..{}", self.base_commit, self.branch)],
+            )
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0) > 0
+            })
+            .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if self.preserve_branch || has_commits {
             info!(branch = %self.branch, "Preserving worker branch with committed changes");
         } else {
             let _ = git(

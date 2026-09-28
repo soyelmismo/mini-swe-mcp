@@ -157,6 +157,23 @@ pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
     cmd.env("GOCACHE", &dirs.go_build);
     cmd.env("GOMODCACHE", &dirs.go_mod);
 
+    // Ensure toolchain paths (~/.local/bin, ~/.cargo/bin) are in PATH
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let local_bin = home.join(".local/bin").to_string_lossy().to_string();
+        let cargo_bin = home.join(".cargo/bin").to_string_lossy().to_string();
+        let mut parts: Vec<&str> = current_path.split(':').collect();
+        let mut new_parts = Vec::new();
+        if !parts.contains(&local_bin.as_str()) {
+            new_parts.push(local_bin.as_str());
+        }
+        if !parts.contains(&cargo_bin.as_str()) {
+            new_parts.push(cargo_bin.as_str());
+        }
+        new_parts.append(&mut parts);
+        cmd.env("PATH", new_parts.join(":"));
+    }
+
     // Rust / C / C++ compiler wrapper
     if std::env::var("SWE_DISABLE_KACHE").as_deref() != Ok("1")
         && std::env::var("KACHE_DISABLED").as_deref() != Ok("1")

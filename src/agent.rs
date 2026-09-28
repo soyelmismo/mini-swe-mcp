@@ -596,10 +596,19 @@ impl AgentRunner {
             // Expose the worktree directory read-write
             cmd.args(["--bind", &dir_str, &dir_str]);
 
-            // If worktree points to a parent .git common directory, bind it read-write so git status/commit work
-            if let Some(common_git) = find_git_common_dir(dir) {
-                let git_str = common_git.to_string_lossy();
-                cmd.args(["--bind", &git_str, &git_str]);
+            // Expose the common .git directory READ-ONLY so git can resolve refs/objects
+            // without permitting the sandbox to prune or delete repository branches!
+            if let Some((common_git, worktree_gitdir)) = find_git_dirs(dir) {
+                let common_str = common_git.to_string_lossy();
+                cmd.args(["--ro-bind", &common_str, &common_str]);
+
+                // Expose ONLY this worker's worktree gitdir read-write so it can update its local index
+                if let Some(wt_gitdir) = worktree_gitdir
+                    && wt_gitdir.is_dir()
+                {
+                    let wt_str = wt_gitdir.to_string_lossy();
+                    cmd.args(["--bind", &wt_str, &wt_str]);
+                }
             }
 
             // Bind isolated build target directory read-write
@@ -788,21 +797,27 @@ pub fn has_bwrap() -> bool {
 }
 
 /// If a worktree's `.git` is a gitdir reference pointing to a parent git directory,
-/// locate that common `.git` directory so bubblewrap can expose it to the sandbox.
-pub fn find_git_common_dir(worktree_dir: &Path) -> Option<PathBuf> {
+/// locate both the common `.git` directory and the specific worktree gitdir.
+pub fn find_git_dirs(worktree_dir: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
     let dot_git = worktree_dir.join(".git");
     if dot_git.is_file()
         && let Ok(content) = std::fs::read_to_string(&dot_git)
         && let Some(gitdir_line) = content.lines().find(|l| l.starts_with("gitdir: "))
     {
-        let gitdir_path = Path::new(gitdir_line.trim_start_matches("gitdir: ").trim());
+        let raw_path = gitdir_line.trim_start_matches("gitdir: ").trim();
+        let gitdir_path = PathBuf::from(raw_path);
         for ancestor in gitdir_path.ancestors() {
             if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
-                return Some(ancestor.to_path_buf());
+                return Some((ancestor.to_path_buf(), Some(gitdir_path)));
             }
         }
     }
     None
+}
+
+/// Backwards-compatible helper returning only the common `.git` root.
+pub fn find_git_common_dir(worktree_dir: &Path) -> Option<PathBuf> {
+    find_git_dirs(worktree_dir).map(|(common, _)| common)
 }
 
 #[cfg(test)]
