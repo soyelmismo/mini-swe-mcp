@@ -2,7 +2,7 @@ use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
-use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use mini_swe_mcp::pool::{WorkerPhase, WorkerPool};
 use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -299,34 +299,33 @@ where
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if let Some(state) = pool.get_worker_state(&wid).await {
-                    match state {
-                        WorkerState::Completed { .. }
-                        | WorkerState::Failed { .. } => {
-                            let logs = pool.get_worker_logs(&wid).await.unwrap_or_default();
-                            result = serde_json::json!({
-                                "worker_id": wid,
-                                "state": state,
-                                "logs": logs
-                            });
-                            break;
-                        }
-                        WorkerState::Paused {
-                            ref question,
-                            step,
-                            ..
-                        } => {
-                            result = serde_json::json!({
-                                "worker_id": wid,
-                                "status": "needs_input",
-                                "question": question,
-                                "step": step,
-                                "message": "Worker is paused waiting for orchestrator steering."
-                            });
-                            break;
-                        }
-                        _ => {}
+                // Lightweight progress poll: no cloning of the worker's
+                // diff/summary/artifacts on every tick (see pool::worker_progress).
+                let Some(progress) = pool.worker_progress(&wid).await else {
+                    continue;
+                };
+                match progress.phase {
+                    WorkerPhase::Completed | WorkerPhase::Failed => {
+                        let state = pool.get_worker_state(&wid).await;
+                        let logs = pool.take_worker_logs(&wid).await.unwrap_or_default();
+                        result = serde_json::json!({
+                            "worker_id": wid,
+                            "state": state,
+                            "logs": logs
+                        });
+                        break;
                     }
+                    WorkerPhase::Paused => {
+                        result = serde_json::json!({
+                            "worker_id": wid,
+                            "status": "needs_input",
+                            "question": progress.question,
+                            "step": progress.step,
+                            "message": "Worker is paused waiting for orchestrator steering."
+                        });
+                        break;
+                    }
+                    WorkerPhase::Running => {}
                 }
             }
         }

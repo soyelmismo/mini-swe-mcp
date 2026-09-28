@@ -74,6 +74,9 @@ impl WorkerState {
     }
 }
 
+/// Maximum number of output bytes retained per step in the worker log history.
+const MAX_STEP_LOG_BYTES: usize = 2048;
+
 pub struct WorkerRecord {
     pub id: String,
     pub task: String,
@@ -93,6 +96,35 @@ impl WorkerRecord {
             failed_at: unix_timestamp(),
         };
     }
+}
+
+/// Coarse lifecycle stage of a worker, used by progress polls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPhase {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+}
+
+/// Lightweight, allocation-cheap snapshot of a worker's progress.
+///
+/// Deliberately excludes the terminal payload (`diff`, `summary`,
+/// `artifacts`) so that the 500 ms polling loops neither clone nor serialize
+/// potentially multi-megabyte strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerProgress {
+    pub phase: WorkerPhase,
+    /// Turn currently running (or the turn the worker paused at); for terminal
+    /// phases this is the number of turns performed.
+    pub step: usize,
+    /// Last bash command summary while running.
+    pub last_command: Option<String>,
+    /// Escalated question while paused.
+    pub question: Option<String>,
+    /// `true` once the worker reached `Completed` or `Failed` and its full
+    /// payload can be fetched once with `get_worker_state`.
+    pub terminal: bool,
 }
 
 /// Result of a one-shot worker collection, detached from the live pool.
@@ -247,6 +279,9 @@ impl WorkerPool {
             .or_else(|| extract_group(&task))
             .unwrap_or_else(|| "default".to_string());
 
+        // H-6: the record keeps its own `String`s, so the original `task`/
+        // `model` are cloned exactly once here and then *moved* into the launch
+        // config instead of being cloned again below.
         let initial_record = WorkerRecord {
             id: worker_id.clone(),
             task: task.clone(),
@@ -294,7 +329,7 @@ impl WorkerPool {
             temperature,
             repo_path,
             max_turns,
-            group: resolved_group.clone(),
+            group: resolved_group,
         };
 
         let join_handle = tokio::spawn(async move {
@@ -321,9 +356,16 @@ impl WorkerPool {
             }
         });
 
-        // Store handle for potential cancellation
-        if let Some(w) = self.workers.write().await.get_mut(&worker_id) {
-            w.handle = Some(join_handle);
+        // Store handle for potential cancellation. The record was inserted
+        // without a handle just above so the worker is visible immediately;
+        // this second (short) write-guard attaches the handle as soon as the
+        // task exists, minimising the window in which a concurrent `kill`/
+        // `kill_all` could not yet abort the task.
+        {
+            let mut lock = self.workers.write().await;
+            if let Some(w) = lock.get_mut(&worker_id) {
+                w.handle = Some(join_handle);
+            }
         }
 
         Ok(worker_id)
@@ -572,21 +614,34 @@ impl WorkerPool {
                 }
             }
 
+            // The log keeps a single owned copy of the (truncated) output; the
+            // conversation entry below is built from that same copy instead of
+            // cloning the raw output a second time.
+            let logged_output = if output.len() > MAX_STEP_LOG_BYTES {
+                let cut = output.floor_char_boundary(MAX_STEP_LOG_BYTES);
+                format!(
+                    "{}... [{} bytes truncated]",
+                    &output[..cut],
+                    output.len() - cut
+                )
+            } else {
+                output
+            };
+
             let step_log = AgentStepLog {
                 step,
                 command: cmd_summary,
-                output: if output.len() > 2048 {
-                    let cut = output.floor_char_boundary(2048);
-                    format!(
-                        "{}... [{} bytes truncated]",
-                        &output[..cut],
-                        output.len() - cut
-                    )
-                } else {
-                    output.clone()
-                },
+                output: logged_output,
                 exit_code: code,
             };
+
+            // Built from the log copy before the record is moved into the pool,
+            // so the raw output is never copied twice.
+            let output_text = format!(
+                "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
+                code.unwrap_or(-1),
+                step_log.output
+            );
 
             {
                 let mut lock = self.workers.write().await;
@@ -594,12 +649,6 @@ impl WorkerPool {
                     w.logs.push(step_log);
                 }
             }
-
-            let output_text = format!(
-                "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
-                code.unwrap_or(-1),
-                output
-            );
 
             if let (Some(tool_calls), Some(tc_id)) = (llm_resp.tool_calls, llm_resp.tool_call_id) {
                 // OpenAI tool_calls protocol: assistant with tool_calls → tool response
@@ -653,16 +702,22 @@ impl WorkerPool {
             None
         };
 
-        let mut lock = self.workers.write().await;
-        if let Some(w) = lock.get_mut(&worker_id) {
-            w.state = WorkerState::Completed {
-                turns: step,
-                diff,
-                summary,
-                completed_at: now,
-                artifacts,
-                branch,
-            };
+        // The completion payload (diff/summary/artifacts/branch) is assembled
+        // *before* the write-guard is taken: the critical section only performs
+        // the O(1) move of the pre-built value into the record.
+        let completed_state = WorkerState::Completed {
+            turns: step,
+            diff,
+            summary,
+            completed_at: now,
+            artifacts,
+            branch,
+        };
+        {
+            let mut lock = self.workers.write().await;
+            if let Some(w) = lock.get_mut(&worker_id) {
+                w.state = completed_state;
+            }
         }
 
         save_registry_entry(&WorkerRegistryEntry {
@@ -690,6 +745,96 @@ impl WorkerPool {
 
     pub async fn get_worker_logs(&self, id: &str) -> Option<Vec<AgentStepLog>> {
         self.workers.read().await.get(id).map(|w| w.logs.clone())
+    }
+
+    /// Insert a synthetic record into the pool (test support).
+    ///
+    /// Exposed so integration tests can assert lock-discipline invariants
+    /// (e.g. that `steer` performs its channel `send` *without* holding the
+    /// write-guard) without spinning up a real LLM-backed worker.
+    #[doc(hidden)]
+    pub async fn __test_insert_worker(&self, record: WorkerRecord) {
+        self.workers
+            .write()
+            .await
+            .insert(record.id.clone(), record);
+    }
+
+    /// Lightweight poll used by the 500 ms progress loops.
+    ///
+    /// Clones only the small strings needed to render progress (`step`,
+    /// `last_command` and the pause question) and never touches the potentially
+    /// multi-megabyte `diff`, `summary` or `artifacts` of a completed worker.
+    pub async fn worker_progress(&self, id: &str) -> Option<WorkerProgress> {
+        let lock = self.workers.read().await;
+        let w = lock.get(id)?;
+        let progress = match &w.state {
+            WorkerState::Running {
+                step,
+                last_command,
+                ..
+            } => WorkerProgress {
+                phase: WorkerPhase::Running,
+                step: *step,
+                last_command: Some(last_command.clone()),
+                question: None,
+                terminal: false,
+            },
+            WorkerState::Paused { question, step, .. } => WorkerProgress {
+                phase: WorkerPhase::Paused,
+                step: *step,
+                last_command: None,
+                question: Some(question.clone()),
+                terminal: false,
+            },
+            WorkerState::Completed { turns, .. } => WorkerProgress {
+                phase: WorkerPhase::Completed,
+                step: *turns,
+                last_command: None,
+                question: None,
+                terminal: true,
+            },
+            WorkerState::Failed { step, .. } => WorkerProgress {
+                phase: WorkerPhase::Failed,
+                step: *step,
+                last_command: None,
+                question: None,
+                terminal: true,
+            },
+        };
+        drop(lock);
+        Some(progress)
+    }
+
+    /// Number of recorded steps for a worker, without copying the log history.
+    pub async fn worker_step_count(&self, id: &str) -> Option<usize> {
+        self.workers.read().await.get(id).map(|w| w.logs.len())
+    }
+
+    /// Move a worker's log history out of the pool (terminal path).
+    ///
+    /// Taking the `Vec` is O(1); only the read-guard scope is exclusive of
+    /// writers, and no per-step string is copied. The record stays registered so
+    /// its final state can still be inspected with `get_worker_state`.
+    pub async fn take_worker_logs(&self, id: &str) -> Option<Vec<AgentStepLog>> {
+        let mut lock = self.workers.write().await;
+        lock.get_mut(id).map(|w| std::mem::take(&mut w.logs))
+    }
+
+    /// Take a worker's record out of the pool and return it untouched.
+    ///
+    /// Used by `collect`-style flows that need the full terminal payload
+    /// (state *and* logs) in one shot, so the record is moved rather than
+    /// cloned field by field.
+    pub async fn take_worker(&self, id: &str) -> Option<CollectedWorker> {
+        let record = self.workers.write().await.remove(id)?;
+        Some(CollectedWorker {
+            id: record.id,
+            task: record.task,
+            model: record.model,
+            state: record.state,
+            logs: record.logs,
+        })
     }
 
     pub async fn list_workers(&self) -> Vec<serde_json::Value> {
@@ -737,25 +882,62 @@ impl WorkerPool {
         }
     }
 
+    /// Deliver an orchestrator message to a worker.
+    ///
+    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
+    /// held and the guard is dropped *before* the `send().await` is performed:
+    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
+    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
+    /// read). A missing sender is now reported instead of silently dropping the
+    /// guidance.
+    /// Deliver an orchestrator message to a worker.
+    ///
+    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
+    /// held and the guard is dropped *before* the `send().await` is performed:
+    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
+    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
+    /// read). A missing sender is now reported instead of silently dropping the
+    /// guidance.
+    /// Deliver an orchestrator message to a worker.
+    ///
+    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
+    /// held and the guard is dropped *before* the `send().await` is performed:
+    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
+    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
+    /// read). A missing sender is now reported instead of silently dropping the
+    /// guidance.
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
-        let mut lock = self.workers.write().await;
-        if let Some(w) = lock.get_mut(id) {
-            match &mut w.state {
+        let tx_opt = {
+            let mut lock = self.workers.write().await;
+            let w = lock
+                .get_mut(id)
+                .ok_or_else(|| anyhow::anyhow!("Worker not found: {id}"))?;
+            match &w.state {
                 WorkerState::Running { .. } => {
                     w.pending_steer.push(message);
-                    Ok(())
+                    return Ok(());
                 }
-                WorkerState::Paused { .. } => {
-                    if let Some(tx) = w.resume_tx.take() {
-                        let _ = tx.send(message).await;
-                    }
-                    Ok(())
+                WorkerState::Paused { .. } => w.resume_tx.take(),
+                _ => {
+                    anyhow::bail!(
+                        "Worker {} is not in a steerable state (running or paused)",
+                        id
+                    )
                 }
-                _ => anyhow::bail!("Worker {} is not in a steerable state (running or paused)", id),
             }
-        } else {
-            anyhow::bail!("Worker not found: {}", id)
-        }
+            // write-guard released here, before any `.await`
+        };
+
+        let Some(tx) = tx_opt else {
+            anyhow::bail!(
+                "Worker {} is paused but has no resume channel (already resumed)",
+                id
+            );
+        };
+        // Send without holding the lock: the worker needs the write-guard to
+        // transition back to `Running` right after `rx.recv().await`.
+        let _ = tx.send(message).await;
+        Ok(())
     }
 
     pub async fn kill(&self, id: &str) -> bool {
@@ -772,6 +954,11 @@ impl WorkerPool {
     }
 
     /// Terminate every worker currently tracked by the pool.
+    ///
+    /// The map is walked once under a single write-guard. The loop contains no
+    /// `.await`, so the critical section stays O(n) in the number of live
+    /// workers (small, and bounded by the dispatch semaphore) and is never
+    /// prolonged in wall-clock time.
     pub async fn kill_all(&self) -> usize {
         let mut lock = self.workers.write().await;
         let mut count = 0usize;
