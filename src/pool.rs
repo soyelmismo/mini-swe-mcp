@@ -447,39 +447,42 @@ fn summarize_command(cmd: &str) -> String {
     }
 }
 
-fn parse_request_turns(cmd: &str, output: &str) -> Option<usize> {
-    for text in [output, cmd] {
-        if let Some(pos) = text.find("REQUEST_TURNS:") {
-            let rest = &text[pos + "REQUEST_TURNS:".len()..];
-            let num_str: String = rest
-                .chars()
-                .skip_while(|c| c.is_whitespace())
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(n) = num_str.parse::<usize>()
-                && n > 0
-            {
-                return Some(n);
-            }
+fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
+    let trimmed = cmd.trim();
+    if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
+        && let Some(pos) = trimmed.find("REQUEST_TURNS:")
+    {
+        let rest = &trimmed[pos + "REQUEST_TURNS:".len()..];
+        let num_str: String = rest
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = num_str.parse::<usize>()
+            && n > 0
+        {
+            return Some(n);
         }
     }
     None
 }
 
-fn parse_ask_orchestrator(cmd: &str, output: &str) -> Option<String> {
-    for text in [output, cmd] {
-        if let Some(pos) = text.find("ASK_ORCHESTRATOR:") {
-            let rest = &text[pos + "ASK_ORCHESTRATOR:".len()..];
-            let line = rest
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-            if !line.is_empty() {
-                return Some(line.to_string());
-            }
+fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
+        && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")
+    {
+        let rest = &trimmed[pos + "ASK_ORCHESTRATOR:".len()..];
+        let line = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        if !line.is_empty() && line != "<your specific question>" && line != "<question>" {
+            return Some(line.to_string());
         }
     }
     None
@@ -492,9 +495,10 @@ mod tests {
     #[test]
     fn test_parse_request_turns() {
         assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20", ""), Some(20));
-        assert_eq!(parse_request_turns("", "REQUEST_TURNS: 15"), Some(15));
+        assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'", ""), Some(15));
+        assert_eq!(parse_request_turns("cat file.rs", "REQUEST_TURNS: 15"), None);
         assert_eq!(parse_request_turns("echo nothing", "normal output"), None);
-        assert_eq!(parse_request_turns("REQUEST_TURNS: 0", ""), None);
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0", ""), None);
     }
 
     #[test]
@@ -504,8 +508,16 @@ mod tests {
             Some("should I delete old code?".to_string())
         );
         assert_eq!(
-            parse_ask_orchestrator("", "ASK_ORCHESTRATOR: \"is this ok?\"\nnext line"),
+            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\"", ""),
             Some("is this ok?".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("cat src/agent.rs", "echo 'ASK_ORCHESTRATOR: <your specific question>'"),
+            None
+        );
+        assert_eq!(
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'", ""),
+            None
         );
         assert_eq!(parse_ask_orchestrator("ls -la", "total 12"), None);
     }
