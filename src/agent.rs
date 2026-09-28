@@ -453,6 +453,10 @@ impl AgentRunner {
             .env("MKL_NUM_THREADS", &parallelism)
             .env("GOMAXPROCS", &parallelism);
 
+        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+            cmd.env("CARGO_TARGET_DIR", "/tmp/swe-cargo-target");
+        }
+
         let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())

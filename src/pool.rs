@@ -36,6 +36,37 @@ pub enum WorkerState {
     },
 }
 
+impl WorkerState {
+    pub fn to_summary(&self) -> serde_json::Value {
+        match self {
+            WorkerState::Running { step, last_command, started_at } => serde_json::json!({
+                "status": "Running",
+                "step": step,
+                "last_command": last_command,
+                "started_at": started_at,
+            }),
+            WorkerState::Paused { question, step, paused_at } => serde_json::json!({
+                "status": "Paused",
+                "step": step,
+                "question": question,
+                "paused_at": paused_at,
+            }),
+            WorkerState::Completed { turns, summary, completed_at, .. } => serde_json::json!({
+                "status": "Completed",
+                "turns": turns,
+                "summary": summary,
+                "completed_at": completed_at,
+            }),
+            WorkerState::Failed { error, step, failed_at } => serde_json::json!({
+                "status": "Failed",
+                "step": step,
+                "error": error,
+                "failed_at": failed_at,
+            }),
+        }
+    }
+}
+
 pub struct WorkerRecord {
     pub id: String,
     pub task: String,
@@ -438,7 +469,7 @@ impl WorkerPool {
                     "id": w.id,
                     "task": w.task,
                     "model": w.model,
-                    "state": w.state,
+                    "state": w.state.to_summary(),
                     "total_steps": w.logs.len(),
                 })
             })

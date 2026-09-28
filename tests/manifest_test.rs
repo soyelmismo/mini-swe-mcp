@@ -191,6 +191,115 @@ fn test_empty_manifest_is_valid() {
 }
 
 // -------------------------------------------------------------------------
+// 2b. Custom manifest turn-budget (`max_turns`) overrides
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_custom_manifest_max_turns_override_via_resolve_model() {
+    let manifest = parse_manifest(
+        r#"
+default: quick
+models:
+  quick:
+    id: vendor:quick
+    role: "Short, focused edits."
+    temperature: 0.1
+    max_turns: 8
+  marathon:
+    id: vendor:marathon
+    role: "Long refactors."
+    temperature: 0.7
+    max_turns: 500
+  unlimited:
+    id: vendor:unlimited
+    role: "No explicit budget."
+    temperature: 0.3
+"#,
+    );
+
+    assert_eq!(manifest.default, Some("quick".to_string()));
+    assert_eq!(
+        manifest.models.len(),
+        3,
+        "custom manifest must not inherit the built-in `ninja`/`nerd` entries"
+    );
+
+    assert_eq!(
+        manifest.resolve_model("quick"),
+        ("vendor:quick".to_string(), Some(0.1), Some(8)),
+        "per-model `max_turns` must be returned to the dispatcher"
+    );
+    assert_eq!(
+        manifest.resolve_model("vendor:marathon"),
+        ("vendor:marathon".to_string(), Some(0.7), Some(500))
+    );
+    assert_eq!(
+        manifest.resolve_model("marathon").2,
+        Some(500),
+        "a large budget must not be clamped back to the built-in default"
+    );
+    assert_eq!(
+        manifest.resolve_model("unlimited").2,
+        None,
+        "a model without `max_turns` must leave the turn budget unset"
+    );
+
+    let zero = parse_manifest(
+        r#"
+models:
+  halt:
+    id: vendor:halt
+    max_turns: 0
+"#,
+    );
+    assert_eq!(
+        zero.resolve_model("halt"),
+        ("vendor:halt".to_string(), None, Some(0))
+    );
+}
+
+#[test]
+fn test_model_definition_max_turns_is_returned_by_resolve_model() {
+    let mut models = std::collections::HashMap::new();
+    models.insert(
+        "tight".to_string(),
+        definition("vendor:tight", Some("Tight budget."), Some(0.2), Some(3)),
+    );
+    models.insert(
+        "loose".to_string(),
+        definition("vendor:loose", None, Some(0.8), Some(1_000)),
+    );
+    models.insert(
+        "unset".to_string(),
+        definition("vendor:unset", None, None, None),
+    );
+    let manifest = ModelManifest {
+        default: Some("tight".to_string()),
+        models,
+    };
+
+    assert_eq!(
+        manifest.resolve_model("tight"),
+        ("vendor:tight".to_string(), Some(0.2), Some(3)),
+        "a model definition setting `max_turns` must yield that exact value"
+    );
+    assert_eq!(
+        manifest.resolve_model("loose"),
+        ("vendor:loose".to_string(), Some(0.8), Some(1_000))
+    );
+    assert_eq!(
+        manifest.resolve_model("unset").2,
+        None,
+        "omitting `max_turns` must stay `None` so the caller keeps control"
+    );
+
+    assert_eq!(
+        manifest.resolve_model("not-in-manifest"),
+        ("not-in-manifest".to_string(), None, None)
+    );
+}
+
+// -------------------------------------------------------------------------
 // 3. resolve_model
 // -------------------------------------------------------------------------
 
