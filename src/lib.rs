@@ -7,5 +7,6 @@ pub mod agent;
 pub mod config;
 pub mod manifest;
 pub mod mcp;
+pub mod monitor;
 pub mod pool;
 pub mod worktree;

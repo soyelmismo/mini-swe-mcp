@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
@@ -22,11 +22,13 @@ async fn main() -> Result<()> {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
                 println!("Usage: mini-swe-mcp [--stdio | [--json] <action> [args...]]");
                 println!("\nActions:");
-                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>]");
+                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]");
                 println!("  status <worker_id>");
                 println!("  collect <worker_id>");
                 println!("  steer <worker_id> <message>");
                 println!("  list");
+                println!("  monitor [--once]");
+                println!("  supervisor [--once]");
                 println!("  kill <worker_id>");
                 println!("  manifest");
                 println!("  prune");
@@ -35,6 +37,10 @@ async fn main() -> Result<()> {
                 println!("  -h, --help     Print help");
                 println!("  -V, --version  Print version");
                 return Ok(());
+            }
+            "monitor" | "supervisor" => {
+                let once = raw_args.iter().any(|arg| arg == "--once");
+                return mini_swe_mcp::monitor::run_monitor(once).await;
             }
             _ => {}
         }
@@ -128,9 +134,7 @@ where
     let api_base =
         env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
 
-    let api_key = env::var("OPENAI_API_KEY").context(
-        "Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.",
-    )?;
+    let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
 
     let manifest = ModelManifest::load();
 
@@ -146,7 +150,7 @@ where
         .and_then(|v| v.parse().ok())
         .unwrap_or(64); // Supports up to 64 concurrent subagents out of the box
 
-    let pool = WorkerPool::new(max_workers, api_base, api_key);
+    let pool = WorkerPool::new(max_workers, api_base, api_key.clone());
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
     if cli_args.len() > 1 && cli_args[1] != "--stdio" {
@@ -171,9 +175,12 @@ where
 
         match action.as_str() {
             "dispatch" => {
+                if api_key.is_empty() {
+                    anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
+                }
                 if cli_args.len() < 3 {
                     eprintln!(
-                        "Usage: mini-swe-mcp dispatch <task> [--model <model>] [--repo <repo>] [--wait]"
+                        "Usage: mini-swe-mcp dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]"
                     );
                     return Ok(());
                 }
@@ -216,6 +223,13 @@ where
                                 i += 1;
                             }
                         }
+                        "--group" | "-g" if i + 1 < cli_args.len() => {
+                            tool_args.insert(
+                                "group".into(),
+                                serde_json::Value::String(cli_args[i + 1].clone()),
+                            );
+                            i += 1;
+                        }
                         _ => {}
                     }
                     i += 1;
@@ -240,6 +254,10 @@ where
                         serde_json::Value::String(cli_args[3].clone()),
                     );
                 }
+            }
+            "monitor" | "supervisor" => {
+                let once = cli_args.iter().any(|arg| arg == "--once");
+                return mini_swe_mcp::monitor::run_monitor(once).await;
             }
             "manifest" | "list" => {}
             _ => {
@@ -321,6 +339,10 @@ where
         return Ok(());
     }
 
+    if api_key.is_empty() {
+        anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
+    }
+
     tokio::select! {
         res = server.run_stdio() => res,
         _ = tokio::signal::ctrl_c() => {
@@ -335,7 +357,7 @@ where
 }
 
 const AVAILABLE_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune",
+    "dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune", "monitor", "supervisor",
 ];
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -418,6 +440,7 @@ fn format_list(val: &serde_json::Value) -> String {
     for w in workers {
         let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
         let model = w.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let group = w.get("group").and_then(|v| v.as_str()).unwrap_or("default");
         let state_obj = w.get("state");
         let status = state_obj
             .and_then(|s| s.get("status"))
@@ -425,6 +448,12 @@ fn format_list(val: &serde_json::Value) -> String {
             .unwrap_or("Unknown");
 
         let mut details = Vec::new();
+        if group != "default" {
+            details.push(format!("group: {group}"));
+        }
+        if let Some(pid) = state_obj.and_then(|s| s.get("pid")).and_then(|v| v.as_u64()) {
+            details.push(format!("pid: {pid}"));
+        }
         if !model.is_empty() {
             details.push(format!("model: {model}"));
         }
@@ -432,6 +461,11 @@ fn format_list(val: &serde_json::Value) -> String {
             details.push(format!("turns: {turns}"));
         } else if let Some(step) = state_obj.and_then(|s| s.get("step")).and_then(|v| v.as_u64()) {
             details.push(format!("step: {step}"));
+        }
+        if let Some(op) = state_obj.and_then(|s| s.get("last_command")).and_then(|v| v.as_str())
+            && !op.is_empty() && op != "initializing"
+        {
+            details.push(format!("op: {op}"));
         }
         if let Some(err) = state_obj.and_then(|s| s.get("error")).and_then(|v| v.as_str()) {
             details.push(format!("error: {err}"));

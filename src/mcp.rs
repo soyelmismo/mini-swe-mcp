@@ -381,10 +381,21 @@ impl McpServer {
             .unwrap_or(100);
 
         let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        let group = args
+            .get("group")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let wid = self
             .pool
-            .dispatch(task, resolved_model, temperature, repo_path, max_turns)
+            .dispatch(
+                task,
+                resolved_model,
+                temperature,
+                repo_path,
+                max_turns,
+                group,
+            )
             .await?;
 
         Self::emit_progress(

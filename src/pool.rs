@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,6 +105,87 @@ pub struct CollectedWorker {
     pub logs: Vec<AgentStepLog>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRegistryEntry {
+    pub id: String,
+    pub pid: u32,
+    pub task: String,
+    pub model: String,
+    pub status: String,
+    pub step: usize,
+    pub max_turns: usize,
+    pub last_command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    pub started_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+pub fn extract_group(task: &str) -> Option<String> {
+    let trimmed = task.trim();
+    if trimmed.starts_with('[')
+        && let Some(end) = trimmed.find(']')
+    {
+        let tag = trimmed[1..end].trim();
+        if !tag.is_empty() {
+            return Some(tag.to_string());
+        }
+    }
+    None
+}
+
+pub struct WorkerLaunchConfig {
+    pub task: String,
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub repo_path: PathBuf,
+    pub max_turns: usize,
+    pub group: String,
+}
+
+pub fn registry_dir() -> PathBuf {
+    std::env::temp_dir().join("swe-registry")
+}
+
+pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
+    let dir = registry_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("{}.json", entry.id));
+    if let Ok(json) = serde_json::to_string(entry) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+pub fn remove_registry_entry(worker_id: &str) {
+    let path = registry_dir().join(format!("{worker_id}.json"));
+    let _ = std::fs::remove_file(path);
+}
+
+pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
+    let dir = registry_dir();
+    let mut entries = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(content) = std::fs::read_to_string(&p)
+                && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
+            {
+                if (item.status == "running" || item.status == "paused")
+                    && !crate::worktree::is_process_alive(item.pid)
+                {
+                    item.status = "stopped".to_string();
+                }
+                entries.push(item);
+            }
+        }
+    }
+    entries.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    entries
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
@@ -151,9 +233,13 @@ impl WorkerPool {
         temperature: Option<f32>,
         repo_path: PathBuf,
         max_turns: usize,
+        group: Option<String>,
     ) -> Result<String> {
         let worker_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let now = unix_timestamp();
+        let resolved_group = group
+            .or_else(|| extract_group(&task))
+            .unwrap_or_else(|| "default".to_string());
 
         let initial_record = WorkerRecord {
             id: worker_id.clone(),
@@ -170,6 +256,21 @@ impl WorkerPool {
             handle: None,
         };
 
+        save_registry_entry(&WorkerRegistryEntry {
+            id: worker_id.clone(),
+            pid: std::process::id(),
+            task: task.clone(),
+            model: model.clone(),
+            status: "running".into(),
+            step: 0,
+            max_turns,
+            last_command: "initializing".into(),
+            question: None,
+            started_at: now,
+            updated_at: now,
+            group: Some(resolved_group.clone()),
+        });
+
         self.workers
             .write()
             .await
@@ -177,17 +278,40 @@ impl WorkerPool {
 
         let pool = self.clone();
         let wid = worker_id.clone();
+        let task_clone = task.clone();
+        let model_clone = model.clone();
+        let group_clone = resolved_group.clone();
+
+        let config = WorkerLaunchConfig {
+            task,
+            model,
+            temperature,
+            repo_path,
+            max_turns,
+            group: resolved_group.clone(),
+        };
 
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = pool
-                .run_worker(wid.clone(), task, model, temperature, repo_path, max_turns)
-                .await
-            {
+            if let Err(e) = pool.run_worker(wid.clone(), config).await {
                 error!(worker = %wid, error = %e, "Worker failed with error");
                 let mut lock = pool.workers.write().await;
                 if let Some(w) = lock.get_mut(&wid) {
                     w.fail(e.to_string());
                 }
+                save_registry_entry(&WorkerRegistryEntry {
+                    id: wid.clone(),
+                    pid: std::process::id(),
+                    task: task_clone,
+                    model: model_clone,
+                    status: "failed".into(),
+                    step: 0,
+                    max_turns,
+                    last_command: format!("error: {e}"),
+                    question: None,
+                    started_at: now,
+                    updated_at: unix_timestamp(),
+                    group: Some(group_clone),
+                });
             }
         });
 
@@ -199,15 +323,16 @@ impl WorkerPool {
         Ok(worker_id)
     }
 
-    async fn run_worker(
-        &self,
-        worker_id: String,
-        task: String,
-        model: String,
-        temperature: Option<f32>,
-        repo_path: PathBuf,
-        max_turns: usize,
-    ) -> Result<()> {
+    async fn run_worker(&self, worker_id: String, config: WorkerLaunchConfig) -> Result<()> {
+        let WorkerLaunchConfig {
+            task,
+            model,
+            temperature,
+            repo_path,
+            max_turns,
+            group,
+        } = config;
+
         let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
         info!(worker = %worker_id, model = %model, "Starting worker execution");
 
@@ -215,7 +340,7 @@ impl WorkerPool {
         let runner = AgentRunner::new(
             self.api_base.clone(),
             self.api_key.clone(),
-            model,
+            model.clone(),
             temperature,
         );
 
@@ -228,6 +353,7 @@ impl WorkerPool {
         let mut current_max_turns = max_turns;
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
+        let started_at_ts = unix_timestamp();
 
         while step < current_max_turns {
             step += 1;
@@ -331,6 +457,21 @@ impl WorkerPool {
                 }
             }
 
+            save_registry_entry(&WorkerRegistryEntry {
+                id: worker_id.clone(),
+                pid: std::process::id(),
+                task: task.clone(),
+                model: model.clone(),
+                status: "running".into(),
+                step,
+                max_turns: current_max_turns,
+                last_command: cmd_summary.clone(),
+                question: None,
+                started_at: started_at_ts,
+                updated_at: unix_timestamp(),
+                group: Some(group.clone()),
+            });
+
             info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
 
             let (output, code) = {
@@ -386,6 +527,21 @@ impl WorkerPool {
                         w.resume_tx = Some(tx);
                     }
                 }
+
+                save_registry_entry(&WorkerRegistryEntry {
+                    id: worker_id.clone(),
+                    pid: std::process::id(),
+                    task: task.clone(),
+                    model: model.clone(),
+                    status: "paused".into(),
+                    step,
+                    max_turns: current_max_turns,
+                    last_command: cmd_summary.clone(),
+                    question: Some(question.clone()),
+                    started_at: started_at_ts,
+                    updated_at: now,
+                    group: Some(group.clone()),
+                });
 
                 if let Some(answer) = rx.recv().await {
                     info!(worker = %worker_id, "Worker resumed by orchestrator guidance");
@@ -503,6 +659,21 @@ impl WorkerPool {
             };
         }
 
+        save_registry_entry(&WorkerRegistryEntry {
+            id: worker_id.clone(),
+            pid: std::process::id(),
+            task: task.clone(),
+            model: model.clone(),
+            status: "completed".into(),
+            step,
+            max_turns: current_max_turns,
+            last_command: "completed".into(),
+            question: None,
+            started_at: started_at_ts,
+            updated_at: now,
+            group: Some(group.clone()),
+        });
+
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())
     }
@@ -516,18 +687,48 @@ impl WorkerPool {
     }
 
     pub async fn list_workers(&self) -> Vec<serde_json::Value> {
-        let lock = self.workers.read().await;
-        lock.values()
-            .map(|w| {
-                serde_json::json!({
-                    "id": w.id,
-                    "task": w.task,
-                    "model": w.model,
-                    "state": w.state.to_summary(),
-                    "total_steps": w.logs.len(),
+        let registry = load_all_registry_entries();
+        if !registry.is_empty() {
+            registry
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.id,
+                        "task": e.task,
+                        "model": e.model,
+                        "group": e.group.as_deref().unwrap_or("default"),
+                        "state": {
+                            "status": match e.status.as_str() {
+                                "running" => "Running",
+                                "completed" => "Completed",
+                                "paused" => "Paused",
+                                "failed" => "Failed",
+                                _ => "Stopped",
+                            },
+                            "step": e.step,
+                            "turns": e.step,
+                            "last_command": e.last_command,
+                            "pid": e.pid,
+                            "started_at": e.started_at,
+                        },
+                        "total_steps": e.step,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        } else {
+            let lock = self.workers.read().await;
+            lock.values()
+                .map(|w| {
+                    serde_json::json!({
+                        "id": w.id,
+                        "task": w.task,
+                        "model": w.model,
+                        "state": w.state.to_summary(),
+                        "total_steps": w.logs.len(),
+                    })
+                })
+                .collect()
+        }
     }
 
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
@@ -596,7 +797,7 @@ impl WorkerPool {
     }
 }
 
-fn unix_timestamp() -> u64 {
+pub fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
