@@ -80,10 +80,17 @@ fn test_cli_unknown_action() {
 #[test]
 fn test_cli_prune_action() {
     let exe = binary_path();
+    let temp = std::env::temp_dir().join(format!("test-prune-cli-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp);
+    let _ = Command::new("git").args(["init"]).current_dir(&temp).output();
+
     let output = Command::new(&exe)
+        .current_dir(&temp)
         .arg("prune")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+
+    let _ = std::fs::remove_dir_all(&temp);
 
     assert!(output.status.success(), "prune action failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
