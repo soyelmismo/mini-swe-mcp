@@ -8,6 +8,7 @@ pub struct WorktreeGuard {
     pub branch: String,
     pub repo_root: PathBuf,
     pub keep: bool,
+    pub preserve_branch: bool,
 }
 
 fn git(dir: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -63,6 +64,7 @@ impl WorktreeGuard {
             branch,
             repo_root: repo_root.to_path_buf(),
             keep: false,
+            preserve_branch: false,
         })
     }
 
@@ -74,6 +76,87 @@ impl WorktreeGuard {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+
+    /// Sync report and audit directories (audits, reports, .agents, artifacts)
+    /// from the worktree back into the repository root.
+    pub fn sync_artifacts(&self) -> Result<Vec<String>> {
+        const ARTIFACT_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
+        let mut synced = Vec::new();
+
+        for dir in ARTIFACT_DIRS {
+            let src_dir = self.path.join(dir);
+            if src_dir.is_dir() {
+                let dest_dir = self.repo_root.join(dir);
+                let _ = copy_dir_all(&src_dir, &dest_dir, &mut synced, &self.path);
+            }
+        }
+
+        Ok(synced)
+    }
+
+    /// Commit all dirty changes in the worktree to preserve work in git history,
+    /// marking the branch to be retained upon worktree cleanup.
+    pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
+        // Stage all changes (both tracked and untracked)
+        let _ = git(&self.path, "add", &["add", "-A"]);
+
+        // Check if there are changes to commit
+        let status = git(&self.path, "status", &["status", "--porcelain"])?;
+        if status.stdout.is_empty() {
+            return Ok(None);
+        }
+
+        // Commit with fallback credentials so lack of git config never errors
+        let _ = git(
+            &self.path,
+            "commit",
+            &[
+                "-c",
+                "user.name=mini-swe",
+                "-c",
+                "user.email=mini-swe@localhost",
+                "commit",
+                "-m",
+                message,
+            ],
+        )?;
+
+        self.preserve_branch = true;
+        Ok(Some(self.branch.clone()))
+    }
+}
+
+fn copy_dir_all(
+    src: &Path,
+    dst: &Path,
+    collected: &mut Vec<String>,
+    worktree_root: &Path,
+) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_all(&src_path, &dst_path, collected, worktree_root)?;
+        } else if ft.is_file() {
+            std::fs::copy(&src_path, &dst_path)?;
+            if let Ok(rel) = src_path.strip_prefix(worktree_root) {
+                let rel_str = rel.to_string_lossy().to_string();
+                if !collected.contains(&rel_str) {
+                    collected.push(rel_str);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn is_process_alive(pid: u32) -> bool {
@@ -153,14 +236,26 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         }
     }
 
-    // 2. Prune orphaned worker-* branches that have no registered worktrees
+    // 2. Prune orphaned worker-* branches that have no registered worktrees AND are merged into HEAD
     if let Ok(output) = git(repo_root, "branch --list", &["branch", "--list", "worker-*"]) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             let branch = line.trim().trim_start_matches('*').trim_start_matches('+').trim();
             if branch.starts_with("worker-") && !active_branches.iter().any(|b| b == branch) {
-                info!(branch = %branch, "Pruning orphaned worker branch");
-                let _ = git(repo_root, "branch -D", &["branch", "-D", branch]);
+                let is_merged = git(
+                    repo_root,
+                    "merge-base",
+                    &["merge-base", "--is-ancestor", branch, "HEAD"],
+                )
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+                if is_merged {
+                    info!(branch = %branch, "Pruning merged or empty worker branch");
+                    let _ = git(repo_root, "branch -D", &["branch", "-D", branch]);
+                } else {
+                    info!(branch = %branch, "Preserving unmerged worker branch with commits");
+                }
             }
         }
     }
@@ -211,6 +306,9 @@ impl Drop for WorktreeGuard {
             return;
         }
 
+        // Sync report/audit artifacts to repo root before cleanup
+        let _ = self.sync_artifacts();
+
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
         let path_str = self.path.to_string_lossy();
@@ -224,11 +322,15 @@ impl Drop for WorktreeGuard {
             "worktree prune",
             &["worktree", "prune"],
         );
-        let _ = git(
-            &self.repo_root,
-            "branch -D",
-            &["branch", "-D", &self.branch],
-        );
+        if self.preserve_branch {
+            info!(branch = %self.branch, "Preserving worker branch with committed changes");
+        } else {
+            let _ = git(
+                &self.repo_root,
+                "branch -D",
+                &["branch", "-D", &self.branch],
+            );
+        }
 
         if self.path.exists()
             && let Err(e) = std::fs::remove_dir_all(&self.path)

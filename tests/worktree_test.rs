@@ -246,3 +246,70 @@ fn test_worktree_cleanup_on_drop_with_uncommitted_files() {
         "branch {branch} still exists after dropping the guard"
     );
 }
+
+#[test]
+fn test_sync_artifacts_preserves_reports_to_repo_root() {
+    let repo = repo_root();
+    let id = unique_worker_id("artifacts");
+    let guard = WorktreeGuard::new(&repo, &id).expect("worktree creation failed");
+
+    let audit_dir = guard.path.join("audits");
+    std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
+    let audit_file = audit_dir.join(format!("audit_{id}.md"));
+    std::fs::write(&audit_file, "# Subagent Audit Report\nAll clear.").expect("failed to write audit file");
+
+    let synced = guard.sync_artifacts().expect("sync_artifacts failed");
+    let expected_rel = format!("audits/audit_{id}.md");
+    assert!(
+        synced.contains(&expected_rel),
+        "expected synced to contain {expected_rel}, got: {synced:?}"
+    );
+
+    let destination = repo.join(&expected_rel);
+    assert!(destination.exists(), "artifact was not copied to repo root: {destination:?}");
+    let content = std::fs::read_to_string(&destination).expect("failed to read copied artifact");
+    assert!(content.contains("# Subagent Audit Report"));
+
+    drop(guard);
+
+    // Cleanup artifact in repo
+    let _ = std::fs::remove_file(&destination);
+    let _ = std::fs::remove_dir(repo.join("audits"));
+}
+
+#[test]
+fn test_commit_changes_preserves_branch_on_drop() {
+    let repo = repo_root();
+    let id = unique_worker_id("commit");
+    let branch = format!("worker-{id}");
+
+    {
+        let mut guard = WorktreeGuard::new(&repo, &id).expect("worktree creation failed");
+        let new_file = guard.path.join("preserved_feature.txt");
+        std::fs::write(&new_file, "Preserved code from subagent\n").expect("write file");
+
+        let committed_branch = guard
+            .commit_changes("worker(test): preserve this work")
+            .expect("commit failed");
+        assert_eq!(committed_branch, Some(branch.clone()));
+        assert!(guard.preserve_branch);
+        // Guard drops here
+    }
+
+    // Worktree directory and registration are gone
+    let path = std::env::temp_dir().join(format!("swe-wt-{id}"));
+    assert!(!path.exists(), "worktree dir should be cleaned up");
+    assert!(!worktree_is_registered(&repo, &path));
+
+    // But the git branch is PRESERVED
+    assert!(branch_exists(&repo, &branch), "worker branch should be preserved");
+
+    let log = run(&repo, &["log", "-1", "--pretty=%s", &branch]);
+    assert!(
+        log.contains("worker(test): preserve this work"),
+        "commit message not found in preserved branch: {log}"
+    );
+
+    // Clean up test branch
+    run(&repo, &["branch", "-D", &branch]);
+}

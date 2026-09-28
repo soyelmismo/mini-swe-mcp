@@ -22,6 +22,10 @@ WORKFLOW:
    - For audit/analysis tasks: print your concise findings report to stdout and in the same or next turn execute:
      echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
 
+REPORTS & ARTIFACTS:
+- If you generate reports, audits, benchmarks, or handoffs, save them under `audits/`, `reports/`, or `.agents/` (e.g. `audits/audit_01_feature.md` or `.agents/handoff.md`).
+- Files created in these directories are automatically preserved and synchronized back to the main repository when your task completes.
+
 COMMUNICATION WITH ORCHESTRATOR:
 - Need more turns: If you are close to finishing verification/refactoring and need more steps, execute:
   echo "REQUEST_TURNS: <number>"

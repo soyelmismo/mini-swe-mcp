@@ -545,6 +545,15 @@ fn format_dispatch(val: &serde_json::Value) -> String {
                 if let Some(summary) = details.and_then(|d| d.get("summary")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Summary: {summary}\n"));
                 }
+                if let Some(branch) = details.and_then(|d| d.get("branch")).and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Branch: {branch}\n"));
+                }
+                if let Some(artifacts) = details.and_then(|d| d.get("artifacts")).and_then(|v| v.as_array())
+                    && !artifacts.is_empty()
+                {
+                    let list: Vec<&str> = artifacts.iter().filter_map(|a| a.as_str()).collect();
+                    out.push_str(&format!("Preserved Artifacts: {}\n", list.join(", ")));
+                }
                 if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(|v| v.as_str())
                     && !diff.trim().is_empty()
                 {

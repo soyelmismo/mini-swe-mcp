@@ -28,6 +28,10 @@ pub enum WorkerState {
         diff: String,
         summary: String,
         completed_at: u64,
+        #[serde(default)]
+        artifacts: Vec<String>,
+        #[serde(default)]
+        branch: Option<String>,
     },
     Failed {
         error: String,
@@ -51,11 +55,13 @@ impl WorkerState {
                 "question": question,
                 "paused_at": paused_at,
             }),
-            WorkerState::Completed { turns, summary, completed_at, .. } => serde_json::json!({
+            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, .. } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
                 "completed_at": completed_at,
+                "artifacts": artifacts,
+                "branch": branch,
             }),
             WorkerState::Failed { error, step, failed_at } => serde_json::json!({
                 "status": "Failed",
@@ -193,7 +199,7 @@ impl WorkerPool {
         let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
         info!(worker = %worker_id, model = %model, "Starting worker execution");
 
-        let worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
+        let mut worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
         let runner = AgentRunner::new(
             self.api_base.clone(),
             self.api_key.clone(),
@@ -428,6 +434,15 @@ impl WorkerPool {
             }
         }
 
+        let artifacts = worktree.sync_artifacts().unwrap_or_default();
+        if !artifacts.is_empty() {
+            info!(
+                worker = %worker_id,
+                count = artifacts.len(),
+                "Synchronized worker artifacts to repo root"
+            );
+        }
+
         let diff = worktree.get_diff()?;
         let now = unix_timestamp();
 
@@ -439,6 +454,17 @@ impl WorkerPool {
             format!("Finished after {} turns. Completed successfully.", step)
         };
 
+        let branch = if !diff.trim().is_empty() {
+            let commit_msg = format!(
+                "worker({}): {}",
+                worker_id,
+                summary.lines().next().unwrap_or("")
+            );
+            worktree.commit_changes(&commit_msg).unwrap_or(None)
+        } else {
+            None
+        };
+
         let mut lock = self.workers.write().await;
         if let Some(w) = lock.get_mut(&worker_id) {
             w.state = WorkerState::Completed {
@@ -446,6 +472,8 @@ impl WorkerPool {
                 diff,
                 summary,
                 completed_at: now,
+                artifacts,
+                branch,
             };
         }
 
