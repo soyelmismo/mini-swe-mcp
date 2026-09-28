@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
                 println!("Usage: mini-swe-mcp [--stdio | [--json] <action> [args...]]");
                 println!("\nActions:");
-                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait]");
+                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>]");
                 println!("  status <worker_id>");
                 println!("  collect <worker_id>");
                 println!("  steer <worker_id> <message>");
@@ -204,6 +204,17 @@ where
                         }
                         "--wait" | "-w" => {
                             tool_args.insert("wait".into(), serde_json::Value::Bool(true));
+                        }
+                        "--max-turns" | "-t" => {
+                            if i + 1 < cli_args.len() {
+                                if let Ok(turns) = cli_args[i + 1].parse::<u64>() {
+                                    tool_args.insert(
+                                        "max_turns".into(),
+                                        serde_json::Value::Number(turns.into()),
+                                    );
+                                }
+                                i += 1;
+                            }
                         }
                         _ => {}
                     }
