@@ -213,9 +213,6 @@ impl Drop for WorktreeGuard {
 
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        let pid_file = format!("{}.pid", self.path.to_string_lossy());
-        let _ = std::fs::remove_file(&pid_file);
-
         let path_str = self.path.to_string_lossy();
         let _ = git(
             &self.repo_root,
@@ -238,5 +235,8 @@ impl Drop for WorktreeGuard {
         {
             error!(error = %e, path = %self.path.display(), "Failed to delete leftover worktree directory");
         }
+
+        let pid_file = format!("{}.pid", self.path.to_string_lossy());
+        let _ = std::fs::remove_file(&pid_file);
     }
 }
