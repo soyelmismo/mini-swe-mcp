@@ -199,29 +199,26 @@ impl WorkerPool {
             }
 
             // 1. Run LLM step with silent retry for empty / no-command responses
-            let mut llm_reply = runner.run_step_llm(&messages).await?;
-            let mut command = runner.extract_command(&llm_reply);
+            let mut llm_resp = runner.run_step_llm(&messages).await?;
 
-            if command.is_none() {
+            if llm_resp.command.is_none() {
                 info!(
                     worker = %worker_id,
-                    "No bash block found or empty reply; discarding and silently retrying once without warning"
+                    "No command found (tool_calls or code block); discarding and silently retrying once without warning"
                 );
-                let retry_reply = runner.run_step_llm(&messages).await?;
-                let retry_cmd = runner.extract_command(&retry_reply);
-                if retry_cmd.is_some() {
-                    llm_reply = retry_reply;
-                    command = retry_cmd;
+                let retry_resp = runner.run_step_llm(&messages).await?;
+                if retry_resp.command.is_some() {
+                    llm_resp = retry_resp;
                 }
             }
 
-            let (cmd_str, is_finish) = match command {
+            let (cmd_str, is_finish) = match llm_resp.command {
                 Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
                     (cmd.clone(), true)
                 }
-                Some(cmd) => (cmd, false),
+                Some(ref cmd) => (cmd.clone(), false),
                 None => (
-                    "echo 'ERROR: No bash block found in previous response. You MUST output a ```bash block.'".into(),
+                    "echo 'ERROR: No bash command found. Use the bash tool or a ```bash block.'".into(),
                     false,
                 ),
             };
@@ -331,10 +328,10 @@ impl WorkerPool {
                 }
             }
 
-            let assistant_content = if llm_reply.trim().is_empty() {
+            let assistant_content = if llm_resp.content.trim().is_empty() {
                 "I will execute a bash command.".to_string()
             } else {
-                llm_reply
+                llm_resp.content
             };
 
             messages.push(ChatMessage {

@@ -11,11 +11,9 @@ You are given a task to complete within a git repository.
 WORKFLOW:
 1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
-3. Every response MUST contain your short reasoning followed by EXACTLY ONE bash command in a ```bash ... ``` block.
+3. Every response MUST execute EXACTLY ONE command using the `bash` tool. If the bash tool is unavailable, use a ```bash ... ``` code block instead.
 4. When finished and verified, complete your work by executing:
-```bash
-echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-```
+   echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
 
 COMMUNICATION WITH ORCHESTRATOR:
 - Need more turns: If you are close to finishing verification/refactoring and need more steps, execute:
@@ -31,11 +29,25 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Serialize)]
+struct ToolFunction {
+    name: &'static str,
+    description: &'static str,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolDefinition {
+    r#type: &'static str,
+    function: ToolFunction,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    tools: &'a [ToolDefinition],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +63,24 @@ struct ChatChoice {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatMessageOutput {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolCallOutput {
+    function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BashArgs {
+    command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +89,13 @@ pub struct AgentStepLog {
     pub command: String,
     pub output: String,
     pub exit_code: Option<i32>,
+}
+
+pub struct LlmResponse {
+    /// Full text content from the assistant (may be empty if model only used tool_calls)
+    pub content: String,
+    /// Extracted bash command — from tool_calls first, regex fallback second
+    pub command: Option<String>,
 }
 
 pub struct AgentRunner {
@@ -101,7 +138,7 @@ impl AgentRunner {
             .map(|m| m.as_str().trim().to_string())
     }
 
-    pub async fn run_step_llm(&self, messages: &[ChatMessage]) -> Result<String> {
+    pub async fn run_step_llm(&self, messages: &[ChatMessage]) -> Result<LlmResponse> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
 
         // Handle models that reject temperature parameter (e.g. kimi-k3)
@@ -111,10 +148,29 @@ impl AgentRunner {
             self.temperature.or(Some(0.2))
         };
 
+        let bash_tool = ToolDefinition {
+            r#type: "function",
+            function: ToolFunction {
+                name: "bash",
+                description: "Execute a bash command in the repository working directory",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The bash command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+        };
+
         let payload = ChatCompletionRequest {
             model: &self.model,
             messages,
             temperature,
+            tools: &[bash_tool],
         };
 
         let mut attempts = 0;
@@ -149,13 +205,21 @@ impl AgentRunner {
             .await
             .context("Failed to parse LLM JSON response")?;
 
-        let content = result
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
+        let choice = result.choices.first().context("Empty choices in LLM response")?;
+        let content = choice.message.content.clone().unwrap_or_default();
 
-        Ok(content)
+        // Priority 1: extract command from tool_calls (OpenAI function calling)
+        let command = choice
+            .message
+            .tool_calls
+            .iter()
+            .find(|tc| tc.function.name == "bash")
+            .and_then(|tc| serde_json::from_str::<BashArgs>(&tc.function.arguments).ok())
+            .map(|args| args.command)
+            // Priority 2: fallback to regex extraction from content (code block models)
+            .or_else(|| self.extract_command(&content));
+
+        Ok(LlmResponse { content, command })
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
