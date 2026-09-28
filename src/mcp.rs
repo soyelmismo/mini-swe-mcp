@@ -98,104 +98,50 @@ impl McpServer {
                 result: Some(json!({
                     "tools": [
                         {
-                            "name": "dispatch_worker",
-                            "description": "Spawn an autonomous SWE mini-agent in an isolated Git worktree to solve a coding task.",
+                            "name": "worker",
+                            "description": "Manage autonomous SWE mini-agents. Dispatches subagents in isolated Git worktrees, checks progress, injects steering instructions, retrieves git diffs, or inspects models.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["dispatch", "status", "steer", "collect", "list", "kill", "manifest"],
+                                        "description": "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'list' (list all workers), 'kill' (terminate worker), 'manifest' (models catalog)"
+                                    },
                                     "task": {
                                         "type": "string",
-                                        "description": "Detailed task description, bug to fix, or feature to implement"
+                                        "description": "Task description or bug to fix. Required for 'dispatch'."
+                                    },
+                                    "repo_path": {
+                                        "type": "string",
+                                        "description": "Absolute path to repository root. Required for 'dispatch'."
                                     },
                                     "model": {
                                         "type": "string",
                                         "description": self.manifest.build_tool_description()
                                     },
-                                    "repo_path": {
-                                        "type": "string",
-                                        "description": "Absolute path to repository root"
-                                    },
-                                    "max_turns": {
-                                        "type": "integer",
-                                        "description": "Maximum bash exploration turns (overrides manifest default)"
-                                    },
-                                    "temperature": {
-                                        "type": "number",
-                                        "description": "Model sampling temperature (overrides manifest default)"
-                                    },
-                                    "wait": {
-                                        "type": "boolean",
-                                        "description": "If true, blocks until the worker finishes and returns final diff immediately"
-                                    }
-                                },
-                                "required": ["task", "repo_path"]
-                            }
-                        },
-                        {
-                            "name": "get_model_manifest",
-                            "description": "Get the declarative catalog of available models, their specialized roles, and guidelines on when to use each.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {}
-                            }
-                        },
-                        {
-                            "name": "worker_status",
-                            "description": "Check current step, last executed bash command, and status of a worker.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "worker_id": { "type": "string" }
-                                },
-                                "required": ["worker_id"]
-                            }
-                        },
-                        {
-                            "name": "collect_result",
-                            "description": "Retrieve the final result, git diff patch, and command logs from a completed worker.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "worker_id": { "type": "string" }
-                                },
-                                "required": ["worker_id"]
-                            }
-                        },
-                        {
-                            "name": "list_workers",
-                            "description": "List all active, completed, or failed workers in the pool.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {}
-                            }
-                        },
-                        {
-                            "name": "kill_worker",
-                            "description": "Terminate a running worker subagent and clean up its git worktree.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "worker_id": { "type": "string" }
-                                },
-                                "required": ["worker_id"]
-                            }
-                        },
-                        {
-                            "name": "steer_worker",
-                            "description": "Inject a steering instruction, correction, or follow-up guidance into a running worker. It will be injected directly into the subagent's prompt on its next turn.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
                                     "worker_id": {
                                         "type": "string",
-                                        "description": "ID of the running worker"
+                                        "description": "Target worker ID. Required for 'status', 'steer', 'collect', and 'kill'."
                                     },
                                     "message": {
                                         "type": "string",
-                                        "description": "Steering prompt or follow-up guidance for the subagent"
+                                        "description": "Steering guidance or follow-up instruction. Required for 'steer'."
+                                    },
+                                    "wait": {
+                                        "type": "boolean",
+                                        "description": "If true, blocks until worker completes and returns final diff immediately. Optional for 'dispatch' (default: false)."
+                                    },
+                                    "max_turns": {
+                                        "type": "integer",
+                                        "description": "Maximum bash exploration turns (overrides manifest default)."
+                                    },
+                                    "temperature": {
+                                        "type": "number",
+                                        "description": "Model sampling temperature (overrides manifest default)."
                                     }
                                 },
-                                "required": ["worker_id", "message"]
+                                "required": ["action"]
                             }
                         }
                     ]
@@ -247,16 +193,36 @@ impl McpServer {
     }
 
     async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
-        match name {
-            "get_model_manifest" => {
+        let action = if name == "worker" {
+            args.get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        } else {
+            match name {
+                "dispatch_worker" => "dispatch",
+                "worker_status" => "status",
+                "steer_worker" => "steer",
+                "collect_result" => "collect",
+                "list_workers" => "list",
+                "kill_worker" => "kill",
+                "get_model_manifest" => "manifest",
+                _ => name,
+            }
+        };
+
+        match action {
+            "manifest" => {
                 Ok(json!({
                     "default_model": self.manifest.default,
                     "models": self.manifest.models,
                 }))
             }
 
-            "dispatch_worker" => {
+            "dispatch" => {
                 let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if task.is_empty() {
+                    anyhow::bail!("'task' is required for action 'dispatch'");
+                }
                 let repo_path = PathBuf::from(
                     args.get("repo_path")
                         .and_then(|v| v.as_str())
@@ -314,8 +280,11 @@ impl McpServer {
                 }
             }
 
-            "worker_status" => {
+            "status" => {
                 let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+                if wid.is_empty() {
+                    anyhow::bail!("'worker_id' is required for action 'status'");
+                }
                 if let Some(state) = self.pool.get_worker_state(wid).await {
                     Ok(json!({
                         "worker_id": wid,
@@ -326,8 +295,11 @@ impl McpServer {
                 }
             }
 
-            "collect_result" => {
+            "collect" => {
                 let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+                if wid.is_empty() {
+                    anyhow::bail!("'worker_id' is required for action 'collect'");
+                }
                 if let Some(state) = self.pool.get_worker_state(wid).await {
                     let logs = self.pool.get_worker_logs(wid).await.unwrap_or_default();
                     Ok(json!({
@@ -340,24 +312,33 @@ impl McpServer {
                 }
             }
 
-            "list_workers" => {
+            "list" => {
                 let workers = self.pool.list_workers().await;
                 Ok(json!({ "workers": workers }))
             }
 
-            "kill_worker" => {
+            "kill" => {
                 let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+                if wid.is_empty() {
+                    anyhow::bail!("'worker_id' is required for action 'kill'");
+                }
                 let killed = self.pool.kill(wid).await;
                 Ok(json!({ "worker_id": wid, "killed": killed }))
             }
 
-            "steer_worker" => {
+            "steer" => {
                 let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+                if wid.is_empty() {
+                    anyhow::bail!("'worker_id' is required for action 'steer'");
+                }
                 let message = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if message.is_empty() {
+                    anyhow::bail!("'message' is required for action 'steer'");
+                }
                 self.pool.steer(wid, message).await?;
                 Ok(json!({
                     "worker_id": wid,
@@ -366,7 +347,7 @@ impl McpServer {
                 }))
             }
 
-            _ => anyhow::bail!("Unknown tool: {}", name),
+            _ => anyhow::bail!("Unknown action or tool: {}", action),
         }
     }
 }
