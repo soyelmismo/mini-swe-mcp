@@ -23,10 +23,12 @@ impl WorktreeGuard {
         let branch = format!("worker-{}", worker_id);
         let path = std::env::temp_dir().join(format!("swe-wt-{}", worker_id));
 
-        // Ensure target directory doesn't exist
+        // Ensure target directory and branch don't exist
         if path.exists() {
             let _ = std::fs::remove_dir_all(&path);
         }
+        let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
+        let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
 
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
 
@@ -70,6 +72,56 @@ impl WorktreeGuard {
     }
 }
 
+pub fn prune_stale_worktrees(repo_root: &Path) {
+    let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
+
+    if let Ok(output) = git(repo_root, "worktree list", &["worktree", "list", "--porcelain"]) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_wt: Option<String> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in stdout.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current_wt = Some(path.to_string());
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                current_branch = Some(branch.to_string());
+            } else if line.is_empty()
+                && let (Some(wt), Some(br)) = (current_wt.take(), current_branch.take())
+                && br.starts_with("worker-")
+                && wt.contains("swe-wt-")
+            {
+                info!(path = %wt, branch = %br, "Pruning zombie subagent worktree");
+                let _ = git(repo_root, "worktree remove", &["worktree", "remove", "--force", &wt]);
+                let _ = git(repo_root, "branch -D", &["branch", "-D", &br]);
+                if Path::new(&wt).exists() {
+                    let _ = std::fs::remove_dir_all(&wt);
+                }
+            }
+        }
+        if let (Some(wt), Some(br)) = (current_wt, current_branch)
+            && br.starts_with("worker-")
+            && wt.contains("swe-wt-")
+        {
+            info!(path = %wt, branch = %br, "Pruning zombie subagent worktree");
+            let _ = git(repo_root, "worktree remove", &["worktree", "remove", "--force", &wt]);
+            let _ = git(repo_root, "branch -D", &["branch", "-D", &br]);
+            if Path::new(&wt).exists() {
+                let _ = std::fs::remove_dir_all(&wt);
+            }
+        }
+    }
+
+    if let Ok(output) = git(repo_root, "branch --list", &["branch", "--list", "worker-*"]) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let branch = line.trim().trim_start_matches('*').trim_start_matches('+').trim();
+            if branch.starts_with("worker-") {
+                let _ = git(repo_root, "branch -D", &["branch", "-D", branch]);
+            }
+        }
+    }
+}
+
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         if self.keep {
@@ -89,6 +141,11 @@ impl Drop for WorktreeGuard {
             &self.repo_root,
             "branch -D",
             &["branch", "-D", &self.branch],
+        );
+        let _ = git(
+            &self.repo_root,
+            "worktree prune",
+            &["worktree", "prune"],
         );
 
         if self.path.exists()

@@ -135,3 +135,136 @@ impl ModelManifest {
         desc
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelDefinition, ModelManifest};
+
+    #[test]
+    fn test_default_manifest() {
+        let manifest = ModelManifest::default();
+
+        assert_eq!(manifest.default, Some("ninja".to_string()));
+
+        let ninja = manifest
+            .models
+            .get("ninja")
+            .expect("default manifest must contain the `ninja` model");
+        assert_eq!(ninja.id, "combo:ninja");
+        assert!(ninja.role.as_deref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(ninja.temperature, Some(0.2));
+        assert_eq!(ninja.max_turns, Some(50));
+
+        let nerd = manifest
+            .models
+            .get("nerd")
+            .expect("default manifest must contain the `nerd` model");
+        assert_eq!(nerd.id, "combo:nerd");
+        assert!(nerd.role.as_deref().is_some_and(|r| !r.is_empty()));
+        assert_eq!(nerd.temperature, Some(0.6));
+        assert_eq!(nerd.max_turns, Some(100));
+
+        assert_eq!(manifest.models.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_model() {
+        let manifest = ModelManifest::default();
+
+        // Resolution by alias name
+        assert_eq!(
+            manifest.resolve_model("ninja"),
+            ("combo:ninja".to_string(), Some(0.2), Some(50))
+        );
+        assert_eq!(
+            manifest.resolve_model("nerd"),
+            ("combo:nerd".to_string(), Some(0.6), Some(100))
+        );
+
+        // Resolution by full model id
+        assert_eq!(
+            manifest.resolve_model("combo:nerd"),
+            ("combo:nerd".to_string(), Some(0.6), Some(100))
+        );
+
+        // Fallback: unknown models are passed through untouched
+        assert_eq!(
+            manifest.resolve_model("some/unknown-model"),
+            ("some/unknown-model".to_string(), None, None)
+        );
+
+        // Empty request
+        assert_eq!(manifest.resolve_model(""), (String::new(), None, None));
+
+        // Model without overrides
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            "plain".to_string(),
+            ModelDefinition {
+                id: "vendor:plain".to_string(),
+                role: None,
+                temperature: None,
+                max_turns: None,
+            },
+        );
+        let sparse = ModelManifest {
+            default: None,
+            models,
+        };
+        assert_eq!(
+            sparse.resolve_model("plain"),
+            ("vendor:plain".to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn test_tool_description() {
+        let manifest = ModelManifest::default();
+        let desc = manifest.build_tool_description();
+
+        let mut lines = desc.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Available model aliases and their roles:")
+        );
+
+        let body: Vec<&str> = lines.collect();
+        assert_eq!(body.len(), 2);
+
+        let find = |alias: &str| {
+            body.iter()
+                .find(|line| line.starts_with(&format!("- `{alias}`")))
+                .unwrap_or_else(|| panic!("missing bullet for alias `{alias}`"))
+        };
+
+        let ninja = find("ninja");
+        assert!(ninja.contains("combo:ninja"));
+
+        let nerd = find("nerd");
+        assert!(nerd.contains("combo:nerd"));
+    }
+
+    #[test]
+    fn test_tool_description_role_fallback() {
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            "bare".to_string(),
+            ModelDefinition {
+                id: "vendor:bare".to_string(),
+                role: None,
+                temperature: Some(0.9),
+                max_turns: Some(7),
+            },
+        );
+        let manifest = ModelManifest {
+            default: None,
+            models,
+        };
+
+        assert_eq!(
+            manifest.build_tool_description(),
+            "Available model aliases and their roles:\n\
+             - `bare` (id: `vendor:bare`): Autonomous subagent\n"
+        );
+    }
+}

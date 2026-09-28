@@ -70,6 +70,9 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64); // Supports up to 64 concurrent subagents out of the box
 
+    // Automatically prune any stale worktrees or branches leftover from forcefully killed processes
+    worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
+
     let pool = WorkerPool::new(max_workers, api_base, api_key);
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
