@@ -9,18 +9,18 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli_args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
 
     // Early CLI flag handling without requiring API keys
-    if cli_args.len() > 1 {
-        match cli_args[1].as_str() {
+    if raw_args.len() > 1 {
+        match raw_args[1].as_str() {
             "--version" | "-V" => {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--help" | "-h" => {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
-                println!("Usage: mini-swe-mcp [--stdio | <action> [args...]]");
+                println!("Usage: mini-swe-mcp [--stdio | [--json] <action> [args...]]");
                 println!("\nActions:");
                 println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait]");
                 println!("  status <worker_id>");
@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
                 println!("  manifest");
                 println!("  prune");
                 println!("\nFlags:");
+                println!("      --json     Output in JSON format (default is formatted plain text)");
                 println!("  -h, --help     Print help");
                 println!("  -V, --version  Print version");
                 return Ok(());
@@ -38,6 +39,9 @@ async fn main() -> Result<()> {
             _ => {}
         }
     }
+
+    let json_output = raw_args.iter().any(|arg| arg == "--json");
+    let cli_args: Vec<String> = raw_args.into_iter().filter(|arg| arg != "--json").collect();
 
 struct ShortFormatter;
 
@@ -141,13 +145,15 @@ where
 
         if action == "prune" {
             worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "ok",
-                    "message": "Stale worktrees and orphaned worker branches pruned"
-                }))?
-            );
+            let res = serde_json::json!({
+                "status": "ok",
+                "message": "Stale worktrees and orphaned worker branches pruned"
+            });
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!("{}", format_prune(&res));
+            }
             return Ok(());
         }
 
@@ -287,7 +293,11 @@ where
             }
         }
 
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("{}", format_output(action, &result));
+        }
         return Ok(());
     }
 
@@ -340,4 +350,207 @@ fn suggest_action<'a>(unknown: &str, candidates: &[&'a str]) -> Option<&'a str> 
         .filter(|&(_, dist)| dist <= 2)
         .min_by_key(|&(_, dist)| dist)
         .map(|(c, _)| c)
+}
+
+fn format_manifest(val: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(default_model) = val.get("default_model").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Default model: {default_model}\n\n"));
+    }
+    out.push_str("Models:\n");
+    if let Some(models) = val.get("models").and_then(|v| v.as_object()) {
+        let mut entries: Vec<(&String, &serde_json::Value)> = models.iter().collect();
+        entries.sort_by_key(|(k, _)| (*k).clone());
+
+        for (name, def) in entries {
+            let id = def.get("id").and_then(|v| v.as_str()).unwrap_or(name);
+            let mut meta = Vec::new();
+            meta.push(format!("id: {id}"));
+            if let Some(temp) = def.get("temperature").and_then(|v| v.as_f64()) {
+                let temp_str = format!("{temp:.2}");
+                let temp_clean = temp_str.trim_end_matches('0').trim_end_matches('.');
+                meta.push(format!("temp: {temp_clean}"));
+            }
+            if let Some(turns) = def.get("max_turns").and_then(|v| v.as_u64()) {
+                meta.push(format!("max turns: {turns}"));
+            }
+            out.push_str(&format!("  - {} ({})\n", name, meta.join(", ")));
+            if let Some(role) = def.get("role").and_then(|v| v.as_str()) {
+                out.push_str(&format!("    Role: {role}\n"));
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn format_list(val: &serde_json::Value) -> String {
+    let empty_vec = Vec::new();
+    let workers = val
+        .get("workers")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty_vec);
+
+    if workers.is_empty() {
+        return "No active or recent workers found.".to_string();
+    }
+
+    let mut out = format!("Workers ({}):\n", workers.len());
+    for w in workers {
+        let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let model = w.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let state_obj = w.get("state");
+        let status = state_obj
+            .and_then(|s| s.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+
+        let mut details = Vec::new();
+        if !model.is_empty() {
+            details.push(format!("model: {model}"));
+        }
+        if let Some(turns) = state_obj.and_then(|s| s.get("turns")).and_then(|v| v.as_u64()) {
+            details.push(format!("turns: {turns}"));
+        } else if let Some(step) = state_obj.and_then(|s| s.get("step")).and_then(|v| v.as_u64()) {
+            details.push(format!("step: {step}"));
+        }
+        if let Some(err) = state_obj.and_then(|s| s.get("error")).and_then(|v| v.as_str()) {
+            details.push(format!("error: {err}"));
+        }
+
+        let detail_str = if details.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", details.join(", "))
+        };
+
+        out.push_str(&format!("  - {id} [{status}]{detail_str}\n"));
+        if let Some(task) = w.get("task").and_then(|v| v.as_str()) {
+            let task_preview = if task.len() > 60 {
+                let cut = task.floor_char_boundary(57);
+                format!("{}...", &task[..cut])
+            } else {
+                task.to_string()
+            };
+            out.push_str(&format!("    Task: {task_preview}\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn format_prune(val: &serde_json::Value) -> String {
+    let msg = val
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Stale worktrees and orphaned worker branches pruned");
+    format!("✓ {msg}.")
+}
+
+fn format_status(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = format!("Worker: {wid}\n");
+    if let Some(state) = val.get("state") {
+        if let Some(status_str) = state.as_str() {
+            out.push_str(&format!("State: {status_str}\n"));
+        } else if let Some(obj) = state.as_object() {
+            for (state_name, details) in obj {
+                out.push_str(&format!("State: {state_name}\n"));
+                if let Some(turns) = details.get("turns").and_then(|v| v.as_u64()) {
+                    out.push_str(&format!("Turns: {turns}\n"));
+                }
+                if let Some(step) = details.get("step").and_then(|v| v.as_u64()) {
+                    out.push_str(&format!("Step: {step}\n"));
+                }
+                if let Some(summary) = details.get("summary").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Summary: {summary}\n"));
+                }
+                if let Some(err) = details.get("error").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Error: {err}\n"));
+                }
+                if let Some(q) = details.get("question").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Question: {q}\n"));
+                }
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn format_collect(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let diff = val
+        .get("state")
+        .and_then(|s| s.get("Completed"))
+        .and_then(|c| c.get("diff"))
+        .or_else(|| val.get("diff"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if diff.trim().is_empty() {
+        format!("Worker {wid}: No git diff produced.")
+    } else {
+        diff.to_string()
+    }
+}
+
+fn format_dispatch(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
+        format!("✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress.")
+    } else {
+        let mut out = format!("✓ Worker {wid} finished.\n");
+        if let Some(state) = val.get("state") {
+            if let Some(completed) = state.get("Completed") {
+                if let Some(turns) = completed.get("turns").and_then(|v| v.as_u64()) {
+                    out.push_str(&format!("Turns: {turns}\n"));
+                }
+                if let Some(summary) = completed.get("summary").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Summary: {summary}\n"));
+                }
+                if let Some(diff) = completed.get("diff").and_then(|v| v.as_str())
+                    && !diff.trim().is_empty()
+                {
+                    out.push_str(&format!("\nDiff:\n{diff}"));
+                }
+            } else if let Some(failed) = state.get("Failed") {
+                out.push_str("State: Failed\n");
+                if let Some(err) = failed.get("error").and_then(|v| v.as_str()) {
+                    out.push_str(&format!("Error: {err}\n"));
+                }
+            }
+        }
+        out.trim_end().to_string()
+    }
+}
+
+fn format_steer(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let msg = val
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Steering instruction queued");
+    format!("✓ Worker {wid}: {msg}")
+}
+
+fn format_kill(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let killed = val.get("killed").and_then(|v| v.as_bool()).unwrap_or(false);
+    if killed {
+        format!("✓ Worker {wid} terminated.")
+    } else {
+        format!("Worker {wid} was not running.")
+    }
+}
+
+fn format_output(action: &str, val: &serde_json::Value) -> String {
+    match action {
+        "manifest" => format_manifest(val),
+        "list" => format_list(val),
+        "prune" => format_prune(val),
+        "status" => format_status(val),
+        "collect" => format_collect(val),
+        "dispatch" => format_dispatch(val),
+        "steer" => format_steer(val),
+        "kill" => format_kill(val),
+        _ => serde_json::to_string_pretty(val).unwrap_or_default(),
+    }
 }
