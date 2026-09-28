@@ -364,3 +364,106 @@ fn unknown_method_returns_method_not_found() {
         "expected a Method not found message, got: {error}"
     );
 }
+
+/// 5. `tools/list` advertises the `worker` tool with its full action enum and
+///    argument properties (including the `path` / `id` aliases).
+#[test]
+fn test_tools_list_schema() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({ "jsonrpc": "2.0", "id": "tools-1", "method": "tools/list" }));
+    let response = server
+        .expect_response("tools/list")
+        .unwrap_or_else(|| panic!("tools/list must be answered"));
+
+    assert_eq!(
+        response["id"],
+        json!("tools-1"),
+        "id must be echoed verbatim"
+    );
+    let result = expect_result(&response);
+
+    let tools = result["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("result.tools must be an array, got: {result}"));
+    assert!(
+        !tools.is_empty(),
+        "tools/list must advertise at least one tool, got: {result}"
+    );
+
+    let worker = tools
+        .iter()
+        .find(|t| t["name"].as_str() == Some("worker"))
+        .unwrap_or_else(|| panic!("tools/list must expose the 'worker' tool, got: {result}"));
+
+    assert!(
+        worker["description"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "the worker tool needs a non-empty description, got: {worker}"
+    );
+
+    let schema = &worker["inputSchema"];
+    assert_eq!(
+        schema["type"].as_str(),
+        Some("object"),
+        "worker inputSchema must be a JSON object schema, got: {schema}"
+    );
+
+    let properties = schema["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("worker inputSchema needs a properties object, got: {schema}"));
+
+    // The action selector drives the tool, so its enum must cover every verb.
+    let action_enum = properties
+        .get("action")
+        .and_then(|action| action["enum"].as_array())
+        .unwrap_or_else(|| {
+            panic!("worker inputSchema.properties.action must carry an enum, got: {schema}")
+        });
+    let actions: Vec<&str> = action_enum
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    for expected in [
+        "prune",
+        "dispatch",
+        "status",
+        "steer",
+        "collect",
+        "list",
+        "kill",
+        "manifest",
+    ] {
+        assert!(
+            actions.contains(&expected),
+            "worker action enum must contain '{expected}', got: {actions:?}"
+        );
+    }
+
+    // `path` and `id` are the documented aliases for repo_path / worker_id.
+    for prop in ["path", "id"] {
+        assert!(
+            properties.contains_key(prop),
+            "worker inputSchema.properties must include '{prop}', got: {:?}",
+            properties.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            properties[prop]["type"].as_str(),
+            Some("string"),
+            "property '{prop}' must be typed as a string, got: {}",
+            properties[prop]
+        );
+    }
+
+    // `action` stays the only required argument.
+    let required = schema["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("worker inputSchema must declare required fields, got: {schema}"));
+    assert_eq!(
+        required.iter().filter(|v| v.as_str() == Some("action")).count(),
+        1,
+        "'action' must be required exactly once, got: {required:?}"
+    );
+}

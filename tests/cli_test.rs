@@ -54,6 +54,64 @@ fn test_cli_help_flag() {
     }
 }
 
+/// `--version`/`-V` and `--help`/`-h` must be handled *before* any API-key
+/// resolution, so they work even when `OPENAI_API_KEY` is absent from the
+/// environment.
+#[test]
+fn test_cli_flags_without_api_key() {
+    let exe = binary_path();
+    let temp = std::env::temp_dir().join(format!("test-cli-nokey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    let _ = std::fs::create_dir_all(temp.join(".config"));
+
+    let mut outputs = Vec::new();
+    for flag in ["--version", "-V", "--help", "-h"] {
+        let output = Command::new(&exe)
+            .current_dir(&temp)
+            .arg(flag)
+            .env_remove("OPENAI_API_KEY")
+            .env("ENV_FILE", temp.join(".env.does-not-exist"))
+            .env("XDG_CONFIG_HOME", temp.join(".config"))
+            .env("HOME", &temp)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {} {flag}: {e}", exe.display()));
+        outputs.push((flag, output));
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+
+    for (flag, output) in outputs {
+        assert!(
+            output.status.success(),
+            "flag {flag} must exit 0 without OPENAI_API_KEY, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("mini-swe-mcp"),
+            "output should identify the binary for {flag}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Missing OPENAI_API_KEY") && !stderr.contains("Missing OPENAI_API_KEY"),
+            "flag {flag} must not require OPENAI_API_KEY; stderr: {stderr}"
+        );
+
+        if flag == "--version" || flag == "-V" {
+            assert!(
+                stdout.contains(env!("CARGO_PKG_VERSION")),
+                "version output missing package version for {flag}: {stdout}"
+            );
+        } else {
+            assert!(
+                stdout.contains("Usage: mini-swe-mcp"),
+                "help output missing usage for {flag}: {stdout}"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_cli_unknown_action() {
     let exe = binary_path();

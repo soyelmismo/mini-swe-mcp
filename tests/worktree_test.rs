@@ -165,3 +165,84 @@ fn get_diff_reports_untracked_and_modified_files() {
     assert!(new_file.starts_with(&guard.path));
     assert!(tracked.starts_with(&guard.path));
 }
+
+/// True when `git worktree list` mentions `path` as a registered worktree.
+fn worktree_list_mentions(repo: &std::path::Path, path: &std::path::Path) -> bool {
+    let list = run(repo, &["worktree", "list"]);
+    let target = path.to_str().unwrap_or_default();
+    list.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|entry| entry == target)
+}
+
+/// True when `git branch --list <branch>` reports the branch as existing.
+fn branch_is_listed(repo: &std::path::Path, branch: &str) -> bool {
+    let list = run(repo, &["branch", "--list", branch]);
+    list.lines().any(|line| {
+        let name = line.trim().trim_start_matches('*').trim();
+        !name.is_empty()
+    })
+}
+
+#[test]
+fn test_worktree_cleanup_on_drop_with_uncommitted_files() {
+    let repo = repo_root();
+    let id = unique_worker_id("dirty");
+    let (branch, path) = {
+        let guard = WorktreeGuard::new(&repo, &id).expect("worktree creation failed");
+        let path = guard.path.clone();
+        let branch = guard.branch.clone();
+
+        // 1. An untracked (never added) file inside the worktree.
+        let untracked = path.join("untracked_dirty_file.txt");
+        std::fs::write(&untracked, "untracked payload\n").expect("failed to write untracked file");
+        assert!(untracked.exists(), "untracked file was not created");
+
+        // 2. A modification of a file that is tracked in the worktree.
+        let tracked = path.join("README.md");
+        assert!(tracked.exists(), "expected a tracked README.md in the worktree");
+        let original = std::fs::read_to_string(&tracked).expect("failed to read tracked file");
+        std::fs::write(&tracked, format!("{original}\nmodified by the worker\n"))
+            .expect("failed to modify tracked file");
+
+        // 3. Sanity check: git really sees both kinds of uncommitted change,
+        //    so cleanup is not trivially satisfied by a pristine tree.
+        let status = run(&path, &["status", "--porcelain"]);
+        assert!(
+            status.contains("untracked_dirty_file.txt"),
+            "untracked file missing from git status:\n{status}"
+        );
+        assert!(
+            status.contains("README.md"),
+            "modified file missing from git status:\n{status}"
+        );
+
+        // Dropping the guard must clean up regardless of the dirty state.
+        drop(guard);
+
+        (branch, path)
+    };
+
+    assert!(
+        !path.exists(),
+        "worktree directory {path:?} still exists after dropping the guard"
+    );
+    assert!(
+        !worktree_list_mentions(&repo, &path),
+        "git worktree list still mentions {path:?}:\n{}",
+        run(&repo, &["worktree", "list"])
+    );
+    assert!(
+        !worktree_is_registered(&repo, &path),
+        "worktree {path:?} is still registered"
+    );
+    assert!(
+        !branch_is_listed(&repo, &branch),
+        "git branch --list still reports branch {branch}:\n{}",
+        run(&repo, &["branch", "--list", &branch])
+    );
+    assert!(
+        !branch_exists(&repo, &branch),
+        "branch {branch} still exists after dropping the guard"
+    );
+}
