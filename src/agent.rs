@@ -211,6 +211,7 @@ impl AgentRunner {
         temperature: Option<f32>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
+            .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(120))
             .build()
             .expect("Failed to build HTTP client");
