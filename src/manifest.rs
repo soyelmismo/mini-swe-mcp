@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::xdg_config_dir;
 
@@ -101,7 +101,10 @@ impl ModelManifest {
                 info!(path = %path.display(), "Loaded model manifest from {source}");
                 Some(manifest)
             }
-            Err(_) => None,
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "Failed to parse models.yaml from {source}");
+                None
+            }
         }
     }
 

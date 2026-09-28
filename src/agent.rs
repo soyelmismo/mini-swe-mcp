@@ -301,7 +301,7 @@ impl AgentRunner {
         let mut accumulated_tools: Vec<(String, String, String)> = Vec::new();
         let mut buffer: Vec<u8> = Vec::new();
 
-        while let Some(bytes) = resp.chunk().await.context("Failed reading stream chunk")? {
+        'stream: while let Some(bytes) = resp.chunk().await.context("Failed reading stream chunk")? {
             buffer.extend_from_slice(&bytes);
             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                 let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
@@ -316,7 +316,7 @@ impl AgentRunner {
                     continue;
                 };
                 if data == "[DONE]" {
-                    break;
+                    break 'stream;
                 }
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
                     && let Some(choice) = chunk.choices.first()
@@ -473,17 +473,24 @@ impl AgentRunner {
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
         }
 
-        // Truncate output to 16384 chars if too long to prevent context explosion
-        if combined.len() > 16384 {
-            let truncated = format!(
-                "\n... [Truncated {} bytes] ...\n{}",
-                combined.len() - 16384,
-                &combined[combined.len() - 4096..]
-            );
-            combined = format!("{}{}", &combined[..12288], truncated);
-        }
+        let combined = truncate_output(&combined);
 
         Ok((combined, output.status.code()))
+    }
+}
+
+pub fn truncate_output(combined: &str) -> String {
+    if combined.len() > 16384 {
+        let head_end = combined.floor_char_boundary(12288);
+        let tail_start = combined.ceil_char_boundary(combined.len().saturating_sub(4096));
+        let truncated = format!(
+            "\n... [Truncated {} bytes] ...\n{}",
+            combined.len() - (head_end + (combined.len() - tail_start)),
+            &combined[tail_start..]
+        );
+        format!("{}{}", &combined[..head_end], truncated)
+    } else {
+        combined.to_string()
     }
 }
 
@@ -522,5 +529,14 @@ mod tests {
         let reply = "There is no command block in this response.";
 
         assert_eq!(runner().extract_command(reply), None);
+    }
+
+    #[test]
+    fn test_truncate_output_utf8_boundary() {
+        let mut s = "a".repeat(12287);
+        s.push('€'); // bytes 12287..12290
+        s.push_str(&"b".repeat(9000));
+        let truncated = super::truncate_output(&s);
+        assert!(truncated.contains("... [Truncated"));
     }
 }

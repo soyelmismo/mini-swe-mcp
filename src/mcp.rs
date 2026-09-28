@@ -60,6 +60,18 @@ impl McpServer {
                 Ok(r) => r,
                 Err(e) => {
                     error!(error = %e, line = %line, "Malformed JSON-RPC request");
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id: None,
+                        result: None,
+                        error: Some(json!({
+                            "code": -32700,
+                            "message": format!("Parse error: {}", e)
+                        })),
+                    };
+                    let serialized = serde_json::to_string(&resp)? + "\n";
+                    stdout.write_all(serialized.as_bytes()).await?;
+                    stdout.flush().await?;
                     continue;
                 }
             };

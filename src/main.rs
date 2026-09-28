@@ -209,5 +209,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    server.run_stdio().await
+    tokio::select! {
+        res = server.run_stdio() => res,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received SIGINT, shutting down stdio server");
+            Ok(())
+        }
+    }
 }

@@ -221,6 +221,9 @@ impl WorkerPool {
             let cmd_str = match llm_resp.command {
                 Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
                     info!(worker = %worker_id, step = step, "Worker requested completion");
+                    if !llm_resp.content.trim().is_empty() {
+                        last_assistant_text = llm_resp.content.clone();
+                    }
                     break;
                 }
                 Some(ref cmd) => {
@@ -337,11 +340,12 @@ impl WorkerPool {
             let step_log = AgentStepLog {
                 step,
                 command: cmd_summary,
-                output: if output.len() > 500 {
+                output: if output.len() > 2048 {
+                    let cut = output.floor_char_boundary(2048);
                     format!(
                         "{}... [{} bytes truncated]",
-                        &output[..500],
-                        output.len() - 500
+                        &output[..cut],
+                        output.len() - cut
                     )
                 } else {
                     output.clone()
@@ -478,7 +482,8 @@ fn summarize_command(cmd: &str) -> String {
     let words: Vec<&str> = first_line.split_whitespace().take(4).collect();
     let joined = words.join(" ");
     if joined.len() > 40 {
-        format!("{}...", &joined[..37])
+        let cut = joined.floor_char_boundary(37);
+        format!("{}...", &joined[..cut])
     } else if !joined.is_empty() {
         joined
     } else {
@@ -530,6 +535,20 @@ fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_summarize_command_utf8() {
+        let cmd = "echo 'esta_es_una_palabra_extremadamente_larga_con_ñ_y_acentos_para_superar_limite'";
+        let summary = summarize_command(cmd);
+        assert!(summary.ends_with("..."));
+
+        // Multi-byte character exactly crossing byte 37
+        let mut special = "a".repeat(36);
+        special.push('€');
+        special.push_str(" rest of command");
+        let summary_special = summarize_command(&special);
+        assert!(summary_special.ends_with("..."));
+    }
 
     #[test]
     fn test_parse_request_turns() {

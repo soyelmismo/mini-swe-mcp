@@ -30,6 +30,10 @@ impl WorktreeGuard {
 
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
 
+        let path_str = path
+            .to_str()
+            .context("Worktree path contains invalid UTF-8")?;
+
         let output = git(
             repo_root,
             "worktree add",
@@ -38,7 +42,7 @@ impl WorktreeGuard {
                 "add",
                 "-b",
                 &branch,
-                path.to_str().unwrap(),
+                path_str,
                 "HEAD",
             ],
         )?;
@@ -75,10 +79,11 @@ impl Drop for WorktreeGuard {
 
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
+        let path_str = self.path.to_string_lossy();
         let _ = git(
             &self.repo_root,
             "worktree remove",
-            &["worktree", "remove", "--force", self.path.to_str().unwrap()],
+            &["worktree", "remove", "--force", &path_str],
         );
         let _ = git(
             &self.repo_root,
