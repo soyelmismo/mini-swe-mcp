@@ -157,14 +157,8 @@ impl WorkerPool {
         );
 
         let mut messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: SYSTEM_PROMPT.into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: format!("TASK:\n{}\n\nBegin by exploring the repository.", task),
-            },
+            ChatMessage::text("system", SYSTEM_PROMPT),
+            ChatMessage::text("user", format!("TASK:\n{}\n\nBegin by exploring the repository.", task)),
         ];
 
         let mut step = 0;
@@ -185,23 +179,23 @@ impl WorkerPool {
 
             for msg in steer_msgs {
                 info!(worker = %worker_id, "Injected steering message into subagent turn");
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: format!("STEER / ORCHESTRATOR GUIDANCE:\n{}", msg),
-                });
+                messages.push(ChatMessage::text(
+                    "user",
+                    format!("STEER / ORCHESTRATOR GUIDANCE:\n{}", msg),
+                ));
             }
 
             // Proactive turn warning when approaching limit (at 5 and 2 turns remaining)
             let remaining = current_max_turns.saturating_sub(step);
             if remaining == 5 || remaining == 2 {
                 info!(worker = %worker_id, step, current_max_turns, "Injecting proactive turn limit warning");
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: format!(
+                messages.push(ChatMessage::text(
+                    "user",
+                    format!(
                         "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
                         step, current_max_turns, remaining
                     ),
-                });
+                ));
             }
 
             // 1. Run LLM step with silent retry for empty / no-command responses
@@ -309,10 +303,10 @@ impl WorkerPool {
                             w.resume_tx = None;
                         }
                     }
-                    messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
-                    });
+                    messages.push(ChatMessage::text(
+                        "user",
+                        format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
+                    ));
                 }
             }
 
@@ -338,25 +332,31 @@ impl WorkerPool {
                 }
             }
 
-            let assistant_content = if llm_resp.content.trim().is_empty() {
-                "I will execute a bash command.".to_string()
+            let output_text = format!(
+                "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
+                code.unwrap_or(-1),
+                output
+            );
+
+            if let (Some(tool_calls), Some(tc_id)) = (llm_resp.tool_calls, llm_resp.tool_call_id) {
+                // OpenAI tool_calls protocol: assistant with tool_calls → tool response
+                let content = if llm_resp.content.trim().is_empty() {
+                    None
+                } else {
+                    Some(llm_resp.content)
+                };
+                messages.push(ChatMessage::assistant_with_tool_calls(content, tool_calls));
+                messages.push(ChatMessage::tool_result(tc_id, &output_text));
             } else {
-                llm_resp.content
-            };
-
-            messages.push(ChatMessage {
-                role: "assistant".into(),
-                content: assistant_content,
-            });
-
-            messages.push(ChatMessage {
-                role: "user".into(),
-                content: format!(
-                    "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
-                    code.unwrap_or(-1),
-                    output
-                ),
-            });
+                // Fallback: code-block models use plain assistant + user messages
+                let assistant_content = if llm_resp.content.trim().is_empty() {
+                    "I will execute a bash command.".to_string()
+                } else {
+                    llm_resp.content
+                };
+                messages.push(ChatMessage::text("assistant", assistant_content));
+                messages.push(ChatMessage::text("user", output_text));
+            }
         }
 
         let diff = worktree.get_diff()?;

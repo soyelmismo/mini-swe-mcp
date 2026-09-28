@@ -25,7 +25,55 @@ COMMUNICATION WITH ORCHESTRATOR:
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Outbound tool_call representation for assistant messages in the conversation history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: ToolCallFn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFn {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ChatMessage {
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +117,7 @@ struct ChatMessageOutput {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ToolCallOutput {
+    id: String,
     function: ToolCallFunction,
 }
 
@@ -96,6 +145,10 @@ pub struct LlmResponse {
     pub content: String,
     /// Extracted bash command — from tool_calls first, regex fallback second
     pub command: Option<String>,
+    /// Raw tool_calls from the response, for re-insertion into conversation history
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// The tool_call id that produced the command (for tool response messages)
+    pub tool_call_id: Option<String>,
 }
 
 pub struct AgentRunner {
@@ -209,17 +262,40 @@ impl AgentRunner {
         let content = choice.message.content.clone().unwrap_or_default();
 
         // Priority 1: extract command from tool_calls (OpenAI function calling)
-        let command = choice
+        let bash_tc = choice
             .message
             .tool_calls
             .iter()
-            .find(|tc| tc.function.name == "bash")
+            .find(|tc| tc.function.name == "bash");
+
+        let command = bash_tc
             .and_then(|tc| serde_json::from_str::<BashArgs>(&tc.function.arguments).ok())
             .map(|args| args.command)
             // Priority 2: fallback to regex extraction from content (code block models)
             .or_else(|| self.extract_command(&content));
 
-        Ok(LlmResponse { content, command })
+        // Convert API tool_calls to history-compatible format
+        let (tool_calls, tool_call_id) = if choice.message.tool_calls.is_empty() {
+            (None, None)
+        } else {
+            let tc_id = bash_tc.map(|tc| tc.id.clone());
+            let tcs: Vec<ToolCall> = choice
+                .message
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    r#type: "function".to_string(),
+                    function: ToolCallFn {
+                        name: tc.function.name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                    },
+                })
+                .collect();
+            (Some(tcs), tc_id)
+        };
+
+        Ok(LlmResponse { content, command, tool_calls, tool_call_id })
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
