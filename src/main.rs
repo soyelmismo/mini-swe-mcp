@@ -2,7 +2,7 @@ use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
-use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use mini_swe_mcp::pool::WorkerPool;
 use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -277,9 +277,17 @@ where
         }
 
         let mut result = server
-            .execute_tool("worker", serde_json::Value::Object(tool_args))
+            .execute_tool("worker", serde_json::Value::Object(tool_args.clone()))
             .await?;
 
+        // Interactive steering: whenever the shared wait loop reports the worker
+        // paused for input, prompt the operator and resume. Re-waiting goes through
+        // the exact same helper the MCP stdio dispatch path uses, so both callers
+        // share one polling/termination algorithm.
+        let wait_max_turns = tool_args
+            .get("max_turns")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
         while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
             let wid = result["worker_id"].as_str().unwrap_or("").to_string();
             let q = result["question"].as_str().unwrap_or("");
@@ -297,38 +305,9 @@ where
             pool.steer(&wid, input).await?;
             eprintln!("[mini-swe] Guidance sent. Resuming execution...");
 
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if let Some(state) = pool.get_worker_state(&wid).await {
-                    match state {
-                        WorkerState::Completed { .. }
-                        | WorkerState::Failed { .. } => {
-                            let logs = pool.get_worker_logs(&wid).await.unwrap_or_default();
-                            result = serde_json::json!({
-                                "worker_id": wid,
-                                "state": state,
-                                "logs": logs
-                            });
-                            break;
-                        }
-                        WorkerState::Paused {
-                            ref question,
-                            step,
-                            ..
-                        } => {
-                            result = serde_json::json!({
-                                "worker_id": wid,
-                                "status": "needs_input",
-                                "question": question,
-                                "step": step,
-                                "message": "Worker is paused waiting for orchestrator steering."
-                            });
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            result = server
+                .await_worker_result(&wid, wait_max_turns, None, None)
+                .await?;
         }
 
         if json_output {

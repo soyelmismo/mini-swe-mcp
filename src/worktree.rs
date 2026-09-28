@@ -8,7 +8,6 @@ pub struct WorktreeGuard {
     pub branch: String,
     pub repo_root: PathBuf,
     pub base_commit: String,
-    pub keep: bool,
     pub preserve_branch: bool,
 }
 
@@ -94,7 +93,6 @@ impl WorktreeGuard {
             branch,
             repo_root: repo_root.to_path_buf(),
             base_commit,
-            keep: false,
             preserve_branch: false,
         })
     }
@@ -247,6 +245,18 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Decide whether a `.pid` sidecar file proves its owning process is gone.
+///
+/// Returns `Some(!alive)` when the file exists and holds a parsable pid, and
+/// `None` when the file is missing or unreadable/unparsable, so callers can
+/// choose their own conservative default for the "unknown" case.
+fn pid_file_dead_verdict(pid_file: &str) -> Option<bool> {
+    std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        .map(|pid| !is_process_alive(pid))
+}
+
 fn prune_worktree_if_stale(
     repo_root: &Path,
     wt: &str,
@@ -260,14 +270,9 @@ fn prune_worktree_if_stale(
     let pid_file = format!("{wt}.pid");
     let is_stale = if !wt_path.exists() {
         true
-    } else if let Ok(content) = std::fs::read_to_string(&pid_file) {
-        content
-            .trim()
-            .parse::<u32>()
-            .is_ok_and(|pid| !is_process_alive(pid))
     } else {
-        // Directory exists but has no pid file: do not delete, assume active
-        false
+        // Directory exists but has no readable pid file: do not delete, assume active
+        pid_file_dead_verdict(&pid_file).unwrap_or(false)
     };
 
     if is_stale {
@@ -292,6 +297,8 @@ fn prune_worktree_if_stale(
 }
 
 pub fn prune_stale_worktrees(repo_root: &Path) {
+    // Pre-pass prune: garbage-collect worktree registrations left behind by
+    // previous runs (dead administrative files) *before* we inspect the list.
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 
     // 1. Prune registered worktrees whose owner process is dead or directory is missing
@@ -351,25 +358,18 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
                 {
                     if p.is_dir() {
                         let pid_file = format!("{}.pid", p.to_string_lossy());
-                        let is_stale = if let Ok(content) = std::fs::read_to_string(&pid_file) {
-                            content
-                                .trim()
-                                .parse::<u32>()
-                                .is_ok_and(|pid| !is_process_alive(pid))
-                        } else {
-                            false
-                        };
+                        // No readable pid file: assume the directory is still active.
+                        let is_stale = pid_file_dead_verdict(&pid_file).unwrap_or(false);
                         if is_stale {
                             let _ = std::fs::remove_dir_all(&p);
                             let _ = std::fs::remove_file(&pid_file);
                         }
-                    } else if name.ends_with(".pid")
-                        && let Ok(content) = std::fs::read_to_string(&p)
-                    {
-                        let is_stale = content
-                            .trim()
-                            .parse::<u32>()
-                            .map_or(true, |pid| !is_process_alive(pid));
+                    } else if name.ends_with(".pid") {
+                        // The worktree directory is gone, so a matching live pid
+                        // means the file belongs to a still-running worker; an
+                        // unreadable one is an orphan and safe to remove.
+                        let pid_str = p.to_string_lossy().to_string();
+                        let is_stale = pid_file_dead_verdict(&pid_str).unwrap_or(true);
                         if is_stale {
                             let _ = std::fs::remove_file(&p);
                         }
@@ -394,19 +394,15 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         }
     }
 
+    // Post-pass prune: phase 1 may have removed worktrees, which leaves new
+    // stale administrative entries; this second pass clears them. Together the
+    // pre- and post-passes form a legitimate double pass (pre collects old
+    // garbage, post collects what we just removed) — both are needed.
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 }
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        if self.keep {
-            info!(path = %self.path.display(), "Preserving worktree");
-            return;
-        }
-
-        // Sync report/audit artifacts to repo root before cleanup
-        let _ = self.sync_artifacts();
-
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
         let path_str = self.path.to_string_lossy();

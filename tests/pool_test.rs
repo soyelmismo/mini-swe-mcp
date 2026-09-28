@@ -19,58 +19,58 @@ use mini_swe_mcp::pool::{parse_ask_orchestrator, parse_request_turns, summarize_
 
 #[test]
 fn test_parse_request_turns_echo_returns_count() {
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 15", ""), Some(15));
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 15"), Some(15));
 }
 
 #[test]
 fn test_parse_request_turns_variants() {
     // `printf` is accepted just like `echo`.
-    assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'", ""), Some(15));
+    assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'"), Some(15));
     // Different counts, and surrounding whitespace is irrelevant.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20", ""), Some(20));
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 1", ""), Some(1));
-    assert_eq!(parse_request_turns("   echo REQUEST_TURNS: 42   ", ""), Some(42));
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20"), Some(20));
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 1"), Some(1));
+    assert_eq!(parse_request_turns("   echo REQUEST_TURNS: 42   "), Some(42));
     // Leading whitespace between the token and the number is skipped.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS:   7", ""), Some(7));
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS:   7"), Some(7));
     // Trailing characters after the number are ignored.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 15 # more", ""), Some(15));
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 15 # more"), Some(15));
 }
 
 #[test]
 fn test_parse_request_turns_non_matching_commands_return_none() {
     // Right token, wrong command.
-    assert_eq!(parse_request_turns("cat file.rs", "REQUEST_TURNS: 15"), None);
+    assert_eq!(parse_request_turns("cat file.rs"), None);
     // Right command, no token.
-    assert_eq!(parse_request_turns("echo nothing", "normal output"), None);
+    assert_eq!(parse_request_turns("echo nothing"), None);
     // Unrelated commands.
-    assert_eq!(parse_request_turns("ls -la", "total 12"), None);
-    assert_eq!(parse_request_turns("git status", "On branch main"), None);
-    // The output stream is never consulted for these control commands.
-    assert_eq!(parse_request_turns("echo done", "REQUEST_TURNS: 15"), None);
+    assert_eq!(parse_request_turns("ls -la"), None);
+    assert_eq!(parse_request_turns("git status"), None);
+    // Only the command itself is ever inspected for these control sentinels.
+    assert_eq!(parse_request_turns("echo done"), None);
     // Not an echo/printf invocation at all.
-    assert_eq!(parse_request_turns("REQUEST_TURNS: 15", ""), None);
-    assert_eq!(parse_request_turns("myecho REQUEST_TURNS: 15", ""), None);
+    assert_eq!(parse_request_turns("REQUEST_TURNS: 15"), None);
+    assert_eq!(parse_request_turns("myecho REQUEST_TURNS: 15"), None);
 }
 
 #[test]
 fn test_parse_request_turns_rejects_degenerate_numbers() {
     // Zero turns is not a meaningful request.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0", ""), None);
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0"), None);
     // Missing / non-numeric value.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS:", ""), None);
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: abc", ""), None);
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: -3", ""), None);
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS:"), None);
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: abc"), None);
+    assert_eq!(parse_request_turns("echo REQUEST_TURNS: -3"), None);
     // Overflows `usize`.
     assert_eq!(
-        parse_request_turns("echo REQUEST_TURNS: 99999999999999999999999", ""),
+        parse_request_turns("echo REQUEST_TURNS: 99999999999999999999999"),
         None
     );
 }
 
 #[test]
 fn test_parse_request_turns_empty_input() {
-    assert_eq!(parse_request_turns("", ""), None);
-    assert_eq!(parse_request_turns("   \n\t ", ""), None);
+    assert_eq!(parse_request_turns(""), None);
+    assert_eq!(parse_request_turns("   \n\t "), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,11 +80,11 @@ fn test_parse_request_turns_empty_input() {
 #[test]
 fn test_parse_ask_orchestrator_double_quoted_echo() {
     assert_eq!(
-        parse_ask_orchestrator("echo ASK_ORCHESTRATOR: \"Proceed?\"", ""),
+        parse_ask_orchestrator("echo ASK_ORCHESTRATOR: \"Proceed?\""),
         Some("Proceed?".to_string())
     );
     assert_eq!(
-        parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\"", ""),
+        parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\""),
         Some("is this ok?".to_string())
     );
 }
@@ -92,52 +92,46 @@ fn test_parse_ask_orchestrator_double_quoted_echo() {
 #[test]
 fn test_parse_ask_orchestrator_single_quoted_echo() {
     assert_eq!(
-        parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'", ""),
+        parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'"),
         Some("should I delete old code?".to_string())
     );
     assert_eq!(
-        parse_ask_orchestrator("printf 'ASK_ORCHESTRATOR: continue?'", ""),
+        parse_ask_orchestrator("printf 'ASK_ORCHESTRATOR: continue?'"),
         Some("continue?".to_string())
     );
     // Surrounding whitespace of the command is trimmed first.
     assert_eq!(
-        parse_ask_orchestrator("   echo \"ASK_ORCHESTRATOR:  hello  \"   ", ""),
+        parse_ask_orchestrator("   echo \"ASK_ORCHESTRATOR:  hello  \"   "),
         Some("hello".to_string())
     );
 }
 
 #[test]
 fn test_parse_ask_orchestrator_non_matching_commands_return_none() {
-    // Right token, wrong command (and the output is ignored).
-    assert_eq!(
-        parse_ask_orchestrator(
-            "cat src/agent.rs",
-            "echo 'ASK_ORCHESTRATOR: <your specific question>'"
-        ),
-        None
-    );
-    // Unrelated command and output.
-    assert_eq!(parse_ask_orchestrator("ls -la", "total 12"), None);
-    assert_eq!(parse_ask_orchestrator("cargo build", "Finished release"), None);
+    // Right token, wrong command.
+    assert_eq!(parse_ask_orchestrator("cat src/agent.rs"), None);
+    // Unrelated command.
+    assert_eq!(parse_ask_orchestrator("ls -la"), None);
+    assert_eq!(parse_ask_orchestrator("cargo build"), None);
     // Right command, no token.
-    assert_eq!(parse_ask_orchestrator("echo done", "all good"), None);
+    assert_eq!(parse_ask_orchestrator("echo done"), None);
     // A bare command that merely mentions the token.
-    assert_eq!(parse_ask_orchestrator("ASK_ORCHESTRATOR: why?", ""), None);
-    assert_eq!(parse_ask_orchestrator("grepecho ASK_ORCHESTRATOR: why?", ""), None);
+    assert_eq!(parse_ask_orchestrator("ASK_ORCHESTRATOR: why?"), None);
+    assert_eq!(parse_ask_orchestrator("grepecho ASK_ORCHESTRATOR: why?"), None);
 }
 
 #[test]
 fn test_parse_ask_orchestrator_placeholders_and_blanks_are_rejected() {
     // The literal templates documented for agents must not escalate.
     assert_eq!(
-        parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'", ""),
+        parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'"),
         None
     );
-    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: <question>\"", ""), None);
+    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: <question>\""), None);
     // Empty question.
-    assert_eq!(parse_ask_orchestrator("echo ASK_ORCHESTRATOR:", ""), None);
-    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR:   \"", ""), None);
-    assert_eq!(parse_ask_orchestrator("", ""), None);
+    assert_eq!(parse_ask_orchestrator("echo ASK_ORCHESTRATOR:"), None);
+    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR:   \""), None);
+    assert_eq!(parse_ask_orchestrator(""), None);
 }
 
 // ---------------------------------------------------------------------------

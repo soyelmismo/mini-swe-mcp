@@ -180,7 +180,11 @@ struct BashArgs {
     command: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One executed step of a subagent run.
+///
+/// `Deserialize` is intentionally absent: step logs are only ever *built* in
+/// `pool::run_worker` and then serialized outward, never parsed back.
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentStepLog {
     pub step: usize,
     pub command: String,

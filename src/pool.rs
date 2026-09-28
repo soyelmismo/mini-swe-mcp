@@ -74,15 +74,20 @@ impl WorkerState {
     }
 }
 
-pub struct WorkerRecord {
-    pub id: String,
-    pub task: String,
-    pub model: String,
-    pub state: WorkerState,
-    pub logs: Vec<AgentStepLog>,
-    pub pending_steer: Vec<String>,
-    pub resume_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    pub handle: Option<JoinHandle<()>>,
+/// Live bookkeeping for one in-flight subagent.
+///
+/// Deliberately private: the pool only ever hands it back to callers through
+/// `collect()`, and the backing `HashMap` is private as well, so no field needs
+/// to be part of the crate's public API.
+struct WorkerRecord {
+    id: String,
+    task: String,
+    model: String,
+    state: WorkerState,
+    logs: Vec<AgentStepLog>,
+    pending_steer: Vec<String>,
+    resume_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl WorkerRecord {
@@ -96,13 +101,13 @@ impl WorkerRecord {
 }
 
 /// Result of a one-shot worker collection, detached from the live pool.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CollectedWorker {
-    pub id: String,
-    pub task: String,
-    pub model: String,
-    pub state: WorkerState,
-    pub logs: Vec<AgentStepLog>,
+///
+/// Only `state` and `logs` are consumed (the MCP `collect` handler renders both
+/// into a `serde_json::Value` by hand), so the identity fields are not carried.
+#[derive(Debug, Clone)]
+pub(crate) struct CollectedWorker {
+    pub(crate) state: WorkerState,
+    pub(crate) logs: Vec<AgentStepLog>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,8 +505,8 @@ impl WorkerPool {
                 runner.execute_bash(&worktree.path, &cmd_str).await?
             };
 
-            // 2. Check for REQUEST_TURNS sentinel in command or output
-            if let Some(additional) = parse_request_turns(&cmd_str, &output) {
+            // 2. Check for REQUEST_TURNS sentinel in the command itself
+            if let Some(additional) = parse_request_turns(&cmd_str) {
                 let old_max = current_max_turns;
                 current_max_turns = (current_max_turns + additional).max(current_max_turns).min(500);
                 info!(
@@ -513,8 +518,8 @@ impl WorkerPool {
                 );
             }
 
-            // 3. Check for ASK_ORCHESTRATOR sentinel in command or output
-            if let Some(question) = parse_ask_orchestrator(&cmd_str, &output) {
+            // 3. Check for ASK_ORCHESTRATOR sentinel in the command itself
+            if let Some(question) = parse_ask_orchestrator(&cmd_str) {
                 info!(
                     worker = %worker_id,
                     question = %question,
@@ -789,14 +794,11 @@ impl WorkerPool {
     }
 
     /// Collect a worker's final result and release its in-memory resources.
-    pub async fn collect(&self, id: &str) -> Option<CollectedWorker> {
+    pub(crate) async fn collect(&self, id: &str) -> Option<CollectedWorker> {
         let mut lock = self.workers.write().await;
         let record = lock.remove(id)?;
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         Some(CollectedWorker {
-            id: record.id,
-            task: record.task,
-            model: record.model,
             state: record.state,
             logs: record.logs,
         })
@@ -836,7 +838,7 @@ pub fn summarize_command(cmd: &str) -> String {
     out
 }
 
-pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
+pub fn parse_request_turns(cmd: &str) -> Option<usize> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("REQUEST_TURNS:")
@@ -856,7 +858,7 @@ pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
     None
 }
 
-pub fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
+pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")
@@ -897,31 +899,28 @@ mod tests {
 
     #[test]
     fn test_parse_request_turns() {
-        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20", ""), Some(20));
-        assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'", ""), Some(15));
-        assert_eq!(parse_request_turns("cat file.rs", "REQUEST_TURNS: 15"), None);
-        assert_eq!(parse_request_turns("echo nothing", "normal output"), None);
-        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0", ""), None);
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20"), Some(20));
+        assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'"), Some(15));
+        assert_eq!(parse_request_turns("cat file.rs"), None);
+        assert_eq!(parse_request_turns("echo nothing"), None);
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0"), None);
     }
 
     #[test]
     fn test_parse_ask_orchestrator() {
         assert_eq!(
-            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'", ""),
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'"),
             Some("should I delete old code?".to_string())
         );
         assert_eq!(
-            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\"", ""),
+            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\""),
             Some("is this ok?".to_string())
         );
+        assert_eq!(parse_ask_orchestrator("cat src/agent.rs"), None);
         assert_eq!(
-            parse_ask_orchestrator("cat src/agent.rs", "echo 'ASK_ORCHESTRATOR: <your specific question>'"),
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'"),
             None
         );
-        assert_eq!(
-            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'", ""),
-            None
-        );
-        assert_eq!(parse_ask_orchestrator("ls -la", "total 12"), None);
+        assert_eq!(parse_ask_orchestrator("ls -la"), None);
     }
 }

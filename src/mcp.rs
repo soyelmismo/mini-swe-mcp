@@ -11,9 +11,7 @@ use crate::manifest::ModelManifest;
 use crate::pool::WorkerPool;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct JsonRpcRequest {
-    jsonrpc: String,
     id: Option<Value>,
     method: String,
     params: Option<Value>,
@@ -408,7 +406,7 @@ impl McpServer {
         .await;
 
         if wait {
-            self.wait_for_worker(&wid, max_turns, token, tx).await
+            self.await_worker_result(&wid, max_turns, token, tx).await
         } else {
             Ok(json!({
                 "worker_id": wid,
@@ -418,7 +416,17 @@ impl McpServer {
         }
     }
 
-    async fn wait_for_worker(
+    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
+    ///
+    /// Returns the terminal payload:
+    /// * `{ worker_id, state, logs }` when the worker reached `Completed`/`Failed`
+    /// * `{ worker_id, status: "needs_input", question, step, message }` when the
+    ///   worker paused waiting for steering.
+    ///
+    /// Progress notifications are emitted only when a `progress_token`/`tx` pair is
+    /// supplied (i.e. the MCP stdio path); the plain-CLI path passes `None`, and the
+    /// polling algorithm stays identical for both callers.
+    pub async fn await_worker_result(
         &self,
         wid: &str,
         max_turns: usize,
