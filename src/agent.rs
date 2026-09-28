@@ -631,12 +631,12 @@ impl AgentRunner {
             std::env::var("COMMAND_HEAVY_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300)
+                .unwrap_or(600)
         } else {
             std::env::var("COMMAND_LIGHT_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(30)
+                .unwrap_or(120)
         };
         let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
             .ok()
@@ -658,7 +658,10 @@ impl AgentRunner {
                         .args(["-KILL", &format!("-{pid}")])
                         .status();
                 }
-                anyhow::bail!("Command timed out after {}s", timeout_secs);
+                return Ok((
+                    format!("Command timed out after {}s and was terminated.", timeout_secs),
+                    Some(124),
+                ));
             }
         };
 

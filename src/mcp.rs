@@ -495,6 +495,42 @@ impl McpServer {
         if let Some(state) = self.pool.get_worker_state(wid).await {
             Ok(json!({ "worker_id": wid, "state": state }))
         } else {
+            let path = crate::pool::registry_dir().join(format!("{wid}.json"));
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(entry) = serde_json::from_str::<crate::pool::WorkerRegistryEntry>(&content)
+            {
+                let is_alive = crate::worktree::is_process_alive(entry.pid);
+                let status = if !is_alive && (entry.status == "running" || entry.status == "paused") {
+                    "stopped"
+                } else {
+                    &entry.status
+                };
+                let state_name = match status {
+                    "running" => "Running",
+                    "completed" => "Completed",
+                    "paused" => "Paused",
+                    "failed" => "Failed",
+                    _ => "Stopped",
+                };
+                return Ok(json!({
+                    "worker_id": wid,
+                    "task": entry.task,
+                    "model": entry.model,
+                    "state": {
+                        "state": state_name,
+                        "details": {
+                            "status": state_name,
+                            "step": entry.step,
+                            "turns": entry.step,
+                            "summary": entry.last_command.clone(),
+                            "error": if entry.status == "failed" { Some(entry.last_command) } else { None },
+                            "question": entry.question,
+                            "pid": entry.pid,
+                            "started_at": entry.started_at,
+                        }
+                    }
+                }));
+            }
             anyhow::bail!("Worker not found: {wid}")
         }
     }
@@ -520,7 +556,24 @@ impl McpServer {
     async fn handle_kill(&self, args: &Value) -> Result<Value> {
         let wid = Self::get_worker_id(args, "kill")?;
         let killed = self.pool.kill(wid).await;
-        Ok(json!({ "worker_id": wid, "killed": killed }))
+        if killed {
+            Ok(json!({ "worker_id": wid, "killed": true }))
+        } else {
+            let path = crate::pool::registry_dir().join(format!("{wid}.json"));
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(entry) = serde_json::from_str::<crate::pool::WorkerRegistryEntry>(&content)
+                && crate::worktree::is_process_alive(entry.pid)
+            {
+                #[cfg(unix)]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &entry.pid.to_string()])
+                        .status();
+                }
+                return Ok(json!({ "worker_id": wid, "killed": true }));
+            }
+            Ok(json!({ "worker_id": wid, "killed": false }))
+        }
     }
 
     async fn handle_steer(&self, args: &Value) -> Result<Value> {
