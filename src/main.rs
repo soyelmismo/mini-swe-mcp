@@ -39,9 +39,48 @@ async fn main() -> Result<()> {
         }
     }
 
+struct ShortFormatter;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for ShortFormatter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = event.metadata();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let secs = now % 60;
+        let mins = (now / 60) % 60;
+        let hours = (now / 3600) % 24;
+
+        let target = meta.target();
+        let short_target = target.strip_prefix("mini_swe_mcp::").unwrap_or(target);
+
+        let lvl = match *meta.level() {
+            tracing::Level::ERROR => "\x1b[31mERRO\x1b[0m",
+            tracing::Level::WARN => "\x1b[33mWARN\x1b[0m",
+            tracing::Level::INFO => "\x1b[32mINFO\x1b[0m",
+            tracing::Level::DEBUG => "\x1b[34mDEBG\x1b[0m",
+            tracing::Level::TRACE => "\x1b[35mTRCE\x1b[0m",
+        };
+
+        write!(writer, "{:02}:{:02}:{:02} {} [{}] ", hours, mins, secs, lvl, short_target)?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
     // Crucial: log to STDERR, because STDOUT is dedicated to MCP JSON-RPC protocol
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().event_format(ShortFormatter).with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
