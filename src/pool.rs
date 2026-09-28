@@ -60,6 +60,7 @@ impl WorkerRecord {
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
+    bash_semaphore: Arc<Semaphore>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     api_base: String,
     api_key: String,
@@ -67,8 +68,13 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
+        let bash_slots = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(1))
+            .unwrap_or(2);
+        info!(bash_slots, "Bash execution semaphore initialized");
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             workers: Arc::new(RwLock::new(HashMap::new())),
             api_base,
             api_key,
@@ -247,7 +253,11 @@ impl WorkerPool {
 
             info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
 
-            let (output, code) = runner.execute_bash(&worktree.path, &cmd_str).await?;
+            let (output, code) = {
+                let _bash_permit = self.bash_semaphore.acquire().await
+                    .context("Bash semaphore closed")?;
+                runner.execute_bash(&worktree.path, &cmd_str).await?
+            };
 
             // 2. Check for REQUEST_TURNS sentinel in command or output
             if let Some(additional) = parse_request_turns(&cmd_str, &output) {

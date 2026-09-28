@@ -223,8 +223,21 @@ impl AgentRunner {
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
-        let mut cmd = Command::new("bash");
-        cmd.current_dir(dir).args(["-c", command]);
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(1))
+            .unwrap_or(2)
+            .to_string();
+
+        let mut cmd = Command::new("nice");
+        cmd.current_dir(dir)
+            .args(["-n", "10", "bash", "-c", command])
+            // Universal build parallelism caps
+            .env("CARGO_BUILD_JOBS", &parallelism)
+            .env("MAKEFLAGS", format!("-j{parallelism}"))
+            .env("CMAKE_BUILD_PARALLEL_LEVEL", &parallelism)
+            .env("RAYON_NUM_THREADS", &parallelism)
+            .env("OMP_NUM_THREADS", &parallelism)
+            .env("GOMAXPROCS", &parallelism);
 
         let timeout_secs = std::env::var("COMMAND_TIMEOUT_SECS")
             .ok()
