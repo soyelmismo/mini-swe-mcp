@@ -477,7 +477,7 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-fn summarize_command(cmd: &str) -> String {
+pub fn summarize_command(cmd: &str) -> String {
     let first_line = cmd.lines().next().unwrap_or("").trim();
     let words: Vec<&str> = first_line.split_whitespace().take(4).collect();
     let joined = words.join(" ");
@@ -491,7 +491,7 @@ fn summarize_command(cmd: &str) -> String {
     }
 }
 
-fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
+pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("REQUEST_TURNS:")
@@ -511,7 +511,7 @@ fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
     None
 }
 
-fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
+pub fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")

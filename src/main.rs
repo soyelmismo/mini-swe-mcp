@@ -1,25 +1,52 @@
-mod agent;
-mod config;
-mod manifest;
-mod mcp;
-mod pool;
-mod worktree;
-
 use anyhow::{Context, Result};
-use config::xdg_config_dir;
-use manifest::ModelManifest;
-use mcp::McpServer;
-use pool::WorkerPool;
+use mini_swe_mcp::config::xdg_config_dir;
+use mini_swe_mcp::manifest::ModelManifest;
+use mini_swe_mcp::mcp::McpServer;
+use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli_args: Vec<String> = env::args().collect();
+
+    // Early CLI flag handling without requiring API keys
+    if cli_args.len() > 1 {
+        match cli_args[1].as_str() {
+            "--version" | "-V" => {
+                println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
+                println!("Usage: mini-swe-mcp [--stdio | <action> [args...]]");
+                println!("\nActions:");
+                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait]");
+                println!("  status <worker_id>");
+                println!("  collect <worker_id>");
+                println!("  steer <worker_id> <message>");
+                println!("  list");
+                println!("  kill <worker_id>");
+                println!("  manifest");
+                println!("  prune");
+                println!("\nFlags:");
+                println!("  -h, --help     Print help");
+                println!("  -V, --version  Print version");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Crucial: log to STDERR, because STDOUT is dedicated to MCP JSON-RPC protocol
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
+
+    // Safe startup cleanup: prune leftover zombie worktrees/branches from dead processes
+    worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
 
     // 1. Try loading from current working directory or ancestor directories
     dotenvy::dotenv().ok();
@@ -70,15 +97,24 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64); // Supports up to 64 concurrent subagents out of the box
 
-    // Automatically prune any stale worktrees or branches leftover from forcefully killed processes
-    worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
-
     let pool = WorkerPool::new(max_workers, api_base, api_key);
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
-    let cli_args: Vec<String> = env::args().collect();
     if cli_args.len() > 1 && cli_args[1] != "--stdio" {
         let action = &cli_args[1];
+
+        if action == "prune" {
+            worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ok",
+                    "message": "Stale worktrees and orphaned worker branches pruned"
+                }))?
+            );
+            return Ok(());
+        }
+
         let mut tool_args = serde_json::Map::new();
         tool_args.insert("action".into(), serde_json::Value::String(action.clone()));
 
@@ -146,10 +182,10 @@ async fn main() -> Result<()> {
             "manifest" | "list" => {}
             _ => {
                 eprintln!(
-                    "Unknown action: {}. Available: dispatch, status, steer, collect, list, kill, manifest",
+                    "Unknown action: {}. Available: dispatch, status, steer, collect, list, kill, manifest, prune",
                     action
                 );
-                return Ok(());
+                std::process::exit(1);
             }
         }
 
@@ -178,8 +214,8 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if let Some(state) = pool.get_worker_state(&wid).await {
                     match state {
-                        pool::WorkerState::Completed { .. }
-                        | pool::WorkerState::Failed { .. } => {
+                        WorkerState::Completed { .. }
+                        | WorkerState::Failed { .. } => {
                             let logs = pool.get_worker_logs(&wid).await.unwrap_or_default();
                             result = serde_json::json!({
                                 "worker_id": wid,
@@ -188,7 +224,7 @@ async fn main() -> Result<()> {
                             });
                             break;
                         }
-                        pool::WorkerState::Paused {
+                        WorkerState::Paused {
                             ref question,
                             step,
                             ..
