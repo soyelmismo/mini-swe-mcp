@@ -460,23 +460,47 @@ fn format_status(val: &serde_json::Value) -> String {
     if let Some(state) = val.get("state") {
         if let Some(status_str) = state.as_str() {
             out.push_str(&format!("State: {status_str}\n"));
-        } else if let Some(obj) = state.as_object() {
-            for (state_name, details) in obj {
-                out.push_str(&format!("State: {state_name}\n"));
-                if let Some(turns) = details.get("turns").and_then(|v| v.as_u64()) {
-                    out.push_str(&format!("Turns: {turns}\n"));
+        } else {
+            let tag = state.get("state").and_then(|v| v.as_str());
+            let details = state.get("details").and_then(|v| v.as_object());
+
+            if let Some(t) = tag {
+                out.push_str(&format!("State: {t}\n"));
+                if let Some(d) = details {
+                    if let Some(turns) = d.get("turns").and_then(|v| v.as_u64()) {
+                        out.push_str(&format!("Turns: {turns}\n"));
+                    }
+                    if let Some(step) = d.get("step").and_then(|v| v.as_u64()) {
+                        out.push_str(&format!("Step: {step}\n"));
+                    }
+                    if let Some(summary) = d.get("summary").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Summary: {summary}\n"));
+                    }
+                    if let Some(err) = d.get("error").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Error: {err}\n"));
+                    }
+                    if let Some(q) = d.get("question").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Question: {q}\n"));
+                    }
                 }
-                if let Some(step) = details.get("step").and_then(|v| v.as_u64()) {
-                    out.push_str(&format!("Step: {step}\n"));
-                }
-                if let Some(summary) = details.get("summary").and_then(|v| v.as_str()) {
-                    out.push_str(&format!("Summary: {summary}\n"));
-                }
-                if let Some(err) = details.get("error").and_then(|v| v.as_str()) {
-                    out.push_str(&format!("Error: {err}\n"));
-                }
-                if let Some(q) = details.get("question").and_then(|v| v.as_str()) {
-                    out.push_str(&format!("Question: {q}\n"));
+            } else if let Some(obj) = state.as_object() {
+                for (state_name, d) in obj {
+                    out.push_str(&format!("State: {state_name}\n"));
+                    if let Some(turns) = d.get("turns").and_then(|v| v.as_u64()) {
+                        out.push_str(&format!("Turns: {turns}\n"));
+                    }
+                    if let Some(step) = d.get("step").and_then(|v| v.as_u64()) {
+                        out.push_str(&format!("Step: {step}\n"));
+                    }
+                    if let Some(summary) = d.get("summary").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Summary: {summary}\n"));
+                    }
+                    if let Some(err) = d.get("error").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Error: {err}\n"));
+                    }
+                    if let Some(q) = d.get("question").and_then(|v| v.as_str()) {
+                        out.push_str(&format!("Question: {q}\n"));
+                    }
                 }
             }
         }
@@ -488,7 +512,7 @@ fn format_collect(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let diff = val
         .get("state")
-        .and_then(|s| s.get("Completed"))
+        .and_then(|s| s.get("details").or_else(|| s.get("Completed")))
         .and_then(|c| c.get("diff"))
         .or_else(|| val.get("diff"))
         .and_then(|v| v.as_str())
@@ -508,21 +532,27 @@ fn format_dispatch(val: &serde_json::Value) -> String {
     } else {
         let mut out = format!("✓ Worker {wid} finished.\n");
         if let Some(state) = val.get("state") {
-            if let Some(completed) = state.get("Completed") {
-                if let Some(turns) = completed.get("turns").and_then(|v| v.as_u64()) {
+            let state_name = state.get("state").and_then(|v| v.as_str()).unwrap_or("");
+            let details = state
+                .get("details")
+                .or_else(|| state.get("Completed"))
+                .or_else(|| state.get("Failed"));
+
+            if state_name == "Completed" || state.get("Completed").is_some() {
+                if let Some(turns) = details.and_then(|d| d.get("turns")).and_then(|v| v.as_u64()) {
                     out.push_str(&format!("Turns: {turns}\n"));
                 }
-                if let Some(summary) = completed.get("summary").and_then(|v| v.as_str()) {
+                if let Some(summary) = details.and_then(|d| d.get("summary")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Summary: {summary}\n"));
                 }
-                if let Some(diff) = completed.get("diff").and_then(|v| v.as_str())
+                if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(|v| v.as_str())
                     && !diff.trim().is_empty()
                 {
-                    out.push_str(&format!("\nDiff:\n{diff}"));
+                    out.push_str(&format!("\nDiff:\n{diff}\n"));
                 }
-            } else if let Some(failed) = state.get("Failed") {
+            } else if state_name == "Failed" || state.get("Failed").is_some() {
                 out.push_str("State: Failed\n");
-                if let Some(err) = failed.get("error").and_then(|v| v.as_str()) {
+                if let Some(err) = details.and_then(|d| d.get("error")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Error: {err}\n"));
                 }
             }
