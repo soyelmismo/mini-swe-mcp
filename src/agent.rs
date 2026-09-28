@@ -504,6 +504,16 @@ impl AgentRunner {
     }
 
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
+        if let Err(reason) = validate_bash_command(command) {
+            return Ok((
+                format!(
+                    "COMMAND BLOCKED BY WORKTREE GUARDRAIL:\n{}\nPlease run your command within the current repository directory ($PWD).",
+                    reason
+                ),
+                Some(1),
+            ));
+        }
+
         let default_parallelism = std::thread::available_parallelism()
             .map(|n| (n.get() / 2).max(1))
             .unwrap_or(2);
@@ -591,6 +601,54 @@ pub fn truncate_output(combined: &str) -> String {
     }
 }
 
+/// Validate that a subagent command does not attempt to escape the worktree
+/// or trigger runaway recursive scans of root or home filesystems.
+pub fn validate_bash_command(command: &str) -> Result<(), &'static str> {
+    let trimmed = command.trim();
+
+    // 1. Block recursive searches starting at root, home, or system directories
+    const FORBIDDEN_SEARCHES: &[&str] = &[
+        "find / ",
+        "find / -",
+        "find /\"",
+        "find /'",
+        "find ~",
+        "find /home",
+        "find /root",
+        "find /etc",
+        "find /var",
+        "find /usr",
+        "grep -rn / ",
+        "grep -r / ",
+    ];
+
+    for token in FORBIDDEN_SEARCHES {
+        if trimmed.contains(token) {
+            return Err("Scanning root '/' or system directories is forbidden. Confine searches to the current repository ($PWD).");
+        }
+    }
+
+    // 2. Block escaping to parent or root directory via cd
+    const FORBIDDEN_CDS: &[&str] = &[
+        "cd / ",
+        "cd /;",
+        "cd /&&",
+        "cd /||",
+        "cd /home",
+        "cd ~",
+        "cd $HOME",
+        "cd /root",
+    ];
+
+    for token in FORBIDDEN_CDS {
+        if trimmed.contains(token) || trimmed.ends_with("cd /") {
+            return Err("Navigating outside the repository with 'cd' is forbidden. All files are in $PWD.");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::AgentRunner;
@@ -635,5 +693,27 @@ mod tests {
         s.push_str(&"b".repeat(9000));
         let truncated = super::truncate_output(&s);
         assert!(truncated.contains("... [Truncated"));
+    }
+
+    #[test]
+    fn test_validate_bash_command_blocks_escapes() {
+        use super::validate_bash_command;
+
+        // Blocked: root find
+        assert!(validate_bash_command("find / -name 'foo'").is_err());
+        assert!(validate_bash_command("find ~ -name 'foo'").is_err());
+        assert!(validate_bash_command("find /home -name 'foo'").is_err());
+
+        // Blocked: cd to root or home
+        assert!(validate_bash_command("cd / && ls").is_err());
+        assert!(validate_bash_command("cd /home && ls").is_err());
+        assert!(validate_bash_command("cd ~").is_err());
+        assert!(validate_bash_command("cd /").is_err());
+
+        // Allowed: within worktree
+        assert!(validate_bash_command("find . -name 'foo'").is_ok());
+        assert!(validate_bash_command("find src -type f").is_ok());
+        assert!(validate_bash_command("cd src && cargo test").is_ok());
+        assert!(validate_bash_command("grep -rn 'WorkerState' src/").is_ok());
     }
 }
