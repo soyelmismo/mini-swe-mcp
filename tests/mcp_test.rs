@@ -467,3 +467,84 @@ fn test_tools_list_schema() {
         "'action' must be required exactly once, got: {required:?}"
     );
 }
+
+#[test]
+fn test_concurrent_pipelined_requests() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    // Send 10 pipelined requests in rapid succession without waiting
+    for id in 100..110 {
+        server.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": if id % 2 == 0 { "ping" } else { "tools/list" }
+        }));
+    }
+
+    // Collect all 10 responses and verify every id is received
+    let mut received_ids = std::collections::HashSet::new();
+    for _ in 100..110 {
+        let resp = server
+            .expect_response("pipelined request")
+            .expect("must return response");
+        let id = resp["id"].as_i64().expect("valid integer id");
+        received_ids.insert(id);
+    }
+
+    assert_eq!(received_ids.len(), 10);
+    for id in 100..110 {
+        assert!(received_ids.contains(&id), "missing id {id}");
+    }
+}
+
+#[test]
+fn test_tools_call_prune_with_progress_token_emits_notifications() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 200,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": {
+                "action": "prune",
+                "repo_path": "."
+            },
+            "_meta": {
+                "progressToken": "token-prune-xyz"
+            }
+        }
+    }));
+
+    // Expect progress notification 0/1
+    let notif1 = server
+        .expect_response("first progress notification")
+        .expect("must receive notification");
+    assert_eq!(notif1["method"], json!("notifications/progress"));
+    assert_eq!(
+        notif1["params"]["progressToken"],
+        json!("token-prune-xyz")
+    );
+    assert_eq!(notif1["params"]["progress"], json!(0));
+
+    // Expect progress notification 1/1
+    let notif2 = server
+        .expect_response("second progress notification")
+        .expect("must receive notification");
+    assert_eq!(notif2["method"], json!("notifications/progress"));
+    assert_eq!(
+        notif2["params"]["progressToken"],
+        json!("token-prune-xyz")
+    );
+    assert_eq!(notif2["params"]["progress"], json!(1));
+
+    // Expect final response
+    let final_resp = server
+        .expect_response("final tools/call response")
+        .expect("must receive tool response");
+    assert_eq!(final_resp["id"], json!(200));
+    assert!(final_resp.get("result").is_some());
+}

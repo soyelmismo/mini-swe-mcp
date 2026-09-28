@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::manifest::ModelManifest;
@@ -28,6 +29,7 @@ struct JsonRpcResponse {
     error: Option<Value>,
 }
 
+#[derive(Clone)]
 pub struct McpServer {
     pool: Arc<WorkerPool>,
     default_model: String,
@@ -50,6 +52,22 @@ impl McpServer {
 
         info!("Mini-SWE-MCP server listening on stdio");
 
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(128);
+
+        // Dedicated background writer draining stdout messages
+        let stdout_task = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if let Err(e) = stdout.write_all(msg.as_bytes()).await {
+                    error!(error = %e, "Failed writing to stdout");
+                    break;
+                }
+                if let Err(e) = stdout.flush().await {
+                    error!(error = %e, "Failed flushing stdout");
+                    break;
+                }
+            }
+        });
+
         while let Some(line) = reader.next_line().await? {
             let line = line.trim();
             if line.is_empty() {
@@ -69,9 +87,9 @@ impl McpServer {
                             "message": format!("Parse error: {}", e)
                         })),
                     };
-                    let serialized = serde_json::to_string(&resp)? + "\n";
-                    stdout.write_all(serialized.as_bytes()).await?;
-                    stdout.flush().await?;
+                    if let Ok(serialized) = serde_json::to_string(&resp) {
+                        let _ = out_tx.send(serialized + "\n").await;
+                    }
                     continue;
                 }
             };
@@ -82,16 +100,27 @@ impl McpServer {
                 continue;
             }
 
-            let resp = self.handle_request(req).await;
-            let serialized = serde_json::to_string(&resp)? + "\n";
-            stdout.write_all(serialized.as_bytes()).await?;
-            stdout.flush().await?;
+            let server = self.clone();
+            let tx = out_tx.clone();
+            tokio::spawn(async move {
+                let resp = server.handle_request(req, Some(tx.clone())).await;
+                if let Ok(serialized) = serde_json::to_string(&resp) {
+                    let _ = tx.send(serialized + "\n").await;
+                }
+            });
         }
+
+        drop(out_tx);
+        let _ = stdout_task.await;
 
         Ok(())
     }
 
-    async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(
+        &self,
+        req: JsonRpcRequest,
+        progress_tx: Option<mpsc::Sender<String>>,
+    ) -> JsonRpcResponse {
         let id = req.id;
         match req.method.as_str() {
             "ping" => JsonRpcResponse {
@@ -187,7 +216,17 @@ impl McpServer {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-                match self.execute_tool(tool_name, arguments).await {
+                let progress_token = params
+                    .get("_meta")
+                    .and_then(|m| m.get("progressToken"))
+                    .or_else(|| arguments.get("_meta").and_then(|m| m.get("progressToken")))
+                    .or_else(|| arguments.get("progressToken"))
+                    .cloned();
+
+                match self
+                    .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
+                    .await
+                {
                     Ok(val) => JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
@@ -250,6 +289,16 @@ impl McpServer {
     }
 
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
+        self.execute_tool_with_progress(name, args, None, None).await
+    }
+
+    pub async fn execute_tool_with_progress(
+        &self,
+        name: &str,
+        args: Value,
+        progress_token: Option<Value>,
+        progress_tx: Option<mpsc::Sender<String>>,
+    ) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
         }
@@ -293,16 +342,76 @@ impl McpServer {
                     .dispatch(task, resolved_model, temperature, repo_path, max_turns)
                     .await?;
 
+                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": token,
+                            "progress": 0,
+                            "total": max_turns,
+                            "message": format!("Worker {wid} dispatched in isolated worktree")
+                        }
+                    });
+                    if let Ok(serialized) = serde_json::to_string(&notif) {
+                        let _ = tx.send(serialized + "\n").await;
+                    }
+                }
+
                 if wait {
+                    let mut last_reported_step = 0;
                     // Poll until completed or failed
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         if let Some(state) = self.pool.get_worker_state(&wid).await {
                             match state {
+                                crate::pool::WorkerState::Running {
+                                    step,
+                                    ref last_command,
+                                    ..
+                                } => {
+                                    if step > last_reported_step {
+                                        last_reported_step = step;
+                                        if let (Some(token), Some(tx)) =
+                                            (&progress_token, &progress_tx)
+                                        {
+                                            let notif = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "notifications/progress",
+                                                "params": {
+                                                    "progressToken": token,
+                                                    "progress": step,
+                                                    "total": max_turns,
+                                                    "message": format!("Step {step}/{max_turns}: {last_command}")
+                                                }
+                                            });
+                                            if let Ok(serialized) = serde_json::to_string(&notif) {
+                                                let _ = tx.send(serialized + "\n").await;
+                                            }
+                                        }
+                                    }
+                                }
                                 crate::pool::WorkerState::Completed { .. }
                                 | crate::pool::WorkerState::Failed { .. } => {
+                                    if let (Some(token), Some(tx)) =
+                                        (&progress_token, &progress_tx)
+                                    {
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": {
+                                                "progressToken": token,
+                                                "progress": max_turns,
+                                                "total": max_turns,
+                                                "message": format!("Worker {wid} finished execution")
+                                            }
+                                        });
+                                        if let Ok(serialized) = serde_json::to_string(&notif) {
+                                            let _ = tx.send(serialized + "\n").await;
+                                        }
+                                    }
                                     let logs =
-                                         self.pool.get_worker_logs(&wid).await.unwrap_or_default();
+                                        self.pool.get_worker_logs(&wid).await.unwrap_or_default();
                                     return Ok(json!({
                                         "worker_id": wid,
                                         "state": state,
@@ -314,6 +423,23 @@ impl McpServer {
                                     step,
                                     ..
                                 } => {
+                                    if let (Some(token), Some(tx)) =
+                                        (&progress_token, &progress_tx)
+                                    {
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": {
+                                                "progressToken": token,
+                                                "progress": step,
+                                                "total": max_turns,
+                                                "message": format!("Worker {wid} paused: waiting for orchestrator steering")
+                                            }
+                                        });
+                                        if let Ok(serialized) = serde_json::to_string(&notif) {
+                                            let _ = tx.send(serialized + "\n").await;
+                                        }
+                                    }
                                     return Ok(json!({
                                         "worker_id": wid,
                                         "status": "needs_input",
@@ -322,7 +448,6 @@ impl McpServer {
                                         "message": "Worker is paused waiting for orchestrator steering."
                                     }));
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -384,7 +509,37 @@ impl McpServer {
 
             "prune" => {
                 let repo_path = Self::get_repo_path(&args);
+                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": token,
+                            "progress": 0,
+                            "total": 1,
+                            "message": "Pruning stale worktrees and dead worker branches"
+                        }
+                    });
+                    if let Ok(serialized) = serde_json::to_string(&notif) {
+                        let _ = tx.send(serialized + "\n").await;
+                    }
+                }
                 crate::worktree::prune_stale_worktrees(&repo_path);
+                if let (Some(token), Some(tx)) = (&progress_token, &progress_tx) {
+                    let notif = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": token,
+                            "progress": 1,
+                            "total": 1,
+                            "message": "Prune complete"
+                        }
+                    });
+                    if let Ok(serialized) = serde_json::to_string(&notif) {
+                        let _ = tx.send(serialized + "\n").await;
+                    }
+                }
                 Ok(json!({
                     "status": "pruned",
                     "message": "Stale worktrees and dead worker branches cleaned up"
