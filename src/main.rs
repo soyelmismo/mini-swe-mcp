@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::ModelManifest;
-use mini_swe_mcp::mcp::McpServer;
+use mini_swe_mcp::mcp::{McpServer, WORKER_ACTIONS};
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 use mini_swe_mcp::worktree;
 use std::env;
@@ -261,15 +261,16 @@ where
             }
             "manifest" | "list" => {}
             _ => {
-                if let Some(suggestion) = suggest_action(action, AVAILABLE_ACTIONS) {
+                let actions = available_actions();
+                if let Some(suggestion) = suggest_action(action, &actions) {
                     eprintln!(
                         "Unknown action: {action}. Did you mean '{suggestion}'?\nAvailable: {}",
-                        AVAILABLE_ACTIONS.join(", ")
+                        actions.join(", ")
                     );
                 } else {
                     eprintln!(
                         "Unknown action: {action}. Available: {}",
-                        AVAILABLE_ACTIONS.join(", ")
+                        actions.join(", ")
                     );
                 }
                 std::process::exit(1);
@@ -356,9 +357,19 @@ where
     }
 }
 
-const AVAILABLE_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune", "monitor", "supervisor",
-];
+/// CLI-only verbs, i.e. actions the binary handles directly instead of
+/// dispatching through the `worker` tool.
+const CLI_ONLY_ACTIONS: &[&str] = &["monitor", "supervisor"];
+
+/// Everything the CLI accepts: the tool's own actions (single-sourced from the
+/// MCP server) plus the CLI-only verbs.
+fn available_actions() -> Vec<&'static str> {
+    WORKER_ACTIONS
+        .iter()
+        .copied()
+        .chain(CLI_ONLY_ACTIONS.iter().copied())
+        .collect()
+}
 
 fn levenshtein(a: &str, b: &str) -> usize {
     let mut prev: Vec<usize> = (0..=b.len()).collect();
