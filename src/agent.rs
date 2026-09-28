@@ -196,3 +196,41 @@ impl AgentRunner {
         Ok((combined, output.status.code()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AgentRunner;
+
+    fn runner() -> AgentRunner {
+        AgentRunner::new(
+            "http://localhost".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            None,
+        )
+    }
+
+    #[test]
+    fn extract_command_single_line_bash() {
+        let reply = "Run this:\n```bash\necho hello\n```";
+
+        assert_eq!(runner().extract_command(reply), Some("echo hello".to_string()));
+    }
+
+    #[test]
+    fn extract_command_multiline_bash() {
+        let reply = "```bash\ncd /tmp\nls -la\n```";
+
+        assert_eq!(
+            runner().extract_command(reply),
+            Some("cd /tmp\nls -la".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_command_missing_bash_block() {
+        let reply = "There is no command block in this response.";
+
+        assert_eq!(runner().extract_command(reply), None);
+    }
+}
