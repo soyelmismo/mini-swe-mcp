@@ -185,6 +185,19 @@ impl WorkerPool {
                 });
             }
 
+            // Proactive turn warning when approaching limit (at 5 and 2 turns remaining)
+            let remaining = current_max_turns.saturating_sub(step);
+            if remaining == 5 || remaining == 2 {
+                info!(worker = %worker_id, step, current_max_turns, "Injecting proactive turn limit warning");
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: format!(
+                        "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
+                        step, current_max_turns, remaining
+                    ),
+                });
+            }
+
             // 1. Run LLM step with silent retry for empty / no-command responses
             let mut llm_reply = runner.run_step_llm(&messages).await?;
             let mut command = runner.extract_command(&llm_reply);
