@@ -82,10 +82,19 @@ where
     }
 }
 
+    let default_level = if cli_args.len() > 1 && cli_args[1] != "--stdio" && cli_args[1] != "dispatch" {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::INFO
+    };
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::default().add_directive(default_level.into()));
+
     // Crucial: log to STDERR, because STDOUT is dedicated to MCP JSON-RPC protocol
     tracing_subscriber::registry()
         .with(fmt::layer().event_format(ShortFormatter).with_writer(std::io::stderr))
-        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with(env_filter)
         .init();
 
     // 1. Try loading from current working directory or ancestor directories
