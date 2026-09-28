@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         .unwrap_or(64); // Supports up to 64 concurrent subagents out of the box
 
     let pool = WorkerPool::new(max_workers, api_base, api_key);
-    let server = McpServer::new(pool, default_model, manifest);
+    let server = McpServer::new(pool.clone(), default_model, manifest);
 
     let cli_args: Vec<String> = env::args().collect();
     if cli_args.len() > 1 && cli_args[1] != "--stdio" {
@@ -150,9 +150,61 @@ async fn main() -> Result<()> {
             }
         }
 
-        let result = server
+        let mut result = server
             .execute_tool("worker", serde_json::Value::Object(tool_args))
             .await?;
+
+        while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
+            let wid = result["worker_id"].as_str().unwrap_or("").to_string();
+            let q = result["question"].as_str().unwrap_or("");
+            eprintln!("\n[mini-swe] Worker {} is PAUSED: {}", wid, q);
+            eprint!("Reply with guidance (or press Enter to abort): ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                eprintln!("[mini-swe] No input provided; terminating worker.");
+                pool.kill(&wid).await;
+                break;
+            }
+
+            pool.steer(&wid, input).await?;
+            eprintln!("[mini-swe] Guidance sent. Resuming execution...");
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Some(state) = pool.get_worker_state(&wid).await {
+                    match state {
+                        pool::WorkerState::Completed { .. }
+                        | pool::WorkerState::Failed { .. } => {
+                            let logs = pool.get_worker_logs(&wid).await.unwrap_or_default();
+                            result = serde_json::json!({
+                                "worker_id": wid,
+                                "state": state,
+                                "logs": logs
+                            });
+                            break;
+                        }
+                        pool::WorkerState::Paused {
+                            ref question,
+                            step,
+                            ..
+                        } => {
+                            result = serde_json::json!({
+                                "worker_id": wid,
+                                "status": "needs_input",
+                                "question": question,
+                                "step": step,
+                                "message": "Worker is paused waiting for orchestrator steering."
+                            });
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
