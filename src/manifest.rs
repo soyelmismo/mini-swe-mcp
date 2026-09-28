@@ -4,6 +4,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+use crate::config::xdg_config_dir;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDefinition {
     pub id: String,
@@ -54,52 +56,53 @@ impl Default for ModelManifest {
 
 impl ModelManifest {
     pub fn load() -> Self {
+        let mut candidates = Vec::with_capacity(4);
+
         // 1. Explicit environment variable MODELS_FILE
         if let Ok(path) = env::var("MODELS_FILE") {
-            let p = PathBuf::from(path);
-            if p.exists()
-                && let Ok(manifest) = Self::from_file(&p) {
-                    info!(path = %p.display(), "Loaded model manifest from MODELS_FILE");
-                    return manifest;
-                }
+            candidates.push((PathBuf::from(path), "MODELS_FILE"));
         }
 
         // 2. Local working directory models.yaml
-        let local_path = PathBuf::from("models.yaml");
-        if local_path.exists()
-            && let Ok(manifest) = Self::from_file(&local_path) {
-                info!(path = %local_path.display(), "Loaded model manifest from current directory");
-                return manifest;
-            }
+        candidates.push((PathBuf::from("models.yaml"), "current directory"));
 
         // 3. Standard XDG config directory (~/.config/mini-swe/models.yaml)
-        let config_dir = env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| env::var("HOME").map(|h| Path::new(&h).join(".config")))
-            .ok();
-
-        if let Some(dir) = config_dir {
-            let xdg_path = dir.join("mini-swe").join("models.yaml");
-            if xdg_path.exists()
-                && let Ok(manifest) = Self::from_file(&xdg_path) {
-                    info!(path = %xdg_path.display(), "Loaded model manifest from XDG config directory");
-                    return manifest;
-                }
+        if let Some(dir) = xdg_config_dir() {
+            candidates.push((
+                dir.join("mini-swe").join("models.yaml"),
+                "XDG config directory",
+            ));
         }
 
         // 4. Alongside the executable
         if let Ok(exe) = env::current_exe()
-            && let Some(parent) = exe.parent() {
-                let exe_model_path = parent.join("models.yaml");
-                if exe_model_path.exists()
-                    && let Ok(manifest) = Self::from_file(&exe_model_path) {
-                        info!(path = %exe_model_path.display(), "Loaded model manifest from executable directory");
-                        return manifest;
-                    }
+            && let Some(parent) = exe.parent()
+        {
+            candidates.push((parent.join("models.yaml"), "executable directory"));
+        }
+
+        for (path, source) in candidates {
+            if let Some(manifest) = Self::from_candidate(&path, source) {
+                return manifest;
             }
+        }
 
         info!("No models.yaml found; using default built-in manifest (ninja & nerd)");
         Self::default()
+    }
+
+    fn from_candidate(path: &Path, source: &str) -> Option<Self> {
+        if !path.exists() {
+            return None;
+        }
+
+        match Self::from_file(path) {
+            Ok(manifest) => {
+                info!(path = %path.display(), "Loaded model manifest from {source}");
+                Some(manifest)
+            }
+            Err(_) => None,
+        }
     }
 
     fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -109,19 +112,13 @@ impl ModelManifest {
     }
 
     pub fn resolve_model(&self, requested: &str) -> (String, Option<f32>, Option<usize>) {
-        if let Some(def) = self.models.get(requested) {
-            return (def.id.clone(), def.temperature, def.max_turns);
-        }
-
-        // Check if requested matches any model.id directly
-        for def in self.models.values() {
-            if def.id == requested {
-                return (def.id.clone(), def.temperature, def.max_turns);
-            }
-        }
-
-        // Fallback: use requested name directly
-        (requested.to_string(), None, None)
+        self.models
+            .get(requested)
+            .or_else(|| self.models.values().find(|def| def.id == requested))
+            .map_or_else(
+                || (requested.to_string(), None, None),
+                |def| (def.id.clone(), def.temperature, def.max_turns),
+            )
     }
 
     pub fn build_tool_description(&self) -> String {

@@ -10,6 +10,14 @@ pub struct WorktreeGuard {
     pub keep: bool,
 }
 
+fn git(dir: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to execute git {operation}"))
+}
+
 impl WorktreeGuard {
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
         let branch = format!("worker-{}", worker_id);
@@ -22,11 +30,18 @@ impl WorktreeGuard {
 
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
 
-        let output = Command::new("git")
-            .current_dir(repo_root)
-            .args(["worktree", "add", "-b", &branch, path.to_str().unwrap(), "HEAD"])
-            .output()
-            .context("Failed to execute git worktree add")?;
+        let output = git(
+            repo_root,
+            "worktree add",
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -43,16 +58,9 @@ impl WorktreeGuard {
 
     pub fn get_diff(&self) -> Result<String> {
         // Stage untracked files intent-to-add so git diff captures new files as well
-        let _ = Command::new("git")
-            .current_dir(&self.path)
-            .args(["add", "-N", "."])
-            .output();
+        let _ = git(&self.path, "add", &["add", "-N", "."]);
 
-        let output = Command::new("git")
-            .current_dir(&self.path)
-            .args(["diff", "HEAD"])
-            .output()
-            .context("Failed to execute git diff")?;
+        let output = git(&self.path, "diff", &["diff", "HEAD"])?;
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
@@ -67,19 +75,21 @@ impl Drop for WorktreeGuard {
 
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        let _ = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["worktree", "remove", "--force", self.path.to_str().unwrap()])
-            .output();
-
-        let _ = Command::new("git")
-            .current_dir(&self.repo_root)
-            .args(["branch", "-D", &self.branch])
-            .output();
+        let _ = git(
+            &self.repo_root,
+            "worktree remove",
+            &["worktree", "remove", "--force", self.path.to_str().unwrap()],
+        );
+        let _ = git(
+            &self.repo_root,
+            "branch -D",
+            &["branch", "-D", &self.branch],
+        );
 
         if self.path.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.path) {
-                error!(error = %e, path = %self.path.display(), "Failed to delete leftover worktree directory");
-            }
+            && let Err(e) = std::fs::remove_dir_all(&self.path)
+        {
+            error!(error = %e, path = %self.path.display(), "Failed to delete leftover worktree directory");
+        }
     }
 }

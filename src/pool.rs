@@ -41,6 +41,16 @@ pub struct WorkerRecord {
     pub handle: Option<JoinHandle<()>>,
 }
 
+impl WorkerRecord {
+    fn fail(&mut self, error: impl Into<String>) {
+        self.state = WorkerState::Failed {
+            error: error.into(),
+            step: self.logs.len(),
+            failed_at: unix_timestamp(),
+        };
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
@@ -68,10 +78,7 @@ impl WorkerPool {
         max_turns: usize,
     ) -> Result<String> {
         let worker_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_timestamp();
 
         let initial_record = WorkerRecord {
             id: worker_id.clone(),
@@ -87,22 +94,23 @@ impl WorkerPool {
             handle: None,
         };
 
-        self.workers.write().await.insert(worker_id.clone(), initial_record);
+        self.workers
+            .write()
+            .await
+            .insert(worker_id.clone(), initial_record);
 
         let pool = self.clone();
         let wid = worker_id.clone();
 
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = pool.run_worker(wid.clone(), task, model, temperature, repo_path, max_turns).await {
+            if let Err(e) = pool
+                .run_worker(wid.clone(), task, model, temperature, repo_path, max_turns)
+                .await
+            {
                 error!(worker = %wid, error = %e, "Worker failed with error");
                 let mut lock = pool.workers.write().await;
                 if let Some(w) = lock.get_mut(&wid) {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                    w.state = WorkerState::Failed {
-                        error: e.to_string(),
-                        step: w.logs.len(),
-                        failed_at: now,
-                    };
+                    w.fail(e.to_string());
                 }
             }
         });
@@ -128,7 +136,12 @@ impl WorkerPool {
         info!(worker = %worker_id, model = %model, "Starting worker execution");
 
         let worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
-        let runner = AgentRunner::new(self.api_base.clone(), self.api_key.clone(), model, temperature);
+        let runner = AgentRunner::new(
+            self.api_base.clone(),
+            self.api_key.clone(),
+            model,
+            temperature,
+        );
 
         let mut messages = vec![
             ChatMessage {
@@ -184,10 +197,15 @@ impl WorkerPool {
             {
                 let mut lock = self.workers.write().await;
                 if let Some(w) = lock.get_mut(&worker_id)
-                    && let WorkerState::Running { step: ref mut s, ref mut last_command, .. } = w.state {
-                        *s = step;
-                        *last_command = cmd_summary.clone();
-                    }
+                    && let WorkerState::Running {
+                        step: ref mut s,
+                        ref mut last_command,
+                        ..
+                    } = w.state
+                {
+                    *s = step;
+                    *last_command = cmd_summary.clone();
+                }
             }
 
             if is_finish {
@@ -203,7 +221,11 @@ impl WorkerPool {
                 step,
                 command: cmd_summary,
                 output: if output.len() > 500 {
-                    format!("{}... [{} bytes truncated]", &output[..500], output.len() - 500)
+                    format!(
+                        "{}... [{} bytes truncated]",
+                        &output[..500],
+                        output.len() - 500
+                    )
                 } else {
                     output.clone()
                 },
@@ -233,7 +255,7 @@ impl WorkerPool {
         }
 
         let diff = worktree.get_diff()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = unix_timestamp();
 
         let mut lock = self.workers.write().await;
         if let Some(w) = lock.get_mut(&worker_id) {
@@ -293,17 +315,19 @@ impl WorkerPool {
             if let Some(handle) = w.handle.take() {
                 handle.abort();
             }
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            w.state = WorkerState::Failed {
-                error: "Manually terminated by user/orchestrator".into(),
-                step: w.logs.len(),
-                failed_at: now,
-            };
+            w.fail("Manually terminated by user/orchestrator");
             true
         } else {
             false
         }
     }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn summarize_command(cmd: &str) -> String {
@@ -318,4 +342,3 @@ fn summarize_command(cmd: &str) -> String {
         "bash".to_string()
     }
 }
-

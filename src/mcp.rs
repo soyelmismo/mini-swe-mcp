@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -205,29 +205,28 @@ impl McpServer {
         }
     }
 
+    fn required_string<'a>(args: &'a Value, name: &str, action: &str) -> Result<&'a str> {
+        args.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("'{name}' is required for action '{action}'"))
+    }
+
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{}'. Only 'worker' is supported.", name);
         }
 
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
         match action {
-            "manifest" => {
-                Ok(json!({
-                    "default_model": self.manifest.default,
-                    "models": self.manifest.models,
-                }))
-            }
+            "manifest" => Ok(json!({
+                "default_model": self.manifest.default,
+                "models": self.manifest.models,
+            })),
 
             "dispatch" => {
-                let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if task.is_empty() {
-                    anyhow::bail!("'task' is required for action 'dispatch'");
-                }
+                let task = Self::required_string(&args, "task", action)?.to_string();
                 let repo_path = PathBuf::from(
                     args.get("repo_path")
                         .and_then(|v| v.as_str())
@@ -238,7 +237,8 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&self.default_model);
 
-                let (resolved_model, def_temp, def_turns) = self.manifest.resolve_model(requested_model);
+                let (resolved_model, def_temp, def_turns) =
+                    self.manifest.resolve_model(requested_model);
 
                 let temperature = args
                     .get("temperature")
@@ -255,7 +255,10 @@ impl McpServer {
 
                 let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                let wid = self.pool.dispatch(task, resolved_model, temperature, repo_path, max_turns).await?;
+                let wid = self
+                    .pool
+                    .dispatch(task, resolved_model, temperature, repo_path, max_turns)
+                    .await?;
 
                 if wait {
                     // Poll until completed or failed
@@ -265,7 +268,8 @@ impl McpServer {
                             match state {
                                 crate::pool::WorkerState::Completed { .. }
                                 | crate::pool::WorkerState::Failed { .. } => {
-                                    let logs = self.pool.get_worker_logs(&wid).await.unwrap_or_default();
+                                    let logs =
+                                        self.pool.get_worker_logs(&wid).await.unwrap_or_default();
                                     return Ok(json!({
                                         "worker_id": wid,
                                         "state": state,
@@ -286,10 +290,7 @@ impl McpServer {
             }
 
             "status" => {
-                let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
-                if wid.is_empty() {
-                    anyhow::bail!("'worker_id' is required for action 'status'");
-                }
+                let wid = Self::required_string(&args, "worker_id", action)?;
                 if let Some(state) = self.pool.get_worker_state(wid).await {
                     Ok(json!({
                         "worker_id": wid,
@@ -301,10 +302,7 @@ impl McpServer {
             }
 
             "collect" => {
-                let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
-                if wid.is_empty() {
-                    anyhow::bail!("'worker_id' is required for action 'collect'");
-                }
+                let wid = Self::required_string(&args, "worker_id", action)?;
                 if let Some(state) = self.pool.get_worker_state(wid).await {
                     let logs = self.pool.get_worker_logs(wid).await.unwrap_or_default();
                     Ok(json!({
@@ -323,27 +321,14 @@ impl McpServer {
             }
 
             "kill" => {
-                let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
-                if wid.is_empty() {
-                    anyhow::bail!("'worker_id' is required for action 'kill'");
-                }
+                let wid = Self::required_string(&args, "worker_id", action)?;
                 let killed = self.pool.kill(wid).await;
                 Ok(json!({ "worker_id": wid, "killed": killed }))
             }
 
             "steer" => {
-                let wid = args.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
-                if wid.is_empty() {
-                    anyhow::bail!("'worker_id' is required for action 'steer'");
-                }
-                let message = args
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if message.is_empty() {
-                    anyhow::bail!("'message' is required for action 'steer'");
-                }
+                let wid = Self::required_string(&args, "worker_id", action)?;
+                let message = Self::required_string(&args, "message", action)?.to_string();
                 self.pool.steer(wid, message).await?;
                 Ok(json!({
                     "worker_id": wid,
