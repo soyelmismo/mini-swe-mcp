@@ -288,7 +288,7 @@ fn test_sync_artifacts_preserves_reports_to_repo_root() {
     let audit_file = audit_dir.join(format!("audit_{id}.md"));
     std::fs::write(&audit_file, "# Subagent Audit Report\nAll clear.").expect("failed to write audit file");
 
-    let synced = guard.sync_artifacts().expect("sync_artifacts failed");
+    let synced = guard.sync_artifacts();
     let expected_rel = format!("audits/audit_{id}.md");
     assert!(
         synced.contains(&expected_rel),
@@ -353,7 +353,7 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
     std::fs::write(&worktree_file, "content v1\n").expect("failed to write audit file");
 
     // First sync copies the file and reports it.
-    let first = guard.sync_artifacts().expect("first sync_artifacts failed");
+    let first = guard.sync_artifacts();
     assert!(
         first.contains(&"audits/stable_audit.md".to_string()),
         "expected the first sync to report audits/stable_audit.md, got: {first:?}"
@@ -373,9 +373,7 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
         .expect("failed to stamp destination mtime");
 
     // The unchanged file is still reported as in sync...
-    let second = guard
-        .sync_artifacts()
-        .expect("second sync_artifacts failed");
+    let second = guard.sync_artifacts();
     assert!(
         second.contains(&"audits/stable_audit.md".to_string()),
         "an unchanged but present artifact must still be reported, got: {second:?}"
@@ -392,7 +390,7 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
 
     // Once the worktree copy actually changes, the sync must pick it up.
     std::fs::write(&worktree_file, "content v2\n").expect("failed to modify audit file");
-    guard.sync_artifacts().expect("third sync_artifacts failed");
+    guard.sync_artifacts();
     let body = std::fs::read_to_string(&destination).expect("failed to read copied artifact");
     assert_eq!(body, "content v2\n", "changed artifact was not re-copied");
 
@@ -428,7 +426,7 @@ fn test_sync_artifacts_never_mirrors_git_build_or_node_modules() {
     }
     std::fs::write(audit_dir.join("keep.md"), "keep me\n").expect("failed to write artifact");
 
-    let synced = guard.sync_artifacts().expect("sync_artifacts failed");
+    let synced = guard.sync_artifacts();
 
     // The genuine artifact is synced and lands in the repo root.
     assert!(
@@ -472,7 +470,7 @@ fn test_sync_artifacts_publishes_files_atomically_without_staging_debris() {
         .expect("failed to write report");
     }
 
-    guard.sync_artifacts().expect("sync_artifacts failed");
+    guard.sync_artifacts();
 
     let destination = repo.join("reports");
     // Every file landed with its exact contents...

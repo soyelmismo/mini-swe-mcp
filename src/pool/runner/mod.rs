@@ -492,7 +492,7 @@ impl WorkerPool {
                 .await?;
         }
 
-        let artifacts = worktree.sync_artifacts().unwrap_or_default();
+        let artifacts = worktree.sync_artifacts();
         if !artifacts.is_empty() {
             info!(
                 worker = %worker_id,

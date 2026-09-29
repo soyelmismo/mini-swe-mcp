@@ -20,7 +20,6 @@
 
 use super::{force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
 
@@ -69,11 +68,19 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// counts as dead.
 #[cfg(unix)]
 fn kill_zero_says_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true)
+    // `kill(pid, 0)` probes for the process without signalling it. `EPERM`
+    // means the process exists but belongs to another user (still alive);
+    // `ESRCH` means no such process. Any other error is unprovable, so fail
+    // open towards keeping work.
+    // SAFETY: `kill` takes no pointers; signal 0 only checks for existence.
+    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+        0 => true,
+        -1 => {
+            let err = std::io::Error::last_os_error();
+            err.raw_os_error() != Some(libc::ESRCH)
+        }
+        _ => true,
+    }
 }
 
 /// `kill -0` is unavailable off-unix; treat liveness as unprovable (keep).
@@ -114,13 +121,8 @@ fn current_uid() -> Option<u32> {
 
 #[cfg(unix)]
 fn read_proc_uid() -> Option<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            return rest.split_whitespace().next()?.parse::<u32>().ok();
-        }
-    }
-    None
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    Some(unsafe { libc::getuid() })
 }
 
 static CURRENT_UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
@@ -242,10 +244,54 @@ fn reclaim_abandoned_worktree(dir: &Path) -> bool {
         return false;
     }
     // The reclaim is now ours alone. The claimed copy is dropped afterwards.
+    salvage_dirty_worktree(dir);
     force_remove_dir(dir);
     remove_target_dirs(dir);
     let _ = std::fs::remove_file(&claimed);
     true
+}
+
+/// Commit any uncommitted changes in a dead worker's worktree onto the branch
+/// it has checked out, so an interrupted worker's work survives the prune.
+///
+/// Both prune paths call this before deleting anything. A registered worktree
+/// is on its own `worker-<id>` branch; the salvage commit makes that branch
+/// unmerged, so the branch sweep preserves it. An orphan directory whose git
+/// metadata is already gone cannot be committed and is skipped (the status
+/// probe fails). Fallback credentials match `guard::commit_changes`.
+fn salvage_dirty_worktree(dir: &Path) {
+    let Ok(status) = git(dir, "status --porcelain", &["status", "--porcelain"]) else {
+        return;
+    };
+    if !status.status.success() || status.stdout.is_empty() {
+        return;
+    }
+    let id = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_prefix("swe-wt-").unwrap_or(n))
+        .unwrap_or("unknown");
+    let msg = format!("worker({id}): salvaged uncommitted work before prune");
+    let _ = git(dir, "add -A", &["add", "-A"]);
+    let committed = git(
+        dir,
+        "commit",
+        &[
+            "-c",
+            "user.name=mini-swe",
+            "-c",
+            "user.email=mini-swe@localhost",
+            "commit",
+            "-m",
+            &msg,
+        ],
+    );
+    match committed {
+        Ok(out) if out.status.success() => {
+            info!(path = %dir.display(), "Salvaged uncommitted worker changes before prune");
+        }
+        _ => error!(path = %dir.display(), "Could not salvage uncommitted worker changes"),
+    }
 }
 
 /// Atomically take exclusive ownership of a lease by renaming it aside.
@@ -297,6 +343,7 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     let wt_path = Path::new(wt);
     let pid_file = pid_file_for(wt_path);
 
+    salvage_dirty_worktree(wt_path);
     let _ = git(
         repo_root,
         "worktree remove",

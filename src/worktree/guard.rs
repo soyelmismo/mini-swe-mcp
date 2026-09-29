@@ -135,12 +135,6 @@ pub struct WorktreeGuard {
     pub branch: String,
     pub repo_root: PathBuf,
     pub base_commit: String,
-    /// When set, [`Drop`] leaves the worktree on disk instead of removing it.
-    ///
-    /// The `.pid` lease is deleted on preservation so the abandoned-worktree
-    /// sweep keeps failing open on it instead of eventually treating it as a
-    /// zombie (audit §05/§08).
-    pub keep: bool,
     pub preserve_branch: bool,
 }
 
@@ -214,7 +208,6 @@ impl WorktreeGuard {
             branch,
             repo_root: repo_root.to_path_buf(),
             base_commit,
-            keep: false,
             preserve_branch: false,
         })
     }
@@ -262,7 +255,7 @@ impl WorktreeGuard {
     /// sites discard the `Result` (`pool::runner` wants the artifact count,
     /// `Drop` is a best-effort safety net), so failing here would abort a
     /// worker's teardown over a single unreadable report.
-    pub fn sync_artifacts(&self) -> Result<Vec<String>> {
+    pub fn sync_artifacts(&self) -> Vec<String> {
         let mut synced = BTreeSet::new();
 
         for dir in ARTIFACT_DIRS {
@@ -280,7 +273,7 @@ impl WorktreeGuard {
             }
         }
 
-        Ok(synced.into_iter().collect())
+        synced.into_iter().collect()
     }
 
     /// Commit all dirty changes in the worktree to preserve work in git history,
@@ -360,22 +353,11 @@ impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         let pid_file = pid_file_for(&self.path);
 
-        if self.keep {
-            // The worktree outlives this process on purpose. Its lease must not
-            // outlive the leaseholder, or a later sweep would see a dead PID and
-            // delete a worktree the user asked to keep. Dropping the `.pid` makes
-            // the pruner fail open and treat the directory as active forever
-            // (audit §05/§08).
-            let _ = std::fs::remove_file(&pid_file);
-            info!(path = %self.path.display(), "Preserving worktree");
-            return;
-        }
-
         // Sync report/audit artifacts to repo root before cleanup. This is the
         // safety net for teardown paths that never reached the explicit call in
         // `pool::runner`; a second run is cheap because unchanged files are
         // skipped rather than recopied.
-        let _ = self.sync_artifacts();
+        self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
         let _ = git(
@@ -389,7 +371,7 @@ impl Drop for WorktreeGuard {
             ],
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it.
-        let has_commits = self.branch_has_commits();
+        let has_commits = !self.preserve_branch && self.branch_has_commits();
 
         if self.preserve_branch || has_commits {
             info!(branch = %self.branch, "Preserving worker branch with committed changes");
@@ -428,6 +410,7 @@ fn tmp_sibling_name(dir: &Path, file_name: &str) -> PathBuf {
     ))
 }
 
+
 /// True when `dst` already holds `src`'s exact bytes.
 ///
 /// Length is compared first (one `stat`, and it rules out the overwhelming
@@ -450,6 +433,7 @@ fn is_up_to_date(src: &Path, dst: &Path) -> bool {
         _ => false,
     }
 }
+
 
 /// Copy `src` onto `dst` atomically.
 ///

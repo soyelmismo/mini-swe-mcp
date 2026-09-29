@@ -12,7 +12,7 @@
 //! (missing, unreadable, malformed or foreign lease) must be preserved.
 
 use mini_swe_mcp::worktree::{
-    WorktreeGuard, claim_lease_for_test, is_process_alive, prune_stale_worktrees_in,
+    claim_lease_for_test, is_process_alive, prune_stale_worktrees_in,
     worktree_is_stale_for_test,
 };
 use std::path::{Path, PathBuf};
@@ -358,54 +358,41 @@ fn orphan_branch_pruning_respects_unmerged_commits() {
     );
 }
 
-/// Test 7 — `keep = true` preserves the worktree, and the preserved worktree
-/// also survives a later sweep (its lease is not left pointing at a PID that
-/// will eventually die).
+/// Test 7 — a registered worktree whose owner died with uncommitted work is
+/// salvaged before the prune: the change is committed onto its own
+/// `worker-<id>` branch, which is then preserved, while the directory goes.
 #[test]
-fn kept_worktree_survives_its_own_drop_and_a_later_sweep() {
-    let repo = std::env::temp_dir().join(unique("keep"));
-    let _ = std::fs::remove_dir_all(&repo);
-    std::fs::create_dir_all(&repo).unwrap();
-    run(&repo, &["init", "-b", "master"]);
-    run(&repo, &["config", "user.name", "mini-swe-test"]);
-    run(&repo, &["config", "user.email", "test@localhost"]);
-    std::fs::write(repo.join("README.md"), "# Baseline\n").unwrap();
-    run(&repo, &["add", "README.md"]);
-    run(&repo, &["commit", "-m", "Initial baseline commit"]);
-
-    let (path, branch) = {
-        let id = unique("keep");
-        let mut guard = WorktreeGuard::new(&repo, &id).expect("worktree creation failed");
-        guard.keep = true;
-        std::fs::write(guard.path.join("work.txt"), "kept\n").unwrap();
-        (guard.path.clone(), guard.branch.clone())
+fn dirty_worktree_is_salvaged_before_prune() {
+    let f = Fixture::new("salvage");
+    let id = unique("salvage");
+    let dir = f.base.join(format!("swe-wt-{id}"));
+    let branch = format!("worker-{id}");
+    let pid_file = {
+        let mut s = dir.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
     };
+    run(&f.repo, &["worktree", "add", "-b", &branch, dir.to_str().unwrap(), "HEAD"]);
+    f.write_dead_lease(&pid_file);
+    std::fs::write(dir.join("precious.txt"), "uncommitted worker output\n").unwrap();
 
-    assert!(path.is_dir(), "keep = true still removed the worktree directory");
-    assert!(branch_exists(&repo, &branch), "keep = true removed the branch");
+    f.sweep();
 
-    // The lease must be gone: leaving it would let a later sweep see a dead PID
-    // and destroy the worktree the user asked to keep.
-    let mut pid_name = path.clone().into_os_string();
-    pid_name.push(".pid");
-    let pid_file = PathBuf::from(pid_name);
+    assert!(!dir.exists(), "dirty worktree directory survived the sweep");
     assert!(
-        !pid_file.exists(),
-        "kept worktree left a lease behind that would later be treated as a zombie"
+        branch_exists(&f.repo, &branch),
+        "salvaged branch {branch} was destroyed"
     );
-
-    // A later sweep, run with this repo's worktree listed but the keeper process
-    // (the test binary) still alive, must still keep it.
-    let base = path.parent().unwrap().to_path_buf();
-    prune_stale_worktrees_in(&repo, std::slice::from_ref(&base));
+    let log = run(&f.repo, &["log", "-1", "--pretty=%s", &branch]);
     assert!(
-        path.is_dir(),
-        "kept worktree was pruned by a later sweep after its owner exited"
+        log.contains("salvaged uncommitted work before prune"),
+        "salvage commit missing: {log}"
     );
-
-    let _ = try_run(&repo, &["worktree", "remove", "--force", path.to_str().unwrap()]);
-    let _ = try_run(&repo, &["branch", "-D", &branch]);
-    let _ = std::fs::remove_dir_all(&repo);
+    let body = run(&f.repo, &["show", &format!("{branch}:precious.txt")]);
+    assert!(
+        body.contains("uncommitted worker output"),
+        "salvaged change was not committed: {body}"
+    );
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
