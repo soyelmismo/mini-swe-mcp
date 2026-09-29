@@ -748,3 +748,23 @@ fn reclaim_leaves_no_claim_debris() {
         "claim debris left in the base dir: {leftovers:?}"
     );
 }
+
+/// The target's name may sort before its worktree's name in the directory
+/// stream. Reclamation must remove both regardless of encounter order.
+#[test]
+fn orphan_removes_target_in_custom_base() {
+    let f = Fixture::new("target-order");
+    let orphan = f.base.join(format!("swe-wt-{}", unique("target-order")));
+    let target = f.base.join(format!(
+        "swe-target-{}",
+        orphan.file_name().unwrap().to_str().unwrap()
+    ));
+    let mut name = orphan.clone().into_os_string();
+    name.push(".pid");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    f.write_dead_lease(&PathBuf::from(name));
+    f.sweep();
+    assert!(!orphan.exists());
+    assert!(!target.exists());
+}
