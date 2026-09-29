@@ -40,7 +40,7 @@ pub use self::buffer::{
 };
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
-    WorkerMeta, WorkerRegistryEntry, extract_group, load_all_registry_entries, load_registry_entry,
+    RegistryStatus, WorkerMeta, WorkerRegistryEntry, extract_group, load_all_registry_entries, load_registry_entry,
     registry_dir,
     remove_registry_entry, save_registry_entry,
 };
@@ -192,7 +192,7 @@ impl WorkerPool {
             handle: None,
         };
 
-        meta.save_status(&model, "running", 0, max_turns, "initializing", None);
+        meta.save_status(&model, RegistryStatus::Running, 0, max_turns, "initializing", None);
 
         {
             // Prune stale terminal records *before* inserting, so a long-lived
@@ -227,7 +227,7 @@ impl WorkerPool {
                 }
                 meta_for_fail.save_status(
                     &model_for_fail,
-                    "failed",
+                    RegistryStatus::Failed,
                     0,
                     max_turns,
                     &format!("error: {e}"),
@@ -327,14 +327,7 @@ impl WorkerPool {
                         "model": e.model,
                         "group": e.group.as_deref().unwrap_or("default"),
                         "state": {
-                            "status": match e.status.as_str() {
-                                "running" => "Running",
-                                "reviewing" => "Reviewing",
-                                "completed" => "Completed",
-                                "paused" => "Paused",
-                                "failed" => "Failed",
-                                _ => "Stopped",
-                            },
+                            "status": e.status.display_name(),
                             "step": e.step,
                             "turns": e.step,
                             "last_command": e.last_command,

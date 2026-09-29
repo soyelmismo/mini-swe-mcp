@@ -27,7 +27,7 @@
 //! repository finishing early is visible both in its own table and in the
 //! fleet-wide strip.
 
-use crate::pool::{WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
+use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -394,32 +394,32 @@ fn turns_cell(step: usize, max_turns: usize, layout: &Layout) -> String {
 }
 
 /// Whether a status is terminal (its uptime is frozen, not still counting).
-fn is_terminal_status(status: &str) -> bool {
-    status == "completed" || status == "failed" || status == "stopped"
+fn is_terminal_status(status: RegistryStatus) -> bool {
+    status.is_terminal()
 }
 
 /// Status cell for a worker: badge text plus colour, padded by the caller.
 ///
 /// `reviewing` is deliberately distinct from `running`: the implementer is
 /// done and an independent reviewer is auditing the diff.
-fn status_cell(status: &str, use_color: bool) -> &'static str {
-    if status == "reviewing" {
+fn status_cell(status: RegistryStatus, use_color: bool) -> &'static str {
+    if status == RegistryStatus::Reviewing {
         return review_badge(use_color);
     }
     if use_color {
         match status {
-            "running" => "\x1b[1;32mRUNNING  \x1b[0m",
-            "paused" => "\x1b[1;33mPAUSED  \x1b[0m",
-            "completed" => "\x1b[1;34mDONE    \x1b[0m",
-            "failed" => "\x1b[1;31mFAILED  \x1b[0m",
+            RegistryStatus::Running => "\x1b[1;32mRUNNING  \x1b[0m",
+            RegistryStatus::Paused => "\x1b[1;33mPAUSED  \x1b[0m",
+            RegistryStatus::Completed => "\x1b[1;34mDONE    \x1b[0m",
+            RegistryStatus::Failed => "\x1b[1;31mFAILED  \x1b[0m",
             _ => "\x1b[2;37mSTOPPED \x1b[0m",
         }
     } else {
         match status {
-            "running" => "RUNNING ",
-            "paused" => "PAUSED  ",
-            "completed" => "DONE    ",
-            "failed" => "FAILED  ",
+            RegistryStatus::Running => "RUNNING ",
+            RegistryStatus::Paused => "PAUSED  ",
+            RegistryStatus::Completed => "DONE    ",
+            RegistryStatus::Failed => "FAILED  ",
             _ => "STOPPED ",
         }
     }
@@ -429,14 +429,14 @@ fn status_cell(status: &str, use_color: bool) -> &'static str {
 fn row_prefix(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool, now: u64) -> String {
     let id = truncate_visible(&w.id, layout.id);
     let pid = format!("{:<width$}", w.pid, width = PID_WIDTH);
-    let duration_secs = if is_terminal_status(&w.status) {
+    let duration_secs = if is_terminal_status(w.status) {
         w.updated_at.saturating_sub(w.started_at)
     } else {
         now.saturating_sub(w.started_at)
     };
     let uptime = format_duration(duration_secs);
 
-    let status = status_cell(&w.status, use_color);
+    let status = status_cell(w.status, use_color);
 
     let turns = turns_cell(w.step, w.max_turns, layout);
     let model = pad_visible(&w.model, layout.model);
@@ -469,12 +469,12 @@ fn stack_row(
     now: u64,
     op: &str,
 ) -> String {
-    let duration_secs = if is_terminal_status(&w.status) {
+    let duration_secs = if is_terminal_status(w.status) {
         w.updated_at.saturating_sub(w.started_at)
     } else {
         now.saturating_sub(w.started_at)
     };
-    let status = status_cell(&w.status, use_color);
+    let status = status_cell(w.status, use_color);
     let first = format!(
         "{}  {}  {}",
         pad_visible(&truncate_visible(&w.id, layout.id), layout.id),
@@ -517,7 +517,7 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
         first_line.to_string()
     };
 
-    let tag = if w.status == "reviewing" {
+    let tag = if w.status == RegistryStatus::Reviewing {
         format!("{} ", review_tag(use_color))
     } else {
         match w.group.as_deref() {
@@ -549,14 +549,14 @@ enum Bucket {
 
 /// Classify a raw registry status; anything unrecognized is `Stopped`, which
 /// is the same catch-all the supervisor already used for terminal workers.
-fn status_bucket(status: &str) -> Bucket {
+fn status_bucket(status: RegistryStatus) -> Bucket {
     match status {
-        "running" => Bucket::Active,
-        "paused" => Bucket::Paused,
-        "reviewing" => Bucket::Reviewing,
-        "completed" => Bucket::Completed,
-        "failed" => Bucket::Failed,
-        _ => Bucket::Stopped,
+        RegistryStatus::Running => Bucket::Active,
+        RegistryStatus::Paused => Bucket::Paused,
+        RegistryStatus::Reviewing => Bucket::Reviewing,
+        RegistryStatus::Completed => Bucket::Completed,
+        RegistryStatus::Failed => Bucket::Failed,
+        RegistryStatus::Stopped => Bucket::Stopped,
     }
 }
 
@@ -592,7 +592,7 @@ impl<'a> RepoGroup<'a> {
 
     /// Append one worker and fold its status into the counters.
     fn push(&mut self, entry: &'a WorkerRegistryEntry) {
-        match status_bucket(&entry.status) {
+        match status_bucket(entry.status) {
             Bucket::Active => self.active += 1,
             Bucket::Paused => self.paused += 1,
             Bucket::Reviewing => self.reviewing += 1,
@@ -657,7 +657,7 @@ pub fn render_dashboard_with_width(
     // dashboard never reshuffles between ticks.
     let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
     for entry in entries {
-        match status_bucket(&entry.status) {
+        match status_bucket(entry.status) {
             Bucket::Active => active += 1,
             Bucket::Paused => paused += 1,
             Bucket::Reviewing => reviewing += 1,
@@ -1020,7 +1020,7 @@ mod tests {
     /// positional 8-argument helper would be unreadable.
     struct Row {
         id: &'static str,
-        status: &'static str,
+        status: RegistryStatus,
         step: usize,
         max_turns: usize,
         command: String,
@@ -1034,7 +1034,7 @@ mod tests {
         fn new(id: &'static str) -> Self {
             Self {
                 id,
-                status: "running",
+                status: RegistryStatus::Running,
                 step: 1,
                 max_turns: 100,
                 command: String::new(),
@@ -1045,7 +1045,7 @@ mod tests {
             }
         }
 
-        fn status(mut self, status: &'static str) -> Self {
+        fn status(mut self, status: RegistryStatus) -> Self {
             self.status = status;
             self
         }
@@ -1087,7 +1087,7 @@ mod tests {
                 pid: 1234,
                 task: self.task,
                 model: "ninja".into(),
-                status: self.status.into(),
+                status: self.status,
                 step: self.step,
                 max_turns: self.max_turns,
                 last_command: self.command,
@@ -1128,7 +1128,7 @@ mod tests {
                 .task("Fix something else")
                 .command("ask")
                 .turns(5, 100)
-                .status("paused")
+                .status(RegistryStatus::Paused)
                 .repo("/home/dev/proj-b")
                 .build(),
             Row::new("c3d4e5f6a7")
@@ -1142,7 +1142,7 @@ mod tests {
                 .task("No repo recorded")
                 .command("completed")
                 .turns(9, 100)
-                .status("completed")
+                .status(RegistryStatus::Completed)
                 .build(),
         ];
 
@@ -1190,14 +1190,14 @@ mod tests {
         // Three domain tags, one repository: the tags must not sub-partition
         // the dashboard, they only prefix the task column of their own row.
         let entries: Vec<WorkerRegistryEntry> = [
-            ("aud001", "running", "audits"),
-            ("perf001", "running", "perf"),
-            ("sec001", "completed", "sec"),
+            ("aud001", RegistryStatus::Running, "audits"),
+            ("perf001", RegistryStatus::Running, "perf"),
+            ("sec001", RegistryStatus::Completed, "sec"),
         ]
         .iter()
         .map(|(id, status, group)| {
             Row::new(id)
-                .status(status)
+                .status(*status)
                 .task("Task for the domain")
                 .command("cargo test")
                 .turns(3, 100)
@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn test_render_dashboard_completed_uptime_is_frozen() {
         let entries = vec![Row::new("done01")
-            .status("completed")
+            .status(RegistryStatus::Completed)
             .task("Finished task")
             .command("completed")
             .repo("local")
@@ -1242,7 +1242,7 @@ mod tests {
     fn test_reviewing_status_is_indicated() {
         let entries = vec![
             Row::new("rev123")
-                .status("reviewing")
+                .status(RegistryStatus::Reviewing)
                 .turns(42, 120)
                 .task("Audit the diff")
                 .command("[review] cargo clippy")
@@ -1415,7 +1415,12 @@ mod tests {
     fn test_colored_rows_stay_aligned() {
         let entries: Vec<WorkerRegistryEntry> = ["c1", "c2", "c3", "c4"]
             .iter()
-            .zip(["running", "reviewing", "completed", "failed"])
+            .zip([
+                RegistryStatus::Running,
+                RegistryStatus::Reviewing,
+                RegistryStatus::Completed,
+                RegistryStatus::Failed,
+            ])
             .map(|(id, status)| {
                 Row::new(id)
                     .status(status)
@@ -1448,14 +1453,14 @@ mod tests {
     #[test]
     fn test_every_line_fits_every_width() {
         let entries: Vec<WorkerRegistryEntry> = [
-            ("w1", "running", "/home/dev/very-long-project-name-here", "[audits]"),
-            ("w2", "reviewing", "/home/dev/very-long-project-name-here", "[audits]"),
-            ("w3", "failed", "local", ""),
+            ("w1", RegistryStatus::Running, "/home/dev/very-long-project-name-here", "[audits]"),
+            ("w2", RegistryStatus::Reviewing, "/home/dev/very-long-project-name-here", "[audits]"),
+            ("w3", RegistryStatus::Failed, "local", ""),
         ]
         .iter()
         .map(|(id, status, repo, group)| {
             let mut row = Row::new(id)
-                .status(status)
+                .status(*status)
                 .task("Refactor the authentication middleware into smaller cohesive pieces")
                 .command("cargo test --all --verbose")
                 .turns(37, 250)

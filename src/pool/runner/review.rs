@@ -23,7 +23,7 @@ use crate::worktree::WorktreeGuard;
 use super::sentinels::summarize_command;
 use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
-use super::super::registry::{WorkerRegistryEntry, save_registry_entry};
+use super::super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::super::unix_timestamp;
@@ -142,7 +142,7 @@ impl WorkerPool {
         pid: std::process::id(),
         task: task.clone(),
         model: reviewer_model.clone(),
-        status: "reviewing".into(),
+        status: RegistryStatus::Reviewing,
         step,
         max_turns: current_max_turns + review_max_turns,
         last_command: "starting review phase".into(),
@@ -239,7 +239,7 @@ impl WorkerPool {
             pid: std::process::id(),
             task: task.clone(),
             model: reviewer_model.clone(),
-            status: "reviewing".into(),
+            status: RegistryStatus::Reviewing,
             step,
             max_turns: current_max_turns + review_max_turns,
             last_command: format!("[review] {}", cmd_summary),

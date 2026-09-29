@@ -13,7 +13,7 @@ use tracing::info;
 
 use super::sentinels::summarize_command;
 use super::super::WorkerPool;
-use super::super::registry::{WorkerRegistryEntry, save_registry_entry};
+use super::super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
 use super::super::state::WorkerState;
 use super::super::unix_timestamp;
 
@@ -82,7 +82,7 @@ impl WorkerPool {
             pid: std::process::id(),
             task: task.to_string(),
             model: model.to_string(),
-            status: "paused".into(),
+            status: RegistryStatus::Paused,
             step,
             max_turns,
             last_command: last_command.to_string(),

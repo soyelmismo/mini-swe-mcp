@@ -7,10 +7,10 @@
 //! repairs these values lives in the `validate` submodule.
 //!
 //! The declarative execution policy ([`ExecutionPolicy`] and its
-//! [`NetworkPolicy`] / [`FsPolicy`] fields) is the exception: it is *data* here
-//! too. Parsing is lenient (every field is optional and an unknown string is
-//! kept verbatim so a warning can name it), while the accept/reject rules for
-//! those strings live in the `rules` submodule.
+//! [`NetworkPolicy`] field) is the exception: it is *data* here too. Parsing
+//! is lenient (every field is optional and an unknown string is kept verbatim
+//! so a warning can name it), while the accept/reject rules for those strings
+//! live in the `rules` submodule.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,9 +39,6 @@ pub const MAX_TURNS_LIMIT: usize = 500;
 /// every message.
 pub const NETWORK_POLICIES: &[&str] = &["offline", "allow"];
 
-/// Accepted values of `policy.fs` in `models.yaml`, from least to most capable.
-pub const FS_POLICIES: &[&str] = &["read-only", "worktree-only", "full"];
-
 /// Inclusive bounds every sampling temperature is clamped into before it can
 /// reach a provider. OpenAI-compatible endpoints reject values outside this
 /// window, some silently clamp, and some ignore the field entirely.
@@ -49,12 +46,12 @@ pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 
 /// Network permission of a model, as declared by `models.yaml`.
 ///
-/// The variants mirror the `network` enum the `dispatch` tool already accepts
-/// (see [`NETWORK_MODES`](crate::mcp::NETWORK_MODES)), so a model-level
-/// declaration and a per-dispatch override spell the policy the same way.
-/// Deserialization is lenient on purpose: an unrecognised string is kept as
-/// [`NetworkPolicy::Other`] instead of failing the whole manifest, which lets
-/// [`ModelManifest::validate`] report it and keep serving the catalog.
+/// The variants mirror the `network` enum the `dispatch` tool already accepts,
+/// so a model-level declaration and a per-dispatch override spell the policy
+/// the same way. Deserialization is lenient on purpose: an unrecognised string
+/// is kept as [`NetworkPolicy::Other`] instead of failing the whole manifest,
+/// which lets [`ModelManifest::validate`] report it and keep serving the
+/// catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
     /// No egress at all: every bash step runs in its own network namespace.
@@ -140,88 +137,6 @@ impl NetworkPolicy {
     }
 }
 
-/// Filesystem confinement of a model, as declared by `models.yaml`.
-///
-/// The three values describe exactly the writable set of a sandboxed worker
-/// (see [`crate::agent::sandbox`]): the widest one is the worktree plus its
-/// build directory, the narrowest is nothing at all. They are listed least to
-/// most capable, and [`FS_POLICIES`] lists them in that same order.
-///
-/// Deliberately not [`Ord`]: the derive would rank [`FsPolicy::Other`] *above*
-/// [`FsPolicy::Full`], so the order would not mean "least privilege" for exactly
-/// the values that most need it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FsPolicy {
-    /// Nothing may be written outside the process' own scratch state.
-    ReadOnly,
-    /// Only the worktree (and its git directory) may be written.
-    WorktreeOnly,
-    /// The worktree *and* its build/target directory.
-    Full,
-    /// Anything else the manifest spelled out, preserved verbatim.
-    ///
-    /// Reported as a warning and repaired to [`FsPolicy::ReadOnly`].
-    Other(String),
-}
-
-/// The value an unrecognised filesystem policy is repaired to: the most
-/// restrictive one. See [`NetworkPolicy`]'s `Default` for why it is not `Full`.
-impl Default for FsPolicy {
-    fn default() -> Self {
-        Self::ReadOnly
-    }
-}
-
-impl<'de> Deserialize<'de> for FsPolicy {
-    /// Delegate to [`FsPolicy::parse`]; see [`NetworkPolicy`]'s impl for why.
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        Ok(Self::parse(&raw))
-    }
-}
-
-impl Serialize for FsPolicy {
-    /// Always emit the canonical spelling.
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-impl FsPolicy {
-    /// The policy as written in `models.yaml`: the canonical spelling for a
-    /// known value, and the user's own text for [`FsPolicy::Other`].
-    ///
-    /// "Declares no filesystem policy at all" is not representable here — that
-    /// is an `Option::None` *field*, i.e. an absent [`ExecutionPolicy::fs`],
-    /// which is what keeps it distinct from declaring `read-only`.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorktreeOnly => "worktree-only",
-            Self::Full => "full",
-            Self::Other(raw) => raw,
-        }
-    }
-
-    /// Whether the model declares this policy explicitly.
-    pub fn is_declared(&self) -> bool {
-        !matches!(self, Self::Other(..))
-    }
-
-    /// Parse a manifest-supplied value, keeping anything unrecognised.
-    ///
-    /// Trims and lower-cases first; `_` is accepted as a separator so both
-    /// `worktree-only` and `worktree_only` name the same policy.
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "read-only" | "readonly" => Self::ReadOnly,
-            "worktree-only" => Self::WorktreeOnly,
-            "full" => Self::Full,
-            _ => Self::Other(raw.trim().to_string()),
-        }
-    }
-}
-
 /// The optional `policy:` block of one model entry.
 ///
 /// Every field defaults to "not declared", which is what keeps the change
@@ -233,15 +148,12 @@ pub struct ExecutionPolicy {
     /// Egress permission, or `None` when the model declares none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkPolicy>,
-    /// Writable filesystem confinement, or `None` when the model declares none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fs: Option<FsPolicy>,
 }
 
 impl ExecutionPolicy {
     /// Whether the policy block declares nothing at all.
     pub fn is_empty(&self) -> bool {
-        self.network.is_none() && self.fs.is_none()
+        self.network.is_none()
     }
 }
 
@@ -280,9 +192,8 @@ impl Default for ModelManifest {
                 max_turns: Some(100),
                 policy: Some(ExecutionPolicy {
                     // The fast executor runs tests and the toolchain, so it keeps
-                    // egress and the full writable set of a sandboxed worker.
+                    // egress.
                     network: Some(NetworkPolicy::Allow),
-                    fs: Some(FsPolicy::Full),
                 }),
             },
         );
@@ -297,7 +208,6 @@ impl Default for ModelManifest {
                     // The deep reasoner is for debugging and refactors: it reads
                     // broadly and must reach its dependencies to do so.
                     network: Some(NetworkPolicy::Allow),
-                    fs: Some(FsPolicy::Full),
                 }),
             },
         );

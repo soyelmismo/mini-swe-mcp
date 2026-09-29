@@ -1013,13 +1013,11 @@ models:
     role: "Isolated refactor."
     policy:
       network: "offline"
-      fs: "read-only"
   runner:
     id: vendor:runner
     role: "Builds and tests."
     policy:
       network: "allow"
-      fs: "worktree-only"
   bare:
     id: vendor:bare
 "#,
@@ -1030,17 +1028,12 @@ models:
         .as_ref()
         .expect("sealed policy");
     assert_eq!(sealed.network.as_ref().map(|n| n.as_str()), Some("offline"));
-    assert_eq!(sealed.fs.as_ref().map(|f| f.as_str()), Some("read-only"));
 
     let runner = manifest.models["runner"]
         .policy
         .as_ref()
         .expect("runner policy");
     assert_eq!(runner.network.as_ref().map(|n| n.as_str()), Some("allow"));
-    assert_eq!(
-        runner.fs.as_ref().map(|f| f.as_str()),
-        Some("worktree-only")
-    );
 
     assert_eq!(
         manifest.models["bare"].policy, None,
@@ -1065,7 +1058,6 @@ models:
     id: vendor:sealed
     policy:
       network: "offine"
-      fs: "unrestricted"
 "#,
     );
 
@@ -1074,10 +1066,6 @@ models:
         warnings.iter().any(|w| w.contains("offine")),
         "the misspelled network value must be reported: {warnings:?}"
     );
-    assert!(
-        warnings.iter().any(|w| w.contains("unrestricted")),
-        "the unknown fs value must be reported: {warnings:?}"
-    );
 
     let normalized = manifest.normalize();
     let policy = normalized.models["sealed"].policy.as_ref().expect("policy");
@@ -1085,11 +1073,6 @@ models:
         policy.network.as_ref().map(|n| n.as_str()),
         Some("offline"),
         "an unrecognised network must be repaired to the restrictive default"
-    );
-    assert_eq!(
-        policy.fs.as_ref().map(|f| f.as_str()),
-        Some("read-only"),
-        "an unrecognised fs value must be repaired to the restrictive default"
     );
     assert!(
         normalized.validate().is_empty(),
@@ -1141,10 +1124,6 @@ fn test_shipped_models_yaml_is_valid_and_policy_annotated() {
         assert!(
             policy.network.as_ref().is_some_and(|n| n.is_declared()),
             "{alias} must declare a known network policy"
-        );
-        assert!(
-            policy.fs.as_ref().is_some_and(|f| f.is_declared()),
-            "{alias} must declare a known fs policy"
         );
     }
 }

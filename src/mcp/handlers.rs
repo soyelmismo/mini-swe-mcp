@@ -216,14 +216,7 @@ impl McpServer {
         if let Some(state) = self.pool.get_worker_state(wid).await {
             Ok(json!({ "worker_id": wid, "state": state }))
         } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
-            let state_name = match entry.status.as_str() {
-                "running" => "Running",
-                "reviewing" => "Reviewing",
-                "completed" => "Completed",
-                "paused" => "Paused",
-                "failed" => "Failed",
-                _ => "Stopped",
-            };
+            let state_name = entry.status.display_name();
             Ok(json!({
                 "worker_id": wid,
                 "task": entry.task,
@@ -235,7 +228,7 @@ impl McpServer {
                         "step": entry.step,
                         "turns": entry.step,
                         "summary": entry.last_command.clone(),
-                        "error": if entry.status == "failed" { Some(entry.last_command) } else { None },
+                        "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                         "question": entry.question,
                         "pid": entry.pid,
                         "started_at": entry.started_at,

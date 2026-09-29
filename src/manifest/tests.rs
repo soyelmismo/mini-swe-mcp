@@ -727,7 +727,7 @@ fn test_alias_for_model_bridges_resolved_ids() {
 // Declarative execution policy (`policy:` in models.yaml)
 // ----------
 
-use crate::manifest::{ExecutionPolicy, FS_POLICIES, FsPolicy, NETWORK_POLICIES, NetworkPolicy};
+use crate::manifest::{ExecutionPolicy, NETWORK_POLICIES, NetworkPolicy};
 
 /// Parse a single-entry manifest carrying the given `policy:` block body.
 fn policy_manifest(block: &str) -> ModelManifest {
@@ -758,32 +758,21 @@ fn test_a_model_without_a_policy_stays_none_and_warns_about_nothing() {
 }
 
 #[test]
-fn test_every_declared_policy_value_is_accepted_verbatim() {
-    let def = |id: &str, network: NetworkPolicy, fs: FsPolicy| ModelDefinition {
+fn test_every_declared_network_policy_value_is_accepted_verbatim() {
+    let def = |id: &str, network: NetworkPolicy| ModelDefinition {
         id: id.to_string(),
         role: None,
         temperature: None,
         max_turns: None,
         policy: Some(ExecutionPolicy {
             network: Some(network),
-            fs: Some(fs),
         }),
     };
     let manifest = ModelManifest {
         default: None,
         models: [
-            (
-                "a".to_string(),
-                def("combo:a", NetworkPolicy::Offline, FsPolicy::ReadOnly),
-            ),
-            (
-                "b".to_string(),
-                def("combo:b", NetworkPolicy::Allow, FsPolicy::Full),
-            ),
-            (
-                "c".to_string(),
-                def("combo:c", NetworkPolicy::Allow, FsPolicy::WorktreeOnly),
-            ),
+            ("a".to_string(), def("combo:a", NetworkPolicy::Offline)),
+            ("b".to_string(), def("combo:b", NetworkPolicy::Allow)),
         ]
         .into_iter()
         .collect(),
@@ -803,13 +792,9 @@ fn test_every_declared_policy_value_is_accepted_verbatim() {
 
 #[test]
 fn test_policy_round_trips_through_yaml() {
-    for (network, fs) in [
-        ("offline", "read-only"),
-        ("allow", "worktree-only"),
-        ("allow", "full"),
-    ] {
+    for network in ["offline", "allow"] {
         let manifest = policy_manifest(&format!(
-            "    policy:\n      network: {network}\n      fs: {fs}\n"
+            "    policy:\n      network: {network}\n"
         ));
         let policy = manifest.models["solo"]
             .policy
@@ -819,32 +804,26 @@ fn test_policy_round_trips_through_yaml() {
             policy.network.as_ref().map(NetworkPolicy::as_str),
             Some(network)
         );
-        assert_eq!(policy.fs.as_ref().map(FsPolicy::as_str), Some(fs));
         assert!(
             manifest.validate().is_empty(),
-            "{network}/{fs} is a documented policy and must not warn"
+            "{network} is a documented policy and must not warn"
         );
     }
 }
 
 #[test]
-fn test_an_unknown_policy_value_warns_and_repairs_to_the_restrictive_default() {
-    let manifest =
-        policy_manifest("    policy:\n      network: \"offine\"\n      fs: \"everything\"\n");
+fn test_an_unknown_network_policy_warns_and_repairs_to_the_restrictive_default() {
+    let manifest = policy_manifest("    policy:\n      network: \"offine\"\n");
 
     let warnings = manifest.validate();
     assert_eq!(
         warnings.len(),
-        2,
-        "both misspelled fields must be reported: {warnings:?}"
+        1,
+        "the misspelled field must be reported: {warnings:?}"
     );
     assert!(
         warnings.iter().any(|w| w.contains("offine")),
         "the network warning must name the value the user wrote: {warnings:?}"
-    );
-    assert!(
-        warnings.iter().any(|w| w.contains("everything")),
-        "the fs warning must name the value the user wrote: {warnings:?}"
     );
 
     let policy = manifest
@@ -859,11 +838,6 @@ fn test_an_unknown_policy_value_warns_and_repairs_to_the_restrictive_default() {
         Some(NetworkPolicy::Offline),
         "an unknown network must fall back to the restrictive default, never \
          to the permissive one: a typo must not widen a sandbox"
-    );
-    assert_eq!(
-        policy.fs,
-        Some(FsPolicy::ReadOnly),
-        "an unknown fs value must fall back to the restrictive default"
     );
     assert!(
         manifest.clone().normalize().validate().is_empty(),
@@ -892,7 +866,7 @@ fn test_policy_values_are_matched_case_insensitively_and_after_trimming() {
 }
 
 #[test]
-fn test_shipped_models_yaml_declares_an_explicit_policy_for_both_roles() {
+fn test_shipped_models_yaml_declares_an_explicit_network_policy_for_both_roles() {
     let manifest = ModelManifest::from_path(std::path::Path::new("models.yaml"))
         .expect("the shipped models.yaml must load");
 
@@ -908,10 +882,6 @@ fn test_shipped_models_yaml_declares_an_explicit_policy_for_both_roles() {
                 .is_some_and(NetworkPolicy::is_declared),
             "{alias} must declare a known network policy"
         );
-        assert!(
-            policy.fs.as_ref().is_some_and(FsPolicy::is_declared),
-            "{alias} must declare a known fs policy"
-        );
     }
     assert!(
         manifest.validate().is_empty(),
@@ -921,10 +891,10 @@ fn test_shipped_models_yaml_declares_an_explicit_policy_for_both_roles() {
 }
 
 #[test]
-fn test_the_advertised_policy_lists_match_the_parsed_grammar() {
-    // `NETWORK_POLICIES` / `FS_POLICIES` are what the warning messages print, so
-    // a value the parser accepts but the list omits (or vice versa) would make
-    // the message either incomplete or a lie.
+fn test_the_advertised_network_policy_list_matches_the_parsed_grammar() {
+    // `NETWORK_POLICIES` is what the warning messages print, so a value the
+    // parser accepts but the list omits (or vice versa) would make the message
+    // either incomplete or a lie.
     for value in NETWORK_POLICIES {
         assert!(
             matches!(
@@ -932,12 +902,6 @@ fn test_the_advertised_policy_lists_match_the_parsed_grammar() {
                 NetworkPolicy::Allow | NetworkPolicy::Offline
             ),
             "{value:?} is advertised as a network policy but does not parse as one",
-        );
-    }
-    for value in FS_POLICIES {
-        assert!(
-            !matches!(FsPolicy::parse(value), FsPolicy::Other(..)),
-            "{value:?} is advertised as an fs policy but does not parse as one",
         );
     }
 
@@ -948,13 +912,6 @@ fn test_the_advertised_policy_lists_match_the_parsed_grammar() {
         assert!(
             NETWORK_POLICIES.contains(&name),
             "{name:?} parses as a policy but is not in NETWORK_POLICIES",
-        );
-    }
-    for variant in [FsPolicy::ReadOnly, FsPolicy::WorktreeOnly, FsPolicy::Full] {
-        let name = variant.as_str();
-        assert!(
-            FS_POLICIES.contains(&name),
-            "{name:?} parses as a policy but is not in FS_POLICIES",
         );
     }
 }

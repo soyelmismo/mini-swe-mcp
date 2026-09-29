@@ -10,7 +10,7 @@
 //! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
 //!   loaded into a worker's system prompt.
 //! * `rules` — the accept/reject rules for the optional declarative execution
-//!   policy (`policy.network`, `policy.fs`) and the fixups that repair them.
+//!   policy (`policy.network`) and the fixups that repair them.
 //! * `validate` — the advisory warning rules and the fixups that repair what
 //!   they report.
 //! * `tests` — the package unit tests (compiled only under `cfg(test)`).
@@ -39,9 +39,8 @@ pub use self::memory::{
     MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory,
 };
 pub use self::types::{
-    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, FS_POLICIES, FsPolicy,
-    MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, NETWORK_POLICIES, NetworkPolicy,
-    TEMPERATURE_RANGE,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT,
+    ModelDefinition, ModelManifest, NETWORK_POLICIES, NetworkPolicy, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.
@@ -126,6 +125,7 @@ impl ModelManifest {
     fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let manifest: Self = serde_yaml::from_str(&content)?;
+        warn_fs_policy(&content);
         Ok(manifest)
     }
 
@@ -195,5 +195,27 @@ impl ModelManifest {
             .collect();
         entries.sort_unstable_by_key(|(alias, _)| *alias);
         entries
+    }
+}
+
+/// Warn once per `fs:` key in a `models.yaml`, since the filesystem policy is
+/// not enforced at runtime and advertising it would be misleading.
+fn warn_fs_policy(content: &str) {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        return;
+    };
+    let Some(models) = value.get("models").and_then(|m| m.as_mapping()) else {
+        return;
+    };
+    for (alias, def) in models {
+        let Some(policy) = def.get("policy").and_then(|p| p.as_mapping()) else {
+            continue;
+        };
+        if policy.contains_key(serde_yaml::Value::String("fs".to_string())) {
+            warn!(
+                alias = %alias.as_str().unwrap_or("?"),
+                "models.yaml policy.fs is not supported and is ignored"
+            );
+        }
     }
 }

@@ -7,13 +7,54 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Lifecycle status of a worker, as recorded in the on-disk registry.
+///
+/// Serialized to lowercase so the on-disk JSON stays byte-identical to the
+/// historical stringly-typed rows. An unknown value deserializes to
+/// [`RegistryStatus::Stopped`] for forward compatibility: a newer server that
+/// writes a status this build does not know must not crash the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryStatus {
+    Running,
+    Paused,
+    Reviewing,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl RegistryStatus {
+    /// Whether the worker has finished and its uptime is frozen.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+    }
+
+    /// Whether the worker is still live (its uptime keeps counting).
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Paused | Self::Reviewing)
+    }
+
+    /// The user-visible, title-cased name of the status.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Paused => "Paused",
+            Self::Reviewing => "Reviewing",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Stopped => "Stopped",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
     pub id: String,
     pub pid: u32,
     pub task: String,
     pub model: String,
-    pub status: String,
+    pub status: RegistryStatus,
     pub step: usize,
     pub max_turns: usize,
     pub last_command: String,
@@ -46,7 +87,7 @@ impl WorkerMeta {
     pub fn save_status(
         &self,
         model: &str,
-        status: &str,
+        status: RegistryStatus,
         step: usize,
         max_turns: usize,
         last_command: &str,
@@ -57,7 +98,7 @@ impl WorkerMeta {
             pid: self.pid,
             task: self.task.clone(),
             model: model.to_string(),
-            status: status.into(),
+            status,
             step,
             max_turns,
             last_command: last_command.into(),
@@ -101,10 +142,6 @@ pub fn remove_registry_entry(worker_id: &str) {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         let _ = std::fs::remove_file(path);
     }
-}
-
-fn is_terminal_status(status: &str) -> bool {
-    status == "completed" || status == "failed" || status == "stopped"
 }
 
 fn worktree_exists(worker_id: &str) -> bool {
@@ -164,13 +201,11 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
                     && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
                     && seen_ids.insert(item.id.clone())
                 {
-                    if (item.status == "running" || item.status == "paused" || item.status == "reviewing")
-                        && !crate::worktree::is_process_alive(item.pid)
-                    {
-                        item.status = "stopped".to_string();
+                    if item.status.is_live() && !crate::worktree::is_process_alive(item.pid) {
+                        item.status = RegistryStatus::Stopped;
                     }
 
-                    if is_terminal_status(&item.status)
+                    if item.status.is_terminal()
                         && !worktree_exists(&item.id)
                         && !branch_exists(&item, &mut branches_by_repo)
                     {
@@ -191,17 +226,13 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
 /// [`load_all_registry_entries`] does: a `running`/`paused`/`reviewing` row
 /// whose pid is dead is reported as `stopped`.
 pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
-    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
-        let path = dir.join(format!("{worker_id}.json"));
+    for dir in crate::worktree::swe_base_dirs() {
+        let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         if let Ok(content) = std::fs::read_to_string(&path)
             && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
         {
-            if (item.status == "running"
-                || item.status == "paused"
-                || item.status == "reviewing")
-                && !crate::worktree::is_process_alive(item.pid)
-            {
-                item.status = "stopped".to_string();
+            if item.status.is_live() && !crate::worktree::is_process_alive(item.pid) {
+                item.status = RegistryStatus::Stopped;
             }
             return Some(item);
         }

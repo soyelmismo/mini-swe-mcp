@@ -27,7 +27,7 @@ use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::buffer::build_step_log;
-use super::registry::{WorkerRegistryEntry, save_registry_entry};
+use super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
 use super::state::WorkerState;
 use super::steer::{drain_steer_messages, remove_steer_file};
 use super::{WorkerPool, unix_timestamp};
@@ -231,7 +231,7 @@ impl WorkerPool {
                         pid: std::process::id(),
                         task: task.clone(),
                         model: model.clone(),
-                        status: "paused".into(),
+                        status: RegistryStatus::Paused,
                         step,
                         max_turns: current_max_turns,
                         last_command: format!("paused_on_error: {e}"),
@@ -344,7 +344,7 @@ impl WorkerPool {
                 pid: std::process::id(),
                 task: task.clone(),
                 model: model.clone(),
-                status: "running".into(),
+                status: RegistryStatus::Running,
                 step,
                 max_turns: current_max_turns,
                 last_command: cmd_summary.clone(),
@@ -566,7 +566,7 @@ impl WorkerPool {
             pid: std::process::id(),
             task: task.clone(),
             model: model.clone(),
-            status: "completed".into(),
+            status: RegistryStatus::Completed,
             step,
             max_turns: current_max_turns,
             last_command: "completed".into(),
