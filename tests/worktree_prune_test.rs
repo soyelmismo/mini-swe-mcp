@@ -501,3 +501,151 @@ fn staleness_decision_prefers_the_lease_over_the_missing_directory() {
         "an unleased worktree with no directory must be considered stale"
     );
 }
+
+/// A process that has exited but not yet been reaped is a **zombie**: the
+/// kernel keeps every per-process resource (`/proc/<pid>`, the pid slot, the
+/// exit status) alive, so both the `/proc/<pid>` presence check and `kill -0`
+/// happily report a process that can never read or write its worktree again.
+/// The lease of such an owner must be treated as dead, or the abandoned
+/// worktree, its branch and its target directory are pinned until the pid slot
+/// is finally recycled.
+#[cfg(target_os = "linux")]
+fn spawn_zombie() -> Option<i32> {
+    use std::process::Stdio;
+
+    // `--list` makes the test binary enumerate its tests and exit immediately:
+    // a short-lived child, with no shell and no other dependency.
+    let exe = std::env::current_exe().ok()?;
+    let child = Command::new(exe)
+        .arg("--list")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid = child.id() as i32;
+    // `std::process::Child` does not reap on drop, so the child stays in state
+    // `Z` (unreaped) and keeps both its `/proc` entry and its pid slot.
+    std::mem::forget(child);
+
+    // Wait for the child to actually exit; only then is it a zombie.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            if status
+                .lines()
+                .any(|l| l.trim_start().starts_with("State:") && l.contains("(zombie)"))
+            {
+                return Some(pid);
+            }
+        } else {
+            return None; // reaped or vanished: no zombie to test
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Placeholder kept so the binary re-executed by [`spawn_zombie`] has a body to
+/// enumerate; `--list` runs no test at all.
+#[test]
+#[ignore = "not a real test; only enumerated by --list"]
+fn __zombie_placeholder__() {}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn zombie_owner_is_treated_as_dead() {
+    let Some(zpid) = spawn_zombie() else {
+        panic!("failed to create a real zombie process on this host");
+    };
+    let zpid_u32 = u32::try_from(zpid).expect("positive pid");
+
+    // `/proc/<pid>` exists, so the old presence-only check reported "alive".
+    assert!(
+        Path::new(&format!("/proc/{zpid}")).exists(),
+        "precondition: the zombie still has a /proc entry"
+    );
+    assert!(
+        !is_process_alive(zpid_u32),
+        "a zombie owner must not count as alive (it can never touch the worktree)"
+    );
+    assert!(
+        is_process_alive(std::process::id()),
+        "a real, running process must still count as alive"
+    );
+}
+
+/// End-to-end: an orphan worktree whose lease names a **zombie** owner is
+/// reclaimed, together with its lease and its scratch target directory.
+#[test]
+#[cfg(target_os = "linux")]
+fn zombie_leased_orphan_is_reclaimed() {
+    let Some(zpid) = spawn_zombie() else {
+        panic!("failed to create a real zombie process on this host");
+    };
+    let f = Fixture::new("zombie");
+
+    let orphan = f.base.join(format!("swe-wt-{}", unique("zombie")));
+    let pid_file = {
+        let mut s = orphan.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
+    };
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(&pid_file, zpid.to_string()).unwrap();
+    let target_dir = f.base.join(format!("swe-target-{}", orphan.file_name().unwrap().to_str().unwrap()));
+    std::fs::create_dir_all(&target_dir).unwrap();
+
+    f.sweep();
+
+    assert!(!orphan.exists(), "zombie-leased orphan directory survived");
+    assert!(!pid_file.exists(), "zombie lease survived its directory");
+    assert!(
+        !target_dir.exists(),
+        "scratch target directory of a zombie-leased worktree survived"
+    );
+
+    // Idempotent: a second sweep has nothing left to do and changes nothing.
+    f.sweep();
+    assert!(!orphan.exists(), "second sweep resurrected nothing");
+}
+
+/// The orphan sweep must be idempotent: repeated sweeps converge to the same
+/// state and never leave a half-removed directory behind, however many times it
+/// is run.
+#[test]
+fn orphan_sweep_is_idempotent() {
+    let f = Fixture::new("idem");
+
+    let mut orphans = Vec::new();
+    for i in 0..5 {
+        let orphan = f.base.join(format!("swe-wt-{}", unique("idem")));
+        let pid_file = {
+            let mut s = orphan.clone().into_os_string();
+            s.push(".pid");
+            PathBuf::from(s)
+        };
+        std::fs::create_dir_all(&orphan).unwrap();
+        f.write_dead_lease(&pid_file);
+        orphans.push((orphan.clone(), pid_file.clone(), i));
+    }
+
+    // Run the sweep several times: the first pass reclaims, later passes are
+    // no-ops that must neither error nor resurrect anything.
+    for pass in 0..4 {
+        f.sweep();
+        for (dir, pid_file, _) in &orphans {
+            assert!(
+                !dir.exists(),
+                "pass {pass}: orphan {} came back",
+                dir.display()
+            );
+            assert!(
+                !pid_file.exists(),
+                "pass {pass}: lease {} came back",
+                pid_file.display()
+            );
+        }
+    }
+}
