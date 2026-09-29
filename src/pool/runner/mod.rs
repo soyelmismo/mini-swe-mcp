@@ -427,20 +427,40 @@ impl WorkerPool {
         let diff = worktree.get_diff()?;
         let now = unix_timestamp();
 
-        let summary = if !diff.trim().is_empty() {
-            format!("Finished after {} turns. Produced git diff.", step)
-        } else if !last_assistant_text.trim().is_empty() {
-            last_assistant_text
+        let task_headline = task
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("completed task");
+
+        let agent_summary = last_assistant_text.trim();
+        let summary = if !agent_summary.is_empty() {
+            agent_summary.to_string()
+        } else if !diff.trim().is_empty() {
+            format!("{task_headline} (produced diff in {step} turns)")
         } else {
-            format!("Finished after {} turns. Completed successfully.", step)
+            format!("{task_headline} (completed in {step} turns)")
         };
 
         let branch = if !diff.trim().is_empty() {
-            let commit_msg = format!(
-                "worker({}): {}",
-                worker_id,
-                summary.lines().next().unwrap_or("")
-            );
+            let commit_subject = if !agent_summary.is_empty() {
+                let first_line = agent_summary.lines().next().unwrap_or(task_headline).trim();
+                let stripped = first_line.trim_start_matches('#').trim();
+                if stripped.is_empty() {
+                    task_headline
+                } else {
+                    stripped
+                }
+            } else {
+                task_headline
+            };
+            let clean_subject = if commit_subject.len() > 72 {
+                let cut = commit_subject.floor_char_boundary(69);
+                format!("{}...", &commit_subject[..cut])
+            } else {
+                commit_subject.to_string()
+            };
+            let commit_msg = format!("worker({worker_id}): {clean_subject}");
             worktree.commit_changes(&commit_msg).unwrap_or(None)
         } else {
             None
