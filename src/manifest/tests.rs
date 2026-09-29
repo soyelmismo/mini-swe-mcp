@@ -11,9 +11,10 @@
 //! every manifest instance in the process.
 
 use super::{
-    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE,
-    MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, catalog::catalog_row, catalog_cache_len,
-    clear_catalog_cache,
+    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE, MEMORY_DIR,
+    MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, agent_memory_path,
+    append_agent_memory, build_system_prompt, catalog::catalog_row, catalog_cache_len,
+    clear_catalog_cache, load_agent_memory,
 };
 
 fn single(definition: ModelDefinition) -> ModelManifest {
@@ -613,4 +614,293 @@ fn test_from_path_parses_and_normalizes_an_explicit_file() {
     assert!(ModelManifest::from_path(&dir.join("absent.yaml")).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent role memory (`.agents/memory/<alias>.md`)
+// ---------------------------------------------------------------------------
+
+/// A scratch repository root for the memory tests, removed on drop.
+struct MemoryRepo {
+    path: std::path::PathBuf,
+}
+
+impl MemoryRepo {
+    fn new(tag: &str) -> Self {
+        // The tag keeps the two repos that share a `.agents/memory` layout apart,
+        // and the pid keeps two concurrent test binaries apart.
+        let path = std::env::temp_dir().join(format!(
+            "swe-manifest-memory-{}-{tag}-{}",
+            std::process::id(),
+            CATALOG_CACHE_CAPACITY as u64
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch repo");
+        Self { path }
+    }
+
+    fn memory_dir(&self) -> std::path::PathBuf {
+        self.path.join(".agents").join("memory")
+    }
+}
+
+impl Drop for MemoryRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Memory lives at `.agents/memory/<alias>.md`, keyed by the alias and never by
+/// the resolved model id.
+#[test]
+fn test_agent_memory_path_is_alias_keyed_and_traversal_safe() {
+    let repo = std::path::Path::new("/repo");
+
+    assert_eq!(
+        agent_memory_path(repo, "ninja"),
+        Some(std::path::PathBuf::from("/repo/.agents/memory/ninja.md"))
+    );
+    assert_eq!(
+        agent_memory_path(repo, "nerd"),
+        Some(std::path::PathBuf::from("/repo/.agents/memory/nerd.md"))
+    );
+    // A full model id sanitizes into a harmless slug instead of walking out of
+    // the memory directory.
+    let hostile = agent_memory_path(repo, "../../etc/passwd").expect("sanitized");
+    assert_eq!(hostile.parent(), Some(repo.join(MEMORY_DIR).as_path()));
+    assert!(!hostile.to_string_lossy().contains(".."));
+    // Nothing usable left -> no path at all.
+    assert_eq!(agent_memory_path(repo, "///"), None);
+}
+
+#[test]
+fn test_load_agent_memory_reads_the_role_file() {
+    let repo = MemoryRepo::new("load");
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    std::fs::write(
+        agent_memory_path(&repo.path, "ninja").expect("path"),
+        "- Run `cargo test --all-targets` before declaring success.\n",
+    )
+    .expect("fixture written");
+
+    let memory = load_agent_memory(&repo.path, "ninja").expect("memory is loaded");
+    assert_eq!(memory, "- Run `cargo test --all-targets` before declaring success.");
+
+    // Memory is per role: another alias of the same repo has none.
+    assert_eq!(load_agent_memory(&repo.path, "nerd"), None);
+}
+
+/// The two shipped defaults must actually be loadable, or the feature would ship
+/// dead: the files exist at the repo root and are readable through the loader.
+#[test]
+fn test_shipped_role_memory_files_are_loadable() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for alias in ["ninja", "nerd"] {
+        let memory = load_agent_memory(repo_root, alias)
+            .unwrap_or_else(|| panic!("{MEMORY_DIR}/{alias}.md must ship with the crate"));
+        assert!(
+            memory.contains('-'),
+            "{alias} memory must hold at least one takeaway"
+        );
+        assert!(
+            !load_agent_memory(repo_root, alias).unwrap().is_empty(),
+            "{alias} memory must never load as empty"
+        );
+    }
+}
+
+/// Missing, blank, unreadable and directory-shaped memory all degrade to `None`
+/// so a repository without `.agents/memory/` behaves exactly as it did before.
+#[test]
+fn test_load_agent_memory_falls_back_to_none() {
+    let repo = MemoryRepo::new("missing");
+
+    // No `.agents/memory` directory at all.
+    assert_eq!(load_agent_memory(&repo.path, "ninja"), None);
+    // A directory exists but holds no file for this alias.
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    assert_eq!(load_agent_memory(&repo.path, "ninja"), None);
+    // A blank file is as good as absent: injecting it would add an empty section.
+    let path = agent_memory_path(&repo.path, "ninja").expect("path");
+    std::fs::write(&path, "   \n\n\t\n").expect("fixture written");
+    assert_eq!(load_agent_memory(&repo.path, "ninja"), None);
+    // The path is a directory, not a file.
+    std::fs::remove_file(&path).expect("cleanup");
+    std::fs::create_dir_all(&path).expect("dir-shaped memory path");
+    assert_eq!(load_agent_memory(&repo.path, "ninja"), None);
+    // An alias with no usable slug has no path to load.
+    assert_eq!(load_agent_memory(&repo.path, "///"), None);
+}
+
+#[test]
+fn test_append_agent_memory_creates_and_appends() {
+    let repo = MemoryRepo::new("append");
+
+    append_agent_memory(&repo.path, "ninja", "Both clippy and cargo test must pass.")
+        .expect("first append");
+
+    let memory = load_agent_memory(&repo.path, "ninja").expect("memory exists");
+    assert!(
+        memory.contains("Both clippy and cargo test must pass."),
+        "the note must be readable back: {memory}"
+    );
+    // The directory is created on demand, at the documented location.
+    assert!(repo.memory_dir().join("ninja.md").is_file());
+
+    append_agent_memory(&repo.path, "ninja", "Prefer the smallest diff.")
+        .expect("second append");
+
+    let memory = load_agent_memory(&repo.path, "ninja").expect("memory exists");
+    assert!(memory.contains("Both clippy and cargo test must pass."));
+    assert!(memory.contains("Prefer the smallest diff."));
+    // Appends accumulate; they never overwrite.
+    assert_eq!(memory.lines().filter(|l| l.starts_with("- ")).count(), 2);
+    // A second role has its own, independent file.
+    assert_eq!(load_agent_memory(&repo.path, "nerd"), None);
+    append_agent_memory(&repo.path, "nerd", "Reproduce before you patch.")
+        .expect("nerd append");
+    let nerd = load_agent_memory(&repo.path, "nerd").expect("nerd memory");
+    assert!(nerd.contains("Reproduce before you patch."));
+    assert!(!nerd.contains("smallest diff"));
+}
+
+/// A takeaway must land as exactly one list item: a multi-line note cannot break
+/// the line-oriented format, and an empty note is refused rather than written as a
+/// blank bullet that would load back as noise.
+#[test]
+fn test_append_agent_memory_normalizes_notes_and_rejects_empty() {
+    let repo = MemoryRepo::new("normalize");
+
+    append_agent_memory(&repo.path, "nerd", "  reproduce\n\tbefore   patching  ").expect("append");
+    let memory = load_agent_memory(&repo.path, "nerd").expect("memory exists");
+    assert_eq!(
+        memory.lines().filter(|l| l.starts_with("- ")).count(),
+        1,
+        "a multi-line note must collapse into a single entry: {memory}"
+    );
+    assert!(memory.contains("- reproduce before patching"));
+
+    for empty in ["", "   ", "\n\t "] {
+        assert!(
+            append_agent_memory(&repo.path, "nerd", empty).is_err(),
+            "an empty note must be rejected, not written"
+        );
+    }
+    // An alias with no usable slug has no memory file to write to.
+    assert!(append_agent_memory(&repo.path, "///", "note").is_err());
+}
+
+/// Memory is appended to forever, so what reaches the prompt is capped: the
+/// system instructions must not be squeezed out by a bloated memory file, and the
+/// cut must land on a line boundary rather than mid-line.
+#[test]
+fn test_loaded_memory_is_bounded() {
+    let repo = MemoryRepo::new("bounded");
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    let mut note = String::new();
+    while note.len() < MAX_MEMORY_PROMPT_BYTES * 2 {
+        note.push_str("- filler takeaway that keeps the memory file growing\n");
+    }
+    std::fs::write(
+        agent_memory_path(&repo.path, "ninja").expect("path"),
+        &note,
+    )
+    .expect("fixture written");
+
+    let memory = load_agent_memory(&repo.path, "ninja").expect("memory is loaded");
+    assert!(memory.len() <= MAX_MEMORY_PROMPT_BYTES);
+    assert!(
+        memory.lines().all(|line| line.starts_with("- ") || line.is_empty()),
+        "the cut must land on a line boundary: {memory:?}"
+    );
+    assert!(!memory.contains("filler takeaway") || memory.len() < note.len());
+}
+
+/// The system prompt is the only injection point, and it must be a no-op for a
+/// repository without memory.
+#[test]
+fn test_build_system_prompt_injects_memory_only_when_present() {
+    let repo = MemoryRepo::new("prompt");
+
+    // No memory file: byte-identical to the static prompt.
+    assert_eq!(
+        build_system_prompt(&repo.path, "ninja"),
+        crate::agent::SYSTEM_PROMPT
+    );
+
+    append_agent_memory(&repo.path, "ninja", "Verify with cargo clippy.").expect("append");
+    let prompt = build_system_prompt(&repo.path, "ninja");
+    assert!(prompt.starts_with(crate::agent::SYSTEM_PROMPT));
+    assert!(
+        prompt.contains("Verify with cargo clippy."),
+        "the role memory must reach the prompt: {prompt}"
+    );
+    // Roles stay isolated: the nerd prompt is untouched by ninja's memory.
+    assert_eq!(
+        build_system_prompt(&repo.path, "nerd"),
+        crate::agent::SYSTEM_PROMPT
+    );
+}
+
+/// The pool carries a *resolved* model id (`combo:ninja`), while memory files are
+/// keyed by alias, so `alias_for_model` is what makes the lookup work at all.
+#[test]
+fn test_alias_for_model_bridges_resolved_ids() {
+    let manifest = ModelManifest::default();
+
+    assert_eq!(manifest.alias_for_model("combo:ninja"), "ninja");
+    assert_eq!(manifest.alias_for_model("combo:nerd"), "nerd");
+    // An alias is already its own answer.
+    assert_eq!(manifest.alias_for_model("ninja"), "ninja");
+    // Unknown models pass through so a missing memory file is simply "none".
+    assert_eq!(manifest.alias_for_model("some/unknown"), "some/unknown");
+
+    // And the round trip actually finds the file the worker asked for.
+    let repo = MemoryRepo::new("alias");
+    append_agent_memory(&repo.path, "ninja", "Round trip note.").expect("append");
+    let alias = manifest.alias_for_model("combo:ninja");
+    assert!(build_system_prompt(&repo.path, &alias).contains("Round trip note."));
+}
+
+/// `rename` makes each write atomic and the lock serializes the
+/// read-modify-write; the second property is what stops two agents finishing at
+/// the same time from silently discarding each other's takeaway, so it is
+/// asserted rather than assumed.
+#[test]
+fn test_concurrent_appends_do_not_lose_notes() {
+    use std::sync::Arc;
+
+    let repo = Arc::new(MemoryRepo::new("concurrent"));
+    const THREADS: usize = 8;
+
+    std::thread::scope(|scope| {
+        for i in 0..THREADS {
+            let repo = Arc::clone(&repo);
+            scope.spawn(move || {
+                append_agent_memory(&repo.path, "nerd", &format!("takeaway {i}"))
+                    .expect("concurrent append");
+            });
+        }
+    });
+
+    let memory = load_agent_memory(&repo.path, "nerd").expect("memory exists");
+    for i in 0..THREADS {
+        assert!(
+            memory.contains(&format!("takeaway {i}")),
+            "every concurrent append must survive; missing takeaway {i}: {memory}"
+        );
+    }
+    assert_eq!(
+        memory.lines().filter(|l| l.starts_with("- ")).count(),
+        THREADS,
+        "and no append may be duplicated"
+    );
+    // The staging file never survives a successful append.
+    let leftovers: Vec<_> = std::fs::read_dir(repo.memory_dir())
+        .expect("memory dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging debris left behind: {leftovers:?}");
 }

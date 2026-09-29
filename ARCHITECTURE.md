@@ -113,7 +113,58 @@ Workers communicate status and request human/orchestrator intervention via shell
 
 ---
 
-## 5. Step-Log Retention & Worker Residency
+## 5. Persistent Role Memory
+
+Every dispatch used to start from a byte-identical, static `SYSTEM_PROMPT`:
+nothing a previous run learned survived its worktree. Role memory gives each
+*role* a durable notes file that is spliced into the system prompt at the exact
+moment the prompt is built.
+
+```
+repo root
+  │
+  ▼
+[1] ModelManifest::alias_for_model        resolved id ("combo:ninja") -> alias
+  ▼
+[2] build_system_prompt                  src/manifest/catalog.rs
+  │     SYSTEM_PROMPT  +  memory section (only if a memory file exists)
+  ▼
+[3] load_agent_memory                    src/manifest/memory.rs
+  │     <repo>/.agents/memory/<alias>.md, read fresh every dispatch
+  ▼
+ChatMessage::text(Role::System, prompt)   implementer loop AND review phase
+```
+
+Both the implementer loop and the review phase build their prompt through the
+same `build_system_prompt`, so the reviewer inherits the *reviewer's* memory
+(`nerd.md`) rather than the implementer's — the two roles never contaminate each
+other.
+
+Three invariants are load-bearing:
+
+- **Optional.** `load_agent_memory` returns `None` — never an empty section — when
+  the file is missing, blank, non-UTF-8, or is not even a file. A repository
+  without `.agents/memory/` produces the exact static prompt it produced before
+  this feature existed.
+- **Bounded.** Injected memory is capped at `MAX_MEMORY_PROMPT_BYTES` (8 KiB),
+  keeping the *newest* entries and cutting on a line boundary so the system
+  instructions are never squeezed out by an ever-growing memory file. Memory is
+  deliberately *not* memoized process-wide (unlike the catalog in `cache.rs`):
+  it changes on disk between renders, so it must be re-read on every build.
+- **Atomic.** `append_agent_memory` stages the new file next to the target and
+  publishes it with `rename` (atomic within a filesystem), and serializes the
+  read-modify-write under a process-wide lock, so a concurrent reader — or a
+  `worktree` artifact sync — sees either the whole old file or the whole new one,
+  and two agents of the same role finishing at once cannot discard each other's
+  note.
+
+The alias is reduced to a conservative `[a-z0-9_-]` slug before it touches the
+filesystem, so a hostile `model` argument (`../../etc/passwd`) collapses to
+`etc-passwd.md` inside the memory directory and can never escape it.
+
+---
+
+## 6. Step-Log Retention & Worker Residency
 
 Each bash step appends an `AgentStepLog` to `WorkerRecord.logs`. Left
 append-only, that buffer is the one structure in the pool that grows without

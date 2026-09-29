@@ -7,7 +7,12 @@
 //! input other than the catalog itself: it reads no environment variable, no
 //! file, and no user configuration.
 //!
-//! Three properties are load-bearing and are asserted by the tests in `tests.rs`:
+//! It also owns [`build_system_prompt`], the one place where a role's persistent
+//! memory ([`super::memory`]) is spliced into the system prompt a worker starts
+//! with, so the implementer and the reviewer build their prompts identically.
+//!
+//! Three properties of the catalog render are load-bearing and are asserted by
+//! the tests in `tests.rs`:
 //!
 //! * **Determinism.** Bullets are emitted in sorted-alias order (via
 //!   [`ModelManifest::sorted_models`]) rather than in `HashMap` iteration order,
@@ -23,6 +28,8 @@
 //!   [`catalog_row`] uses, including the role fallback, so appending never
 //!   reallocates the output.
 
+use std::path::Path;
+
 use super::DEFAULT_ROLE;
 /// The one-entry-bullet renderer, re-exported from the [`cache`] submodule so
 /// the whole markdown rendering path lives in this one file.
@@ -32,6 +39,7 @@ use super::DEFAULT_ROLE;
 /// the package root, where it remains an implementation detail.
 pub(super) use super::cache::catalog_row;
 use super::cache::{CATALOG_ROW_OVERHEAD, catalog_header};
+use super::memory::memory_prompt_section;
 use super::types::ModelManifest;
 
 impl ModelManifest {
@@ -71,5 +79,25 @@ impl ModelManifest {
         }
 
         desc
+    }
+}
+
+/// Build the effective system prompt for a worker of `model_alias` running in
+/// `repo_path`: the crate-wide [`SYSTEM_PROMPT`](crate::agent::SYSTEM_PROMPT)
+/// followed by that role's persistent memory, when the repository provides any.
+///
+/// This is the single point where role memory enters a conversation, so both the
+/// implementer loop and the review phase get identical treatment (they previously
+/// both passed the static prompt straight to `ChatMessage::text`). Memory is read
+/// from disk on every build — never memoized, see [`super::memory`] — so a note
+/// appended by a previous run is visible to the very next dispatch.
+///
+/// Returns the static prompt **unchanged** when the role has no memory file, so a
+/// repository that has not opted in sees byte-identical behaviour to before
+/// persistent memory existed.
+pub fn build_system_prompt(repo_path: &Path, model_alias: &str) -> String {
+    match memory_prompt_section(repo_path, model_alias) {
+        Some(section) => format!("{}{section}", crate::agent::SYSTEM_PROMPT),
+        None => crate::agent::SYSTEM_PROMPT.to_string(),
     }
 }
