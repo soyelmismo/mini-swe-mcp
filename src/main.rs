@@ -7,8 +7,32 @@ use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Tokio worker threads for the MCP server runtime.
+///
+/// Pinned explicitly so the server never degrades to a single worker on a
+/// one-core deployment target: with one worker a long `execute_bash` wait would
+/// block every progress notification and every other in-flight request (see
+/// audit F8). Overridable at runtime with `MINI_SWE_WORKER_THREADS`.
+const DEFAULT_WORKER_THREADS: usize = 4;
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(resolve_worker_threads())
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+/// Resolve the Tokio worker thread count from the environment.
+pub fn resolve_worker_threads() -> usize {
+    env::var("MINI_SWE_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WORKER_THREADS)
+}
+
+async fn async_main() -> Result<()> {
     let raw_args: Vec<String> = env::args().collect();
 
     // Early CLI flag handling without requiring API keys
@@ -90,7 +114,57 @@ where
     }
 }
 
-    let default_level = if cli_args.len() > 1 && cli_args[1] != "--stdio" && cli_args[1] != "dispatch" {
+    let stdio_mode = cli_args.iter().any(|arg| arg == "--stdio");
+
+    /// Non-blocking stderr writer for tracing.
+    struct AsyncStderrWriter {
+        tx: std::sync::mpsc::Sender<String>,
+    }
+
+    impl std::io::Write for AsyncStderrWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let text = String::from_utf8_lossy(buf);
+            self.tx
+                .send(text.into_owned())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log sink gone"))?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AsyncStderrWriter {
+        type Writer = AsyncStderrWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            AsyncStderrWriter {
+                tx: self.tx.clone(),
+            }
+        }
+    }
+
+    fn non_blocking_stderr() -> AsyncStderrWriter {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("telemetry-stderr".to_string())
+            .spawn(move || {
+                use std::io::Write as _;
+                let mut stderr = std::io::stderr();
+                while let Ok(line) = rx.recv() {
+                    if let Err(e) = stderr.write_all(line.as_bytes()) {
+                        let _ = e;
+                        break;
+                    }
+                    let _ = stderr.flush();
+                }
+            })
+            .ok();
+        AsyncStderrWriter { tx }
+    }
+
+    let default_level = if stdio_mode {
         tracing::Level::WARN
     } else {
         tracing::Level::INFO
@@ -99,9 +173,15 @@ where
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::default().add_directive(default_level.into()));
 
-    // Crucial: log to STDERR, because STDOUT is dedicated to MCP JSON-RPC protocol
+    // Crucial: log to STDERR, because STDOUT is dedicated to MCP JSON-RPC protocol.
+    // The writer is non-blocking so telemetry can never stall a runtime thread.
+    let stderr_writer = non_blocking_stderr();
     tracing_subscriber::registry()
-        .with(fmt::layer().event_format(ShortFormatter).with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .event_format(ShortFormatter)
+                .with_writer(stderr_writer),
+        )
         .with(env_filter)
         .init();
 
@@ -757,5 +837,34 @@ fn format_output(action: &str, val: &serde_json::Value) -> String {
         "steer" => format_steer(val),
         "kill" => format_kill(val),
         _ => serde_json::to_string_pretty(val).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_worker_threads_defaults_to_the_pinned_count() {
+        const { assert!(DEFAULT_WORKER_THREADS > 1) };
+        if std::env::var("MINI_SWE_WORKER_THREADS").is_err() {
+            assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
+        }
+    }
+
+    #[test]
+    fn test_resolve_worker_threads_ignores_nonsense_values() {
+        let saved = std::env::var("MINI_SWE_WORKER_THREADS").ok();
+        unsafe { std::env::set_var("MINI_SWE_WORKER_THREADS", "0") };
+        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
+        unsafe { std::env::set_var("MINI_SWE_WORKER_THREADS", "-3") };
+        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
+        unsafe { std::env::set_var("MINI_SWE_WORKER_THREADS", "not-a-number") };
+        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("MINI_SWE_WORKER_THREADS", v) },
+            None => unsafe { std::env::remove_var("MINI_SWE_WORKER_THREADS") },
+        }
     }
 }

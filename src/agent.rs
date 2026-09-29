@@ -1080,6 +1080,9 @@ impl AgentRunner {
                 if let Some(pid) = child_pid {
                     let _ = std::process::Command::new("kill")
                         .args(["-KILL", &format!("-{pid}")])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
                         .status();
                 }
                 return Ok((
