@@ -95,10 +95,11 @@ impl WorkerPool {
         let review_prompt = format!(
             "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
             YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
-            1. Inspect changes: run `git status`, `git diff HEAD~1` (or `git log -1 -p`).\n\
-            2. Run test suites and static checks (e.g. `cargo clippy --all-targets -- -D warnings`, `cargo test`, linters).\n\
-            3. Fix any regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
-            4. When verified and 100% clean, execute:\n\
+            1. First run the full test and lint suite on the checkpoint (e.g. `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`) and see it pass.\n\
+            2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
+            3. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
+            4. Re-run the full test and lint suite and see it pass before completing.\n\
+            5. When verified and 100% clean, execute:\n\
                echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
             task
         );

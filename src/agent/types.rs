@@ -77,7 +77,22 @@ COMMUNICATION WITH ORCHESTRATOR:
   echo "REQUEST_TURNS: <number>"
 - Ask orchestrator / Critical ambiguity: If you face critical blockers, breaking decisions, or require orchestrator confirmation, execute:
   echo "ASK_ORCHESTRATOR: <your specific question>"
-  This will immediately pause execution until the orchestrator replies with guidance."#;
+  This will immediately pause execution until the orchestrator replies with guidance.
+
+DISCIPLINE:
+1. Before echoing COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT on a code task, run the project's tests and linters in the current state and see them pass.
+2. Edit files in place; never create parallel copies, backups or encoded dumps in scratch dirs and iterate on them.
+3. Check `git diff --stat` regularly; if several turns pass without measurable progress, change approach or ASK_ORCHESTRATOR instead of repeating.
+4. Never re-run a command whose output you already have.
+5. Use REQUEST_TURNS only with demonstrable progress and a short concrete plan.
+6. Before deleting or renaming a symbol, grep for every use (tests, docs, re-exports) and update them in the same change.
+7. When editing comments, leave complete sentences; no orphaned fragments.
+8. Do not add code that nothing uses.
+9. Exactly one bash tool call per response; chain steps with && inside it; do not probe the harness.
+10. You are already at the repository root ($PWD); do not cd elsewhere.
+11. Scripted edits (python/sed) can silently match nothing: assert the old text is present before replacing and confirm with `git diff --stat` that the change landed.
+12. Keep each command small: never paste a whole large file into one command (tool arguments over 64 KiB are dropped); edit in targeted chunks.
+13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work; use git only to inspect."#;
 
 /// Chat roles accepted by the OpenAI chat-completions API.
 ///
