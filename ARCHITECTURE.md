@@ -59,6 +59,27 @@ The agent runner interacts with OpenAI-compatible endpoints using native Server-
    - `reqwest` stream reader processes chunks via `resp.chunk().await`.
    - Streaming buffers delimiter frames (`\n`) and terminates immediately upon receiving `data: [DONE]`.
    - When a worker is killed or dropped, the stream future is aborted immediately, closing the underlying TCP socket and preventing orphaned token consumption or API stalls.
+3. **Framing (`SseAccumulator`)**:
+   - The read buffer only ever holds bytes that have not yet been framed, so the newline
+     search is a single forward pass: no byte is scanned twice, even when a frame is split
+     across thousands of one-byte TCP segments.
+   - Multi-byte UTF-8 split across chunk boundaries is safe (a line is always complete
+     before decoding). A genuinely malformed frame is logged at `warn` and decoded
+     lossily, and counted on `LlmResponse::invalid_utf8_lines` — never silently dropped.
+   - `tool_calls` are accumulated in a `BTreeMap` keyed by the provider's `index`, so a
+     sparse index (e.g. `index: 3` on the first frame) cannot fabricate placeholder calls.
+     Placeholders and malformed calls are filtered at finalization, and every emitted id is
+     unique and non-empty.
+   - Retention is bounded: `MAX_STREAMED_CONTENT_BYTES` (16 KiB) for assistant text and
+     `MAX_TOOL_ARGUMENT_BYTES` (64 KiB) per tool call; overflow is logged and the call dropped.
+4. **Idle (not whole-request) Timeout**:
+   - The client uses `connect_timeout` for the handshake and `read_timeout` for a single
+     stalled read; `run_step_llm` additionally wraps each `resp.chunk()` in
+     `tokio::time::timeout(DEFAULT_STREAM_IDLE_TIMEOUT)`.
+   - The deadline resets on every chunk, so a healthy-but-slow long generation runs to
+     completion while a genuinely stalled stream is aborted and retried with backoff.
+   - The process-wide `COMMAND_REGEX` (`LazyLock`) and `bash_tool_schema()` (`OnceLock`) are
+     built once instead of once per worker / per request.
 
 ---
 
