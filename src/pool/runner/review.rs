@@ -45,6 +45,10 @@ pub struct ReviewPhase {
     pub started_at_ts: u64,
     /// The implementer's turn counter entering the review phase.
     pub step: usize,
+    /// The dispatch's declared network policy, applied to the reviewer's own
+    /// bash steps too: a worker declared `offline` must not regain egress just
+    /// because a second agent takes over the worktree.
+    pub network_offline: bool,
 }
 
 /// The step counter after the review phase, for the caller to fold back into
@@ -73,6 +77,7 @@ impl WorkerPool {
             repo_path_str,
             started_at_ts,
             mut step,
+            network_offline,
         } = review;
 
     info!(
@@ -108,7 +113,8 @@ impl WorkerPool {
         self.api_key.clone(),
         reviewer_model.clone(),
         temperature,
-    );
+    )
+    .with_network_offline(network_offline);
 
     let manifest = crate::manifest::ModelManifest::load();
     let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);

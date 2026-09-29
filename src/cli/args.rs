@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]";
+pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>] [--offline]";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
@@ -92,6 +92,11 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
             "--group" | "-g" if i + 1 < cli_args.len() => {
                 tool_args.insert("group".into(), Value::String(cli_args[i + 1].clone()));
                 i += 1;
+            }
+            // `--offline` is the CLI spelling of `network: "offline"`: the same
+            // tool argument, so the policy has exactly one implementation.
+            "--offline" => {
+                tool_args.insert("network".into(), Value::String("offline".into()));
             }
             _ => {}
         }
@@ -190,6 +195,33 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// `--offline` is only a spelling of the tool's `network` property, so the
+    /// CLI must produce exactly the argument the MCP path would send.
+    #[test]
+    fn test_dispatch_offline_flag_maps_to_the_network_property() {
+        let without = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "tidy docs"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !without.contains_key("network"),
+            "an omitted flag must leave the default policy in place"
+        );
+
+        let with = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "tidy docs", "--offline"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["network"], "offline");
+        assert!(crate::mcp::NETWORK_MODES.contains(&with["network"].as_str().unwrap()));
     }
 
     #[test]

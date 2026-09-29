@@ -40,6 +40,32 @@ impl McpServer {
             })
     }
 
+    /// Resolve the declarative network policy of a `dispatch` call.
+    ///
+    /// The property is optional and defaults to
+    /// [`super::schema::NETWORK_DEFAULT`] (`"allow"`), so a client that never
+    /// sends it keeps exactly the behaviour it had before the property existed.
+    /// An explicit value outside [`NETWORK_MODES`](super::schema::NETWORK_MODES)
+    /// is a hard error rather than a silent fallback: a request asking for
+    /// isolation and getting connectivity (or the reverse) is worse than a
+    /// rejected call, and the enum is right there in the advertised schema.
+    pub(super) fn get_network_offline(args: &Value, action: &str) -> Result<bool> {
+        let Some(value) = args.get("network") else {
+            return Ok(false);
+        };
+        let mode = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("'network' must be a string for action '{action}'"))?;
+        match mode {
+            "offline" => Ok(true),
+            mode if super::schema::NETWORK_MODES.contains(&mode) => Ok(false),
+            other => anyhow::bail!(
+                "'{other}' is not a valid 'network' policy for action '{action}';                  expected one of: {}",
+                super::schema::NETWORK_MODES.join(", ")
+            ),
+        }
+    }
+
     pub(super) fn get_repo_path(args: &Value) -> PathBuf {
         let repo_path_str = args
             .get("repo_path")
@@ -177,6 +203,8 @@ impl McpServer {
                 resolved
             });
 
+        let network_offline = Self::get_network_offline(args, "dispatch")?;
+
         let wid = self
             .pool
             .dispatch(
@@ -187,6 +215,7 @@ impl McpServer {
                 max_turns,
                 group,
                 review_after,
+                network_offline,
             )
             .await?;
 
@@ -205,6 +234,7 @@ impl McpServer {
             Ok(json!({
                 "worker_id": wid,
                 "status": "dispatched",
+                "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
                 "message": "Worker is executing in isolated worktree in background"
             }))
         }
@@ -518,6 +548,45 @@ mod tests {
             throttle.should_emit(),
             "after the window a frame must be allowed again"
         );
+    }
+
+    /// An omitted `network` must keep the pre-existing connected behaviour:
+    /// the property is additive, so a client that never sends it is unaffected.
+    #[test]
+    fn network_defaults_to_allow_when_absent() {
+        let args = json!({ "action": "dispatch", "task": "t" });
+        assert!(
+            !McpServer::get_network_offline(&args, "dispatch").expect("absent is not an error"),
+            "an omitted network policy must not isolate the worker"
+        );
+    }
+
+    /// An explicit `offline` is the opt-in that turns isolation on, and
+    /// `allow` is the explicit spelling of the default.
+    #[test]
+    fn network_offline_and_allow_are_both_accepted() {
+        assert!(
+            McpServer::get_network_offline(&json!({ "network": "offline" }), "dispatch")
+                .expect("offline must be accepted")
+        );
+        assert!(
+            !McpServer::get_network_offline(&json!({ "network": "allow" }), "dispatch")
+                .expect("allow must be accepted")
+        );
+    }
+
+    /// An unknown policy (or a non-string) is rejected instead of silently
+    /// falling back: a caller that asked for isolation must never silently get
+    /// connectivity instead.
+    #[test]
+    fn an_unknown_network_policy_is_a_hard_error() {
+        let err = McpServer::get_network_offline(&json!({ "network": "offine" }), "dispatch")
+            .expect_err("a typo must not be accepted");
+        assert!(err.to_string().contains("not a valid 'network' policy"), "{err}");
+
+        let err = McpServer::get_network_offline(&json!({ "network": true }), "dispatch")
+            .expect_err("a non-string network must not be accepted");
+        assert!(err.to_string().contains("must be a string"), "{err}");
     }
 
     /// The interval is the documented 100 ms floor.

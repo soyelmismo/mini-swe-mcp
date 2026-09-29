@@ -166,6 +166,7 @@ impl WorkerPool {
         max_turns: usize,
         group: Option<String>,
         review_after: Option<String>,
+        network_offline: bool,
     ) -> Result<String> {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
@@ -237,6 +238,7 @@ impl WorkerPool {
             max_turns,
             group: resolved_group,
             review_after,
+            network_offline,
         };
 
         let join_handle = tokio::spawn(async move {

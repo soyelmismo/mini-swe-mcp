@@ -5,6 +5,7 @@ pub mod sandbox;
 pub mod stream;
 pub mod types;
 
+pub use exec::{has_unshare, wrap_network_command};
 pub use runner::{
     AgentRunner, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
 };

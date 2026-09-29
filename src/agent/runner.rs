@@ -33,6 +33,11 @@ pub struct AgentRunner {
     pub api_key: String,
     pub model: String,
     pub temperature: Option<f32>,
+    /// Declarative network policy for every bash step this worker runs.
+    ///
+    /// `true` (from `network: "offline"`) confines each step to an isolated
+    /// network namespace; `false` keeps normal connectivity.
+    pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
     pub max_retries: usize,
@@ -58,10 +63,17 @@ impl AgentRunner {
             api_key,
             model,
             temperature,
+            network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             max_retries: max_llm_retries(),
             initial_retry_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
         }
+    }
+
+    /// Confine every bash step to an isolated network namespace (`unshare -n`).
+    pub fn with_network_offline(mut self, offline: bool) -> Self {
+        self.network_offline = offline;
+        self
     }
 
     /// Override the per-chunk idle deadline (used by tests to keep them fast).

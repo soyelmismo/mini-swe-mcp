@@ -18,5 +18,5 @@ mod protocol;
 mod schema;
 mod server;
 
-pub use schema::WORKER_ACTIONS;
+pub use schema::{NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
 pub use server::McpServer;

@@ -47,6 +47,9 @@ pub struct WorkerLaunchConfig {
     pub max_turns: usize,
     pub group: String,
     pub review_after: Option<String>,
+    /// Declared network policy: `true` confines every bash step to an
+    /// isolated network namespace (`network: "offline"` on the dispatch).
+    pub network_offline: bool,
 }
 
 impl WorkerPool {
@@ -63,6 +66,7 @@ impl WorkerPool {
             max_turns,
             group,
             review_after,
+            network_offline,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
@@ -75,7 +79,8 @@ impl WorkerPool {
             self.api_key.clone(),
             model.clone(),
             temperature,
-        );
+        )
+        .with_network_offline(network_offline);
 
         let mut messages = vec![
             ChatMessage::text(Role::System, SYSTEM_PROMPT),
@@ -410,6 +415,7 @@ impl WorkerPool {
                         repo_path_str: repo_path_str.clone(),
                         started_at_ts,
                         step,
+                        network_offline,
                     },
                 )
                 .await?;

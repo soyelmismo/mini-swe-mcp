@@ -19,6 +19,20 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "dispatch", "status", "steer", "collect", "logs", "list", "kill", "reap", "manifest", "prune",
 ];
 
+/// Declared network policy for a dispatched worker.
+///
+/// `offline` runs every bash step inside an isolated network namespace (no
+/// egress at all), `allow` keeps the host's connectivity. The value is the
+/// advertised `network` enum of the `worker` tool, and
+/// [`NETWORK_DEFAULT`] is what a dispatch without the property gets.
+pub const NETWORK_MODES: &[&str] = &["offline", "allow"];
+
+/// Policy applied when a `tools/call` omits the optional `network` property.
+///
+/// Backwards compatible: a client that never heard of the property keeps the
+/// connected behaviour it had before isolation existed.
+pub const NETWORK_DEFAULT: &str = "allow";
+
 /// Description of the `worker` tool itself.
 const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents. Dispatches subagents in isolated Git worktrees, checks progress, injects steering instructions, retrieves git diffs, or inspects models.";
 
@@ -111,6 +125,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
             "Optional reviewer model (e.g. 'nerd') to automatically audit and finalize the worktree after implementation completes, using a fresh context window.",
         ),
     ),
+    (
+        "network",
+        "string",
+        DescriptionSource::Static(
+            "Declarative network policy for the worker: 'offline' runs every bash step in an isolated network namespace with no egress (useful for pure refactor/analysis tasks), 'allow' keeps normal connectivity. Optional for 'dispatch' (default: 'allow').",
+        ),
+    ),
 ];
 
 /// Render one table row as a JSON Schema property object.
@@ -131,6 +152,18 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     .collect(),
             ),
         );
+    }
+    if name == "network" {
+        schema.insert(
+            "enum".to_string(),
+            Value::Array(
+                NETWORK_MODES
+                    .iter()
+                    .map(|mode| Value::String((*mode).to_string()))
+                    .collect(),
+            ),
+        );
+        schema.insert("default".to_string(), Value::String(NETWORK_DEFAULT.to_string()));
     }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));
@@ -238,5 +271,46 @@ mod tests {
             );
         }
         assert_eq!(schema["required"], json!(["action"]));
+    }
+
+    /// The `network` property advertises exactly the accepted policies and the
+    /// documented default, so a client never has to guess the vocabulary.
+    #[test]
+    fn network_property_advertises_its_enum_and_default() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let network = &schema["properties"]["network"];
+
+        assert_eq!(network["type"], json!("string"));
+        assert_eq!(
+            network["enum"],
+            json!(["offline", "allow"]),
+            "the network enum is the documented policy vocabulary"
+        );
+        assert_eq!(network["default"], json!(NETWORK_DEFAULT));
+        assert_eq!(NETWORK_DEFAULT, "allow");
+        assert!(
+            network["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("offline")),
+            "the description must document what 'offline' does"
+        );
+    }
+
+    /// `network` is optional: a dispatch that omits it must still validate
+    /// against the advertised schema.
+    #[test]
+    fn network_is_not_required() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        assert_eq!(schema["required"], json!(["action"]));
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("required is an array")
+                .iter()
+                .any(|entry| entry == "network"),
+            "network must stay optional so existing callers are unaffected"
+        );
     }
 }
