@@ -13,8 +13,10 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 
 use super::AgentRunner;
 use super::sandbox::{
@@ -35,6 +37,25 @@ const DEFAULT_LIGHT_TIMEOUT_SECS: u64 = 120;
 /// `nice` level applied to every child so agent work yields to interactive
 /// work on a shared machine.
 const NICE_LEVEL: &str = "-n";
+
+/// Grace period a timed-out command gets to stop itself after `SIGTERM` before
+/// its process group is escalated to `SIGKILL`.
+///
+/// Long enough for a tool to flush its buffers and tidy up after itself, short
+/// enough that a wedged build still fails close to its wall-clock budget.
+const TERM_GRACE_MS: u64 = 5_000;
+
+/// Bound on the second, post-`SIGKILL` reap. `SIGKILL` cannot be caught or
+/// ignored, so a child still unreaped here is not ours to wait on any longer
+/// and must not stall the tool result.
+const KILL_GRACE_MS: u64 = 2_000;
+
+/// Bound on draining the output pipes of a command that has been terminated.
+///
+/// A grandchild that inherited stdout/stderr can hold the write end open long
+/// after its parent was killed, so the drain is abandoned at this deadline
+/// rather than being allowed to hang the worker.
+const DRAIN_GRACE_MS: u64 = 2_000;
 
 impl AgentRunner {
     /// Run `command` with `bash -c` inside `dir` and return its combined
@@ -257,45 +278,152 @@ fn command_timeout_secs(command: &str) -> u64 {
 
 /// Spawn `cmd`, wait up to `timeout_secs`, and collect the combined output.
 ///
-/// On timeout the child's whole process group is `SIGKILL`ed (a lingering
-/// compiler or test runner would otherwise outlive the budget) and the timeout
-/// is reported to the model as ordinary output with exit code 124.
+/// On timeout the child's whole process group is asked to stop with a graceful
+/// `SIGTERM` and escalated to `SIGKILL` only if it refuses to stop within
+/// [`TERM_GRACE_MS`] (a lingering compiler or test runner would otherwise
+/// outlive its budget). Whatever the command printed before the budget expired
+/// is still reported, so the model sees the last diagnostics instead of a bare
+/// "timed out". The timeout itself is reported as ordinary output with exit
+/// code [`TIMEOUT_EXIT_CODE`].
 async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(String, Option<i32>)> {
-    let child = cmd.spawn().context("Failed to spawn bash process")?;
+    let mut child = cmd.spawn().context("Failed to spawn bash process")?;
     let child_pid = child.id();
 
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-            .await
-        {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => return Err(e).context("Failed waiting for bash process"),
-            Err(_) => {
-                kill_process_group(child_pid);
-                return Ok((
-                    format!("Command timed out after {timeout_secs}s and was terminated."),
-                    Some(TIMEOUT_EXIT_CODE),
-                ));
-            }
-        };
+    // Take the pipes out of the child's hands and hand them to reader tasks.
+    // The readers keep running independently of the wait, so cancelling the
+    // wait on timeout cannot throw away output the command already produced.
+    let stdout = child.stdout.take().context("stdout pipe was not captured")?;
+    let stderr = child.stderr.take().context("stderr pipe was not captured")?;
+    let out_buf = PipeBuffer::spawn(stdout);
+    let err_buf = PipeBuffer::spawn(stderr);
 
-    Ok((combine_output(&output), output.status.code()))
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        // Clean exit: the write ends are closed now that the child is gone, so
+        // the readers reach EOF and the real output and code are reported.
+        Ok(Ok(status)) => {
+            let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
+            Ok((combine_output(&out, &err), status.code()))
+        }
+        Ok(Err(e)) => Err(e).context("Failed waiting for bash process"),
+        // The child outlived its budget: stop it, then report what it printed.
+        Err(_elapsed) => {
+            terminate_process_group(child_pid, &mut child).await;
+            // The group is gone by now, so the readers are released and the
+            // drain converges instead of waiting out the whole drain budget.
+            let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
+            let mut output = combine_output(&out, &err);
+            output.push_str(&format!(
+                "\nCommand timed out after {timeout_secs}s and was terminated."
+            ));
+            Ok((output, Some(TIMEOUT_EXIT_CODE)))
+        }
+    }
 }
 
-/// `SIGKILL` the child's process group. Best-effort: the child may already be
-/// gone, and the sandbox wrapper may have taken its group down with it.
-fn kill_process_group(pid: Option<u32>) {
+/// One of a command's output pipes, drained in the background into a buffer
+/// that outlives the command's own timeout.
+///
+/// Running the read as a detached task is what makes the drain robust. A read
+/// inlined into the awaited future is cancelled wholesale when the wait times
+/// out, discarding every byte it had already received; here the task keeps
+/// filling `bytes` while the caller is free to stop waiting, and
+/// [`finish`](Self::finish) later collects whatever arrived.
+struct PipeBuffer {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl PipeBuffer {
+    /// Start draining `pipe` into a fresh buffer.
+    fn spawn<R>(mut pipe: R) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bytes);
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            // A read failure means the child is gone, but whatever arrived is
+            // still worth reporting, so the buffer is flushed either way.
+            let _ = pipe.read_to_end(&mut buf).await;
+            match sink.lock() {
+                Ok(mut sink) => sink.extend_from_slice(&buf),
+                // The owning task panicked while holding the lock; a poisoned
+                // mutex still holds the bytes collected so far.
+                Err(poisoned) => poisoned.into_inner().extend_from_slice(&buf),
+            }
+        });
+        Self { bytes, reader }
+    }
+
+    /// Stop waiting for the reader and return every byte it collected.
+    ///
+    /// Bounded by [`DRAIN_GRACE_MS`] because a grandchild that inherited the
+    /// write end can hold the pipe open long after its parent was killed; the
+    /// reader is then abandoned and the bytes read up to that point returned.
+    async fn finish(self) -> Vec<u8> {
+        if tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS), self.reader)
+            .await
+            .is_err()
+        {
+            // Still blocked on a pipe somebody else holds open. Dropping the
+            // handle detaches the reader, and the `Arc` keeps the buffer alive
+            // until the runtime reaps the task when that pipe finally closes.
+            tracing::debug!(
+                timeout_ms = DRAIN_GRACE_MS,
+                "abandoning output drain of a timed-out command"
+            );
+        }
+
+        match self.bytes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// `SIGTERM` the child's process group, then `SIGKILL` it if it is still alive
+/// after [`TERM_GRACE_MS`].
+///
+/// Best-effort at every step: the group may already be gone (the sandbox
+/// wrapper carries `--die-with-parent` and takes its children with it), and a
+/// group that stops promptly on the `SIGTERM` is never escalated.
+async fn terminate_process_group(pid: Option<u32>, child: &mut Child) {
+    signal_process_group(pid, "TERM");
+
+    // Reap with a bounded wait so a well-behaved child can exit on its own and
+    // close its pipes; the deadline stops a wedged child from extending the
+    // budget by an unbounded amount.
+    if tokio::time::timeout(Duration::from_millis(TERM_GRACE_MS), child.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    signal_process_group(pid, "KILL");
+    // Reap again after the kill, still bounded: `SIGKILL` is uncatchable, so a
+    // child surviving this long is not ours to wait on any further.
+    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
+}
+
+/// Send `signal` (`"TERM"` or `"KILL"`) to the process group led by `pid`.
+///
+/// `configure_process` places the child in its own process group (`bwrap` adds
+/// `--new-session`), so the negated PID addresses the group and also reaches
+/// grandchildren that `child.wait` alone would never reap.
+fn signal_process_group(pid: Option<u32>, signal: &str) {
     #[cfg(unix)]
     if let Some(pid) = pid {
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
+            .args([&format!("-{signal}"), &format!("-{pid}")])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = (pid, signal);
 }
 
 /// Merge stdout and stderr into a single string, separated by a newline when
@@ -305,16 +433,16 @@ fn kill_process_group(pid: Option<u32>) {
 /// yields a blank line between the streams. That is pre-existing behaviour the
 /// model sees verbatim in the tool result, so it is preserved as-is rather
 /// than quietly changing the transcripts this crate already produced.
-fn combine_output(output: &std::process::Output) -> String {
+fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
     let mut combined = String::new();
-    if !output.stdout.is_empty() {
-        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    if !stdout.is_empty() {
+        combined.push_str(&String::from_utf8_lossy(stdout));
     }
-    if !output.stderr.is_empty() {
+    if !stderr.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
         }
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        combined.push_str(&String::from_utf8_lossy(stderr));
     }
 
     truncate_output(&combined)
@@ -378,38 +506,22 @@ mod tests {
     #[test]
     fn combine_output_joins_both_streams_and_truncates() {
         // Both streams non-empty: stdout, the separator, then stderr.
-        let out = std::process::Output {
-            status: exit_status(0),
-            stdout: b"from stdout\n".to_vec(),
-            stderr: b"from stderr".to_vec(),
-        };
-        assert_eq!(combine_output(&out), "from stdout\n\nfrom stderr");
+        assert_eq!(
+            combine_output(b"from stdout\n", b"from stderr"),
+            "from stdout\n\nfrom stderr"
+        );
 
         // Only one stream present: no separator is inserted.
-        let stdout_only = std::process::Output {
-            status: exit_status(0),
-            stdout: b"only stdout".to_vec(),
-            stderr: Vec::new(),
-        };
-        assert_eq!(combine_output(&stdout_only), "only stdout");
+        assert_eq!(combine_output(b"only stdout", b""), "only stdout");
 
         let long = "x".repeat(TRUNCATE_LIMIT_FOR_TEST + 1_000);
-        let truncated = combine_output(&std::process::Output {
-            status: exit_status(0),
-            stdout: long.into_bytes(),
-            stderr: Vec::new(),
-        });
+        let truncated = combine_output(long.as_bytes(), b"");
         assert!(truncated.contains("... [Truncated "), "{truncated}");
         assert!(truncated.len() < TRUNCATE_LIMIT_FOR_TEST + 1_000);
     }
 
     /// Mirrors the sandbox budget constant without importing it twice.
     const TRUNCATE_LIMIT_FOR_TEST: usize = super::super::sandbox::TRUNCATE_LIMIT;
-
-    fn exit_status(code: i32) -> std::process::ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(code << 8)
-    }
 
     #[tokio::test]
     async fn execute_bash_sandbox_runs_and_blocks_write() {
@@ -465,6 +577,191 @@ mod tests {
             .unwrap();
         assert_eq!(code, Some(0), "command failed with output: {out:?}");
         assert!(out.contains("plain"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A process group that ignores `SIGTERM` is still taken down, but only
+    /// after the grace period: the child must be alive when the grace expires
+    /// (proving `SIGTERM` was sent and had no effect) and gone once the call
+    /// returns (proving the `SIGKILL` escalation landed).
+    #[tokio::test]
+    async fn terminate_escalates_term_to_kill_after_the_grace_period() {
+        let mut cmd = Command::new("bash");
+        // The loop must run *in the shell*: bash `exec`s a trailing simple
+        // command, so `trap '' TERM; sleep 300` would really be a `sleep`, which
+        // dies on SIGTERM and would hide the escalation entirely.
+        cmd.args([
+            "-c",
+            "trap '' TERM; end=$((SECONDS+300)); while (( SECONDS < end )); do :; done",
+        ]);
+        configure_process(&mut cmd);
+        let mut child = cmd.spawn().expect("bash must spawn");
+        let pid = child.id().expect("a spawned child has a pid");
+        // Let the trap take effect before any signal is sent.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        terminate_process_group(Some(pid), &mut child).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(TERM_GRACE_MS),
+            "a child ignoring SIGTERM must be given the full {TERM_GRACE_MS}ms grace \
+             period before the SIGKILL escalation, but the group went down in {elapsed:?}"
+        );
+        // It only went down because of the SIGKILL: it was still running when
+        // the SIGTERM was sent, so nothing else could have reaped it.
+        assert!(!group_is_alive(pid), "the SIGKILL escalation must reap the group");
+    }
+
+    /// A child that stops on `SIGTERM` is never escalated: it exits inside the
+    /// grace period, so the call returns long before the `SIGKILL` deadline.
+    #[tokio::test]
+    async fn terminate_does_not_escalate_a_child_that_obeys_sigterm() {
+        let mut cmd = Command::new("bash");
+        // Shell-side loop again, so the trapped shell itself receives the signal
+        // instead of an exec'd `sleep`.
+        cmd.args([
+            "-c",
+            "trap 'exit 0' TERM; end=$((SECONDS+300)); while (( SECONDS < end )); do :; done",
+        ]);
+        configure_process(&mut cmd);
+        let mut child = cmd.spawn().expect("bash must spawn");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        terminate_process_group(child.id(), &mut child).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(TERM_GRACE_MS),
+            "a SIGTERM-obedient child must be reaped without waiting out the grace \
+             period, but the call took {elapsed:?}"
+        );
+    }
+
+    /// Signalling a group that is already gone is a no-op rather than a panic:
+    /// the sandbox wrapper carries `--die-with-parent` and routinely takes its
+    /// children down before the timeout ever fires.
+    #[tokio::test]
+    async fn terminate_tolerates_an_already_dead_group() {
+        let mut cmd = Command::new("true");
+        configure_process(&mut cmd);
+        let mut child = cmd.spawn().expect("true must spawn");
+        let pid = child.id();
+        let _ = child.wait().await;
+
+        let started = std::time::Instant::now();
+        terminate_process_group(pid, &mut child).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(TERM_GRACE_MS),
+            "signalling a dead group must return promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Whether a process still exists, used by the escalation test to show the
+    /// child outlived the `SIGTERM` and was removed by the `SIGKILL`.
+    fn group_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill must run")
+            .success()
+    }
+
+    /// The timeout path must not discard what the command had already printed:
+    /// the reader tasks keep filling their buffers across the cancellation, so
+    /// the model still sees the last diagnostics.
+    #[tokio::test]
+    async fn timed_out_command_still_reports_the_output_it_produced() {
+        let tmp = crate::worktree::swe_base_dir().join("exec-drain-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        // A one-second budget, so the test stays quick.
+        // SAFETY: this test binary runs its tests single-threaded, and no other
+        // thread in this process reads the command timeout variables.
+        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
+
+        let (out, code) = runner()
+            .execute_bash(&tmp, "echo EARLY-STDOUT; echo EARLY-STDERR >&2; sleep 300")
+            .await
+            .expect("a timeout is an ordinary result, not an error");
+
+        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
+
+        assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "a timeout reports 124: {out:?}");
+        assert!(
+            out.contains("EARLY-STDOUT"),
+            "stdout written before the timeout must survive the kill: {out:?}"
+        );
+        assert!(
+            out.contains("EARLY-STDERR"),
+            "stderr written before the timeout must survive the kill: {out:?}"
+        );
+        assert!(
+            out.contains("timed out after 1s"),
+            "the timeout itself must still be reported: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A grandchild that inherited the output pipes cannot be reaped by us, so
+    /// the drain is abandoned at its deadline instead of hanging the worker.
+    #[tokio::test]
+    async fn a_leaked_pipe_does_not_hang_the_timeout_path() {
+        let tmp = crate::worktree::swe_base_dir().join("exec-leak-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
+
+        // `setsid` detaches the sleeper from the killed process group, so it
+        // keeps the inherited stdout open past the SIGKILL.
+        let started = std::time::Instant::now();
+        let (out, code) = runner()
+            .execute_bash(&tmp, "echo BEFORE-LEAK; (setsid sleep 300 &); sleep 300")
+            .await
+            .expect("a leaked pipe must not turn the timeout into a hang");
+        let elapsed = started.elapsed();
+
+        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
+
+        assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "{out:?}");
+        assert!(
+            out.contains("BEFORE-LEAK"),
+            "output produced before the leak must still be reported: {out:?}"
+        );
+        let budget = Duration::from_secs(1)
+            + Duration::from_millis(TERM_GRACE_MS)
+            + Duration::from_millis(DRAIN_GRACE_MS)
+            + Duration::from_secs(5);
+        assert!(
+            elapsed < budget,
+            "the timeout path must stay bounded, took {elapsed:?} (budget {budget:?})"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A command that fills far more than a kernel pipe buffer must not
+    /// deadlock: both pipes are drained while the child is still running, so it
+    /// never blocks in `write`.
+    #[tokio::test]
+    async fn a_large_output_does_not_deadlock_the_collector() {
+        let tmp = crate::worktree::swe_base_dir().join("exec-chatty-test");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // 20k lines is well past the 64 KiB pipe buffer.
+        let (out, code) = runner()
+            .execute_bash(&tmp, "for i in $(seq 1 20000); do echo line-$i; done")
+            .await
+            .expect("a chatty command must not hang");
+        assert_eq!(code, Some(0), "command failed with output: {out:?}");
+        assert!(out.contains("line-1\n"), "stdout head: {out:?}");
+        assert!(
+            out.contains("... [Truncated "),
+            "20k lines must still hit the shared truncation budget"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
