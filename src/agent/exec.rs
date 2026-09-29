@@ -20,7 +20,8 @@ use tokio::process::{Child, Command};
 
 use super::AgentRunner;
 use super::sandbox::{
-    find_git_dirs, has_bwrap, is_heavy_command, truncate_output, validate_bash_command,
+    find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command, truncate_output,
+    validate_bash_command,
 };
 
 /// Exit code reported to the model when a command exceeded its wall-clock
@@ -86,6 +87,11 @@ impl AgentRunner {
                 .args([NICE_LEVEL, "10", "bash", "-c", command]);
         }
 
+        // Environment hygiene first: the child is spawned with a cleared
+        // environment and a strict allow-list, so no ambient credential from
+        // the operator's shell can reach the model. Build/cache variables are
+        // layered on top of the sanitized base afterwards.
+        apply_sanitized_environment(&mut cmd, dir);
         apply_build_env(&mut cmd, &target_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
 
@@ -238,6 +244,30 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
 
     // Modular shared package/compiler caches
     crate::cache::append_bwrap_cache_args(cmd, home.as_deref());
+}
+
+/// Replace the inherited environment with the sanitized allow-list.
+///
+/// The parent process environment is cleared wholesale and rebuilt from
+/// `env::build_clean_environment`, which forwards only the essential runtime
+/// variables, remaps `HOME` to an isolated per-worktree scratch directory and
+/// purges credential-bearing names (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_*`,
+/// `SSH_*`, ...). The child therefore cannot read back the operator's secrets
+/// through the ambient environment, and two runs are reproducible regardless of
+/// what else the operator happens to have exported.
+///
+/// The `repo_path` argument is the original checkout; the worker's worktree
+/// `dir` is what the command is chdir'ed into, so the isolated `HOME` is placed
+/// under `dir` where the sandbox bind makes it writable.
+fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
+    // The worker's worktree `dir`; the original repository is its git common
+    // dir when one can be resolved, else the worktree itself.
+    let repo_path = find_git_common_dir(dir).unwrap_or_else(|| dir.to_path_buf());
+    let repo_path = repo_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(repo_path);
+    super::env::apply_clean_environment_cmd(cmd, &repo_path, dir);
 }
 
 /// Universal build and test parallelism caps, so a command cannot oversubscribe
@@ -739,6 +769,78 @@ mod tests {
         assert!(
             elapsed < budget,
             "the timeout path must stay bounded, took {elapsed:?} (budget {budget:?})"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The end-to-end guarantee: a secret exported in the *worker's* own
+    /// environment is invisible to the command the model runs, and the command
+    /// sees the remapped, isolated `HOME` instead of the operator's.
+    ///
+    /// This is the check that matters, because it exercises the real spawn
+    /// path (`env_clear` + allow-list) rather than the pure helper: a bug that
+    /// only removed the helper's redaction, or one where `env_clear` was never
+    /// called, is invisible to unit tests of `build_clean_environment` alone.
+    #[tokio::test]
+    async fn a_spawned_command_cannot_read_the_operators_secrets() {
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = crate::worktree::swe_base_dir().join(format!(
+            "env-sanitize-test-{}-{unique_id}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // Export a secret the way an operator's shell would.
+        // SAFETY: the test binary runs its tests single-threaded, and no other
+        // thread in this process reads this variable.
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "sk-leaked-must-not-appear");
+            std::env::set_var("GITHUB_TOKEN", "ghp-leaked-must-not-appear");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear");
+            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
+        }
+
+        let (out, code) = runner()
+            .execute_bash(
+                &tmp,
+                "echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"",
+            )
+            .await
+            .expect("a spawned command must not error");
+
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("SSH_AUTH_SOCK");
+        }
+
+        assert_eq!(code, Some(0), "command failed with output: {out:?}");
+        for var in [
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(
+                !out.contains("leaked-must-not-appear"),
+                "{var} leaked into the child environment: {out:?}"
+            );
+        }
+        assert!(
+            !out.contains("/tmp/agent.sock"),
+            "the SSH agent socket path must not reach the child: {out:?}"
+        );
+        assert!(
+            out.contains("home=[") && out.contains("target/home"),
+            "HOME must be remapped into an isolated directory, got: {out:?}"
+        );
+        assert!(
+            std::env::var("HOME").is_ok_and(|real| !out.contains(&real)),
+            "the real HOME must not be visible to the child: {out:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
