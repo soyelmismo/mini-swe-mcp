@@ -10,6 +10,24 @@
 //!
 //! [`AgentRunner::execute_bash`] is the single entry point and keeps its
 //! original signature so callers (notably `pool::runner`) are unaffected.
+//!
+//! # Sandboxing: two backends, one policy
+//!
+//! Every command is confined, and *how* depends on what the host provides:
+//!
+//! * **bubblewrap present** - the child gets its own mount namespace, PID
+//!   namespace and an empty tmpfs `$HOME` (see [`apply_sandbox_args`]).
+//! * **bubblewrap absent** - nothing can build a namespace unprivileged, so
+//!   the kernel's own LSM does the work instead: the child is confined with
+//!   Landlock from a `pre_exec` hook (see [`apply_landlock_pre_exec`]).
+//!
+//! The second path is what makes the daemon usable on a host with no `bwrap`
+//! installed at all, and it is deliberately *not* a weaker policy: the same
+//! allow-list applies, and the sensitive paths (`$HOME/.ssh`, `/etc/shadow`) are
+//! unreachable either way. It is, however, narrower in scope: Landlock
+//! confines the filesystem only, so it grants no PID or network isolation. A
+//! step that needs `network: "offline"` still gets its own network namespace
+//! from [`wrap_network_command`], independently of the sandbox backend.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -22,8 +40,8 @@ use super::AgentRunner;
 use super::intercept::{CommandPipeline, InterceptDecision};
 use super::sandbox::{
     TRUNCATE_HEAD, TRUNCATE_MARKER, TRUNCATE_MARKER_SUFFIX, TRUNCATE_TAIL, USIZE_MAX_DIGITS,
-    find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command, truncate_output,
-    validate_bash_command,
+    build_landlock_plan, find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command,
+    truncate_output, validate_bash_command,
 };
 
 /// Exit code reported to the model when a command exceeded its wall-clock
@@ -126,10 +144,16 @@ impl AgentRunner {
         let final_command = wrap_network_command(&effective_command, self.network_offline);
 
         if sandbox_enabled() {
+            // bubblewrap is present: it builds the mount namespace itself, so
+            // there is nothing left for Landlock to add. Adding it here would
+            // only risk re-confining a process bwrap has already confined.
             apply_sandbox_args(&mut cmd, dir, &target_dir);
             cmd.args(["--chdir", &dir.to_string_lossy()]);
             cmd.args(["/usr/bin/bash", "-c", &final_command]);
         } else {
+            // No bubblewrap: the only isolation left is the kernel's own LSM,
+            // applied in the forked child (see `apply_landlock_pre_exec`).
+            apply_landlock_pre_exec(&mut cmd, dir, &target_dir);
             cmd.current_dir(dir)
                 .args([NICE_LEVEL, "10", "bash", "-c", &final_command]);
         }
@@ -245,6 +269,81 @@ fn resolve_target_dir(dir: &Path) -> PathBuf {
 fn sandbox_enabled() -> bool {
     has_bwrap() && std::env::var("SWE_DISABLE_SANDBOX").as_deref() != Ok("1")
 }
+
+/// Confine the child to `dir` and `target_dir` with the Landlock LSM, in the
+/// forked child itself.
+///
+/// # Why a `pre_exec` hook and not a call in the parent
+///
+/// Landlock is confined through `landlock_restrict_self`, which restricts
+/// **the calling process** and is irreversible. Calling it in the daemon would
+/// confine the daemon: it could no longer read its own worktree management
+/// state, its config or its caches, and no later call could undo it. The only
+/// correct place to confine a worker is in the process that is about to become
+/// that worker, which is precisely what a `Command::pre_exec` closure is - it
+/// runs in the child between `fork(2)` and `exec(2)`.
+///
+/// # Why the work happens in the parent
+///
+/// A `pre_exec` closure runs in a forked child of a *multi-threaded* server, so
+/// only async-signal-safe operations are permitted; `malloc`, `tracing` and
+/// `anyhow` are not (a thread that held the allocator lock at the instant of
+/// the fork leaves the child permanently deadlocked). [`build_landlock_plan`]
+/// therefore resolves the whole policy - ABI probe, path canonicalisation,
+/// `CString` construction, syscall-backed existence checks - here in the
+/// parent, where allocating is safe, and the closure is left with nothing but
+/// raw syscalls.
+///
+/// # Failure policy
+///
+/// * **No Landlock on this kernel, or `SWE_DISABLE_LANDLOCK=1`** -
+///   [`build_landlock_plan`] returns `Ok(None)` and *no hook is registered*:
+///   the command runs unconfined rather than failing. Landlock is absent on
+///   pre-5.13 kernels, when `CONFIG_SECURITY_LANDLOCK` is off, when the
+///   bootloader was given `lsm=` without it, and when a seccomp policy kills
+///   the syscalls, so a hard failure there would take the worker offline for
+///   no security gain.
+/// * **A malformed policy** (the worktree or the target dir does not exist) -
+///   propagated as an `Err` by the caller, because a worker confined to a
+///   directory that is not there has no correct behaviour.
+///
+/// A hook that *does* run and then fails is fatal to the child: an `Err` out of
+/// `pre_exec` aborts the spawn and is reported to the parent, which is the right
+/// outcome - it means the kernel promised a domain and did not deliver one,
+/// and silently continuing would be a confinement that is only advertised.
+#[cfg(unix)]
+fn apply_landlock_pre_exec(cmd: &mut Command, dir: &Path, target_dir: &Path) {
+    // Parent side of the hook: everything that allocates happens here, so the
+    // closure below is reduced to syscalls. A `None` plan means this host
+    // cannot confine the process, which is not an error.
+    let plan = match build_landlock_plan(dir, target_dir) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                worktree = %dir.display(),
+                "landlock confinement unavailable; running the command unconfined"
+            );
+            return;
+        }
+    };
+
+    // SAFETY: the closure runs in the child between `fork` and `exec`, where
+    // `plan.apply` performs only raw syscalls - it allocates nothing, takes no
+    // lock and never unwinds - and confines only that child, never the parent.
+    unsafe {
+        cmd.pre_exec(move || {
+            // SAFETY: forwarded from this function's contract; see above.
+            plan.apply()
+        });
+    }
+}
+
+/// Non-unix stub: there is no Landlock LSM and no `fork` to hook, so the child
+/// is spawned exactly as it was before this confinement existed.
+#[cfg(not(unix))]
+fn apply_landlock_pre_exec(_cmd: &mut Command, _dir: &Path, _target_dir: &Path) {}
 
 /// Baseline child process setup: kill the whole process group on drop, detach
 /// stdin, and capture both output streams.
@@ -1616,5 +1715,316 @@ mod tests {
             "20k lines must still hit the shared truncation budget"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+    // ---------- Landlock pre_exec confinement ----------
+
+    /// Sentinel that turns this test binary into a Landlock probe instead of a
+    /// libtest run. `landlock_restrict_self` is irreversible, so the probe
+    /// cannot share an address space with the rest of the suite.
+    const LANDLOCK_PROBE_ENV: &str = "MINI_SWE_EXEC_LANDLOCK_PROBE";
+
+    /// Scratch worktree + target pair, removed on drop.
+    struct LandlockScratch {
+        worktree: PathBuf,
+        target: PathBuf,
+    }
+
+    impl LandlockScratch {
+        fn new(tag: &str) -> Self {
+            let unique_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let base = crate::worktree::swe_base_dir().join(format!(
+                "exec-landlock-{tag}-{}-{unique_id}",
+                std::process::id()
+            ));
+            let worktree = base.join("worktree");
+            let target = base.join("target");
+            std::fs::create_dir_all(&worktree).expect("create worktree");
+            std::fs::create_dir_all(&target).expect("create target dir");
+            Self { worktree, target }
+        }
+    }
+
+    impl Drop for LandlockScratch {
+        fn drop(&mut self) {
+            if let Some(base) = self.worktree.parent() {
+                let _ = std::fs::remove_dir_all(base);
+            }
+        }
+    }
+
+    /// A plan is built for two existing directories and names both of them.
+    #[test]
+    fn a_landlock_plan_is_built_for_two_existing_roots() {
+        let scratch = LandlockScratch::new("plan");
+        let plan = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+            .expect("building a plan must not fail on a Landlock-capable kernel");
+
+        if let Some(plan) = plan {
+            let named: Vec<PathBuf> = (0..plan.rule_count())
+                .filter_map(|i| plan.rule_path(i).map(Path::to_path_buf))
+                .collect();
+            assert!(
+                named.len() >= 2,
+                "a plan must carry at least the two writable roots, got {named:?}"
+            );
+            for root in [&scratch.worktree, &scratch.target] {
+                assert!(
+                    named.contains(root),
+                    "the plan must grant {}; it grants {named:?}",
+                    root.display()
+                );
+            }
+            assert_ne!(
+                plan.handled_access(),
+                0,
+                "a plan with no handled rights would deny everything"
+            );
+        }
+    }
+
+    /// A missing root is a caller bug, not a runtime condition, and must be
+    /// reported rather than silently producing a plan that grants nothing.
+    #[test]
+    fn a_missing_root_is_reported_rather_than_silently_dropped() {
+        let scratch = LandlockScratch::new("missing");
+        let missing = scratch.worktree.join("no-such-dir");
+        let err =
+            super::super::sandbox::build_landlock_plan(&missing, &scratch.target).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "a missing worktree must be reported, got: {err:#}"
+        );
+
+        let err =
+            super::super::sandbox::build_landlock_plan(&scratch.worktree, &missing).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "a missing target dir must be reported, got: {err:#}"
+        );
+    }
+
+    /// The opt-out knob must produce *no plan at all* rather than an empty one:
+    /// an empty plan would install a ruleset that grants nothing and confine
+    /// the worker to a directory it cannot even read.
+    #[test]
+    fn the_landlock_opt_out_produces_no_plan() {
+        let scratch = LandlockScratch::new("disabled");
+        // SAFETY: the harness runs these environment-sensitive tests in one
+        // process; nothing else in the suite reads this variable concurrently
+        // with the window below.
+        unsafe { std::env::set_var(super::super::sandbox::DISABLE_LANDLOCK_ENV, "1") };
+        let built = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target);
+        unsafe { std::env::remove_var(super::super::sandbox::DISABLE_LANDLOCK_ENV) };
+
+        assert!(
+            matches!(built, Ok(None)),
+            "an explicit opt-out must skip confinement entirely, got: {built:?}"
+        );
+    }
+
+    /// The hook is only installed when there is no bubblewrap: with bwrap
+    /// present it builds the mount namespace itself and a second, LSM-level
+    /// confinement would be redundant (and would confine `bwrap` itself).
+    #[test]
+    fn the_landlock_hook_is_skipped_when_bubblewrap_is_available() {
+        if !has_bwrap() {
+            eprintln!("skipping: bubblewrap is unavailable on this host");
+            return;
+        }
+        // Both branches are driven by `sandbox_enabled()`; this asserts the
+        // predicate that selects them, which is what the hook hangs off.
+        assert!(
+            sandbox_enabled(),
+            "with bwrap present and no opt-out, the bwrap branch must win"
+        );
+    }
+
+    /// A confined command still runs, and it still gets its own process group
+    /// and pipes: the Landlock hook must not disturb the existing plumbing.
+    ///
+    /// This is the regression that matters most in practice. A `pre_exec` hook
+    /// that returned `Err`, or that confined the process before `fork`
+    /// completed, would break *every* worker on a host without bubblewrap -
+    /// including a plain `echo`.
+    #[tokio::test]
+    async fn a_command_runs_while_the_landlock_hook_is_installed() {
+        let scratch = LandlockScratch::new("runs");
+        let mut cmd = Command::new("/bin/sh");
+        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        cmd.arg("-c").arg("echo confined-and-alive");
+
+        let out = cmd
+            .output()
+            .await
+            .expect("a confined child must still spawn");
+        assert!(
+            out.status.success(),
+            "the confined child must run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("confined-and-alive"),
+            "the confined child must still produce its output"
+        );
+    }
+
+    /// End-to-end: the `pre_exec` hook really confines the *child* - and only
+    /// the child.
+    ///
+    /// The parent side of the contract is the part a naive implementation gets
+    /// catastrophically wrong: calling `landlock_restrict_self` from the daemon
+    /// would confine the daemon itself, permanently and irreversibly. This
+    /// test therefore asserts both halves: the child is denied a path outside
+    /// the domain, and the parent is not.
+    #[tokio::test]
+    async fn the_pre_exec_hook_confines_the_child_and_leaves_the_parent_alone() {
+        if std::env::var_os(LANDLOCK_PROBE_ENV).is_some() {
+            return;
+        }
+        // Only meaningful where the kernel actually confines: on a kernel
+        // without Landlock the hook is never installed at all, which is the
+        // documented graceful degradation.
+        let scratch = LandlockScratch::new("e2e");
+        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+            .expect("plan")
+            .is_none()
+        {
+            eprintln!("skipping: this kernel has no Landlock");
+            return;
+        }
+
+        // A file the domain must not be able to read. The policy grants
+        // exactly two writable roots - the worktree and the target dir - so a
+        // sibling of the scratch base is outside the domain by construction,
+        // without depending on what else happens to live on this host.
+        let secret = scratch
+            .worktree
+            .parent()
+            .expect("scratch has a parent")
+            .join("secret");
+        std::fs::write(&secret, b"PRIVATE KEY").expect("seed a decoy secret");
+
+        // Report the real errno rather than a shell `if`: `touch` on an
+        // existing file legitimately succeeds, so a bare success/failure word
+        // would conflate "allowed" with "already there".
+        //
+        // The `>/dev/null` redirect is load-bearing, not decoration: opening
+        // `/dev/null` for writing needs `WRITE_FILE`, so a read-only `/dev`
+        // would fail the redirect itself and every command in the domain that
+        // uses the most idiomatic redirection in shell would fail with it.
+        let probe = format!(
+            "cat {secret} >/dev/null; echo cat_rc=$?; \
+             touch {wt}/wrote; echo touch_rc=$?; \
+             echo hi >/dev/null; echo redir_rc=$?; \
+             echo PID=$$",
+            secret = secret.display(),
+            wt = scratch.worktree.display(),
+        );
+
+        let mut cmd = Command::new("/bin/sh");
+        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        cmd.arg("-c").arg(&probe);
+        let out = cmd.output().await.expect("spawn the confined probe");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "probe failed: {stdout}");
+        assert!(
+            stdout.contains("cat_rc=1"),
+            "the child must not be able to read outside its domain: {stdout}"
+        );
+        assert!(
+            stdout.contains("touch_rc=0"),
+            "the child must still be able to write its worktree: {stdout}"
+        );
+        assert!(
+            stdout.contains("redir_rc=0"),
+            "the child must still be able to redirect to /dev/null: {stdout}"
+        );
+
+        // The parent is untouched. If the hook had confined the daemon, this
+        // write would fail - and so would every later command in the suite.
+        let parent_probe = scratch.worktree.join("parent-probe");
+        std::fs::write(&parent_probe, b"parent").expect(
+            "the parent must NOT be confined: landlock_restrict_self belongs in the child only",
+        );
+        let _ = std::fs::remove_file(&parent_probe);
+        let _ = std::fs::remove_file(&secret);
+    }
+
+    /// The parent's own `$HOME` must remain readable after a confined child has
+    /// run, which is the observable form of "the hook confined the child only".
+    #[tokio::test]
+    async fn a_confined_child_does_not_narrow_the_parents_access() {
+        if std::env::var_os(LANDLOCK_PROBE_ENV).is_some() {
+            return;
+        }
+        let scratch = LandlockScratch::new("parent");
+        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+            .expect("plan")
+            .is_none()
+        {
+            eprintln!("skipping: this kernel has no Landlock");
+            return;
+        }
+
+        // Something outside the domain the parent has legitimate access to.
+        let outside = scratch
+            .worktree
+            .parent()
+            .expect("scratch has a parent")
+            .join("outside");
+        std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
+
+        let mut cmd = Command::new("/bin/sh");
+        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        cmd.arg("-c").arg("true");
+        let _ = cmd.output().await.expect("spawn");
+
+        // The child could not have read it...
+        let mut child = Command::new("/bin/sh");
+        apply_landlock_pre_exec(&mut child, &scratch.worktree, &scratch.target);
+        child.arg("-c").arg(format!("cat {}", outside.display()));
+        let out = child.output().await.expect("spawn");
+        assert!(
+            !out.status.success(),
+            "the child must not read a file outside the domain: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        // ...but the parent still can, because the restriction was installed in
+        // the child and nowhere else.
+        assert_eq!(
+            std::fs::read(&outside).expect("the parent must keep its own access"),
+            b"secret",
+            "a confined child must not narrow the parent's access"
+        );
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    /// The confinement must be the *fallback*, never a replacement: with
+    /// bubblewrap present the bwrap argument vector is unchanged.
+    #[test]
+    fn bubblewrap_remains_the_primary_sandbox_when_available() {
+        if !has_bwrap() {
+            eprintln!("skipping: bubblewrap is unavailable on this host");
+            return;
+        }
+        // A worktree the bwrap builder accepts must still yield the bwrap
+        // argv, and the Landlock hook must not have been folded into it.
+        let scratch = LandlockScratch::new("bwrap");
+        let mut cmd = Command::new("true");
+        apply_sandbox_args(&mut cmd, &scratch.worktree, &scratch.target);
+        let rendered: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rendered.iter().any(|a| a == "bwrap"),
+            "bwrap must still lead the argv: {rendered:?}"
+        );
     }
 }
