@@ -21,6 +21,7 @@
 use super::{force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
 
 /// True when a process with `pid` is alive **and able to do work** on this host.
@@ -152,21 +153,30 @@ pub(super) fn pid_file_contents() -> String {
 /// by the registered-worktree and orphan-directory paths: a `.pid` holding
 /// only a bare integer that the kernel recycles freely must never be able to
 /// destroy a live worktree, and a corrupt file must not be able to do it
-/// either. Dangling lease files that no longer have a worktree are cleaned up
-/// separately by `worktree_dir_of_pid_file`, which is a decision that cannot
-/// lose work (audit §01/§03/§08/§12).
+/// either.
+///
+/// A bare-pid lease stays readable (older builds wrote one) and is answered by
+/// liveness alone; pid *recycling* cannot make such a lease dangerous here,
+/// because a recycled pid is either alive — and then the work is kept — or dead
+/// — and then there is no owner left to lose work. Dangling lease files that no
+/// longer have a worktree are cleaned up separately by `worktree_dir_of_pid_file`,
+/// which is a decision that cannot lose work (audit §01/§03/§08/§12).
 fn pid_file_is_stale(pid_file: &Path) -> Option<bool> {
     let content = std::fs::read_to_string(pid_file).ok()?;
-    let mut lines = content.lines();
-    let pid: u32 = lines.next()?.trim().parse().ok()?;
-    // A lease recorded for another uid is not ours to interpret or to act on.
+    let mut lines = content.lines().map(str::trim);
+    let pid: u32 = lines.next()?.parse().ok()?;
+
+    // A lease recorded for another uid is not ours to interpret or to act on —
+    // and neither is one whose owner line we cannot read at all. Accepting an
+    // unparseable line would silently downgrade a truncated or tampered lease to
+    // the weaker "bare pid" form and hand it authority it was never granted.
     if let Some(ours) = current_uid()
-        && lines
-            .next()
-            .is_some_and(|l| l.trim().parse::<u32>().is_ok_and(|uid| uid != ours))
+        && let Some(uid) = lines.next()
+        && !matches!(uid.parse::<u32>(), Ok(uid) if uid == ours)
     {
         return None;
     }
+
     Some(!is_process_alive(pid))
 }
 
@@ -212,12 +222,61 @@ fn reclaim_abandoned_worktree(dir: &Path) {
         return;
     }
     info!(path = %dir.display(), "Pruning orphaned worktree directory");
-    // The lease goes with the directory, and it goes last: removing it first
-    // would make a concurrent sweep see an unleased directory and fail open,
-    // stranding it forever (the leak audit §01 was written about).
+    // The lease is *claimed* by renaming it to a private name before anything is
+    // destroyed. `rename` within a directory is atomic, so of N concurrent
+    // sweeps racing over the same abandoned worktree exactly one observes a
+    // successful claim and only that one proceeds; the losers get `NotFound` (or
+    // some other error) and leave the entry alone. Without this, two sweeps could
+    // both read a live-looking lease, both decide "stale", and interleave their
+    // directory/lease/target removals into a half-reclaimed worktree.
+    //
+    // Claiming before the directory is removed — rather than after — is what
+    // keeps the unit all-or-nothing for *readers* too: the unleased window a
+    // concurrent sweep would otherwise see (and fail open on, stranding the
+    // directory forever, the leak audit §01 was written about) is bounded to a
+    // single `rename` and the reclaiming sweep is already committed to finishing.
+    let Ok(claimed) = claim_lease(&pid_file) else {
+        // Another sweep claimed this lease first, or the lease vanished under
+        // us; either way the worktree is that sweep's to finish, not ours.
+        return;
+    };
+    // The reclaim is now ours alone, so the destructive steps cannot interleave
+    // with another sweep's. The claimed copy is dropped afterwards — it names
+    // nothing, but leaving it behind would litter the shared scratch dir with
+    // files no later sweep knows how to classify.
     force_remove_dir(dir);
-    let _ = std::fs::remove_file(&pid_file);
     remove_target_dirs(dir);
+    let _ = std::fs::remove_file(&claimed);
+}
+
+/// Atomically take exclusive ownership of a lease by renaming it aside.
+///
+/// Returns the claimed path on success. Any error — most importantly
+/// `NotFound`, meaning another sweep claimed it first — leaves the original
+/// lease untouched and tells the caller to abandon the reclaim.
+fn claim_lease(pid_file: &Path) -> std::io::Result<PathBuf> {
+    let Some(parent) = pid_file.parent() else {
+        return Err(std::io::ErrorKind::NotFound.into());
+    };
+    let claimed = parent.join(format!(
+        ".swe-wt-lease-claimed.{}.{}",
+        std::process::id(),
+        CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::rename(pid_file, &claimed)?;
+    Ok(claimed)
+}
+
+/// Process-unique counter backing [`claim_lease`], so two sweeps in the same
+/// process never pick the same claimed-lease name.
+static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Test seam: the atomic lease claim itself. A race between two concurrent
+/// sweeps cannot be provoked from a single-threaded test, but the property that
+/// makes it safe — the claim succeeds exactly once — is directly observable.
+#[doc(hidden)]
+pub fn claim_lease_for_test(pid_file: &Path) -> std::io::Result<PathBuf> {
+    claim_lease(pid_file)
 }
 
 /// Reclaim leases that describe nothing: a `swe-wt-*.pid` whose worktree
@@ -387,49 +446,63 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
     }
 
     for base in base_dirs {
-        // 3. Reclaim abandoned `swe-wt-*` scratch directories. Every entry is
-        //    classified by name alone and then handled as a whole unit — the
-        //    directory with its lease, or the lease on its own — so the result
-        //    is independent of `read_dir` ordering and no orphan can survive
-        //    with its lease already removed (audit §01/§09).
-        if let Ok(entries) = std::fs::read_dir(base) {
-            for entry in entries.flatten() {
+        // 3 & 4 share a single traversal of the base directory. `read_dir` on a
+        //    scratch base is the sweep's most expensive step — the base is
+        //    usually the system temp dir — and phases 3 and 4 classify disjoint
+        //    subsets of exactly the same entries, so listing the directory twice
+        //    bought nothing but a second full directory read (and a second
+        //    chance to observe a torn `read_dir` snapshot mid-reclaim). The
+        //    entries are collected once, together with the type `readdir` already
+        //    reported, and both phases then run off that in-memory snapshot.
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        let snapshot: Vec<(PathBuf, bool)> = entries
+            .flatten()
+            .map(|entry| {
                 let p = entry.path();
-                // Non-UTF-8 names are reported instead of guessed at: such an
-                // entry is never a lease this sweep wrote, so nothing is lost
-                // by skipping it.
-                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                    error!(path = %p.display(), "Skipping non-UTF-8 scratch entry");
-                    continue;
-                };
+                // `DirEntry::file_type` is served from the `readdir` `d_type`
+                // field on Linux, so this replaces the extra `stat` that
+                // `Path::is_dir` would issue for every entry. When the type is
+                // unavailable (some filesystems report `DT_UNKNOWN`) fall back to
+                // a single `stat` — still without a second directory read.
+                let is_dir = entry
+                    .file_type()
+                    .map(|t| t.is_dir())
+                    .unwrap_or_else(|_| p.is_dir());
+                (p, is_dir)
+            })
+            .collect();
 
-                // Dispatch on the entry's *type* first: a directory can only be
-                // a worktree, and a lease is always a regular file. Both
-                // branches are self-contained, so which of the two `read_dir`
-                // hands back first cannot change the outcome.
-                if p.is_dir() {
-                    if is_worktree_dir_name(name) {
-                        reclaim_abandoned_worktree(&p);
-                    }
-                } else if is_worktree_lease_name(name) {
-                    reclaim_dangling_lease(&p);
+        for (p, is_dir) in &snapshot {
+            // Non-UTF-8 names are reported instead of guessed at: such an entry
+            // is never a lease this sweep wrote, so nothing is lost by skipping.
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                error!(path = %p.display(), "Skipping non-UTF-8 scratch entry");
+                continue;
+            };
+
+            // Dispatch on the entry's *type* first: a directory can only be a
+            // worktree, and a lease is always a regular file. Both branches are
+            // self-contained, so the order the snapshot happens to hold cannot
+            // change the outcome.
+            if *is_dir {
+                if is_worktree_dir_name(name) {
+                    reclaim_abandoned_worktree(p);
                 }
+            } else if is_worktree_lease_name(name) {
+                reclaim_dangling_lease(p);
             }
         }
 
-        // 4. Prune orphaned swe-target-* directories in base dirs whose worktrees are gone
-        if let Ok(entries) = std::fs::read_dir(base) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                    && let Some(wt_name) = name.strip_prefix("swe-target-")
-                    && wt_name.starts_with("swe-wt-")
-                {
-                    let wt_path = base.join(wt_name);
-                    if !wt_path.exists() {
-                        force_remove_dir(&p);
-                    }
-                }
+        // 4. Prune orphaned swe-target-* directories whose worktrees are gone.
+        for (p, _) in &snapshot {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && let Some(wt_name) = name.strip_prefix("swe-target-")
+                && wt_name.starts_with("swe-wt-")
+                && !base.join(wt_name).exists()
+            {
+                force_remove_dir(p);
             }
         }
     }

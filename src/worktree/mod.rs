@@ -17,7 +17,8 @@ mod prune;
 
 pub use guard::WorktreeGuard;
 pub use prune::{
-    is_process_alive, prune_stale_worktrees, prune_stale_worktrees_in, worktree_is_stale_for_test,
+    claim_lease_for_test, is_process_alive, prune_stale_worktrees, prune_stale_worktrees_in,
+    worktree_is_stale_for_test,
 };
 
 use anyhow::{Context, Result};
