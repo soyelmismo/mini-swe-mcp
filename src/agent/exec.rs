@@ -37,7 +37,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use super::AgentRunner;
-use super::intercept::check_command;
+use super::intercept::{check_command, strip_data_heredocs};
 use super::sandbox::{
     TRUNCATE_HEAD, TRUNCATE_TAIL, build_landlock_plan, find_git_common_dir, find_git_dirs,
     has_bwrap, is_heavy_command, truncate_with_dropped, validate_bash_command,
@@ -105,7 +105,9 @@ impl AgentRunner {
             return Ok((blocked_by_interceptor(&reason), Some(1)));
         }
 
-        if let Err(reason) = validate_bash_command(command) {
+        // Same executable view as `check_command`: file content written through
+        // a heredoc is data, not a search or a `cd`.
+        if let Err(reason) = validate_bash_command(&strip_data_heredocs(command)) {
             return Ok((blocked_by_guardrail(reason), Some(1)));
         }
 
@@ -148,7 +150,7 @@ impl AgentRunner {
 /// Message shown to the model when an interceptor blocks a command.
 fn blocked_by_interceptor(reason: &str) -> String {
     format!(
-        "COMMAND BLOCKED BY INTERCEPTOR:\n{reason}\nPlease use a safe, non-destructive command within the current repository directory ($PWD). The whole command text is scanned, heredocs and quoted strings included: if the pattern only appears in content you are writing, build that text without the literal pattern (e.g. concatenate two string pieces)."
+        "COMMAND BLOCKED BY INTERCEPTOR:\n{reason}\nPlease use a safe, non-destructive command within the current repository directory ($PWD)."
     )
 }
 
