@@ -46,22 +46,9 @@ pub trait CommandInterceptor: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Blocks destructive patterns that must never reach the executor, even
-/// inside the bubblewrap sandbox (the sandbox bind-mounts the worktree
-/// read-write, so `rm -rf` inside it still destroys user data).
-///
-/// Matching happens on a *canonical scan view* of the command, not on the raw
-/// text: ASCII whitespace is dropped, single quotes are dropped, quote
-/// *characters* are dropped from every other token, and the remaining variable
-/// expansions are neutralised (see [`scan_form`]). Padding (`r m  -r f /`,
-/// `rm  -rf\t/`, `rm -rf "$HOME"`), quote interleaving (`"r"m -rf '/'`) and
-/// variable expansion (`rm -rf $HOME`, `rm -rf "${H:-\/}"`) therefore reduce to
-/// the canonical text `rm -rf $home`, and the block rules below stay
-/// token-exact.
-///
-/// Benign developer verbs short-circuit before any of that work (see
-/// [`is_benign`]); a chained, substituted or obfuscated command takes the slow
-/// path, so the fast path can never mask a later destructive segment.
+/// Blocks destructive invocations before they reach the executor, including
+/// simple whitespace, quote and variable-expansion obfuscation. The fast path
+/// only accepts plain developer commands without shell substitution or chaining.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DestructiveCommandInterceptor;
 
@@ -72,41 +59,20 @@ impl DestructiveCommandInterceptor {
     }
 }
 
-/// Developer verbs that can neither be destructive on their own nor
-/// de-obfuscate a later segment: they neither are nor can smuggle a
-/// `sudo` prefix, a command separator or a `rm`/`dd` token.
-///
-/// A command is *only* considered benign when every one of its segments
-/// starts with one of these verbs, which is what makes the fast path in
-/// [`DestructiveCommandInterceptor::intercept`] safe.
+/// Plain developer verbs eligible for the pattern-check fast path.
 const BENIGN_VERBS: &[&str] = &["cargo", "git", "ls", "cat"];
 
-/// `true` when `lowered` is a single benign developer command, e.g.
-/// `cargo test --all-targets`, `git status`, `ls -la` or `cat Cargo.toml`.
-///
-/// The check is a prefix match plus two linear scans over the (already
-/// lowercased, untrimmed) input — O(1) in the number of guarded patterns and
-/// allocation-free, so it stays cheap for the common case.
+/// Skip expensive pattern matching for simple commands with a known verb.
+/// Shell composition and substitution always take the slow path.
 fn is_benign(lowered: &str) -> bool {
-    // No shell composition at all: nothing after the first verb can be
-    // a separate command.
-    if !lowered.contains([';', '&', '|', '`', '\n']) {
-        let trimmed = lowered.trim();
-        return BENIGN_VERBS
-            .iter()
-            .any(|verb| strip_verb(trimmed, verb).is_some());
+    // Do not accept substituted commands or shell redirections as plain verbs.
+    if lowered.contains([';', '&', '|', '`', '\n', '$', '(', ')', '<', '>']) {
+        return false;
     }
-    // Otherwise *every* segment must be a benign verb; a `;`, `&&`, `|` or
-    // newline separates two commands, and the destructive one is never a
-    // developer verb. This is the sound-and-complete split: a destructive
-    // segment is either preceded by a separator (caught here) or is the head
-    // of the command (caught by the fast path missing, slow path running).
-    lowered.split([';', '&', '|', '\n']).all(|segment| {
-        let segment = segment.trim();
-        BENIGN_VERBS
-            .iter()
-            .any(|verb| strip_verb(segment, verb).is_some())
-    })
+    let trimmed = lowered.trim();
+    BENIGN_VERBS
+        .iter()
+        .any(|verb| strip_verb(trimmed, verb).is_some())
 }
 
 /// Strip a leading `verb` from a command segment, requiring the shell token
@@ -121,34 +87,8 @@ fn strip_verb<'a>(segment: &'a str, verb: &str) -> Option<&'a str> {
     }
 }
 
-/// Canonical *scan view* of a command: the lowercased text reduced to the
-/// characters a token-aware scan can still interpret.
-///
-/// The view is a superset of the danger space (every variant of a command
-/// reduces to one of the canonical strings the rules below look for), never a
-/// subset: quote stripping and padding removal can only make the view *more*
-/// general, so no evasive spelling of a blocked command slips through. The
-/// view must not be used as evidence in a block reason, and commands
-/// rejected by a sibling guardrail are re-validated with the raw text, so
-/// this relaxation is contained.
-/// Canonical *scan view* of a command: the text reduced to what a
-/// token-aware scan still has to interpret.
-///
-/// A view is a superset of the danger space, never a subset: dropping a quote
-/// character, an ASCII whitespace padding or expanding an unknown variable to a
-/// root-level path can only make the view *more* general, so no evasive
-/// spelling of a blocked command slips through. The view is therefore never
-/// used as evidence in a block reason, and the sibling guardrail in `sandbox`
-/// re-validates the raw text, which keeps the relaxation contained.
-/// Canonical *scan view* of a command: the text reduced to what a
-/// token-aware scan still has to interpret.
-///
-/// A view is a superset of the danger space, never a subset: dropping a quote
-/// character, an ASCII whitespace padding or expanding an unknown variable to a
-/// root-level path can only make the view *more* general, so no evasive
-/// spelling of a blocked command slips through. The view is therefore never
-/// used as evidence in a block reason, and the sibling guardrail in `sandbox`
-/// re-validates the raw text, which keeps the relaxation contained.
+/// Build a conservative scan view of a command, retaining token boundaries
+/// while removing interleaved quotes and neutralising variable expansions.
 fn scan_form(command: &str) -> String {
     let mut out = String::with_capacity(command.len());
     let mut quote: Option<char> = None;
@@ -238,11 +178,10 @@ impl CommandInterceptor for DestructiveCommandInterceptor {
         // Fast path: pure developer verbs (`cargo test`, `git status`, `ls -la`,
         // `cat Cargo.toml`) can never contain a destructive pattern, so the
         // canonicalisation work below is skipped entirely.
-        let lowered = command.to_lowercase();
-        if is_benign(&lowered) {
+        if is_benign(command) {
             return Ok(InterceptDecision::Allow);
         }
-        let trimmed = scan_form(&lowered);
+        let trimmed = scan_form(&command.to_lowercase());
         let trimmed = trimmed.trim();
 
         // `rm -rf /`, `rm -fr /`, `rm -rf /*`, `rm --no-preserve-root`, bare `rm -rf /`.
@@ -330,7 +269,7 @@ fn is_destructive_rm(scan_trimmed: &str) -> bool {
                 if arg.starts_with('-') {
                     continue;
                 }
-                if targets_root_level(arg) {
+                if targets_root_level(arg.trim_end_matches([')', '}'])) {
                     return true;
                 }
             }
@@ -345,7 +284,11 @@ fn is_destructive_rm(scan_trimmed: &str) -> bool {
 /// Wrapping a command (`sudo rm`, `xargs rm`) does not change the name, which
 /// is why the callers look for the command word anywhere in a segment.
 fn is_command_word(token: &str, command: &str) -> bool {
-    token.rsplit('/').next().is_some_and(|name| name == command)
+    token
+        .trim_start_matches(['<', '>', '$', '(', '{'])
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == command)
 }
 
 /// The root operand carried by a flag-shaped token, e.g. `/` in `-rf/`
@@ -361,16 +304,6 @@ fn root_operand_in_flag(token: &str) -> Option<&str> {
 
 /// `true` when `path` addresses the filesystem root or a direct child of it.
 fn targets_root_level(path: &str) -> bool {
-    // In `${VAR...}` the operator decides whether the root is the expansion
-    // itself (`:?`/`:+`/`%`/`#` prefixes, `:+`/`:-`/`-`/`=` substitutions) or
-    // only its default (`:/`), so every one of them is a root-level target.
-    if let Some(group) = path.find('{') {
-        let inner = &path[group + 1..];
-        let root = ['/', '-', '+', '=', '?', '%', '#', ':']
-            .iter()
-            .any(|op| inner.contains(*op) || inner.starts_with(*op));
-        return root;
-    }
     // `~`, `~/x`, `~user` and `~user/x` all address a path under the home
     // root, so a leading `~` counts as the root component.
     let home_root;
@@ -383,14 +316,10 @@ fn targets_root_level(path: &str) -> bool {
     if path == "/" || path.starts_with("/*") {
         return true;
     }
-    // The scan view rewrites every `$` to the root of a top-level path, so a
-    // variable expansion is a root-level target, while a worktree-relative
-    // one such as `target/$BUILD` keeps its relative prefix and stays
-    // allowed.
     // `rm -rf / home`-style split or top-level system dir with no deeper
     // path component (e.g. `/etc`, not `/etc/hostname.bak`? conservatively
     // block any direct child of root that is short).
-    if path.starts_with('/') && !path.starts_with("/tmp*") && !path.starts_with("/dev*") {
+    if path.starts_with('/') {
         let depth = path.split('/').filter(|c| !c.is_empty()).count();
         return depth <= 1;
     }
@@ -599,21 +528,18 @@ mod tests {
     fn destructive_blocks_mkfs_dd_and_fork_bomb() {
         let i = DestructiveCommandInterceptor;
         assert!(i.intercept("mkfs.ext4 /dev/sda1").unwrap().is_block());
-        assert!(
-            i.intercept("sudo mkfs -t ext4 /dev/sda1")
-                .unwrap()
-                .is_block()
-        );
-        assert!(
-            i.intercept("dd if=/dev/zero of=/dev/sda")
-                .unwrap()
-                .is_block()
-        );
-        assert!(
-            i.intercept("sudo dd if=/dev/random of=/dev/sda")
-                .unwrap()
-                .is_block()
-        );
+        assert!(i
+            .intercept("sudo mkfs -t ext4 /dev/sda1")
+            .unwrap()
+            .is_block());
+        assert!(i
+            .intercept("dd if=/dev/zero of=/dev/sda")
+            .unwrap()
+            .is_block());
+        assert!(i
+            .intercept("sudo dd if=/dev/random of=/dev/sda")
+            .unwrap()
+            .is_block());
         assert!(i.intercept(":(){ :|:& };:").unwrap().is_block());
         assert!(i.intercept(":() { : | : & } ; :").unwrap().is_block());
     }
@@ -637,6 +563,23 @@ mod tests {
                 InterceptDecision::Allow,
                 "should allow: {cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn destructive_blocks_obfuscated_and_substituted_commands() {
+        let i = DestructiveCommandInterceptor;
+        for cmd in [
+            "r\"m\" -rf /",
+            "rm -rf \"$HOME\"",
+            "rm -rf ${HOME}",
+            "rm -rf /etc",
+            "git status $(rm -rf /)",
+            "cat <(rm -rf /)",
+            "cargo test `rm -rf /`",
+            "ls; rm -rf /",
+        ] {
+            assert!(i.intercept(cmd).unwrap().is_block(), "should block: {cmd}");
         }
     }
 
