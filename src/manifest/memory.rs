@@ -25,11 +25,17 @@
 //! * **Traversal-safe.** The alias is reduced to a conservative
 //!   `[a-z0-9_-]` slug before it touches the filesystem, so a hostile `model`
 //!   argument can never read or write outside `.agents/memory/`.
+//! * **Symlink-safe.** The staging file is *exclusively* created
+//!   ([`write_new_staging_file`]), so a pre-planted `.ninja.md.<pid>.<seq>.tmp`
+//!   symlink is never followed, and a symlinked `.agents/memory` directory is
+//!   rejected instead of quietly redirecting the write.
 //!
 //! Role memory is deliberately *not* part of the memoized catalog
 //! ([`super::cache`]): memory changes on disk between renders, so it must be
 //! re-read on every build instead of being interned process-wide.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -65,11 +71,12 @@ pub const MAX_MEMORY_PROMPT_BYTES: usize = 8 * 1024;
 /// Anything that sanitizes away to nothing (or that is unreasonably long) yields
 /// `None`, which the callers treat as "no memory for this alias".
 fn memory_slug(alias: &str) -> Option<String> {
-    let mut slug = String::with_capacity(alias.len());
-    for ch in alias.chars() {
-        if slug.len() >= 64 {
-            break;
-        }
+    // Every surviving character is one ASCII byte, so the byte budget doubles as
+    // a character budget and the slug is capped without re-measuring.
+    const MAX_SLUG_BYTES: usize = 64;
+
+    let mut slug = String::with_capacity(alias.len().min(MAX_SLUG_BYTES));
+    for ch in alias.chars().take(MAX_SLUG_BYTES) {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
             slug.push(ch.to_ascii_lowercase());
         } else {
@@ -77,8 +84,8 @@ fn memory_slug(alias: &str) -> Option<String> {
         }
     }
     // Trim the separator noise an alias like `"  ninja  "` would otherwise keep.
-    let slug = slug.trim_matches('-').to_string();
-    (!slug.is_empty()).then_some(slug)
+    let trimmed = slug.trim_matches('-');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Path of the memory file backing `model_alias` inside `repo_path`.
@@ -113,11 +120,10 @@ fn truncate_to_memory_budget(text: &str) -> &str {
         return text;
     }
     // The byte budget need not fall on a `char` boundary (e.g. a cut inside a
-    // multi-byte code point); round the cut index up first so the slice below
-    // can never panic and remains within the byte budget, then drop any leading
-    // partial line so the block starts at a line boundary.
-    let cut = text.ceil_char_boundary(text.len() - MAX_MEMORY_PROMPT_BYTES);
-    let tail = &text[cut..];
+    // multi-byte code point); `ceil_char_boundary` rounds the cut index up so the
+    // slice below can never panic and stays within the byte budget, then drop
+    // any leading partial line so the block starts at a line boundary.
+    let tail = &text[text.ceil_char_boundary(text.len() - MAX_MEMORY_PROMPT_BYTES)..];
     match tail.find('\n') {
         Some(offset) => &tail[offset + 1..],
         None => tail,
@@ -157,8 +163,21 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
     // itself is still intact (publishing is a rename), so recovery is safe.
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create memory directory {}", dir.display()))?;
+    // `create_dir_all` reports success for any already-existing path, *including*
+    // a symlink to a directory somewhere else entirely, so a hostile repository
+    // that symlinks `.agents/memory` would silently redirect every memory write
+    // (and every staged temp file) out of the worktree. `symlink_metadata` reads
+    // the link itself rather than following it, which is exactly the check needed
+    // to refuse that.
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => anyhow::bail!(
+            "Refusing to write agent memory: {} is not a real directory",
+            dir.display()
+        ),
+        Err(_) => std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create memory directory {}", dir.display()))?,
+    }
 
     // Read-then-rewrite (rather than a bare `O_APPEND` write) so the note can be
     // published with a temp-file + `rename`, which is atomic: a concurrent
@@ -189,7 +208,7 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
         std::process::id(),
         APPEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
-    std::fs::write(&tmp, existing.as_bytes())
+    write_new_staging_file(&tmp, existing.as_bytes())
         .with_context(|| format!("Failed to stage memory update in {}", tmp.display()))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -199,17 +218,48 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
     Ok(())
 }
 
+/// Create `path` and write `bytes` to it, exclusively and durably.
+///
+/// The staging name is derived from the target name plus a pid and a counter, so
+/// it is *predictable* — which makes [`std::fs::write`] unsafe here: it opens
+/// with `O_CREAT | O_TRUNC` and **follows symlinks**, so a symlink pre-planted
+/// at that name (in the shared `.agents/memory` directory) would redirect the
+/// staged note to any file the daemon can write. [`OpenOptions::create_new`]
+/// fails with `AlreadyExists` instead of following the link, which closes the
+/// race, and the collision it reports is resolved by the caller's next counter
+/// value.
+///
+/// [`std::fs::write`] also returns as soon as the data reached the page cache, so
+/// a note that has been accepted could still be lost to a crash. `sync_all`
+/// closes that window: the buffer is on stable storage before the `rename` that
+/// publishes it, so recovery always finds a complete file.
+fn write_new_staging_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Reduce a note to a single markdown list item.
 ///
 /// Whitespace is collapsed so a multi-line note cannot break the one-entry-per-
 /// line format, and an empty result is rejected rather than written as a blank
 /// bullet.
 fn normalize_note(note: &str) -> Result<String> {
-    let collapsed = note.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
+    // Collapsed straight into the final bullet: one allocation, and a short
+    // note never borrows an intermediate `Vec<&str>`.
+    let mut entry = String::with_capacity(note.len() + 4);
+    entry.push_str("- ");
+    for word in note.split_whitespace() {
+        if entry.len() > 2 {
+            entry.push(' ');
+        }
+        entry.push_str(word);
+    }
+    if entry.len() == 2 {
         anyhow::bail!("Refusing to append an empty note to agent memory");
     }
-    Ok(format!("- {collapsed}\n"))
+    entry.push('\n');
+    Ok(entry)
 }
 
 /// Render the system-prompt section for a role, memory included.
@@ -265,5 +315,71 @@ mod tests {
         assert!(cut.len() <= MAX_MEMORY_PROMPT_BYTES);
         assert!(text.ends_with(cut));
         assert!(cut.is_char_boundary(0));
+    }
+
+    #[test]
+    fn normalize_note_collapses_to_one_bullet() {
+        assert_eq!(
+            normalize_note("  reproduce\n  before   patching\n").expect("note"),
+            "- reproduce before patching\n"
+        );
+        assert!(
+            normalize_note(" \n\t ").is_err(),
+            "a whitespace-only note is not a memory entry"
+        );
+    }
+
+    /// The staging name is predictable, so the note must be staged with
+    /// `O_CREAT | O_EXCL` (`create_new`), never the symlink-following
+    /// `O_CREAT | O_TRUNC` that [`std::fs::write`] uses.
+    #[test]
+    fn staging_a_note_never_follows_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("swe-memory-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        let victim = dir.join("victim.md");
+        std::fs::write(&victim, "untouched\n").expect("victim");
+        let link = dir.join(".note.md.1.2.tmp");
+        std::os::unix::fs::symlink(&victim, &link).expect("planted symlink");
+
+        let err = write_new_staging_file(&link, b"- note\n").expect_err("must not follow the link");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim intact"),
+            "untouched\n",
+            "a pre-planted symlink must never receive the staged note"
+        );
+
+        // The exclusive create succeeds once the name is free.
+        write_new_staging_file(&dir.join(".note.md.1.3.tmp"), b"- note\n").expect("fresh stage");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked `.agents/memory` passes `create_dir_all` (which reports
+    /// success for any existing path) and would otherwise redirect every memory
+    /// write outside the repository.
+    #[test]
+    fn append_refuses_a_symlinked_memory_directory() {
+        let repo = std::env::temp_dir().join(format!("swe-memory-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".agents")).expect(".agents");
+        let elsewhere = repo.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("decoy");
+        std::os::unix::fs::symlink(&elsewhere, repo.join(MEMORY_DIR)).expect("symlinked dir");
+
+        let err = append_agent_memory(&repo, "ninja", "note")
+            .expect_err("append must not write through a symlinked memory dir");
+        assert!(
+            err.to_string().contains("not a real directory"),
+            "the refusal must say why: {err}"
+        );
+        assert!(
+            std::fs::read_dir(&elsewhere)
+                .expect("decoy readable")
+                .next()
+                .is_none(),
+            "nothing may be written through the symlink"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
