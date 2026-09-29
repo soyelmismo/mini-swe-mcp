@@ -37,7 +37,9 @@
 //!
 //! On a `SharedCache`, [`SharedCache::peek`] runs under a *shared* read lock and
 //! therefore many threads can read concurrently, while `get` / `insert` /
-//! `remove` take the exclusive lock.
+//! `remove` take the exclusive lock. The same split is what the catalog cache in
+//! `src/manifest/cache.rs` applies by hand, because it needs a *hit* to be
+//! refreshable (`get`) and non-blocking (shared `peek`) at the same time.
 //!
 //! # `peek` vs `get`: the recency trade-off
 //!
@@ -46,7 +48,9 @@
 //! were never touched, so a hot key can still be evicted by a stream of cold
 //! inserts. Use `peek` for membership checks that must not influence eviction;
 //! use `get` whenever the key's popularity should keep it alive. The catalog
-//! cache in `src/manifest/cache.rs` reads through `get` for exactly this reason.
+//! cache in `src/manifest/cache.rs` serves its hits through `peek` under a
+//! shared lock and refreshes recency with a separate non-blocking `get`, which
+//! is how it gets both properties at once.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
