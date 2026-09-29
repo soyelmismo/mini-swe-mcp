@@ -64,22 +64,25 @@ pub fn is_process_alive(pid: u32) -> bool {
     kill_zero_says_alive(pid)
 }
 
-/// `kill -0` verdict, or `false` when the check itself cannot be performed.
+/// `kill -0` verdict, failing open towards keeping work.
 ///
-/// `None`-style ambiguity (no `kill` binary, no permission to signal) fails
-/// closed *towards keeping* work: an unprovable death is not a death.
+/// When the check itself cannot be performed (no `kill` binary, no permission
+/// to signal) liveness is unprovable, so `true` is returned: an unprovable
+/// death is not a death. Only a successfully-executed `kill -0` that reports
+/// "no such process" counts as dead.
 #[cfg(unix)]
 fn kill_zero_says_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .map(|o| o.status.success())
+        .unwrap_or(true)
 }
 
-/// `kill -0` is unavailable off-unix; treat liveness as unprovable.
+/// `kill -0` is unavailable off-unix; treat liveness as unprovable (keep).
 #[cfg(not(unix))]
 fn kill_zero_says_alive(_pid: u32) -> bool {
-    false
+    true
 }
 
 /// `Some(true)`/`Some(false)` when `/proc/<pid>/status` exposes the process
@@ -93,7 +96,9 @@ fn proc_state(pid: u32) -> Option<bool> {
             // `State:\tZ (zombie)`; the letter is always the first field and is
             // present on every `/proc` implementation this kernel ships.
             let code = rest.split_whitespace().next()?;
-            return Some(code != "Z");
+            // `Z` (zombie) can never do work again; `X` (dead, should never
+            // be observed) is gone too. Everything else keeps its lease.
+            return Some(code != "Z" && code != "X");
         }
     }
     None
