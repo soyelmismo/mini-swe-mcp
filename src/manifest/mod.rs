@@ -1,169 +1,40 @@
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+//! Model catalog served to MCP hosts, loaded from a `models.yaml`.
+//!
+//! The package is split by responsibility while keeping the historical
+//! `mini_swe_mcp::manifest::*` surface identical through the re-exports below:
+//!
+//! * `types` — the serializable [`ModelManifest`] / [`ModelDefinition`] pair
+//!   and the process-wide constants that bound them.
+//! * `cache` — the bounded, process-wide memoization of rendered catalog
+//!   bullets.
+//! * `validate` — the advisory warning rules and the fixups that repair what
+//!   they report.
+//!
+//! [`ModelManifest`] itself stays here: it owns manifest discovery and
+//! loading ([`ModelManifest::load`], [`ModelManifest::from_path`]), id
+//! resolution ([`ModelManifest::resolve_model`]) and catalog rendering
+//! ([`ModelManifest::build_tool_description`]), the three entry points the rest
+//! of the crate uses.
+
 use std::env;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
 use tracing::{error, info, warn};
 
 use crate::config::xdg_config_dir;
 
-/// Model id the server falls back to when neither `DEFAULT_MODEL` nor a usable
-/// `default:` in the manifest is available (see `main.rs`).
-pub const BUILTIN_DEFAULT_MODEL: &str = "ninja";
+mod cache;
+mod types;
+mod validate;
 
-/// Turn budget used when neither the request nor the manifest asks for one.
-///
-/// Also the value the runtime falls back to in `pool.rs` when a `REQUEST_TURNS`
-/// expansion yields nothing, so the two code paths agree.
-pub const DEFAULT_MAX_TURNS: usize = 100;
-
-/// Hard ceiling on the turn budget, mirroring the `REQUEST_TURNS` expansion cap
-/// in `pool.rs`: a budget above it can never be grown into, so it is clamped
-/// here instead of being shipped to the worker.
-pub const MAX_TURNS_LIMIT: usize = 500;
-
-/// Inclusive bounds every sampling temperature is clamped into before it can
-/// reach a provider. OpenAI-compatible endpoints reject values outside this
-/// window, some silently clamp, and some ignore the field entirely.
-pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
+pub use self::cache::{catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY};
+pub use self::types::{
+    ModelDefinition, ModelManifest, BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT,
+    TEMPERATURE_RANGE,
+};
+use self::cache::{CATALOG_HEADER, CATALOG_ROW_OVERHEAD, catalog_row};
 
 /// Role shown for a model that declares none.
 const DEFAULT_ROLE: &str = "Autonomous subagent";
-
-/// First line of the rendered catalog.
-const CATALOG_HEADER: &str = "Available model aliases and their roles:\n";
-
-/// Hard bound on the process-wide catalog row cache.
-///
-/// A manifest is a single, immutable, `Arc`-shared value in practice, so the
-/// cache holds at most a handful of entries. The cap is defense in depth: it
-/// keeps a pathological caller (many synthetic manifests, e.g. in tests) from
-/// growing the process without bound. Public so tests can exercise the bound.
-pub const CATALOG_CACHE_CAPACITY: usize = 256;
-
-/// Identity of one rendered catalog bullet: everything a bullet depends on.
-type CatalogRowKey = (String, String, String);
-
-/// Process-wide memoization of the rendered catalog bullets.
-///
-/// [`ModelManifest::build_tool_description`] is re-rendered on every
-/// `tools/list` request, and rendering a bullet allocates and formats a
-/// `String`. The rendered bullet is a pure function of `(alias, id, role)`, so
-/// it is cached here rather than inside [`ModelManifest`]: the struct stays
-/// `&self`-clean, so its `Clone`/`Debug`/`Serialize` derives are untouched (no
-/// `serde(skip)` plumbing, no interior mutability leaking into `Arc` clones).
-static CATALOG_ROW_CACHE: LazyLock<RwLock<HashMap<CatalogRowKey, Arc<str>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-/// Render (or reuse) the bullet for one model entry.
-///
-/// Cache misses build the row with `writeln!` on a single pre-sized allocation
-/// instead of `format!` plus `push_str`; hits clone an `Arc<str>` instead of the
-/// whole catalog `String`, which is what makes repeated `tools/list` calls cheap.
-fn catalog_row(alias: &str, def: &ModelDefinition) -> String {
-    let key = (
-        alias.to_string(),
-        def.id.clone(),
-        def.role.clone().unwrap_or_default(),
-    );
-
-    if let Ok(cache) = CATALOG_ROW_CACHE.read()
-        && let Some(row) = cache.get(&key)
-    {
-        return row.to_string();
-    }
-
-    let role = def.role.as_deref().unwrap_or(DEFAULT_ROLE);
-    let mut row = String::with_capacity(48 + alias.len() + def.id.len() + role.len());
-    let _ = writeln!(row, "- `{alias}` (id: `{}`): {role}", def.id);
-
-    if let Ok(mut cache) = CATALOG_ROW_CACHE.write() {
-        if cache.len() >= CATALOG_CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(key, Arc::from(row.as_str()));
-    }
-
-    row
-}
-
-/// Render aliases as `"a", "b", "c"` for a warning message.
-fn quote_list(aliases: &[&str]) -> String {
-    aliases
-        .iter()
-        .map(|alias| format!("\"{alias}\""))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Number of catalog bullets currently memoized.
-///
-/// Exposed for tests and diagnostics: the cache is bounded by
-/// [`CATALOG_CACHE_CAPACITY`] and never grows with repeated `tools/list` calls.
-pub fn catalog_cache_len() -> usize {
-    CATALOG_ROW_CACHE
-        .read()
-        .map(|cache| cache.len())
-        .unwrap_or_default()
-}
-
-/// Drop every memoized catalog bullet.
-///
-/// Exposed for tests and diagnostics; never needed on a serving path.
-pub fn clear_catalog_cache() {
-    if let Ok(mut cache) = CATALOG_ROW_CACHE.write() {
-        cache.clear();
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelDefinition {
-    pub id: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub max_turns: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelManifest {
-    #[serde(default)]
-    pub default: Option<String>,
-    #[serde(default)]
-    pub models: HashMap<String, ModelDefinition>,
-}
-
-impl Default for ModelManifest {
-    fn default() -> Self {
-        let mut models = HashMap::new();
-        models.insert(
-            "ninja".to_string(),
-            ModelDefinition {
-                id: "combo:ninja".to_string(),
-                role: Some("Fast executor. Use for exploration, test runs, syntax fixes, and focused edits.".to_string()),
-                temperature: Some(0.2),
-                max_turns: Some(100),
-            },
-        );
-        models.insert(
-            "nerd".to_string(),
-            ModelDefinition {
-                id: "combo:nerd".to_string(),
-                role: Some("Deep reasoner. Use for hard debugging, complex architecture, and multi-file refactors.".to_string()),
-                temperature: Some(0.6),
-                max_turns: Some(100),
-            },
-        );
-
-        Self {
-            default: Some(BUILTIN_DEFAULT_MODEL.to_string()),
-            models,
-        }
-    }
-}
 
 impl ModelManifest {
     pub fn load() -> Self {
@@ -200,6 +71,21 @@ impl ModelManifest {
 
         info!("No models.yaml found; using default built-in manifest (ninja & nerd)");
         Self::default().normalized()
+    }
+
+    /// Parse and normalize a manifest from an explicit `models.yaml` path.
+    ///
+    /// Unlike [`ModelManifest::load`] this does not consult the environment or
+    /// fall back to the built-in catalog: a caller that names a file wants that
+    /// file (or a hard error), which is what makes it testable without mutating
+    /// process-wide state. Warnings are logged exactly as they are on the
+    /// discovery path, and the returned manifest is always normalized.
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        let manifest = Self::from_file(path)?;
+        for warning in manifest.validate() {
+            warn!(path = %path.display(), "Model manifest warning: {warning}");
+        }
+        Ok(manifest.normalized())
     }
 
     fn from_candidate(path: &Path, source: &str) -> Option<Self> {
@@ -279,7 +165,7 @@ impl ModelManifest {
     /// Bullets are emitted in alias order, which makes the output byte-identical
     /// for identical manifests (rendering straight out of the `HashMap` produced
     /// up to 24 different strings for the same YAML across 200 parses), and each
-    /// bullet is memoized process-wide (see [`catalog_row`]).
+    /// bullet is memoized process-wide (see `cache::catalog_row`).
     pub fn build_tool_description(&self) -> String {
         let entries = self.sorted_models();
 
@@ -287,7 +173,10 @@ impl ModelManifest {
             + entries
                 .iter()
                 .map(|(alias, def)| {
-                    48 + alias.len() + def.id.len() + def.role.as_deref().map_or(0, str::len)
+                    CATALOG_ROW_OVERHEAD
+                        + alias.len()
+                        + def.id.len()
+                        + def.role.as_deref().map_or(0, str::len)
                 })
                 .sum::<usize>();
         let mut desc = String::with_capacity(total);
@@ -298,156 +187,6 @@ impl ModelManifest {
         }
 
         desc
-    }
-
-    /// Collect human-readable warnings about suspicious manifest entries.
-    ///
-    /// Validation is deliberately non-fatal: a manifest with warnings is still
-    /// served so that a typo in `models.yaml` degrades gracefully instead of
-    /// taking the server down. Callers surface the returned strings as warnings
-    /// (see [`ModelManifest::from_candidate`]).
-    ///
-    /// This is a *shape* check on a manifest, not schema validation: it is
-    /// callable for any manifest, including [`ModelManifest::default`] and
-    /// manifests built in code. Every warning it reports is paired with a fixup
-    /// in [`ModelManifest::normalize`], so the warnings are never the only
-    /// consequence of a bad value.
-    ///
-    /// The catalog is iterated in sorted alias order so the output is stable
-    /// across runs; callers may rely on the ordering.
-    pub fn validate(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-
-        // `default` is looked up by alias, so the lookup is trimmed the same way
-        // `resolve_model` would match it: an over-indented `default:` is not a
-        // dangling reference.
-        if let Some(name) = &self.default
-            && !self.models.contains_key(name.trim())
-        {
-            warnings.push(format!(
-                "default model \"{name}\" not found in models; it will be ignored and the built-in \
-                 fallback used (set DEFAULT_MODEL to override)"
-            ));
-        }
-
-        // Duplicate ids are ambiguous for id-based resolution. The policy in
-        // `resolve_model` is first-alias-wins (sorted by alias), so the
-        // resolution is stable, but the manifest is still ambiguous and the user
-        // should know. Non-fatal by design, like every other warning here.
-        let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (alias, def) in self.sorted_models() {
-            let id = def.id.trim();
-            if !id.is_empty() {
-                by_id.entry(id).or_default().push(alias);
-            }
-        }
-        for (id, aliases) in &by_id {
-            if aliases.len() > 1 {
-                warnings.push(format!(
-                    "duplicate model id \"{id}\" shared by aliases {}; resolving the full id returns the first alias",
-                    quote_list(aliases)
-                ));
-            }
-        }
-        for (alias, def) in self.sorted_models() {
-            if def.id.trim().is_empty() {
-                warnings.push(format!("model \"{alias}\": id cannot be empty"));
-            }
-
-            if let Some(t) = def.temperature {
-                if !t.is_finite() {
-                    warnings.push(format!(
-                        "model \"{alias}\": temperature {t} is not a finite number; replaced with \
-                         the provider default"
-                    ));
-                } else if !TEMPERATURE_RANGE.contains(&t) {
-                    warnings.push(format!(
-                        "model \"{alias}\": temperature {t} is outside [0, 2]; clamped to that \
-                         range"
-                    ));
-                }
-            }
-
-            match def.max_turns {
-                Some(0) => warnings.push(format!(
-                    "model \"{alias}\": max_turns must be greater than 0; replaced with \
-                     {DEFAULT_MAX_TURNS}"
-                )),
-                Some(n) if n > MAX_TURNS_LIMIT => warnings.push(format!(
-                    "model \"{alias}\": max_turns {n} exceeds the runtime limit \
-                     {MAX_TURNS_LIMIT}; clamped to that limit"
-                )),
-                _ => {}
-            }
-        }
-
-        warnings
-    }
-
-    /// Clamp `temperature` into [`TEMPERATURE_RANGE`], dropping non-finite
-    /// values (which no provider accepts) in favour of the provider default.
-    ///
-    /// `None` in, `None` out: an unset temperature still means "use the provider
-    /// default" and must stay distinguishable from a clamped one.
-    pub fn sanitize_temperature(temperature: Option<f32>) -> Option<f32> {
-        let t = temperature?;
-        if !t.is_finite() {
-            return None;
-        }
-        Some(t.clamp(*TEMPERATURE_RANGE.start(), *TEMPERATURE_RANGE.end()))
-    }
-
-    /// Resolve the turn budget from both ingresses, filtering a useless `0`
-    /// before it can reach the worker loop.
-    ///
-    /// A `max_turns` of `0` is `Some(0)`, not `None`: it would defeat the
-    /// `unwrap_or` fallback and make `while step < current_max_turns` false on
-    /// the first check, i.e. a worker that never runs a single turn. So `0` is
-    /// filtered out of *both* ingresses -- a request of `0` falls through to the
-    /// manifest budget rather than clobbering it, and a manifest of `0` falls
-    /// through to [`DEFAULT_MAX_TURNS`]. Anything above [`MAX_TURNS_LIMIT`] is
-    /// clamped to it, matching the `REQUEST_TURNS` expansion cap in `pool.rs`.
-    pub fn sanitize_max_turns(requested: Option<usize>, manifest: Option<usize>) -> usize {
-        // Filter *before* combining: a `0` from either ingress must fall through
-        // to the other one, not shadow it and then vanish.
-        requested
-            .filter(|&n| n > 0)
-            .or_else(|| manifest.filter(|&n| n > 0))
-            .map_or(DEFAULT_MAX_TURNS, |n| n.min(MAX_TURNS_LIMIT))
-    }
-
-    /// Apply every fixup that [`ModelManifest::validate`] reports.
-    ///
-    /// Each *fixable* warning is paired with a repair: invalid temperatures are
-    /// clamped or dropped, unusable turn budgets are replaced with
-    /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), and a `default` that names
-    /// no known alias is dropped so `main.rs` reaches its fallback deliberately.
-    ///
-    /// One warning has no mechanical fixup and is left for the user: an empty
-    /// `id` has no correct value to substitute (the alias key is the only
-    /// guess available), so [`ModelManifest::resolve_model`] keeps passing it
-    /// through and the provider decides. Normalizing is therefore idempotent,
-    /// and re-running [`ModelManifest::validate`] on the result only ever
-    /// reports that remaining `id cannot be empty`.
-    pub fn normalize(mut self) -> Self {
-        self.default = self
-            .default
-            .filter(|name| self.models.contains_key(name.trim()));
-
-        for def in self.models.values_mut() {
-            def.temperature = Self::sanitize_temperature(def.temperature);
-            def.max_turns = def
-                .max_turns
-                .map(|n| Self::sanitize_max_turns(Some(n), None));
-        }
-
-        self
-    }
-
-    /// [`ModelManifest::normalize`] behind a borrow, for callers that keep the
-    /// original manifest around (the unit tests here, mainly).
-    pub fn normalized(&self) -> Self {
-        self.clone().normalize()
     }
 }
 
@@ -980,5 +719,48 @@ mod tests {
             .filter_map(|line| line.split('`').nth(1))
             .collect();
         assert_eq!(aliases, vec!["nerd", "ninja"]);
+    }
+
+    /// `from_path` is the only loader that names a file explicitly, so the
+    /// fixtures are written to a scratch directory and the manifest is checked
+    /// for the two properties the discovery path relies on: the YAML is parsed
+    /// and the fixups from `validate` are already applied.
+    #[test]
+    fn test_from_path_parses_and_normalizes_an_explicit_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "swe-manifest-from-path-{}-{}",
+            std::process::id(),
+            catalog_cache_len() as u64 ^ DEFAULT_MAX_TURNS as u64
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("models.yaml");
+        std::fs::write(
+            &path,
+            "default: ghost\nmodels:\n  hot: { id: vendor:hot, role: \"Hot.\", temperature: 9.0, max_turns: 0 }\n",
+        )
+        .expect("fixture written");
+
+        let manifest = ModelManifest::from_path(&path).expect("fixture parses");
+
+        // A dangling `default` is dropped and the out-of-range values repaired,
+        // exactly as `from_candidate` would serve them.
+        assert_eq!(manifest.default, None);
+        let hot = &manifest.models["hot"];
+        assert_eq!(hot.temperature, Some(2.0));
+        assert_eq!(hot.max_turns, Some(DEFAULT_MAX_TURNS));
+        assert_eq!(
+            manifest.resolve_model("hot"),
+            ("vendor:hot".to_string(), Some(2.0), Some(DEFAULT_MAX_TURNS))
+        );
+
+        // A malformed file is a hard error, never a silent built-in fallback.
+        let broken = dir.join("broken.yaml");
+        std::fs::write(&broken, "models: [not, a, mapping]").expect("fixture written");
+        assert!(ModelManifest::from_path(&broken).is_err());
+
+        // A missing file is an error too: the caller named it explicitly.
+        assert!(ModelManifest::from_path(&dir.join("absent.yaml")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
