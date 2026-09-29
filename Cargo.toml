@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 regex = "1"
 dotenvy = "0.15"
 serde_yaml = "0.9"
+libc = "0.2.189"
 
 # Release profile tuned by audits/opt_10_cargo_codegen.md (Audit 10).
 #
