@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, RwLock};
 use tracing::{error, info, warn};
 
 use crate::config::xdg_config_dir;
@@ -25,6 +27,95 @@ pub const MAX_TURNS_LIMIT: usize = 500;
 /// reach a provider. OpenAI-compatible endpoints reject values outside this
 /// window, some silently clamp, and some ignore the field entirely.
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
+
+/// Role shown for a model that declares none.
+const DEFAULT_ROLE: &str = "Autonomous subagent";
+
+/// First line of the rendered catalog.
+const CATALOG_HEADER: &str = "Available model aliases and their roles:\n";
+
+/// Hard bound on the process-wide catalog row cache.
+///
+/// A manifest is a single, immutable, `Arc`-shared value in practice, so the
+/// cache holds at most a handful of entries. The cap is defense in depth: it
+/// keeps a pathological caller (many synthetic manifests, e.g. in tests) from
+/// growing the process without bound. Public so tests can exercise the bound.
+pub const CATALOG_CACHE_CAPACITY: usize = 256;
+
+/// Identity of one rendered catalog bullet: everything a bullet depends on.
+type CatalogRowKey = (String, String, String);
+
+/// Process-wide memoization of the rendered catalog bullets.
+///
+/// [`ModelManifest::build_tool_description`] is re-rendered on every
+/// `tools/list` request, and rendering a bullet allocates and formats a
+/// `String`. The rendered bullet is a pure function of `(alias, id, role)`, so
+/// it is cached here rather than inside [`ModelManifest`]: the struct stays
+/// `&self`-clean, so its `Clone`/`Debug`/`Serialize` derives are untouched (no
+/// `serde(skip)` plumbing, no interior mutability leaking into `Arc` clones).
+static CATALOG_ROW_CACHE: LazyLock<RwLock<HashMap<CatalogRowKey, Arc<str>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Render (or reuse) the bullet for one model entry.
+///
+/// Cache misses build the row with `writeln!` on a single pre-sized allocation
+/// instead of `format!` plus `push_str`; hits clone an `Arc<str>` instead of the
+/// whole catalog `String`, which is what makes repeated `tools/list` calls cheap.
+fn catalog_row(alias: &str, def: &ModelDefinition) -> String {
+    let key = (
+        alias.to_string(),
+        def.id.clone(),
+        def.role.clone().unwrap_or_default(),
+    );
+
+    if let Ok(cache) = CATALOG_ROW_CACHE.read()
+        && let Some(row) = cache.get(&key)
+    {
+        return row.to_string();
+    }
+
+    let role = def.role.as_deref().unwrap_or(DEFAULT_ROLE);
+    let mut row = String::with_capacity(48 + alias.len() + def.id.len() + role.len());
+    let _ = writeln!(row, "- `{alias}` (id: `{}`): {role}", def.id);
+
+    if let Ok(mut cache) = CATALOG_ROW_CACHE.write() {
+        if cache.len() >= CATALOG_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, Arc::from(row.as_str()));
+    }
+
+    row
+}
+
+/// Render aliases as `"a", "b", "c"` for a warning message.
+fn quote_list(aliases: &[&str]) -> String {
+    aliases
+        .iter()
+        .map(|alias| format!("\"{alias}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Number of catalog bullets currently memoized.
+///
+/// Exposed for tests and diagnostics: the cache is bounded by
+/// [`CATALOG_CACHE_CAPACITY`] and never grows with repeated `tools/list` calls.
+pub fn catalog_cache_len() -> usize {
+    CATALOG_ROW_CACHE
+        .read()
+        .map(|cache| cache.len())
+        .unwrap_or_default()
+}
+
+/// Drop every memoized catalog bullet.
+///
+/// Exposed for tests and diagnostics; never needed on a serving path.
+pub fn clear_catalog_cache() {
+    if let Ok(mut cache) = CATALOG_ROW_CACHE.write() {
+        cache.clear();
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDefinition {
@@ -140,22 +231,70 @@ impl ModelManifest {
         Ok(manifest)
     }
 
+    /// Resolve an alias **or** a full model id to `(id, temperature, max_turns)`.
+    ///
+    /// Alias lookup is an O(1) `HashMap` hit; a hit always wins over the id
+    /// fallback so a manifest can never be shadowed by pass-through.
+    ///
+    /// Duplicate-`id` policy: when several aliases share one `id`, the
+    /// **first alias in lexicographic (sorted) order wins**. `self.models` is a
+    /// `HashMap`, whose iteration order depends on `RandomState` and therefore
+    /// differs between instances, so the previous `values().find(..)` fallback
+    /// returned a *different* definition for the same id on every parse. The
+    /// tie-break is now stable, and [`ModelManifest::validate`] reports the
+    /// collision as a non-fatal warning.
     pub fn resolve_model(&self, requested: &str) -> (String, Option<f32>, Option<usize>) {
-        self.models
-            .get(requested)
-            .or_else(|| self.models.values().find(|def| def.id == requested))
+        if let Some(def) = self.models.get(requested) {
+            return (def.id.clone(), def.temperature, def.max_turns);
+        }
+
+        self.sorted_models()
+            .iter()
+            .find(|(_, def)| def.id == requested)
             .map_or_else(
                 || (requested.to_string(), None, None),
-                |def| (def.id.clone(), def.temperature, def.max_turns),
+                |(_, def)| (def.id.clone(), def.temperature, def.max_turns),
             )
     }
 
-    pub fn build_tool_description(&self) -> String {
-        let mut desc = String::from("Available model aliases and their roles:\n");
+    /// Model entries in alias order.
+    ///
+    /// `self.models` is a `HashMap` with a randomly seeded `RandomState`, so its
+    /// iteration order differs between processes *and* between instances built
+    /// from the same YAML. Every user-visible derivation (catalog rendering,
+    /// id resolution, warnings) goes through this helper so the output is
+    /// reproducible.
+    fn sorted_models(&self) -> Vec<(&str, &ModelDefinition)> {
+        let mut entries: Vec<(&str, &ModelDefinition)> = self
+            .models
+            .iter()
+            .map(|(alias, def)| (alias.as_str(), def))
+            .collect();
+        entries.sort_unstable_by_key(|(alias, _)| *alias);
+        entries
+    }
 
-        for (alias, def) in self.sorted_models() {
-            let role = def.role.as_deref().unwrap_or("Autonomous subagent");
-            desc.push_str(&format!("- `{}` (id: `{}`): {}\n", alias, def.id, role));
+    /// Render the catalog advertised through the MCP `tools/list` payload.
+    ///
+    /// Bullets are emitted in alias order, which makes the output byte-identical
+    /// for identical manifests (rendering straight out of the `HashMap` produced
+    /// up to 24 different strings for the same YAML across 200 parses), and each
+    /// bullet is memoized process-wide (see [`catalog_row`]).
+    pub fn build_tool_description(&self) -> String {
+        let entries = self.sorted_models();
+
+        let total = CATALOG_HEADER.len()
+            + entries
+                .iter()
+                .map(|(alias, def)| {
+                    48 + alias.len() + def.id.len() + def.role.as_deref().map_or(0, str::len)
+                })
+                .sum::<usize>();
+        let mut desc = String::with_capacity(total);
+        desc.push_str(CATALOG_HEADER);
+
+        for (alias, def) in entries {
+            desc.push_str(&catalog_row(alias, def));
         }
 
         desc
@@ -191,6 +330,25 @@ impl ModelManifest {
             ));
         }
 
+        // Duplicate ids are ambiguous for id-based resolution. The policy in
+        // `resolve_model` is first-alias-wins (sorted by alias), so the
+        // resolution is stable, but the manifest is still ambiguous and the user
+        // should know. Non-fatal by design, like every other warning here.
+        let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (alias, def) in self.sorted_models() {
+            let id = def.id.trim();
+            if !id.is_empty() {
+                by_id.entry(id).or_default().push(alias);
+            }
+        }
+        for (id, aliases) in &by_id {
+            if aliases.len() > 1 {
+                warnings.push(format!(
+                    "duplicate model id \"{id}\" shared by aliases {}; resolving the full id returns the first alias",
+                    quote_list(aliases)
+                ));
+            }
+        }
         for (alias, def) in self.sorted_models() {
             if def.id.trim().is_empty() {
                 warnings.push(format!("model \"{alias}\": id cannot be empty"));
@@ -291,20 +449,13 @@ impl ModelManifest {
     pub fn normalized(&self) -> Self {
         self.clone().normalize()
     }
-
-    /// The catalog in stable alias order, so rendered output and validation
-    /// order do not depend on `HashMap` iteration.
-    fn sorted_models(&self) -> Vec<(&String, &ModelDefinition)> {
-        let mut entries: Vec<(&String, &ModelDefinition)> = self.models.iter().collect();
-        entries.sort_by_key(|(alias, _)| *alias);
-        entries
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest,
+        catalog_cache_len, catalog_row, clear_catalog_cache, BUILTIN_DEFAULT_MODEL,
+        CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest,
     };
 
     fn single(definition: ModelDefinition) -> ModelManifest {
@@ -650,6 +801,135 @@ mod tests {
     }
 
     #[test]
+    fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
+        clear_catalog_cache();
+
+        let a = ModelDefinition {
+            id: "vendor:a".to_string(),
+            role: Some("Role A.".to_string()),
+            temperature: None,
+            max_turns: None,
+        };
+        let b = ModelDefinition {
+            id: "vendor:b".to_string(),
+            role: Some("Role A.".to_string()),
+            temperature: None,
+            max_turns: None,
+        };
+        let no_role = ModelDefinition {
+            id: "vendor:a".to_string(),
+            role: None,
+            temperature: None,
+            max_turns: None,
+        };
+
+        assert_eq!(catalog_row("a", &a), "- `a` (id: `vendor:a`): Role A.\n");
+        assert_eq!(catalog_cache_len(), 1);
+
+        // Same key twice -> memoized, no new entry.
+        assert_eq!(catalog_row("a", &a), "- `a` (id: `vendor:a`): Role A.\n");
+        assert_eq!(catalog_cache_len(), 1);
+
+        // Different id, different role and a missing role are all distinct keys.
+        assert_eq!(catalog_row("a", &b), "- `a` (id: `vendor:b`): Role A.\n");
+        assert_eq!(
+            catalog_row("a", &no_role),
+            "- `a` (id: `vendor:a`): Autonomous subagent\n"
+        );
+        assert_eq!(catalog_cache_len(), 3);
+    }
+
+    #[test]
+    fn test_catalog_cache_stays_bounded() {
+        clear_catalog_cache();
+
+        for i in 0..(CATALOG_CACHE_CAPACITY + 8) {
+            let def = ModelDefinition {
+                id: format!("vendor:id{i}"),
+                role: Some("Role.".to_string()),
+                temperature: None,
+                max_turns: None,
+            };
+            let row = catalog_row(&format!("alias{i}"), &def);
+            assert_eq!(row, format!("- `alias{i}` (id: `vendor:id{i}`): Role.\n"));
+            assert!(
+                catalog_cache_len() <= CATALOG_CACHE_CAPACITY,
+                "catalog cache must stay bounded, got {}",
+                catalog_cache_len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            "z:shared".to_string(),
+            ModelDefinition {
+                id: "vendor:shared".to_string(),
+                role: None,
+                temperature: Some(0.9),
+                max_turns: Some(9),
+            },
+        );
+        models.insert(
+            "a:shared".to_string(),
+            ModelDefinition {
+                id: "vendor:shared".to_string(),
+                role: None,
+                temperature: Some(0.1),
+                max_turns: Some(1),
+            },
+        );
+        let manifest = ModelManifest {
+            default: None,
+            models,
+        };
+
+        // "a:shared" sorts first, so it wins regardless of HashMap order.
+        for _ in 0..200 {
+            assert_eq!(
+                manifest.resolve_model("vendor:shared"),
+                ("vendor:shared".to_string(), Some(0.1), Some(1))
+            );
+        }
+
+        // Alias hits always win over the id fallback.
+        assert_eq!(
+            manifest.resolve_model("z:shared"),
+            ("vendor:shared".to_string(), Some(0.9), Some(9))
+        );
+    }
+
+    #[test]
+    fn test_validate_flags_duplicate_model_ids() {
+        let mut models = std::collections::HashMap::new();
+        for (alias, temperature) in [("a", 0.1), ("b", 0.9), ("c", 0.5)] {
+            models.insert(
+                alias.to_string(),
+                ModelDefinition {
+                    id: "vendor:shared".to_string(),
+                    role: None,
+                    temperature: Some(temperature),
+                    max_turns: None,
+                },
+            );
+        }
+        let manifest = ModelManifest {
+            default: None,
+            models,
+        };
+
+        assert_eq!(
+            manifest.validate(),
+            vec![
+                "duplicate model id \"vendor:shared\" shared by aliases \"a\", \"b\", \"c\"; resolving the full id returns the first alias"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn test_tool_description_lists_aliases_in_sorted_order() {
         let mut models = std::collections::HashMap::new();
         for alias in ["zulu", "alpha", "mike"] {
@@ -679,5 +959,22 @@ mod tests {
             ],
             "the advertised catalog must not depend on HashMap iteration order"
         );
+    }
+
+    #[test]
+    fn test_tool_description_is_reproducible_and_cached() {
+        let manifest = ModelManifest::default();
+
+        let first = manifest.build_tool_description();
+        let second = manifest.build_tool_description();
+        assert_eq!(first, second);
+
+        // Bullets are sorted by alias, not by HashMap iteration order.
+        let aliases: Vec<&str> = first
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split('`').nth(1))
+            .collect();
+        assert_eq!(aliases, vec!["nerd", "ninja"]);
     }
 }
