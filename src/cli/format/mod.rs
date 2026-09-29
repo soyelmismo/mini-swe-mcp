@@ -30,8 +30,8 @@ pub use self::worker::{
     format_steer, log_counters_line,
 };
 
-/// Render `val` for `action`, falling back to pretty JSON for actions that have
-/// no dedicated human-facing view.
+/// Render `val` for `action`, falling back to pretty JSON for actions with no
+/// dedicated human-facing view.
 pub fn format_output(action: &str, val: &serde_json::Value) -> String {
     match action {
         "manifest" => format_manifest(val),
