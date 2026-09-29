@@ -1,22 +1,22 @@
 //! Garbage collection for abandoned subagent worktrees.
 //!
 //! A worktree is leased by a sibling `<worktree>.pid` file holding the owner's
-//! pid and uid. The sweep below consumes those leases to reclaim worktrees,
+//! pid and uid. The sweep consumes those leases to reclaim worktrees,
 //! `worker-*` branches and `swe-target-*` scratch directories left behind by
-//! crashed processes — while *failing open* whenever a lease is missing or
+//! crashed processes — *failing open* whenever a lease is missing or
 //! unreadable, so an ambiguous marker can never destroy live work.
 //!
 //! Two properties underpin the whole sweep:
 //!
 //! * **Liveness means "able to do work".** A crashed owner stays visible to the
-//!   kernel until it is reaped, so it can survive for minutes as a *zombie*:
-//!   `/proc/<pid>` and `kill -0` both keep answering "alive" while nothing will
-//!   ever read or write the worktree again. [`is_process_alive`] therefore
-//!   inspects `/proc/<pid>/status` and reports zombies as dead (audit §05).
+//!   kernel until reaped, surviving for minutes as a *zombie*: `/proc/<pid>`
+//!   and `kill -0` both answer "alive" while nothing will ever touch the
+//!   worktree again. [`is_process_alive`] therefore inspects
+//!   `/proc/<pid>/status` and reports zombies as dead (audit §05).
 //! * **Every reclaim is all-or-nothing and order-free.** An orphan worktree and
 //!   its lease are removed as one atomic unit keyed by the directory itself, so
-//!   the sweep converges to the same state no matter how `read_dir` happens to
-//!   order the entries, and re-running it changes nothing (audit §01/§09).
+//!   the sweep converges to the same state no matter how `read_dir` orders the
+//!   entries, and re-running it changes nothing (audit §01/§09).
 
 use super::{force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs};
 use std::path::{Path, PathBuf};
@@ -27,18 +27,15 @@ use tracing::{error, info};
 /// True when a process with `pid` is alive **and able to do work** on this host.
 ///
 /// A crashed owner is not reaped instantly: until its parent runs `wait()` the
-/// kernel keeps it as a *zombie*, and neither the presence of `/proc/<pid>` nor
-/// `kill -0` can tell a zombie from a real process — both signal "still here".
-/// Reporting such a lease as live pins its worktree, its `worker-*` branch and
-/// its `swe-target-*` scratch directory for as long as the lease owner lingers
-/// (an agent that leaks a child leaves the whole tree stranded). On Linux the
-/// single-letter `State:` field of `/proc/<pid>/status` is therefore treated as
-/// the authority and `Z` is answered as dead.
+/// kernel keeps it as a *zombie*, and neither `/proc/<pid>` nor `kill -0` can
+/// tell a zombie from a real process. Reporting such a lease as live pins its
+/// worktree, branch and scratch directory for as long as the owner lingers. On
+/// Linux the `State:` field of `/proc/<pid>/status` is the authority and `Z` is
+/// answered as dead.
 ///
-/// `/proc` is consulted first because it is the cheapest and most reliable
-/// answer; `kill -0` is the portable fallback, and is the authority on every
-/// platform where `/proc/<pid>/status` cannot be read (restricted containers,
-/// `hidepid=2` mount options, non-Linux kernels).
+/// `/proc` is consulted first (cheapest, most reliable); `kill -0` is the
+/// portable fallback and the authority where `/proc/<pid>/status` cannot be
+/// read (restricted containers, `hidepid=2`, non-Linux kernels).
 pub fn is_process_alive(pid: u32) -> bool {
     // pid 0 addresses the process group and is never a valid lease owner.
     if pid == 0 {
@@ -51,9 +48,8 @@ pub fn is_process_alive(pid: u32) -> bool {
             // Readable `State:` field: trust it, so zombies are never mistaken
             // for live owners.
             Some(alive) => return alive,
-            // The entry exists but `status` is not readable (hidepid=2 over
-            // hidepid=0, a racing exit, an unreadable mount). The pid is
-            // certainly allocated, so keep the worktree; `kill -0` decides.
+            // Entry exists but `status` is unreadable (hidepid, racing exit).
+            // The pid is allocated, so keep the worktree; `kill -0` decides.
             None => {
                 if Path::new(&format!("/proc/{pid}")).exists() {
                     return kill_zero_says_alive(pid);
@@ -67,10 +63,10 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 /// `kill -0` verdict, failing open towards keeping work.
 ///
-/// When the check itself cannot be performed (no `kill` binary, no permission
-/// to signal) liveness is unprovable, so `true` is returned: an unprovable
-/// death is not a death. Only a successfully-executed `kill -0` that reports
-/// "no such process" counts as dead.
+/// When the check cannot be performed (no `kill` binary, no permission to
+/// signal) liveness is unprovable, so `true` is returned: an unprovable death
+/// is not a death. Only a successful `kill -0` reporting "no such process"
+/// counts as dead.
 #[cfg(unix)]
 fn kill_zero_says_alive(pid: u32) -> bool {
     Command::new("kill")
@@ -86,28 +82,25 @@ fn kill_zero_says_alive(_pid: u32) -> bool {
     true
 }
 
-/// `Some(true)`/`Some(false)` when `/proc/<pid>/status` exposes the process
-/// state, `None` when the process is not visible on this host (or its `status`
-/// cannot be read).
+/// `Some(bool)` when `/proc/<pid>/status` exposes the process state, `None`
+/// when the process is not visible or its `status` cannot be read.
 #[cfg(target_os = "linux")]
 fn proc_state(pid: u32) -> Option<bool> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("State:") {
-            // `State:\tZ (zombie)`; the letter is always the first field and is
-            // present on every `/proc` implementation this kernel ships.
+            // `State:\tZ (zombie)`; the letter is always the first field.
             let code = rest.split_whitespace().next()?;
-            // `Z` (zombie) can never do work again; `X` (dead, should never
-            // be observed) is gone too. Everything else keeps its lease.
+            // `Z` (zombie) and `X` (dead) can never do work again; all else keeps its lease.
             return Some(code != "Z" && code != "X");
         }
     }
     None
 }
 
-/// Owner identity recorded inside a `.pid` file so pruning can refuse to touch
-/// worktrees that belong to a different user (mitigates PID reuse across
-/// accounts on shared hosts, see audit §12).
+/// Owner identity recorded inside a `.pid` file so pruning refuses to touch
+/// worktrees belonging to a different user (mitigates PID reuse across
+/// accounts on shared hosts, audit §12).
 fn current_uid() -> Option<u32> {
     #[cfg(unix)]
     {
@@ -141,26 +134,22 @@ pub(super) fn pid_file_contents() -> String {
     }
 }
 
-/// Liveness decision for a `<worktree>.pid` file, expressed as an `Option`:
+/// Liveness decision for a `<worktree>.pid` file:
 ///
-/// * `Some(true)`  -> the owner is provably gone, the worktree is abandoned;
-/// * `Some(false)` -> the owner process is alive, the worktree is in use;
-/// * `None`        -> **no usable lease**; the caller must fail open and keep
-///   the worktree.
+/// * `Some(true)`  -> owner provably gone, worktree abandoned;
+/// * `Some(false)` -> owner alive, worktree in use;
+/// * `None`        -> **no usable lease**; caller must fail open and keep.
 ///
 /// `None` covers a missing, unreadable, malformed or foreign-owner marker. The
-/// policy is deliberately "keep" in all four cases and is applied identically
-/// by the registered-worktree and orphan-directory paths: a `.pid` holding
-/// only a bare integer that the kernel recycles freely must never be able to
-/// destroy a live worktree, and a corrupt file must not be able to do it
-/// either.
-///
-/// A bare-pid lease stays readable (older builds wrote one) and is answered by
-/// liveness alone; pid *recycling* cannot make such a lease dangerous here,
-/// because a recycled pid is either alive — and then the work is kept — or dead
-/// — and then there is no owner left to lose work. Dangling lease files that no
-/// longer have a worktree are cleaned up separately by `worktree_dir_of_pid_file`,
-/// which is a decision that cannot lose work (audit §01/§03/§08/§12).
+/// policy is deliberately "keep" in all four cases, applied identically by the
+/// registered-worktree and orphan-directory paths: a bare-pid lease that the
+/// kernel recycles freely must never destroy a live worktree, nor may a corrupt
+/// file. A bare-pid lease stays readable (older builds wrote one) and is
+/// answered by liveness alone; pid recycling cannot make it dangerous, because
+/// a recycled pid is either alive (work kept) or dead (no owner left to lose
+/// work). Dangling leases with no worktree are cleaned up separately by
+/// `worktree_dir_of_pid_file`, a decision that cannot lose work
+/// (audit §01/§03/§08/§12).
 fn pid_file_is_stale(pid_file: &Path) -> Option<bool> {
     let content = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = content.lines().map(str::trim);
@@ -169,10 +158,10 @@ fn pid_file_is_stale(pid_file: &Path) -> Option<bool> {
         return None; // process-group sentinel, never a valid owner
     }
 
-    // A lease recorded for another uid is not ours to interpret or to act on —
-    // and neither is one whose owner line we cannot read at all. Accepting an
-    // unparseable line would silently downgrade a truncated or tampered lease to
-    // the weaker "bare pid" form and hand it authority it was never granted.
+    // A lease recorded for another uid is not ours to act on — and neither is
+    // one whose owner line we cannot read. Accepting an unparseable line would
+    // silently downgrade a truncated or tampered lease to the weaker "bare pid"
+    // form and hand it authority it was never granted.
     if let Some(ours) = current_uid()
         && let Some(uid) = lines.next()
         && !matches!(uid.parse::<u32>(), Ok(uid) if uid == ours)
@@ -211,36 +200,35 @@ fn is_worktree_lease_name(name: &str) -> bool {
 ///
 /// Atomicity matters because the sweep walks `read_dir` output while other
 /// subagents keep creating and dropping entries in the same base directory. The
-/// decision is therefore taken from a single source — the worktree directory's
-/// own lease — *before* the first destructive step, so a worktree is never
-/// observed half-removed, and `read_dir` order cannot change the outcome
-/// (audit §01/§09). Idempotence follows from it: every step tolerates an
-/// already-missing path, so re-running the sweep is a no-op.
+/// decision is taken from a single source — the worktree directory's own lease
+/// — *before* the first destructive step, so a worktree is never observed
+/// half-removed and `read_dir` order cannot change the outcome
+/// (audit §01/§09). Idempotence follows: every step tolerates an already-missing
+/// path, so re-running the sweep is a no-op.
 ///
-/// Fails open: only `Some(true)` — a readable lease naming a process that can no
-/// longer do work — authorizes the removal.
+/// Fails open: only `Some(true)` — a readable lease naming a process that can
+/// no longer do work — authorizes the removal.
 fn reclaim_abandoned_worktree(dir: &Path) -> bool {
     let pid_file = pid_file_for(dir);
     if pid_file_is_stale(&pid_file) != Some(true) {
         return false;
     }
     info!(path = %dir.display(), "Pruning orphaned worktree directory");
-    // The lease is *claimed* by renaming it to a private name before anything is
-    // destroyed. `rename` within a directory is atomic, so of N concurrent
-    // sweeps racing over the same abandoned worktree exactly one observes a
-    // successful claim and only that one proceeds; the losers get `NotFound` (or
-    // some other error) and leave the entry alone. Without this, two sweeps could
-    // both read a live-looking lease, both decide "stale", and interleave their
-    // directory/lease/target removals into a half-reclaimed worktree.
+    // Claim the lease by renaming it to a private name before destroying
+    // anything. `rename` within a directory is atomic, so of N concurrent
+    // sweeps exactly one observes a successful claim and only that one
+    // proceeds; the losers get `NotFound` and leave the entry alone. Without
+    // this, two sweeps could both read a live-looking lease, both decide
+    // "stale", and interleave their removals into a half-reclaimed worktree.
     //
-    // Claiming before the directory is removed — rather than after — is what
-    // keeps the unit all-or-nothing for *readers* too: the unleased window a
-    // concurrent sweep would otherwise see (and fail open on, stranding the
-    // directory forever, the leak audit §01 was written about) is bounded to a
-    // single `rename` and the reclaiming sweep is already committed to finishing.
+    // Claiming before the directory is removed keeps the unit all-or-nothing
+    // for *readers* too: the unleased window a concurrent sweep would otherwise
+    // see (and fail open on, stranding the directory forever — the leak audit
+    // §01 was written about) is bounded to a single `rename`, and the reclaiming
+    // sweep is already committed to finishing.
     let Ok(claimed) = claim_lease(&pid_file) else {
-        // Another sweep claimed this lease first, or the lease vanished under
-        // us; either way the worktree is that sweep's to finish, not ours.
+        // Another sweep claimed this lease first, or it vanished under us;
+        // either way the worktree is that sweep's to finish, not ours.
         return false;
     };
     // The lease may have been replaced between the initial read and the claim.
@@ -292,7 +280,7 @@ pub fn claim_lease_for_test(pid_file: &Path) -> std::io::Result<PathBuf> {
 
 /// Reclaim leases that describe nothing: a `swe-wt-*.pid` whose worktree
 /// directory no longer exists. They protect no work, cannot lose data, and are
-/// handled independently of the directory walk so that ordering between the two
+/// handled independently of the directory walk so ordering between the two
 /// entry kinds is irrelevant.
 fn reclaim_dangling_lease(lease: &Path) {
     if worktree_dir_of_pid_file(lease).is_none() {
@@ -324,8 +312,8 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     remove_target_dirs(wt_path);
 }
 
-/// True when `branch` has no commits that are missing from `HEAD`, i.e. deleting
-/// it cannot lose work. Unreadable/absent branches count as safe to delete.
+/// True when `branch` has no commits missing from `HEAD`, i.e. deleting it
+/// cannot lose work. Unreadable/absent branches count as safe to delete.
 fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     git(
         repo_root,
@@ -345,8 +333,7 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
 fn registered_worktree_is_stale(wt: &str) -> bool {
     let wt_path = Path::new(wt);
     match pid_file_is_stale(&pid_file_for(wt_path)) {
-        // Owner process is gone (or the marker is unusable) -> the worktree is
-        // abandoned regardless of whether the directory still exists.
+        // Owner gone (or marker unusable) -> abandoned regardless of directory.
         Some(stale) => stale,
         // No marker at all: fall back to the directory. Without a lease there
         // is nothing to protect, and an unregistered-but-present directory is
@@ -406,7 +393,7 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
 pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 
-    // 1. Prune registered worktrees whose owner process is dead or directory is missing
+    // 1. Prune registered worktrees whose owner process is dead or directory is missing.
     let mut active_branches = Vec::new();
     if let Ok(output) = git(
         repo_root,
@@ -432,7 +419,7 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
         }
     }
 
-    // 2. Prune orphaned worker-* branches that have no registered worktrees AND are merged into HEAD
+    // 2. Prune orphaned worker-* branches with no registered worktrees AND merged into HEAD.
     if let Ok(output) = git(
         repo_root,
         "branch --list",
@@ -490,9 +477,9 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
         }
     }
 
-    // Post-pass prune: phase 1 may have removed worktrees, which leaves new
-    // stale administrative entries; this second pass clears them. Together the
-    // pre- and post-passes form a legitimate double pass (pre collects old
-    // garbage, post collects what we just removed) — both are needed.
+    // Post-pass prune: phase 1 may have removed worktrees, leaving new stale
+    // administrative entries; this second pass clears them. Together the pre-
+    // and post-passes form a legitimate double pass (pre collects old garbage,
+    // post collects what we just removed) — both are needed.
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 }

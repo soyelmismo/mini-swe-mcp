@@ -1,9 +1,8 @@
 //! Isolated `git` worktrees for subagents.
 //!
-//! Every dispatched subagent gets its own worktree checked out on a dedicated
-//! `worker-<id>` branch under [`swe_base_dir`], so concurrent agents never
-//! contend for the repository working tree. This package owns both halves of
-//! that lifecycle:
+//! Every dispatched subagent gets its own worktree on a dedicated `worker-<id>`
+//! branch under [`swe_base_dir`], so concurrent agents never contend for the
+//! repository working tree. This package owns both halves of that lifecycle:
 //!
 //! * `guard` — the RAII [`WorktreeGuard`] that creates a worktree, syncs
 //!   artifacts, produces diffs, commits work and cleans up on `Drop`;
@@ -26,8 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::error;
 
-/// Root directory that hosts all subagent scratch data (worktrees, target
-/// dirs, caches).
+/// Root directory hosting all subagent scratch data (worktrees, target dirs, caches).
 pub fn swe_base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SWE_TEMP_DIR") {
         PathBuf::from(dir)
@@ -54,8 +52,7 @@ pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Run `git` in `dir`, attaching the operation to the error when the process
-/// itself cannot be spawned.
+/// Run `git` in `dir`, attaching the operation to the error when spawning fails.
 pub(crate) fn git(dir: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .current_dir(dir)
@@ -74,8 +71,8 @@ pub(crate) fn pid_file_for(path: &Path) -> PathBuf {
 
 /// Remove a directory tree, tolerating an already-missing path.
 ///
-/// Centralises the `exists() && remove_dir_all` pattern that was repeated in
-/// three places (audit §04/§04b).
+/// Centralises the `exists() && remove_dir_all` pattern repeated in three
+/// places (audit §04/§04b).
 pub(crate) fn force_remove_dir(path: &Path) {
     if let Err(e) = std::fs::remove_dir_all(path)
         && e.kind() != std::io::ErrorKind::NotFound
