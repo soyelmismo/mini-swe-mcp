@@ -4,10 +4,13 @@
 //! can also be exercised from integration tests in `tests/`.
 
 pub mod agent;
+pub mod bootstrap;
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod manifest;
 pub mod mcp;
 pub mod monitor;
 pub mod pool;
+pub mod telemetry;
 pub mod worktree;
