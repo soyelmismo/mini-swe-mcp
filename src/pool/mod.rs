@@ -391,6 +391,7 @@ impl WorkerPool {
                         "state": {
                             "status": match e.status.as_str() {
                                 "running" => "Running",
+                                "reviewing" => "Reviewing",
                                 "completed" => "Completed",
                                 "paused" => "Paused",
                                 "failed" => "Failed",

@@ -229,6 +229,7 @@ impl McpServer {
                 };
                 let state_name = match status {
                     "running" => "Running",
+                    "reviewing" => "Reviewing",
                     "completed" => "Completed",
                     "paused" => "Paused",
                     "failed" => "Failed",
