@@ -11,9 +11,9 @@
 //! every manifest instance in the process.
 
 use super::{
-    catalog::catalog_row,
-    catalog_cache_len, clear_catalog_cache, BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY,
-    DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest,
+    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE,
+    MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, catalog::catalog_row, catalog_cache_len,
+    clear_catalog_cache,
 };
 
 fn single(definition: ModelDefinition) -> ModelManifest {
@@ -384,20 +384,52 @@ fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
         max_turns: None,
     };
 
-    assert_eq!(catalog_row("a", &a), "- `a` (id: `vendor:a`): Role A.\n");
+    let first = catalog_row("a", &a);
+    assert_eq!(&*first, "- `a` (id: `vendor:a`): Role A.\n");
     assert_eq!(catalog_cache_len(), 1);
 
-    // Same key twice -> memoized, no new entry.
-    assert_eq!(catalog_row("a", &a), "- `a` (id: `vendor:a`): Role A.\n");
+    // Same key twice -> memoized, no new entry AND no re-render: the cache
+    // hands back the very same `Arc`, so a hit is a refcount bump, not a copy.
+    let second = catalog_row("a", &a);
+    assert_eq!(&*second, "- `a` (id: `vendor:a`): Role A.\n");
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
     assert_eq!(catalog_cache_len(), 1);
 
     // Different id, different role and a missing role are all distinct keys.
-    assert_eq!(catalog_row("a", &b), "- `a` (id: `vendor:b`): Role A.\n");
-    assert_eq!(
-        catalog_row("a", &no_role),
-        "- `a` (id: `vendor:a`): Autonomous subagent\n"
-    );
+    let other_id = catalog_row("a", &b);
+    assert_eq!(&*other_id, "- `a` (id: `vendor:b`): Role A.\n");
+    let fallback = catalog_row("a", &no_role);
+    assert_eq!(&*fallback, "- `a` (id: `vendor:a`): Autonomous subagent\n");
     assert_eq!(catalog_cache_len(), 3);
+}
+
+/// The cache key is built from the **effective** role, so a model that declares
+/// no role and one that spells out `DEFAULT_ROLE` verbatim render identical text
+/// and therefore correctly share one entry. Keying on the raw `Option` (as the
+/// previous `(String, String, String)` tuple did, via `unwrap_or_default()`)
+/// would have split them into two entries holding the same bytes.
+#[test]
+fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
+    let _guard = TEST_CACHE_MUTEX.lock().unwrap();
+    clear_catalog_cache();
+
+    let implicit = ModelDefinition {
+        id: "vendor:role".to_string(),
+        role: None,
+        temperature: None,
+        max_turns: None,
+    };
+    let explicit = ModelDefinition {
+        role: Some(DEFAULT_ROLE.to_string()),
+        ..implicit.clone()
+    };
+
+    let a = catalog_row("r", &implicit);
+    let b = catalog_row("r", &explicit);
+
+    assert_eq!(a, b, "both render the same bullet");
+    assert!(std::sync::Arc::ptr_eq(&a, &b), "and share one cache entry");
+    assert_eq!(catalog_cache_len(), 1);
 }
 
 #[test]
@@ -413,7 +445,7 @@ fn test_catalog_cache_stays_bounded() {
             max_turns: None,
         };
         let row = catalog_row(&format!("alias{i}"), &def);
-        assert_eq!(row, format!("- `alias{i}` (id: `vendor:id{i}`): Role.\n"));
+        assert_eq!(&*row, format!("- `alias{i}` (id: `vendor:id{i}`): Role.\n"));
         assert!(
             catalog_cache_len() <= CATALOG_CACHE_CAPACITY,
             "catalog cache must stay bounded, got {}",
