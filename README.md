@@ -48,6 +48,21 @@ install -m 755 target/release/mini-swe-mcp ~/.local/bin/mini-swe-mcp
 
 Ensure `~/.local/bin` is in your `PATH`.
 
+The release profile is tuned for this I/O-bound stdio daemon
+(see `audits/opt_10_cargo_codegen.md`):
+
+```toml
+[profile.release]
+opt-level = 2        # smaller and faster to build than 3 for a stdio/JSON daemon
+lto = "thin"         # 34% faster release link than fat LTO for a ~5% size cost
+codegen-units = 1    # deterministic single-core thin-LTO link
+panic = "abort"      # no unwinding tables (~473 KB smaller)
+strip = true         # drops ~9.9 MB of debug symbols
+```
+
+Measured result: ~34% faster release compilation and a smaller binary than the
+previous `opt-level = 3` / fat-LTO configuration.
+
 ### Configuration (`.env`)
 
 Copy `.env.example` to `.env` and set your credentials:

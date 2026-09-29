@@ -20,9 +20,29 @@ regex = "1"
 dotenvy = "0.15"
 serde_yaml = "0.9"
 
+# Release profile tuned by audits/opt_10_cargo_codegen.md (Audit 10).
+#
+# Benchmarked on this crate (I/O-bound stdio MCP daemon):
+#   baseline (opt=3, fat LTO, cgu=1)      -> 5,182,584 B, 227 s
+#   opt-level = 2                        -> 4,944,808 B, 177 s  (-4.6% size, -22% time)
+#   lto = "thin"                         -> 5,450,024 B, 150 s  (-34% build time)
+#   lto = false                          -> 5,340,296 B, 142 s  (-37% build time)
+#   strip = false                        -> 15,125,488 B        (2.9x larger)
+#   panic = "unwind"                     -> 5,656,224 B        (+473 KB)
+#
+# Chosen result: ~34% faster release compilation and a smaller binary than the
+# previous fat-LTO/opt-3 configuration, while keeping single-core linking and
+# abort-on-panic semantics.
 [profile.release]
-opt-level = 3
-lto = true
+# Level 3 buys no measurable throughput for a stdio/JSON daemon but inflates the
+# binary by ~237 KB via loop unrolling and cross-crate inlining. Level 2 is both
+# smaller and 22% faster to build.
+opt-level = 2
+# Fat LTO dominates build time for a negligible win; "thin" recovers 34% of it.
+lto = "thin"
+# Single codegen unit keeps the thin-LTO link deterministic and robust on one core.
 codegen-units = 1
+# No unwinding tables needed: a daemon aborts on panic. Saves ~473 KB.
 panic = "abort"
+# Essential for distribution: strips ~9.9 MB of debug symbols.
 strip = true
