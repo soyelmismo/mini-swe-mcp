@@ -101,7 +101,12 @@ pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bo
             let id = if w.id.len() > 8 { &w.id[..8] } else { &w.id };
             let pid = format!("{:<7}", w.pid);
             let turns = format!("{}/{}", w.step, w.max_turns);
-            let uptime = format_duration(now.saturating_sub(w.started_at));
+            let duration_secs = if w.status == "completed" || w.status == "failed" || w.status == "stopped" {
+                w.updated_at.saturating_sub(w.started_at)
+            } else {
+                now.saturating_sub(w.started_at)
+            };
+            let uptime = format_duration(duration_secs);
             let model = &w.model;
 
             let status_colored = if use_color {
@@ -255,5 +260,27 @@ mod tests {
         assert!(text.contains("worker02"));
         assert!(text.contains("Active: 1"));
         assert!(text.contains("Paused: 1"));
+    }
+
+    #[test]
+    fn test_render_dashboard_completed_uptime_is_frozen() {
+        let entries = vec![WorkerRegistryEntry {
+            id: "done01".into(),
+            pid: 1234,
+            task: "Finished task".into(),
+            model: "ninja".into(),
+            status: "completed".into(),
+            step: 20,
+            max_turns: 100,
+            last_command: "completed".into(),
+            question: None,
+            started_at: 1000,
+            updated_at: 1065, // Ran for 65s ("01m 05s")
+            group: Some("default".into()),
+        }];
+
+        // When rendered long after completion (now = 5000), uptime must remain 65s ("01m 05s"), not 4000s
+        let text = render_dashboard(&entries, 5000, false);
+        assert!(text.contains("01m 05s"), "expected frozen duration 01m 05s, got:\n{text}");
     }
 }
