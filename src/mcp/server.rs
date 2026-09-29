@@ -10,13 +10,14 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace};
 
 use super::handlers::ProgressThrottle;
 use super::protocol::{
-    INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse, code, parse_frame,
+    FrameRejection, INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse,
+    MAX_FRAME_BYTES, code, parse_frame,
 };
 use super::schema::build_tools_list;
 use crate::manifest::ModelManifest;
@@ -53,7 +54,8 @@ impl McpServer {
 
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin).lines();
+        let mut reader = BufReader::new(stdin);
+        let mut input = Vec::new();
 
         info!("Mini-SWE-MCP server listening on stdio");
 
@@ -77,8 +79,14 @@ impl McpServer {
         // parsed frame borrows that line, so the response can echo the client's
         // `id` and quote its method name without either being copied into an
         // owned request first.
-        while let Some(line) = reader.next_line().await? {
-            let line = line.trim();
+        while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
+            if oversized {
+                let _ = out_tx
+                    .send(FrameRejection::FrameTooLarge.into_frame())
+                    .await;
+                continue;
+            }
+            let line = std::str::from_utf8(&input)?.trim();
             if line.is_empty() {
                 continue;
             }
@@ -94,7 +102,7 @@ impl McpServer {
                 let req = match parse_frame(line) {
                     Ok(req) => req,
                     Err(rejection) => {
-                        error!(line = %line, "Rejected JSON-RPC frame: {rejection:?}");
+                        error!("Rejected JSON-RPC frame: {rejection:?}");
                         let _ = tx.send(rejection.into_frame()).await;
                         return;
                     }
@@ -156,7 +164,11 @@ impl McpServer {
                 let progress_token = params
                     .get("_meta")
                     .and_then(|meta| meta.get("progressToken"))
-                    .or_else(|| arguments.get("_meta").and_then(|meta| meta.get("progressToken")))
+                    .or_else(|| {
+                        arguments
+                            .get("_meta")
+                            .and_then(|meta| meta.get("progressToken"))
+                    })
                     .or_else(|| arguments.get("progressToken"))
                     .cloned();
 
@@ -309,11 +321,98 @@ impl McpServer {
     }
 }
 
+/// Read one newline-delimited frame without letting a peer grow the input
+/// buffer beyond the protocol limit. On overflow, discard through the next
+/// newline so that the following request stays in sync. `false` means the
+/// buffer holds a complete line; `true` means the line was too long.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let mut oversized = false;
+    let mut seen = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(seen.then_some(oversized));
+        }
+        seen = true;
+        let end = chunk.iter().position(|&b| b == b'\n');
+        let count = end.unwrap_or(chunk.len());
+        if !oversized {
+            if count > MAX_FRAME_BYTES - line.len() {
+                oversized = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(&chunk[..count]);
+            }
+        }
+        reader.consume(count + usize::from(end.is_some()));
+        if end.is_some() {
+            return Ok(Some(oversized));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mcp::schema::WORKER_ACTIONS;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn oversized_stdio_line_is_discarded_without_losing_the_next_frame() {
+        let valid = br#"{"id":1,"method":"ping"}"#;
+        let mut input = vec![b'x'; MAX_FRAME_BYTES + 1];
+        input.push(b'\n');
+        input.extend_from_slice(valid);
+        let mut reader = BufReader::new(input.as_slice());
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            Some(true)
+        );
+        assert!(line.is_empty(), "do not retain an oversized prefix");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(line, valid, "the final unterminated frame is preserved");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_oversized_line_is_rejected_once() {
+        let input = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            Some(true)
+        );
+        assert!(line.is_empty());
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_ceiling_is_inclusive_for_the_stdio_reader() {
+        let input = vec![b'x'; MAX_FRAME_BYTES];
+        let mut reader = BufReader::new(input.as_slice());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(line.len(), MAX_FRAME_BYTES);
+    }
 
     fn server() -> McpServer {
         McpServer::new(
