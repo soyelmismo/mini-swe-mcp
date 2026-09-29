@@ -1,18 +1,18 @@
 //! Markdown catalog rendering for the MCP `tools/list` payload.
 //!
 //! [`ModelManifest::build_tool_description`] turns the manifest into the plain
-//! markdown block that is embedded in the `dispatch` tool description. It lives
-//! here, away from manifest *discovery* (`mod.rs`) and manifest *validation*
-//! (`validate.rs`), because rendering is the one part of the package that has no
-//! input other than the catalog itself: it reads no environment variable, no
-//! file, and no user configuration.
+//! markdown block embedded in the `dispatch` tool description. It lives here,
+//! away from manifest *discovery* (`mod.rs`) and *validation* (`validate.rs`),
+//! because rendering is the one part of the package with no input other than
+//! the catalog itself: it reads no environment variable, no file, and no user
+//! configuration.
 //!
 //! It also owns [`build_system_prompt`], the one place where a role's persistent
 //! memory ([`super::memory`]) is spliced into the system prompt a worker starts
 //! with, so the implementer and the reviewer build their prompts identically.
 //!
-//! Three properties of the catalog render are load-bearing and are asserted by
-//! the tests in `tests.rs`:
+//! Three properties of the catalog render are load-bearing and asserted by the
+//! tests in `tests.rs`:
 //!
 //! * **Determinism.** Bullets are emitted in sorted-alias order (via
 //!   [`ModelManifest::sorted_models`]) rather than in `HashMap` iteration order,
@@ -20,9 +20,9 @@
 //!   straight out of the `HashMap` produced up to 24 different strings for the
 //!   same YAML across 200 parses.
 //! * **Bounded cost.** The result is allocated exactly once, pre-sized from the
-//!   *effective* cost of every bullet, and each individual bullet is memoized
-//!   process-wide as an `Arc<str>` by [`catalog_row`] (see the `cache`
-//!   submodule), so a warm render copies no bullet twice.
+//!   *effective* cost of every bullet, and each bullet is memoized process-wide
+//!   as an `Arc<str>` by [`catalog_row`] (see the `cache` submodule), so a warm
+//!   render copies no bullet twice.
 //! * **Single allocation.** The header is a shared, once-initialized `Arc<str>`
 //!   ([`catalog_header`]) and the buffer is pre-sized with the same accounting
 //!   [`catalog_row`] uses, including the role fallback, so appending never

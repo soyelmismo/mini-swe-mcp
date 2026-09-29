@@ -1,6 +1,6 @@
 //! Model catalog served to MCP hosts, loaded from a `models.yaml`.
 //!
-//! The package is split by responsibility while keeping the historical
+//! Split by responsibility while keeping the historical
 //! `mini_swe_mcp::manifest::*` surface identical through the re-exports below:
 //!
 //! * `types` — the serializable [`ModelManifest`] / [`ModelDefinition`] pair
@@ -19,8 +19,7 @@
 //!
 //! [`ModelManifest`] itself stays here: it owns manifest discovery and
 //! loading ([`ModelManifest::load`], [`ModelManifest::from_path`]) and id
-//! resolution ([`ModelManifest::resolve_model`]), the entry points the rest of
-//! the crate uses.
+//! resolution ([`ModelManifest::resolve_model`]).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -115,9 +114,8 @@ impl ModelManifest {
                 for warning in manifest.validate() {
                     warn!(path = %path.display(), "Model manifest warning: {warning}");
                 }
-                // Validation is advisory, so the fixups are applied here: a
-                // manifest with warnings is still served, but it serves a
-                // working configuration (see [`ModelManifest::normalize`]).
+                // Validation is advisory, so fixups are applied here: a manifest
+                // with warnings is still served, but as a working configuration.
                 Some(manifest.normalized())
             }
             Err(e) => {
