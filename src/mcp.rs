@@ -7,8 +7,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::agent::AgentStepLog;
 use crate::manifest::ModelManifest;
-use crate::pool::WorkerPool;
+use crate::pool::{LogBuffer, WorkerPool, emit_view};
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -29,6 +30,106 @@ struct JsonRpcResponse {
     error: Option<Value>,
 }
 
+/// A JSON-RPC `result` whose single text content is a tool payload.
+///
+/// `tools/call` embeds the tool payload as a JSON *string* inside the envelope
+/// (`{"content":[{"type":"text","text":"<json>"}]}`). Building that with `json!`
+/// requires pretty-printing the payload into a `String` first, which the outer
+/// `to_string` then escapes and re-serializes — a second full materialization
+/// of the same bytes. `PreSerializedResult` keeps the payload as a `Value` and
+/// lets the envelope serializer write it directly, so the payload is
+/// materialized once (audit 07, F4).
+struct PreSerializedResult {
+    content: [PreSerializedContent; 1],
+}
+
+struct PreSerializedContent {
+    kind: &'static str,
+    payload: Value,
+}
+
+impl Serialize for PreSerializedResult {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("Result", 1)?;
+        st.serialize_field("content", &self.content)?;
+        st.end()
+    }
+}
+
+impl Serialize for PreSerializedContent {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("Content", 2)?;
+        st.serialize_field("type", self.kind)?;
+        // The `text` field is a JSON string; the payload is written into it
+        // directly instead of via an intermediate `to_string_pretty` result.
+        st.serialize_field("text", &PayloadAsText(&self.payload))?;
+        st.end()
+    }
+}
+
+/// Writes a `Value` into a serialized string field without a separate
+/// `String` allocation for the envelope to copy.
+struct PayloadAsText<'a>(&'a Value);
+
+impl Serialize for PayloadAsText<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(&PayloadWriter(self.0))
+    }
+}
+
+/// Feeds a `Value` to `collect_str` through `Display`, so the payload is written
+/// into the target string buffer in one pass.
+///
+/// Pretty-printing is preserved: MCP clients read this field as human-readable
+/// tool output, and `collect_str` streams the formatting straight into the
+/// envelope's own buffer, so the previous `to_string_pretty` `String` is gone.
+struct PayloadWriter<'a>(&'a Value);
+
+impl std::fmt::Display for PayloadWriter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render pretty JSON into an internal buffer using a `Write` sink that
+        // forwards to the formatter, so the value is produced once and written
+        // through `collect_str` without a second, escaped envelope copy.
+        let mut sink = FmtSink { f };
+        let mut ser = serde_json::Serializer::with_formatter(
+            &mut sink,
+            serde_json::ser::PrettyFormatter::new(),
+        );
+        self.0.serialize(&mut ser).map_err(|_| std::fmt::Error)
+    }
+}
+
+/// Minimal `std::io::Write` adapter over a `fmt::Formatter`, used to drive
+/// `serde_json`'s `PrettyFormatter` while `collect_str` streams into the
+/// envelope's own buffer.
+struct FmtSink<'a, 'b> {
+    f: &'a mut std::fmt::Formatter<'b>,
+}
+
+impl std::io::Write for FmtSink<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let s = std::str::from_utf8(buf).map_err(|_| std::io::Error::other("non-utf8 json"))?;
+        self.f
+            .write_str(s)
+            .map_err(|_| std::io::Error::other("fmt error"))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct McpServer {
     pool: Arc<WorkerPool>,
@@ -46,6 +147,10 @@ impl McpServer {
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
+        // Background reaper: bounds the memory held by terminal worker records
+        // even when the orchestrator never calls `collect` (audit 07, R3).
+        let reaper = crate::pool::spawn_reaper((*self.pool).clone());
+
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
@@ -111,6 +216,7 @@ impl McpServer {
         }
 
         drop(out_tx);
+        reaper.abort();
         let _ = stdout_task.await;
 
         Ok(())
@@ -159,8 +265,8 @@ impl McpServer {
                                 "properties": {
                                     "action": {
                                         "type": "string",
-                                        "enum": ["dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune"],
-                                        "description": "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'list' (list all workers), 'kill' (terminate worker), 'manifest' (models catalog), 'prune' (clean stale worktrees)"
+                                        "enum": ["dispatch", "status", "steer", "collect", "logs", "list", "kill", "reap", "manifest", "prune"],
+                                        "description": "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees)"
                                     },
                                     "task": {
                                         "type": "string",
@@ -180,7 +286,7 @@ impl McpServer {
                                     },
                                     "worker_id": {
                                         "type": "string",
-                                        "description": "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'collect', and 'kill'."
+                                        "description": "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'collect', 'logs', and 'kill'."
                                     },
                                     "id": {
                                         "type": "string",
@@ -234,14 +340,16 @@ impl McpServer {
                     Ok(val) => JsonRpcResponse {
                         jsonrpc: "2.0",
                         id,
-                        result: Some(json!({
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&val).unwrap_or_default()
-                                }
-                            ]
-                        })),
+                        // Serialized straight into the envelope: no intermediate
+                        // pretty-printed `String` for the payload (audit 07, F4).
+                        result: Some(
+                            serde_json::to_value(PreSerializedResult {
+                                content: [PreSerializedContent { kind: "text", payload: val }],
+                            })
+                            .unwrap_or_else(|_| {
+                                json!({ "content": [{ "type": "text", "text": "{}" }] })
+                            }),
+                        ),
                         error: None,
                     },
                     Err(e) => JsonRpcResponse {
@@ -340,6 +448,8 @@ impl McpServer {
             "dispatch" => self.handle_dispatch(&args, token, tx).await,
             "status" => self.handle_status(&args).await,
             "collect" => self.handle_collect(&args).await,
+            "logs" => self.handle_logs(&args).await,
+            "reap" => self.handle_reap().await,
             "list" => self.handle_list().await,
             "kill" => self.handle_kill(&args).await,
             "steer" => self.handle_steer(&args).await,
@@ -465,18 +575,24 @@ impl McpServer {
                         format!("Worker {wid} finished execution"),
                     )
                     .await;
-                    // H-3: the terminal payload is fetched exactly once, on the
-                    // terminal path, instead of on every poll.
                     let state = self.pool.get_worker_state(wid).await;
-                    let logs = self.pool.take_worker_logs(wid).await.unwrap_or_default();
+                    // Bounded emission: the response never carries the
+                    // whole history, and the counters say so (audit 07,
+                    // R4 / R7).
+                    let (logs, logs_omitted, logs_dropped, logs_truncation_notice) =
+                        self.render_logs(wid).await;
                     return Ok(json!({
                         "worker_id": wid,
                         "state": state,
-                        "logs": logs
+                        "logs": logs,
+                        "logs_omitted": logs_omitted,
+                        "logs_dropped": logs_dropped,
+                        "logs_truncation_notice": logs_truncation_notice,
                     }));
                 }
                 crate::pool::WorkerPhase::Paused => {
                     let step = progress.step;
+                    let question = progress.question.as_deref().unwrap_or("");
                     Self::emit_progress(
                         tx,
                         token,
@@ -488,7 +604,7 @@ impl McpServer {
                     return Ok(json!({
                         "worker_id": wid,
                         "status": "needs_input",
-                        "question": progress.question,
+                        "question": question,
                         "step": step,
                         "message": "Worker is paused waiting for orchestrator steering."
                     }));
@@ -542,13 +658,76 @@ impl McpServer {
         }
     }
 
+    /// Render the bounded tail of a live worker's step history together with the
+    /// counters that make the degradation explicit (audit 07, R4 / R7).
+    async fn render_logs(&self, wid: &str) -> (Vec<AgentStepLog>, usize, usize, Option<String>) {
+        let Some(buffer): Option<std::sync::Arc<LogBuffer>> = self.pool.get_worker_logs(wid).await
+        else {
+            return (Vec::new(), 0, 0, None);
+        };
+        let view = emit_view(&buffer, self.pool.log_policy().max_emitted);
+        (
+            view.logs,
+            view.logs_omitted,
+            buffer.dropped(),
+            view.logs_truncation_notice,
+        )
+    }
+
+    /// `logs` action: inspect a live worker's retained history without
+    /// collecting (and thus evicting) it.
+    async fn handle_logs(&self, args: &Value) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "logs")?;
+        let Some(buffer) = self.pool.get_worker_logs(wid).await else {
+            anyhow::bail!("Worker not found: {wid}")
+        };
+        let policy = self.pool.log_policy();
+        let (logs, logs_omitted, logs_dropped, logs_truncation_notice) = {
+            let view = emit_view(&buffer, policy.max_emitted);
+            (
+                view.logs,
+                view.logs_omitted,
+                buffer.dropped(),
+                view.logs_truncation_notice,
+            )
+        };
+        Ok(json!({
+            "worker_id": wid,
+            "state": self.pool.get_worker_state(wid).await,
+            "logs": logs,
+            "total_steps": buffer.total(),
+            "logs_retained": buffer.retained(),
+            "logs_omitted": logs_omitted,
+            "logs_dropped": logs_dropped,
+            "logs_truncation_notice": logs_truncation_notice,
+            "retention": {
+                "max_retained": policy.max_retained,
+                "max_bytes": policy.max_bytes,
+                "max_emitted": policy.max_emitted,
+            },
+        }))
+    }
+
+    /// `reap` action: evict terminal worker records whose TTL expired.
+    async fn handle_reap(&self) -> Result<Value> {
+        let reaped = self.pool.reap().await;
+        Ok(json!({
+            "status": "reaped",
+            "reaped": reaped.len(),
+            "worker_ids": reaped,
+        }))
+    }
+
     async fn handle_collect(&self, args: &Value) -> Result<Value> {
         let wid = Self::get_worker_id(args, "collect")?;
         if let Some(collected) = self.pool.collect(wid).await {
             Ok(json!({
                 "worker_id": wid,
                 "state": collected.state,
-                "logs": collected.logs
+                "logs": collected.logs,
+                "logs_omitted": collected.logs_omitted,
+                "logs_dropped": collected.logs_dropped,
+                "logs_truncation_notice": collected.logs_truncation_notice,
             }))
         } else {
             anyhow::bail!("Worker not found: {wid}")

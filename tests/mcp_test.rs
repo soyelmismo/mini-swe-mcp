@@ -432,8 +432,10 @@ fn test_tools_list_schema() {
         "status",
         "steer",
         "collect",
+        "logs",
         "list",
         "kill",
+        "reap",
         "manifest",
     ] {
         assert!(
@@ -547,4 +549,138 @@ fn test_tools_call_prune_with_progress_token_emits_notifications() {
         .expect("must receive tool response");
     assert_eq!(final_resp["id"], json!(200));
     assert!(final_resp.get("result").is_some());
+}
+
+#[test]
+fn test_tools_call_reap_reports_evicted_records() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 300,
+        "method": "tools/call",
+        "params": { "name": "worker", "arguments": { "action": "reap" } }
+    }));
+
+    let response = server
+        .expect_response("tools/call reap")
+        .expect("reap must be answered");
+    let result = expect_result(&response);
+    // The result is double-encoded: text holds the pretty-printed JSON payload.
+    let payload: Value = serde_json::from_str(
+        result["content"][0]["text"]
+            .as_str()
+            .expect("tool text content"),
+    )
+    .expect("tool text must be JSON");
+    assert_eq!(payload["status"], json!("reaped"));
+    assert_eq!(
+        payload["reaped"],
+        json!(0),
+        "a fresh pool has nothing to reap"
+    );
+    assert_eq!(payload["worker_ids"], json!([]));
+}
+
+#[test]
+fn test_tools_call_logs_reports_retention_counters() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 301,
+        "method": "tools/call",
+        "params": { "name": "worker", "arguments": { "action": "logs", "worker_id": "missing-xyz" } }
+    }));
+
+    let response = server
+        .expect_response("tools/call logs")
+        .expect("logs must be answered");
+    // An unknown worker is a tool error, surfaced as -32000 with a useful message.
+    expect_error_code(&response, -32000);
+}
+
+/// The `tools/call` envelope must still expose the tool payload as a
+/// pretty-printed JSON string, byte-for-byte as before the F4 change, now that
+/// it is streamed into the envelope instead of via an intermediate `String`
+/// (audit 07, F4).
+#[test]
+fn test_tools_call_text_content_is_pretty_printed_json() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 400,
+        "method": "tools/call",
+        "params": { "name": "worker", "arguments": { "action": "reap" } }
+    }));
+
+    let response = server
+        .expect_response("tools/call reap")
+        .expect("must receive tool response");
+    let result = expect_result(&response);
+
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("content[0].text must be a string, got: {result}"));
+    assert_eq!(result["content"][0]["type"], json!("text"));
+    // Still valid JSON...
+    let payload: Value = serde_json::from_str(text).expect("text must contain valid JSON");
+    assert_eq!(payload["status"], json!("reaped"));
+    // ...and still pretty-printed (the envelope never carries compact JSON).
+    assert!(
+        text.contains('\n') && text.contains("  "),
+        "tool text must stay pretty-printed, got: {text}"
+    );
+}
+
+/// The streaming payload writer must be byte-identical to
+/// `serde_json::to_string_pretty`, including escapes, nesting and floats.
+/// This is the regression guard for the F4 change (audit 07).
+#[test]
+fn test_streaming_payload_writer_matches_to_string_pretty() {
+    use serde::Serialize as _;
+
+    let payload = json!({
+        "z": [1, 2, 3],
+        "a": {"nested": {"deeper": "x\"y\nz\ttab\\slash"}},
+        "unicode": "ñandú café 🦀",
+        "null": Value::Null,
+        "bool": true,
+        "float": 1.5,
+        "empty_obj": {},
+        "empty_arr": []
+    });
+
+    let expected = serde_json::to_string_pretty(&payload).unwrap();
+
+    // Drive the same serializer over an io::Write sink, exactly as
+    // `PayloadWriter` does over a `fmt::Formatter`.
+    struct Sink(Vec<u8>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Sink(Vec::new());
+    let mut ser =
+        serde_json::Serializer::with_formatter(&mut sink, serde_json::ser::PrettyFormatter::new());
+    payload.serialize(&mut ser).unwrap();
+    let buf = String::from_utf8(sink.0).unwrap();
+
+    assert_eq!(
+        buf, expected,
+        "streaming payload must be byte-identical to to_string_pretty"
+    );
+
+    // The pretty form must be genuinely indented, not compact.
+    assert!(expected.contains('\n'));
+    assert!(expected.contains("  \"z\": ["));
 }

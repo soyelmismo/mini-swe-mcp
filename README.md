@@ -84,7 +84,14 @@ OPENAI_API_BASE=https://api.openai.com/v1   # Optional, default: https://api.ope
 DEFAULT_MODEL=ninja                         # Optional, default: ninja
 MAX_CONCURRENT_WORKERS=64                   # Optional, default: 64
 BASH_CONCURRENT_LIMIT=2                     # Optional, default: cores / 2
+WORKER_MAX_RETAINED_LOGS=200                # Optional, default: 200 (ceiling 1000)
+WORKER_MAX_EMITTED_LOGS=40                  # Optional, default: 40 (ceiling 500)
+WORKER_TERMINAL_TTL_SECS=300                # Optional, default: 300
 ```
+
+The three `WORKER_*` variables bound the per-worker step-log memory and the
+lifetime of finished worker records; see `.env.example` for the full contract
+and [Step-Log Retention](#step-log-retention) below.
 
 ---
 
@@ -151,21 +158,62 @@ mini-swe-mcp steer <worker_id> "Focus on unit tests first, skip integration test
 mini-swe-mcp collect <worker_id>
 ```
 
-#### 5. Kill a Worker
+#### 5. Inspect a Worker's Step Logs
+```bash
+# Read a live worker's retained (bounded) step history without collecting it
+mini-swe-mcp logs <worker_id>
+```
+
+The response always carries `total_steps`, `logs_retained`, `logs_omitted` and
+`logs_dropped`, plus a `logs_truncation_notice` whenever part of the history is
+missing — see [Step-Log Retention](#step-log-retention).
+
+#### 6. Kill a Worker
 ```bash
 mini-swe-mcp kill <worker_id>
 ```
 
-#### 6. Prune Stale Worktrees
+#### 7. Reap Expired Worker Records
+```bash
+# Evict terminal worker records whose TTL expired (also runs in the background)
+mini-swe-mcp reap
+```
+
+#### 8. Prune Stale Worktrees
 ```bash
 # Clean up orphaned branches and stale temporary worktrees whose processes died
 mini-swe-mcp prune
 ```
 
-#### 7. Inspect Model Manifest
+#### 9. Inspect Model Manifest
 ```bash
 mini-swe-mcp manifest
 ```
+
+---
+
+## Step-Log Retention
+
+Every bash step a worker runs appends an `AgentStepLog` to its in-memory history.
+That history is bounded on three independent axes so a long-running server's
+residency tracks *concurrent* workers, not historical ones:
+
+| Axis | Variable | Default | What it bounds |
+|---|---|---|---|
+| Entries per worker | `WORKER_MAX_RETAINED_LOGS` | 200 (max 1000) | Sliding window; the oldest entries are evicted |
+| Bytes per worker | derived from the window | ~430 KiB | Each entry stores a `<= 64 B` command summary and a `<= 2048 B` output excerpt |
+| Entries per response | `WORKER_MAX_EMITTED_LOGS` | 40 (max 500) | A single `collect` / `dispatch --wait` / `logs` reply |
+| Terminal record TTL | `WORKER_TERMINAL_TTL_SECS` | 300 | How long a finished worker is kept before eviction |
+
+The truncation marker (`... [N bytes truncated]`) is charged *against* the
+2048-byte budget, so the stored `output` is at most 2048 bytes rather than
+2048-plus-marker.
+
+Nothing degrades silently: every log-bearing response reports
+`total_steps`, `logs_retained`, `logs_omitted` and `logs_dropped`, and adds a
+`logs_truncation_notice` when part of the history is not shown. Use
+`logs <worker_id>` to page through the retained window of a live worker, and
+`reap` (or the background reaper) to reclaim finished workers.
 
 ---
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
-use mini_swe_mcp::pool::{WorkerPhase, WorkerPool};
+use mini_swe_mcp::pool::{WorkerPhase, WorkerPool, emit_view};
 use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
                 println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]");
                 println!("  status <worker_id>");
                 println!("  collect <worker_id>");
+                println!("  logs <worker_id>");
+                println!("  reap");
                 println!("  steer <worker_id> <message>");
                 println!("  list");
                 println!("  monitor [--once]");
@@ -237,7 +239,7 @@ where
                     i += 1;
                 }
             }
-            "status" | "collect" | "kill" => {
+            "status" | "collect" | "logs" | "kill" => {
                 if cli_args.len() > 2 {
                     tool_args.insert(
                         "worker_id".into(),
@@ -261,7 +263,7 @@ where
                 let once = cli_args.iter().any(|arg| arg == "--once");
                 return mini_swe_mcp::monitor::run_monitor(once).await;
             }
-            "manifest" | "list" => {}
+            "manifest" | "list" | "reap" => {}
             _ => {
                 if let Some(suggestion) = suggest_action(action, AVAILABLE_ACTIONS) {
                     eprintln!(
@@ -309,11 +311,30 @@ where
                 match progress.phase {
                     WorkerPhase::Completed | WorkerPhase::Failed => {
                         let state = pool.get_worker_state(&wid).await;
-                        let logs = pool.take_worker_logs(&wid).await.unwrap_or_default();
+                        // Bounded emission: the CLI never materialises the
+                        // whole history, and the counters say what is
+                        // missing (audit 07, R4 / R7).
+                        let (logs, logs_omitted, logs_dropped, notice) =
+                            match pool.get_worker_logs(&wid).await {
+                                Some(buffer) => {
+                                    let view =
+                                        emit_view(&buffer, pool.log_policy().max_emitted);
+                                    (
+                                        view.logs,
+                                        view.logs_omitted,
+                                        buffer.dropped(),
+                                        view.logs_truncation_notice,
+                                    )
+                                }
+                                None => (Vec::new(), 0, 0, None),
+                            };
                         result = serde_json::json!({
                             "worker_id": wid,
                             "state": state,
-                            "logs": logs
+                            "logs": logs,
+                            "logs_omitted": logs_omitted,
+                            "logs_dropped": logs_dropped,
+                            "logs_truncation_notice": notice,
                         });
                         break;
                     }
@@ -358,7 +379,7 @@ where
 }
 
 const AVAILABLE_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "collect", "list", "kill", "manifest", "prune", "monitor", "supervisor",
+    "dispatch", "status", "steer", "collect", "logs", "list", "kill", "reap", "manifest", "prune", "monitor", "supervisor",
 ];
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -564,13 +585,90 @@ fn format_collect(val: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    let counters = log_counters_line(val);
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.")
+        format!("Worker {wid}: No git diff produced.\n{counters}")
     } else {
-        diff.to_string()
+        format!("{diff}\n{counters}")
     }
 }
 
+/// Render the `logs` action: the bounded window plus the counters that make any
+/// truncation visible instead of silent (audit 07, R7).
+fn format_logs(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = format!("Worker {wid} step logs\n");
+    if let Some(entries) = val.get("logs").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let step = entry.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+            let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            out.push_str(&format!("  [{step}] {command}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "{}
+",
+        log_counters_line(val)
+    ));
+    out.trim_end().to_string()
+}
+
+fn format_reap(val: &serde_json::Value) -> String {
+    let reaped = val.get("reaped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ids = val
+        .get("worker_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if reaped == 0 {
+        "✓ No expired terminal worker records to reap.".to_string()
+    } else {
+        format!("✓ Reaped {reaped} expired worker record(s): {ids}")
+    }
+}
+
+/// One-line summary of the step-log counters present in `val`.
+fn log_counters_line(val: &serde_json::Value) -> String {
+    let read = |key: &str| val.get(key).and_then(|v| v.as_u64());
+    let total = read("total_steps");
+    let emitted = val
+        .get("logs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len() as u64);
+    let retained = read("logs_retained")
+        .or_else(|| emitted.map(|n| n.saturating_add(read("logs_omitted").unwrap_or(0))));
+    let omitted = read("logs_omitted");
+    let dropped = read("logs_dropped");
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(total) = total {
+        parts.push(format!("total_steps: {total}"));
+    }
+    if let Some(retained) = retained {
+        parts.push(format!("retained: {retained}"));
+    }
+    if let Some(omitted) = omitted
+        && omitted > 0
+    {
+        parts.push(format!("omitted: {omitted}"));
+    }
+    if let Some(dropped) = dropped
+        && dropped > 0
+    {
+        parts.push(format!("dropped: {dropped}"));
+    }
+    if let Some(notice) = val.get("logs_truncation_notice").and_then(|v| v.as_str()) {
+        parts.push(notice.to_string());
+    }
+    if parts.is_empty() {
+        return "no step logs".to_string();
+    }
+    parts.join(" | ")
+}
 fn format_dispatch(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
@@ -642,6 +740,8 @@ fn format_output(action: &str, val: &serde_json::Value) -> String {
         "prune" => format_prune(val),
         "status" => format_status(val),
         "collect" => format_collect(val),
+        "logs" => format_logs(val),
+        "reap" => format_reap(val),
         "dispatch" => format_dispatch(val),
         "steer" => format_steer(val),
         "kill" => format_kill(val),
