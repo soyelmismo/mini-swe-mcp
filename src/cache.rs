@@ -1,7 +1,7 @@
 //! Shared toolchain/compiler caches and the process-wide, bounded
 //! least-recently-used (LRU) storage they are memoized in.
 //!
-//! This module has two responsibilities:
+//! Two responsibilities:
 //!
 //! 1. **Filesystem cache wiring** — resolve the shared cache root, lay out the
 //!    well-known package/compiler cache directories (`kache`, `uv`, `pip`, the
@@ -17,12 +17,11 @@
 //!
 //! # Why an explicit LRU instead of a `HashMap` + `clear()`
 //!
-//! The classic bounded-memoization shortcut — `if map.len() >= CAP { map.clear() }`
-//! — is *not* O(1): a full `clear()` walks and drops every entry, and it throws
-//! away hot entries that will be immediately re-requested. [`LruCache`] instead
-//! evicts exactly the least-recently-*used* entry (the front of a recency
-//! `VecDeque`) in O(1) by popping a single key and removing its map entry,
-//! leaving the working set warm.
+//! The classic shortcut — `if map.len() >= CAP { map.clear() }` — is *not* O(1):
+//! a full `clear()` walks and drops every entry, and it throws away hot entries
+//! that will be immediately re-requested. [`LruCache`] instead evicts exactly the
+//! least-recently-*used* entry (the front of a recency `VecDeque`) in O(1) by
+//! popping a single key and removing its map entry, leaving the working set warm.
 //!
 //! # Complexity
 //!
