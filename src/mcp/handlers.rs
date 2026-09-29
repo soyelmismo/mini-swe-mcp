@@ -247,20 +247,14 @@ impl McpServer {
                     serde_json::from_str::<crate::pool::WorkerRegistryEntry>(&content)
             {
                 let is_alive = crate::worktree::is_process_alive(entry.pid);
-                let status = if !is_alive && (entry.status == "running" || entry.status == "paused")
+                let status = if !is_alive && (entry.status == crate::pool::RegistryStatus::Running
+                    || entry.status == crate::pool::RegistryStatus::Paused)
                 {
-                    "stopped"
+                    crate::pool::RegistryStatus::Stopped
                 } else {
-                    &entry.status
+                    entry.status
                 };
-                let state_name = match status {
-                    "running" => "Running",
-                    "reviewing" => "Reviewing",
-                    "completed" => "Completed",
-                    "paused" => "Paused",
-                    "failed" => "Failed",
-                    _ => "Stopped",
-                };
+                let state_name = status.display_name();
                 return Ok(json!({
                     "worker_id": wid,
                     "task": entry.task,
@@ -272,7 +266,7 @@ impl McpServer {
                             "step": entry.step,
                             "turns": entry.step,
                             "summary": entry.last_command.clone(),
-                            "error": if entry.status == "failed" { Some(entry.last_command) } else { None },
+                            "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                             "question": entry.question,
                             "pid": entry.pid,
                             "started_at": entry.started_at,

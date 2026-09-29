@@ -41,7 +41,7 @@ pub use self::buffer::{
 };
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
-    WorkerRegistryEntry, extract_group, load_all_registry_entries, registry_dir,
+    RegistryStatus, WorkerRegistryEntry, extract_group, load_all_registry_entries, registry_dir,
     remove_registry_entry, save_registry_entry,
 };
 pub use self::runner::{
@@ -207,7 +207,7 @@ impl WorkerPool {
             pid: std::process::id(),
             task: task.clone(),
             model: model.clone(),
-            status: "running".into(),
+            status: RegistryStatus::Running,
             step: 0,
             max_turns,
             last_command: "initializing".into(),
@@ -257,7 +257,7 @@ impl WorkerPool {
                     pid: std::process::id(),
                     task: task_clone,
                     model: model_clone,
-                    status: "failed".into(),
+                    status: RegistryStatus::Failed,
                     step: 0,
                     max_turns,
                     last_command: format!("error: {e}"),
@@ -391,14 +391,7 @@ impl WorkerPool {
                         "model": e.model,
                         "group": e.group.as_deref().unwrap_or("default"),
                         "state": {
-                            "status": match e.status.as_str() {
-                                "running" => "Running",
-                                "reviewing" => "Reviewing",
-                                "completed" => "Completed",
-                                "paused" => "Paused",
-                                "failed" => "Failed",
-                                _ => "Stopped",
-                            },
+                            "status": e.status.display_name(),
                             "step": e.step,
                             "turns": e.step,
                             "last_command": e.last_command,
