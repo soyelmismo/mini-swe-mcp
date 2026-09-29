@@ -13,7 +13,8 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
-use mini_swe_mcp::mcp::WORKER_ACTIONS;
+use mini_swe_mcp::mcp::{NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
+use mini_swe_mcp::agent::wrap_network_command;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -626,6 +627,212 @@ fn test_tools_call_text_content_is_pretty_printed_json() {
         text.contains('\n') && text.contains("  "),
         "tool text must stay pretty-printed, got: {text}"
     );
+}
+
+/// The `network` property is part of the advertised contract: an optional
+/// string, its enum is exactly the accepted policies, and it stays out of
+/// `required` so pre-existing clients are unaffected.
+#[test]
+fn test_tools_list_advertises_the_optional_network_policy() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({ "jsonrpc": "2.0", "id": "network-schema", "method": "tools/list" }));
+    let response = server
+        .expect_response("tools/list")
+        .expect("tools/list must be answered");
+    let result = expect_result(&response);
+
+    let worker = result["tools"]
+        .as_array()
+        .expect("result.tools must be an array")
+        .iter()
+        .find(|tool| tool["name"] == "worker")
+        .expect("tools/list must expose the 'worker' tool");
+    let schema = &worker["inputSchema"];
+    let network = schema["properties"]
+        .get("network")
+        .unwrap_or_else(|| panic!("the worker tool must advertise a 'network' property, got: {schema}"));
+
+    assert_eq!(network["type"], json!("string"));
+    assert_eq!(
+        network["enum"],
+        json!(NETWORK_MODES.to_vec()),
+        "the advertised enum must be the accepted policy vocabulary"
+    );
+    assert_eq!(network["default"], json!(NETWORK_DEFAULT));
+    assert_eq!(NETWORK_DEFAULT, "allow");
+    assert!(
+        network["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("offline") && text.contains("allow")),
+        "the description must document both policies, got: {network}"
+    );
+
+    // Optional by construction: `action` is still the only required argument.
+    assert_eq!(schema["required"], json!(["action"]));
+}
+
+/// An unknown `network` value is a hard tool error, not a silent fallback: a
+/// caller that asked for isolation must never quietly get connectivity back.
+#[test]
+fn test_tools_call_dispatch_rejects_an_unknown_network_policy() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 500,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": {
+                "action": "dispatch",
+                "task": "tidy the docs",
+                "repo_path": ".",
+                "network": "offine"
+            }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call dispatch with a bad network policy")
+        .expect("the call must be answered");
+    let error = expect_error_code(&response, -32000);
+    let message = error["message"]
+        .as_str()
+        .expect("error.message must be a string")
+        .to_string();
+    assert!(
+        message.contains("not a valid 'network' policy"),
+        "the error must name the invalid policy, got: {message}"
+    );
+    assert!(
+        message.contains("offline") && message.contains("allow"),
+        "the error must list the accepted policies, got: {message}"
+    );
+}
+
+/// A non-string `network` is rejected the same way, before any worker is
+/// spawned (no `worker_id` is ever handed back).
+#[test]
+fn test_tools_call_dispatch_rejects_a_non_string_network_policy() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": { "action": "dispatch", "task": "tidy the docs", "network": true }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call dispatch with a non-string network policy")
+        .expect("the call must be answered");
+    let error = expect_error_code(&response, -32000);
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be a string")),
+        "got: {error}"
+    );
+}
+
+/// The verbs that do not dispatch a worker ignore the property entirely: it is
+/// a `dispatch` option, so a `reap` carrying it must still succeed.
+#[test]
+fn test_tools_call_ignores_network_on_non_dispatch_verbs() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 502,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": { "action": "reap", "network": "offline" }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call reap with network")
+        .expect("reap must be answered");
+    let result = expect_result(&response);
+    let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+        .expect("tool text must be JSON");
+    assert_eq!(payload["status"], json!("reaped"));
+}
+
+/// The wrapper itself: connected stays byte-identical, `offline` enters a
+/// network namespace and keeps the command verbatim inside it.
+#[test]
+fn test_wrap_network_command_wraps_only_when_offline() {
+    let cmd = "git fetch --all && echo done";
+
+    // The default policy never rewrites a command: 'allow' (the advertised
+    // default) means exactly "run the command as written".
+    assert_eq!(NETWORK_DEFAULT, "allow");
+    assert_eq!(wrap_network_command(cmd, false), cmd);
+
+    let wrapped = wrap_network_command(cmd, true);
+    assert!(
+        wrapped.starts_with("unshare -n -- bash -c "),
+        "offline must enter an isolated network namespace, got: {wrapped}"
+    );
+    assert!(
+        wrapped.contains(&format!("'{cmd}'")),
+        "the command must survive the wrapper verbatim, got: {wrapped}"
+    );
+
+    // The wrapper is shell-transparent: the command is still one plain bash
+    // string, so where the host allows namespaces it runs exactly as written.
+    if can_create_network_namespace() {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(wrap_network_command("echo done", true))
+            .output()
+            .expect("bash must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("done"),
+            "the wrapped command must still execute, got: {stdout:?}"
+        );
+    } else {
+        // Where namespaces cannot be created, the wrapper must fail loudly
+        // rather than quietly running the command *with* network access.
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(wrap_network_command("echo done", true))
+            .output()
+            .expect("bash must run");
+        assert!(
+            !output.status.success() && !String::from_utf8_lossy(&output.stdout).contains("done"),
+            "an unavailable namespace must fail instead of silently running \
+             unisolated (status: {}, stdout: {:?})",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// Whether this host actually lets a process build a network namespace.
+///
+/// `unshare` being on `$PATH` is not enough: inside an unprivileged container
+/// `unshare -n` still fails with `EPERM`, and the isolation a caller asked for
+/// cannot be created there.
+fn can_create_network_namespace() -> bool {
+    std::process::Command::new("unshare")
+        .args(["-n", "--", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The streaming payload writer must be byte-identical to

@@ -136,7 +136,13 @@ mini-swe-mcp dispatch "Implement unit tests for src/config.rs" --model ninja --r
 
 # Synchronous dispatch with interactive steering (--wait)
 mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
+
+# Offline dispatch: every bash step runs with no network egress
+mini-swe-mcp dispatch "Rename the internal helper" --model ninja --repo . --offline
 ```
+
+The `--offline` flag is the CLI spelling of the tool's optional `network`
+property — see [Network Policy](#network-policy).
 
 #### 2. Monitor and List Workers
 ```bash
@@ -189,6 +195,44 @@ mini-swe-mcp prune
 ```bash
 mini-swe-mcp manifest
 ```
+
+---
+
+## Network Policy
+
+Every `dispatch` may declare a network policy for its worker:
+
+```json
+{ "action": "dispatch", "task": "Refactor the parser", "network": "offline" }
+```
+
+| Value | Effect |
+|---|---|
+| `allow` (default) | Steps run with the host's normal connectivity |
+| `offline` | Each bash step runs inside its own network namespace with no egress |
+
+`network` is optional and defaults to `allow`, so a client that never sends it
+behaves exactly as before. Any other value — or a non-string — is rejected as a
+tool error instead of being silently downgraded: a request that asked for
+isolation must never quietly get connectivity back.
+
+`offline` is enforced at the kernel level with `unshare -n`, with no containers
+and no external firewall. Inside the namespace there is no interface and no
+route, so `curl`, `git fetch` or `cargo add` fail immediately with
+`Network is unreachable` rather than blocking out a connect timeout — the step
+returns fast and the model can adapt on its next turn. The worktree, the build
+environment, the command timeout and the output plumbing are all unchanged; the
+policy also covers the reviewer phase of a `review_after` dispatch.
+
+Use it for pure refactors, analysis, renames or formatting passes, where an
+outbound request would be a defect rather than a feature. Note that `cargo
+build` / `cargo test` still work offline as long as their dependencies are
+already vendored or present in the local registry cache.
+
+If the host forbids creating network namespaces (an unprivileged container
+without `CAP_SYS_ADMIN`), the wrapper is still applied and the step fails
+loudly — a policy that quietly did not apply would be worse than one that is
+visibly unavailable.
 
 ---
 

@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -51,6 +51,20 @@ const TERM_GRACE_MS: u64 = 5_000;
 /// ignored, so a child still unreaped here is not ours to wait on any longer
 /// and must not stall the tool result.
 const KILL_GRACE_MS: u64 = 2_000;
+
+/// Program used to place a command in a fresh network namespace.
+///
+/// `unshare -n` is the only primitive that gives a step a *kernel-level* "no
+/// egress" guarantee without containers or an external firewall: the child gets
+/// its own empty network stack, so every connect() fails immediately with
+/// `ENETUNREACH` instead of hanging out a TCP timeout.
+const NETWORK_NAMESPACE_TOOL: &str = "unshare";
+
+/// Command run by an offline step that is asked to produce output at all.
+///
+/// Wrapping in `bash -c` keeps the model's command semantics (pipes,
+/// redirections, `&&`) intact instead of re-parsing the string into argv.
+const OFFLINE_SHELL: &str = "bash";
 
 /// Bound on draining the output pipes of a command that has been terminated.
 ///
@@ -91,13 +105,18 @@ impl AgentRunner {
         let mut cmd = Command::new("nice");
         configure_process(&mut cmd);
 
+        // Classify on the model's own command, before the offline wrapper is
+        // applied: `unshare -n -- bash -c ...` would otherwise mask the
+        let timeout_secs = command_timeout_secs(&effective_command);
+        let final_command = wrap_network_command(&effective_command, self.network_offline);
+
         if sandbox_enabled() {
             apply_sandbox_args(&mut cmd, dir, &target_dir);
             cmd.args(["--chdir", &dir.to_string_lossy()]);
-            cmd.args(["/usr/bin/bash", "-c", &effective_command]);
+            cmd.args(["/usr/bin/bash", "-c", &final_command]);
         } else {
             cmd.current_dir(dir)
-                .args([NICE_LEVEL, "10", "bash", "-c", &effective_command]);
+                .args([NICE_LEVEL, "10", "bash", "-c", &final_command]);
         }
 
         // Environment hygiene first: the child is spawned with a cleared
@@ -108,7 +127,6 @@ impl AgentRunner {
         apply_build_env(&mut cmd, &target_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
 
-        let timeout_secs = command_timeout_secs(&effective_command);
         run_with_timeout(&mut cmd, timeout_secs).await
     }
 }
@@ -118,6 +136,57 @@ fn blocked_by_interceptor(reason: &str) -> String {
     format!(
         "COMMAND BLOCKED BY INTERCEPTOR:\n{reason}\nPlease use a safe, non-destructive command within the current repository directory ($PWD)."
     )
+}
+
+/// Wrap `cmd` in an isolated network namespace when the worker declared
+/// `network: "offline"`.
+///
+/// The wrapped form is `unshare -n -- bash -c '<cmd>'`, which is idempotent
+/// with respect to the rest of the execution path: the child is still a bash
+/// process spawned by `nice`, so the worktree `current_dir`, the build
+/// environment, the timeout and the output plumbing are all unchanged. Inside
+/// the namespace there is no route and no interface, so a `curl`/`git fetch`/
+/// `cargo add` fails immediately (`Network is unreachable`) rather than
+/// blocking for its own connect timeout.
+///
+/// `offline == false` returns `cmd` verbatim: connectivity is the default, and
+/// a wrapper there would only add a process for no isolation benefit.
+///
+/// The wrapper is applied even when `unshare` is missing: the command then
+/// fails fast with a clear "not found" instead of silently running *with*
+/// network access, because a policy that quietly does not apply is worse than
+/// one that is loudly unavailable. Callers that must degrade can inspect
+/// [`has_unshare`] first.
+pub fn wrap_network_command(cmd: &str, offline: bool) -> String {
+    if !offline {
+        return cmd.to_string();
+    }
+    format!("{NETWORK_NAMESPACE_TOOL} -n -- {OFFLINE_SHELL} -c {}", shell_quote(cmd))
+}
+
+/// Whether the network-namespace primitive is usable on this host.
+///
+/// A cached probe: [`wrap_network_command`] is called once per agent step and
+/// spawning `unshare` just to ask would add a fork per step.
+pub fn has_unshare() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new(NETWORK_NAMESPACE_TOOL)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Single-quote `value` for `bash -c`.
+///
+/// The command reaches us as a model-authored string that may contain every
+/// metacharacter, so the wrapping layer must not be able to re-interpret it:
+/// single quotes suppress all expansion, and the embedded `'` is closed,
+/// escaped and reopened (the standard `'"'"'` dance).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// Message shown to the model when the worktree guardrail rejects a command.
@@ -509,6 +578,122 @@ mod tests {
             "test-model".to_string(),
             None,
         )
+    }
+
+    /// The default (connected) policy must not touch the command at all: a
+    /// wrapper there would only add a process and a quoting layer.
+    #[test]
+    fn an_online_command_is_returned_verbatim() {
+        let cmd = "cargo test && echo done > out.txt";
+        assert_eq!(wrap_network_command(cmd, false), cmd);
+        assert_eq!(wrap_network_command(cmd, false), cmd.to_string());
+    }
+
+    /// `offline` wraps the command in a network namespace while keeping it a
+    /// single bash string, so the model's pipes/redirections still work.
+    #[test]
+    fn an_offline_command_is_wrapped_in_a_network_namespace() {
+        let wrapped = wrap_network_command("echo hi", true);
+        assert!(
+            wrapped.starts_with("unshare -n -- bash -c "),
+            "the wrapper must enter an isolated network namespace: {wrapped}"
+        );
+        assert!(wrapped.contains("'echo hi'"), "{wrapped}");
+    }
+
+    /// The command is model-authored text, so the wrapper must quote it: an
+    /// embedded single quote, `$VAR` or backtick has to survive the extra
+    /// shell layer verbatim instead of being expanded or breaking out of it.
+    #[test]
+    fn an_offline_wrapper_quotes_its_command_exactly_once() {
+        let wrapped = wrap_network_command("echo 'it'\''s' $HOME `id` \"q\"", true);
+        let inner = wrapped
+            .rsplit_once("bash -c ")
+            .expect("an offline command is wrapped")
+            .1;
+        assert!(inner.starts_with('\'') && inner.ends_with('\''), "{inner}");
+        // The escaped-quote dance keeps the outer quoting balanced.
+        assert!(inner.contains("'\\''"), "{inner}");
+        assert!(inner.contains("$HOME"), "no expansion happens at wrap time: {inner}");
+    }
+
+    /// The end-to-end contract from the hardening plan: with the policy on, a
+    /// request that would need egress fails *immediately* (no interface, no
+    /// route) instead of hanging out a connect timeout, while a local command
+    /// still runs normally.
+    ///
+    /// Where the host forbids namespace creation (an unprivileged container,
+    /// a kernel without `CONFIG_NET_NS`) the wrapper is still applied and the
+    /// step fails loudly; that fallback is asserted separately below rather
+    /// than letting the test quietly pass in isolation.
+    #[tokio::test]
+    async fn an_offline_worker_has_no_egress_and_still_runs_local_commands() {
+        if !has_unshare() {
+            eprintln!("skipping: unshare is unavailable on this host");
+            return;
+        }
+        let tmp = crate::worktree::swe_base_dir().join("exec-offline-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let offline = runner().with_network_offline(true);
+
+        if !can_create_network_namespace() {
+            // Policy must never silently degrade into "with network access".
+            let (out, code) = offline
+                .execute_bash(&tmp, "printf 'must not run\n'")
+                .await
+                .expect("an offline command must still be spawned");
+            assert_ne!(
+                code,
+                Some(0),
+                "an unavailable namespace must fail loudly, never run unisolated: {out:?}"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let (out, code) = offline
+            .execute_bash(&tmp, "printf 'still runs\n'")
+            .await
+            .expect("an offline command must still be spawned");
+        assert_eq!(code, Some(0), "local commands must work offline: {out:?}");
+        assert!(out.contains("still runs"), "{out:?}");
+
+        let started = std::time::Instant::now();
+        let (out, code) = offline
+            .execute_bash(
+                &tmp,
+                "curl -sS --max-time 20 https://example.com -o /dev/null; echo exit=$?",
+            )
+            .await
+            .expect("an offline curl must fail as ordinary output, not an error");
+        let elapsed = started.elapsed();
+
+        assert_ne!(code, Some(0), "egress must fail offline: {out:?}");
+        assert!(
+            out.contains("exit=") && !out.contains("exit=0"),
+            "the curl must not succeed: {out:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "offline must fail fast on ENETUNREACH, not wait out a connect \
+             timeout (took {elapsed:?})"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Whether this host actually lets us build a network namespace.
+    ///
+    /// `has_unshare` only proves the binary exists; inside an unprivileged
+    /// container `unshare -n` still fails with EPERM, and the isolation the
+    /// policy promises cannot be created there.
+    fn can_create_network_namespace() -> bool {
+        std::process::Command::new(NETWORK_NAMESPACE_TOOL)
+            .args(["-n", "--", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     #[test]
