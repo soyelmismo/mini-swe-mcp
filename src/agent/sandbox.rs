@@ -7,16 +7,14 @@
 //!   classifies a command so it gets a longer timeout.
 //! * **Kernel-level filesystem confinement** - the [Landlock] LSM restricts
 //!   the filesystem to a read-only system prefix plus an explicitly writable
-//!   worktree and build target directory. Two entry points share one policy:
-//!   [`apply_landlock_sandbox`] confines the *calling* process (and everything
-//!   it later spawns), while [`build_landlock_plan`] prepares the same domain
-//!   for installation in a forked child through a `pre_exec` hook - which is
-//!   how `exec.rs` confines a worker when bubblewrap is unavailable, without
-//!   ever confining the daemon itself.
+//!   worktree and build target directory. [`build_landlock_plan`] prepares the
+//!   domain for installation in a forked child through a `pre_exec` hook -
+//!   which is how `exec.rs` confines a worker when bubblewrap is unavailable,
+//!   without ever confining the daemon itself.
 //!
 //! [Landlock]: https://docs.kernel.org/userspace-api/landlock.html
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
@@ -322,52 +320,6 @@ struct PathBeneathAttr {
     parent_fd: libc::c_int,
 }
 
-/// An owned file descriptor that never escapes into a child process.
-///
-/// Two complementary mechanisms: `open(2)` uses `O_CLOEXEC` where the crate
-/// chooses the descriptor itself, and descriptors the *kernel* hands back
-/// (notably `landlock_create_ruleset`, which takes no flags) get `FD_CLOEXEC`
-/// set explicitly, since `O_CLOEXEC` is not retroactive. Without this, a
-/// ruleset fd opened before `Command::spawn` would be inherited by every
-/// worker, leaking a handle to a live policy. Dropping closes it exactly once.
-struct Fd(libc::c_int);
-
-impl Fd {
-    /// Adopt a raw descriptor, marking it close-on-exec.
-    ///
-    /// Returns `None` if `FD_CLOEXEC` cannot be set, so a descriptor that could
-    /// leak into a child is never held.
-    fn new(raw: libc::c_int) -> Option<Self> {
-        if raw < 0 {
-            return None;
-        }
-        // SAFETY: `raw` is a live descriptor owned by this function until the
-        // `Fd` below takes over. `F_GETFD`/`F_SETFD` only read and write the
-        // descriptor's own flag word, and the previous value is preserved.
-        unsafe {
-            let flags = libc::fcntl(raw, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
-                libc::close(raw);
-                return None;
-            }
-        }
-        Some(Self(raw))
-    }
-
-    /// The raw descriptor, for passing into a syscall.
-    fn raw(&self) -> libc::c_int {
-        self.0
-    }
-}
-
-impl Drop for Fd {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor came from a successful `open`/syscall, is owned
-        // by this value, and is closed exactly once here.
-        unsafe { libc::close(self.0) };
-    }
-}
-
 /// Rights a sandboxed child needs to read a path: list dirs, read files,
 /// resolve sockets, execute binaries.
 const READ_ONLY_RIGHTS: u64 =
@@ -521,8 +473,9 @@ fn is_denied(path: &Path, denied: &[PathBuf]) -> bool {
 /// Canonicalising makes the string check and the rule agree.
 ///
 /// An un-canonicalisable root (missing or unreadable component) is returned
-/// unchanged: the caller already validated existence, and the `O_PATH` open in
-/// [`add_rule`] is the real check. Falling back is the safe direction - it
+/// unchanged: the caller already validated existence, and the `O_PATH` open
+/// during plan application is the real check. Falling back is the safe
+/// direction - it
 /// keeps current behaviour instead of silently dropping a writable root.
 fn canonical_root(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -637,119 +590,6 @@ fn handled_access_fs(rules: &[PathRule], access: u64) -> u64 {
         & access
 }
 
-/// Apply a Landlock filesystem domain to the calling process and its children.
-///
-/// `landlock_restrict_self` is **irreversible and one-way**: the process cannot
-/// widen its own access afterwards, and every fork inherits the restriction.
-/// That is what worker execution wants, but it is also why this is the *only*
-/// place in the crate that should call it - a caller must be done touching
-/// anything outside the sandbox, because its own subsequent access is confined
-/// too.
-///
-/// The domain permits:
-///
-/// * **read + execute** on the system prefixes ([`READ_ONLY_SYSTEM_PATHS`]),
-///   selected `/etc` config files, `/proc` and `/dev` - enough to run a
-///   compiler, linker and `bash`;
-/// * **read + write** on `worktree` and `target_dir`.
-///
-/// Everything else is denied, which is what makes the sensitive paths (the
-/// operator's `~/.ssh`, `~/.aws`, `~/.gnupg`, `/etc/shadow`; see
-/// [`denied_paths`]) unreachable rather than merely unused.
-///
-/// # Graceful degradation
-///
-/// Landlock is absent from kernels older than 5.13 and can be disabled at boot
-/// (`lsm=` without `landlock`) or blocked by seccomp. None of those is a reason
-/// to fail a worker: when the kernel cannot support the domain, this logs at
-/// debug level and returns `Ok(())`, leaving the process unconfined. Only a
-/// *malformed policy* - a path we were told to sandbox that does not exist - is
-/// reported as an `Err`.
-///
-/// # Example
-///
-/// ```no_run
-/// use std::path::Path;
-/// mini_swe_mcp::agent::sandbox::apply_landlock_sandbox(
-///     Path::new("/tmp/swe-wt-ab12cd34"),
-///     Path::new("/tmp/swe-target-ab12cd34"),
-/// )?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
-pub fn apply_landlock_sandbox(worktree: &Path, target_dir: &Path) -> Result<()> {
-    if landlock_disabled() {
-        tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
-        return Ok(());
-    }
-
-    // Both roots must exist: a rule on a missing path is a caller bug, and
-    // silently granting access to a directory that is not there would only hide
-    // it until the first write fails somewhere much less obvious.
-    if !worktree.is_dir() {
-        anyhow::bail!("landlock worktree does not exist: {}", worktree.display());
-    }
-    if !target_dir.is_dir() {
-        anyhow::bail!(
-            "landlock target dir does not exist: {}",
-            target_dir.display()
-        );
-    }
-
-    apply_with_abi(worktree, target_dir, query_abi_version())
-}
-
-/// Body of [`apply_landlock_sandbox`], with the ABI probe as a parameter.
-///
-/// Taking the ABI as an argument makes the "kernel has no Landlock" branch
-/// reachable from a test: on a kernel that *does* support Landlock the probe
-/// can never return `None`, so the degradation path would otherwise be dead
-/// code no test executes. `abi == None` is exactly the state a pre-5.13 or
-/// `lsm=`-disabled kernel puts us in.
-fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Result<()> {
-    let Some(abi) = abi else {
-        tracing::debug!("landlock unsupported by this kernel; running unconfined");
-        return Ok(());
-    };
-
-    let access = supported_access_fs(abi);
-    let rules = build_path_rules(worktree, target_dir);
-    let handled = handled_access_fs(&rules, access);
-
-    create_ruleset(handled)
-        .and_then(|ruleset_fd| {
-            for rule in &rules {
-                add_rule(ruleset_fd.raw(), rule)?;
-            }
-            // Landlock requires PR_SET_NO_NEW_PRIVS before restrict_self unless
-            // the process has CAP_SYS_ADMIN.
-            // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes integer arguments.
-            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-                anyhow::bail!(
-                    "prctl PR_SET_NO_NEW_PRIVS: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-
-            // SAFETY: `ruleset_fd` is still open (closed only when this
-            // closure's `Fd` drops) and no other thread closed it.
-            let ret = landlock_syscall(
-                SYS_LANDLOCK_RESTRICT_SELF,
-                [ruleset_fd.raw().into(), 0, 0, 0],
-            );
-            if ret < 0 {
-                anyhow::bail!(
-                    "landlock_restrict_self: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            Ok(())
-        })
-        .with_context(|| format!("failed to install landlock ABI {abi} filesystem domain"))?;
-
-    tracing::debug!(abi, handled, rules = rules.len(), "landlock filesystem domain applied");
-    Ok(())
-}
-
 // ----------
 // Signal-safe pre-exec plan
 // ----------
@@ -758,8 +598,8 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
 ///
 /// # Why this exists
 ///
-/// [`apply_landlock_sandbox`] is not safe to call from a `Command::pre_exec`
-/// closure: that closure runs in the child between `fork(2)` and `exec(2)`,
+/// A `Command::pre_exec` closure is not a safe place to build a policy: it
+/// runs in the child between `fork(2)` and `exec(2)`,
 /// where only async-signal-safe operations are permitted. Everything the
 /// policy needs - canonicalising paths, `CString` construction, `Vec` growth,
 /// `tracing`, `anyhow` formatting - allocates, and allocating in a forked child
@@ -773,9 +613,8 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
 /// async-signal-safe.
 ///
 /// [`build_landlock_plan`] returns `Ok(None)` when the kernel has no Landlock
-/// or confinement is disabled - the same graceful degradation
-/// [`apply_landlock_sandbox`] performs - so the caller registers no `pre_exec`
-/// hook at all.
+/// or confinement is disabled, so the caller registers no `pre_exec` hook at
+/// all.
 pub struct LandlockPlan {
     /// Bitmask of `ACCESS_FS_*` rights the ruleset handles.
     handled: u64,
@@ -859,9 +698,8 @@ impl LandlockPlan {
             return Err(std::io::Error::last_os_error());
         }
         // The descriptor belongs to the child alone (this ran after the fork),
-        // so it is closed exactly once on the way out rather than through `Fd`,
-        // whose `Drop` would add a branch and flag dance to signal-unsafe code.
-        // It must stay open until `landlock_restrict_self` consumes it.
+        // so it is closed exactly once on the way out. It must stay open until
+        // `landlock_restrict_self` consumes it.
 
         // `O_PATH` needs no permission on the target itself, only traversal of
         // its parents, so a rule installs even on paths this process could not
@@ -947,8 +785,7 @@ impl LandlockPlan {
 /// this process cannot be confined.
 ///
 /// The two conditions that make a plan impossible are the two that make the
-/// sandbox optional, and they are deliberately the *same* ones
-/// [`apply_landlock_sandbox`] treats as graceful:
+/// sandbox optional:
 ///
 /// * `SWE_DISABLE_LANDLOCK=1` - the operator asked for no confinement;
 /// * the Landlock syscalls are unavailable (a pre-5.13 kernel, a build
@@ -957,9 +794,9 @@ impl LandlockPlan {
 ///   as `None` and the worker runs unconfined rather than failing.
 ///
 /// A malformed policy is *not* in that list: a worktree or target dir that
-/// does not exist is a caller bug and is reported as an `Err`, exactly as
-/// [`apply_landlock_sandbox`] reports it. A caller that only ever gets here
-/// with directories the parent just created never reaches that branch.
+/// does not exist is a caller bug and is reported as an `Err`. A caller that
+/// only ever gets here with directories the parent just created never reaches
+/// that branch.
 ///
 /// Everything this does - the ABI probe, canonicalisation, `CString`
 /// construction, the syscall-backed existence checks - runs in the parent
@@ -971,7 +808,6 @@ pub fn build_landlock_plan(worktree: &Path, target_dir: &Path) -> Result<Option<
 
 /// The body of [`build_landlock_plan`], with the ABI probe as a parameter.
 ///
-/// This mirrors the [`apply_with_abi`] seam and exists for the same reason.
 /// `query_abi_version` is a syscall against the machine running the test suite,
 /// which supports Landlock, so the "this kernel cannot confine" branch can
 /// never be taken there - leaving the single most important robustness
@@ -1043,85 +879,6 @@ fn build_plan_with_abi(
         paths,
         allowed,
     }))
-}
-
-/// Add one `PATH_BENEATH` rule to an open ruleset.
-fn add_rule(ruleset_fd: libc::c_int, rule: &PathRule) -> Result<()> {
-    // `O_PATH` needs no permission on the target itself (only traversal of
-    // its parents), so a rule installs even on paths the caller could not
-    // `File::open` for reading. A genuinely missing path has nothing to
-    // protect; skipping keeps the sandbox working on minimal images.
-    let Some(c_path) = CString::new(rule.path.as_os_str().as_bytes()).ok() else {
-        return Ok(());
-    };
-    // SAFETY: `c_path` is a NUL-terminated OS string that outlives the call.
-    // `O_CLOEXEC` keeps the descriptor out of any child spawned later; `Fd`
-    // also sets `FD_CLOEXEC` as belt-and-braces and owns the descriptor.
-    let fd = Fd::new(unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) });
-    let Some(parent) = fd else {
-        return Ok(());
-    };
-    let allowed = rights_for(&rule.path, rule.allowed);
-    let attr = PathBeneathAttr {
-        allowed_access: allowed,
-        parent_fd: parent.raw(),
-    };
-    // SAFETY: `attr` is a live `landlock_path_beneath_attr` and `parent` keeps
-    // the referenced file or directory open for the duration of the call.
-    let ret = landlock_syscall(
-        SYS_LANDLOCK_ADD_RULE,
-        [
-            ruleset_fd.into(),
-            RULE_PATH_BENEATH.into(),
-            &attr as *const PathBeneathAttr as libc::c_long,
-            0,
-        ],
-    );
-    if ret < 0 {
-        // A right the kernel rejects means the policy is ahead of the running
-        // ABI, which is a bug in [`supported_access_fs`], not a runtime condition.
-        anyhow::bail!(
-            "landlock_add_rule({}): {}",
-            rule.path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-/// Create a Landlock ruleset handling `handled_access_fs`, returning its fd.
-///
-/// The returned [`Fd`] carries `FD_CLOEXEC`: the kernel hands the ruleset
-/// descriptor back without it, and a leaked ruleset fd would be inherited by
-/// every command the daemon spawns from here on. [`Fd`] also closes it once the
-/// ruleset has been applied.
-fn create_ruleset(handled_access_fs: u64) -> Result<Fd> {
-    let attr = RulesetAttr { handled_access_fs };
-    // SAFETY: `attr` is a live, correctly laid out `landlock_ruleset_attr`
-    // prefix and `size` is its exact size, which is what the kernel validates.
-    let ret = landlock_syscall(
-        SYS_LANDLOCK_CREATE_RULESET,
-        [
-            &attr as *const RulesetAttr as libc::c_long,
-            std::mem::size_of::<RulesetAttr>() as libc::c_long,
-            0,
-            0,
-        ],
-    );
-    if ret < 0 {
-        anyhow::bail!(
-            "landlock_create_ruleset: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    // A descriptor we could not mark close-on-exec must not be used, or it
-    // would leak into children.
-    Fd::new(ret as libc::c_int).ok_or_else(|| {
-        anyhow::anyhow!(
-            "landlock_create_ruleset: could not mark the ruleset fd close-on-exec: {}",
-            std::io::Error::last_os_error()
-        )
-    })
 }
 
 #[cfg(test)]
@@ -1537,53 +1294,6 @@ fn relative_roots_are_never_granted() {
     assert!(!rules.iter().any(|r| r.path == Path::new("relative-worktree")));
 }
 
-/// Descriptors that outlive the call must never reach a child process.
-///
-/// `O_CLOEXEC` in `open(2)` only covers descriptors *this* code creates;
-/// `landlock_create_ruleset` returns one the kernel made, with no flags it
-/// could honour, so `FD_CLOEXEC` has to be set explicitly. A ruleset fd
-/// inherited by a spawned worker would be a live handle to a policy the child
-/// was never meant to be able to reach.
-#[test]
-fn landlock_descriptors_are_close_on_exec() {
-    let ruleset = create_ruleset(ALL_ACCESS_FS).expect("create a ruleset");
-    // SAFETY: `ruleset` owns a live descriptor for the whole block.
-    let flags = unsafe { libc::fcntl(ruleset.raw(), libc::F_GETFD) };
-    assert!(flags >= 0, "F_GETFD must succeed on a live descriptor");
-    assert_ne!(
-        flags & libc::FD_CLOEXEC,
-        0,
-        "the ruleset descriptor must be close-on-exec or it leaks into children"
-    );
-}
-
-/// Dropping the ruleset must close the descriptor.
-///
-/// Before the [`Fd`] wrapper, `landlock_create_ruleset`'s descriptor was never
-/// closed at all: it stayed open for the remaining life of the (long-running,
-/// multi-threaded) daemon, and was inherited by every process subsequently
-/// spawned. Closing on drop is what actually bounds its lifetime to the one
-/// call that needs it.
-#[test]
-fn the_ruleset_descriptor_is_closed_when_it_goes_out_of_scope() {
-    let fd = {
-        let ruleset = create_ruleset(ALL_ACCESS_FS).expect("create a ruleset");
-        let raw = ruleset.raw();
-        // SAFETY: `raw` is a live descriptor owned by the `Fd` here.
-        assert!(unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0);
-        raw
-    };
-    // `fcntl` on a stale descriptor must now fail; a leaked one would still
-    // answer, and the number was just freed so it cannot name another live
-    // descriptor.
-    // SAFETY: the descriptor is expected to be closed, so this probes, not uses.
-    let reopened = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    assert_eq!(
-        reopened, -1,
-        "the ruleset descriptor must be closed on drop, not leaked for the process lifetime"
-    );
-}
-
 /// A symlinked writable root must not smuggle a grant onto a denied directory.
 ///
 /// This is the whole point of [`canonical_root`]: Landlock resolves a
@@ -1623,45 +1333,6 @@ fn a_symlinked_root_cannot_smuggle_a_grant_onto_a_denied_directory() {
 }
 
 #[test]
-fn a_missing_worktree_is_reported_rather_than_ignored() {
-    let scratch = Scratch::new("missing");
-    let missing = scratch.0.join("does-not-exist");
-    let err = apply_landlock_sandbox(&missing, &scratch.target()).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("does not exist"),
-        "a missing worktree must be an error, got: {err:#}"
-    );
-}
-
-#[test]
-fn a_missing_target_dir_is_reported_rather_than_ignored() {
-    let scratch = Scratch::new("missing-target");
-    let missing = scratch.0.join("no-target");
-    let err = apply_landlock_sandbox(&scratch.worktree(), &missing).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("does not exist"),
-        "a missing target dir must be an error, got: {err:#}"
-    );
-}
-
-#[test]
-fn landlock_can_be_disabled_without_failing() {
-    let scratch = Scratch::new("disabled");
-    // SAFETY: the test harness runs these environment-sensitive tests in one
-    // process; `SWE_DISABLE_LANDLOCK` is only read here and by
-    // `apply_landlock_sandbox`, and each test that touches it removes it again
-    // before returning. Nothing else in the process consults the variable.
-    unsafe { std::env::set_var(DISABLE_LANDLOCK_ENV, "1") };
-    let result = apply_landlock_sandbox(&scratch.worktree(), &scratch.target());
-    unsafe { std::env::remove_var(DISABLE_LANDLOCK_ENV) };
-
-    assert!(
-        result.is_ok(),
-        "an explicit opt-out must never fail a worker: {result:?}"
-    );
-}
-
-#[test]
 fn an_unsupported_kernel_degrades_instead_of_failing() {
     // `supported_access_fs` is total: every ABI, including one below the minimum
     // this build supports, yields a mask the kernel can actually be asked for.
@@ -1678,30 +1349,6 @@ fn an_unsupported_kernel_degrades_instead_of_failing() {
     // proves it end-to-end); the degradation path is exercised by the
     // opt-out test above, which does not depend on kernel capabilities.
     assert!(query_abi_version().is_some(), "this kernel does support it");
-}
-
-/// The graceful-degradation path, forced through the [`apply_with_abi`] seam.
-///
-/// This is the property that matters operationally: on a kernel without
-/// Landlock (pre-5.13, built without the LSM, disabled via `lsm=`, or blocked
-/// by a seccomp policy) a worker must still run. The probe is the *only* thing
-/// that distinguishes that machine from this one, so the branch is exercised
-/// with `None` directly rather than being left to chance.
-#[test]
-fn a_kernel_without_landlock_still_runs_the_worker() {
-    let scratch = Scratch::new("noll");
-
-    // `None` is exactly what a failing `landlock_create_ruleset(VERSION)` reports.
-    let result = apply_with_abi(&scratch.worktree(), &scratch.target(), None);
-
-    assert!(
-        result.is_ok(),
-        "an unsupported kernel must degrade, not fail: {result:?}"
-    );
-    // Degrading means *unconfined*, so the process keeps the access it had -
-    // which is why this is a downgrade and not a silently partial sandbox.
-    std::fs::write(scratch.worktree().join("still-writable"), b"ok")
-        .expect("an unconfined process keeps its access");
 }
 
 /// An ABI that does not exist must not silently produce an empty ruleset: a
@@ -1871,9 +1518,24 @@ fn run_landlock_enforcement_mode() -> ! {
         std::process::exit(2);
     };
 
-    // From here on the process is confined: anything outside the domain fails with EACCES.
-    if let Err(e) = apply_landlock_sandbox(&worktree, &target) {
-        eprintln!("FAIL: could not apply landlock: {e:#}");
+    // Build the plan in the parent and apply it here, exactly as `exec.rs`
+    // does through the `pre_exec` hook. From here on the process is confined:
+    // anything outside the domain fails with EACCES.
+    let plan = match build_landlock_plan(&worktree, &target) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            eprintln!("FAIL: this kernel cannot confine the process");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("FAIL: could not build a landlock plan: {e:#}");
+            std::process::exit(1);
+        }
+    };
+    // SAFETY: this child is single-threaded (it has not spawned anything yet)
+    // and `apply` performs only raw syscalls, so it is safe here.
+    if let Err(e) = unsafe { plan.apply() } {
+        eprintln!("FAIL: could not apply landlock: {e}");
         std::process::exit(1);
     }
 
