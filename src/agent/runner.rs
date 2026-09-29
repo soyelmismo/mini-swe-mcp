@@ -1,9 +1,9 @@
 //! LLM transport for the agent: HTTP chat completions and SSE streaming.
 //!
-//! This module owns one worker step's conversation with the model: building the
-//! request, POSTing it with retry/backoff, pumping the streamed response into
-//! an [`SseAccumulator`], and assembling the [`LlmResponse`] the agent loop
-//! consumes. The command-execution half of a step lives in [`super::exec`].
+//! Owns one worker step's conversation with the model: building the request,
+//! POSTing it with retry/backoff, pumping the streamed response into an
+//! [`SseAccumulator`], and assembling the [`LlmResponse`] the agent loop
+//! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -14,16 +14,16 @@ use super::types::{
     ChatCompletionRequest, ChatMessage, DEFAULT_STREAM_IDLE_TIMEOUT, LlmResponse, bash_tool,
 };
 
-/// Temperature used when the caller configured none. Low but non-zero: the
-/// model needs to break ties differently across steps, yet must not wander.
+/// Temperature when the caller configured none. Low but non-zero: the model
+/// must break ties differently across steps, yet not wander.
 const DEFAULT_TEMPERATURE: f32 = 0.2;
 
 /// Outcome of one pass over an SSE body.
 #[derive(Debug, PartialEq, Eq)]
 enum StreamRun {
-    /// The stream ended (or emitted `[DONE]`); the accumulator is complete.
+    /// Stream ended (or emitted `[DONE]`); accumulator is complete.
     Completed,
-    /// The stream stalled or failed mid-flight; the caller should retry.
+    /// Stream stalled or failed mid-flight; caller should retry.
     Retry,
 }
 
@@ -33,10 +33,8 @@ pub struct AgentRunner {
     pub api_key: String,
     pub model: String,
     pub temperature: Option<f32>,
-    /// Declarative network policy for every bash step this worker runs.
-    ///
-    /// `true` (from `network: "offline"`) confines each step to an isolated
-    /// network namespace; `false` keeps normal connectivity.
+    /// `true` (from `network: "offline"`) confines each bash step to an
+    /// isolated network namespace; `false` keeps normal connectivity.
     pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
@@ -95,10 +93,8 @@ impl AgentRunner {
     }
 
     /// Recover a bash command from the first ```bash / ```sh fenced block.
-    ///
-    /// The parsing itself lives with the response types in
-    /// [`super::stream`]; this method stays on the runner because it is part of
-    /// the public agent surface and does not depend on the instance.
+    /// Parsing lives in [`super::stream`]; this stays on the runner as part of
+    /// the public agent surface.
     pub fn extract_command(&self, text: &str) -> Option<String> {
         extract_command(text)
     }
@@ -109,12 +105,12 @@ impl AgentRunner {
         retry::retry_delay(self.initial_retry_delay, attempt, retry_after)
     }
 
-    /// Run one agent step: post `messages` to the chat-completions endpoint and
-    /// turn the streamed response into an [`LlmResponse`].
+    /// Run one agent step: post `messages` and turn the streamed response into
+    /// an [`LlmResponse`].
     ///
     /// Transient failures (network errors, 429/502/503/504, stalled SSE reads)
-    /// are retried with exponential backoff up to `max_retries` attempts;
-    /// anything else is a hard error.
+    /// retry with exponential backoff up to `max_retries`; anything else is a
+    /// hard error.
     pub async fn run_step_llm(&self, messages: &[ChatMessage]) -> Result<LlmResponse> {
         let tools = bash_tool();
         let payload = self.chat_request(messages, &tools);
@@ -152,7 +148,7 @@ impl AgentRunner {
     }
 
     /// Build the request payload, dropping `temperature` for models known to
-    /// reject it (e.g. kimi-k3) and defaulting to a low temperature otherwise.
+    /// reject it (e.g. kimi-k3) and defaulting low otherwise.
     fn chat_request<'a>(
         &'a self,
         messages: &'a [ChatMessage],
@@ -176,9 +172,9 @@ impl AgentRunner {
     /// POST `payload`, retrying transient conditions with backoff.
     ///
     /// Returns `Ok(None)` when the caller should start another attempt (the
-    /// backoff sleep has already been awaited), and `Ok(Some(response))` for a
-    /// response that should be inspected — including a non-2xx one, so the
-    /// caller can report the status and body verbatim.
+    /// backoff sleep is already awaited), and `Ok(Some(response))` for a
+    /// response to inspect — including a non-2xx one, so the caller can report
+    /// the status and body verbatim.
     async fn send_with_retry(
         &self,
         payload: &ChatCompletionRequest<'_>,
@@ -233,7 +229,7 @@ impl AgentRunner {
     /// Feed SSE chunks from `resp` into `acc` until the stream ends.
     ///
     /// Each read is bounded by `stream_idle_timeout` so a half-open connection
-    /// cannot wedge a worker forever. A stall or a read error is retried while
+    /// cannot wedge a worker forever. A stall or read error retries while
     /// attempts remain, and is a hard error once they are exhausted.
     async fn pump_sse(
         &self,

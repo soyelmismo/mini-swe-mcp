@@ -1,11 +1,10 @@
 //! Retry policy for calls out to the LLM API.
 //!
 //! Rate limits and upstream outages are routine for a hosted model, so every
-//! request the agent makes is wrapped in a bounded exponential backoff. This
-//! module holds that policy — the attempt budget, the delay curve and the
-//! classification of transient failures — so the transport code in
-//! [`super::runner`] can stay about *what* is being sent rather than *how often
-//! to resend it*.
+//! request is wrapped in a bounded exponential backoff. This module holds that
+//! policy — the attempt budget, the delay curve and the classification of
+//! transient failures — so the transport code in [`super::runner`] stays about
+//! *what* is being sent rather than *how often to resend it*.
 
 use std::time::Duration;
 

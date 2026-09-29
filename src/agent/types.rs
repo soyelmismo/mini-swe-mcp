@@ -1,45 +1,39 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Default idle (per-chunk) deadline for the SSE body read.
+/// Idle (per-chunk) deadline for the SSE body read.
 ///
 /// A *whole-request* deadline is the wrong tool for a token stream: it kills
-/// healthy-but-slow generations regardless of progress. `read_timeout` /
-/// `connect_timeout` plus a per-chunk `tokio::time::timeout` only abort genuine
-/// stalls.
+/// healthy-but-slow generations regardless of progress. Only a per-chunk
+/// `tokio::time::timeout` aborts genuine stalls.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hard cap on the assistant text retained from a stream.
 ///
-/// Sized to match [`MAX_TOOL_ARGUMENT_BYTES`] (64 KiB) so a turn's reasoning
-/// and its tool arguments get the same budget: at 16 KiB a long chain-of-thought
-/// reply was truncated mid-sentence, which both corrupted the context fed back
-/// to the model and hid the tail of the model's own explanation. A runaway
-/// stream still cannot inflate memory (nor be re-sent verbatim on the next
-/// request) because the cap is enforced in [`crate::agent::stream`].
+/// Matched to [`MAX_TOOL_ARGUMENT_BYTES`] so a turn's reasoning and its tool
+/// arguments share one budget: at 16 KiB long chain-of-thought replies were
+/// truncated mid-sentence, corrupting the context fed back to the model.
+/// Enforced in [`crate::agent::stream`], so a runaway stream can neither inflate
+/// memory nor be re-sent verbatim on the next request.
 pub const MAX_STREAMED_CONTENT_BYTES: usize = 64 * 1024;
 
-/// Hard cap on the serialized `arguments` accumulated for a single tool call.
-/// A model that streams megabytes of arguments is treated as malformed and the
-/// call is dropped rather than buffered.
+/// Hard cap on the serialized `arguments` accumulated for one tool call.
+/// A model streaming megabytes of arguments is treated as malformed: the call is
+/// dropped rather than buffered.
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
-/// Byte size of a typical SSE frame; used to pre-reserve the read buffer so a
-/// long stream does not repeatedly reallocate as chunks arrive.
+/// Byte size of a typical SSE frame; pre-reserves the read buffer so a long
+/// stream stops reallocating as chunks arrive.
 pub(crate) const SSE_BUFFER_HINT_BYTES: usize = 8 * 1024;
 
 /// Hard cap on a single SSE line retained or parsed by the framing buffer.
 ///
-/// `content` and tool-call `arguments` are already budgeted, but the raw
-/// framing buffer is not: a provider (or a proxy) that streams bytes with no
-/// newline — a huge line, or a `data:` payload larger than any real model emits
-/// — would otherwise make the buffer absorb the entire body chunk by chunk,
-/// with no upper bound. Retaining at most this many unframed bytes caps that
-/// growth; anything longer is dropped and the reader resyncs on the next
-/// newline, so an ill-formed stream degrades instead of exhausting memory.
-///
-/// Sized well above [`SSE_BUFFER_HINT_BYTES`] (a typical frame is ~8 KiB) and
-/// above [`MAX_TOOL_ARGUMENT_BYTES`], leaving room for normal frames.
+/// `content` and tool-call `arguments` are budgeted, the raw framing buffer is
+/// not: a provider (or proxy) streaming bytes with no newline would otherwise
+/// make the buffer absorb the whole body with no upper bound. Longer tails are
+/// dropped and the reader resyncs on the next newline, so an ill-formed stream
+/// degrades instead of exhausting memory. Sized well above
+/// [`SSE_BUFFER_HINT_BYTES`] and [`MAX_TOOL_ARGUMENT_BYTES`].
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
 pub const SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering subagent running in a Linux bash environment.
@@ -72,9 +66,9 @@ COMMUNICATION WITH ORCHESTRATOR:
 
 /// Chat roles accepted by the OpenAI chat-completions API.
 ///
-/// Modelling the role as an enum instead of a free-form `String` turns an
-/// invalid role from a provider-side `400` into a compile error: the wire
-/// strings are pinned by `rename_all = "lowercase"`.
+/// An enum instead of a free-form `String` turns an invalid role from a
+/// provider-side `400` into a compile error: `rename_all = "lowercase"` pins
+/// the wire strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -85,11 +79,8 @@ pub enum Role {
 }
 
 impl Role {
-    /// The exact string the chat API expects for this role.
-    ///
-    /// Kept in lockstep with the `rename_all = "lowercase"` derive and asserted
-    /// against it in the tests, so there is a single source of truth for the
-    /// wire spelling.
+    /// Wire string for this role; asserted against the derive in the tests so
+    /// both spellings cannot drift.
     pub const fn as_wire_str(self) -> &'static str {
         match self {
             Self::System => "system",
@@ -102,11 +93,11 @@ impl Role {
 
 /// A single outbound conversation message.
 ///
-/// All fields are private so that the three constructors below are the *only*
-/// way to build one. That closes the invalid states an all-`pub` struct allows
-/// (a `tool` message with no `tool_call_id`, an `assistant` message with
-/// `tool_calls: Some(vec![])`), while keeping the per-field
-/// `skip_serializing_if` needed for each role's wire shape.
+/// All fields are private, so the three constructors below are the *only* way to
+/// build one. That closes the invalid states an all-`pub` struct allows (a `tool`
+/// message with no `tool_call_id`, an `assistant` message with
+/// `tool_calls: Some(vec![])`) while keeping the per-field `skip_serializing_if`
+/// each role's wire shape needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     role: Role,
@@ -120,7 +111,7 @@ pub struct ChatMessage {
     tool_call_id: Option<String>,
 }
 
-/// Outbound tool_call representation for assistant messages in the conversation history
+/// Outbound `tool_calls` entry of an assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -128,13 +119,9 @@ pub struct ToolCall {
     pub function: ToolCallFn,
 }
 
-/// The nested `function` object of a [`ToolCall`].
-///
-/// The OpenAI wire format nests the call one level deep
-/// (`{"id":..,"type":"function","function":{"name":..,"arguments":..}}`), so
-/// this struct is load-bearing rather than a premature abstraction. It is also
-/// reused by the non-streaming inbound path ([`ToolCallOutput`]) to avoid
-/// duplicating a structurally identical type.
+/// The nested `function` object of a [`ToolCall`], one level deep as the wire
+/// format requires (`{"id":..,"type":"function","function":{..}}`). Reused by the
+/// non-streaming inbound path ([`ToolCallOutput`]) to avoid a duplicate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFn {
     pub name: String,
@@ -142,9 +129,9 @@ pub struct ToolCallFn {
 }
 
 impl ChatMessage {
-    /// A plain single-content message: the shape used by `system`, `user` and
-    /// `assistant` turns. `tool` content must go through [`Self::tool_result`],
-    /// which also records the `tool_call_id` the API requires.
+    /// Plain single-content message for `system`, `user` and `assistant` turns.
+    /// `tool` content must go through [`Self::tool_result`], which records the
+    /// required `tool_call_id`.
     pub fn text(role: Role, content: impl Into<String>) -> Self {
         debug_assert_ne!(
             role,
@@ -160,12 +147,11 @@ impl ChatMessage {
         }
     }
 
-    /// An assistant turn that requests tool execution.
+    /// An assistant turn requesting tool execution.
     ///
-    /// `content` is `None` when the model emitted tool calls with no prose, in
-    /// which case the field is omitted on the wire. An empty `tool_calls` vec is
-    /// normalised to `None` so the API never sees a call-less assistant turn
-    /// carrying an empty array.
+    /// `content` is `None` when the model emitted calls with no prose, and the
+    /// field is then omitted on the wire. An empty `tool_calls` vec normalises to
+    /// `None`: the API must never see a call-less assistant turn carrying `[]`.
     pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: Role::Assistant,
@@ -196,10 +182,8 @@ impl ChatMessage {
         self
     }
 
-    /// Read-only view of the (already validated) role.
-    ///
-    /// The field itself is private; this accessor exists so callers and tests can
-    /// observe the role without being able to set an arbitrary one.
+    /// Read-only view of the (already validated) role; the field is private so
+    /// no caller can set an arbitrary one.
     pub fn role(&self) -> Role {
         self.role
     }
@@ -316,8 +300,8 @@ pub(crate) struct BashArgs {
 
 /// One executed step of a subagent run.
 ///
-/// `Deserialize` is intentionally absent: step logs are only ever *built* in
-/// `pool::run_worker` and then serialized outward, never parsed back.
+/// `Deserialize` is intentionally absent: step logs are built in
+/// `pool::run_worker` and serialized outward, never parsed back.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentStepLog {
     pub step: usize,
@@ -328,19 +312,19 @@ pub struct AgentStepLog {
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
-    /// Full text content from the assistant (may be empty if model only used tool_calls)
+    /// Assistant text; empty when the model only used `tool_calls`.
     pub content: String,
     /// Captured chain-of-thought reasoning, required for multi-turn history with reasoning models
     pub reasoning_content: Option<String>,
-    /// Extracted bash command — from tool_calls first, regex fallback second
+    /// Extracted bash command: `tool_calls` first, fenced-block fallback second.
     pub command: Option<String>,
-    /// Raw tool_calls from the response, for re-insertion into conversation history
+    /// Raw `tool_calls`, for re-insertion into conversation history.
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// The tool_call id that produced the command (for tool response messages)
+    /// Id of the call that produced the command, for the tool response message.
     pub tool_call_id: Option<String>,
-    /// Number of SSE frames whose bytes were not valid UTF-8 and therefore had
-    /// to be decoded lossily. Surfaced so a fleet-wide corruption rate is
-    /// observable instead of being silently absorbed.
+    /// SSE frames whose bytes were not valid UTF-8 and had to be decoded
+    /// lossily. Surfaced so fleet-wide corruption is observable rather than
+    /// silently absorbed.
     pub invalid_utf8_lines: usize,
 }
 
