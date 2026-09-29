@@ -1,61 +1,15 @@
-//! Pre-execution command interceptor middleware.
+//! Destructive-command guard run before any bash step is spawned.
 //!
-//! Interceptors run inside [`crate::agent::AgentRunner::execute_bash`] before
-//! any sandbox construction or process spawn. Each inspects the requested
-//! command and votes [`InterceptDecision::Allow`], [`InterceptDecision::Block`]
-//! or [`InterceptDecision::Rewrite`]. The [`CommandPipeline`] chains them in
-//! registration order: the first `Block` wins, while `Rewrite` updates the
-//! effective command seen by the remaining interceptors and by the executor.
+//! [`check_command`] is called by [`crate::agent::AgentRunner::execute_bash`]
+//! before sandbox construction. It rejects the obvious catastrophic patterns
+//! (`rm -rf /`, `mkfs`, raw `dd` to a device, the classic fork bomb) even when
+//! they are hidden behind quotes, variable expansions or command substitution.
+//! It is a text-level first line of defence; filesystem confinement is the
+//! sandbox's job.
 
-use anyhow::Result;
-use std::time::Instant;
-
-/// Verdict of a single [`CommandInterceptor`] for one command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InterceptDecision {
-    /// Run the (possibly rewritten) command.
-    Allow,
-    /// Refuse to run; the inner string is the human-readable reason shown to
-    /// the model.
-    Block(String),
-    /// Run `String` instead of the original command.
-    Rewrite(String),
-}
-
-impl InterceptDecision {
-    /// `true` for [`InterceptDecision::Allow`].
-    #[must_use]
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Self::Allow)
-    }
-
-    /// `true` for [`InterceptDecision::Block`].
-    #[must_use]
-    pub fn is_block(&self) -> bool {
-        matches!(self, Self::Block(_))
-    }
-}
-
-/// Pre-execution hook inspecting a bash command before it is spawned.
-pub trait CommandInterceptor: Send + Sync {
-    /// Inspect `command` and vote on whether it may run.
-    fn intercept(&self, command: &str) -> Result<InterceptDecision>;
-
-    /// Stable name used in telemetry / debug logs.
-    fn name(&self) -> &'static str;
-}
-
-/// Blocks destructive invocations before they reach the executor, including
-/// simple whitespace, quote and variable-expansion obfuscation. The fast path
-/// only accepts plain developer commands without shell substitution or chaining.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DestructiveCommandInterceptor;
-
-impl DestructiveCommandInterceptor {
-    /// Reason string for a matched dangerous pattern.
-    fn block_reason(matched: &str) -> String {
-        format!("destructive pattern blocked: {matched}")
-    }
+/// Reason string for a matched dangerous pattern.
+fn block_reason(matched: &str) -> String {
+    format!("destructive pattern blocked: {matched}")
 }
 
 /// Plain developer verbs eligible for the pattern-check fast path.
@@ -172,45 +126,40 @@ fn scan_form(command: &str) -> String {
     out
 }
 
-impl CommandInterceptor for DestructiveCommandInterceptor {
-    fn intercept(&self, command: &str) -> Result<InterceptDecision> {
-        // Fast path: pure developer verbs (`cargo test`, `git status`, `ls -la`,
-        // `cat Cargo.toml`) can never contain a destructive pattern, so the
-        // canonicalisation work below is skipped entirely.
-        if is_benign(command) {
-            return Ok(InterceptDecision::Allow);
-        }
-        let trimmed = scan_form(&command.to_lowercase());
-        let trimmed = trimmed.trim();
-
-        // `rm -rf /`, `rm -fr /`, `rm -rf /*`, `rm --no-preserve-root`, bare `rm -rf /`.
-        // Match token-aware: look for `rm` followed by recursive+force flags and
-        // a root-level target (`/`, `/*`, `~`, `/home`, `/etc`, ...). A plain
-        // `rm -rf target/` inside the worktree must stay allowed.
-        if is_destructive_rm(trimmed) {
-            return Ok(InterceptDecision::Block(Self::block_reason("rm -rf /")));
-        }
-
-        // Filesystem creation / raw disk writes.
-        if trimmed.contains("mkfs") {
-            return Ok(InterceptDecision::Block(Self::block_reason("mkfs")));
-        }
-        // `dd if=... of=/dev/...` — tokenise loosely: any `dd` with `if=`.
-        if dd_targets_disk(trimmed) {
-            return Ok(InterceptDecision::Block(Self::block_reason("dd if=")));
-        }
-
-        // Classic bash fork bomb `:(){ :|:& };:` (whitespace-insensitive).
-        if is_fork_bomb(trimmed) {
-            return Ok(InterceptDecision::Block(Self::block_reason("fork bomb")));
-        }
-
-        Ok(InterceptDecision::Allow)
+/// Reject destructive invocations, including simple whitespace, quote and
+/// variable-expansion obfuscation. Returns the reason shown to the model.
+///
+/// The whole command text is scanned, heredoc bodies and quoted strings
+/// included: a pattern cannot be told apart from data there, so content that
+/// merely *mentions* one (a test fixture, a grep for it) is refused too.
+pub fn check_command(command: &str) -> Result<(), String> {
+    // Fast path: pure developer verbs (`cargo test`, `git status`, `ls -la`,
+    // `cat Cargo.toml`) can never contain a destructive pattern, so the
+    // canonicalisation work below is skipped entirely.
+    if is_benign(command) {
+        return Ok(());
     }
+    let trimmed = scan_form(&command.to_lowercase());
+    let trimmed = trimmed.trim();
 
-    fn name(&self) -> &'static str {
-        "destructive"
+    // `rm -rf /`, `rm -fr /`, `rm -rf /*`, `rm --no-preserve-root`. Token-aware:
+    // `rm` with recursive+force flags and a root-level target (`/`, `/*`, `~`,
+    // `/home`, `/etc`, ...); a plain `rm -rf target/` stays allowed.
+    if is_destructive_rm(trimmed) {
+        return Err(block_reason("rm -rf /"));
     }
+    // Filesystem creation / raw disk writes.
+    if trimmed.contains("mkfs") {
+        return Err(block_reason("mkfs"));
+    }
+    if dd_targets_disk(trimmed) {
+        return Err(block_reason("dd if="));
+    }
+    // Classic bash fork bomb (whitespace-insensitive).
+    if is_fork_bomb(trimmed) {
+        return Err(block_reason("fork bomb"));
+    }
+    Ok(())
 }
 
 /// `true` when `scan_trimmed` (see [`scan_form`]) contains an `rm` invocation
@@ -346,171 +295,12 @@ fn is_fork_bomb(scan_trimmed: &str) -> bool {
     compact.contains(":(){:|:&};:")
 }
 
-/// Passive interceptor that records when a command was first seen and how it
-/// is classified (heavy vs. light). It never blocks or rewrites.
-#[derive(Debug, Clone, Copy)]
-pub struct TelemetryInterceptor;
-
-impl Default for TelemetryInterceptor {
-    fn default() -> Self {
-        Self
-    }
-}
-
-/// Lightweight classification mirroring [`super::sandbox::is_heavy_command`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandClass {
-    /// Builds, test suites, package installs — long wall-clock budget.
-    Heavy,
-    /// Exploration commands (`git status`, `ls`, `cat`, ...).
-    Light,
-}
-
-impl CommandClass {
-    /// Classify `command` without side effects.
-    #[must_use]
-    pub fn classify(command: &str) -> Self {
-        if super::sandbox::is_heavy_command(command) {
-            Self::Heavy
-        } else {
-            Self::Light
-        }
-    }
-
-    /// Stable string used in telemetry logs.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Heavy => "heavy",
-            Self::Light => "light",
-        }
-    }
-}
-
-impl CommandInterceptor for TelemetryInterceptor {
-    fn intercept(&self, command: &str) -> Result<InterceptDecision> {
-        let started = Instant::now();
-        let class = CommandClass::classify(command);
-        tracing::debug!(
-            interceptor = self.name(),
-            classification = class.as_str(),
-            command_len = command.len(),
-            ?started,
-            "intercepting command"
-        );
-        Ok(InterceptDecision::Allow)
-    }
-
-    fn name(&self) -> &'static str {
-        "telemetry"
-    }
-}
-
-/// Ordered chain of [`CommandInterceptor`]s executed before a command runs.
-///
-/// Semantics: interceptors see the *effective* command in registration order.
-/// A `Rewrite` replaces the effective command for the remaining interceptors;
-/// the first `Block` short-circuits the chain. [`CommandPipeline::process`]
-/// returns the final verdict: `Block` if any interceptor blocked, `Rewrite`
-/// with the last rewritten command if any rewrote, else `Allow`.
-pub struct CommandPipeline {
-    interceptors: Vec<Box<dyn CommandInterceptor>>,
-}
-
-impl Default for CommandPipeline {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CommandPipeline {
-    /// Empty pipeline (allows everything).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            interceptors: Vec::new(),
-        }
-    }
-
-    /// Production pipeline: destructive guard first, telemetry second.
-    #[must_use]
-    pub fn default_pipeline() -> Self {
-        Self::new()
-            .with(DestructiveCommandInterceptor)
-            .with(TelemetryInterceptor)
-    }
-
-    /// Append an interceptor and return the pipeline (builder style).
-    #[must_use]
-    pub fn with(mut self, interceptor: impl CommandInterceptor + 'static) -> Self {
-        self.interceptors.push(Box::new(interceptor));
-        self
-    }
-
-    /// Push an interceptor onto an existing pipeline.
-    pub fn add(&mut self, interceptor: impl CommandInterceptor + 'static) {
-        self.interceptors.push(Box::new(interceptor));
-    }
-
-    /// Number of registered interceptors.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.interceptors.len()
-    }
-
-    /// `true` when no interceptors are registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.interceptors.is_empty()
-    }
-
-    /// Run the chain over `command`.
-    ///
-    /// Returns `Ok(Block)` on the first block, otherwise `Ok(Rewrite)` if at
-    /// least one interceptor rewrote, else `Ok(Allow)`.
-    pub fn process(&self, command: &str) -> Result<InterceptDecision> {
-        let mut effective = command.to_string();
-        let mut rewritten = false;
-        for interceptor in &self.interceptors {
-            match interceptor.intercept(&effective)? {
-                InterceptDecision::Allow => {}
-                InterceptDecision::Block(reason) => {
-                    return Ok(InterceptDecision::Block(reason));
-                }
-                InterceptDecision::Rewrite(next) => {
-                    effective = next;
-                    rewritten = true;
-                }
-            }
-        }
-        if rewritten {
-            Ok(InterceptDecision::Rewrite(effective))
-        } else {
-            Ok(InterceptDecision::Allow)
-        }
-    }
-
-    /// Run the chain and resolve the command the executor should use.
-    ///
-    /// Returns `(effective_command, blocked_reason)`: `blocked_reason` is
-    /// `Some` when the chain voted `Block`, otherwise `None` and the effective
-    /// (possibly rewritten) command.
-    pub fn resolve(&self, command: &str) -> Result<(String, Option<String>)> {
-        match self.process(command)? {
-            InterceptDecision::Allow => Ok((command.to_string(), None)),
-            InterceptDecision::Rewrite(next) => Ok((next, None)),
-            InterceptDecision::Block(reason) => Ok((command.to_string(), Some(reason))),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn destructive_blocks_rm_rf_root() {
-        let i = DestructiveCommandInterceptor;
         for cmd in [
             "rm -rf /",
             "rm -rf /*",
@@ -519,33 +309,22 @@ mod tests {
             "echo hi; rm -rf /",
             "rm --no-preserve-root -rf /",
         ] {
-            assert!(i.intercept(cmd).unwrap().is_block(), "should block: {cmd}");
+            assert!(check_command(cmd).is_err(), "should block: {cmd}");
         }
     }
 
     #[test]
     fn destructive_blocks_mkfs_dd_and_fork_bomb() {
-        let i = DestructiveCommandInterceptor;
-        assert!(i.intercept("mkfs.ext4 /dev/sda1").unwrap().is_block());
-        assert!(i
-            .intercept("sudo mkfs -t ext4 /dev/sda1")
-            .unwrap()
-            .is_block());
-        assert!(i
-            .intercept("dd if=/dev/zero of=/dev/sda")
-            .unwrap()
-            .is_block());
-        assert!(i
-            .intercept("sudo dd if=/dev/random of=/dev/sda")
-            .unwrap()
-            .is_block());
-        assert!(i.intercept(":(){ :|:& };:").unwrap().is_block());
-        assert!(i.intercept(":() { : | : & } ; :").unwrap().is_block());
+        assert!(check_command("mkfs.ext4 /dev/sda1").is_err());
+        assert!(check_command("sudo mkfs -t ext4 /dev/sda1").is_err());
+        assert!(check_command("dd if=/dev/zero of=/dev/sda").is_err());
+        assert!(check_command("sudo dd if=/dev/random of=/dev/sda").is_err());
+        assert!(check_command(":(){ :|:& };:").is_err());
+        assert!(check_command(":() { : | : & } ; :").is_err());
     }
 
     #[test]
     fn destructive_allows_normal_commands() {
-        let i = DestructiveCommandInterceptor;
         for cmd in [
             "cargo test",
             "cargo test --all-targets",
@@ -557,17 +336,12 @@ mod tests {
             "rm ./some-file.txt",
             "grep -rn 'foo' src/",
         ] {
-            assert_eq!(
-                i.intercept(cmd).unwrap(),
-                InterceptDecision::Allow,
-                "should allow: {cmd}"
-            );
+            assert!(check_command(cmd).is_ok(), "should allow: {cmd}");
         }
     }
 
     #[test]
     fn destructive_blocks_obfuscated_and_substituted_commands() {
-        let i = DestructiveCommandInterceptor;
         for cmd in [
             "r\"m\" -rf /",
             "rm -rf \"$HOME\"",
@@ -578,68 +352,7 @@ mod tests {
             "cargo test `rm -rf /`",
             "ls; rm -rf /",
         ] {
-            assert!(i.intercept(cmd).unwrap().is_block(), "should block: {cmd}");
+            assert!(check_command(cmd).is_err(), "should block: {cmd}");
         }
-    }
-
-    #[test]
-    fn telemetry_never_blocks_and_classifies() {
-        let t = TelemetryInterceptor;
-        assert_eq!(t.intercept("cargo test").unwrap(), InterceptDecision::Allow);
-        assert_eq!(t.intercept("git status").unwrap(), InterceptDecision::Allow);
-        assert_eq!(CommandClass::classify("cargo test"), CommandClass::Heavy);
-        assert_eq!(CommandClass::classify("git status"), CommandClass::Light);
-        assert_eq!(CommandClass::Heavy.as_str(), "heavy");
-        assert_eq!(CommandClass::Light.as_str(), "light");
-    }
-
-    #[test]
-    fn pipeline_short_circuits_on_block() {
-        let pipe = CommandPipeline::default_pipeline();
-        let decision = pipe.process("rm -rf /").unwrap();
-        assert!(decision.is_block());
-        assert_eq!(
-            pipe.process("cargo test").unwrap(),
-            InterceptDecision::Allow
-        );
-        assert_eq!(
-            pipe.process("git status").unwrap(),
-            InterceptDecision::Allow
-        );
-    }
-
-    #[test]
-    fn pipeline_applies_rewrites_in_order() {
-        struct Prefix;
-        impl CommandInterceptor for Prefix {
-            fn intercept(&self, command: &str) -> Result<InterceptDecision> {
-                Ok(InterceptDecision::Rewrite(format!("echo {command}")))
-            }
-            fn name(&self) -> &'static str {
-                "prefix"
-            }
-        }
-        let pipe = CommandPipeline::new().with(Prefix);
-        assert_eq!(
-            pipe.process("hi").unwrap(),
-            InterceptDecision::Rewrite("echo hi".to_string())
-        );
-        let (effective, blocked) = pipe.resolve("hi").unwrap();
-        assert_eq!(effective, "echo hi");
-        assert_eq!(blocked, None);
-
-        let (_, blocked) = CommandPipeline::default_pipeline()
-            .resolve("rm -rf /")
-            .unwrap();
-        assert!(blocked.is_some());
-    }
-
-    #[test]
-    fn empty_pipeline_allows_everything() {
-        let pipe = CommandPipeline::new();
-        assert!(pipe.is_empty());
-        assert_eq!(pipe.len(), 0);
-        assert_eq!(pipe.process("rm -rf /").unwrap(), InterceptDecision::Allow);
-        assert_eq!(CommandPipeline::default().len(), 0);
     }
 }
