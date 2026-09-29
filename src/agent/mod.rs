@@ -8,8 +8,9 @@ pub mod stream;
 pub mod types;
 
 pub use env::{
-    ALLOWED_VARS, CommandEnv, apply_clean_environment, apply_clean_environment_cmd,
-    build_clean_environment, is_sensitive_var,
+    ALLOWED_VARS, CARGO_HOME_VAR, CommandEnv, RUSTUP_HOME_VAR, TOOLCHAIN_VARS,
+    apply_clean_environment, apply_clean_environment_cmd, build_clean_environment, host_cargo_home,
+    is_sensitive_var, resolve_cargo_home,
 };
 pub use exec::{has_unshare, wrap_network_command};
 pub use runner::{

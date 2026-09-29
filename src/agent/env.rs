@@ -14,14 +14,23 @@
 //! 1. **Deny by default.** The child is spawned with [`std::process::Command::env_clear`],
 //!    so *nothing* from the parent leaks unless it is deliberately re-added.
 //! 2. **Strict allow-list.** Only the handful of runtime variables a compiler or
-//!    shell genuinely needs survive ([`ALLOWED_VARS`]): toolchain discovery
-//!    (`PATH`, `CARGO_HOME`, `RUSTUP_HOME`), identity (`USER`, `LOGNAME`,
-//!    `SHELL`) and locale/terminal presentation (`LANG`, `LC_ALL`, `TERM`).
-//! 3. **Isolated `HOME`.** `HOME` is remapped to a per-worktree scratch
+//!    shell genuinely needs survive ([`ALLOWED_VARS`]): binary discovery
+//!    (`PATH`), identity (`USER`, `LOGNAME`, `SHELL`) and locale/terminal
+//!    presentation (`LANG`, `LC_ALL`, `TERM`).
+//! 3. **Toolchain cache forwarding.** `CARGO_HOME` and `RUSTUP_HOME`
+//!    ([`TOOLCHAIN_VARS`]) are *resolved* rather than copied — `CARGO_HOME`
+//!    falls back to the host's `~/.cargo` when the parent did not set it
+//!    ([`host_cargo_home`]). This is what keeps a sandboxed worktree able to
+//!    build offline: `HOME` is remapped to an empty scratch directory, so with
+//!    no explicit `CARGO_HOME` Cargo would find an empty registry and try to
+//!    reach `index.crates.io` for crates the operator already has cached. These
+//!    variables name *directories*, not secrets, and are still re-screened by
+//!    [`is_sensitive_var`] on the way out.
+//! 4. **Isolated `HOME`.** `HOME` is remapped to a per-worktree scratch
 //!    directory so a command that reads `~/.aws/credentials`, writes
 //!    `~/.gitconfig` or drops a stray `~/.npmrc` touches only the sandbox, never
 //!    the operator's real home.
-//! 4. **Explicit secret purge.** [`is_sensitive_var`] is a second, independent
+//! 5. **Explicit secret purge.** [`is_sensitive_var`] is a second, independent
 //!    line of defence: even if a sensitive name were somehow added to the
 //!    allow-list (or reintroduced by a later `env(...)` call), it is stripped
 //!    before the child is spawned.
@@ -34,26 +43,39 @@
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 
-/// Variables forwarded from the parent process into the agent's shell.
+/// Variables copied verbatim from the parent process into the agent's shell.
 ///
 /// Deliberately tiny: every entry here is a variable whose *absence* breaks
-/// ordinary toolchain execution, and none of them can carry a credential.
-/// `PATH` locates the binaries (the command is spawned as `nice`/`bwrap`,
-/// which are then resolved through it), `CARGO_HOME`/`RUSTUP_HOME` locate the
-/// Rust toolchain, `USER`/`LOGNAME`/`SHELL` keep `id` and prompt-oriented tools
-/// sane, and `LANG`/`LC_ALL`/`TERM` keep output and diagnostics readable.
-pub const ALLOWED_VARS: &[&str] = &[
-    "PATH",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-];
+/// ordinary execution, and none of them can carry a credential. `PATH` locates
+/// the binaries (the command is spawned as `nice`/`bwrap`, which are then
+/// resolved through it), `USER`/`LOGNAME`/`SHELL` keep `id` and prompt-oriented
+/// tools sane, and `LANG`/`LC_ALL`/`TERM` keep output and diagnostics readable.
+///
+/// The Rust toolchain locations are deliberately **not** here: `CARGO_HOME` and
+/// `RUSTUP_HOME` need discovery rather than a verbatim copy (see
+/// [`host_cargo_home`]), so they are forwarded by [`build_clean_environment`]
+/// through [`TOOLCHAIN_VARS`]. Keeping them in both lists would make the output
+/// order depend on which list happened to run first.
+pub const ALLOWED_VARS: &[&str] = &["PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM"];
+
+/// Toolchain cache locations forwarded to the agent's shell, in output order.
+///
+/// Unlike [`ALLOWED_VARS`] these are *resolved* rather than copied: a name unset
+/// in the parent falls back to a host default where one can be discovered on the
+/// filesystem, and is otherwise omitted. The child then uses the same populated
+/// registry the operator's shell would, instead of the empty isolated `HOME` a
+/// plain `env_clear` leaves behind.
+pub const TOOLCHAIN_VARS: &[&str] = &[CARGO_HOME_VAR, RUSTUP_HOME_VAR];
+
+/// Cargo's configuration/registry directory (the crates cache, plus the
+/// registry credentials and config that live alongside it).
+pub const CARGO_HOME_VAR: &str = "CARGO_HOME";
+
+/// `rustup`'s toolchain directory (the installed compilers and shims).
+pub const RUSTUP_HOME_VAR: &str = "RUSTUP_HOME";
 
 /// Name of the directory created under the worker's target dir to serve as the
 /// child shell's `HOME`.
@@ -216,6 +238,54 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
     base.join("target").join(ISOLATED_HOME_DIR)
 }
 
+/// Resolve the host's Cargo directory for forwarding to a sandboxed child.
+///
+/// `CARGO_HOME` is where Cargo keeps the registry cache, so it is what makes an
+/// *offline* `cargo build`/`cargo test` possible inside a sandboxed worktree.
+/// The child cannot discover it on its own: `HOME` is remapped to a per-worktree
+/// scratch directory, so Cargo's own `$HOME/.cargo` default resolves to an empty
+/// directory and an already-cached dependency set becomes an apparent network
+/// fetch.
+///
+/// Resolution order (see [`resolve_cargo_home`] for the pure policy):
+///
+/// 1. `CARGO_HOME` as set in the parent, forwarded verbatim so a non-default
+///    install layout keeps working;
+/// 2. `$HOME/.cargo`, **only when it actually exists** — a host with no Cargo
+///    directory has no cache to forward, and pointing at a non-existent path
+///    would be worse than omitting the variable and letting Cargo apply its own
+///    default resolution;
+/// 3. otherwise nothing, and the variable is omitted entirely.
+///
+/// Only the *path* is forwarded. `$CARGO_HOME/credentials.toml`, registry tokens
+/// in `$CARGO_HOME/config.toml` and any `CARGO_REGISTRY_TOKEN` stay unreachable,
+/// because the variable is the only thing this module emits: the allow-list
+/// re-screen in [`build_clean_environment`] still runs over the result, and no
+/// credential-bearing *name* is introduced by this lookup.
+pub fn host_cargo_home() -> Option<PathBuf> {
+    resolve_cargo_home(
+        std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+/// The pure core of [`host_cargo_home`], with the parent's `CARGO_HOME` and
+/// `HOME` passed in instead of read from the process environment.
+///
+/// Split out so the resolution *policy* — explicit wins, `~/.cargo` only when it
+/// exists, nothing otherwise — is unit-testable against synthetic layouts (a
+/// home that does have a `.cargo`, one that does not, an unset variable) rather
+/// than only against whatever the machine running the tests happens to have. It
+/// also keeps the `is_dir` filesystem probe out of the "forwarded verbatim" path,
+/// so that path allocates nothing.
+pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(explicit) = explicit.filter(|value| !value.as_os_str().is_empty()) {
+        return Some(explicit.to_path_buf());
+    }
+    let dot_cargo = home?.join(".cargo");
+    dot_cargo.is_dir().then_some(dot_cargo)
+}
+
 /// Build the sanitized environment for a child process.
 ///
 /// `repo_path` is the original repository checkout and `worktree_path` the
@@ -225,11 +295,23 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
 /// when the worktree has no directory name of its own, so the isolated home
 /// never degenerates into a relative path.
 ///
-/// The returned vector is deterministic (allow-list order, then `HOME`) and
-/// contains **only** variables the child is allowed to see:
+/// The returned vector is deterministic (allow-list order, then
+/// [`TOOLCHAIN_VARS`] order, then `HOME`) and contains **only** variables the
+/// child is allowed to see:
 ///
 /// * each allow-listed variable that is set in the parent, copied verbatim;
+/// * each toolchain cache location that could be resolved — `CARGO_HOME` from
+///   the host, falling back to `~/.cargo` when it exists ([`host_cargo_home`]),
+///   and `RUSTUP_HOME` when the parent sets it. This is what lets a sandboxed
+///   worktree build against the host's crates cache offline: `HOME` is remapped
+///   to an empty scratch directory, so with no explicit `CARGO_HOME` Cargo
+///   would find an empty registry and try the network;
 /// * `HOME`, always remapped to [`isolated_home`] — never the real home.
+///
+/// The toolchain variables name *directories*, not secrets: no credential-
+/// bearing variable name is introduced, and every name is re-screened by
+/// [`is_sensitive_var`] on the way out, so a credential cannot ride along in a
+/// cache path.
 ///
 /// Because the caller must pair this with `env_clear()`, the result is a
 /// complete environment, not a patch. Credentials, tokens, `*_PROXY` and
@@ -241,9 +323,11 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
 /// need it to exist (command spawning) create it explicitly, which keeps this
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
-    // Sized up front for the worst case (every allow-listed name set) plus the
-    // `HOME` appended below, so the vector never reallocates mid-build.
-    let mut env: Vec<(String, String)> = Vec::with_capacity(ALLOWED_VARS.len() + 1);
+    // Sized up front for the worst case (every allow-listed name set, every
+    // toolchain cache resolved) plus the `HOME` appended below, so the vector
+    // never reallocates mid-build.
+    let mut env: Vec<(String, String)> =
+        Vec::with_capacity(ALLOWED_VARS.len() + TOOLCHAIN_VARS.len() + 1);
     for name in ALLOWED_VARS {
         // Defence in depth: an allow-listed name that trips the secret filter is
         // dropped regardless of its value.
@@ -257,6 +341,32 @@ pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(S
             // allocated for names that are unset or empty.
             Ok(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
             _ => {}
+        }
+    }
+
+    // Toolchain caches are resolved, not merely copied: a name the parent did
+    // not set is still forwarded when a host default can be discovered, so a
+    // sandboxed `cargo build` finds the operator's crates cache and resolves
+    // dependencies offline instead of asking `index.crates.io` for them.
+    //
+    // The secret filter is re-applied to every name, including the ones
+    // resolved here, so widening the resolution below can never introduce a
+    // credential-bearing name.
+    for name in TOOLCHAIN_VARS {
+        if is_sensitive_var(name) {
+            continue;
+        }
+        let resolved = if *name == CARGO_HOME_VAR {
+            host_cargo_home()
+        } else {
+            // No `~/.rustup` fallback: a host with no rustup has no toolchain
+            // directory to share, and an invented path would be a silent lie.
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some(value) = resolved {
+            env.push(((*name).to_string(), value.to_string_lossy().into_owned()));
         }
     }
 
@@ -343,9 +453,61 @@ fn is_safe_home(value: &OsString) -> bool {
     !value.is_empty() && path != Path::new("/") && path.is_absolute()
 }
 
+/// Serializes tests that mutate the process environment.
+///
+/// `std::env::set_var` is process-global, and the harness runs unit tests on
+/// parallel threads, so a test that overrides `HOME`/`CARGO_HOME` would otherwise
+/// be observed by an unrelated test running at the same instant — in this module
+/// *and* in `exec`, which spawns real children that read the same variables.
+/// Holding this lock for the whole mutating test, rather than just around the
+/// `set_var` calls, is what makes those tests atomic against their neighbours.
+///
+/// Exposed as a crate-visible test seam because sibling modules cannot reach a
+/// test-private item.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the environment lock, ignoring poisoning.
+///
+/// A panic in one mutating test leaves the mutex poisoned, but the invariant the
+/// lock protects (a restored environment) is re-established by each test on its
+/// own path, so a stale poison must not cascade into unrelated failures.
+#[cfg(test)]
+pub(crate) fn env_test_guard() -> MutexGuard<'static, ()> {
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `body` with exclusive access to the process environment.
+///
+/// The lock is a std `Mutex`, so `body` must be synchronous: holding it across an
+/// `.await` would park a runtime thread and can deadlock a multi-threaded
+/// runtime, which is exactly what `clippy::await_holding_lock` rejects. A test
+/// that needs both an environment override and an await therefore drives the
+/// future to completion inside this closure (see the `runtime.block_on` call in
+/// `exec`).
+#[cfg(test)]
+pub(crate) fn with_env_lock<T>(body: impl FnOnce() -> T) -> T {
+    let _guard = env_test_guard();
+    body()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// The process-wide real `HOME`, captured once on first use so a test that
+    /// overrides it can put it back without depending on when it ran.
+    static ORIGINAL_HOME_VALUE: OnceLock<String> = OnceLock::new();
+
+    /// The real `HOME`, captured before any test overrides it.
+    fn original_home() -> String {
+        ORIGINAL_HOME_VALUE
+            .get_or_init(|| std::env::var("HOME").unwrap_or_default())
+            .clone()
+    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let unique_id = std::time::SystemTime::now()
@@ -493,6 +655,7 @@ mod tests {
 
     #[test]
     fn build_clean_environment_drops_secrets_from_parent() {
+        let _guard = env_test_guard();
         let dir = unique_dir("secrets");
         // Inject secrets into *our* environment; the child env must not carry them.
         unsafe {
@@ -563,6 +726,7 @@ mod tests {
 
     #[test]
     fn apply_clean_environment_clears_and_sets_isolated_home() {
+        let _guard = env_test_guard();
         let dir = unique_dir("apply");
         let mut cmd = std::process::Command::new("true");
         // Seed with a secret so env_clear has something to remove.
@@ -587,6 +751,188 @@ mod tests {
             isolated_home(&dir, &dir).is_dir(),
             "isolated HOME must be created"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// The toolchain-cache contract: with the parent's `CARGO_HOME` unset, a
+    /// host that *does* have a `~/.cargo` gets that directory forwarded, so a
+    /// cargo command in a sandboxed worktree sees the populated registry instead
+    /// of the empty isolated `HOME`.
+    #[test]
+    fn cargo_home_falls_back_to_the_host_dot_cargo() {
+        let _guard = env_test_guard();
+        let dir = unique_dir("cargo-home-fallback");
+        let fake_home = dir.join("fake-home");
+        std::fs::create_dir_all(fake_home.join(".cargo")).expect("create fake ~/.cargo");
+        // The parent has no `CARGO_HOME`, so the fallback is the only thing that
+        // can populate the variable. `HOME` is remapped independently, so this
+        // synthetic layout is the *host's*, not the child's.
+        // SAFETY: serialized against every other test that reads or writes the
+        // process environment.
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let env = build_clean_environment(&dir, &dir);
+        let cargo_home = env
+            .iter()
+            .find(|(k, _)| k == CARGO_HOME_VAR)
+            .map(|(_, v)| v.clone());
+        // SAFETY: as above; restore before asserting so a failure cannot leak.
+        unsafe { std::env::set_var("HOME", original_home()) };
+
+        let cargo_home = cargo_home.expect("CARGO_HOME must be forwarded from the host ~/.cargo");
+        assert_eq!(cargo_home, fake_home.join(".cargo").to_string_lossy());
+        // The whole point: the cache is the host's, not the sandbox's HOME.
+        assert_ne!(
+            PathBuf::from(&cargo_home),
+            isolated_home(&dir, &dir).join(".cargo"),
+            "the cache must not point back into the sandboxed HOME"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No host cache means no forwarded variable: inventing a path that does not
+    /// exist would be worse than staying quiet and letting Cargo apply its own
+    /// default resolution.
+    #[test]
+    fn cargo_home_is_omitted_when_the_host_has_none() {
+        let _guard = env_test_guard();
+        let dir = unique_dir("cargo-home-absent");
+        let fake_home = dir.join("fake-home");
+        std::fs::create_dir_all(&fake_home).expect("create empty fake home");
+        // SAFETY: serialized against every other test that reads or writes the
+        // process environment.
+        unsafe {
+            std::env::remove_var("CARGO_HOME");
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let env = build_clean_environment(&dir, &dir);
+        // SAFETY: as above; restore before asserting.
+        unsafe { std::env::set_var("HOME", original_home()) };
+
+        assert!(
+            !env.iter().any(|(k, _)| k == CARGO_HOME_VAR),
+            "a host with no ~/.cargo must not get a CARGO_HOME at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`resolve_cargo_home`] is the policy, tested directly against synthetic
+    /// layouts so every branch is covered whether or not the machine running the
+    /// suite happens to have a `~/.cargo`.
+    #[test]
+    fn cargo_home_resolution_covers_every_branch() {
+        let dir = unique_dir("cargo-home-pure");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".cargo")).expect("create ~/.cargo");
+        let with_cargo = home.join(".cargo");
+        let without_cargo = dir.join("empty-home");
+        std::fs::create_dir_all(&without_cargo).expect("create empty home");
+
+        // Explicit wins over the fallback, and is not probed on disk.
+        assert_eq!(
+            resolve_cargo_home(Some(Path::new("/opt/cargo")), Some(&home)),
+            Some(PathBuf::from("/opt/cargo"))
+        );
+        // An explicit but *empty* value is treated as unset, not as a directory
+        // whose name is "".
+        assert_eq!(
+            resolve_cargo_home(Some(Path::new("")), Some(&home)),
+            Some(with_cargo.clone())
+        );
+        // No explicit value: `~/.cargo` when it exists.
+        assert_eq!(resolve_cargo_home(None, Some(&home)), Some(with_cargo));
+        // `~/.cargo` missing, or `HOME` missing entirely: nothing to forward.
+        assert_eq!(resolve_cargo_home(None, Some(&without_cargo)), None);
+        assert_eq!(resolve_cargo_home(None, None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit host `CARGO_HOME` wins over the `~/.cargo` fallback and is
+    /// forwarded verbatim, so a non-default install layout keeps working.
+    #[test]
+    fn an_explicit_cargo_home_is_forwarded_verbatim() {
+        let _guard = env_test_guard();
+        let dir = unique_dir("cargo-home-explicit");
+        let custom = dir.join("custom-cargo");
+        std::fs::create_dir_all(&custom).expect("create custom cargo home");
+        // SAFETY: serialized against every other test that reads or writes the
+        // process environment.
+        unsafe { std::env::set_var("CARGO_HOME", &custom) };
+        let env = build_clean_environment(&dir, &dir);
+        unsafe { std::env::remove_var("CARGO_HOME") };
+
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == CARGO_HOME_VAR)
+                .map(|(_, v)| v.clone()),
+            Some(custom.to_string_lossy().into_owned()),
+            "an explicit CARGO_HOME must be forwarded verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `RUSTUP_HOME` is forwarded like `CARGO_HOME`: set in the parent means
+    /// verbatim, and unset means simply absent (there is no `~/.rustup`
+    /// fallback, because a host with no toolchain manager is not an error).
+    #[test]
+    fn rustup_home_is_forwarded_when_set_and_absent_otherwise() {
+        let _guard = env_test_guard();
+        let dir = unique_dir("rustup-home");
+        // SAFETY: serialized against every other test that reads or writes the
+        // process environment.
+        unsafe { std::env::set_var("RUSTUP_HOME", "/opt/rustup") };
+        let set_env = build_clean_environment(&dir, &dir);
+        unsafe { std::env::remove_var("RUSTUP_HOME") };
+        let unset_env = build_clean_environment(&dir, &dir);
+
+        assert_eq!(
+            set_env
+                .iter()
+                .find(|(k, _)| k == RUSTUP_HOME_VAR)
+                .map(|(_, v)| v.clone())
+                .as_deref(),
+            Some("/opt/rustup")
+        );
+        assert!(
+            !unset_env.iter().any(|(k, _)| k == RUSTUP_HOME_VAR),
+            "an unset RUSTUP_HOME must stay absent, not be invented"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The toolchain paths are cache *locations*, not credentials: they must
+    /// survive the secret filter, or the forwarding would be dropped.
+    #[test]
+    fn toolchain_cache_vars_are_not_treated_as_secrets() {
+        for name in [CARGO_HOME_VAR, RUSTUP_HOME_VAR] {
+            assert!(
+                !is_sensitive_var(name),
+                "{name} is a cache location, not a credential"
+            );
+        }
+    }
+
+    /// Whatever the host's toolchain layout looks like, the forwarded result
+    /// must still be exactly the allow-list plus `HOME` and carry no secret.
+    #[test]
+    fn toolchain_forwarding_keeps_the_allow_list_and_scrubbing() {
+        let dir = unique_dir("toolchain-scrub");
+        let env = build_clean_environment(&dir, &dir);
+        for (k, _) in &env {
+            assert!(
+                !is_sensitive_var(k),
+                "{k} leaked into the child env through toolchain forwarding"
+            );
+            assert!(
+                ALLOWED_VARS.contains(&k.as_str())
+                    || TOOLCHAIN_VARS.contains(&k.as_str())
+                    || k == HOME_VAR,
+                "{k} escaped the allow-list"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

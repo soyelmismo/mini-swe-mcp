@@ -257,6 +257,18 @@ fn configure_process(cmd: &mut Command) {
     cmd.stderr(std::process::Stdio::piped());
 }
 
+/// Read-only bind for a toolchain cache directory, if it is present.
+///
+/// A missing cache is not an error: `--ro-bind-try` keeps the sandbox startable
+/// on a host that never installed the toolchain in question.
+fn ro_bind_toolchain_cache(cmd: &mut Command, path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let path_str = path.to_string_lossy();
+    cmd.args(["--ro-bind-try", &path_str, &path_str]);
+}
+
 /// Append the full `bwrap` argument vector.
 ///
 /// The sandbox is read-only by default: only the worktree, its own gitdir, the
@@ -318,14 +330,21 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
         cmd.args(["--tmpfs", &cache_tmp_str]);
     }
 
-    // Expose the shared toolchain homes read-only when they exist.
-    for var in ["CARGO_HOME", "RUSTUP_HOME"] {
-        if let Some(p) = std::env::var_os(var).map(PathBuf::from)
-            && p.exists()
-        {
-            let p = p.to_string_lossy();
-            cmd.args(["--ro-bind-try", &p, &p]);
-        }
+    // Expose the shared toolchain homes read-only when they exist. The paths
+    // come from the same resolution the child environment uses
+    // (`env::host_cargo_home`, plus `RUSTUP_HOME`), so the mount and the
+    // forwarded `CARGO_HOME` can never disagree: a directory the sandbox binds
+    // but the environment does not point at would leave cargo with an empty
+    // registry, and one the environment points at but the sandbox does not bind
+    // would simply be missing.
+    if let Some(cargo_home) = super::env::host_cargo_home() {
+        ro_bind_toolchain_cache(cmd, &cargo_home);
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        ro_bind_toolchain_cache(cmd, &rustup_home);
     }
 
     // Expose the worktree directory read-write
@@ -1281,9 +1300,15 @@ mod tests {
              not the size of the retained buffer"
         );
         // The head survives...
-        assert!(out.starts_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1\n"), "head: {out}");
+        assert!(
+            out.starts_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1\n"),
+            "head: {out}"
+        );
         // ...and so does the tail.
-        assert!(out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-40000"), "tail: {out}");
+        assert!(
+            out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-40000"),
+            "tail: {out}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1501,6 +1526,72 @@ mod tests {
         assert!(
             std::env::var("HOME").is_ok_and(|real| !out.contains(&real)),
             "the real HOME must not be visible to the child: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The end-to-end toolchain contract: a command the model runs inside the
+    /// sandbox observes a `CARGO_HOME` pointing at the *host's* registry cache,
+    /// even though its own `HOME` is an empty scratch directory.
+    ///
+    /// Without this, a worktree builds against an empty registry and reaches for
+    /// `index.crates.io` for crates the operator already has locally, which fails
+    /// on an offline host. Asserting on the *relationship* between the two
+    /// variables — the cache must not be the sandboxed home — is what makes the
+    /// test meaningful on a host that has no `~/.cargo` at all.
+    ///
+    // Deliberately *not* a `#[tokio::test]`: the spawn has to run while the
+    // process-environment lock is held, and that lock is a std `Mutex` which
+    // cannot be held across an `.await` (`clippy::await_holding_lock`). The test
+    // therefore drives its own current-thread runtime and blocks on it, which is
+    // the only way to make "mutate the environment, spawn, assert" atomic.
+    #[test]
+    fn a_spawned_command_sees_the_host_toolchain_cache() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = crate::worktree::swe_base_dir().join(format!(
+            "env-toolchain-test-{}-{unique_id}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        // A host cache this test controls, so the expectation does not depend on
+        // whatever layout the machine running the suite happens to have, and so
+        // the forwarding is exercised even on hosts with no `~/.cargo`.
+        let host_cargo = tmp.join("host-cargo");
+        std::fs::create_dir_all(&host_cargo).expect("create host cargo home");
+
+        // The whole spawn runs under the environment lock: it has to, because
+        // the child reads `CARGO_HOME` when it is built, and a concurrent
+        // mutating test would otherwise swap the value out from under the
+        // assertion.
+        let spawned = crate::agent::env::with_env_lock(|| {
+            // SAFETY: serialized against every other test that reads or writes
+            // the process environment, including the ones in `env`.
+            unsafe { std::env::set_var("CARGO_HOME", &host_cargo) };
+            let result = runtime.block_on(
+                runner().execute_bash(&tmp, "echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\""),
+            );
+            unsafe { std::env::remove_var("CARGO_HOME") };
+            result
+        });
+        let (out, code) = spawned.expect("a spawned command must not error");
+
+        assert_eq!(code, Some(0), "command failed with output: {out:?}");
+        assert_eq!(
+            out.trim(),
+            format!(
+                "home=[{}] cargo_home=[{}]",
+                tmp.join("target/home").display(),
+                host_cargo.display()
+            ),
+            "the child must see the host CARGO_HOME, not the sandboxed home: {out:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
