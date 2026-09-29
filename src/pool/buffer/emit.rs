@@ -1,8 +1,8 @@
 //! The degradation-aware emission view over a retained step-log window.
 //!
 //! The buffer bounds what is *held*; this module bounds what is *put on the
-//! wire*. A response inlines only the newest `max_emitted` entries and carries an
-//! explicit [`EmittedLogs::logs_truncation_notice`] whenever anything is
+//! wire*. A response inlines only the newest `max_emitted` entries and carries
+//! an explicit [`EmittedLogs::logs_truncation_notice`] whenever anything is
 //! missing, so a consumer can never mistake the emitted tail for the full
 //! history (audit 07, R4/R7). [`LogStats`] is the same idea as counters.
 
@@ -30,8 +30,7 @@ pub struct LogStats {
 pub struct EmittedLogs {
     /// The emitted tail, oldest-first.
     pub logs: Vec<AgentStepLog>,
-    /// How many retained entries were **not** emitted because of the emission
-    /// budget.
+    /// Retained entries **not** emitted because of the emission budget.
     pub logs_omitted: usize,
     /// Present only when something is missing, so a consumer can never mistake
     /// the emitted tail for the full history.
