@@ -136,9 +136,13 @@ pub(crate) struct StreamedToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) arguments: String,
-    /// Set when the call blew past [`MAX_TOOL_ARGUMENT_BYTES`] or the provider
-    /// used the same `index` for two different ids. Such calls are dropped
-    /// rather than replayed into the conversation history.
+    /// Set when the call blew past [`MAX_TOOL_ARGUMENT_BYTES`] and is therefore
+    /// unusable. Such calls are dropped rather than replayed into the
+    /// conversation history.
+    ///
+    /// A *conflicting id* on a re-used `index` no longer lands here: that is a
+    /// provider numbering quirk, not corruption, so the delta is redirected to
+    /// a fresh slot. See [`SseAccumulator::accumulate_tool_call`].
     pub(crate) malformed: bool,
 }
 
@@ -369,21 +373,43 @@ impl SseAccumulator {
     }
 
     /// Fold one streamed `tool_calls` delta into the index-keyed map.
+    ///
+    /// Providers that omit `index` (serde defaults it to `0`) or that re-send
+    /// `index: 0` for every call in a turn deliver *several distinct calls*
+    /// on the same slot. Treating the second id as a malicious collision
+    /// marked the entry `malformed` and dropped **both** calls, leaving an
+    /// empty turn with no command to run — an infinite retry loop. Instead,
+    /// a differing id that lands on a slot which already has an id or a
+    /// command *opens a new slot* just past the highest index in use, so both
+    /// calls survive and are still ordered deterministically.
     pub(crate) fn accumulate_tool_call(&mut self, tc: &StreamToolCall) {
-        let entry = self.tools.entry(tc.index).or_default();
+        // Pick the slot this delta belongs to. A fresh id landing on an
+        // already-populated slot means the provider restarted its call
+        // numbering, so redirect it to a brand-new index instead of
+        // clobbering the call we already accumulated.
+        let target_index = match self.tools.get(&tc.index) {
+            Some(entry)
+                if !entry.malformed
+                    && tc.id.as_deref().is_some_and(|id| id != entry.id)
+                    && (!entry.id.is_empty() || !entry.arguments.trim().is_empty()) =>
+            {
+                let next = self.tools.keys().max().copied().unwrap_or(0) + 1;
+                tracing::warn!(
+                    index = tc.index,
+                    new_index = next,
+                    "New tool_call id on an already-populated index; opening a new slot"
+                );
+                next
+            }
+            _ => tc.index,
+        };
+
+        let entry = self.tools.entry(target_index).or_default();
         if entry.malformed {
             return;
         }
 
         if let Some(id) = &tc.id {
-            if !entry.id.is_empty() && &entry.id != id {
-                tracing::warn!(
-                    index = tc.index,
-                    "Conflicting tool_call ids for the same index; dropping the call"
-                );
-                entry.malformed = true;
-                return;
-            }
             entry.id = id.clone();
         }
 
@@ -749,13 +775,115 @@ mod tests {
         assert_eq!(tcs[0].function.arguments, r#"{"command":"pwd"}"#);
     }
 
+    /// A provider that emits several tool calls with the same `index` (or omits
+    /// `index`, which serde defaults to `0`) used to have the *second* id treated
+    /// as a malicious collision: the entry was marked `malformed` and both calls
+    /// were dropped, so the turn carried no command and the agent loop spun
+    /// forever. Both calls must survive in separate slots instead.
     #[test]
-    fn conflicting_ids_for_one_index_mark_call_malformed() {
+    fn conflicting_ids_for_one_index_open_a_new_slot_instead_of_dropping() {
         let mut acc = SseAccumulator::default();
         acc.accumulate_tool_call(&tc(0, Some("a"), Some("bash"), Some("{}")));
         acc.accumulate_tool_call(&tc(0, Some("b"), None, None));
         let (tcs, _) = SseAccumulator::finalize_from(&acc.tools);
-        assert!(tcs.is_empty(), "ambiguous call must be dropped: {tcs:?}");
+        assert_eq!(tcs.len(), 2, "both calls must survive: {tcs:?}");
+        assert_eq!(tcs[0].id, "a");
+        assert_eq!(tcs[1].id, "b");
+        assert!(
+            acc.tools.values().all(|e| !e.malformed),
+            "a numbering quirk is not corruption: {:?}",
+            acc.tools
+        );
+    }
+
+    /// The realistic shape: a full multi-call turn where *every* call arrives on
+    /// `index: 0`, each with its own id and complete arguments. All of them must
+    /// be emitted, in arrival order, with unique ids.
+    #[test]
+    fn sequential_calls_all_reusing_index_zero_are_all_retained() {
+        let mut acc = SseAccumulator::default();
+        for (i, cmd) in ["ls", "pwd", "whoami"].iter().enumerate() {
+            acc.accumulate_tool_call(&tc(
+                0,
+                Some(&format!("call_{i}")),
+                Some("bash"),
+                Some(&format!(r#"{{"command":"{cmd}"}}"#)),
+            ));
+        }
+        let (tcs, ids) = SseAccumulator::finalize_from(&acc.tools);
+        assert_eq!(tcs.len(), 3, "no call may be dropped: {tcs:?}");
+        let commands: Vec<&str> = tcs
+            .iter()
+            .map(|c| c.function.arguments.as_str())
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                r#"{"command":"ls"}"#,
+                r#"{"command":"pwd"}"#,
+                r#"{"command":"whoami"}"#
+            ],
+            "arrival order must be preserved"
+        );
+        assert_eq!(ids.len(), 3, "ids must be unique");
+    }
+
+    /// A delta that merely *continues* a call (no id in the delta, matching the
+    /// one already on the slot) must keep accumulating into the same entry — the
+    /// new-slot path must not fire for a legitimate continuation.
+    #[test]
+    fn continuation_deltas_still_accumulate_into_the_same_slot() {
+        let mut acc = SseAccumulator::default();
+        acc.accumulate_tool_call(&tc(0, Some("c0"), Some("bash"), Some(r#"{"comm"#)));
+        acc.accumulate_tool_call(&tc(0, Some("c0"), None, Some(r#"and":"pwd"}"#)));
+        let (tcs, _) = SseAccumulator::finalize_from(&acc.tools);
+        assert_eq!(tcs.len(), 1, "same id must stay one call: {tcs:?}");
+        assert_eq!(tcs[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    /// A differing id on a slot that is *still empty* (no id, no arguments) is
+    /// not a conflict: it is the first frame of a call, and it just fills the
+    /// slot rather than opening another one.
+    #[test]
+    fn id_on_an_empty_slot_fills_it_without_opening_another() {
+        let mut acc = SseAccumulator::default();
+        acc.accumulate_tool_call(&tc(0, Some("first"), Some("bash"), Some("{}")));
+        assert_eq!(acc.tools.len(), 1);
+        assert_eq!(acc.tools.get(&0).expect("slot 0").id, "first");
+    }
+
+    /// The new slot is opened at `max_index + 1`, so it never collides with an
+    /// index a later delta legitimately claims.
+    #[test]
+    fn new_slot_is_placed_past_the_highest_index_in_use() {
+        let mut acc = SseAccumulator::default();
+        acc.accumulate_tool_call(&tc(7, Some("seven"), Some("bash"), Some("{}")));
+        acc.accumulate_tool_call(&tc(0, Some("zero"), Some("bash"), Some("{}")));
+        // Conflicting id on index 0, which already holds a call: must land on 8.
+        acc.accumulate_tool_call(&tc(0, Some("other"), Some("bash"), Some("{}")));
+        assert!(acc.tools.contains_key(&8), "slots: {:?}", acc.tools.keys());
+        let (tcs, _) = SseAccumulator::finalize_from(&acc.tools);
+        assert_eq!(tcs.len(), 3, "all three calls must survive: {tcs:?}");
+        // Ordering stays index-ordered, so 7 comes after 0 and 8.
+        assert_eq!(tcs[0].id, "zero");
+        assert_eq!(tcs[1].id, "seven");
+        assert_eq!(tcs[2].id, "other");
+    }
+
+    /// Long chain-of-thought replies used to be cut at 16 KiB, losing the tail of
+    /// the model's reasoning. The budget now matches the tool-argument budget.
+    #[test]
+    fn content_budget_is_64_kib() {
+        assert_eq!(MAX_STREAMED_CONTENT_BYTES, 64 * 1024);
+        let mut acc = SseAccumulator::default();
+        // A CoT stream of 48 KiB must be retained in full, untruncated.
+        acc.push_content(&"r".repeat(48 * 1024));
+        assert_eq!(acc.content.len(), 48 * 1024, "no CoT truncation");
+        assert!(!acc.content_capped, "48 KiB must fit in the budget");
+        // The cap must still exist past the new budget.
+        acc.push_content(&"s".repeat(MAX_STREAMED_CONTENT_BYTES));
+        assert_eq!(acc.content.len(), MAX_STREAMED_CONTENT_BYTES);
+        assert!(acc.content_capped, "the cap must still fire past 64 KiB");
     }
 
     #[test]

@@ -9,11 +9,15 @@ use std::time::Duration;
 /// stalls.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Hard cap on the assistant text retained from a stream. The bash-output
-/// budget is 16 KiB; the assistant's own reasoning is bounded by the same
-/// order of magnitude so a runaway stream cannot inflate memory (nor be
-/// re-sent verbatim on the next request).
-pub const MAX_STREAMED_CONTENT_BYTES: usize = 16 * 1024;
+/// Hard cap on the assistant text retained from a stream.
+///
+/// Sized to match [`MAX_TOOL_ARGUMENT_BYTES`] (64 KiB) so a turn's reasoning
+/// and its tool arguments get the same budget: at 16 KiB a long chain-of-thought
+/// reply was truncated mid-sentence, which both corrupted the context fed back
+/// to the model and hid the tail of the model's own explanation. A runaway
+/// stream still cannot inflate memory (nor be re-sent verbatim on the next
+/// request) because the cap is enforced in [`crate::agent::stream`].
+pub const MAX_STREAMED_CONTENT_BYTES: usize = 64 * 1024;
 
 /// Hard cap on the serialized `arguments` accumulated for a single tool call.
 /// A model that streams megabytes of arguments is treated as malformed and the

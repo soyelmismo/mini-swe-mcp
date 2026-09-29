@@ -185,6 +185,62 @@ async fn repeated_index_deltas_accumulate_into_one_call() {
     assert_eq!(resp.command.as_deref(), Some("pwd"));
 }
 
+// ----------
+// F1b — a provider that re-uses `index: 0` must not lose every tool call
+// ----------
+
+/// Regression (PENDING_ROADMAP #2): providers that omit `index` (serde defaults
+/// it to `0`) or that send every call in a turn as `index: 0` used to hit
+/// `accumulate_tool_call`'s collision branch, which marked the entry
+/// `malformed` and dropped **both** calls. The turn came back with no command
+/// at all, so the agent loop re-issued the same prompt forever.
+///
+/// Two sequential calls, both on `index: 0`, must both survive the round trip.
+#[tokio::test]
+async fn sequential_calls_reusing_index_zero_both_survive() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+
+    let calls = resp.tool_calls.expect("tool_calls present");
+    assert_eq!(
+        calls.len(),
+        2,
+        "a numbering quirk must not drop calls: {calls:?}"
+    );
+    assert_eq!(calls[0].id, "a");
+    assert_eq!(calls[1].id, "b");
+    assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
+    assert_eq!(calls[1].function.arguments, r#"{"command":"pwd"}"#);
+    // The whole point of the fix: the turn is no longer empty.
+    assert_eq!(resp.command.as_deref(), Some("ls"));
+    assert!(resp.tool_call_id.is_some(), "tool_call_id must be reported");
+}
+
+/// A delta with **no** `index` field at all deserializes to `0`; two such calls
+/// in one turn are the exact shape that deadlocked the agent.
+#[tokio::test]
+async fn calls_without_an_index_field_are_not_dropped() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"id":"x","function":{"name":"bash","arguments":"{\"command\":\"whoami\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"id":"y","function":{"name":"bash","arguments":"{\"command\":\"id\"}"}}]}}]}"#,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+
+    let calls = resp.tool_calls.expect("tool_calls present");
+    assert_eq!(
+        calls.len(),
+        2,
+        "index-less calls must both survive: {calls:?}"
+    );
+    assert_eq!(calls[0].function.arguments, r#"{"command":"whoami"}"#);
+    assert_eq!(calls[1].function.arguments, r#"{"command":"id"}"#);
+}
+
 // ---------------------------------------------------------------------------
 // F2 — invalid UTF-8 must degrade visibly, not vanish
 // ---------------------------------------------------------------------------
@@ -363,6 +419,27 @@ async fn streamed_content_is_capped() {
         "content must be capped, got {} bytes",
         resp.content.len()
     );
+}
+
+/// A long chain-of-thought reply used to be cut at 16 KiB, silently losing the
+/// tail of the model's reasoning before it was fed back as context. With the
+/// budget raised to 64 KiB, a 48 KiB CoT stream must round-trip intact.
+#[tokio::test]
+async fn long_reasoning_stream_is_not_truncated() {
+    let cot = "r".repeat(48 * 1024);
+    let body = MockSse::frames(&[&serde_json::json!({
+        "choices": [{"delta": {"content": cot}}]
+    })
+    .to_string()]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+
+    assert_eq!(
+        resp.content.len(),
+        cot.len(),
+        "a 48 KiB CoT stream must survive intact"
+    );
+    assert_eq!(resp.content, cot, "content must be byte-exact");
 }
 
 // ---------------------------------------------------------------------------
