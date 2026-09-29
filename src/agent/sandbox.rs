@@ -14,7 +14,6 @@
 //! [Landlock]: https://docs.kernel.org/userspace-api/landlock.html
 
 use anyhow::{Context, Result};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -217,16 +216,7 @@ const READ_ONLY_SYSTEM_PATHS: &[&str] =
 const DENIED_HOME_SUBDIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".gpg", ".kube", ".docker"];
 
 /// Absolute system paths that must never be reachable, even read-only.
-const DENIED_ABSOLUTE_PATHS: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/root"];
-
-/// World-writable scratch directories.
-///
-/// Both are listed because they are *not* interchangeable on every system: on
-/// several distributions `/var/tmp` is a symlink to `/tmp`, but elsewhere they
-/// are two genuinely separate trees, and `swe_base_dir()` picks whichever
-/// exists. Treating them as one family is the only choice that is safe in both
-/// cases - a rule keyed on the symlink would not match the resolved path.
-const SCRATCH_PATHS: &[&str] = &["/tmp", "/var/tmp"];
+const DENIED_ABSOLUTE_PATHS: &[&str] = &["/root", "/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
 /// `LANDLOCK_ACCESS_FS_EXECUTE`: run a file.
 const ACCESS_FS_EXECUTE: u64 = 1 << 0;
@@ -382,13 +372,19 @@ const ABI_ACCESS_FS_INTRODUCED: &[(i64, u64)] = &[
 /// Returns the raw return value: a non-negative `c_long` on success (a file
 /// descriptor for `create_ruleset`, `0` for the other two) and `-1` with
 /// `errno` set on failure.
-fn landlock_syscall(number: libc::c_long, args: [libc::c_long; 3]) -> i64 {
-    // SAFETY: the Landlock syscalls take a (pointer, size/flags/fd,
-    // rule-type/flags) triplet, all of which are passed here as plain
-    // `c_long`s. Pointers are either null or reference live, correctly sized
-    // and aligned stack structs that outlive the call, and the kernel only ever
-    // reads `size` bytes from them.
-    unsafe { libc::syscall(number, args[0], args[1], args[2]) }
+///
+/// All three syscalls take up to four arguments
+/// (`landlock_add_rule` is `(ruleset_fd, rule_type, rule_attr, flags)`); the
+/// shorter ones simply ignore the trailing zero. Passing `flags` explicitly
+/// matters: leaving the fourth register uninitialised makes `add_rule` fail
+/// intermittently with `EINVAL` depending on whatever garbage the caller
+/// happened to leave in `r10`.
+fn landlock_syscall(number: libc::c_long, args: [libc::c_long; 4]) -> i64 {
+    // SAFETY: the Landlock syscalls take plain `c_long`-sized arguments.
+    // Pointers are either null or reference live, correctly sized and aligned
+    // stack structs that outlive the call, and the kernel only ever reads
+    // `size` bytes from them.
+    unsafe { libc::syscall(number, args[0], args[1], args[2], args[3]) }
 }
 
 /// Query the highest Landlock ABI version the running kernel implements.
@@ -400,7 +396,7 @@ fn query_abi_version() -> Option<i64> {
     // `size == 0` with the VERSION flag is the documented ABI-version query.
     let ret = landlock_syscall(
         SYS_LANDLOCK_CREATE_RULESET,
-        [0, 0, CREATE_RULESET_VERSION as libc::c_long],
+        [0, 0, CREATE_RULESET_VERSION as libc::c_long, 0],
     );
     if ret < MIN_SUPPORTED_ABI {
         return None;
@@ -455,11 +451,6 @@ fn denied_paths() -> Vec<PathBuf> {
     denied
 }
 
-/// True when `prefix` is an ancestor of (or equal to) any path in `paths`.
-fn under(prefix: &Path, paths: &[&Path]) -> bool {
-    paths.iter().any(|p| p.starts_with(prefix))
-}
-
 /// True when `path` is `denied` or lives underneath it.
 ///
 /// Purely lexical (no canonicalisation): the rules handed to Landlock are
@@ -469,12 +460,12 @@ fn is_denied(path: &Path, denied: &[PathBuf]) -> bool {
     denied.iter().any(|d| path == d || path.starts_with(d))
 }
 
-/// Build the ordered set of `PATH_BENEATH` rules for a sandboxed child.
+/// Build the set of `PATH_BENEATH` rules for a sandboxed child.
 ///
-/// Ordering is significant: later rules refine earlier ones, so the
-/// read-only system prefixes are added first and the writable roots last, which
-/// keeps a pathological configuration (a worktree that lives under `/usr`, say)
-/// from being downgraded back to read-only.
+/// Landlock is allow-only: every granted path widens access, so the policy
+/// grants read-only system prefixes plus exactly two writable roots and
+/// nothing else. Sensitive paths stay unreachable by omission (see
+/// [`denied_paths`]).
 ///
 /// Every path is filtered through [`is_denied`], so a denied directory can never
 /// be granted access even if it is also reachable from an allowed prefix.
@@ -493,28 +484,22 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
         push(PathBuf::from(sys), READ_ONLY_RIGHTS, &mut rules);
     }
 
-    // 2. Configuration the toolchain needs to start at all. `/etc` is read-only
-    //    but, for the same reason, is not in the deny list: `passwd`, `group`,
-    //    `resolv.conf` and friends must stay readable for a build to work. The
-    //    genuinely secret files inside it are denied individually above.
-    push(PathBuf::from("/etc"), READ_ONLY_RIGHTS, &mut rules);
+    // Landlock is allow-only: a rule on /etc would also grant /etc/shadow.
+    // Grant only the individual non-secret configuration files needed by tools.
+    for config in [
+        "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/resolv.conf",
+        "/etc/hosts", "/etc/host.conf", "/etc/gai.conf", "/etc/ld.so.cache",
+        "/etc/localtime", "/etc/os-release", "/etc/protocols", "/etc/services",
+        "/etc/ssl/certs", "/etc/ca-certificates", "/etc/pki/tls/certs",
+    ] {
+        push(PathBuf::from(config), ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR, &mut rules);
+    }
 
     // 3. Pseudo-filesystems, always readable.
     push(PathBuf::from("/dev"), READ_ONLY_RIGHTS, &mut rules);
     push(PathBuf::from("/proc"), READ_ONLY_RIGHTS, &mut rules);
 
-    // 4. Scratch space, but only where it is not the parent of one of the
-    //    writable roots. Worktrees live under `/tmp` or `/var/tmp` by default,
-    //    and granting a whole scratch tree write access would quietly widen
-    //    "write access *exclusively* to the worktree and target dir" into
-    //    "write access to every other worker's scratch space too".
-    for scratch in SCRATCH_PATHS {
-        if !under(Path::new(scratch), &[worktree, target_dir]) {
-            push(PathBuf::from(scratch), WRITE_RIGHTS, &mut rules);
-        }
-    }
-
-    // 5. The worker's own writable roots, added last so they win any overlap.
+    // 4. The worker's own writable roots: the only writable paths in the domain.
     push(worktree.to_path_buf(), WRITE_RIGHTS, &mut rules);
     push(target_dir.to_path_buf(), WRITE_RIGHTS, &mut rules);
 
@@ -546,9 +531,9 @@ fn handled_access_fs(rules: &[PathRule], access: u64) -> u64 {
 /// What the resulting domain permits:
 ///
 /// * **read + execute** on the system prefixes ([`READ_ONLY_SYSTEM_PATHS`]),
-///   `/etc`, `/proc` and `/dev` - enough to run a compiler, a linker and
+///   selected `/etc` config files, `/proc` and `/dev` - enough to run a compiler, a linker and
 ///   `bash` itself;
-/// * **read + write** on `worktree`, `target_dir` and `/tmp`.
+/// * **read + write** on `worktree` and `target_dir`.
 ///
 /// Everything else is denied, which is what makes the sensitive paths - the
 /// operator's `~/.ssh`, `~/.aws`, `~/.gnupg` and `/etc/shadow` (see
@@ -619,7 +604,7 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
             // have closed it; `restrict_self` needs no other argument.
             let ret = landlock_syscall(
                 SYS_LANDLOCK_RESTRICT_SELF,
-                [ruleset_fd.into(), 0, 0],
+                [ruleset_fd.into(), 0, 0, 0],
             );
             if ret < 0 {
                 anyhow::bail!(
@@ -637,23 +622,46 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
 
 /// Add one `PATH_BENEATH` rule to an open ruleset.
 fn add_rule(ruleset_fd: libc::c_int, rule: &PathRule) -> Result<()> {
-    // A missing directory simply has nothing to protect; skipping it keeps the
-    // sandbox working on minimal images that lack, say, `/opt`.
-    let Ok(parent) = std::fs::File::open(&rule.path) else {
+    // Open with `O_PATH`: it needs no permission on the target itself (only
+    // traversal of its parents), so a rule is still installed on paths the
+    // caller could not `File::open` for reading. A genuinely missing path
+    // simply has nothing to protect; skipping it keeps the sandbox working on
+    // minimal images that lack, say, `/opt`.
+    // SAFETY: `path` is a NUL-free OS string converted via `CString`; the fd
+    // returned by `open` is owned here and closed exactly once below.
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let fd: libc::c_int = match CString::new(rule.path.as_os_str().as_bytes()) {
+        Ok(c) => unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) },
+        Err(_) => return Ok(()),
+    };
+    if fd < 0 {
         return Ok(());
-    };
+    }
+    struct FdGuard(libc::c_int);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            // SAFETY: fd was returned by a successful `open` above and is
+            // closed exactly once here.
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _guard = FdGuard(fd);
+    let parent: libc::c_int = fd;
+    let allowed = if rule.path.is_file() { rule.allowed & ACCESS_FS_READ_FILE } else { rule.allowed };
     let attr = PathBeneathAttr {
-        allowed_access: rule.allowed,
-        parent_fd: parent.as_raw_fd(),
+        allowed_access: allowed,
+        parent_fd: parent,
     };
-    // SAFETY: `attr` is a live `landlock_path_beneath_attr` and `parent` keeps
-    // the referenced directory open for the duration of the call.
+    // SAFETY: `attr` is a live `landlock_path_beneath_attr` and `_guard` keeps
+    // the referenced file or directory open for the duration of the call.
     let ret = landlock_syscall(
         SYS_LANDLOCK_ADD_RULE,
         [
             ruleset_fd.into(),
             RULE_PATH_BENEATH.into(),
             &attr as *const PathBeneathAttr as libc::c_long,
+            0,
         ],
     );
     if ret < 0 {
@@ -678,6 +686,7 @@ fn create_ruleset(handled_access_fs: u64) -> Result<libc::c_int> {
         [
             &attr as *const RulesetAttr as libc::c_long,
             std::mem::size_of::<RulesetAttr>() as libc::c_long,
+            0,
             0,
         ],
     );
@@ -910,7 +919,9 @@ fn sensitive_paths_are_never_granted() {
         "/etc/shadow must be on the deny list"
     );
 
-    // ...and no rule may cover any of them.
+    // Home-relative secrets must never appear in any rule: they are denied by
+    // omission (no rule covers them), so the handled-rights deny-by-default
+    // model keeps them unreachable.
     for path in &denied {
         assert!(
             !is_denied(path, &[]),
@@ -924,6 +935,12 @@ fn sensitive_paths_are_never_granted() {
                 path.display()
             );
         }
+    }
+
+    // A broad /etc grant would also grant these files. They must be denied
+    // by omission, not an impossible zero-rights rule (the kernel rejects it).
+    for secret in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"] {
+        assert!(!rules.iter().any(|r| Path::new(secret).starts_with(&r.path)));
     }
 }
 
@@ -1083,22 +1100,16 @@ fn the_abi_query_is_stable_within_a_process() {
     }
 }
 
-    /// Is `candidate` an ancestor of (or equal to) any declared root?
-    fn path_under(candidate: &Path, roots: &[&Path]) -> bool {
-        roots.iter().any(|r| r.starts_with(candidate))
-    }
-
     /// Write access must go to the worktree and the target dir and nowhere else.
     ///
     /// This is the property that makes the sandbox worth having, and it is easy
-    /// to lose by accident: worktrees live under `/tmp` by default, so granting
-    /// `/tmp` write access "for scratch space" would hand the agent write
-    /// access to every *other* worker's scratch directory as well. When a
-    /// writable root is under `/tmp`, the rule for `/tmp` has to disappear.
+    /// to lose by accident: Landlock is allow-only, so a `/tmp` rule would also
+    /// cover the worktree/target (which live there by default) and hand the
+    /// agent write access to every other worker's files. Scratch space is
+    /// therefore never granted: only the two declared roots are writable.
     #[test]
     fn write_access_is_exclusive_to_the_two_declared_roots() {
         let scratch = Scratch::new("exclusive");
-        // Both roots under /tmp - the default layout for this crate.
         let worktree = Path::new("/tmp/landlock-wt-abc123");
         let target = Path::new("/tmp/landlock-target-abc123");
         let rules = build_path_rules(worktree, target);
@@ -1109,79 +1120,30 @@ fn the_abi_query_is_stable_within_a_process() {
             .map(|r| r.path.as_path())
             .collect();
 
-        // Both declared roots are writable, always.
-        for root in [worktree, target] {
-            assert!(
-                writable.contains(&root),
-                "{} must be writable",
-                root.display()
-            );
-        }
-        // Nothing else is writable except a scratch tree that does *not*
-        // contain either root. Here the roots are under /tmp, so /tmp is
-        // excluded; a sibling scratch tree with no root beneath it is fine.
-        for path in &writable {
-            let is_declared_root = *path == worktree || *path == target;
-            let is_unshadowed_scratch = SCRATCH_PATHS
-                .iter()
-                .any(|s| *path == Path::new(*s) && !path_under(path, &[worktree, target]));
-            assert!(
-                is_declared_root || is_unshadowed_scratch,
-                "{} is writable but is neither a declared root nor an unshadowed \
-                 scratch directory",
-                path.display()
-            );
-        }
-        assert!(
-            !writable.contains(&Path::new("/tmp")),
-            "/tmp contains both roots, so it must not be writable"
+        assert_eq!(
+            writable.len(),
+            2,
+            "only the two declared roots may be writable, got: {writable:?}"
         );
-
-        // With the roots somewhere else entirely, /tmp is genuine scratch space
-        // and may be granted.
-        let outside_wt = Path::new("/srv/work/landlock-wt");
-        let outside_target = Path::new("/srv/target");
-        let outside = build_path_rules(outside_wt, outside_target);
-        for scratch in SCRATCH_PATHS {
-            assert!(
-                outside
-                    .iter()
-                    .any(|r| r.path == Path::new(scratch) && r.allowed & ACCESS_FS_WRITE_FILE != 0),
-                "{scratch} is legitimate scratch space when no root lives under it"
-            );
-        }
+        assert!(writable.contains(&worktree));
+        assert!(writable.contains(&target));
         let _ = &scratch;
     }
 
-    /// No scratch directory may be granted while a writable root lives under it.
+    /// Scratch space (/tmp, /var/tmp) is never granted writable: it is the
+    /// parent of the default worktree layout.
     #[test]
-    fn scratch_space_is_not_granted_beneath_a_writable_root() {
-        for (wt, tgt) in [
-            (Path::new("/tmp/wt"), Path::new("/var/tmp/tgt")),
-            (Path::new("/var/tmp/wt"), Path::new("/var/tmp/tgt")),
-            (Path::new("/tmp/a/b/wt"), Path::new("/tmp/tgt")),
-            (Path::new("/var/tmp/a/wt"), Path::new("/var/tmp/tgt")),
-            (Path::new("/tmp/wt"), Path::new("/tmp/tgt")),
-        ] {
-            let rules = build_path_rules(wt, tgt);
-            for scratch in SCRATCH_PATHS {
-                // Only the scratch tree that actually *contains* a root has to
-                // be withheld; a sibling scratch tree with no root beneath it is
-                // still granted (see the exclusivity test for that case).
-                if !wt.starts_with(scratch) && !tgt.starts_with(scratch) {
-                    continue;
-                }
-                assert!(
-                    !rules.iter().any(|r| {
-                        r.path == Path::new(scratch) && r.allowed & ACCESS_FS_WRITE_FILE != 0
-                    }),
-                    "{scratch} must not be writable when {} lives under it",
-                    wt.display()
-                );
-            }
+    fn scratch_space_is_never_writable() {
+        let rules = build_path_rules(Path::new("/tmp/wt"), Path::new("/var/tmp/tgt"));
+        for scratch in ["/tmp", "/var/tmp"] {
+            assert!(
+                !rules.iter().any(|r| {
+                    r.path == Path::new(scratch) && r.allowed & ACCESS_FS_WRITE_FILE != 0
+                }),
+                "{scratch} must never be writable"
+            );
         }
     }
-
 
 /// Sentinel that turns this test binary into a Landlock probe instead of a
 /// libtest run.
