@@ -12,7 +12,8 @@
 //! (missing, unreadable, malformed or foreign lease) must be preserved.
 
 use mini_swe_mcp::worktree::{
-    WorktreeGuard, is_process_alive, prune_stale_worktrees_in, worktree_is_stale_for_test,
+    WorktreeGuard, claim_lease_for_test, is_process_alive, prune_stale_worktrees_in,
+    worktree_is_stale_for_test,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -648,4 +649,122 @@ fn orphan_sweep_is_idempotent() {
             );
         }
     }
+}
+
+/// A lease carrying a *malformed* owner line (a truncated write, or tampering)
+/// must fail open. It must never be silently downgraded to the weaker "bare pid"
+/// form and obeyed: an unreadable uid is exactly the case where we cannot tell a
+/// stale lease from a foreign one, so the sweep must keep the worktree.
+#[test]
+fn lease_with_malformed_owner_line_is_refused() {
+    let f = Fixture::new("malformed");
+    let (_branch, dir, pid_file) = f.add_worktree(&unique("malformed"));
+
+    // A DEAD pid, but with a garbage owner line: the stale decision must be
+    // withheld because the lease is not trustworthy, and the worktree kept.
+    std::fs::write(&pid_file, format!("{}\nnot-a-uid", Fixture::DEAD_PID)).unwrap();
+
+    assert!(
+        !worktree_is_stale_for_test(dir.to_str().unwrap()),
+        "a lease with a malformed owner line must not authorise removal"
+    );
+
+    f.sweep();
+    assert!(
+        dir.is_dir(),
+        "malformed-owner lease destroyed the worktree it does not validly describe"
+    );
+    assert!(pid_file.exists(), "malformed lease was removed anyway");
+}
+
+/// The atomic claim succeeds **exactly once**, so of two concurrent sweeps
+/// racing over the same abandoned worktree precisely one may proceed with the
+/// destructive steps. This is the property that makes a reclaim all-or-nothing
+/// instead of two sweeps interleaving their directory/lease/target removals into
+/// a half-reclaimed worktree.
+///
+/// The race itself cannot be provoked from a single-threaded test, so the
+/// primitive is exercised directly: the first claim wins, the second is refused,
+/// and the loser neither duplicates nor destroys the winner's claimed lease.
+#[test]
+fn lease_claim_succeeds_exactly_once() {
+    let f = Fixture::new("claim");
+    let lease = f.base.join(format!("swe-wt-{}.pid", unique("claim")));
+    f.write_dead_lease(&lease);
+
+    let claimed = claim_lease_for_test(&lease).expect("first claim must win");
+    assert!(claimed.exists(), "claim did not move the lease aside");
+    assert!(
+        !lease.exists(),
+        "claiming the lease must take it out of the sweep's namespace"
+    );
+    // The claimed name is inert: it is not a `swe-wt-` directory, so no later
+    // sweep's name-based classifier can mistake it for a worktree or a lease.
+    let name = claimed.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with(".swe-wt-lease-claimed."),
+        "claimed lease must be hidden from the name-based classifier, got {name}"
+    );
+
+    // A second concurrent sweep loses the election and must not touch anything.
+    assert!(
+        claim_lease_for_test(&lease).is_err(),
+        "a second sweep must not be able to claim the same lease"
+    );
+    assert!(
+        claimed.exists(),
+        "the losing claim destroyed the winner's claimed lease"
+    );
+
+    let _ = std::fs::remove_file(&claimed);
+}
+
+/// The claim leaves no debris in the shared scratch directory: the claimed copy
+/// is dropped once the reclaim finishes, so repeated sweeps do not litter a base
+/// dir that every other subagent on the host also writes into.
+#[test]
+fn reclaim_leaves_no_claim_debris() {
+    let f = Fixture::new("debris");
+    let orphan = f.base.join(format!("swe-wt-{}", unique("debris")));
+    let mut pid_name = orphan.clone().into_os_string();
+    pid_name.push(".pid");
+    let pid_file = PathBuf::from(pid_name);
+    std::fs::create_dir_all(&orphan).unwrap();
+    f.write_dead_lease(&pid_file);
+
+    f.sweep();
+    f.sweep();
+
+    assert!(!orphan.exists(), "orphan survived two sweeps");
+    assert!(!pid_file.exists(), "lease survived two sweeps");
+    let leftovers: Vec<String> = std::fs::read_dir(&f.base)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("claimed"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "claim debris left in the base dir: {leftovers:?}"
+    );
+}
+
+/// The target's name may sort before its worktree's name in the directory
+/// stream. Reclamation must remove both regardless of encounter order.
+#[test]
+fn orphan_removes_target_in_custom_base() {
+    let f = Fixture::new("target-order");
+    let orphan = f.base.join(format!("swe-wt-{}", unique("target-order")));
+    let target = f.base.join(format!(
+        "swe-target-{}",
+        orphan.file_name().unwrap().to_str().unwrap()
+    ));
+    let mut name = orphan.clone().into_os_string();
+    name.push(".pid");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    f.write_dead_lease(&PathBuf::from(name));
+    f.sweep();
+    assert!(!orphan.exists());
+    assert!(!target.exists());
 }
