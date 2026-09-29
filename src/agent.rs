@@ -45,15 +45,52 @@ COMMUNICATION WITH ORCHESTRATOR:
   echo "ASK_ORCHESTRATOR: <your specific question>"
   This will immediately pause execution until the orchestrator replies with guidance."#;
 
+/// Chat roles accepted by the OpenAI chat-completions API.
+///
+/// Modelling the role as an enum instead of a free-form `String` turns an
+/// invalid role from a provider-side `400` into a compile error: the wire
+/// strings are pinned by `rename_all = "lowercase"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    /// The exact string the chat API expects for this role.
+    ///
+    /// Kept in lockstep with the `rename_all = "lowercase"` derive and asserted
+    /// against it in the tests, so there is a single source of truth for the
+    /// wire spelling.
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+/// A single outbound conversation message.
+///
+/// All fields are private so that the three constructors below are the *only*
+/// way to build one. That closes the invalid states an all-`pub` struct allows
+/// (a `tool` message with no `tool_call_id`, an `assistant` message with
+/// `tool_calls: Some(vec![])`), while keeping the per-field
+/// `skip_serializing_if` needed for each role's wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
+    role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    tool_call_id: Option<String>,
 }
 
 /// Outbound tool_call representation for assistant messages in the conversation history
@@ -64,6 +101,13 @@ pub struct ToolCall {
     pub function: ToolCallFn,
 }
 
+/// The nested `function` object of a [`ToolCall`].
+///
+/// The OpenAI wire format nests the call one level deep
+/// (`{"id":..,"type":"function","function":{"name":..,"arguments":..}}`), so
+/// this struct is load-bearing rather than a premature abstraction. It is also
+/// reused by the non-streaming inbound path ([`ToolCallOutput`]) to avoid
+/// duplicating a structurally identical type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFn {
     pub name: String,
@@ -71,45 +115,92 @@ pub struct ToolCallFn {
 }
 
 impl ChatMessage {
-    pub fn text(role: &str, content: impl Into<String>) -> Self {
+    /// A plain single-content message: the shape used by `system`, `user` and
+    /// `assistant` turns. `tool` content must go through [`Self::tool_result`],
+    /// which also records the `tool_call_id` the API requires.
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        debug_assert_ne!(
+            role,
+            Role::Tool,
+            "tool messages require a tool_call_id; use ChatMessage::tool_result"
+        );
         Self {
-            role: role.into(),
+            role,
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
     }
 
+    /// An assistant turn that requests tool execution.
+    ///
+    /// `content` is `None` when the model emitted tool calls with no prose, in
+    /// which case the field is omitted on the wire. An empty `tool_calls` vec is
+    /// normalised to `None` so the API never sees a call-less assistant turn
+    /// carrying an empty array.
     pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: Role::Assistant,
             content,
-            tool_calls: Some(tool_calls),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: None,
         }
     }
 
+    /// The `tool` turn that answers a previous tool call, keyed by its id.
     pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
+            role: Role::Tool,
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
         }
     }
+
+    /// Read-only view of the (already validated) role.
+    ///
+    /// The field itself is private; this accessor exists so callers and tests can
+    /// observe the role without being able to set an arbitrary one.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// The message content, if any.
+    pub fn content(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
 }
 
-#[derive(Debug, Serialize)]
-struct ToolFunction {
-    name: &'static str,
-    description: &'static str,
-    parameters: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolDefinition {
-    r#type: &'static str,
-    function: ToolFunction,
+/// The single tool this agent advertises to the provider.
+///
+/// Per §2 of `audits/overeng_01_agent_structs.md`, `agent.rs` deliberately holds
+/// no tool *schema* types — the dedicated `ToolDefinition`/`ToolFunction` pair
+/// that used to wrap this single constant is gone, and the request DTO now
+/// carries a ready-made `Vec<serde_json::Value>`.
+///
+/// If a second tool is ever needed (write file, search, MCP passthrough) the fix
+/// is **not** to reintroduce a schema struct here, but to promote the tool
+/// catalog in `manifest.rs` (today only a rendered `String` from
+/// `build_tool_description()`) into a real descriptor type and render it into
+/// `Vec<Value>` at this boundary.
+fn bash_tool() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command in the repository working directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    })]
 }
 
 #[derive(Debug, Serialize)]
@@ -118,7 +209,10 @@ struct ChatCompletionRequest<'a> {
     messages: &'a [ChatMessage],
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
-    tools: &'a [ToolDefinition],
+    // `<[_]>::is_empty` rather than `Vec::is_empty`: serde hands the predicate a
+    // `&&[Value]`, and slices are what this borrowed request DTO stores.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tools: &'a [serde_json::Value],
     stream: bool,
 }
 
@@ -176,13 +270,9 @@ struct ChatMessageOutput {
 #[derive(Debug, Clone, Deserialize)]
 struct ToolCallOutput {
     id: String,
-    function: ToolCallFunction,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ToolCallFunction {
-    name: String,
-    arguments: String,
+    // Same object as the outbound `ToolCall::function`; reusing `ToolCallFn`
+    // removes a structurally identical struct without any `Option` juggling.
+    function: ToolCallFn,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,29 +342,13 @@ impl AgentRunner {
             self.temperature.or(Some(0.2))
         };
 
-        let bash_tool = ToolDefinition {
-            r#type: "function",
-            function: ToolFunction {
-                name: "bash",
-                description: "Execute a bash command in the repository working directory",
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The bash command to execute"
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            },
-        };
+        let tools = bash_tool();
 
         let payload = ChatCompletionRequest {
             model: &self.model,
             messages,
             temperature,
-            tools: &[bash_tool],
+            tools: &tools,
             stream: true,
         };
 
@@ -848,7 +922,7 @@ pub fn find_git_common_dir(worktree_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentRunner, BASH_BLOCK_RE};
+    use super::{AgentRunner, ChatCompletionRequest, ChatMessage, Role, BASH_BLOCK_RE};
 
     fn runner() -> AgentRunner {
         AgentRunner::new(
@@ -857,6 +931,132 @@ mod tests {
             "test-model".to_string(),
             None,
         )
+    }
+
+    /// The `tools` array must keep the exact OpenAI function-calling shape after
+    /// `ToolDefinition`/`ToolFunction` were inlined, and must be omitted when
+    /// the slice is empty (a behaviour the old always-one-element slice could not
+    /// express).
+    #[test]
+    fn test_chat_completion_request_tools_wire_shape() {
+        let messages = [ChatMessage::text(Role::User, "hi")];
+        let tools = super::bash_tool();
+
+        let with_tools = ChatCompletionRequest {
+            model: "test-model",
+            messages: &messages,
+            temperature: Some(0.2),
+            tools: &tools,
+            stream: true,
+        };
+        let body = serde_json::to_string(&with_tools).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // `serde_json::Value` objects are sorted maps (no `preserve_order`
+        // feature), so the emitted key order is deterministic even though the
+        // literal in `bash_tool()` is written in OpenAI spec order.
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"#,
+                r#""temperature":0.2,"tools":[{"function":{"description":"Execute a "#,
+                r#"bash command in the repository working directory","name":"bash","#,
+                r#""parameters":{"properties":{"command":{"description":"The bash "#,
+                r#"command to execute","type":"string"}},"required":["command"],"#,
+                r#""type":"object"}},"type":"function"}],"stream":true}"#
+            ),
+            "request body drifted from the pinned wire shape"
+        );
+        let tool = &value["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "bash");
+        assert_eq!(
+            tool["function"]["description"],
+            "Execute a bash command in the repository working directory"
+        );
+        assert_eq!(tool["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["command"]["type"],
+            "string"
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["required"],
+            serde_json::json!(["command"])
+        );
+
+        let no_tools: Vec<serde_json::Value> = Vec::new();
+        let without_tools = ChatCompletionRequest {
+            model: "test-model",
+            messages: &messages,
+            temperature: None,
+            tools: &no_tools,
+            stream: true,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&without_tools).unwrap()).unwrap();
+        assert!(
+            value.get("tools").is_none(),
+            "empty tool slice must be omitted, got {value}"
+        );
+        assert!(value.get("temperature").is_none());
+    }
+
+    /// `Role` serializes to the lowercase strings the API expects; the enum is
+    /// the only source of role values now, so this pins the wire contract.
+    #[test]
+    fn test_role_wire_strings() {
+        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
+            let expected = role.as_wire_str();
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{expected}\""));
+            let back: Role = serde_json::from_str(&format!("\"{expected}\"")).unwrap();
+            assert_eq!(back, role);
+        }
+    }
+
+    /// The inbound non-streaming fallback reuses `ToolCallFn` for
+    /// `ToolCallOutput.function`; it must still parse the OpenAI shape.
+    #[test]
+    fn test_non_stream_tool_call_output_parses() {
+        let raw = r#"{
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+                    }]
+                }
+            }]
+        }"#;
+        let parsed: super::ChatCompletionResponse = serde_json::from_str(raw).unwrap();
+        let choice = parsed.choices.first().unwrap();
+        assert!(choice.message.content.is_none());
+        let tc = &choice.message.tool_calls[0];
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.function.name, "bash");
+        assert_eq!(tc.function.arguments, r#"{"command":"ls"}"#);
+    }
+
+    /// `text(Role::Tool, ..)` is the one misuse the type system alone cannot
+    /// catch (the role is legal, but a `tool` message also needs a
+    /// `tool_call_id`), so the constructor asserts against it. Debug builds
+    /// panic; release builds keep the previous behaviour of emitting a
+    /// `tool_call_id`-less tool message rather than failing the whole turn.
+    #[test]
+    #[should_panic(expected = "tool messages require a tool_call_id")]
+    fn test_text_rejects_tool_role() {
+        let _ = ChatMessage::text(Role::Tool, "raw output");
+    }
+
+    /// An assistant turn must never carry `tool_calls: []`, which the API
+    /// rejects; the constructor normalises it to an omitted field.
+    #[test]
+    fn test_assistant_with_empty_tool_calls_is_normalised() {
+        let msg = ChatMessage::assistant_with_tool_calls(Some("thinking".into()), Vec::new());
+        let value: serde_json::Value = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(msg.role(), Role::Assistant);
+        assert!(value.get("tool_calls").is_none(), "got {value}");
+        assert_eq!(value["content"], "thinking");
     }
 
     #[test]

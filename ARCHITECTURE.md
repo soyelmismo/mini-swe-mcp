@@ -48,8 +48,12 @@ To prevent host resource saturation when fanning out dozens of parallel subagent
 The agent runner interacts with OpenAI-compatible endpoints using native Server-Sent Events (SSE) streaming and the official `tool_calls` format:
 
 1. **Protocol State**:
+   - `ChatMessage::text(role, content)`: a `system` / `user` / `assistant` turn.
    - `ChatMessage::assistant_with_tool_calls(content, tool_calls)`: records model intent.
    - `ChatMessage::tool_result(tool_call_id, content)`: records bash execution result matching the unique tool call ID.
+   - The role is a validated `Role` enum, not a free-form `String`, and every `ChatMessage` field is
+     private: the three constructors above are the only way to build a message, so an invalid role or
+     a malformed tool pairing is a compile error rather than a provider-side `400`.
    - Fallback parser: transparently handles models that output markdown code blocks instead of structured tool calls.
 2. **SSE Streaming & Immediate Abort**:
    - `reqwest` stream reader processes chunks via `resp.chunk().await`.
