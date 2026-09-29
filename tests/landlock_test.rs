@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 
 use mini_swe_mcp::agent::AgentRunner;
 use mini_swe_mcp::agent::sandbox::{
-    DISABLE_LANDLOCK_ENV, LandlockPlan, apply_landlock_sandbox, build_landlock_plan, has_bwrap,
+    DISABLE_LANDLOCK_ENV, LandlockPlan, build_landlock_plan, has_bwrap,
 };
 
 #[test]
 fn sandbox_module_is_exported_with_its_opt_out_knob() {
     assert_eq!(DISABLE_LANDLOCK_ENV, "SWE_DISABLE_LANDLOCK");
-    // Referencing the function is enough: it must be nameable from outside.
-    let _f: fn(&Path, &Path) -> anyhow::Result<()> = apply_landlock_sandbox;
+    // Referencing the plan builder is enough: it must be nameable from outside.
+    let _f: fn(&Path, &Path) -> anyhow::Result<Option<LandlockPlan>> = build_landlock_plan;
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn a_missing_worktree_is_an_error_for_external_callers() {
     let missing = std::env::temp_dir().join("landlock-it-does-not-exist");
     assert!(!missing.exists());
     let target = std::env::temp_dir();
-    let err = apply_landlock_sandbox(&missing, &target).unwrap_err();
+    let err = build_landlock_plan(&missing, &target).unwrap_err();
     assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
 }
 
