@@ -23,9 +23,7 @@
 //! These are exercised through the public library surface only, i.e. the same
 //! way `src/mcp/` and `src/main.rs` consume the manifest.
 
-use mini_swe_mcp::manifest::{
-    DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest,
-};
+use mini_swe_mcp::manifest::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest};
 use std::collections::HashMap;
 
 /// Build a `ModelDefinition` with every field filled in.
@@ -40,6 +38,7 @@ fn definition(
         role: role.map(str::to_string),
         temperature,
         max_turns,
+        policy: None,
     }
 }
 
@@ -1005,4 +1004,154 @@ models:
 "#,
     );
     assert!(manifest.validate().is_empty());
+}
+
+// ----------
+// 5. Declarative execution policy (`policy:` block)
+// ----------
+
+#[test]
+fn test_manifest_parses_optional_model_level_policy() {
+    let manifest = parse_manifest(
+        r#"
+models:
+  sealed:
+    id: vendor:sealed
+    role: "Isolated refactor."
+    policy:
+      network: "offline"
+      fs: "read-only"
+  runner:
+    id: vendor:runner
+    role: "Builds and tests."
+    policy:
+      network: "allow"
+      fs: "worktree-only"
+  bare:
+    id: vendor:bare
+"#,
+    );
+
+    let sealed = manifest.models["sealed"]
+        .policy
+        .as_ref()
+        .expect("sealed policy");
+    assert_eq!(sealed.network.as_ref().map(|n| n.as_str()), Some("offline"));
+    assert_eq!(sealed.fs.as_ref().map(|f| f.as_str()), Some("read-only"));
+
+    let runner = manifest.models["runner"]
+        .policy
+        .as_ref()
+        .expect("runner policy");
+    assert_eq!(runner.network.as_ref().map(|n| n.as_str()), Some("allow"));
+    assert_eq!(
+        runner.fs.as_ref().map(|f| f.as_str()),
+        Some("worktree-only")
+    );
+
+    assert_eq!(
+        manifest.models["bare"].policy, None,
+        "a pre-policy entry must still parse, with no policy declared"
+    );
+    assert!(
+        manifest.validate().is_empty(),
+        "documented policy values must not warn: {:?}",
+        manifest.validate()
+    );
+}
+
+#[test]
+fn test_policy_is_validated_and_repaired_without_failing_the_load() {
+    // A bad policy value must not make the manifest unparseable: the rest of the
+    // catalog still has to be served, with the bad value named in a warning.
+    let manifest = parse_manifest(
+        r#"
+default: sealed
+models:
+  sealed:
+    id: vendor:sealed
+    policy:
+      network: "offine"
+      fs: "unrestricted"
+"#,
+    );
+
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("offine")),
+        "the misspelled network value must be reported: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("unrestricted")),
+        "the unknown fs value must be reported: {warnings:?}"
+    );
+
+    let normalized = manifest.normalized();
+    let policy = normalized.models["sealed"].policy.as_ref().expect("policy");
+    assert_eq!(
+        policy.network.as_ref().map(|n| n.as_str()),
+        Some("offline"),
+        "an unrecognised network must be repaired to the restrictive default"
+    );
+    assert_eq!(
+        policy.fs.as_ref().map(|f| f.as_str()),
+        Some("read-only"),
+        "an unrecognised fs value must be repaired to the restrictive default"
+    );
+    assert!(
+        normalized.validate().is_empty(),
+        "normalize must repair everything it reports: {:?}",
+        normalized.validate()
+    );
+}
+
+#[test]
+fn test_backward_compatible_manifest_has_no_policy_and_no_warnings() {
+    // Exactly a pre-policy models.yaml: nothing here may change behaviour.
+    let manifest = parse_manifest(
+        r#"
+default: ninja
+models:
+  ninja:
+    id: combo:ninja
+    role: "Fast subagent."
+    temperature: 0.2
+    max_turns: 150
+  nerd:
+    id: combo:nerd
+    role: "Deep reasoner."
+    temperature: 0.6
+    max_turns: 200
+"#,
+    );
+
+    assert!(manifest.models.values().all(|d| d.policy.is_none()));
+    assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+    assert_eq!(
+        manifest.resolve_model("ninja"),
+        ("combo:ninja".to_string(), Some(0.2), Some(150)),
+        "resolution must be unaffected by the absent policy"
+    );
+}
+
+#[test]
+fn test_shipped_models_yaml_is_valid_and_policy_annotated() {
+    let manifest = ModelManifest::from_path(std::path::Path::new("models.yaml"))
+        .expect("the shipped models.yaml must load");
+
+    assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+    for alias in ["ninja", "nerd"] {
+        let policy = manifest.models[alias]
+            .policy
+            .as_ref()
+            .unwrap_or_else(|| panic!("{alias} must declare a policy"));
+        assert!(
+            policy.network.as_ref().is_some_and(|n| n.is_declared()),
+            "{alias} must declare a known network policy"
+        );
+        assert!(
+            policy.fs.as_ref().is_some_and(|f| f.is_declared()),
+            "{alias} must declare a known fs policy"
+        );
+    }
 }

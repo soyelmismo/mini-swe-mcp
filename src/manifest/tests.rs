@@ -11,10 +11,10 @@
 //! every manifest instance in the process.
 
 use super::{
-    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE, MEMORY_DIR,
-    MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, agent_memory_path,
-    append_agent_memory, build_system_prompt, catalog::catalog_row, catalog_cache_len,
-    clear_catalog_cache, load_agent_memory,
+    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE,
+    MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, MEMORY_DIR, ModelDefinition, ModelManifest,
+    agent_memory_path, append_agent_memory, build_system_prompt, catalog::catalog_row,
+    catalog_cache_len, clear_catalog_cache, load_agent_memory,
 };
 
 fn single(definition: ModelDefinition) -> ModelManifest {
@@ -91,6 +91,7 @@ fn test_resolve_model() {
             role: None,
             temperature: None,
             max_turns: None,
+            policy: None,
         },
     );
     let sparse = ModelManifest {
@@ -140,6 +141,7 @@ fn test_tool_description_role_fallback() {
             role: None,
             temperature: Some(0.9),
             max_turns: Some(7),
+            policy: None,
         },
     );
     let manifest = ModelManifest {
@@ -223,6 +225,7 @@ fn test_normalize_repairs_every_fixable_warning() {
             role: None,
             temperature: Some(9.0),
             max_turns: Some(0),
+            policy: None,
         },
     );
     models.insert(
@@ -232,6 +235,7 @@ fn test_normalize_repairs_every_fixable_warning() {
             role: None,
             temperature: Some(f32::NAN),
             max_turns: Some(usize::MAX),
+            policy: None,
         },
     );
     let manifest = ModelManifest {
@@ -281,6 +285,7 @@ fn test_normalize_keeps_a_resolvable_default_and_is_idempotent() {
         role: None,
         temperature: Some(0.4),
         max_turns: Some(7),
+        policy: None,
     });
 
     let normalized = manifest.normalized();
@@ -305,6 +310,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
             role: None,
             temperature: None,
             max_turns: None,
+            policy: None,
         },
     );
     let manifest = ModelManifest {
@@ -330,6 +336,7 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
                     role: None,
                     temperature: None,
                     max_turns: Some(0),
+                    policy: None,
                 },
             );
         }
@@ -361,7 +368,9 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
 
 #[test]
 fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
-    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = super::cache::TEST_CACHE_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     let a = ModelDefinition {
@@ -369,18 +378,21 @@ fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
         role: Some("Role A.".to_string()),
         temperature: None,
         max_turns: None,
+        policy: None,
     };
     let b = ModelDefinition {
         id: "vendor:b".to_string(),
         role: Some("Role A.".to_string()),
         temperature: None,
         max_turns: None,
+        policy: None,
     };
     let no_role = ModelDefinition {
         id: "vendor:a".to_string(),
         role: None,
         temperature: None,
         max_turns: None,
+        policy: None,
     };
 
     let first = catalog_row("a", &a);
@@ -409,7 +421,9 @@ fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
 /// would have split them into two entries holding the same bytes.
 #[test]
 fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
-    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = super::cache::TEST_CACHE_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     let implicit = ModelDefinition {
@@ -417,6 +431,7 @@ fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
         role: None,
         temperature: None,
         max_turns: None,
+        policy: None,
     };
     let explicit = ModelDefinition {
         role: Some(DEFAULT_ROLE.to_string()),
@@ -433,7 +448,9 @@ fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
 
 #[test]
 fn test_catalog_cache_stays_bounded() {
-    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = super::cache::TEST_CACHE_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     for i in 0..(CATALOG_CACHE_CAPACITY + 8) {
@@ -442,6 +459,7 @@ fn test_catalog_cache_stays_bounded() {
             role: Some("Role.".to_string()),
             temperature: None,
             max_turns: None,
+            policy: None,
         };
         let row = catalog_row(&format!("alias{i}"), &def);
         assert_eq!(&*row, format!("- `alias{i}` (id: `vendor:id{i}`): Role.\n"));
@@ -463,6 +481,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
             role: None,
             temperature: Some(0.9),
             max_turns: Some(9),
+            policy: None,
         },
     );
     models.insert(
@@ -472,6 +491,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
             role: None,
             temperature: Some(0.1),
             max_turns: Some(1),
+            policy: None,
         },
     );
     let manifest = ModelManifest {
@@ -505,6 +525,7 @@ fn test_validate_flags_duplicate_model_ids() {
                 role: None,
                 temperature: Some(temperature),
                 max_turns: None,
+                policy: None,
             },
         );
     }
@@ -533,6 +554,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
                 role: Some("Role.".to_string()),
                 temperature: None,
                 max_turns: None,
+                policy: None,
             },
         );
     }
@@ -682,7 +704,10 @@ fn test_load_agent_memory_reads_the_role_file() {
     .expect("fixture written");
 
     let memory = load_agent_memory(&repo.path, "ninja").expect("memory is loaded");
-    assert_eq!(memory, "- Run `cargo test --all-targets` before declaring success.");
+    assert_eq!(
+        memory,
+        "- Run `cargo test --all-targets` before declaring success."
+    );
 
     // Memory is per role: another alias of the same repo has none.
     assert_eq!(load_agent_memory(&repo.path, "nerd"), None);
@@ -745,8 +770,7 @@ fn test_append_agent_memory_creates_and_appends() {
     // The directory is created on demand, at the documented location.
     assert!(repo.memory_dir().join("ninja.md").is_file());
 
-    append_agent_memory(&repo.path, "ninja", "Prefer the smallest diff.")
-        .expect("second append");
+    append_agent_memory(&repo.path, "ninja", "Prefer the smallest diff.").expect("second append");
 
     let memory = load_agent_memory(&repo.path, "ninja").expect("memory exists");
     assert!(memory.contains("Both clippy and cargo test must pass."));
@@ -755,8 +779,7 @@ fn test_append_agent_memory_creates_and_appends() {
     assert_eq!(memory.lines().filter(|l| l.starts_with("- ")).count(), 2);
     // A second role has its own, independent file.
     assert_eq!(load_agent_memory(&repo.path, "nerd"), None);
-    append_agent_memory(&repo.path, "nerd", "Reproduce before you patch.")
-        .expect("nerd append");
+    append_agent_memory(&repo.path, "nerd", "Reproduce before you patch.").expect("nerd append");
     let nerd = load_agent_memory(&repo.path, "nerd").expect("nerd memory");
     assert!(nerd.contains("Reproduce before you patch."));
     assert!(!nerd.contains("smallest diff"));
@@ -799,16 +822,15 @@ fn test_loaded_memory_is_bounded() {
     while note.len() < MAX_MEMORY_PROMPT_BYTES * 2 {
         note.push_str("- filler takeaway that keeps the memory file growing\n");
     }
-    std::fs::write(
-        agent_memory_path(&repo.path, "ninja").expect("path"),
-        &note,
-    )
-    .expect("fixture written");
+    std::fs::write(agent_memory_path(&repo.path, "ninja").expect("path"), &note)
+        .expect("fixture written");
 
     let memory = load_agent_memory(&repo.path, "ninja").expect("memory is loaded");
     assert!(memory.len() <= MAX_MEMORY_PROMPT_BYTES);
     assert!(
-        memory.lines().all(|line| line.starts_with("- ") || line.is_empty()),
+        memory
+            .lines()
+            .all(|line| line.starts_with("- ") || line.is_empty()),
         "the cut must land on a line boundary: {memory:?}"
     );
     assert!(!memory.contains("filler takeaway") || memory.len() < note.len());
@@ -900,5 +922,296 @@ fn test_concurrent_appends_do_not_lose_notes() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| name.ends_with(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "staging debris left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "staging debris left behind: {leftovers:?}"
+    );
+}
+
+// ----------
+// Declarative execution policy (`policy:` in models.yaml)
+// ----------
+
+use crate::manifest::{ExecutionPolicy, FS_POLICIES, FsPolicy, NETWORK_POLICIES, NetworkPolicy};
+
+/// Parse a single-entry manifest carrying the given `policy:` block body.
+fn policy_manifest(block: &str) -> ModelManifest {
+    let yaml = format!("models:\n  solo:\n    id: combo:solo\n{block}");
+    serde_yaml::from_str(&yaml).expect("policy manifest must parse")
+}
+
+#[test]
+fn test_a_model_without_a_policy_stays_none_and_warns_about_nothing() {
+    let manifest = policy_manifest("");
+
+    assert_eq!(
+        manifest.models["solo"].policy, None,
+        "an entry that never declared a policy must parse to None, so a \
+         models.yaml written before policies existed behaves unchanged"
+    );
+    assert!(
+        manifest.validate().is_empty(),
+        "a manifest without policies must stay warning-free: {:?}",
+        manifest.validate()
+    );
+    assert_eq!(
+        manifest.normalized().models["solo"].policy,
+        None,
+        "None must survive normalization, so \"declared nothing\" stays \
+         distinguishable from \"declared the default\""
+    );
+}
+
+#[test]
+fn test_every_declared_policy_value_is_accepted_verbatim() {
+    let def = |id: &str, network: NetworkPolicy, fs: FsPolicy| ModelDefinition {
+        id: id.to_string(),
+        role: None,
+        temperature: None,
+        max_turns: None,
+        policy: Some(ExecutionPolicy {
+            network: Some(network),
+            fs: Some(fs),
+        }),
+    };
+    let manifest = ModelManifest {
+        default: None,
+        models: [
+            (
+                "a".to_string(),
+                def("combo:a", NetworkPolicy::Offline, FsPolicy::ReadOnly),
+            ),
+            (
+                "b".to_string(),
+                def("combo:b", NetworkPolicy::Allow, FsPolicy::Full),
+            ),
+            (
+                "c".to_string(),
+                def("combo:c", NetworkPolicy::Allow, FsPolicy::WorktreeOnly),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    assert!(
+        manifest.validate().is_empty(),
+        "every documented policy value must be accepted: {:?}",
+        manifest.validate()
+    );
+    assert_eq!(
+        manifest.normalized().models["a"].policy,
+        manifest.models["a"].policy,
+        "an already-valid policy must survive normalization byte-for-byte"
+    );
+}
+
+#[test]
+fn test_policy_round_trips_through_yaml() {
+    for (network, fs) in [
+        ("offline", "read-only"),
+        ("allow", "worktree-only"),
+        ("allow", "full"),
+    ] {
+        let manifest = policy_manifest(&format!(
+            "    policy:\n      network: {network}\n      fs: {fs}\n"
+        ));
+        let policy = manifest.models["solo"]
+            .policy
+            .clone()
+            .expect("the policy block must parse");
+        assert_eq!(
+            policy.network.as_ref().map(NetworkPolicy::as_str),
+            Some(network)
+        );
+        assert_eq!(policy.fs.as_ref().map(FsPolicy::as_str), Some(fs));
+        assert!(
+            manifest.validate().is_empty(),
+            "{network}/{fs} is a documented policy and must not warn"
+        );
+    }
+}
+
+#[test]
+fn test_an_unknown_policy_value_warns_and_repairs_to_the_restrictive_default() {
+    let manifest =
+        policy_manifest("    policy:\n      network: \"offine\"\n      fs: \"everything\"\n");
+
+    let warnings = manifest.validate();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "both misspelled fields must be reported: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("offine")),
+        "the network warning must name the value the user wrote: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("everything")),
+        "the fs warning must name the value the user wrote: {warnings:?}"
+    );
+
+    let policy = manifest.normalized().models["solo"]
+        .policy
+        .clone()
+        .expect("still a policy after repair");
+    assert_eq!(
+        policy.network,
+        Some(NetworkPolicy::Offline),
+        "an unknown network must fall back to the restrictive default, never \
+         to the permissive one: a typo must not widen a sandbox"
+    );
+    assert_eq!(
+        policy.fs,
+        Some(FsPolicy::ReadOnly),
+        "an unknown fs value must fall back to the restrictive default"
+    );
+    assert!(
+        manifest.normalized().validate().is_empty(),
+        "every reported policy warning must be repaired by normalize"
+    );
+}
+
+#[test]
+fn test_policy_values_are_matched_case_insensitively_and_after_trimming() {
+    let manifest = policy_manifest("    policy:\n      network: \"  Offline \"\n");
+
+    assert!(
+        manifest.validate().is_empty(),
+        "whitespace and case must not turn a valid policy into a warning: {:?}",
+        manifest.validate()
+    );
+    assert_eq!(
+        manifest.normalized().models["solo"]
+            .policy
+            .as_ref()
+            .and_then(|p| p.network.as_ref())
+            .map(NetworkPolicy::as_str),
+        Some("offline"),
+        "a case-insensitive match must still normalize to the canonical spelling"
+    );
+}
+
+#[test]
+fn test_shipped_models_yaml_declares_an_explicit_policy_for_both_roles() {
+    let manifest = ModelManifest::from_path(std::path::Path::new("models.yaml"))
+        .expect("the shipped models.yaml must load");
+
+    for alias in ["ninja", "nerd"] {
+        let policy = manifest.models[alias]
+            .policy
+            .clone()
+            .unwrap_or_else(|| panic!("{alias} must declare an explicit policy"));
+        assert!(
+            policy
+                .network
+                .as_ref()
+                .is_some_and(NetworkPolicy::is_declared),
+            "{alias} must declare a known network policy"
+        );
+        assert!(
+            policy.fs.as_ref().is_some_and(FsPolicy::is_declared),
+            "{alias} must declare a known fs policy"
+        );
+    }
+    assert!(
+        manifest.validate().is_empty(),
+        "the shipped models.yaml must be warning-free: {:?}",
+        manifest.validate()
+    );
+}
+
+#[test]
+fn test_the_advertised_policy_lists_match_the_parsed_grammar() {
+    // `NETWORK_POLICIES` / `FS_POLICIES` are what the warning messages print, so
+    // a value the parser accepts but the list omits (or vice versa) would make
+    // the message either incomplete or a lie.
+    for value in NETWORK_POLICIES {
+        assert!(
+            matches!(
+                NetworkPolicy::parse(value),
+                NetworkPolicy::Allow | NetworkPolicy::Offline
+            ),
+            "{value:?} is advertised as a network policy but does not parse as one",
+        );
+    }
+    for value in FS_POLICIES {
+        assert!(
+            !matches!(FsPolicy::parse(value), FsPolicy::Other(..)),
+            "{value:?} is advertised as an fs policy but does not parse as one",
+        );
+    }
+
+    // Every variant the parser can produce is advertised, so a *new* mode cannot
+    // be added without also updating the user-facing list.
+    for variant in [NetworkPolicy::Offline, NetworkPolicy::Allow] {
+        let name = variant.as_str();
+        assert!(
+            NETWORK_POLICIES.contains(&name),
+            "{name:?} parses as a policy but is not in NETWORK_POLICIES",
+        );
+    }
+    for variant in [FsPolicy::ReadOnly, FsPolicy::WorktreeOnly, FsPolicy::Full] {
+        let name = variant.as_str();
+        assert!(
+            FS_POLICIES.contains(&name),
+            "{name:?} parses as a policy but is not in FS_POLICIES",
+        );
+    }
+}
+
+#[test]
+fn test_model_level_network_policies_match_the_dispatch_network_modes() {
+    // `policy.network` and the `network` argument of the `worker` tool are the
+    // same switch spelled in two places, so a value accepted by one and
+    // rejected by the other would be a trap. They are kept as two constants (the
+    // manifest must not depend on `mcp` and vice versa), so pin them here.
+    assert_eq!(
+        NETWORK_POLICIES,
+        crate::mcp::NETWORK_MODES,
+        "models.yaml policy.network and the dispatch tool advertise different values",
+    );
+    for mode in crate::mcp::NETWORK_MODES {
+        assert!(
+            matches!(
+                NetworkPolicy::parse(mode),
+                NetworkPolicy::Allow | NetworkPolicy::Offline
+            ),
+            "{mode:?} is a dispatch network mode but not a valid models.yaml policy",
+        );
+    }
+}
+
+#[test]
+fn test_normalizing_an_undeclared_or_empty_policy_preserves_the_declaration_shape() {
+    // "declared nothing" and "declared nothing useful" are different states and
+    // neither is repaired into the other: a `None` policy stays `None`, and an
+    // empty block stays an (empty) `Some` so the distinction survives normalize.
+    let absent = policy_manifest("");
+    assert_eq!(absent.models["solo"].policy, None);
+
+    let empty = policy_manifest("    policy: {}\n");
+    let policy = empty.models["solo"].policy.clone().expect("a policy block");
+    assert!(
+        policy.is_empty(),
+        "an empty block declares nothing: {policy:?}"
+    );
+
+    let normalized = empty.normalized();
+    assert_eq!(
+        normalized.models["solo"].policy,
+        Some(ExecutionPolicy::default()),
+        "an empty block is still a declared (if empty) policy",
+    );
+    assert!(
+        normalized.validate().is_empty(),
+        "an empty policy block has nothing to warn about",
+    );
+
+    assert_eq!(
+        absent.normalized().models["solo"].policy,
+        None,
+        "normalize must never invent a policy the manifest did not declare",
+    );
 }

@@ -273,12 +273,36 @@ models:
     role: "Fast, precise, low-token autonomous execution for targeted fixes and audits."
     temperature: 0.2
     max_turns: 50
+    policy:
+      network: "allow"
+      fs: "full"
   nerd:
     id: combo:nerd
     role: "Deep architectural reasoning, extensive documentation, and heavy refactors."
     temperature: 0.6
     max_turns: 100
+    policy:
+      network: "allow"
+      fs: "full"
 ```
+
+### Execution policy
+
+A model entry may declare the execution policy its workers run under. Both
+fields are optional, and an entry without a `policy:` block keeps the runtime
+defaults, so a manifest written before this block existed is still valid:
+
+| Field | Accepted values | Meaning |
+|-------|-----------------|---------|
+| `network` | `"offline"` \| `"allow"` | `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool. |
+| `fs` | `"read-only"` \| `"worktree-only"` \| `"full"` | How much of the filesystem a worker may write, from least to most capable. |
+
+Values are trimmed and matched case-insensitively, so `Offline` and
+`" worktree_only "` are accepted. An **unknown value never fails the load**: it is
+reported as a warning naming the exact text you wrote and is repaired to the
+*restrictive* default (`offline` / `read-only`), so a typo can never quietly widen
+a sandbox. Warnings are emitted on startup, alongside the existing manifest
+checks (temperature bounds, turn budgets, duplicate ids).
 
 ---
 

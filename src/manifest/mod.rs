@@ -11,6 +11,8 @@
 //!   payload ([`ModelManifest::build_tool_description`]).
 //! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
 //!   loaded into a worker's system prompt.
+//! * `rules` — the accept/reject rules for the optional declarative execution
+//!   policy (`policy.network`, `policy.fs`) and the fixups that repair them.
 //! * `validate` — the advisory warning rules and the fixups that repair what
 //!   they report.
 //! * `tests` — the package unit tests (compiled only under `cfg(test)`).
@@ -19,7 +21,6 @@
 //! loading ([`ModelManifest::load`], [`ModelManifest::from_path`]) and id
 //! resolution ([`ModelManifest::resolve_model`]), the entry points the rest of
 //! the crate uses.
-
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -30,21 +31,21 @@ use crate::config::xdg_config_dir;
 mod cache;
 mod catalog;
 mod memory;
+mod rules;
 mod types;
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
-pub use self::cache::{
-    catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY,
-};
+pub use self::cache::{CATALOG_CACHE_CAPACITY, catalog_cache_len, clear_catalog_cache};
 pub use self::catalog::build_system_prompt;
 pub use self::memory::{
-    MEMORY_DIR, MAX_MEMORY_PROMPT_BYTES, agent_memory_path, append_agent_memory, load_agent_memory,
+    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, append_agent_memory, load_agent_memory,
 };
 pub use self::types::{
-    ModelDefinition, ModelManifest, BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, FS_POLICIES, FsPolicy,
+    MAX_TURNS_LIMIT, ModelDefinition, ModelManifest, NETWORK_POLICIES, NetworkPolicy,
     TEMPERATURE_RANGE,
 };
 

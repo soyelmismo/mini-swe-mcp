@@ -6,11 +6,13 @@
 //! taking the server down. [`ModelManifest::normalize`] then applies the
 //! mechanical fixups, and [`ModelManifest::sanitize_temperature`] /
 //! [`ModelManifest::sanitize_max_turns`] are the per-value rules the rest of
-//! the crate calls directly (see `mcp.rs`).
+//! the crate calls directly (see `mcp.rs`). The rules for the optional
+//! declarative execution policy live in their own `rules` submodule, which this
+//! one calls into for both the warning and the fixup.
 
 use std::collections::BTreeMap;
 
-use super::types::{ModelManifest, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT};
+use super::types::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelManifest};
 
 impl ModelManifest {
     /// Collect human-readable warnings about suspicious manifest entries.
@@ -92,6 +94,13 @@ impl ModelManifest {
                 )),
                 _ => {}
             }
+
+            // Declarative execution policy (see the `rules` submodule). A model
+            // with no `policy:` block contributes nothing, which is what keeps a
+            // pre-policy manifest warning-free.
+            if let Some(policy) = &def.policy {
+                warnings.extend(Self::validate_policy(alias, policy));
+            }
         }
 
         warnings
@@ -108,7 +117,10 @@ impl ModelManifest {
         if !t.is_finite() {
             return None;
         }
-        Some(t.clamp(*super::TEMPERATURE_RANGE.start(), *super::TEMPERATURE_RANGE.end()))
+        Some(t.clamp(
+            *super::TEMPERATURE_RANGE.start(),
+            *super::TEMPERATURE_RANGE.end(),
+        ))
     }
 
     /// Resolve the turn budget from both ingresses, filtering a useless `0`
@@ -132,8 +144,10 @@ impl ModelManifest {
 
     /// Apply every fixup that [`ModelManifest::validate`] reports.
     ///
-    /// Each *fixable* warning is paired with a repair: invalid temperatures are
-    /// clamped or dropped, unusable turn budgets are replaced with
+    /// Each *fixable* warning is paired with a repair: an unrecognised
+    /// execution policy is replaced by its restrictive default (the
+    /// `normalize_policy` fixup of the `rules` submodule), invalid temperatures
+    /// are clamped or dropped, unusable turn budgets are replaced with
     /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), and a `default` that names
     /// no known alias is dropped so `main.rs` reaches its fallback deliberately.
     ///
@@ -153,6 +167,7 @@ impl ModelManifest {
             def.max_turns = def
                 .max_turns
                 .map(|n| Self::sanitize_max_turns(Some(n), None));
+            Self::normalize_policy(&mut def.policy);
         }
 
         self

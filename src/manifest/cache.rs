@@ -180,9 +180,7 @@ static CATALOG_ROW_CACHE: OnceLock<RwLock<LruCache<CatalogRowKey, Arc<str>>>> = 
 
 /// The process-wide catalog bullet cache, created on first use.
 fn catalog_row_cache() -> &'static RwLock<LruCache<CatalogRowKey, Arc<str>>> {
-    CATALOG_ROW_CACHE.get_or_init(|| {
-        RwLock::new(LruCache::with_capacity(CATALOG_CACHE_CAPACITY))
-    })
+    CATALOG_ROW_CACHE.get_or_init(|| RwLock::new(LruCache::with_capacity(CATALOG_CACHE_CAPACITY)))
 }
 
 /// Render (or reuse) the bullet for one model entry.
@@ -222,9 +220,8 @@ pub(super) fn catalog_row(alias: &str, def: &ModelDefinition) -> Arc<str> {
     //    exclusive lock. This tier does not refresh recency, which is exactly
     //    why tier (1) exists; when tier (1) loses the race the mark is deferred
     //    to the next render, and the miss path re-marks unconditionally.
-    let hit = try_poisoned_or(catalog_row_cache().try_write()).and_then(|mut cache| {
-        cache.get(&key).map(Arc::clone)
-    });
+    let hit = try_poisoned_or(catalog_row_cache().try_write())
+        .and_then(|mut cache| cache.get(&key).map(Arc::clone));
     if let Some(row) = hit {
         return row;
     }
@@ -298,6 +295,7 @@ mod eviction_tests {
             role: Some("Role.".to_string()),
             temperature: None,
             max_turns: None,
+            policy: None,
         }
     }
 
@@ -345,7 +343,8 @@ mod eviction_tests {
                 catalog_row_cache()
                     .read()
                     .is_ok_and(|c| c.contains_key(&hot_key)),
-                "the hot bullet was evicted at cold row {i} (len={}); a hot working set must not be flushed by cold one-shots", catalog_cache_len()
+                "the hot bullet was evicted at cold row {i} (len={}); a hot working set must not be flushed by cold one-shots",
+                catalog_cache_len()
             );
         }
 
@@ -400,6 +399,7 @@ mod eviction_tests {
             role: Some(huge_role.clone()),
             temperature: None,
             max_turns: None,
+            policy: None,
         };
 
         let row = catalog_row("huge-alias", &def);
@@ -421,6 +421,7 @@ mod eviction_tests {
             role: Some("R".repeat(CATALOG_CACHE_MAX_KEY_BYTES / 4)),
             temperature: None,
             max_turns: None,
+            policy: None,
         };
         let _ = catalog_row("fits-alias", &fits);
         assert_eq!(catalog_cache_len(), 1, "in-bound rows must still be cached");
@@ -528,7 +529,11 @@ mod eviction_tests {
         // `RwLock::read`), but the data is intact and the length accessor
         // must not read that as "empty".
         let recovered = cache.read().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(recovered.len(), 1, "a poisoned cache must still hold its entries");
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a poisoned cache must still hold its entries"
+        );
         drop(recovered);
         assert!(try_poisoned_or(cache.try_write()).is_some());
 
@@ -577,4 +582,3 @@ mod eviction_tests {
         }
     }
 }
-
