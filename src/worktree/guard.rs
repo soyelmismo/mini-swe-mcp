@@ -54,6 +54,94 @@ fn is_skipped_dir_name(name: &str) -> bool {
     SKIP_DIR_NAMES.contains(&name)
 }
 
+/// Ceiling on a sanitized worker id, so a caller cannot force a path or branch
+/// name long enough to hit a filesystem or git limit.
+const MAX_WORKER_ID_LEN: usize = 64;
+
+/// Reduce a caller-supplied worker id to a token that is safe in *both* a path
+/// component and a git branch name.
+///
+/// `WorktreeGuard::new` is a public constructor, so its `worker_id` argument is
+/// untrusted input; ids minted by the pool are hexadecimal, but nothing stops a
+/// caller from passing anything at all. Only `[A-Za-z0-9_-]` survives and every
+/// rejected byte collapses to a single `-`, which makes two classes of abuse
+/// impossible before the value reaches either a path or an argv entry:
+///
+/// * **Traversal.** A `/` can no longer appear, so `../../home/user/.ssh`
+///   degrades to `home-user-ssh` and stays a single component inside
+///   `swe_base_dir()`. This matters beyond the worktree itself: the same value
+///   names the directory that `Drop` recursively removes.
+/// * **Option injection.** Leading `-` is stripped even for callers that
+///   later use the sanitized id directly as a git argument.
+///
+/// An id that sanitizes away to nothing (empty, or nothing but separators and
+/// control bytes) has no safe rendering, so it is replaced with a fresh random
+/// one rather than collapsing two distinct callers onto the same worktree.
+fn sanitize_worker_id(worker_id: &str) -> String {
+    let mut out = String::with_capacity(worker_id.len().min(MAX_WORKER_ID_LEN));
+    let mut last_was_dash = false;
+    for ch in worker_id.chars() {
+        if out.len() >= MAX_WORKER_ID_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            // Collapse a whole run of rejected bytes into one separator, so
+            // `"a///b"` and `"a/b"` cannot produce two different worktrees for
+            // what a caller almost certainly meant as the same id.
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        return format!("w{}", uuid::Uuid::new_v4().simple());
+    }
+    trimmed.to_string()
+}
+
+/// Create the checkout directory private *before* git writes into it.
+/// Git accepts an existing empty directory for `worktree add` and preserves
+/// its mode; chmodding only after checkout exposes its contents under umask 022.
+fn create_private_worktree_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        // Git used to create missing SWE_TEMP_DIR parents during `worktree add`.
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create worktree base {}", parent.display()))?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("Could not create worktree directory {}", path.display()))
+}
+
+/// Verify that git did not relax the directory mode after checkout.
+fn harden_worktree_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "Could not restrict worktree directory {} to 0700",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// RAII guard around one subagent's `git` worktree.
 pub struct WorktreeGuard {
     pub path: PathBuf,
@@ -71,8 +159,12 @@ pub struct WorktreeGuard {
 
 impl WorktreeGuard {
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
-        let branch = format!("worker-{}", worker_id);
-        let path = swe_base_dir().join(format!("swe-wt-{}", worker_id));
+        // Both the branch name and the directory name are derived from the
+        // *sanitized* id, so the two can never describe different worktrees and
+        // neither can escape `swe_base_dir()` or be read as a git option.
+        let worker_id = sanitize_worker_id(worker_id);
+        let branch = format!("worker-{worker_id}");
+        let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
 
         // Ensure target directory and branch don't exist. `worktree prune` is
         // deliberately not called here: `prune_stale_worktrees` owns a single
@@ -86,6 +178,9 @@ impl WorktreeGuard {
         let path_str = path
             .to_str()
             .context("Worktree path contains invalid UTF-8")?;
+        // Git accepts an existing empty directory. Create it private before
+        // checkout so no reader can observe files under a permissive umask.
+        create_private_worktree_dir(&path)?;
 
         let output = git(
             repo_root,
@@ -97,6 +192,9 @@ impl WorktreeGuard {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git worktree add failed: {}", stderr);
         }
+
+        // Verify git left the checkout private before seeding artifacts.
+        harden_worktree_dir(&path)?;
 
         // Write host PID (+ owner uid) to a sibling file so running worktrees are
         // never pruned by concurrent instances, and so a stale marker left by a
@@ -295,11 +393,16 @@ impl Drop for WorktreeGuard {
         let _ = self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        let path_str = self.path.to_string_lossy();
+        // Git only borrows the path for the duration of this call.
         let _ = git(
             &self.repo_root,
             "worktree remove",
-            &["worktree", "remove", "--force", &path_str],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &self.path.to_string_lossy(),
+            ],
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it
         let has_commits = self.branch_has_commits();
@@ -445,4 +548,109 @@ fn copy_dir_all(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sanitized id is spliced into a branch name and into a path that
+    /// `Drop` recursively deletes, so these are the two properties it must hold.
+    #[test]
+    fn sanitized_id_is_a_single_safe_path_and_branch_component() {
+        for raw in [
+            "deadbeef",
+            "../../home/user/.ssh",
+            "a/b\\c",
+            "  spaced  ",
+            "--upload-pack=/bin/sh",
+            "trailing///",
+            "///leading",
+        ] {
+            let id = sanitize_worker_id(raw);
+            assert!(!id.is_empty(), "id {raw:?} must not sanitize to nothing");
+            assert!(
+                !id.starts_with('-'),
+                "id {raw:?} would be read as a git flag"
+            );
+            assert!(
+                !id.contains('/') && !id.contains('\\'),
+                "id {raw:?} kept a separator"
+            );
+            assert!(!id.contains('.'), "id {raw:?} kept a dot");
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "id {raw:?} kept a byte outside [A-Za-z0-9_-]: {id:?}"
+            );
+            assert!(id.len() <= MAX_WORKER_ID_LEN, "id {raw:?} exceeded the cap");
+        }
+    }
+
+    /// Two spellings of the same logical id must not produce two worktrees, and
+    /// a genuinely hostile id must still get a usable worktree of its own.
+    #[test]
+    fn sanitize_collapses_equivalent_ids_and_replaces_unusable_ones() {
+        assert_eq!(sanitize_worker_id("a/b"), sanitize_worker_id("a//b"));
+        assert_eq!(sanitize_worker_id("deadbeef"), "deadbeef");
+
+        // Nothing usable survives: replaced, not collapsed to an empty id that
+        // every such caller would then share.
+        for raw in ["", "///", "   "] {
+            let id = sanitize_worker_id(raw);
+            assert!(!id.is_empty(), "id {raw:?} must be replaced, not emptied");
+            assert!(id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+        }
+        assert_ne!(sanitize_worker_id(""), sanitize_worker_id(""));
+
+        // The cap is enforced before the trim, so a long id cannot outrun it.
+        assert!(sanitize_worker_id(&"x".repeat(500)).len() <= MAX_WORKER_ID_LEN);
+    }
+
+    /// Git must receive a private directory, not create a public one and wait
+    /// for a post-checkout chmod to close the exposure window.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_dir_is_private_before_git_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "swe-precheckout-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = root.join("missing-base").join("worktree");
+        create_private_worktree_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The worktree directory must never be group- or world-readable: it holds
+    /// the full checkout plus any secrets and artifacts seeded into it.
+    #[cfg(unix)]
+    #[test]
+    fn harden_worktree_dir_leaves_only_owner_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swe-harden-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Start world-readable, the way `git worktree add` under umask 022 does.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        harden_worktree_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "worktree dir ended up {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
