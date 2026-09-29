@@ -195,6 +195,8 @@ impl WorkerPool {
             handle: None,
         };
 
+        let repo_path_str = repo_path.to_string_lossy().to_string();
+
         save_registry_entry(&WorkerRegistryEntry {
             id: worker_id.clone(),
             pid: std::process::id(),
@@ -208,6 +210,7 @@ impl WorkerPool {
             started_at: now,
             updated_at: now,
             group: Some(resolved_group.clone()),
+            repo_path: Some(repo_path_str.clone()),
         });
 
         {
@@ -224,6 +227,7 @@ impl WorkerPool {
         let task_clone = task.clone();
         let model_clone = model.clone();
         let group_clone = resolved_group.clone();
+        let repo_path_for_fail = repo_path_str;
 
         let config = WorkerLaunchConfig {
             task,
@@ -255,6 +259,7 @@ impl WorkerPool {
                     started_at: now,
                     updated_at: unix_timestamp(),
                     group: Some(group_clone),
+                    repo_path: Some(repo_path_for_fail),
                 });
             }
         });

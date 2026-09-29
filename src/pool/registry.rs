@@ -23,6 +23,8 @@ pub struct WorkerRegistryEntry {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
 }
 
 pub fn extract_group(task: &str) -> Option<String> {
@@ -58,9 +60,56 @@ pub fn remove_registry_entry(worker_id: &str) {
     }
 }
 
+fn is_terminal_status(status: &str) -> bool {
+    status == "completed" || status == "failed" || status == "stopped"
+}
+
+fn worktree_exists(worker_id: &str) -> bool {
+    for base in [crate::worktree::swe_base_dir(), std::env::temp_dir()] {
+        if base.join(format!("swe-wt-{worker_id}")).is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn branch_exists(
+    item: &WorkerRegistryEntry,
+    cache: &mut std::collections::HashMap<PathBuf, std::collections::HashSet<String>>,
+) -> bool {
+    let repo_dir = item
+        .repo_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let branches = cache.entry(repo_dir.clone()).or_insert_with(|| {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(output) = std::process::Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/worker-*"])
+            .output()
+            && output.status.success()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let branch = line.trim();
+                if !branch.is_empty() {
+                    set.insert(branch.to_string());
+                }
+            }
+        }
+        set
+    });
+
+    branches.contains(&format!("worker-{}", item.id))
+}
+
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     let mut entries = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
+    let mut branches_by_repo: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
 
     for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
         if let Ok(read_dir) = std::fs::read_dir(dir) {
@@ -71,11 +120,20 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
                     && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
                     && seen_ids.insert(item.id.clone())
                 {
-                    if (item.status == "running" || item.status == "paused")
+                    if (item.status == "running" || item.status == "paused" || item.status == "reviewing")
                         && !crate::worktree::is_process_alive(item.pid)
                     {
                         item.status = "stopped".to_string();
                     }
+
+                    if is_terminal_status(&item.status)
+                        && !worktree_exists(&item.id)
+                        && !branch_exists(&item, &mut branches_by_repo)
+                    {
+                        let _ = std::fs::remove_file(&p);
+                        continue;
+                    }
+
                     entries.push(item);
                 }
             }

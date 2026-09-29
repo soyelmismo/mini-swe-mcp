@@ -111,6 +111,7 @@ impl WorkerPool {
             review_after,
         } = config;
 
+        let repo_path_str = repo_path.to_string_lossy().to_string();
         let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
         info!(worker = %worker_id, model = %model, "Starting worker execution");
 
@@ -215,6 +216,7 @@ impl WorkerPool {
                         started_at: started_at_ts,
                         updated_at: now,
                         group: Some(group.clone()),
+                        repo_path: Some(repo_path_str.clone()),
                     });
 
                     // Wait for orchestrator resume via steer
@@ -324,6 +326,7 @@ impl WorkerPool {
                 started_at: started_at_ts,
                 updated_at: unix_timestamp(),
                 group: Some(group.clone()),
+                repo_path: Some(repo_path_str.clone()),
             });
 
             info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
@@ -395,6 +398,7 @@ impl WorkerPool {
                     started_at: started_at_ts,
                     updated_at: now,
                     group: Some(group.clone()),
+                    repo_path: Some(repo_path_str.clone()),
                 });
 
                 if let Some(answer) = rx.recv().await {
@@ -505,6 +509,14 @@ impl WorkerPool {
                 temperature,
             );
 
+            let manifest = crate::manifest::ModelManifest::load();
+            let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
+            let review_max_turns = if max_turns > 0 {
+                max_turns
+            } else {
+                reviewer_manifest_turns.unwrap_or(current_max_turns)
+            };
+
             save_registry_entry(&WorkerRegistryEntry {
                 id: worker_id.clone(),
                 pid: std::process::id(),
@@ -512,16 +524,16 @@ impl WorkerPool {
                 model: reviewer_model.clone(),
                 status: "reviewing".into(),
                 step,
-                max_turns: current_max_turns,
+                max_turns: current_max_turns + review_max_turns,
                 last_command: "starting review phase".into(),
                 question: None,
                 started_at: started_at_ts,
                 updated_at: unix_timestamp(),
                 group: Some(group.clone()),
+                repo_path: Some(repo_path_str.clone()),
             });
 
             let mut review_step = 0;
-            let review_max_turns = 40.min(current_max_turns);
 
             while review_step < review_max_turns {
                 review_step += 1;
@@ -602,12 +614,13 @@ impl WorkerPool {
                     model: reviewer_model.clone(),
                     status: "reviewing".into(),
                     step,
-                    max_turns: current_max_turns,
+                    max_turns: current_max_turns + review_max_turns,
                     last_command: format!("[review] {}", cmd_summary),
                     question: None,
                     started_at: started_at_ts,
                     updated_at: now,
                     group: Some(group.clone()),
+                    repo_path: Some(repo_path_str.clone()),
                 });
 
                 let (output, code) = reviewer_runner.execute_bash(&worktree.path, &cmd_str).await?;
@@ -707,6 +720,7 @@ impl WorkerPool {
             started_at: started_at_ts,
             updated_at: now,
             group: Some(group.clone()),
+            repo_path: Some(repo_path_str.clone()),
         });
 
         info!(worker = %worker_id, turns = step, "Worker completed successfully");

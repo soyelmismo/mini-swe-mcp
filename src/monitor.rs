@@ -238,6 +238,7 @@ mod tests {
                 started_at: 1000,
                 updated_at: 1050,
                 group: Some("audits".into()),
+                repo_path: None,
             },
             WorkerRegistryEntry {
                 id: "worker02".into(),
@@ -252,6 +253,7 @@ mod tests {
                 started_at: 1000,
                 updated_at: 1050,
                 group: None,
+                repo_path: None,
             },
         ];
 
@@ -279,6 +281,7 @@ mod tests {
             started_at: 1000,
             updated_at: 1065, // Ran for 65s ("01m 05s")
             group: Some("default".into()),
+            repo_path: None,
         }];
 
         // When rendered long after completion (now = 5000), uptime must remain 65s ("01m 05s"), not 4000s
