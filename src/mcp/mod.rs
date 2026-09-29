@@ -20,3 +20,6 @@ mod server;
 
 pub use schema::WORKER_ACTIONS;
 pub use server::McpServer;
+
+#[cfg(test)]
+mod bench;

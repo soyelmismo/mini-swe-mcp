@@ -8,12 +8,16 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
-use super::protocol::{JsonRpcRequest, JsonRpcResponse, PreSerializedResult};
+use super::protocol::{
+    INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse, PreSerializedResult,
+    RawText, code, parse_frame,
+};
 use super::schema::build_tools_list;
 use crate::manifest::ModelManifest;
 use crate::pool::WorkerPool;
@@ -69,37 +73,45 @@ impl McpServer {
             }
         });
 
+        // Every request takes ownership of the line it was read from: the
+        // parsed frame borrows that line, so the response can echo the client's
+        // `id` and quote its method name without either being copied into an
+        // owned request first.
         while let Some(line) = reader.next_line().await? {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
-            let req: JsonRpcRequest = match serde_json::from_str(line) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(error = %e, line = %line, "Malformed JSON-RPC request");
-                    let resp = JsonRpcResponse::err(None, -32700, format!("Parse error: {e}"));
-                    if let Ok(serialized) = serde_json::to_string(&resp) {
-                        let _ = out_tx.send(serialized + "\n").await;
-                    }
-                    continue;
-                }
-            };
-
-            // JSON-RPC 2.0: Server MUST NOT reply to notifications (requests without an ID)
-            if req.id.is_none() {
-                info!(method = %req.method, "Received notification");
-                continue;
-            }
-
             let server = self.clone();
             let tx = out_tx.clone();
+            let owned_line = line.to_string();
             tokio::spawn(async move {
-                let resp = server.handle_request(req, Some(tx.clone())).await;
-                if let Ok(serialized) = serde_json::to_string(&resp) {
-                    let _ = tx.send(serialized + "\n").await;
+                // Zero-copy parse: `method`, `id` and `params` are borrowed
+                // views of `owned_line` unless the frame carries a string that
+                // would have to be unescaped.
+                let line = owned_line.as_str();
+                let req = match parse_frame(line) {
+                    Ok(req) => req,
+                    Err(rejection) => {
+                        error!(line = %line, "Rejected JSON-RPC frame: {rejection:?}");
+                        let _ = tx.send(rejection.into_frame()).await;
+                        return;
+                    }
+                };
+
+                // JSON-RPC 2.0 §4.1: a Notification is a Request object without
+                // an `id` (absent or `null`); the server MUST NOT reply to it.
+                if req.id.is_none() {
+                    trace!(method = %req.method, "Received notification");
+                    return;
                 }
+
+                let response = server.handle_request(req, Some(tx.clone())).await;
+                let frame = response
+                    .to_frame()
+                    .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME));
+                let _ = tx.send(frame).await;
             });
         }
 
@@ -110,43 +122,65 @@ impl McpServer {
         Ok(())
     }
 
+    /// Wrap a tool payload in the MCP `content` block the frame serializer
+    /// writes verbatim.
+    ///
+    /// `PreSerializedResult` is a serializer, not a `Value`: feeding it through
+    /// `to_value` would materialize the pretty-printed payload *and* escape it
+    /// into a `String` only for [`JsonRpcResponse::to_frame`] to write that
+    /// `String` out again. Keeping the serializer inside the envelope writes
+    /// the payload straight into the frame buffer, once (audit 07, F4).
+    ///
+    /// The payload is wrapped in [`RawText`], which is the only `Value` the
+    /// frame serializer has to understand.
+    fn raw_tool_result(payload: Value) -> Value {
+        serde_json::to_value(RawText(PreSerializedResult::text(payload))).unwrap_or_else(|_| {
+            // Unreachable: a wrapper of `Value` payloads always serializes.
+            error!("Failed to wrap a tool payload; answering with an empty result");
+            json!({ "content": [{ "type": "text", "text": "{}" }] })
+        })
+    }
+
     /// Route one JSON-RPC request to its response envelope.
-    async fn handle_request(
-        &self,
-        req: JsonRpcRequest,
+    ///
+    /// The response borrows `req` wherever it can — the echoed `id`, the
+    /// unknown method name in the `-32601` message and `tools/list`'s
+    /// precomputed payload all come from the frame that is already in memory.
+    async fn handle_request<'a>(
+        &'a self,
+        req: JsonRpcRequest<'a>,
         progress_tx: Option<mpsc::Sender<String>>,
-    ) -> JsonRpcResponse {
-        let id = req.id;
-        match req.method.as_str() {
+    ) -> JsonRpcResponse<'a> {
+        let id = req.id_or_null();
+        match req.method.as_ref() {
             "ping" => JsonRpcResponse::ok(id, json!({})),
 
-            "initialize" => JsonRpcResponse::ok(
-                id,
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": { "listChanged": false }
-                    },
-                    "serverInfo": {
-                        "name": "mini-swe-mcp",
-                        "version": "0.1.0"
-                    }
-                }),
-            ),
+            // Constant per process: the document lives in a `static` and is
+            // borrowed into the envelope, so a handshake copies no payload.
+            "initialize" => JsonRpcResponse::ok(id, (*INITIALIZE_RESULT).clone()),
 
             // The schema is immutable for the process lifetime, so it is built
             // once in `McpServer::new` and only cloned here.
             "tools/list" => JsonRpcResponse::ok(id, (*self.tools_list).clone()),
 
             "tools/call" => {
-                let params = req.params.unwrap_or_default();
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                let params = req.params_value();
+                let tool_name = params
+                    .and_then(|params| params.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let arguments = params
+                    .and_then(|params| params.get("arguments"))
+                    .cloned()
+                    .unwrap_or(json!({}));
 
+                // The token is a client-supplied id: it rides along as raw
+                // JSON text and is only materialized where it has to appear in
+                // a payload (progress notifications).
                 let progress_token = params
-                    .get("_meta")
-                    .and_then(|m| m.get("progressToken"))
-                    .or_else(|| arguments.get("_meta").and_then(|m| m.get("progressToken")))
+                    .and_then(|params| params.get("_meta"))
+                    .and_then(|meta| meta.get("progressToken"))
+                    .or_else(|| arguments.get("_meta").and_then(|meta| meta.get("progressToken")))
                     .or_else(|| arguments.get("progressToken"))
                     .cloned();
 
@@ -154,23 +188,18 @@ impl McpServer {
                     .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
                     .await
                 {
-                    Ok(val) => JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        // Serialized straight into the envelope: no intermediate
-                        // pretty-printed `String` for the payload (audit 07, F4).
-                        result: Some(
-                            serde_json::to_value(PreSerializedResult::text(val)).unwrap_or_else(
-                                |_| json!({ "content": [{ "type": "text", "text": "{}" }] }),
-                            ),
-                        ),
-                        error: None,
-                    },
-                    Err(e) => JsonRpcResponse::err(id, -32000, e.to_string()),
+                    // Serialized straight into the frame: no intermediate
+                    // pretty-printed `String` for the payload (audit 07, F4).
+                    Ok(payload) => JsonRpcResponse::ok(id, Self::raw_tool_result(payload)),
+                    Err(error) => {
+                        JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Owned(error.to_string()))
+                    }
                 }
             }
 
-            _ => JsonRpcResponse::err(id, -32601, format!("Method not found: {}", req.method)),
+            // `-32601` for every method the server does not expose, including
+            // the MCP notifications a host may send us.
+            _ => JsonRpcResponse::method_not_found(id, req.method),
         }
     }
 
