@@ -104,23 +104,23 @@ pub fn load_agent_memory(repo_path: &Path, model_alias: &str) -> Option<String> 
 
 /// Keep at most [`MAX_MEMORY_PROMPT_BYTES`] of `text`, dropping the oldest part.
 ///
-/// The tail of exactly `MAX_MEMORY_PROMPT_BYTES` bytes is taken, then any leading
-/// partial line is dropped, so a truncated block starts at a line boundary and
-/// never begins mid-sentence. The result is therefore at most the budget, and
-/// never lands inside a multi-byte code point: `floor_char_boundary` snaps the
-/// index down to the nearest char boundary before the line search.
+/// The tail of at most `MAX_MEMORY_PROMPT_BYTES` bytes is taken — the cut index
+/// is rounded up to a `char` boundary first so slicing can never panic inside
+/// a multi-byte code point — then any leading partial line is dropped, so a
+/// truncated block starts at a line boundary and never begins mid-sentence.
 fn truncate_to_memory_budget(text: &str) -> &str {
     if text.len() <= MAX_MEMORY_PROMPT_BYTES {
         return text;
     }
-    let tail = &text[text.len() - MAX_MEMORY_PROMPT_BYTES..];
-    // `MAX_MEMORY_PROMPT_BYTES` is a byte budget and this index is a char
-    // boundary only when it falls on one; `floor_char_boundary` fixes both
-    // the boundary and the resulting over-shoot without panicking.
-    let start = tail.floor_char_boundary(0);
-    match tail[start..].find('\n') {
-        Some(offset) => &tail[start + offset + 1..],
-        None => &tail[start..],
+    // The byte budget need not fall on a `char` boundary (e.g. a cut inside a
+    // multi-byte code point); round the cut index up first so the slice below
+    // can never panic and remains within the byte budget, then drop any leading
+    // partial line so the block starts at a line boundary.
+    let cut = text.ceil_char_boundary(text.len() - MAX_MEMORY_PROMPT_BYTES);
+    let tail = &text[cut..];
+    match tail.find('\n') {
+        Some(offset) => &tail[offset + 1..],
+        None => tail,
     }
 }
 
@@ -147,7 +147,9 @@ fn truncate_to_memory_budget(text: &str) -> &str {
 pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> Result<()> {
     let path = agent_memory_path(repo_path, model_alias)
         .with_context(|| format!("Invalid model alias for memory: {model_alias:?}"))?;
-    let dir = path.parent().context("Memory path has no parent directory")?;
+    let dir = path
+        .parent()
+        .context("Memory path has no parent directory")?;
 
     let entry = normalize_note(note)?;
 
@@ -181,7 +183,9 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
     static APPEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
         ".{}.{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("memory"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("memory"),
         std::process::id(),
         APPEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
@@ -216,7 +220,13 @@ fn normalize_note(note: &str) -> Result<String> {
 /// opted in.
 pub(crate) fn memory_prompt_section(repo_path: &Path, model_alias: &str) -> Option<String> {
     let memory = load_agent_memory(repo_path, model_alias)?;
-    Some(format!("\n\n{MEMORY_HEADER}\n{memory}"))
+    // Appended-only files are seeded with `MEMORY_HEADER`, and the shipped
+    // defaults start with it too, so avoid emitting the header twice.
+    if memory.starts_with(MEMORY_HEADER) {
+        Some(format!("\n\n{memory}"))
+    } else {
+        Some(format!("\n\n{MEMORY_HEADER}\n{memory}"))
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +237,10 @@ mod tests {
     fn slug_is_traversal_safe() {
         assert_eq!(memory_slug("ninja").as_deref(), Some("ninja"));
         assert_eq!(memory_slug("Ninja").as_deref(), Some("ninja"));
-        assert_eq!(memory_slug("../../etc/passwd").as_deref(), Some("etc-passwd"));
+        assert_eq!(
+            memory_slug("../../etc/passwd").as_deref(),
+            Some("etc-passwd")
+        );
         assert_eq!(memory_slug("a/b\\c").as_deref(), Some("a-b-c"));
         assert_eq!(memory_slug("   "), None);
         assert_eq!(memory_slug("///"), None);
@@ -240,5 +253,17 @@ mod tests {
         let cut = truncate_to_memory_budget(&text);
         assert!(cut.len() <= MAX_MEMORY_PROMPT_BYTES);
         assert!(text.ends_with(cut));
+    }
+
+    #[test]
+    fn truncate_never_panics_on_a_mid_char_cut() {
+        // One trailing ASCII byte shifts every cut index by one, so the budget
+        // boundary lands inside a two-byte `é` instead of on it.
+        let text = format!("{}a", "é".repeat(MAX_MEMORY_PROMPT_BYTES));
+        assert!(text.len() > MAX_MEMORY_PROMPT_BYTES);
+        let cut = truncate_to_memory_budget(&text);
+        assert!(cut.len() <= MAX_MEMORY_PROMPT_BYTES);
+        assert!(text.ends_with(cut));
+        assert!(cut.is_char_boundary(0));
     }
 }

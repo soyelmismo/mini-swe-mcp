@@ -14,7 +14,7 @@
 
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{
-    MEMORY_DIR, MAX_MEMORY_PROMPT_BYTES, ModelManifest, agent_memory_path, append_agent_memory,
+    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, ModelManifest, agent_memory_path, append_agent_memory,
     build_system_prompt, load_agent_memory,
 };
 use std::path::{Path, PathBuf};
@@ -53,8 +53,12 @@ fn test_load_agent_memory_round_trips_an_appended_takeaway() {
     // instead of failing, so a dispatch never breaks on a missing file.
     assert_eq!(load_agent_memory(repo.path(), "ninja"), None);
 
-    append_agent_memory(repo.path(), "ninja", "Always run `cargo test --all-targets`.")
-        .expect("append creates the memory directory and file");
+    append_agent_memory(
+        repo.path(),
+        "ninja",
+        "Always run `cargo test --all-targets`.",
+    )
+    .expect("append creates the memory directory and file");
 
     assert!(repo.memory_dir().join("ninja.md").is_file());
     let memory = load_agent_memory(repo.path(), "ninja").expect("memory is readable back");
@@ -78,8 +82,7 @@ fn test_build_system_prompt_is_a_no_op_without_memory() {
 #[test]
 fn test_build_system_prompt_injects_memory_after_the_static_prompt() {
     let repo = ScratchRepo::new("inject");
-    append_agent_memory(repo.path(), "nerd", "Reproduce before you patch.")
-        .expect("append");
+    append_agent_memory(repo.path(), "nerd", "Reproduce before you patch.").expect("append");
 
     let prompt = build_system_prompt(repo.path(), "nerd");
     assert!(
