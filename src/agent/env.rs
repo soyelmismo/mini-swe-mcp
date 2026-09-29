@@ -645,7 +645,7 @@ mod tests {
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         for name in &names {
             assert!(
-                ALLOWED_VARS.contains(name) || *name == HOME_VAR,
+                ALLOWED_VARS.contains(name) || TOOLCHAIN_VARS.contains(name) || *name == HOME_VAR,
                 "{name} escaped the allow-list"
             );
         }
@@ -743,7 +743,9 @@ mod tests {
         );
         for (k, _) in &envs {
             assert!(
-                ALLOWED_VARS.contains(&k.as_str()) || k == HOME_VAR,
+                ALLOWED_VARS.contains(&k.as_str())
+                    || TOOLCHAIN_VARS.contains(&k.as_str())
+                    || k == HOME_VAR,
                 "{k} escaped the allow-list"
             );
         }
@@ -753,6 +755,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
     /// The toolchain-cache contract: with the parent's `CARGO_HOME` unset, a
     /// host that *does* have a `~/.cargo` gets that directory forwarded, so a
     /// cargo command in a sandboxed worktree sees the populated registry instead
