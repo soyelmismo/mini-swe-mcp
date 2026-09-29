@@ -43,7 +43,7 @@ pub enum WorkerState {
 }
 
 impl WorkerState {
-    /// The worker loop turn this state corresponds to, for every variant.
+    /// Turn this state corresponds to, for every variant.
     pub fn step(&self) -> usize {
         match self {
             WorkerState::Running { step, .. } | WorkerState::Paused { step, .. } => *step,
@@ -105,7 +105,7 @@ impl WorkerRecord {
         };
     }
 
-    /// Unix timestamp at which this record became terminal, if it is terminal.
+    /// Unix timestamp when this record became terminal, if it is terminal.
     pub fn terminal_at(&self) -> Option<u64> {
         match &self.state {
             WorkerState::Completed { completed_at, .. } => Some(*completed_at),
@@ -135,9 +135,8 @@ pub enum WorkerPhase {
 
 /// Lightweight, allocation-cheap snapshot of a worker's progress.
 ///
-/// Deliberately excludes the terminal payload (`diff`, `summary`,
-/// `artifacts`) so that the 500 ms polling loops neither clone nor serialize
-/// potentially multi-megabyte strings.
+/// Excludes the terminal payload (`diff`, `summary`, `artifacts`) so the
+/// 500 ms polling loops neither clone nor serialize multi-megabyte strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerProgress {
     pub phase: WorkerPhase,
@@ -179,10 +178,10 @@ pub const DEFAULT_TERMINAL_TTL_SECS: u64 = 300;
 /// Ids of `Completed`/`Failed` records that reached the terminal TTL (audit 07, R3).
 ///
 /// * A `Running`/`Paused` record is *never* expired, whatever its age.
-/// * Clock skew is absorbed by `saturating_sub`, so a timestamp in the future
-///   (NTP jump, forged registry row) yields 0 and the record is kept.
-/// * A fresh terminal record is kept, which is what keeps `collect` and
-///   `wait: true` working after a worker finishes.
+/// * Clock skew is absorbed by `saturating_sub`: a future timestamp (NTP jump,
+///   forged registry row) yields 0 and the record is kept.
+/// * A fresh terminal record is kept, which keeps `collect` and `wait: true`
+///   working after a worker finishes.
 pub(super) fn expired_terminal_ids(
     workers: &HashMap<String, WorkerRecord>,
     ttl_secs: u64,
