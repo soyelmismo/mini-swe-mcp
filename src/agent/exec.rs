@@ -39,9 +39,8 @@ use tokio::process::{Child, Command};
 use super::AgentRunner;
 use super::intercept::{CommandPipeline, InterceptDecision};
 use super::sandbox::{
-    TRUNCATE_HEAD, TRUNCATE_MARKER, TRUNCATE_MARKER_SUFFIX, TRUNCATE_TAIL, USIZE_MAX_DIGITS,
-    build_landlock_plan, find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command,
-    truncate_output, validate_bash_command,
+    TRUNCATE_HEAD, TRUNCATE_TAIL, build_landlock_plan, find_git_common_dir, find_git_dirs,
+    has_bwrap, is_heavy_command, truncate_with_dropped, validate_bash_command,
 };
 
 /// Exit code reported when a command exceeded its wall-clock budget.
@@ -85,12 +84,6 @@ const OFFLINE_SHELL: &str = "bash";
 /// after its parent was killed, so the drain is abandoned at this deadline
 /// rather than hanging the worker.
 const DRAIN_GRACE_MS: u64 = 2_000;
-
-/// Upper bound on the dropped-byte count's decimal digits in the marker.
-const TRUNCATE_MARKER_LEN: usize = TRUNCATE_MARKER.len();
-
-/// Size of the marker suffix after the dropped-byte count.
-const TRUNCATE_MARKER_SUFFIX_LEN: usize = TRUNCATE_MARKER_SUFFIX.len();
 
 /// Granularity of a single pipe read.
 ///
@@ -886,31 +879,7 @@ fn combine_streams(stdout: &[u8], stderr: &[u8], dropped: usize) -> String {
         combined.push_str(&String::from_utf8_lossy(stderr));
     }
 
-    if dropped == 0 {
-        return truncate_output(&combined);
-    }
-    // The retained portions can themselves exceed the *shared* budget when
-    // both pipes are chatty. Cut the combined, already-bounded text once more
-    // and include those additional bytes in the reported elision count.
-    let head_end = combined.floor_char_boundary(TRUNCATE_HEAD.min(combined.len()));
-    let tail_start = combined.ceil_char_boundary(combined.len().saturating_sub(TRUNCATE_TAIL));
-    let tail_start = tail_start.max(head_end);
-    let dropped = dropped.saturating_add(combined.len() - head_end - (combined.len() - tail_start));
-    let mut out = String::with_capacity(
-        head_end
-            + TRUNCATE_MARKER_LEN
-            + USIZE_MAX_DIGITS
-            + TRUNCATE_MARKER_SUFFIX_LEN
-            + combined.len()
-            - tail_start,
-    );
-    out.push_str(&combined[..head_end]);
-    out.push_str(TRUNCATE_MARKER);
-    use std::fmt::Write as _;
-    write!(out, "{dropped}").expect("writing digits into a String cannot fail");
-    out.push_str(TRUNCATE_MARKER_SUFFIX);
-    out.push_str(&combined[tail_start..]);
-    out
+    truncate_with_dropped(&combined, dropped)
 }
 
 #[cfg(test)]

@@ -36,55 +36,39 @@ pub const TRUNCATE_TAIL: usize = 4_096;
 pub const TRUNCATE_MARKER: &str = "\n... [Truncated ";
 /// Literal text of the second half of the marker, after the byte count.
 pub const TRUNCATE_MARKER_SUFFIX: &str = " bytes] ...\n";
-/// Upper bound on the decimal digits of a `usize` (2^64 - 1 has 20 digits).
-/// Used to size the result buffer up front so the marker needs no allocation.
-pub const USIZE_MAX_DIGITS: usize = 20;
 
 /// Bound output to [`TRUNCATE_LIMIT`] bytes, keeping head and tail and
 /// reporting bytes discarded. Cut points snap to UTF-8 boundaries so no
 /// character splits and `head + dropped + tail == input.len()` holds.
-/// Assembles once into an exactly-sized `String` (marker pushed directly,
-/// byte count rendered into a stack buffer, tail never copied twice).
 pub fn truncate_output(combined: &str) -> String {
-    let total = combined.len();
-    if total <= TRUNCATE_LIMIT {
-        return combined.to_string();
-    }
-
-    let head_end = combined.floor_char_boundary(TRUNCATE_HEAD);
-    let tail_start = combined.ceil_char_boundary(total - TRUNCATE_TAIL);
-    let dropped = total - (head_end + (total - tail_start));
-
-    let mut out = String::with_capacity(
-        head_end + TRUNCATE_MARKER.len() + USIZE_MAX_DIGITS + TRUNCATE_MARKER_SUFFIX.len()
-            + (total - tail_start),
-    );
-    let mut digits = [0u8; USIZE_MAX_DIGITS];
-    let count = render_decimal(&mut digits, dropped);
-
-    out.push_str(&combined[..head_end]);
-    out.push_str(TRUNCATE_MARKER);
-    out.push_str(count);
-    out.push_str(TRUNCATE_MARKER_SUFFIX);
-    out.push_str(&combined[tail_start..]);
-    debug_assert!(
-        out.capacity() >= out.len(),
-        "result buffer must be sized up front"
-    );
-    out
+    truncate_with_dropped(combined, 0)
 }
 
-/// Render `value` as decimal ASCII digits into `buf` and return the used
-/// prefix as a `&str`.
-fn render_decimal(buf: &mut [u8; USIZE_MAX_DIGITS], mut value: usize) -> &str {
-    debug_assert!(value > 0, "the marker is only emitted with a dropped region");
-    let mut idx = buf.len();
-    while value > 0 {
-        idx -= 1;
-        buf[idx] = b'0' + u8::try_from(value % 10).expect("remainder is a single digit");
-        value /= 10;
+/// Core truncation shared with `exec::combine_streams`. `already_dropped` is
+/// the byte count the caller's buffers already elided; when non-zero the
+/// marker is emitted even if `text` itself fits the budget, so the reported
+/// elision reflects the child's true output size.
+pub(crate) fn truncate_with_dropped(text: &str, already_dropped: usize) -> String {
+    let total = text.len();
+    if already_dropped == 0 && total <= TRUNCATE_LIMIT {
+        return text.to_string();
     }
-    std::str::from_utf8(&buf[idx..]).expect("ASCII digits are valid UTF-8")
+
+    let head_end = text.floor_char_boundary(TRUNCATE_HEAD.min(total));
+    let tail_start = text.ceil_char_boundary(total.saturating_sub(TRUNCATE_TAIL));
+    let tail_start = tail_start.max(head_end);
+    let dropped = already_dropped.saturating_add(total - head_end - (total - tail_start));
+
+    let mut out = String::with_capacity(
+        head_end + TRUNCATE_MARKER.len() + TRUNCATE_MARKER_SUFFIX.len() + (total - tail_start),
+    );
+    out.push_str(&text[..head_end]);
+    out.push_str(TRUNCATE_MARKER);
+    use std::fmt::Write as _;
+    write!(out, "{dropped}").expect("writing digits into a String cannot fail");
+    out.push_str(TRUNCATE_MARKER_SUFFIX);
+    out.push_str(&text[tail_start..]);
+    out
 }
 
 /// Reject commands that escape the worktree or recursively scan root/home.
