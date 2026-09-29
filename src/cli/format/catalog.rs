@@ -1,9 +1,8 @@
 //! Plain-text renderers for the system-catalog verbs.
 //!
-//! These are the formatters behind `manifest`, `list` and `prune` — the actions
-//! that describe the *installation* rather than one worker: the model catalog
-//! and its defaults, the table of workers the pool currently knows about, and
-//! the housekeeping confirmation.
+//! Formatters behind `manifest`, `list` and `prune` — the actions that describe
+//! the *installation* rather than one worker: the model catalog and its
+//! defaults, the worker table, and the housekeeping confirmation.
 //!
 //! Like every formatter in this package they are pure functions over
 //! [`serde_json::Value`] with no I/O, which is what makes them unit-testable

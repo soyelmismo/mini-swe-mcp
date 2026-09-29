@@ -68,8 +68,8 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
 
 /// Fold the `dispatch` flags after the task into the tool arguments.
 ///
-/// A value flag consumes the next word verbatim, whatever it is; a value flag
-/// with nothing after it is dropped rather than defaulted to an empty string.
+/// A value flag consumes the next word verbatim; one with nothing after it is
+/// dropped rather than defaulted to an empty string.
 fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
     tool_args.insert("task".into(), Value::String(cli_args[2].clone()));
     let mut i = 3;
@@ -104,7 +104,7 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
     }
 }
 
-/// Consume the value after a flag, if there is one.
+/// Consume the value after a flag, if present.
 fn take_value(cli_args: &[String], i: &mut usize, tool_args: &mut Map<String, Value>, key: &str) {
     if *i + 1 < cli_args.len() {
         tool_args.insert(key.into(), Value::String(cli_args[*i + 1].clone()));
@@ -112,18 +112,18 @@ fn take_value(cli_args: &[String], i: &mut usize, tool_args: &mut Map<String, Va
     }
 }
 
-/// `true` when the operator asked for JSON instead of the plain-text views.
+/// True when the operator asked for JSON instead of the plain-text views.
 pub fn json_requested(raw_args: &[String]) -> bool {
     raw_args.iter().any(|arg| arg == "--json")
 }
 
-/// argv with the `--json` selector removed, so positional parsing never trips
+/// argv with the `--json` selector removed so positional parsing never trips
 /// over the flag.
 pub fn strip_json_flag(raw_args: Vec<String>) -> Vec<String> {
     raw_args.into_iter().filter(|arg| arg != "--json").collect()
 }
 
-/// `true` when the binary should serve MCP over stdio rather than run an action.
+/// True when the binary should serve MCP over stdio rather than run an action.
 pub fn stdio_requested(cli_args: &[String]) -> bool {
     cli_args.iter().any(|arg| arg == "--stdio")
 }

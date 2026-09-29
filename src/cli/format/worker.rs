@@ -1,11 +1,10 @@
 //! Plain-text renderers for the per-worker inspection verbs.
 //!
-//! These are the formatters behind `status`, `collect`, `logs`, `dispatch`,
-//! `steer`, `kill` and `reap` — the actions that answer about one worker (or,
-//! for `reap`, about a set of terminal workers) rather than about the system
-//! catalog. [`log_counters_line`] is the shared counter/notice line that
-//! `collect` and `logs` both append so step-log truncation is never silent
-//! (audit 07, R7).
+//! Formatters behind `status`, `collect`, `logs`, `dispatch`, `steer`, `kill`
+//! and `reap` — the actions that answer about one worker (or, for `reap`, about
+//! a set of terminal workers) rather than about the system catalog.
+//! [`log_counters_line`] is the shared counter/notice line that `collect` and
+//! `logs` both append so step-log truncation is never silent (audit 07, R7).
 //!
 //! Every function here is a pure function over [`serde_json::Value`]: no I/O,
 //! no state, no formatting knobs. That is what keeps them unit-testable and
