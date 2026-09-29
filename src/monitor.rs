@@ -540,6 +540,33 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
 // Dashboard rendering
 // ---------------------------------------------------------------------------
 
+/// The status buckets the dashboard counts, in heading order.
+///
+/// One classifier feeds both the global strip and the per-repository counters,
+/// so the two views can never disagree about what a status means.
+#[derive(Clone, Copy)]
+enum Bucket {
+    Active,
+    Paused,
+    Reviewing,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+/// Classify a raw registry status; anything unrecognized is `Stopped`, which
+/// is the same catch-all the supervisor already used for terminal workers.
+fn status_bucket(status: &str) -> Bucket {
+    match status {
+        "running" => Bucket::Active,
+        "paused" => Bucket::Paused,
+        "reviewing" => Bucket::Reviewing,
+        "completed" => Bucket::Completed,
+        "failed" => Bucket::Failed,
+        _ => Bucket::Stopped,
+    }
+}
+
 /// One repository's slice of the dashboard: its workers plus the counters
 /// shown in its heading.
 ///
@@ -572,13 +599,13 @@ impl<'a> RepoGroup<'a> {
 
     /// Append one worker and fold its status into the counters.
     fn push(&mut self, entry: &'a WorkerRegistryEntry) {
-        match entry.status.as_str() {
-            "running" => self.active += 1,
-            "paused" => self.paused += 1,
-            "reviewing" => self.reviewing += 1,
-            "completed" => self.completed += 1,
-            "failed" => self.failed += 1,
-            _ => self.stopped += 1,
+        match status_bucket(&entry.status) {
+            Bucket::Active => self.active += 1,
+            Bucket::Paused => self.paused += 1,
+            Bucket::Reviewing => self.reviewing += 1,
+            Bucket::Completed => self.completed += 1,
+            Bucket::Failed => self.failed += 1,
+            Bucket::Stopped => self.stopped += 1,
         }
         self.workers.push(entry);
     }
@@ -637,13 +664,13 @@ pub fn render_dashboard_with_width(
     // dashboard never reshuffles between ticks.
     let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
     for entry in entries {
-        match entry.status.as_str() {
-            "running" => active += 1,
-            "paused" => paused += 1,
-            "completed" => completed += 1,
-            "failed" => failed += 1,
-            "reviewing" => reviewing += 1,
-            _ => stopped += 1,
+        match status_bucket(&entry.status) {
+            Bucket::Active => active += 1,
+            Bucket::Paused => paused += 1,
+            Bucket::Reviewing => reviewing += 1,
+            Bucket::Completed => completed += 1,
+            Bucket::Failed => failed += 1,
+            Bucket::Stopped => stopped += 1,
         }
         let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
         repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
