@@ -1,6 +1,6 @@
 use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
-use mini_swe_mcp::manifest::ModelManifest;
+use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 use mini_swe_mcp::worktree;
@@ -138,11 +138,13 @@ where
 
     let manifest = ModelManifest::load();
 
+    // A `default` that names no known alias is already dropped by
+    // `ModelManifest::normalize`, so reaching the fallback here is deliberate.
     let default_model = env::var("DEFAULT_MODEL").unwrap_or_else(|_| {
         manifest
             .default
             .clone()
-            .unwrap_or_else(|| "ninja".to_string())
+            .unwrap_or_else(|| BUILTIN_DEFAULT_MODEL.to_string())
     });
 
     let max_workers = env::var("MAX_CONCURRENT_WORKERS")
