@@ -14,7 +14,7 @@
 //!   embedded in the `dispatch` tool description.
 //!
 //! These are exercised through the public library surface only, i.e. the same
-//! way `src/mcp.rs` and `src/main.rs` consume the manifest.
+//! way `src/mcp/` and `src/main.rs` consume the manifest.
 
 use mini_swe_mcp::manifest::{
     catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS,
