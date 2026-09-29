@@ -6,9 +6,7 @@
 //! reported separately from omitted ones, and the truncation notice is present
 //! exactly when something is missing (audit 07, R4/R7).
 
-use super::super::{
-    build_step_log, LogRetentionPolicy, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES,
-};
+use super::super::{build_step_log, LogRetentionPolicy};
 use super::*;
 
 use crate::agent::AgentStepLog;
@@ -20,7 +18,6 @@ fn entry(step: usize, out: &str) -> AgentStepLog {
 fn policy(retained: usize, emitted: usize) -> LogRetentionPolicy {
     LogRetentionPolicy {
         max_retained: retained,
-        max_bytes: retained * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
         max_emitted: emitted,
     }
 }

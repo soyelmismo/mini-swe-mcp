@@ -41,16 +41,13 @@ pub struct EmittedLogs {
 /// Render the tail of a log buffer for one response, bounded by
 /// `WORKER_MAX_EMITTED_LOGS` (audit 07, R4).
 pub fn emit_view(buffer: &LogBuffer, max_emitted: usize) -> EmittedLogs {
-    emit_view_with(&buffer.tail(max_emitted), buffer.dropped(), buffer.len())
-}
-
-/// Assemble an [`EmittedLogs`] from a tail that is already materialised.
-pub fn emit_view_with(tail: &[&AgentStepLog], dropped: usize, retained: usize) -> EmittedLogs {
-    let omitted = retained.saturating_sub(tail.len());
+    let tail = buffer.tail(max_emitted);
+    let omitted = buffer.len().saturating_sub(tail.len());
     let mut notice_parts: Vec<String> = Vec::new();
-    if dropped > 0 {
+    if buffer.dropped() > 0 {
         notice_parts.push(format!(
-            "{dropped} earlier log(s) evicted by the retention window"
+            "{} earlier log(s) evicted by the retention window",
+            buffer.dropped()
         ));
     }
     if omitted > 0 {

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::ModelManifest;
-use crate::pool::{LogBuffer, emit_view};
+use crate::pool::emit_view;
 
 impl McpServer {
     /// Shared argument extraction and progress reporting, defined next to the
@@ -250,7 +250,7 @@ impl McpServer {
     /// Render the bounded tail of a live worker's step history plus the
     /// counters that make the degradation explicit.
     pub(super) async fn render_logs(&self, wid: &str) -> LogView {
-        let Some(buffer): Option<std::sync::Arc<LogBuffer>> = self.pool.get_worker_logs(wid).await
+        let Some(buffer) = self.pool.get_worker_logs(wid).await
         else {
             return LogView::default();
         };
@@ -285,7 +285,6 @@ impl McpServer {
             "logs_retained": buffer.retained(),
             "retention": {
                 "max_retained": policy.max_retained,
-                "max_bytes": policy.max_bytes,
                 "max_emitted": policy.max_emitted,
             },
         });

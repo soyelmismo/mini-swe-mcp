@@ -5,8 +5,8 @@
 //! under `cfg(test)`; everything is exercised through the package surface
 //! (`super::…`), i.e. exactly the API the rest of the crate sees.
 //!
-//! * the sliding window, bounded by entry count *and* by bytes, evicting
-//!   strictly oldest-first and counting every eviction (audit 07, R1/R2),
+//! * the sliding window, bounded by entry count, evicting strictly oldest-first
+//!   and counting every eviction (audit 07, R1/R2),
 //! * the pre-sized backing store, so a full window never reallocates (R2),
 //! * the `LogRetentionPolicy` defaults and hard ceilings (R4 config).
 //!
@@ -25,7 +25,6 @@ fn entry(step: usize, out: &str) -> AgentStepLog {
 fn policy(retained: usize, emitted: usize) -> LogRetentionPolicy {
     LogRetentionPolicy {
         max_retained: retained,
-        max_bytes: retained * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
         max_emitted: emitted,
     }
 }
@@ -62,45 +61,6 @@ fn test_log_buffer_reserves_capacity_for_the_window() {
 }
 
 #[test]
-fn test_log_buffer_byte_budget_evicts_even_under_the_count_cap() {
-    // A tiny byte budget with a generous count budget: the byte ceiling has
-    // to win, otherwise the payload is still unbounded.
-    let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
-        max_retained: 1000,
-        max_bytes: 4 * 1024,
-        max_emitted: 8,
-    });
-    for i in 0..20 {
-        buf.push(entry(i, &"x".repeat(2048)));
-    }
-    assert!(
-        buf.bytes() <= 4 * 1024,
-        "byte budget exceeded: {}",
-        buf.bytes()
-    );
-    assert!(
-        buf.len() <= 2,
-        "expected byte-driven eviction, got {}",
-        buf.len()
-    );
-    assert!(buf.dropped() > 0);
-}
-
-#[test]
-fn test_log_buffer_empty_and_clear() {
-    let mut buf = LogBuffer::new();
-    assert!(buf.is_empty());
-    assert!(buf.front().is_none());
-    assert!(buf.back().is_none());
-    buf.push(entry(1, "a"));
-    assert!(buf.front().is_some());
-    assert!(buf.back().is_some());
-    buf.clear();
-    assert!(buf.is_empty());
-    assert_eq!(buf.bytes(), 0);
-}
-
-#[test]
 fn test_log_buffer_tail_returns_the_newest_entries() {
     let mut buf = LogBuffer::with_policy(policy(10, 10));
     for i in 0..7 {
@@ -133,23 +93,13 @@ fn test_log_policy_defaults_and_ceilings() {
     let d = LogRetentionPolicy::default();
     assert_eq!(d.max_retained, DEFAULT_MAX_RETAINED_LOGS);
     assert_eq!(d.max_emitted, DEFAULT_MAX_EMITTED_LOGS);
-    assert_eq!(
-        d.max_bytes,
-        DEFAULT_MAX_RETAINED_LOGS * worst_case_entry_bytes()
-    );
-    // The budget must actually cover a full window of worst-case entries.
-    assert!(d.max_bytes >= d.max_retained * worst_case_entry_bytes());
-    // A zero policy is coerced to something usable.
-    let zero = LogBuffer::with_policy(LogRetentionPolicy {
+    // A zero window is coerced to a single entry rather than panicking.
+    let mut zero = LogBuffer::with_policy(LogRetentionPolicy {
         max_retained: 0,
-        max_bytes: 0,
         max_emitted: 0,
     });
-    let mut zero = zero;
     zero.push(entry(1, "ok"));
-    assert_eq!(
-        zero.len(),
-        0,
-        "a zero budget retains nothing rather than panicking"
-    );
+    zero.push(entry(2, "ok"));
+    assert_eq!(zero.len(), 1);
+    assert_eq!(zero.dropped(), 1);
 }

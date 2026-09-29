@@ -702,7 +702,6 @@ async fn worker_progress_reports_phase_step_and_command() {
     assert_eq!(p.phase, WorkerPhase::Running);
     assert_eq!(p.step, 1);
     assert_eq!(p.last_command.as_deref(), Some("ls"));
-    assert!(!p.terminal);
 
     assert!(pool.worker_progress("missing").await.is_none());
 }
@@ -726,7 +725,6 @@ async fn worker_progress_never_clones_the_terminal_payload() {
     let p = pool.worker_progress("p2").await.unwrap();
     assert_eq!(p.phase, WorkerPhase::Completed);
     assert_eq!(p.step, 7);
-    assert!(p.terminal);
     assert!(p.last_command.is_none());
     assert!(p.question.is_none());
 
@@ -747,7 +745,6 @@ async fn worker_progress_reports_paused_questions() {
     assert_eq!(p.phase, WorkerPhase::Paused);
     assert_eq!(p.step, 2);
     assert_eq!(p.question.as_deref(), Some("q?"));
-    assert!(!p.terminal);
 }
 
 #[tokio::test]
@@ -764,48 +761,16 @@ async fn worker_progress_reports_failed_workers() {
     let p = pool.worker_progress("p4").await.unwrap();
     assert_eq!(p.phase, WorkerPhase::Failed);
     assert_eq!(p.step, 3);
-    assert!(p.terminal);
-}
-
-// ----------
-// Non-cloning log access (audit opt_02_pool_locks, H-3)
-// ----------
-
-#[tokio::test]
-async fn take_worker_logs_moves_history_without_clearing_state() {
-    use mini_swe_mcp::agent::AgentStepLog;
-
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
-    let mut w = running_worker("l1");
-    w.logs.push(AgentStepLog {
-        step: 1,
-        command: "ls".into(),
-        output: "out".into(),
-        exit_code: Some(0),
-    });
-    pool.__test_insert_worker(w).await;
-
-    assert_eq!(pool.worker_step_count("l1").await, Some(1));
-    let logs = pool.take_worker_logs("l1").await.unwrap();
-    assert_eq!(logs.len(), 1);
-    assert_eq!(logs.front().unwrap().output, "out");
-    // Moving out of the record does not evict it: terminal state stays queryable.
-    assert_eq!(pool.worker_step_count("l1").await, Some(0));
-    assert!(pool.get_worker_state("l1").await.is_some());
-    assert!(pool.take_worker_logs("l1").await.unwrap().is_empty());
-    assert!(pool.take_worker_logs("nope").await.is_none());
 }
 
 #[tokio::test]
-async fn take_worker_evicts_and_returns_the_full_record() {
+async fn collect_evicts_and_returns_the_full_record() {
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     pool.__test_insert_worker(running_worker("c1")).await;
 
-    let collected = pool.take_worker("c1").await.unwrap();
+    let collected = pool.collect("c1").await.unwrap();
     assert_eq!(collected.id, "c1");
     assert!(pool.get_worker_state("c1").await.is_none());
-    assert!(pool.take_worker("c1").await.is_none());
-    // `collect` keeps its original evict-and-return semantics.
     assert!(pool.collect("c1").await.is_none());
 }
 
@@ -821,7 +786,6 @@ fn entry(step: usize) -> AgentStepLog {
 fn test_log_buffer_window_is_bounded_by_entry_count() {
     let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
         max_retained: 8,
-        max_bytes: 8 * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
         max_emitted: 4,
     });
     for step in 0..500 {
@@ -847,12 +811,10 @@ fn test_log_buffer_memory_is_bounded_per_worker() {
         ));
     }
     assert!(buf.len() <= DEFAULT_MAX_RETAINED_LOGS);
-    let per_worker_ceiling =
-        DEFAULT_MAX_RETAINED_LOGS * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES);
     assert!(
-        buf.bytes() <= per_worker_ceiling,
-        "resident payload {} exceeded the ceiling {per_worker_ceiling}",
-        buf.bytes()
+        buf.iter()
+            .all(|e| e.output.len() <= MAX_LOG_OUTPUT_BYTES && e.command.len() <= MAX_LOG_COMMAND_BYTES),
+        "every retained entry must be clamped, which bounds the window's payload"
     );
 }
 
@@ -863,12 +825,8 @@ fn test_log_buffer_is_preallocated_to_the_window() {
     // 41% of the backing store unused; the window is sized once, up front.
     let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
         max_retained: 200,
-        max_bytes: 1,
         max_emitted: 8,
     });
-    // The byte budget of 1 still allows a single (already clamped) entry to be
-    // pushed without the buffer rejecting it, proving the budget is enforced by
-    // eviction and not by panicking.
     for step in 0..200 {
         buf.push(entry(step));
     }
@@ -981,7 +939,6 @@ fn test_high_turn_high_output_worker_stays_bounded() {
 
     let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
         max_retained: MAX_RETAINED,
-        max_bytes: MAX_RETAINED * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
         max_emitted: MAX_EMITTED,
     });
 
@@ -992,15 +949,8 @@ fn test_high_turn_high_output_worker_stays_bounded() {
         buf.push(build_step_log(step, "cargo test --release", raw, Some(0)));
     }
 
-    // Memory: a hard constant, identical to a 50-turn worker. The byte budget
-    // is derived per-entry and can bind slightly before the count budget, so the
-    // invariant is the ceiling, not an exact count.
-    assert!(buf.retained() <= MAX_RETAINED);
-    assert!(
-        buf.bytes() <= MAX_RETAINED * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
-        "resident payload {} B for {TURNS} turns",
-        buf.bytes()
-    );
+    // Memory: a hard constant, identical to a 50-turn worker.
+    assert_eq!(buf.retained(), MAX_RETAINED);
 
     // Bookkeeping: nothing is silently lost.
     assert_eq!(buf.total(), TURNS);

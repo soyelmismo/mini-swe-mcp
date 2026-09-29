@@ -147,9 +147,6 @@ pub struct WorkerProgress {
     pub last_command: Option<String>,
     /// Escalated question while paused.
     pub question: Option<String>,
-    /// `true` once the worker reached `Completed` or `Failed` and its full
-    /// payload can be fetched once with `get_worker_state`.
-    pub terminal: bool,
 }
 
 /// Result of a one-shot worker collection, detached from the live pool.

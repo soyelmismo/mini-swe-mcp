@@ -8,7 +8,8 @@
 //!   reintroduce the unbounded growth the audit flagged;
 //! * [`LogRetentionPolicy`] — how much history is kept and emitted;
 //! * [`LogBuffer`] — a pre-sized `VecDeque` sliding window that evicts
-//!   strictly oldest-first until both budgets hold, counting every eviction.
+//!   strictly oldest-first until the count budget holds, counting every
+//!   eviction.
 //!
 //! Sibling modules bound the two steps around that window: [`clamp`] bounds a
 //! single entry ([`clamp_string`], [`build_step_log`]) and [`emit`] bounds what
@@ -23,7 +24,7 @@ mod emit;
 mod tests;
 
 pub use self::clamp::{build_step_log, clamp_string};
-pub use self::emit::{emit_view, emit_view_with, EmittedLogs, LogStats};
+pub use self::emit::{emit_view, EmittedLogs, LogStats};
 
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -56,20 +57,11 @@ pub const MAX_LOG_OUTPUT_BYTES: usize = 2048;
 /// Hard cap on the `command` field of a retained [`AgentStepLog`].
 pub const MAX_LOG_COMMAND_BYTES: usize = 64;
 
-/// Worst-case charged cost of one retained entry: both text fields plus the
-/// inline `AgentStepLog` struct. Derives the per-worker byte budget from the
-/// entry-count window.
-pub fn worst_case_entry_bytes() -> usize {
-    std::mem::size_of::<AgentStepLog>() + MAX_LOG_COMMAND_BYTES + MAX_LOG_OUTPUT_BYTES
-}
-
 /// How a worker's step-log history is retained and how much is emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogRetentionPolicy {
     /// Maximum entries kept in the window.
     pub max_retained: usize,
-    /// Total byte budget for retained payloads (both fields combined).
-    pub max_bytes: usize,
     /// Maximum entries inlined into one MCP response.
     pub max_emitted: usize,
 }
@@ -78,7 +70,6 @@ impl Default for LogRetentionPolicy {
     fn default() -> Self {
         Self {
             max_retained: DEFAULT_MAX_RETAINED_LOGS,
-            max_bytes: DEFAULT_MAX_RETAINED_LOGS * worst_case_entry_bytes(),
             max_emitted: DEFAULT_MAX_EMITTED_LOGS,
         }
     }
@@ -103,7 +94,6 @@ impl LogRetentionPolicy {
             .unwrap_or(default.max_emitted);
         Self {
             max_retained,
-            max_bytes: max_retained * worst_case_entry_bytes(),
             max_emitted,
         }
     }
@@ -113,8 +103,8 @@ impl LogRetentionPolicy {
 ///
 /// # Invariants
 ///
-/// * `entries.len() <= policy.max_retained` and `bytes <= policy.max_bytes`
-///   hold after every [`LogBuffer::push`].
+/// * `entries.len() <= policy.max_retained` holds after every
+///   [`LogBuffer::push`].
 /// * Entries evict strictly oldest-first, so the retained window is the *tail*
 ///   of the worker's history.
 /// * [`LogBuffer::dropped`] counts every eviction since creation, making the
@@ -122,10 +112,8 @@ impl LogRetentionPolicy {
 #[derive(Debug, Clone)]
 pub struct LogBuffer {
     entries: VecDeque<AgentStepLog>,
-    bytes: usize,
     dropped: usize,
     max_retained: usize,
-    max_bytes: usize,
 }
 
 impl LogBuffer {
@@ -139,32 +127,24 @@ impl LogBuffer {
         let max_retained = policy.max_retained.max(1);
         Self {
             entries: VecDeque::with_capacity(max_retained.min(MAX_RETAINED_LOGS_CEILING)),
-            bytes: 0,
             dropped: 0,
             max_retained,
-            max_bytes: policy.max_bytes.max(1),
         }
     }
 
-    /// Append an entry, evicting the oldest until both the entry-count and byte
-    /// budgets are satisfied again.
+    /// Append an entry, evicting the oldest until the entry-count budget is
+    /// satisfied again. Every entry is already clamped to its per-field
+    /// ceiling by [`build_step_log`], so the count limit always binds first.
     pub fn push(&mut self, entry: AgentStepLog) {
-        self.bytes += entry_size(&entry);
         self.entries.push_back(entry);
         self.evict_until_within_budget();
     }
 
-    /// Drop oldest entries while the window exceeds its count budget, byte
-    /// budget, or both. A single entry larger than the byte budget is still
-    /// evicted: the window must never keep data it cannot account for.
+    /// Drop oldest entries while the window exceeds its count budget.
     fn evict_until_within_budget(&mut self) {
-        while !self.entries.is_empty()
-            && (self.entries.len() > self.max_retained || self.bytes > self.max_bytes)
-        {
-            if let Some(oldest) = self.entries.pop_front() {
-                self.bytes = self.bytes.saturating_sub(entry_size(&oldest));
-                self.dropped = self.dropped.saturating_add(1);
-            }
+        while self.entries.len() > self.max_retained {
+            self.entries.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -191,26 +171,6 @@ impl LogBuffer {
         self.entries.len() + self.dropped
     }
 
-    /// Bytes currently charged against the retention budget.
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    /// Retained entries a `max_emitted` budget would leave out.
-    pub fn logs_omitted(&self, max_emitted: usize) -> usize {
-        self.entries.len().saturating_sub(max_emitted)
-    }
-
-    /// Oldest retained entry, if any.
-    pub fn front(&self) -> Option<&AgentStepLog> {
-        self.entries.front()
-    }
-
-    /// Newest retained entry, if any.
-    pub fn back(&self) -> Option<&AgentStepLog> {
-        self.entries.back()
-    }
-
     /// Iterate the retained window oldest-first.
     pub fn iter(&self) -> impl Iterator<Item = &AgentStepLog> {
         self.entries.iter()
@@ -220,12 +180,6 @@ impl LogBuffer {
     pub fn tail(&self, limit: usize) -> Vec<&AgentStepLog> {
         let skip = self.entries.len().saturating_sub(limit);
         self.entries.iter().skip(skip).collect()
-    }
-
-    /// Drop every retained entry, keeping the `dropped` counter.
-    pub fn clear(&mut self) {
-        self.bytes = 0;
-        self.entries.clear();
     }
 }
 
@@ -242,9 +196,4 @@ impl Serialize for LogBuffer {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.entries.serialize(serializer)
     }
-}
-
-/// Bytes charged for one entry: payload plus the inline `AgentStepLog` struct.
-fn entry_size(entry: &AgentStepLog) -> usize {
-    std::mem::size_of::<AgentStepLog>() + entry.command.len() + entry.output.len()
 }
