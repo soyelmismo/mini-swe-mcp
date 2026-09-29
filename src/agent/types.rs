@@ -1,6 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Deserialize a field, mapping an explicit `null` to `Default::default()`.
+///
+/// `#[serde(default)]` only fills in an *absent* key: `null` still has to match
+/// the field type, so `"tool_calls": null` failed the whole chunk and its
+/// siblings (content, reasoning) with it. This deserializer accepts both, which
+/// is what providers actually send.
+fn deserialize_null_tolerant<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Idle (per-chunk) deadline for the SSE body read.
 ///
 /// A *whole-request* deadline is the wrong tool for a token stream: it kills
@@ -222,7 +236,7 @@ pub(crate) struct ChatCompletionRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) choices: Vec<StreamChoice>,
 }
 
@@ -234,30 +248,59 @@ pub(crate) struct StreamChoice {
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct StreamDelta {
+    /// `deserialize_null_tolerant` everywhere: providers send explicit `null`
+    /// for absent fields, and a plain `Option`/`Vec` would fail the *whole*
+    /// chunk on a null the field tolerates.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) content: Option<String>,
-    #[serde(default, alias = "reasoning")]
+    /// Chain of thought, under the canonical key some providers use.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) reasoning_content: Option<String>,
-    #[serde(default)]
+    /// Chain of thought, under the alias others use. Kept as a *separate* field
+    /// instead of a serde `alias`: proxies that send both keys made an aliased
+    /// field fail with a duplicate-field error, dropping the whole chunk
+    /// (reasoning, content and tool calls alike). Merge with
+    /// [`Self::reasoning`], which prefers `reasoning_content` and never yields
+    /// the same text twice.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) reasoning: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) tool_calls: Vec<StreamToolCall>,
+}
+
+impl StreamDelta {
+    /// The reasoning text of this delta: `reasoning_content` when present,
+    /// otherwise the `reasoning` alias. A proxy sending *both* keys repeats the
+    /// same text, so only the preferred field is taken — appending both would
+    /// double every reasoning token.
+    pub(crate) fn reasoning(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamToolCall {
     #[serde(default)]
     pub(crate) index: usize,
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) function: Option<StreamFunction>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StreamFunction {
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatCompletionResponse {
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) choices: Vec<ChatChoice>,
 }
 
@@ -268,11 +311,25 @@ pub(crate) struct ChatChoice {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatMessageOutput {
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) content: Option<String>,
-    #[serde(default, alias = "reasoning")]
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) reasoning_content: Option<String>,
-    #[serde(default)]
+    /// `reasoning` alias; see [`StreamDelta::reasoning`].
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) reasoning: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
     pub(crate) tool_calls: Vec<ToolCallOutput>,
+}
+
+impl ChatMessageOutput {
+    /// The reasoning text of this message: `reasoning_content` when present,
+    /// otherwise the `reasoning` alias.
+    pub(crate) fn reasoning(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

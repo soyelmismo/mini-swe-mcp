@@ -107,6 +107,9 @@ pub(crate) struct SseAccumulator {
     frame_cap_logged: bool,
     /// Ignore bytes until the next newline after an oversized line.
     discarding_line: bool,
+    /// Latch so an unparsable `data:` frame is warned about once per stream
+    /// rather than once per frame.
+    parse_error_logged: bool,
 }
 
 /// Outcome of feeding one complete SSE frame to the accumulator.
@@ -220,17 +223,31 @@ impl SseAccumulator {
     /// on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this stage
     /// only turns JSON into deltas.
     fn handle_payload(&mut self, data: &str) -> FrameOutcome {
-        if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
-            && let Some(choice) = chunk.choices.first()
-        {
-            if let Some(r) = &choice.delta.reasoning_content {
-                self.push_reasoning_content(r);
+        match serde_json::from_str::<StreamChunk>(data) {
+            Ok(chunk) => {
+                if let Some(choice) = chunk.choices.first() {
+                    if let Some(r) = choice.delta.reasoning() {
+                        self.push_reasoning_content(r);
+                    }
+                    if let Some(c) = &choice.delta.content {
+                        self.push_content(c);
+                    }
+                    for tc in &choice.delta.tool_calls {
+                        self.accumulate_tool_call(tc);
+                    }
+                }
             }
-            if let Some(c) = &choice.delta.content {
-                self.push_content(c);
-            }
-            for tc in &choice.delta.tool_calls {
-                self.accumulate_tool_call(tc);
+            // A dropped frame loses content, tool calls and reasoning at once
+            // and is otherwise invisible, so surface it — but only once per
+            // stream, or a persistently misbehaving provider floods the log.
+            Err(err) => {
+                if !self.parse_error_logged {
+                    self.parse_error_logged = true;
+                    tracing::warn!(
+                        error = %err,
+                        "Failed to parse an SSE data frame; dropping the frame"
+                    );
+                }
             }
         }
         FrameOutcome::Consumed
@@ -295,10 +312,15 @@ impl SseAccumulator {
         // already-populated slot means the provider restarted its call
         // numbering, so redirect it to a brand-new index instead of clobbering
         // the call we already accumulated.
+        // A continuation chunk re-sends the *slot* fields with empty strings
+        // (`"id":"", "type":"", "name":""`), so an empty id means "no id in this
+        // delta" — not a new call. Only a genuinely different, non-empty id
+        // redirects the delta to a new slot.
+        let new_id = tc.id.as_deref().map(str::trim).filter(|id| !id.is_empty());
         let target_index = match self.tools.get(&tc.index) {
             Some(entry)
                 if !entry.malformed
-                    && tc.id.as_deref().is_some_and(|id| id != entry.id)
+                    && new_id.is_some_and(|id| id != entry.id)
                     && (!entry.id.is_empty() || !entry.arguments.trim().is_empty()) =>
             {
                 let next = self.tools.keys().max().copied().unwrap_or(0) + 1;
@@ -317,12 +339,12 @@ impl SseAccumulator {
             return;
         }
 
-        if let Some(id) = &tc.id {
-            entry.id = id.clone();
+        if let Some(id) = new_id {
+            entry.id = id.to_string();
         }
 
         if let Some(fn_info) = &tc.function {
-            if let Some(name) = &fn_info.name
+            if let Some(name) = fn_info.name.as_deref().map(str::trim)
                 && !name.is_empty()
             {
                 entry.name.push_str(name);
@@ -429,19 +451,35 @@ impl SseAccumulator {
             .or_else(|| extract_command(&content));
 
         let (finalized, known_ids) = SseAccumulator::finalize_from(&tools);
-        let tool_calls = (!finalized.is_empty()).then_some(finalized);
-        let tool_call_id = tool_calls.as_ref().and_then(|tcs| {
-            bash_tc.and_then(|tc| {
-                let candidate = if tc.id.trim().is_empty() {
-                    tcs.iter()
-                        .find(|t| t.function.arguments == tc.arguments)
-                        .map(|t| t.id.clone())
-                } else {
-                    Some(tc.id.trim().to_string())
-                };
-                candidate.filter(|id| known_ids.contains(id))
-            })
+        let tool_call_id = bash_tc.and_then(|tc| {
+            let candidate = if tc.id.trim().is_empty() {
+                finalized
+                    .iter()
+                    .find(|t| t.function.arguments == tc.arguments)
+                    .map(|t| t.id.clone())
+            } else {
+                Some(tc.id.trim().to_string())
+            };
+            candidate.filter(|id| known_ids.contains(id))
         });
+        // One step runs one command and answers with one `tool` message, so only
+        // the executed call may go back into history: sibling calls replayed
+        // without their results would leave unanswered `tool_calls` on the
+        // assistant turn, which the tool-call protocol rejects on the next
+        // request.
+        let emitted = finalized.len();
+        let mut tool_calls = finalized;
+        if let Some(id) = &tool_call_id {
+            tool_calls.retain(|tc| &tc.id == id);
+        }
+        if tool_calls.len() < emitted {
+            tracing::debug!(
+                dropped = emitted - tool_calls.len(),
+                kept = tool_calls.len(),
+                "Model returned several tool calls; replaying only the executed one"
+            );
+        }
+        let tool_calls = (!tool_calls.is_empty()).then_some(tool_calls);
 
         let reasoning = (!reasoning_content.trim().is_empty()).then_some(reasoning_content);
 
@@ -464,7 +502,7 @@ impl SseAccumulator {
             && let Ok(result) = serde_json::from_slice::<ChatCompletionResponse>(buffer)
             && let Some(choice) = result.choices.first()
         {
-            if let Some(r) = &choice.message.reasoning_content {
+            if let Some(r) = choice.message.reasoning() {
                 self.push_reasoning_content(r);
             }
             self.push_content(choice.message.content.as_deref().unwrap_or(""));
@@ -681,7 +719,101 @@ mod tests {
         assert_eq!(tcs[0].function.arguments, r#"{"command":"pwd"}"#);
     }
 
-    /// A provider that emits several tool calls with the same `index` (or omits
+    /// The exact chunk shapes captured from the OpenAI-compatible proxy: a first
+    /// tool-call chunk with a real id, continuation chunks that re-send the slot
+    /// with *empty* id/name/type, and reasoning chunks carrying BOTH
+    /// `reasoning` and `reasoning_content`. The empty id must not open a new
+    /// slot (one call, not one per fragment), reasoning must be captured exactly
+    /// once, and the full arguments must parse to `command: "ls"`.
+    #[test]
+    fn real_provider_chunk_shapes_accumulate_one_call_and_reasoning_once() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let body = sse_body(&[
+            r#"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"chatcmpl-tool-9d6a7c55214c5666","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
+            r##"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"{\"command\": "}}]}}]}"##,
+            r#"{"choices":[{"delta":{"role":"assistant","content":"","reasoning":"thought A","reasoning_content":"thought A"}}]}"#,
+            r##"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"\"ls\"}"}}]}}]}"##,
+        ]);
+        for b in &body {
+            if acc.push(&[*b], &mut buffer) == Some(FrameOutcome::Done) {
+                break;
+            }
+        }
+        assert_eq!(acc.tools.len(), 1, "one call, not one per fragment: {:?}", acc.tools);
+        let (tcs, _) = SseAccumulator::finalize_from(&acc.tools);
+        assert_eq!(tcs.len(), 1, "exactly one tool call: {tcs:?}");
+        assert_eq!(tcs[0].id, "chatcmpl-tool-9d6a7c55214c5666");
+        assert_eq!(tcs[0].function.arguments, r#"{"command": "ls"}"#);
+        assert_eq!(acc.reasoning_content, "thought A", "reasoning captured once");
+        let resp = acc.finish();
+        assert_eq!(resp.command.as_deref(), Some("ls"));
+        assert_eq!(resp.reasoning_content.as_deref(), Some("thought A"));
+    }
+
+    /// A genuinely different, non-empty id on an already-populated index must
+    /// still open a new slot (the redirect behaviour is preserved).
+    #[test]
+    fn non_empty_different_id_still_opens_a_new_slot() {
+        let mut acc = SseAccumulator::default();
+        acc.accumulate_tool_call(&tc(0, Some("a"), Some("bash"), Some("{}")));
+        acc.accumulate_tool_call(&tc(0, Some("b"), None, None));
+        assert_eq!(acc.tools.len(), 2, "a real new id must open a slot: {:?}", acc.tools);
+    }
+
+    /// Explicit `null` fields must not drop the chunk: `tool_calls: null`,
+    /// `choices: null`, `function: null`, `content: null`, `id: null`.
+    #[test]
+    fn explicit_nulls_do_not_drop_a_chunk() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let body = sse_body(&[
+            r#"{"choices":null}"#,
+            r#"{"choices":[{"delta":{"content":null,"reasoning_content":null,"tool_calls":null}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"function":null}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        ]);
+        for b in &body {
+            if acc.push(&[*b], &mut buffer) == Some(FrameOutcome::Done) {
+                break;
+            }
+        }
+        let resp = acc.finish();
+        assert_eq!(resp.command.as_deref(), Some("ls"), "nulls must not drop the chunk");
+    }
+
+    /// A data frame that fails to parse is warned about (once per stream) rather
+    /// than silently dropped.
+    #[test]
+    fn unparsable_frame_is_warned_once() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let body = sse_body(&["{not json", "{also bad", r#"{"choices":[{"delta":{"content":"ok"}}]}"#]);
+        for b in &body {
+            if acc.push(&[*b], &mut buffer) == Some(FrameOutcome::Done) {
+                break;
+            }
+        }
+        assert!(acc.parse_error_logged, "the parse failure must be latched");
+        assert_eq!(acc.content, "ok", "the valid frame must still be consumed");
+    }
+
+    /// When the model returns more than one tool call, only the executed one is
+    /// replayed into history (matching `tool_call_id`); the rest are dropped.
+    #[test]
+    fn finish_keeps_only_the_executed_tool_call_in_history() {
+        let mut acc = SseAccumulator::default();
+        acc.accumulate_tool_call(&tc(0, Some("a"), Some("bash"), Some(r#"{"command":"ls"}"#)));
+        acc.accumulate_tool_call(&tc(1, Some("b"), Some("bash"), Some(r#"{"command":"pwd"}"#)));
+        let resp = acc.finish();
+        assert_eq!(resp.command.as_deref(), Some("ls"));
+        let calls = resp.tool_calls.expect("tool_calls present");
+        assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+        assert_eq!(calls[0].id, "a");
+        assert_eq!(resp.tool_call_id.as_deref(), Some("a"));
+    }
+
+    /// A provider that sends several tool calls with the same `index` (or omits
     /// `index`, which serde defaults to `0`) used to have the *second* id treated
     /// as a malicious collision: the entry was marked `malformed` and both calls
     /// were dropped, so the turn carried no command and the agent loop spun
