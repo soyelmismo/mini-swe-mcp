@@ -14,7 +14,10 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::agent::{AgentRunner, ChatMessage, Role, SYSTEM_PROMPT};
+use std::path::Path;
+
+use crate::agent::{AgentRunner, ChatMessage, Role};
+use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::sentinels::summarize_command;
@@ -98,11 +101,6 @@ impl WorkerPool {
         task
     );
 
-    let mut review_messages = vec![
-        ChatMessage::text(Role::System, SYSTEM_PROMPT),
-        ChatMessage::text(Role::User, review_prompt),
-    ];
-
     let reviewer_runner = AgentRunner::new(
         self.api_base.clone(),
         self.api_key.clone(),
@@ -110,8 +108,22 @@ impl WorkerPool {
         temperature,
     );
 
-    let manifest = crate::manifest::ModelManifest::load();
+    let manifest = ModelManifest::load();
     let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
+
+    // The reviewer gets *its own* role memory, keyed by the reviewer alias, so
+    // review lessons never bleed into the implementer's prompt (and vice versa).
+    // `reviewer_model` may already be a resolved id (`combo:nerd`), so it is
+    // mapped back to its alias first; an unknown id passes through unchanged and
+    // simply finds no memory file.
+    let reviewer_alias = manifest.alias_for_model(&reviewer_model);
+    let mut review_messages = vec![
+        ChatMessage::text(
+            Role::System,
+            build_system_prompt(Path::new(&repo_path_str), &reviewer_alias),
+        ),
+        ChatMessage::text(Role::User, review_prompt),
+    ];
     let review_max_turns = if max_turns > 0 {
         max_turns
     } else {

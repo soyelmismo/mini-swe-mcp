@@ -22,7 +22,8 @@
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::agent::{AgentRunner, ChatMessage, Role, SYSTEM_PROMPT};
+use crate::agent::{AgentRunner, ChatMessage, Role};
+use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::buffer::build_step_log;
@@ -77,8 +78,16 @@ impl WorkerPool {
             temperature,
         );
 
+        // The system prompt carries this role's persistent memory
+        // (`.agents/memory/<alias>.md`) when the repository provides any, so a
+        // dispatch starts from what previous runs of the same role learned
+        // instead of from the static prompt alone.
+        let manifest = ModelManifest::load();
+        let memory_alias = manifest.alias_for_model(&model);
+        let system_prompt = build_system_prompt(&repo_path, &memory_alias);
+
         let mut messages = vec![
-            ChatMessage::text(Role::System, SYSTEM_PROMPT),
+            ChatMessage::text(Role::System, system_prompt),
             ChatMessage::text(Role::User, format!("TASK:\n{}\n\nBegin by exploring the repository.", task)),
         ];
 

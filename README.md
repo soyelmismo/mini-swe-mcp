@@ -238,6 +238,41 @@ models:
 
 ---
 
+## Persistent Role Memory
+
+A subagent conversation is volatile: every dispatch starts from the same static
+system prompt. Role memory gives each *role* a durable notes file at the repo
+root that is loaded into the system prompt when the worker starts:
+
+```
+.agents/
+└── memory/
+    ├── ninja.md    # fast-execution lessons (compile/test loop, minimal diffs)
+    └── nerd.md     # architecture & review lessons (root cause, invariants)
+```
+
+The file is keyed by the **alias** from `models.yaml`, so `ninja` and `nerd` have
+separate memories and neither leaks into the other's prompt. Memory is read fresh
+on every dispatch (never memoized), so a note written by one run is visible to the
+next:
+
+- **Absent, blank or unreadable** -> no memory section at all; the system prompt
+  is byte-identical to the pre-memory behaviour. Nothing to configure, nothing to
+  break.
+- **Bounded** -> at most 8 KiB of memory is injected (the newest entries), so a
+  memory file that grows forever can never squeeze out the instructions.
+- **Traversal-safe** -> the alias is reduced to an `[a-z0-9_-]` slug before it
+  touches the filesystem, so a `model` argument can never read or write outside
+  `.agents/memory/`.
+
+Notes are appended as atomic, single-line markdown entries
+(`append_agent_memory`): the new file is staged next to the target and moved into
+place with `rename`, and the read-modify-write is serialized, so a reader (or a
+`worktree` artifact sync) never sees a half-written note and two agents finishing
+at once cannot lose each other's takeaway.
+
+---
+
 ## Verification & Testing
 
 Run the full automated test suite:

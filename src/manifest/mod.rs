@@ -9,6 +9,8 @@
 //!   bullets.
 //! * `catalog` — the markdown catalog rendering used by the MCP `tools/list`
 //!   payload ([`ModelManifest::build_tool_description`]).
+//! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
+//!   loaded into a worker's system prompt.
 //! * `validate` — the advisory warning rules and the fixups that repair what
 //!   they report.
 //! * `tests` — the package unit tests (compiled only under `cfg(test)`).
@@ -27,6 +29,7 @@ use crate::config::xdg_config_dir;
 
 mod cache;
 mod catalog;
+mod memory;
 mod types;
 mod validate;
 
@@ -34,6 +37,10 @@ mod validate;
 mod tests;
 
 pub use self::cache::{catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY};
+pub use self::catalog::build_system_prompt;
+pub use self::memory::{
+    MEMORY_DIR, MAX_MEMORY_PROMPT_BYTES, agent_memory_path, append_agent_memory, load_agent_memory,
+};
 pub use self::types::{
     ModelDefinition, ModelManifest, BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT,
     TEMPERATURE_RANGE,
@@ -147,6 +154,25 @@ impl ModelManifest {
                 || (requested.to_string(), None, None),
                 |(_, def)| (def.id.clone(), def.temperature, def.max_turns),
             )
+    }
+
+    /// Resolve the *alias* that owns `model`, whether `model` is already an alias
+    /// or a full model id.
+    ///
+    /// The worker pool only carries the resolved id (see [`Self::resolve_model`]),
+    /// but role memory is keyed by alias (`.agents/memory/<alias>.md`), so this is
+    /// the bridge between the two. An alias hit always wins; otherwise the first
+    /// alias (in sorted order) whose `id` matches is returned. Unknown models fall
+    /// back to the input unchanged, so a pass-through id like `some/unknown` is
+    /// still looked up verbatim as a slug and simply finds no file.
+    pub fn alias_for_model(&self, model: &str) -> String {
+        if self.models.contains_key(model) {
+            return model.to_string();
+        }
+        self.sorted_models()
+            .iter()
+            .find(|(_, def)| def.id == model)
+            .map_or_else(|| model.to_string(), |(alias, _)| (*alias).to_string())
     }
 
     /// Model entries in alias order.

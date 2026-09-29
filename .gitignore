@@ -2,7 +2,11 @@
 .env
 .tmp-*/
 *.log
-/.agents/
+# Role memory is a shipped default, not an ephemeral artifact: the loader reads it
+# at dispatch time, so `.agents/memory/*.md` must be tracked. Everything else under
+# `.agents/` stays ignored (handoffs, scratch notes).
+/.agents/*
+!/.agents/memory/
 /audits/
 /reports/
 /artifacts/
