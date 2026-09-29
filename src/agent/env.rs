@@ -91,7 +91,6 @@ const SECRET_MARKERS: &[&str] = &[
     "PASSWD",
     "PASSPHRASE",
     "TOKEN",
-    "BEARER",
     "AUTHORIZATION",
     "CREDENTIAL",
     "PRIVATE_KEY",
@@ -139,6 +138,8 @@ pub fn is_sensitive_var(name: &str) -> bool {
         // Matched only at a word boundary so a variable that merely contains the
         // letters (`PATH`, `PATCH_LEVEL`) is not mistaken for a credential.
         || is_word(name, "PAT")
+        // BEARER_* is a credential; e.g. UNBEARERABLE is not.
+        || is_word(name, "BEARER")
 }
 
 /// Whether `name` starts with `prefix`, comparing ASCII case-insensitively.
@@ -165,11 +166,10 @@ fn contains_ignore_ascii_case(name: &str, needle: &str) -> bool {
 
 /// Whether `name` contains `word` delimited by a non-alphanumeric boundary.
 ///
-/// A bare substring test is too greedy for short markers: `PAT` occurs inside
-/// `PATH` and `PATCH_LEVEL`, so matching it anywhere would flag every
-/// `*_PATH`/`*_PATCH` variable. Requiring `_`, `-` or a string edge on both
-/// sides keeps the match precise while still covering the common `FOO_PAT_BAR`
-/// spellings.
+/// A bare substring test is too greedy for markers: `PAT` occurs inside
+/// `PATH` and `PATCH_LEVEL`, and `BEARER` occurs inside `UNBEARERABLE`.
+/// Requiring non-alphanumeric delimiters or a string edge on both sides
+/// keeps the match precise while still covering `FOO_PAT_BAR` and `BEARER_TOKEN`.
 fn is_word(name: &str, word: &str) -> bool {
     let bytes = name.as_bytes();
     let word = word.as_bytes();
@@ -463,6 +463,8 @@ mod tests {
             "XDG_DATA_HOME",
             "KEYBOARD_LAYOUT",
             "AUTHOR_NAME",
+            "UNBEARERABLE",
+            "UNBEARERABLE_MODE",
         ] {
             assert!(!is_sensitive_var(name), "{name} is not a credential");
         }
