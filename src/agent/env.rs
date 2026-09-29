@@ -28,6 +28,7 @@
 //!    directory so a command that reads `~/.aws/credentials`, writes
 //!    `~/.gitconfig` or drops a stray `~/.npmrc` touches only the sandbox,
 //!    never the operator's real home.
+//!
 //! [`build_clean_environment`] is the single entry point. It returns a plain
 //! `Vec<(String, String)>` rather than mutating a `Command` so the exact
 //! contract can be unit-tested without spawning anything, and so callers can
@@ -122,8 +123,7 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
 ///
 /// Only the *path* is forwarded. `$CARGO_HOME/credentials.toml`, registry tokens
 /// in `$CARGO_HOME/config.toml` and any `CARGO_REGISTRY_TOKEN` stay unreachable,
-/// because the variable is the only thing this module emits: the allow-list
-/// re-screen in [`build_clean_environment`] still runs over the result, and no
+/// because the variable is the only thing this module emits: no
 /// credential-bearing *name* is introduced by this lookup.
 pub fn host_cargo_home() -> Option<PathBuf> {
     resolve_cargo_home(
@@ -630,8 +630,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The toolchain paths are cache *locations*, not credentials: they must
-    /// survive the secret filter, or the forwarding would be dropped.
+    /// The toolchain paths are cache *locations*, not credentials: they carry
+    /// no secret and are always safe to forward.
     #[test]
     fn toolchain_cache_vars_are_not_treated_as_secrets() {
         for name in [CARGO_HOME_VAR, RUSTUP_HOME_VAR] {

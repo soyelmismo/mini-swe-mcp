@@ -5,7 +5,8 @@ use std::time::Duration;
 ///
 /// A *whole-request* deadline is the wrong tool for a token stream: it kills
 /// healthy-but-slow generations regardless of progress. Only a per-chunk
-/// `tokio::time::timeout` aborts genuine stalls.
+/// `tokio::time::timeout` aborts genuine stalls, so no `read_timeout` is set
+/// on the HTTP client.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hard cap on the assistant text retained from a stream.

@@ -16,7 +16,7 @@
 //!   shape of each message kind is the only observable behaviour left to pin.
 
 use mini_swe_mcp::agent::{
-    extract_command, truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn,
+    extract_command, truncate_output, ChatMessage, Role, ToolCall, ToolCallFn,
     TRUNCATE_HEAD as HEAD, TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
 };
 
@@ -24,15 +24,6 @@ use mini_swe_mcp::agent::{
 // head/tail slices that are retained when it is, are defined once in
 // `src/agent.rs` and re-exported here, so the numbers cannot drift apart.
 const _: () = assert!(HEAD + TAIL == LIMIT);
-
-fn runner() -> AgentRunner {
-    AgentRunner::new(
-        "http://localhost".to_string(),
-        "test-key".to_string(),
-        "test-model".to_string(),
-        None,
-    )
-}
 
 /// Extract the discarded-byte count from a `... [Truncated N bytes] ...` marker.
 fn parse_marker(marker: &str) -> usize {
