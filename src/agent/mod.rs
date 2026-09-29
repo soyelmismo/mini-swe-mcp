@@ -1,3 +1,5 @@
+//! Agent subsystem: LLM transport, command interception, and execution.
+
 pub mod env;
 pub mod exec;
 pub mod intercept;

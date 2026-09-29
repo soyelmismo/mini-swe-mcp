@@ -1,12 +1,11 @@
 //! Pre-execution command interceptor middleware.
 //!
 //! Interceptors run inside [`crate::agent::AgentRunner::execute_bash`] before
-//! any sandbox construction or process spawn. Each interceptor inspects the
-//! requested command and votes [`InterceptDecision::Allow`],
-//! [`InterceptDecision::Block`] or [`InterceptDecision::Rewrite`]. The
-//! [`CommandPipeline`] chains them in registration order: the first `Block`
-//! wins, while `Rewrite` updates the effective command seen by the remaining
-//! interceptors and by the executor.
+//! any sandbox construction or process spawn. Each inspects the requested
+//! command and votes [`InterceptDecision::Allow`], [`InterceptDecision::Block`]
+//! or [`InterceptDecision::Rewrite`]. The [`CommandPipeline`] chains them in
+//! registration order: the first `Block` wins, while `Rewrite` updates the
+//! effective command seen by the remaining interceptors and by the executor.
 
 use anyhow::Result;
 use std::time::Instant;

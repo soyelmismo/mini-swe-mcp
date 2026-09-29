@@ -10,11 +10,10 @@ use super::types::{
 
 /// Recover a bash command from the first ```bash / ```sh fenced block.
 ///
-/// Uses a single `find()` on a capture-free pattern and slices the body out
-/// of the match by hand, which is materially cheaper than `captures()`.
-/// A literally empty body (```` ```bash\n``` ````) yields `None`, because
-/// the pattern requires a newline before the closing fence; a
-/// whitespace-only body yields `Some("")`.
+/// Uses a single `find()` on a capture-free pattern and slices the body out by
+/// hand, materially cheaper than `captures()`. A literally empty body
+/// (```` ```bash\n``` ````) yields `None` (the pattern requires a newline before
+/// the closing fence); a whitespace-only body yields `Some("")`.
 pub(crate) fn extract_command(text: &str) -> Option<String> {
     let full = BASH_BLOCK_RE.find(text)?.as_str();
     let open_line_end = full.find('\n')?;
@@ -25,13 +24,12 @@ pub(crate) fn extract_command(text: &str) -> Option<String> {
     Some(full[open_line_end + 1..close_start].trim().to_string())
 }
 
-/// Pattern used to recover a shell command from a ```bash/```sh fenced block
-/// when the model did not use the structured `bash` tool call.
+/// Pattern recovering a shell command from a ```bash/```sh fenced block when
+/// the model did not use the structured `bash` tool call.
 ///
-/// The pattern is a compile-time constant (no interpolation), so the compiled
-/// program is memoized process-wide: it is built at most once, no matter how
-/// many `AgentRunner`s (one per worker) exist, and the compiled automaton's
-/// lazy DFA cache is shared instead of duplicated per worker.
+/// A compile-time constant (no interpolation), so the compiled program is
+/// memoized process-wide: built once regardless of how many `AgentRunner`s
+/// exist, and its lazy DFA cache is shared instead of duplicated per worker.
 static BASH_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)```(?:bash|sh)[ \t\r\n]*\n.*?\n```").expect("bash block regex must compile")
 });
@@ -47,11 +45,11 @@ const DONE_SENTINEL_STR: &str = "[DONE]";
 
 /// Classify one raw (undecoded) SSE line and return the bytes of its payload.
 ///
-/// Returns `None` for every line that carries no `data` payload — blank lines,
-/// SSE comments (a leading `:`), and fields such as `event:`, `id:` or
-/// `retry:` — so the caller skips them without decoding or allocating. For a
-/// `data:` line it returns the payload with leading/trailing ASCII whitespace
-/// removed, matching the SSE spec's single optional space after the colon.
+/// Returns `None` for every line carrying no `data` payload — blank lines, SSE
+/// comments (leading `:`), and fields such as `event:`, `id:` or `retry:` — so
+/// the caller skips them without decoding or allocating. For a `data:` line it
+/// returns the payload with leading/trailing ASCII whitespace removed, matching
+/// the spec's single optional space after the colon.
 ///
 /// Operating on `&[u8]` keeps the filter allocation-free and lets the caller
 /// run it *before* UTF-8 validation, so a keep-alive comment costs one
@@ -68,10 +66,10 @@ fn data_field(raw_line: &[u8]) -> Option<&[u8]> {
 
 /// Trim ASCII whitespace from both ends of a byte slice.
 ///
-/// SSE framing only ever introduces ASCII spaces/tabs/CR, and a `&[u8]` cannot
-/// carry the full Unicode whitespace set, so this is exact for the lines the
-/// spec allows. It is a no-op for the overwhelmingly common already-trimmed
-/// case, which the fast path inside `trim_ascii` detects in four comparisons.
+/// SSE framing only introduces ASCII spaces/tabs/CR, and a `&[u8]` cannot carry
+/// the full Unicode whitespace set, so this is exact for the lines the spec
+/// allows. A no-op for the common already-trimmed case, which the fast path
+/// detects in four comparisons.
 #[inline]
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     // Leading whitespace: skip while the front is ASCII whitespace.
@@ -93,11 +91,10 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 /// Append the UTF-8-lossy decoding of `bytes` to `out` without allocating a
 /// temporary `String`.
 ///
-/// Equivalent to `out.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes())`
-/// but writes byte-for-byte: every maximal valid subsequence is copied verbatim,
-/// and each maximal invalid subsequence collapses to the single U+FFFD
-/// replacement character — exactly the substitution `from_utf8_lossy` performs.
-/// `out` must be empty; it is cleared and then grown in place.
+/// Equivalent to `String::from_utf8_lossy(bytes)` but writes byte-for-byte:
+/// each maximal valid subsequence is copied verbatim and each maximal invalid
+/// one collapses to a single U+FFFD. `out` must be empty; it is cleared and
+/// grown in place.
 fn lossy_decode_into(bytes: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(bytes.len() + REPLACEMENT_CHAR.len());
@@ -109,17 +106,13 @@ fn lossy_decode_into(bytes: &[u8], out: &mut Vec<u8>) {
                 return;
             }
             Err(err) => {
-                // Copy the valid prefix verbatim.
                 let (valid, after_valid) = rest.split_at(err.valid_up_to());
                 out.extend_from_slice(valid);
-                // Then one replacement char for the invalid run. When the error
-                // is merely a truncated trailing sequence there is nothing left
-                // to append afterwards, which `from_utf8` reports as
-                // `error_len() == None`; both cases produce a single U+FFFD.
+                // One replacement char for the invalid run. A truncated trailing
+                // sequence (`error_len() == None`) leaves nothing to append.
                 out.extend_from_slice(REPLACEMENT_CHAR);
                 match err.error_len() {
                     Some(len) => rest = &after_valid[len..],
-                    // Incomplete tail: nothing valid remains.
                     None => return,
                 }
             }
@@ -137,8 +130,7 @@ pub(crate) struct StreamedToolCall {
     pub(crate) name: String,
     pub(crate) arguments: String,
     /// Set when the call blew past [`MAX_TOOL_ARGUMENT_BYTES`] and is therefore
-    /// unusable. Such calls are dropped rather than replayed into the
-    /// conversation history.
+    /// unusable; such calls are dropped rather than replayed into history.
     ///
     /// A *conflicting id* on a re-used `index` no longer lands here: that is a
     /// provider numbering quirk, not corruption, so the delta is redirected to
@@ -147,7 +139,7 @@ pub(crate) struct StreamedToolCall {
 }
 
 impl StreamedToolCall {
-    /// `true` for a padding / never-populated slot: no id, no name, no args.
+    /// `true` for a never-populated slot: no id, no name, no args.
     pub(crate) fn is_placeholder(&self) -> bool {
         self.id.trim().is_empty() && self.name.trim().is_empty() && self.arguments.trim().is_empty()
     }
@@ -167,7 +159,7 @@ pub(crate) struct SseAccumulator {
     pub(crate) tools: BTreeMap<usize, StreamedToolCall>,
     /// Set when `content` hit [`MAX_STREAMED_CONTENT_BYTES`].
     pub(crate) content_capped: bool,
-    /// Count of frames that were not valid UTF-8 (decoded lossily).
+    /// Frames that were not valid UTF-8 (decoded lossily).
     pub(crate) invalid_utf8_lines: usize,
     /// Reusable decode buffer for the lossy UTF-8 path, so a corrupting stream
     /// does not allocate one `String` per frame. Never escapes the accumulator.
@@ -192,7 +184,7 @@ impl SseAccumulator {
     /// Frame chunk bytes line by line. Incomplete lines are retained up to the
     /// cap; oversized lines are ignored through their terminating newline.
     /// Complete lines in a single chunk are borrowed directly, without copying
-    /// the entire chunk into the framing buffer.
+    /// the whole chunk into the framing buffer.
     pub(crate) fn push(&mut self, mut bytes: &[u8], buffer: &mut Vec<u8>) -> Option<FrameOutcome> {
         while !bytes.is_empty() {
             if self.discarding_line {
@@ -217,7 +209,7 @@ impl SseAccumulator {
                     );
                 }
                 // If this chunk does not end the oversized line, skip future
-                // chunks too: otherwise their suffix could look like `data:`.
+                // chunks too: their suffix could otherwise look like `data:`.
                 self.discarding_line = newline.is_none();
             } else if newline.is_some() {
                 let outcome = if buffer.is_empty() {
@@ -244,43 +236,41 @@ impl SseAccumulator {
 
     /// Frame one newline-delimited line: decode, filter, parse, accumulate.
     ///
-    /// Framing is done purely on `&[u8]`. The SSE field filter only has to
-    /// recognise three cheap byte patterns (empty line, `:` comment, the ASCII
-    /// `data:` field name), so a line is classified *before* any UTF-8 work:
-    /// keep-alive comments and other unknown fields are rejected without ever
-    /// being validated or copied. Only a `data:` line — the payload — reaches
-    /// the decoder, and even then it is borrowed in place, so no intermediate
-    /// `String` is materialised on the happy path.
+    /// Framing is done purely on `&[u8]`. The field filter only recognises
+    /// three cheap byte patterns (empty line, `:` comment, the ASCII `data:`
+    /// field name), so a line is classified *before* any UTF-8 work:
+    /// keep-alive comments and unknown fields are rejected without ever being
+    /// validated or copied. Only a `data:` line — the payload — reaches the
+    /// decoder, borrowed in place, so no intermediate `String` is materialised
+    /// on the happy path.
     pub(crate) fn handle_line(&mut self, raw_line: &[u8]) -> FrameOutcome {
-        // Cheap byte classification first: skip blanks, SSE comments
-        // (`:`) and any field other than `data` without decoding.
+        // Cheap byte classification first: skip blanks, SSE comments (`:`) and
+        // any field other than `data` without decoding.
         let Some(payload) = data_field(raw_line) else {
             return FrameOutcome::Consumed;
         };
 
-        // `[DONE]` is a fixed ASCII token, so it is matched on bytes and never
-        // decoded at all.
+        // `[DONE]` is a fixed ASCII token, matched on bytes and never decoded.
         if payload == DONE_SENTINEL {
             return FrameOutcome::Done;
         }
 
-        // Validate once and branch on the result: a valid payload is borrowed
-        // straight out of the caller's buffer, and the error is already in hand
-        // on the slow path. Validating twice (to recover the `Utf8Error` with
-        // `unwrap_err`) re-scanned the whole line for nothing.
+        // Validate once and branch: a valid payload is borrowed straight out of
+        // the caller's buffer, and the error is already in hand on the slow
+        // path. Validating twice (to recover the `Utf8Error` via `unwrap_err`)
+        // re-scanned the whole line for nothing.
         let err = match std::str::from_utf8(payload) {
-            // Fast path: valid UTF-8, handed to the shared handler by reference.
             Ok(text) => return self.handle_payload(text),
             Err(err) => err,
         };
 
-        // Slow path: log and count exactly as before, then decode lossily.
-        // The decode reuses `self.lossy_scratch`'s capacity across frames, so a
-        // stream that keeps sending corrupted lines allocates once and then
-        // only regrows when a *larger* corrupted line arrives — instead of one
-        // fresh `String` per line, as `String::from_utf8_lossy` would.
-        // Log against `payload`, the region actually being decoded, so the
-        // reported offsets line up with the lossy substitution that follows.
+        // Slow path: count, log, then decode lossily. The decode reuses
+        // `self.lossy_scratch`'s capacity across frames, so a stream that keeps
+        // sending corrupted lines allocates once and only regrows when a
+        // *larger* corrupted line arrives — instead of one fresh `String` per
+        // line, as `String::from_utf8_lossy` would. Log against `payload`, the
+        // region actually being decoded, so the reported offsets line up with
+        // the lossy substitution that follows.
         self.invalid_utf8_lines += 1;
         tracing::warn!(
             valid_up_to = err.valid_up_to(),
@@ -290,10 +280,9 @@ impl SseAccumulator {
         );
 
         // `handle_payload` takes `&mut self`, so the decoded `&str` must not be
-        // borrowed from `self`. Decode into a local that starts with the capacity
-        // stashed in `lossy_scratch` (moved out, so there is no allocation after
-        // the first corrupted line), handle the line, then hand the capacity
-        // back for the next frame.
+        // borrowed from `self`. Decode into a local starting with the capacity
+        // stashed in `lossy_scratch` (moved out, so no allocation after the
+        // first corrupted line), handle the line, then hand the capacity back.
         let mut decoded = std::mem::take(&mut self.lossy_scratch);
         lossy_decode_into(payload, &mut decoded);
         // `lossy_decode_into` only ever emits valid UTF-8, so this cannot fail.
@@ -309,13 +298,13 @@ impl SseAccumulator {
 
     /// Parse and accumulate one already-classified `data:` payload.
     ///
-    /// Filtering (blank lines, comments, field name, `[DONE]`) has already been
-    /// done on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this
-    /// stage only has to turn JSON into deltas.
+    /// Filtering (blank lines, comments, field name, `[DONE]`) was already done
+    /// on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this stage
+    /// only turns JSON into deltas.
     fn handle_payload(&mut self, data: &str) -> FrameOutcome {
         // `data_field` already ASCII-trimmed the payload on bytes (the only
-        // whitespace the SSE framing can introduce). This zero-alloc Unicode
-        // trim restores exact parity with the old `str::trim` path for exotic
+        // whitespace SSE framing can introduce). This zero-alloc Unicode trim
+        // restores exact parity with the old `str::trim` path for exotic
         // whitespace (e.g. NBSP) at payload edges, and re-checks the sentinel
         // for a `[DONE]` wrapped in such whitespace.
         let data = data.trim();
@@ -355,14 +344,14 @@ impl SseAccumulator {
             self.content.push_str(text);
             return;
         }
-        // Take the longest prefix of `text` that fits in `room` bytes, snapped
-        // to a char boundary so we never store a partial code point.
+        // Longest prefix of `text` that fits in `room` bytes, snapped to a char
+        // boundary so we never store a partial code point.
         //
         // `floor_char_boundary` is *relative* to `text`, so the slice length is
         // exactly that value. Adding `self.content.len()` here (an absolute
         // offset) made the index run past the end of `text` and panic as soon
-        // as the buffer was non-empty, which is the normal case for a long
-        // stream crossing the cap.
+        // as the buffer was non-empty — the normal case for a long stream
+        // crossing the cap.
         self.content
             .push_str(&text[..text.floor_char_boundary(room)]);
         self.content_capped = true;
@@ -374,19 +363,19 @@ impl SseAccumulator {
 
     /// Fold one streamed `tool_calls` delta into the index-keyed map.
     ///
-    /// Providers that omit `index` (serde defaults it to `0`) or that re-send
-    /// `index: 0` for every call in a turn deliver *several distinct calls*
-    /// on the same slot. Treating the second id as a malicious collision
-    /// marked the entry `malformed` and dropped **both** calls, leaving an
-    /// empty turn with no command to run — an infinite retry loop. Instead,
-    /// a differing id that lands on a slot which already has an id or a
-    /// command *opens a new slot* just past the highest index in use, so both
-    /// calls survive and are still ordered deterministically.
+    /// Providers that omit `index` (serde defaults it to `0`) or re-send
+    /// `index: 0` for every call in a turn deliver *several distinct calls* on
+    /// the same slot. Treating the second id as a malicious collision marked
+    /// the entry `malformed` and dropped **both** calls, leaving an empty turn
+    /// with no command to run — an infinite retry loop. Instead, a differing id
+    /// landing on a slot that already has an id or command *opens a new slot*
+    /// just past the highest index in use, so both calls survive and stay
+    /// deterministically ordered.
     pub(crate) fn accumulate_tool_call(&mut self, tc: &StreamToolCall) {
         // Pick the slot this delta belongs to. A fresh id landing on an
         // already-populated slot means the provider restarted its call
-        // numbering, so redirect it to a brand-new index instead of
-        // clobbering the call we already accumulated.
+        // numbering, so redirect it to a brand-new index instead of clobbering
+        // the call we already accumulated.
         let target_index = match self.tools.get(&tc.index) {
             Some(entry)
                 if !entry.malformed
@@ -449,11 +438,11 @@ impl SseAccumulator {
             if entry.malformed || entry.is_placeholder() {
                 continue;
             }
-            // Reserve up front: tool-call counts are known from the map, and
-            // this avoids rehashing on the insert-heavy duplicate path. The
-            // `ToolCall` and the set each need an owned `String`, so the clone
-            // into `seen_ids` stays; what is removed is the extra round of
-            // cloning the *generated* id, which the old shape did twice.
+            // Reserve up front: counts are known from the map, avoiding
+            // rehashing on the insert-heavy duplicate path. The `ToolCall` and
+            // the set each need an owned `String`, so the clone into `seen_ids`
+            // stays; removed is the extra round of cloning the *generated* id,
+            // which the old shape did twice.
             let id = entry.id.trim().to_string();
             let id = if !id.is_empty() && seen_ids.insert(id.clone()) {
                 id
@@ -487,7 +476,7 @@ impl SseAccumulator {
     /// Turn the accumulated stream into the [`LlmResponse`] the agent loop consumes.
     ///
     /// The command comes from the structured `bash` tool call when the model
-    /// emitted one, and falls back to a fenced code block in the content
+    /// emitted one, falling back to a fenced code block in the content
     /// otherwise. The reported tool-call id is only kept when it survived
     /// streaming, so the next request never carries a dangling id.
     pub(crate) fn finish(self) -> LlmResponse {
@@ -553,7 +542,7 @@ impl SseAccumulator {
         }
     }
 
-    /// Handle non-streaming JSON response fallback.
+    /// Handle a non-streaming JSON response fallback.
     pub(crate) fn handle_non_stream_fallback(&mut self, buffer: &[u8]) {
         if self.content.is_empty()
             && self.tools.is_empty()
