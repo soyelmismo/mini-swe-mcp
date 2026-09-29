@@ -434,63 +434,64 @@ impl McpServer {
         let mut last_reported_step = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Some(state) = self.pool.get_worker_state(wid).await {
-                match state {
-                    crate::pool::WorkerState::Running {
-                        step,
-                        ref last_command,
-                        ..
-                    } => {
-                        if step > last_reported_step {
-                            last_reported_step = step;
-                            Self::emit_progress(
-                                tx,
-                                token,
-                                step,
-                                max_turns,
-                                format!("Step {step}/{max_turns}: {last_command}"),
-                            )
-                            .await;
-                        }
-                    }
-                    crate::pool::WorkerState::Completed { .. }
-                    | crate::pool::WorkerState::Failed { .. } => {
-                        Self::emit_progress(
-                            tx,
-                            token,
-                            max_turns,
-                            max_turns,
-                            format!("Worker {wid} finished execution"),
-                        )
-                        .await;
-                        let logs = self.pool.get_worker_logs(wid).await.unwrap_or_default();
-                        return Ok(json!({
-                            "worker_id": wid,
-                            "state": state,
-                            "logs": logs
-                        }));
-                    }
-                    crate::pool::WorkerState::Paused {
-                        ref question,
-                        step,
-                        ..
-                    } => {
+            // H-5: poll the lightweight progress snapshot. It never clones the
+            // (potentially multi-megabyte) `diff`/`summary`/`artifacts` that a
+            // `get_worker_state` clone would copy on every 500 ms tick.
+            let Some(progress) = self.pool.worker_progress(wid).await else {
+                continue;
+            };
+            match progress.phase {
+                crate::pool::WorkerPhase::Running => {
+                    let step = progress.step;
+                    if step > last_reported_step {
+                        last_reported_step = step;
+                        let last_command = progress.last_command.as_deref().unwrap_or("");
                         Self::emit_progress(
                             tx,
                             token,
                             step,
                             max_turns,
-                            format!("Worker {wid} paused: waiting for orchestrator steering"),
+                            format!("Step {step}/{max_turns}: {last_command}"),
                         )
                         .await;
-                        return Ok(json!({
-                            "worker_id": wid,
-                            "status": "needs_input",
-                            "question": question,
-                            "step": step,
-                            "message": "Worker is paused waiting for orchestrator steering."
-                        }));
                     }
+                }
+                crate::pool::WorkerPhase::Completed | crate::pool::WorkerPhase::Failed => {
+                    Self::emit_progress(
+                        tx,
+                        token,
+                        max_turns,
+                        max_turns,
+                        format!("Worker {wid} finished execution"),
+                    )
+                    .await;
+                    // H-3: the terminal payload is fetched exactly once, on the
+                    // terminal path, instead of on every poll.
+                    let state = self.pool.get_worker_state(wid).await;
+                    let logs = self.pool.take_worker_logs(wid).await.unwrap_or_default();
+                    return Ok(json!({
+                        "worker_id": wid,
+                        "state": state,
+                        "logs": logs
+                    }));
+                }
+                crate::pool::WorkerPhase::Paused => {
+                    let step = progress.step;
+                    Self::emit_progress(
+                        tx,
+                        token,
+                        step,
+                        max_turns,
+                        format!("Worker {wid} paused: waiting for orchestrator steering"),
+                    )
+                    .await;
+                    return Ok(json!({
+                        "worker_id": wid,
+                        "status": "needs_input",
+                        "question": progress.question,
+                        "step": step,
+                        "message": "Worker is paused waiting for orchestrator steering."
+                    }));
                 }
             }
         }

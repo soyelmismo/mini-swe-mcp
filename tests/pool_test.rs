@@ -240,3 +240,265 @@ fn test_summarize_command_short_multibyte_is_untouched() {
     assert!(s.len() < 40);
     assert!(!s.ends_with("..."));
 }
+
+// ----------
+// Steer / lock-discipline (audit opt_02_pool_locks, H-1)
+// ----------
+
+use mini_swe_mcp::pool::{WorkerPhase, WorkerPool, WorkerRecord, WorkerState};
+
+fn running_worker(id: &str) -> WorkerRecord {
+    WorkerRecord {
+        id: id.to_string(),
+        task: "t".into(),
+        model: "m".into(),
+        state: WorkerState::Running {
+            step: 1,
+            last_command: "ls".into(),
+            started_at: 0,
+        },
+        logs: Vec::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+    }
+}
+
+fn paused_worker(id: &str, tx: tokio::sync::mpsc::Sender<String>) -> WorkerRecord {
+    WorkerRecord {
+        state: WorkerState::Paused {
+            question: "q?".into(),
+            step: 2,
+            paused_at: 0,
+        },
+        resume_tx: Some(tx),
+        ..running_worker(id)
+    }
+}
+
+#[tokio::test]
+async fn steer_on_running_worker_queues_without_lock_convoy() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("w1")).await;
+
+    pool.steer("w1", "please focus".into()).await.unwrap();
+
+    // The guidance is queued for the next turn and the worker is still running.
+    let progress = pool.worker_progress("w1").await.unwrap();
+    assert_eq!(progress.phase, WorkerPhase::Running);
+    assert_eq!(progress.step, 1);
+}
+
+#[tokio::test]
+async fn steer_does_not_hold_write_guard_across_send() {
+    // Fill the capacity-1 resume channel *before* handing the sender to the
+    // record, so the `send()` performed by `steer` has to await a full buffer
+    // (nobody is receiving). If `steer` still held the write-guard across that
+    // await -- the pre-fix behaviour -- every other pool operation (including
+    // reads) would convoy behind it, and the `worker_progress` call below would
+    // time out.
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send("occupying the single buffer slot".into())
+        .await
+        .unwrap();
+    pool.__test_insert_worker(paused_worker("w2", tx)).await;
+
+    let steer_fut = pool.steer("w2", "blocked guidance".into());
+    tokio::pin!(steer_fut);
+    // Give the future a chance to acquire the guard and park on the full
+    // channel. It cannot complete: the buffer is full and `rx` is untouched.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut steer_fut)
+            .await
+            .is_err(),
+        "steer should still be pending on the full resume channel"
+    );
+
+    // The write-guard must NOT be held while that send is in flight.
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pool.worker_progress("w2"),
+    )
+    .await
+    .expect("read-lock acquisition deadlocked behind an in-flight steer send")
+    .expect("worker still registered");
+    assert_eq!(read.phase, WorkerPhase::Paused);
+
+    // Writers must be servable too, and once the slot frees the pending send
+    // completes normally -- proving the lock was simply released, not leaked.
+    let drained = tokio::spawn(async move {
+        let first = rx.recv().await;
+        let second = rx.recv().await;
+        (first, second)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), steer_fut)
+        .await
+        .expect("steer never completed after the buffer drained")
+        .expect("steer returned an error");
+    let (first, second) = drained.await.unwrap();
+    assert_eq!(first.as_deref(), Some("occupying the single buffer slot"));
+    assert_eq!(
+        second.as_deref(),
+        Some("blocked guidance"),
+        "the message that had to wait for the channel must be delivered, not dropped"
+    );
+}
+
+#[tokio::test]
+async fn steer_reports_missing_resume_channel_instead_of_dropping_message() {
+    // A paused worker whose sender was already taken (e.g. it has been resumed
+    // concurrently) must surface an error rather than silently swallow the
+    // orchestrator guidance and return Ok(()).
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut w = paused_worker("w3", tx);
+    w.resume_tx = None;
+    pool.__test_insert_worker(w).await;
+
+    let err = pool.steer("w3", "guidance".into()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("w3"),
+        "error should name the worker, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn steer_rejects_unknown_and_unsteerable_workers() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let err = pool.steer("nope", "x".into()).await.unwrap_err();
+    assert!(err.to_string().contains("Worker not found"));
+
+    let mut done = running_worker("w4");
+    done.state = WorkerState::Completed {
+        turns: 1,
+        diff: String::new(),
+        summary: String::new(),
+        completed_at: 0,
+        artifacts: vec![],
+        branch: None,
+    };
+    pool.__test_insert_worker(done).await;
+    let err = pool.steer("w4", "x".into()).await.unwrap_err();
+    assert!(err.to_string().contains("not in a steerable state"));
+}
+
+// ----------
+// Lightweight progress polling (audit opt_02_pool_locks, H-5)
+// ----------
+
+#[tokio::test]
+async fn worker_progress_reports_phase_step_and_command() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("p1")).await;
+
+    let p = pool.worker_progress("p1").await.unwrap();
+    assert_eq!(p.phase, WorkerPhase::Running);
+    assert_eq!(p.step, 1);
+    assert_eq!(p.last_command.as_deref(), Some("ls"));
+    assert!(!p.terminal);
+
+    assert!(pool.worker_progress("missing").await.is_none());
+}
+
+#[tokio::test]
+async fn worker_progress_never_clones_the_terminal_payload() {
+    // A completed worker carries a large `diff`. Polling progress must report
+    // the terminal phase without pulling that payload out of the record.
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let mut w = running_worker("p2");
+    w.state = WorkerState::Completed {
+        turns: 7,
+        diff: "d".repeat(2 * 1024 * 1024),
+        summary: "s".repeat(1024),
+        completed_at: 0,
+        artifacts: vec!["a".repeat(4096)],
+        branch: Some("feature".into()),
+    };
+    pool.__test_insert_worker(w).await;
+
+    let p = pool.worker_progress("p2").await.unwrap();
+    assert_eq!(p.phase, WorkerPhase::Completed);
+    assert_eq!(p.step, 7);
+    assert!(p.terminal);
+    assert!(p.last_command.is_none());
+    assert!(p.question.is_none());
+
+    // The full payload is still available, untouched, on the terminal path.
+    match pool.get_worker_state("p2").await.unwrap() {
+        WorkerState::Completed { diff, .. } => assert_eq!(diff.len(), 2 * 1024 * 1024),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn worker_progress_reports_paused_questions() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    pool.__test_insert_worker(paused_worker("p3", tx)).await;
+
+    let p = pool.worker_progress("p3").await.unwrap();
+    assert_eq!(p.phase, WorkerPhase::Paused);
+    assert_eq!(p.step, 2);
+    assert_eq!(p.question.as_deref(), Some("q?"));
+    assert!(!p.terminal);
+}
+
+#[tokio::test]
+async fn worker_progress_reports_failed_workers() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let mut w = running_worker("p4");
+    w.state = WorkerState::Failed {
+        error: "boom".into(),
+        step: 3,
+        failed_at: 0,
+    };
+    pool.__test_insert_worker(w).await;
+
+    let p = pool.worker_progress("p4").await.unwrap();
+    assert_eq!(p.phase, WorkerPhase::Failed);
+    assert_eq!(p.step, 3);
+    assert!(p.terminal);
+}
+
+// ----------
+// Non-cloning log access (audit opt_02_pool_locks, H-3)
+// ----------
+
+#[tokio::test]
+async fn take_worker_logs_moves_history_without_clearing_state() {
+    use mini_swe_mcp::agent::AgentStepLog;
+
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let mut w = running_worker("l1");
+    w.logs = vec![AgentStepLog {
+        step: 1,
+        command: "ls".into(),
+        output: "out".into(),
+        exit_code: Some(0),
+    }];
+    pool.__test_insert_worker(w).await;
+
+    assert_eq!(pool.worker_step_count("l1").await, Some(1));
+    let logs = pool.take_worker_logs("l1").await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].output, "out");
+    // Moving out of the record does not evict it: terminal state stays queryable.
+    assert_eq!(pool.worker_step_count("l1").await, Some(0));
+    assert!(pool.get_worker_state("l1").await.is_some());
+    assert!(pool.take_worker_logs("l1").await.unwrap().is_empty());
+    assert!(pool.take_worker_logs("nope").await.is_none());
+}
+
+#[tokio::test]
+async fn take_worker_evicts_and_returns_the_full_record() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("c1")).await;
+
+    let collected = pool.take_worker("c1").await.unwrap();
+    assert_eq!(collected.id, "c1");
+    assert!(pool.get_worker_state("c1").await.is_none());
+    assert!(pool.take_worker("c1").await.is_none());
+    // `collect` keeps its original evict-and-return semantics.
+    assert!(pool.collect("c1").await.is_none());
+}
