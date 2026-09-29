@@ -1,11 +1,10 @@
 //! Data model and tuning constants for the model manifest.
 //!
-//! This module owns the two serializable structs that make up `models.yaml`
-//! ([`ModelDefinition`], [`ModelManifest`]) plus the four process-wide constants
-//! that bound them ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`],
-//! [`MAX_TURNS_LIMIT`], [`TEMPERATURE_RANGE`]). It contains no behaviour: every
-//! rule that reads or repairs these values lives in the `validate` submodule
-//! of the manifest package.
+//! Owns the two serializable structs of `models.yaml` ([`ModelDefinition`],
+//! [`ModelManifest`]) plus the four process-wide constants that bound them
+//! ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`], [`MAX_TURNS_LIMIT`],
+//! [`TEMPERATURE_RANGE`]). Contains no behaviour: every rule that reads or
+//! repairs these values lives in the `validate` submodule.
 //!
 //! The declarative execution policy ([`ExecutionPolicy`] and its
 //! [`NetworkPolicy`] / [`FsPolicy`] fields) is the exception: it is *data* here
