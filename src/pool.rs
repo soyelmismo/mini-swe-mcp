@@ -241,7 +241,9 @@ impl WorkerPool {
         max_turns: usize,
         group: Option<String>,
     ) -> Result<String> {
-        let worker_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        // F6: format the low 32 UUID bits directly instead of building (and
+        // immediately discarding) a full hyphenated `String` per worker.
+        let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
         let now = unix_timestamp();
         let resolved_group = group
             .or_else(|| extract_group(&task))
@@ -570,6 +572,15 @@ impl WorkerPool {
                         format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
                     ));
                 }
+            }
+
+            if llm_resp.invalid_utf8_lines > 0 {
+                info!(
+                    worker = %worker_id,
+                    step = step,
+                    invalid_utf8_lines = llm_resp.invalid_utf8_lines,
+                    "LLM stream contained non-UTF-8 frames; decoded lossily"
+                );
             }
 
             let step_log = AgentStepLog {
