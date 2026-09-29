@@ -1,6 +1,6 @@
 //! Worker pool: dispatch, tracking, steering, collection and reaping.
 //!
-//! The package is split by responsibility while keeping the historical
+//! Split by responsibility while keeping the historical
 //! `mini_swe_mcp::pool::*` surface byte-for-byte identical through the
 //! re-exports below:
 //!
@@ -270,11 +270,10 @@ impl WorkerPool {
             }
         });
 
-        // Store handle for potential cancellation. The record was inserted
-        // without a handle just above so the worker is visible immediately;
-        // this second (short) write-guard attaches the handle as soon as the
-        // task exists, minimising the window in which a concurrent `kill`/
-        // `kill_all` could not yet abort the task.
+        // Attach the handle in a second short write-guard: the record was
+        // inserted without one so the worker is visible immediately, and this
+        // minimises the window in which a concurrent `kill`/`kill_all` could
+        // not yet abort the task.
         {
             let mut lock = self.workers.write().await;
             if let Some(w) = lock.get_mut(&worker_id) {
@@ -290,9 +289,8 @@ impl WorkerPool {
 
     /// Cheap snapshot of a worker's step history.
     ///
-    /// Returns an `Arc` clone of the *bounded* buffer rather than a deep copy
-    /// of every `String`, so a read never duplicates the whole history nor holds
-    /// the shared `RwLock` while copying (audit 07, R5).
+    /// Returns an `Arc` clone of the *bounded* buffer, so a read never
+    /// duplicates the history nor holds the `RwLock` while copying (audit 07, R5).
     pub async fn get_worker_logs(&self, id: &str) -> Option<Arc<LogBuffer>> {
         self.workers.read().await.get(id).map(|w| Arc::new(w.logs.clone()))
     }
@@ -315,11 +313,10 @@ impl WorkerPool {
             .insert(record.id.clone(), record);
     }
 
-    /// Lightweight poll used by the 500 ms progress loops.
+    /// Lightweight poll for the 500 ms progress loops.
     ///
-    /// Clones only the small strings needed to render progress (`step`,
-    /// `last_command` and the pause question) and never touches the potentially
-    /// multi-megabyte `diff`, `summary` or `artifacts` of a completed worker.
+    /// Clones only the small strings needed to render progress and never the
+    /// potentially multi-megabyte terminal payload.
     pub async fn worker_progress(&self, id: &str) -> Option<WorkerProgress> {
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
@@ -368,15 +365,14 @@ impl WorkerPool {
 
     /// Move a worker's log history out of the pool (terminal path).
     ///
-    /// Taking the `Vec` is O(1); only the read-guard scope is exclusive of
-    /// writers, and no per-step string is copied. The record stays registered so
-    /// its final state can still be inspected with `get_worker_state`.
+    /// O(1) `Vec` take with no per-step copy; the record stays registered so its
+    /// final state remains inspectable via `get_worker_state`.
     pub async fn take_worker_logs(&self, id: &str) -> Option<LogBuffer> {
         let mut lock = self.workers.write().await;
         lock.get_mut(id).map(|w| std::mem::take(&mut w.logs))
     }
 
-    /// Take a worker's record out of the pool and return it.
+    /// Take a worker's record out of the pool.
     ///
     /// Delegates to [`collect`](Self::collect) with bounded emission view.
     pub async fn take_worker(&self, id: &str) -> Option<CollectedWorker> {
@@ -441,25 +437,18 @@ impl WorkerPool {
     ///
     /// Two delivery paths, tried in order:
     ///
-    /// 1. **In-process.** The worker lives in this process' pool: a `Running`
-    ///    worker queues the message on `pending_steer` for its next turn, and a
-    ///    `Paused` one is handed to its resume channel.
-    /// 2. **Cross-process mailbox.** The worker is not in this pool — it is
-    ///    owned by a *different* `mini-swe-mcp` process, which is the normal
-    ///    case for `dispatch … --wait` steered from a second terminal. The
-    ///    message is appended atomically to the worker's mailbox (see
-    ///    [`steer_path`]), which the owning process drains on every step.
+    /// 1. **In-process.** A `Running` worker queues the message on
+    ///    `pending_steer` for its next turn; a `Paused` one is handed to its
+    ///    resume channel.
+    /// 2. **Cross-process mailbox.** The worker is owned by a different
+    ///    `mini-swe-mcp` process (the normal `dispatch … --wait` case): the
+    ///    message is appended atomically to its mailbox (see [`steer_path`]),
+    ///    which the owner drains on every step.
     ///
-    /// The second path is what turns `steer` from an in-memory-only feature
-    /// into a real IPC one; the first is kept because it delivers immediately
-    /// and lets a paused worker resume mid-step rather than at the next one.
-    ///
-    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
-    /// held and the guard is dropped *before* the `send().await` is performed:
-    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
-    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
-    /// read). A missing sender is now reported instead of silently dropping the
-    /// guidance.
+    /// The `resume_tx` sender is extracted with `take()` under the write-guard
+    /// and the guard is dropped *before* `send().await`: awaiting a full `mpsc`
+    /// channel while holding the write-guard would serialise the whole pool.
+    /// A missing sender is reported instead of silently dropping the guidance.
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
         let tx_opt = {
             let mut lock = self.workers.write().await;
@@ -522,10 +511,8 @@ impl WorkerPool {
 
     /// Terminate every worker currently tracked by the pool.
     ///
-    /// The map is walked once under a single write-guard. The loop contains no
-    /// `.await`, so the critical section stays O(n) in the number of live
-    /// workers (small, and bounded by the dispatch semaphore) and is never
-    /// prolonged in wall-clock time.
+    /// Walks the map once under a single write-guard with no `.await`, so the
+    /// critical section stays O(n) and is never prolonged in wall-clock time.
     pub async fn kill_all(&self) -> usize {
         let mut lock = self.workers.write().await;
         let mut count = 0usize;
@@ -543,10 +530,10 @@ impl WorkerPool {
     }
 
     /// Collect a worker's final result and release its in-memory resources.
-    /// The retained window is *moved* out of the pool and then narrowed to the
-    /// emission budget, so a single response can never serialize the full
-    /// history (audit 07, R4). Both counters travel with the result so the
-    /// degradation is visible to the orchestrator (audit 07, R7).
+    ///
+    /// The retained window is *moved* out and narrowed to the emission budget,
+    /// so one response never serializes the full history (audit 07, R4); the
+    /// counters travel with the result so degradation stays visible (audit 07, R7).
     pub async fn collect(&self, id: &str) -> Option<CollectedWorker> {
         let mut lock = self.workers.write().await;
         let record = lock.remove(id)?;
