@@ -34,8 +34,11 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(pool: WorkerPool, default_model: String, manifest: ModelManifest) -> Self {
-        let manifest = Arc::new(manifest);
+    pub fn new(pool: WorkerPool, default_model: String) -> Self {
+        // The pool owns the manifest (attached in `main.rs`); the server shares
+        // the same `Arc` so a dispatch and its worker never disagree on the
+        // catalog.
+        let manifest = pool.manifest_arc();
         let tools_list = Arc::new(build_tools_list(&manifest));
         Self {
             pool: Arc::new(pool),
@@ -390,7 +393,6 @@ mod tests {
         McpServer::new(
             WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
             "ninja".to_string(),
-            ModelManifest::default(),
         )
     }
 

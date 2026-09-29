@@ -11,6 +11,7 @@ use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
 use mini_swe_mcp::{bootstrap, telemetry, worktree};
 use std::env;
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     bootstrap::runtime()?.block_on(async_main())
@@ -49,10 +50,11 @@ async fn async_main() -> Result<()> {
     bootstrap::load_dotenv_files();
 
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
-    let pool = WorkerPool::new(max_concurrent_workers(), api_base(), api_key.clone());
     let manifest = ModelManifest::load();
     let default_model = default_model(&manifest);
-    let server = McpServer::new(pool.clone(), default_model, manifest);
+    let pool = WorkerPool::new(max_concurrent_workers(), api_base(), api_key.clone())
+        .with_manifest(Arc::new(manifest));
+    let server = McpServer::new(pool.clone(), default_model);
 
     if let Some(action) = action_of(&cli_args) {
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;

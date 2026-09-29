@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::server::McpServer;
-use crate::manifest::ModelManifest;
+use crate::manifest::{ModelManifest, NetworkPolicy};
 use crate::pool::emit_view;
 
 impl McpServer {
@@ -37,29 +37,50 @@ impl McpServer {
             })
     }
 
-    /// Resolve the declarative network policy of a `dispatch` call.
+    /// Parse the explicit `network` argument of a `dispatch` call.
     ///
-    /// Optional, defaulting to [`super::schema::NETWORK_DEFAULT`] (`"allow"`),
-    /// so a client that never sends it keeps its prior behaviour. A value
-    /// outside [`NETWORK_MODES`](super::schema::NETWORK_MODES) is a hard error
-    /// rather than a silent fallback: asking for isolation and getting
+    /// Returns `None` when the argument is absent (the caller then falls back
+    /// to the resolved model's manifest policy, then the runtime default).
+    /// Parsing goes through [`NetworkPolicy::parse`] so the MCP vocabulary and
+    /// the manifest vocabulary are one and the same. An unknown value is a hard
+    /// error rather than a silent fallback: asking for isolation and getting
     /// connectivity (or the reverse) is worse than a rejected call.
-    pub(super) fn get_network_offline(args: &Value, action: &str) -> Result<bool> {
+    pub(super) fn get_network_offline(args: &Value, action: &str) -> Result<Option<bool>> {
         let Some(value) = args.get("network") else {
-            return Ok(false);
+            return Ok(None);
         };
         let mode = value
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("'network' must be a string for action '{action}'"))?;
-        match mode {
-            "offline" => Ok(true),
-            mode if super::schema::NETWORK_MODES.contains(&mode) => Ok(false),
-            other => anyhow::bail!(
+        match NetworkPolicy::parse(mode) {
+            NetworkPolicy::Offline => Ok(Some(true)),
+            NetworkPolicy::Allow => Ok(Some(false)),
+            NetworkPolicy::Other(other) => anyhow::bail!(
                 "'{other}' is not a valid 'network' policy for action '{action}'; \
                  expected one of: {}",
                 super::schema::NETWORK_MODES.join(", ")
             ),
         }
+    }
+
+    /// Resolve the effective network policy of a `dispatch` call.
+    ///
+    /// An explicit `network` argument wins; otherwise the resolved model's
+    /// manifest `policy.network` applies when declared; otherwise the runtime
+    /// default ([`super::schema::NETWORK_DEFAULT`], `"allow"`).
+    pub(super) fn resolve_network_policy(
+        args: &Value,
+        action: &str,
+        manifest: &ModelManifest,
+        resolved_model: &str,
+    ) -> Result<bool> {
+        if let Some(explicit) = Self::get_network_offline(args, action)? {
+            return Ok(explicit);
+        }
+        Ok(matches!(
+            manifest.network_policy(resolved_model),
+            Some(NetworkPolicy::Offline)
+        ))
     }
 
     pub(super) fn get_repo_path(args: &Value) -> PathBuf {
@@ -174,7 +195,8 @@ impl McpServer {
                 resolved
             });
 
-        let network_offline = Self::get_network_offline(args, "dispatch")?;
+        let network_offline =
+            Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
         let wid = self
             .pool
@@ -413,14 +435,15 @@ impl LogView {
 mod tests {
     use super::*;
 
-    /// An omitted `network` must keep the pre-existing connected behaviour:
-    /// the property is additive, so a client that never sends it is unaffected.
+    /// An omitted `network` yields `None`: the caller falls back to the
+    /// manifest policy, then the runtime default.
     #[test]
-    fn network_defaults_to_allow_when_absent() {
+    fn network_absent_yields_none() {
         let args = json!({ "action": "dispatch", "task": "t" });
-        assert!(
-            !McpServer::get_network_offline(&args, "dispatch").expect("absent is not an error"),
-            "an omitted network policy must not isolate the worker"
+        assert_eq!(
+            McpServer::get_network_offline(&args, "dispatch").expect("absent is not an error"),
+            None,
+            "an omitted network policy must defer to the manifest/default"
         );
     }
 
@@ -428,13 +451,15 @@ mod tests {
     /// `allow` is the explicit spelling of the default.
     #[test]
     fn network_offline_and_allow_are_both_accepted() {
-        assert!(
+        assert_eq!(
             McpServer::get_network_offline(&json!({ "network": "offline" }), "dispatch")
-                .expect("offline must be accepted")
+                .expect("offline must be accepted"),
+            Some(true)
         );
-        assert!(
-            !McpServer::get_network_offline(&json!({ "network": "allow" }), "dispatch")
-                .expect("allow must be accepted")
+        assert_eq!(
+            McpServer::get_network_offline(&json!({ "network": "allow" }), "dispatch")
+                .expect("allow must be accepted"),
+            Some(false)
         );
     }
 
@@ -450,5 +475,97 @@ mod tests {
         let err = McpServer::get_network_offline(&json!({ "network": true }), "dispatch")
             .expect_err("a non-string network must not be accepted");
         assert!(err.to_string().contains("must be a string"), "{err}");
+    }
+
+    /// An explicit argument wins over the manifest policy.
+    #[test]
+    fn explicit_network_argument_wins_over_manifest() {
+        let manifest = ModelManifest::default();
+        // ninja declares `allow` in the built-in manifest.
+        assert!(
+            McpServer::resolve_network_policy(
+                &json!({ "network": "offline" }),
+                "dispatch",
+                &manifest,
+                "combo:ninja",
+            )
+            .expect("explicit offline must win"),
+            "an explicit offline must override the manifest's allow"
+        );
+        assert!(
+            !McpServer::resolve_network_policy(
+                &json!({ "network": "allow" }),
+                "dispatch",
+                &manifest,
+                "combo:ninja",
+            )
+            .expect("explicit allow must win"),
+            "an explicit allow must override the manifest's allow"
+        );
+    }
+
+    /// When the argument is omitted, the resolved model's manifest policy
+    /// applies.
+    #[test]
+    fn manifest_policy_applies_when_argument_omitted() {
+        let manifest = ModelManifest::default();
+        // ninja declares `allow` in the built-in manifest.
+        assert!(
+            !McpServer::resolve_network_policy(
+                &json!({}),
+                "dispatch",
+                &manifest,
+                "combo:ninja",
+            )
+            .expect("manifest policy must apply"),
+            "ninja's manifest policy is allow"
+        );
+    }
+
+    /// A manifest that declares `offline` isolates the worker when the
+    /// argument is omitted.
+    #[test]
+    fn manifest_offline_policy_isolates_when_argument_omitted() {
+        let mut manifest = ModelManifest::default();
+        manifest.models.insert(
+            "sealed".to_string(),
+            crate::manifest::ModelDefinition {
+                id: "vendor:sealed".to_string(),
+                role: None,
+                temperature: None,
+                max_turns: None,
+                policy: Some(crate::manifest::ExecutionPolicy {
+                    network: Some(NetworkPolicy::Offline),
+                }),
+            },
+        );
+        assert!(
+            McpServer::resolve_network_policy(
+                &json!({}),
+                "dispatch",
+                &manifest,
+                "vendor:sealed",
+            )
+            .expect("manifest offline must apply"),
+            "a model declaring offline must isolate the worker"
+        );
+    }
+
+    /// When neither the argument nor the manifest declares a policy, the
+    /// runtime default (`allow`) applies.
+    #[test]
+    fn runtime_default_applies_when_nothing_declared() {
+        let manifest = ModelManifest::default();
+        // An unknown model has no manifest entry, so no policy is declared.
+        assert!(
+            !McpServer::resolve_network_policy(
+                &json!({}),
+                "dispatch",
+                &manifest,
+                "some/unknown-model",
+            )
+            .expect("default must apply"),
+            "an undeclared policy must fall back to allow"
+        );
     }
 }
