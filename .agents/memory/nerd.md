@@ -4,3 +4,5 @@ PERSISTENT ROLE MEMORY (from .agents/memory/):
 - Verify with `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets`; a warning or a skipped test is a regression, not a nit.
 - Prefer the fix that keeps the public surface unchanged: behaviour changes belong behind the existing `manifest`/`pool`/`agent` module boundaries.
 - When reviewing a diff, read the surrounding module docs first — they state which properties are load-bearing and which previous implementation they replaced.
+- pool/runner is the single agent engine: change behaviour there once, not in each caller.
+- Integration tests under tests/ use public pool/agent APIs; update them when removing APIs.
