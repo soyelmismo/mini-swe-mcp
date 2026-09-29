@@ -163,6 +163,19 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
     // itself is still intact (publishing is a rename), so recovery is safe.
     let _guard = APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+    // Reject a symlinked `.agents` as well: checking only its `memory` child
+    // would still permit writes through a parent that redirects outside the repo.
+    let agents_dir = repo_path.join(".agents");
+    let agents_is_symlink = std::fs::symlink_metadata(&agents_dir)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if agents_is_symlink {
+        anyhow::bail!(
+            "Refusing to write agent memory through symlinked {}",
+            agents_dir.display()
+        );
+    }
+
     // `create_dir_all` reports success for any already-existing path, *including*
     // a symlink to a directory somewhere else entirely, so a hostile repository
     // that symlinks `.agents/memory` would silently redirect every memory write
@@ -177,6 +190,16 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
         ),
         Err(_) => std::fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create memory directory {}", dir.display()))?,
+    }
+
+    // The parent might have been created by create_dir_all above; verify it
+    // again so a symlink introduced during creation is not silently followed.
+    if std::fs::symlink_metadata(&agents_dir)?
+        .file_type()
+        .is_symlink()
+        || !std::fs::symlink_metadata(dir)?.is_dir()
+    {
+        anyhow::bail!("Refusing to write agent memory through a symlinked directory");
     }
 
     // Read-then-rewrite (rather than a bare `O_APPEND` write) so the note can be
@@ -200,22 +223,34 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
     // appends in this process never collide either; `APPEND_LOCK` already
     // serializes the append itself, so this only has to be unique, not ordered.
     static APPEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("memory"),
-        std::process::id(),
-        APPEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    ));
-    write_new_staging_file(&tmp, existing.as_bytes())
-        .with_context(|| format!("Failed to stage memory update in {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::new(e))
-            .with_context(|| format!("Failed to publish memory file {}", path.display()));
+    // A stale staging file (or a planted symlink) must not block future
+    // appends. Never remove a collided path: it belongs to someone else.
+    for _ in 0..16 {
+        let tmp = dir.join(format!(
+            ".{}.{}.{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("memory"),
+            std::process::id(),
+            APPEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        match write_new_staging_file(&tmp, existing.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to stage memory update in {}", tmp.display())
+                });
+            }
+            Ok(()) => {}
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("Failed to publish memory file {}", path.display()));
+        }
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!("Failed to stage memory update: too many staging name collisions")
 }
 
 /// Create `path` and write `bytes` to it, exclusively and durably.
@@ -235,8 +270,11 @@ pub fn append_agent_memory(repo_path: &Path, model_alias: &str, note: &str) -> R
 /// publishes it, so recovery always finds a complete file.
 fn write_new_staging_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 /// Reduce a note to a single markdown list item.
@@ -353,6 +391,20 @@ mod tests {
         // The exclusive create succeeds once the name is free.
         write_new_staging_file(&dir.join(".note.md.1.3.tmp"), b"- note\n").expect("fresh stage");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_refuses_a_symlinked_agents_parent() {
+        let repo =
+            std::env::temp_dir().join(format!("swe-memory-parent-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("repo");
+        let elsewhere = repo.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("memory")).expect("decoy");
+        std::os::unix::fs::symlink(&elsewhere, repo.join(".agents")).expect("symlinked parent");
+        assert!(append_agent_memory(&repo, "ninja", "note").is_err());
+        assert!(!elsewhere.join("memory/ninja.md").exists());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// A symlinked `.agents/memory` passes `create_dir_all` (which reports
