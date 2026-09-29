@@ -15,13 +15,15 @@
 //!   role is a validated enum and the fields are private, so the serialized
 //!   shape of each message kind is the only observable behaviour left to pin.
 
-use mini_swe_mcp::agent::{truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn};
+use mini_swe_mcp::agent::{
+    truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn, TRUNCATE_HEAD as HEAD,
+    TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
+};
 
-/// The byte budget above which output is truncated, and the sizes of the
-/// head/tail slices that are retained when it is.
-const LIMIT: usize = 16384;
-const HEAD: usize = 12288;
-const TAIL: usize = 4096;
+// The byte budget above which output is truncated, and the sizes of the
+// head/tail slices that are retained when it is, are defined once in
+// `src/agent.rs` and re-exported here, so the numbers cannot drift apart.
+const _: () = assert!(HEAD + TAIL == LIMIT);
 
 fn runner() -> AgentRunner {
     AgentRunner::new(
@@ -140,7 +142,7 @@ fn test_truncate_output_drops_only_the_middle() {
 fn test_truncate_output_never_splits_multibyte_head_char() {
     // Position the 3-byte '€' (U+20AC) so that the nominal head cut at byte
     // 12288 lands strictly inside it, at every offset that can straddle it.
-    for leading in [12286, 12287] {
+    for leading in [HEAD - 2, HEAD - 1] {
         let input = format!("{}€{}", "a".repeat(leading), "b".repeat(9000));
         assert!(
             !input.is_char_boundary(HEAD),
@@ -186,7 +188,7 @@ fn test_truncate_output_never_splits_multibyte_head_char() {
 #[test]
 fn test_truncate_output_tail_cut_keeps_whole_chars() {
     // Build input whose len-4096 tail cut lands inside a 3-byte character.
-    let input = format!("{}€{}", "a".repeat(20_000), "b".repeat(4095));
+    let input = format!("{}€{}", "a".repeat(20_000), "b".repeat(TAIL - 1));
     let cut = input.len() - TAIL;
     assert!(
         !input.is_char_boundary(cut),
@@ -209,7 +211,7 @@ fn test_truncate_output_tail_cut_keeps_whole_chars() {
     );
     // The trailing sentinel survives untouched.
     assert!(
-        tail.ends_with(&"b".repeat(4095)),
+        tail.ends_with(&"b".repeat(TAIL - 1)),
         "the end of the output must be preserved verbatim"
     );
 }
@@ -223,14 +225,14 @@ fn test_truncate_output_handles_pathological_multibyte_input() {
     let emoji: &str = EMOJI.encode_utf8(&mut buf);
 
     // A 4-byte char landing exactly on the head boundary.
-    let input = format!("{}{}{}", "a".repeat(12286), emoji, "b".repeat(9000));
+    let input = format!("{}{}{}", "a".repeat(HEAD - 2), emoji, "b".repeat(9000));
     let out = truncate_output(&input);
     assert!(!out.contains('\u{FFFD}'), "4-byte char must not be split");
     let (head, _, _) = split_truncated(&out);
     assert!(head.len() <= HEAD);
 
     // 4-byte chars straddling the head cut at every possible offset.
-    for leading in 12284..=12289 {
+    for leading in (HEAD - 4)..=(HEAD + 1) {
         let input = format!("{}{}{}", "a".repeat(leading), emoji, "b".repeat(9000));
         let out = truncate_output(&input);
         assert!(
@@ -256,7 +258,7 @@ fn test_truncate_output_handles_pathological_multibyte_input() {
 
     // A 2-byte char exactly on the boundary, the case the unit test in
     // `src/agent.rs` covers.
-    let input = format!("{}€{}", "a".repeat(12287), "b".repeat(9000));
+    let input = format!("{}€{}", "a".repeat(HEAD - 1), "b".repeat(9000));
     let out = truncate_output(&input);
     assert!(out.contains("... [Truncated "), "input exceeds the budget");
     assert!(!out.contains('\u{FFFD}'), "2-byte char must not be split");
@@ -385,6 +387,7 @@ fn test_extract_command_edge_cases() {
         Some("echo inner".to_string()),
     );
 }
+
 // ----------
 // ChatMessage wire contract (audits/overeng_01_agent_structs.md §1, §4)
 // ----------
@@ -472,4 +475,253 @@ fn test_assistant_with_tool_calls_wire_shape() {
     let v = to_value(&empty);
     assert_eq!(v["content"], "prose");
     assert!(v.get("tool_calls").is_none(), "got {v}");
+}
+
+/// 12. The extractor's regex is deliberately *capture-free*: the body is sliced
+///     out of the full match by hand. These cases pin the hand-slicing
+///     arithmetic, in particular the boundaries (an empty/whitespace body, and
+///     a body that is exactly the fence delimiters).
+#[test]
+fn test_extract_command_body_slicing_boundaries() {
+    // A whitespace-only body is non-empty between the fences, so it is returned
+    // as the empty string after trimming (not `None`).
+    assert_eq!(runner().extract_command("```bash\n   \n```"), Some(String::new()));
+    assert_eq!(runner().extract_command("```bash\n\n\n```"), Some(String::new()));
+
+    // A literally empty body has no newline before the closing fence, so the
+    // pattern cannot match at all.
+    assert_eq!(runner().extract_command("```bash\n```"), None);
+    assert_eq!(runner().extract_command("```sh\n```"), None);
+
+    // Single-line body: exactly one byte between the opening and closing newline.
+    assert_eq!(runner().extract_command("```bash\nx\n```"), Some("x".to_string()));
+
+    // The body scan is lazy, so the *first* closing fence terminates the block
+    // (a later block is simply not reached).
+    assert_eq!(
+        runner().extract_command("```bash\nx\n```bash\ny\n```"),
+        Some("x".to_string())
+    );
+}
+
+/// 13. The info-string gap is `[ \t\r\n]*` (ASCII whitespace), a strict subset
+///     of the original `\s*`, which also matched Unicode whitespace. This test
+///     documents that tightening: an ASCII gap (spaces, tabs, CR, LF) still
+///     opens a block, a non-ASCII gap does not.
+#[test]
+fn test_extract_command_info_string_whitespace_is_ascii_only() {
+    // The ASCII gap sits between the info string and the newline that ends the
+    // opening line, so every combination still opens a block.
+    for gap in ["", " ", "   ", "\t", "\r", " \t\r", " \t\r\n"] {
+        let reply = format!("```bash{gap}\necho gap\n```");
+        assert_eq!(
+            runner().extract_command(&reply),
+            Some("echo gap".to_string()),
+            "ASCII whitespace {gap:?} must still open a block"
+        );
+    }
+
+    // An empty gap does not open a block at all: the pattern requires a
+    // newline after the info string, so "```bashecho gap" is not a fence.
+    assert_eq!(runner().extract_command("```bashecho gap\n```"), None);
+
+    // U+00A0 NO-BREAK SPACE after the info string: previously matched by `\s`,
+    // now intentionally does not, so the block is not recognised.
+    assert_eq!(runner().extract_command("```bash\u{a0}\necho nbsp\n```"), None);
+}
+
+// ----------
+// Golden-oracle differential tests
+// ----------
+
+/// The pre-optimisation implementation of [`truncate_output`], kept verbatim as
+/// a golden oracle. The optimised version must stay byte-identical to it.
+fn truncate_output_reference(combined: &str) -> String {
+    if combined.len() > LIMIT {
+        let head_end = combined.floor_char_boundary(HEAD);
+        let tail_start = combined.ceil_char_boundary(combined.len().saturating_sub(TAIL));
+        let truncated = format!(
+            "\n... [Truncated {} bytes] ...\n{}",
+            combined.len() - (head_end + (combined.len() - tail_start)),
+            &combined[tail_start..]
+        );
+        format!("{}{}", &combined[..head_end], truncated)
+    } else {
+        combined.to_string()
+    }
+}
+
+/// The pre-optimisation implementation of `extract_command`, using the original
+/// capture-based regex, kept as a golden oracle.
+fn extract_command_reference(text: &str) -> Option<String> {
+    static REF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let rx = REF.get_or_init(|| {
+        regex::Regex::new(r"```(?:bash|sh)\s*\n([\s\S]*?)\n```")
+            .expect("reference regex must compile")
+    });
+    rx.captures(text)
+        .and_then(|cap| cap.get(1))
+        .map(|m| m.as_str().trim().to_string())
+}
+
+/// A tiny deterministic xorshift PRNG, so the pseudo-random sweeps below are
+/// reproducible from run to run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// 14. `truncate_output` is byte-identical to the original two-`format!`
+///     implementation across every length around the budget, around the cut
+///     points, and for multi-byte characters straddling both cuts.
+#[test]
+fn test_truncate_output_matches_reference_implementation() {
+    const EMOJI: &str = "\u{1F680}";
+
+    // 14a. Every short length, and both sides of the budget threshold.
+    for n in 0..40 {
+        let input = "a".repeat(n);
+        assert_eq!(truncate_output(&input), truncate_output_reference(&input));
+    }
+    for n in [LIMIT - 1, LIMIT, LIMIT + 1, LIMIT + 2, LIMIT + 6, 2 * LIMIT, 100_000] {
+        let input = "a".repeat(n);
+        assert_eq!(
+            truncate_output(&input),
+            truncate_output_reference(&input),
+            "mismatch at length {n}"
+        );
+    }
+
+    // 14b. Multi-digit dropped byte counts (large input).
+    let big = "z".repeat(1_000_000);
+    assert_eq!(truncate_output(&big), truncate_output_reference(&big));
+
+    // 14c. 2-, 3- and 4-byte characters straddling the head cut, at every
+    //      offset that can put the cut inside the character.
+    for ch in ['\u{20ac}', EMOJI.chars().next().unwrap(), '\u{65e5}', '\u{800}'] {
+        for leading in (HEAD - 10)..=(HEAD + 10) {
+            let input = format!("{}c{}", "a".repeat(leading), ch) + &"b".repeat(9_000);
+            assert_eq!(
+                truncate_output(&input),
+                truncate_output_reference(&input),
+                "head-cut straddle: char {ch:?} at {leading}"
+            );
+        }
+    }
+
+    // 14d. Multi-byte characters straddling the tail cut.
+    for ch in ['\u{20ac}', EMOJI.chars().next().unwrap()] {
+        for extra in 0..40 {
+            let input = format!("{}c{}", "a".repeat(20_000), ch) + &"b".repeat(TAIL - 6 + extra);
+            assert_eq!(
+                truncate_output(&input),
+                truncate_output_reference(&input),
+                "tail-cut straddle: char {ch:?} with {extra} extra bytes"
+            );
+        }
+    }
+
+    // 14e. All-emoji and all-CJK documents: every cut is deep inside
+    //      multi-byte characters.
+    for input in [EMOJI.repeat(10_000), "\u{65e5}\u{672c}\u{8a9e}".repeat(5_000)] {
+        assert_eq!(truncate_output(&input), truncate_output_reference(&input));
+    }
+
+    // 14f. Pseudo-random mixed-width documents.
+    let alphabet = ['a', 'b', ' ', '\n', '\u{e9}', '\u{20ac}', '\u{65e5}', EMOJI.chars().next().unwrap(), '\u{800}'];
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for _ in 0..400 {
+        let target = rng.below(40_000);
+        let mut input = String::with_capacity(target * 4);
+        while input.len() < target {
+            input.push(alphabet[rng.below(alphabet.len())]);
+        }
+        assert_eq!(truncate_output(&input), truncate_output_reference(&input));
+    }
+}
+
+/// 15. `extract_command` is byte-identical to the original capture-based
+///     implementation. The one intentional divergence — the `[ \t\r\n]*`
+///     info-string class being a strict subset of `\s*` — is checked for
+///     explicitly and is excluded from the oracle sweep below (which uses
+///     ASCII-only inputs, where the two languages coincide).
+#[test]
+fn test_extract_command_matches_reference_on_edge_cases() {
+    let cases = [
+        "Run this:\n```bash\necho hello\n```",
+        "Sure!\n\n```bash\nls -la\n```\n\nDone.",
+        "```bash\n\n  echo padded  \n\n```",
+        "```bash\ncd /tmp\nls -la\n```",
+        "```sh\nmake test\n```",
+        "1. Run:\n   ```bash\n   ls -la\n   git status\n```",
+        "Steps:\n    ```bash\n    echo one\n    echo two\n```",
+        "text:\n    ```bash\n    echo x\n    ```\n",
+        "No command here.",
+        "```bash\n```",
+        "```bash\nfirst\n```\nand\n```bash\nsecond\n```",
+        "```rust\nfn main() {}\n```",
+        "```bash   \necho z\n```",
+        "````bash\necho inner\n````",
+        "```bash\n   \n```",
+        "```bash\n\n\n```",
+        "```bash\necho hi\n```\n```sh\nls\n```",
+        "text ```bash inline\nx\n``` more",
+        "```bash\r\necho crlf\r\n```",
+        "```BASH\necho upper\n```",
+        "```bash extra info\necho x\n```",
+        "no trailing newline ```bash\nx\n```",
+        "```sh\n```",
+        "```bash\n```bash\n```",
+        "```bash\n\u{1F680}\n```",
+        "```bash\nx\n\n```",
+        "```bash\na\n```trailing",
+        "",
+        "a",
+        "```",
+        "```bash",
+        "```bash\n",
+    ];
+    for case in cases {
+        assert_eq!(
+            runner().extract_command(case),
+            extract_command_reference(case),
+            "divergence on {case:?}"
+        );
+    }
+}
+
+/// 16. The same oracle, swept over pseudo-random token soup. The token
+///     alphabet is ASCII-only so that the documented `\s*` -> `[ \t\r\n]*`
+///     tightening cannot fire; the two patterns describe the same language
+///     there, and the sweep proves the hand-slicing never drifts from the
+///     capture-based original.
+#[test]
+fn test_extract_command_matches_reference_on_token_soup() {
+    const TOKENS: &[&str] = &[
+        "```bash", "```sh", "```rust", "```", "\n", " ", "echo hi", "ls", "\t", "\r\n", "a",
+        "```bash\nx", "x\n```", "```bashx", "``` bash", "```sh ", "    ", "```BASH",
+    ];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..2_000 {
+        let parts = rng.below(8) + 1;
+        let mut input = String::new();
+        for _ in 0..parts {
+            input.push_str(TOKENS[rng.below(TOKENS.len())]);
+        }
+        assert_eq!(
+            runner().extract_command(&input),
+            extract_command_reference(&input),
+            "divergence on {input:?}"
+        );
+    }
 }
