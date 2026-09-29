@@ -221,7 +221,15 @@ impl AgentRunner {
             .build()
             .expect("Failed to build HTTP client");
 
-        let command_regex = Regex::new(r"```(?:bash|sh)\s*\n([\s\S]*?)\n```").unwrap();
+        // Capture-free pattern: the body is sliced out of the full match by hand
+        // (see `extract_command`). `captures()` pays for a `Captures`
+        // allocation plus per-group offset tracking on every match, which
+        // dominates the cost of this regex and scales badly with block size.
+        //
+        // `(?s)` lets `.` match newlines (cheaper than the `[\s\S]` class), and
+        // the info-string gap is restricted to ASCII whitespace
+        // (`[ \t\r\n]*`, a strict subset of `\s*`).
+        let command_regex = Regex::new(r"(?s)```(?:bash|sh)[ \t\r\n]*\n.*?\n```").unwrap();
 
         Self {
             http_client,
@@ -233,11 +241,23 @@ impl AgentRunner {
         }
     }
 
+    /// Recover a bash command from the first ```bash / ```sh fenced block.
+    ///
+    /// Uses a single `find()` on a capture-free pattern and slices the body out
+    /// of the match by hand, which is materially cheaper than `captures()`.
+    /// A literally empty body (```` ```bash\n``` ````) yields `None`, because
+    /// the pattern requires a newline before the closing fence; a
+    /// whitespace-only body yields `Some("")`, as before.
     pub fn extract_command(&self, text: &str) -> Option<String> {
-        self.command_regex
-            .captures(text)
-            .and_then(|cap| cap.get(1))
-            .map(|m| m.as_str().trim().to_string())
+        let full = self.command_regex.find(text)?.as_str();
+        // The match always starts with "```", so the opening line ends at its
+        // first newline; the closing fence is the final "\n```" of the match.
+        let open_line_end = full.find('\n')?;
+        let close_start = full.len() - "\n```".len();
+        if close_start <= open_line_end {
+            return None;
+        }
+        Some(full[open_line_end + 1..close_start].trim().to_string())
     }
 
     pub async fn run_step_llm(&self, messages: &[ChatMessage]) -> Result<LlmResponse> {
@@ -683,6 +703,12 @@ impl AgentRunner {
             }
         };
 
+        // NOTE: this still materialises stdout+stderr in full before truncating,
+        // so peak memory here remains O(output size). Streaming truncation (a
+        // head buffer plus a rolling tail, never holding the middle) is the
+        // remaining follow-up; see audit 05 section 6. In the meantime,
+        // `from_utf8_lossy` already returns a `Cow`, so push it directly rather
+        // than forcing an extra deep copy of every stream byte via `.to_string()`.
         let mut combined = String::new();
         if !output.stdout.is_empty() {
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -700,19 +726,84 @@ impl AgentRunner {
     }
 }
 
+/// Byte budget above which captured command output is truncated.
+pub const TRUNCATE_LIMIT: usize = 16_384;
+/// Bytes retained from the *start* of over-budget output (floored to a
+/// character boundary).
+pub const TRUNCATE_HEAD: usize = 12_288;
+/// Bytes retained from the *end* of over-budget output (ceiled to a character
+/// boundary).
+pub const TRUNCATE_TAIL: usize = 4_096;
+
+/// Literal text of the marker inserted in place of the discarded middle,
+/// excluding the decimal byte count that is rendered between the two halves.
+const TRUNCATE_MARKER: &str = "\n... [Truncated ";
+/// Literal text of the second half of the marker, after the byte count.
+const TRUNCATE_MARKER_SUFFIX: &str = " bytes] ...\n";
+/// Upper bound on the decimal digits of a `usize` (2^64 - 1 has 20 digits).
+/// Used to size the result buffer up front so the marker needs no allocation.
+const USIZE_MAX_DIGITS: usize = 20;
+
+/// Bound command output to [`TRUNCATE_LIMIT`] bytes, keeping the head and the
+/// tail of the text and reporting how many bytes were discarded.
+///
+/// Both cut points are snapped to UTF-8 character boundaries (`floor` for the
+/// head, `ceil` for the tail), so no character is ever split and
+/// `head + dropped + tail == input.len()` holds exactly.
+///
+/// The result is assembled **once** into an exactly-sized `String`: the marker
+/// is pushed directly (the byte count is rendered into a stack buffer) and the
+/// 4 KiB tail is never copied through an intermediate allocation.
 pub fn truncate_output(combined: &str) -> String {
-    if combined.len() > 16384 {
-        let head_end = combined.floor_char_boundary(12288);
-        let tail_start = combined.ceil_char_boundary(combined.len().saturating_sub(4096));
-        let truncated = format!(
-            "\n... [Truncated {} bytes] ...\n{}",
-            combined.len() - (head_end + (combined.len() - tail_start)),
-            &combined[tail_start..]
-        );
-        format!("{}{}", &combined[..head_end], truncated)
-    } else {
-        combined.to_string()
+    let total = combined.len();
+    if total <= TRUNCATE_LIMIT {
+        // Fast path: the output fits the budget, so hand back one copy of it.
+        return combined.to_string();
     }
+
+    // `total > TRUNCATE_LIMIT > TRUNCATE_TAIL`, so this cannot underflow.
+    let head_end = combined.floor_char_boundary(TRUNCATE_HEAD);
+    let tail_start = combined.ceil_char_boundary(total - TRUNCATE_TAIL);
+    let dropped = total - (head_end + (total - tail_start));
+
+    // Exact capacity: head + marker + digits + suffix + tail. Sizing it
+    // correctly means the result needs a single allocation and no reallocation.
+    let mut out = String::with_capacity(
+        head_end + TRUNCATE_MARKER.len() + USIZE_MAX_DIGITS + TRUNCATE_MARKER_SUFFIX.len()
+            + (total - tail_start),
+    );
+    // Render the byte count into a stack buffer so the marker adds no allocation.
+    let mut digits = [0u8; USIZE_MAX_DIGITS];
+    let count = render_decimal(&mut digits, dropped);
+
+    out.push_str(&combined[..head_end]);
+    out.push_str(TRUNCATE_MARKER);
+    out.push_str(count);
+    out.push_str(TRUNCATE_MARKER_SUFFIX);
+    out.push_str(&combined[tail_start..]);
+    debug_assert!(
+        out.capacity() >= out.len(),
+        "result buffer must be sized up front"
+    );
+    out
+}
+
+/// Render `value` as decimal ASCII digits into `buf` and return the used
+/// prefix as a `&str`.
+///
+/// Digits are written right-to-left into the end of `buf`; the returned slice
+/// is valid UTF-8 because every byte written is an ASCII digit. This lets the
+/// truncation marker embed its byte count without any heap allocation.
+fn render_decimal(buf: &mut [u8; USIZE_MAX_DIGITS], mut value: usize) -> &str {
+    debug_assert!(value > 0, "the marker is only emitted with a dropped region");
+    let mut idx = buf.len();
+    while value > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + u8::try_from(value % 10).expect("remainder is a single digit");
+        value /= 10;
+    }
+    // Safe: the written prefix is ASCII.
+    std::str::from_utf8(&buf[idx..]).expect("ASCII digits are valid UTF-8")
 }
 
 /// Validate that a subagent command does not attempt to escape the worktree
@@ -859,11 +950,22 @@ mod tests {
 
     #[test]
     fn test_truncate_output_utf8_boundary() {
-        let mut s = "a".repeat(12287);
+        let mut s = "a".repeat(super::TRUNCATE_HEAD - 1);
         s.push('€'); // bytes 12287..12290
         s.push_str(&"b".repeat(9000));
         let truncated = super::truncate_output(&s);
         assert!(truncated.contains("... [Truncated"));
+    }
+
+    #[test]
+    fn test_truncate_output_constants_match_the_budget() {
+        use super::{TRUNCATE_HEAD, TRUNCATE_LIMIT, TRUNCATE_TAIL};
+        // The head and tail budgets make up the truncation limit.
+        const { assert!(TRUNCATE_HEAD + TRUNCATE_TAIL == TRUNCATE_LIMIT) };
+        // Both slices are strictly smaller than the limit, so the
+        // `total - TRUNCATE_TAIL` subtraction inside the truncation branch
+        // cannot underflow.
+        const { assert!(TRUNCATE_TAIL < TRUNCATE_LIMIT && TRUNCATE_HEAD < TRUNCATE_LIMIT) };
     }
 
     #[test]
