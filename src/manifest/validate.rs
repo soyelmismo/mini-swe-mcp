@@ -6,7 +6,9 @@
 //! taking the server down. [`ModelManifest::normalize`] then applies the
 //! mechanical fixups, and [`ModelManifest::sanitize_temperature`] /
 //! [`ModelManifest::sanitize_max_turns`] are the per-value rules the rest of
-//! the crate calls directly (see `mcp.rs`).
+//! the crate calls directly (see `mcp.rs`). The rules for the optional
+//! declarative execution policy live in their own `rules` submodule, which this
+//! one calls into for both the warning and the fixup.
 
 use std::collections::BTreeMap;
 
@@ -92,6 +94,13 @@ impl ModelManifest {
                 )),
                 _ => {}
             }
+
+            // Declarative execution policy (see the `rules` submodule). A model
+            // with no `policy:` block contributes nothing, which is what keeps a
+            // pre-policy manifest warning-free.
+            if let Some(policy) = &def.policy {
+                warnings.extend(Self::validate_policy(alias, policy));
+            }
         }
 
         warnings
@@ -132,7 +141,9 @@ impl ModelManifest {
 
     /// Apply every fixup that [`ModelManifest::validate`] reports.
     ///
-    /// Each *fixable* warning is paired with a repair: invalid temperatures are
+    /// Each *fixable* warning is paired with a repair: an unrecognised
+    /// execution policy is replaced by its restrictive default (see
+    /// [`Self::normalize_policy`]), invalid temperatures are
     /// clamped or dropped, unusable turn budgets are replaced with
     /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), and a `default` that names
     /// no known alias is dropped so `main.rs` reaches its fallback deliberately.
@@ -153,6 +164,7 @@ impl ModelManifest {
             def.max_turns = def
                 .max_turns
                 .map(|n| Self::sanitize_max_turns(Some(n), None));
+            Self::normalize_policy(&mut def.policy);
         }
 
         self

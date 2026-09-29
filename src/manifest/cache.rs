@@ -298,6 +298,7 @@ mod eviction_tests {
             role: Some("Role.".to_string()),
             temperature: None,
             max_turns: None,
+            policy: None,
         }
     }
 
@@ -400,6 +401,7 @@ mod eviction_tests {
             role: Some(huge_role.clone()),
             temperature: None,
             max_turns: None,
+            policy: None,
         };
 
         let row = catalog_row("huge-alias", &def);
@@ -421,6 +423,7 @@ mod eviction_tests {
             role: Some("R".repeat(CATALOG_CACHE_MAX_KEY_BYTES / 4)),
             temperature: None,
             max_turns: None,
+            policy: None,
         };
         let _ = catalog_row("fits-alias", &fits);
         assert_eq!(catalog_cache_len(), 1, "in-bound rows must still be cached");

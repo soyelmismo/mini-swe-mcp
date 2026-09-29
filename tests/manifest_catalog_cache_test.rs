@@ -27,6 +27,7 @@ fn definition(
         role: role.map(str::to_string),
         temperature,
         max_turns,
+        policy: None,
     }
 }
 

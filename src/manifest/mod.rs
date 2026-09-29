@@ -11,6 +11,8 @@
 //!   payload ([`ModelManifest::build_tool_description`]).
 //! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
 //!   loaded into a worker's system prompt.
+//! * `rules` — the accept/reject rules for the optional declarative execution
+//!   policy (`policy.network`, `policy.fs`) and the fixups that repair them.
 //! * `validate` — the advisory warning rules and the fixups that repair what
 //!   they report.
 //! * `tests` — the package unit tests (compiled only under `cfg(test)`).
@@ -30,6 +32,7 @@ use crate::config::xdg_config_dir;
 mod cache;
 mod catalog;
 mod memory;
+mod rules;
 mod types;
 mod validate;
 
@@ -44,8 +47,8 @@ pub use self::memory::{
     MEMORY_DIR, MAX_MEMORY_PROMPT_BYTES, agent_memory_path, append_agent_memory, load_agent_memory,
 };
 pub use self::types::{
-    ModelDefinition, ModelManifest, BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT,
-    TEMPERATURE_RANGE,
+    ExecutionPolicy, FsPolicy, ModelDefinition, ModelManifest, NetworkPolicy, BUILTIN_DEFAULT_MODEL,
+    DEFAULT_MAX_TURNS, FS_POLICIES, MAX_TURNS_LIMIT, NETWORK_POLICIES, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.

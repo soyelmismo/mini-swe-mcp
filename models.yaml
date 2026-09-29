@@ -1,3 +1,18 @@
+# Model catalog served to MCP hosts.
+#
+# Each entry may declare an optional `policy:` block (see src/manifest/rules.rs)
+# naming the execution policy a worker of that model runs under:
+#
+#   network: "offline"        # no egress at all (own network namespace)
+#             | "allow"       # the host's normal connectivity
+#   fs:       "read-only"     # nothing writable outside the worker's own state
+#             | "worktree-only"
+#             | "full"        # worktree + its build/target directory
+#
+# Both fields are optional and an entry without a `policy:` block keeps the
+# runtime defaults, so this file stays valid for older servers. An unknown value
+# is reported as a warning and repaired to the *restrictive* default rather than
+# failing the load.
 default: ninja
 
 models:
@@ -6,9 +21,19 @@ models:
     role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
     temperature: 0.2
     max_turns: 150
+    policy:
+      # The fast executor runs the toolchain and test suites, so it needs both
+      # egress (dependency fetches) and the full writable set of its worktree.
+      network: "allow"
+      fs: "full"
 
   nerd:
     id: combo:nerd
     role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
     temperature: 0.6
     max_turns: 200
+    policy:
+      # The deep reasoner reads broadly and refactors across files: same
+      # capabilities as `ninja`, declared explicitly rather than by omission.
+      network: "allow"
+      fs: "full"
