@@ -383,7 +383,9 @@ async fn stalled_stream_hits_idle_timeout_and_errors_after_retries() {
         "test-model".to_string(),
         None,
     )
-    .with_stream_idle_timeout(Duration::from_millis(200));
+    .with_stream_idle_timeout(Duration::from_millis(200))
+    .with_max_retries(3)
+    .with_initial_retry_delay(Duration::from_millis(50));
 
     let err = runner
         .run_step_llm(&user_turn())

@@ -921,8 +921,11 @@ models:
     );
 }
 
+static CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_build_tool_description_reuses_the_catalog_cache() {
+    let _guard = CACHE_TEST_MUTEX.lock().unwrap();
     clear_catalog_cache();
     let manifest = ModelManifest::default();
 
@@ -944,6 +947,7 @@ fn test_build_tool_description_reuses_the_catalog_cache() {
 
 #[test]
 fn test_build_tool_description_cache_key_includes_role_and_id() {
+    let _guard = CACHE_TEST_MUTEX.lock().unwrap();
     clear_catalog_cache();
     // Same alias, different id/role: the memoized row must not be reused across
     // the variants, otherwise the catalog would serve a stale bullet.
@@ -969,6 +973,7 @@ fn test_build_tool_description_cache_key_includes_role_and_id() {
 
 #[test]
 fn test_build_tool_description_cache_is_bounded() {
+    let _guard = CACHE_TEST_MUTEX.lock().unwrap();
     clear_catalog_cache();
 
     // More distinct rows than the cache capacity: the cache must stay bounded

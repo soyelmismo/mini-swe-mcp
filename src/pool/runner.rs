@@ -7,7 +7,7 @@
 //! sentinels ([`parse_request_turns`] and [`parse_ask_orchestrator`]).
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, Role, SYSTEM_PROMPT};
 use crate::worktree::WorktreeGuard;
@@ -165,16 +165,92 @@ impl WorkerPool {
                 ));
             }
 
-            // 1. Run LLM step with silent retry for empty / no-command responses
-            let mut llm_resp = runner.run_step_llm(&messages).await?;
+            // 1. Run LLM step with automatic pause and checkpoint on network/API failure
+            let mut llm_resp = match runner.run_step_llm(&messages).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Safe checkpoint of uncommitted worktree changes so work is never lost
+                    let _ = worktree.commit_changes(&format!(
+                        "worker({}): checkpoint step {} before pause (error: {})",
+                        worker_id, step, e
+                    ));
+
+                    warn!(
+                        worker = %worker_id,
+                        step,
+                        error = %e,
+                        "LLM step failed after retries; pausing worker for orchestrator resume"
+                    );
+
+                    let question = format!(
+                        "LLM API error (step {}): {}. Send steer/resume to retry.",
+                        step, e
+                    );
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                    let now = unix_timestamp();
+                    {
+                        let mut lock = self.workers.write().await;
+                        if let Some(w) = lock.get_mut(&worker_id) {
+                            w.state = WorkerState::Paused {
+                                question: question.clone(),
+                                step,
+                                paused_at: now,
+                            };
+                            w.resume_tx = Some(tx);
+                        }
+                    }
+
+                    save_registry_entry(&WorkerRegistryEntry {
+                        id: worker_id.clone(),
+                        pid: std::process::id(),
+                        task: task.clone(),
+                        model: model.clone(),
+                        status: "paused".into(),
+                        step,
+                        max_turns: current_max_turns,
+                        last_command: format!("paused_on_error: {e}"),
+                        question: Some(question.clone()),
+                        started_at: started_at_ts,
+                        updated_at: now,
+                        group: Some(group.clone()),
+                    });
+
+                    // Wait for orchestrator resume via steer
+                    if let Some(resume_msg) = rx.recv().await {
+                        info!(worker = %worker_id, msg = %resume_msg, "Worker resumed after error by orchestrator");
+                        {
+                            let mut lock = self.workers.write().await;
+                            if let Some(w) = lock.get_mut(&worker_id) {
+                                w.state = WorkerState::Running {
+                                    step,
+                                    last_command: format!("resumed: {}", summarize_command(&resume_msg)),
+                                    started_at: unix_timestamp(),
+                                };
+                                w.resume_tx = None;
+                            }
+                        }
+                        if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
+                            messages.push(ChatMessage::text(
+                                Role::User,
+                                format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
+                            ));
+                        }
+                        // Re-run the LLM step now that network/connectivity is restored
+                        runner.run_step_llm(&messages).await?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
             if llm_resp.command.is_none() {
                 info!(
                     worker = %worker_id,
                     "No command found (tool_calls or code block); discarding and silently retrying once without warning"
                 );
-                let retry_resp = runner.run_step_llm(&messages).await?;
-                if retry_resp.command.is_some() {
+                if let Ok(retry_resp) = runner.run_step_llm(&messages).await
+                    && retry_resp.command.is_some()
+                {
                     llm_resp = retry_resp;
                 }
             }
