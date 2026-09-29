@@ -195,11 +195,17 @@ fn catalog_row_cache() -> &'static RwLock<LruCache<CatalogRowKey, Arc<str>>> {
 /// agree.
 pub(super) fn catalog_row(alias: &str, def: &ModelDefinition) -> Arc<str> {
     let role = def.role.as_deref().unwrap_or(DEFAULT_ROLE);
+    // Reject obviously oversized inputs before allocating a key. The encoded
+    // key includes length prefixes, so check its exact size below as well.
+    if alias
+        .len()
+        .saturating_add(def.id.len())
+        .saturating_add(role.len())
+        > CATALOG_CACHE_MAX_KEY_BYTES
+    {
+        return render_catalog_row(alias, &def.id, role);
+    }
     let key: CatalogRowKey = catalog_row_key(alias, &def.id, role).into_boxed_str();
-
-    // Over-long (i.e. poisoned) input renders but is never memoized: the key is
-    // built first precisely so its size can be bounded before anything is
-    // retained. See CATALOG_CACHE_MAX_KEY_BYTES.
     if key.len() > CATALOG_CACHE_MAX_KEY_BYTES {
         return render_catalog_row(alias, &def.id, role);
     }
@@ -222,11 +228,11 @@ pub(super) fn catalog_row(alias: &str, def: &ModelDefinition) -> Arc<str> {
     if let Some(row) = hit {
         return row;
     }
-    let hit = if let Ok(cache) = catalog_row_cache().read() {
-        cache.peek(&key).map(Arc::clone)
-    } else {
-        None
-    };
+    let hit = catalog_row_cache()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .peek(&key)
+        .map(Arc::clone);
     if let Some(row) = hit {
         return row;
     }
@@ -265,7 +271,10 @@ fn render_catalog_row(alias: &str, id: &str, role: &str) -> Arc<str> {
 /// Exposed for tests and diagnostics: the cache is bounded by
 /// [`CATALOG_CACHE_CAPACITY`] and never grows with repeated `tools/list` calls.
 pub fn catalog_cache_len() -> usize {
-    catalog_row_cache().read().map_or(0, |cache| cache.len())
+    catalog_row_cache()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 /// Drop every memoized catalog bullet.
@@ -277,19 +286,6 @@ pub fn clear_catalog_cache() {
 
 #[cfg(test)]
 pub(crate) static TEST_CACHE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Non-blocking write that also recovers a poisoned lock — the exact tier-1
-/// acquisition [`catalog_row`] performs. Test-only helper.
-#[cfg(test)]
-fn try_write_recover(
-    cache: &RwLock<LruCache<CatalogRowKey, Arc<str>>>,
-) -> Result<CatalogWriteGuard<'_>, PoisonError<CatalogWriteGuard<'_>>> {
-    match cache.try_write() {
-        Ok(guard) => Ok(guard),
-        Err(TryLockError::Poisoned(poisoned)) => Err(poisoned),
-        Err(e @ TryLockError::WouldBlock) => unreachable!("uncontended lock: {e:?}"),
-    }
-}
 
 #[cfg(test)]
 mod eviction_tests {
@@ -511,7 +507,7 @@ mod eviction_tests {
             RwLock::new(LruCache::with_capacity(4));
 
         // Uncontended: the lock is handed straight through.
-        let mut guard = poisoned_or(try_write_recover(&cache));
+        let mut guard = try_poisoned_or(cache.try_write()).expect("uncontended lock");
         let absent: CatalogRowKey = "1:a".into();
         assert!(guard.get(&absent).is_none());
         drop(guard);
@@ -524,16 +520,24 @@ mod eviction_tests {
         }));
         assert!(cache.read().is_err(), "precondition: the lock is poisoned");
 
-        let mut guard = poisoned_or(cache.write());
+        let mut guard = try_poisoned_or(cache.try_write()).expect("poisoned lock is recoverable");
         guard.insert("2:b".into(), Arc::from("v"));
         assert_eq!(guard.len(), 1, "a poisoned cache must still be writable");
         drop(guard);
         // The read side reports the poison (that is the contract of
-        // `RwLock::read`), but the data is intact and `catalog_cache_len`'s
-        // `map_or` must not read that as "empty".
+        // `RwLock::read`), but the data is intact and the length accessor
+        // must not read that as "empty".
         let recovered = cache.read().unwrap_or_else(|p| p.into_inner());
         assert_eq!(recovered.len(), 1, "a poisoned cache must still hold its entries");
         drop(recovered);
+        assert!(try_poisoned_or(cache.try_write()).is_some());
+
+        let held = cache.read().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            try_poisoned_or(cache.try_write()).is_none(),
+            "contention is not poison"
+        );
+        drop(held);
     }
 
     /// The cache is a single process-wide `RwLock`; hammering it from many
