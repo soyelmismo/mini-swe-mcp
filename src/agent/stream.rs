@@ -424,7 +424,7 @@ impl SseAccumulator {
             {
                 if entry.arguments.len() + args.len() > MAX_TOOL_ARGUMENT_BYTES {
                     tracing::warn!(
-                        index = tc.index,
+                        index = target_index,
                         limit = MAX_TOOL_ARGUMENT_BYTES,
                         "Streamed tool_call arguments exceeded the retention budget; dropping the call"
                     );

@@ -404,9 +404,16 @@ async fn non_streaming_json_body_is_parsed_via_fallback() {
 
 /// A model that streams a very long response must not inflate memory without
 /// bound: the retained content is capped (a marker is appended).
+///
+/// The input deliberately overshoots the budget by 2x. Before the budget was
+/// raised this test streamed exactly 64 KiB and asserted `<=`, which no longer
+/// proves anything once the cap *is* 64 KiB — a pass/fail boundary case is
+/// indistinguishable from a broken cap. Overflowing the cap is the only way to
+/// show the guard still fires after the constant moved.
 #[tokio::test]
 async fn streamed_content_is_capped() {
-    let big = "x".repeat(64 * 1024);
+    let limit = mini_swe_mcp::agent::MAX_STREAMED_CONTENT_BYTES;
+    let big = "x".repeat(limit * 2);
     let payload = format!(
         "data: {}\n\n",
         serde_json::json!({"choices":[{"delta":{"content": big}}]})
@@ -415,9 +422,16 @@ async fn streamed_content_is_capped() {
     let base = spawn_sse_server(body).await;
     let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
     assert!(
-        resp.content.len() <= mini_swe_mcp::agent::MAX_STREAMED_CONTENT_BYTES,
+        resp.content.len() <= limit,
         "content must be capped, got {} bytes",
         resp.content.len()
+    );
+    assert_eq!(
+        resp.content.len(),
+        limit,
+        "a {}-byte stream must retain exactly the {} byte budget",
+        limit * 2,
+        limit
     );
 }
 
