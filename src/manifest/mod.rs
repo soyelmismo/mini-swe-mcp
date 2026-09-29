@@ -36,7 +36,9 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use self::cache::{catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY};
+pub use self::cache::{
+    catalog_cache_len, clear_catalog_cache, CATALOG_CACHE_CAPACITY,
+};
 pub use self::catalog::build_system_prompt;
 pub use self::memory::{
     MEMORY_DIR, MAX_MEMORY_PROMPT_BYTES, agent_memory_path, append_agent_memory, load_agent_memory,
