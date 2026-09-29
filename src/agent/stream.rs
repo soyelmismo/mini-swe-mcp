@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
 use super::types::{
-    BashArgs, ChatCompletionResponse, LlmResponse, MAX_STREAMED_CONTENT_BYTES,
+    BashArgs, ChatCompletionResponse, LlmResponse, MAX_SSE_FRAME_BYTES, MAX_STREAMED_CONTENT_BYTES,
     MAX_TOOL_ARGUMENT_BYTES, SSE_BUFFER_HINT_BYTES, StreamChunk, StreamToolCall, ToolCall,
     ToolCallFn, generate_call_id,
 };
@@ -168,6 +168,9 @@ pub(crate) struct SseAccumulator {
     /// Reusable decode buffer for the lossy UTF-8 path, so a corrupting stream
     /// does not allocate one `String` per frame. Never escapes the accumulator.
     lossy_scratch: Vec<u8>,
+    /// Latch so the unframed-tail cap is reported once per stream, not once per
+    /// offending chunk (a runaway stream would otherwise log in a hot loop).
+    frame_cap_logged: bool,
 }
 
 /// Outcome of feeding one complete SSE frame to the accumulator.
@@ -186,6 +189,15 @@ impl SseAccumulator {
     /// newline search is bounded by the tail of the buffer instead of the whole
     /// accumulated stream: each byte is scanned at most once, even when a frame
     /// is split across thousands of one-byte TCP segments.
+    ///
+    /// An ill-formed stream — one that never emits a newline — would otherwise
+    /// grow `buffer` without bound, since no frame is ever drained. The retained
+    /// unframed tail is therefore capped at [`MAX_SSE_FRAME_BYTES`]: past that
+    /// the pending bytes are dropped (logged once) and the reader resyncs on the
+    /// next newline, so a malformed stream degrades instead of exhausting
+    /// memory. The cap is applied to the *retained tail* only, after this chunk's
+    /// complete frames have been consumed, so it never truncates a well-formed
+    /// frame that happens to arrive across many chunks.
     pub(crate) fn push(&mut self, bytes: &[u8], buffer: &mut Vec<u8>) -> Option<FrameOutcome> {
         if bytes.is_empty() {
             return None;
@@ -220,8 +232,23 @@ impl SseAccumulator {
         // in the buffer matters any more, so drop it outright.
         if outcome == Some(FrameOutcome::Done) || start >= buffer.len() {
             buffer.clear();
-        } else if start > 0 {
-            buffer.drain(..start);
+        } else {
+            if start > 0 {
+                buffer.drain(..start);
+            }
+            // Bound what is still unframed. Without this, a stream that never
+            // emits `\n` (or one huge line) keeps every byte it sends, so the
+            // buffer grows with the body and pins it for the whole request.
+            if buffer.len() > MAX_SSE_FRAME_BYTES {
+                buffer.clear();
+                if !self.frame_cap_logged {
+                    self.frame_cap_logged = true;
+                    tracing::warn!(
+                        limit = MAX_SSE_FRAME_BYTES,
+                        "SSE frame exceeded the unframed-tail budget; dropping the partial frame and resyncing"
+                    );
+                }
+            }
         }
 
         outcome
@@ -249,11 +276,15 @@ impl SseAccumulator {
             return FrameOutcome::Done;
         }
 
-        // Fast path: the payload is valid UTF-8. Borrow it straight out of the
-        // caller's buffer and hand a `&str` to the shared handler.
-        if let Ok(text) = std::str::from_utf8(payload) {
-            return self.handle_payload(text);
-        }
+        // Validate once and branch on the result: a valid payload is borrowed
+        // straight out of the caller's buffer, and the error is already in hand
+        // on the slow path. Validating twice (to recover the `Utf8Error` with
+        // `unwrap_err`) re-scanned the whole line for nothing.
+        let err = match std::str::from_utf8(payload) {
+            // Fast path: valid UTF-8, handed to the shared handler by reference.
+            Ok(text) => return self.handle_payload(text),
+            Err(err) => err,
+        };
 
         // Slow path: log and count exactly as before, then decode lossily.
         // The decode reuses `self.lossy_scratch`'s capacity across frames, so a
@@ -262,7 +293,6 @@ impl SseAccumulator {
         // fresh `String` per line, as `String::from_utf8_lossy` would.
         // Log against `payload`, the region actually being decoded, so the
         // reported offsets line up with the lossy substitution that follows.
-        let err = std::str::from_utf8(payload).unwrap_err();
         self.invalid_utf8_lines += 1;
         tracing::warn!(
             valid_up_to = err.valid_up_to(),
@@ -404,32 +434,39 @@ impl SseAccumulator {
         tools: &BTreeMap<usize, StreamedToolCall>,
     ) -> (Vec<ToolCall>, HashSet<String>) {
         let mut tcs = Vec::with_capacity(tools.len());
-        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(tools.len());
         for entry in tools.values() {
             if entry.malformed || entry.is_placeholder() {
                 continue;
             }
-            let mut id = entry.id.trim().to_string();
-            if id.is_empty() || !seen_ids.insert(id.clone()) {
+            // Reserve up front: tool-call counts are known from the map, and
+            // this avoids rehashing on the insert-heavy duplicate path. The
+            // `ToolCall` and the set each need an owned `String`, so the clone
+            // into `seen_ids` stays; what is removed is the extra round of
+            // cloning the *generated* id, which the old shape did twice.
+            let id = entry.id.trim().to_string();
+            let id = if !id.is_empty() && seen_ids.insert(id.clone()) {
+                id
+            } else {
                 if !id.is_empty() {
                     tracing::warn!(
                         original_id = %id,
                         "Duplicate tool_call id in stream; generated a unique replacement"
                     );
                 }
-                id = generate_call_id();
-                seen_ids.insert(id.clone());
-            }
-            let name = if entry.name.trim().is_empty() {
-                "bash".to_string()
-            } else {
-                entry.name.clone()
+                let generated = generate_call_id();
+                seen_ids.insert(generated.clone());
+                generated
             };
             tcs.push(ToolCall {
                 id,
                 r#type: "function".to_string(),
                 function: ToolCallFn {
-                    name,
+                    name: if entry.name.trim().is_empty() {
+                        "bash".to_string()
+                    } else {
+                        entry.name.clone()
+                    },
                     arguments: entry.arguments.clone(),
                 },
             });
@@ -959,5 +996,77 @@ mod tests {
         body.extend_from_slice(b"data: [DONE]\n\n");
         assert_eq!(acc.push(&body, &mut buffer), Some(FrameOutcome::Done));
         assert_eq!(acc.invalid_utf8_lines, 0, "comments are not payload");
+    }
+
+    // ---- unbounded-growth regression (ill-formed streams) ----
+
+    #[test]
+    fn newline_free_stream_does_not_grow_the_buffer_without_bound() {
+        // A provider that never emits a `\n` would otherwise make the framing
+        // buffer absorb the whole (unbounded) body chunk by chunk. The reader
+        // must drop the over-long unterminated tail instead of retaining it.
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..(MAX_SSE_FRAME_BYTES / chunk.len() + 16) {
+            acc.push(&chunk, &mut buffer);
+        }
+        assert!(
+            buffer.len() <= MAX_SSE_FRAME_BYTES,
+            "unterminated frame must be capped, got {} bytes",
+            buffer.len()
+        );
+    }
+
+    #[test]
+    fn oversized_single_line_is_discarded_and_framing_resyncs() {
+        // One absurd line (no newline inside) must be dropped whole, and the
+        // *next* well-formed frame must still be parsed: the reader resyncs on
+        // the next `\n` rather than wedging.
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let mut body = vec![b'y'; MAX_SSE_FRAME_BYTES * 2];
+        body.push(b'\n');
+        body.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"ok"}}]}"#);
+        body.extend_from_slice(b"\n\n");
+        acc.push(&body, &mut buffer);
+        assert_eq!(
+            acc.content, "ok",
+            "reader must resync after the garbage line"
+        );
+        assert!(
+            buffer.is_empty(),
+            "no tail may survive the well-formed frame"
+        );
+    }
+
+    #[test]
+    fn a_large_but_legal_frame_split_across_chunks_is_never_truncated() {
+        // Guard against the cap misfiring: a single frame well under the budget
+        // but delivered in tiny pieces must still reassemble exactly, and the
+        // cap must not have dropped the tail.
+        // The content stays under `MAX_STREAMED_CONTENT_BYTES` so the assertion
+        // below tests the *framing* cap, not the separate content budget.
+        let text = "z".repeat(MAX_STREAMED_CONTENT_BYTES - 1024);
+        let frame = serde_json::json!({"choices":[{"delta":{"content":text}}]}).to_string();
+        assert!(
+            frame.len() < MAX_SSE_FRAME_BYTES,
+            "test frame must stay within the cap"
+        );
+        let body = sse_body(&[&frame]);
+
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let mut done = false;
+        for chunk in body.chunks(1024) {
+            if acc.push(chunk, &mut buffer) == Some(FrameOutcome::Done) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "[DONE] must terminate the stream");
+        assert_eq!(acc.content.len(), text.len(), "content must be exact");
+        assert!(!acc.content_capped, "a legal frame must not be truncated");
+        assert!(!acc.frame_cap_logged, "the cap must not have fired");
     }
 }

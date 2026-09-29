@@ -426,3 +426,39 @@ async fn slow_but_progressing_stream_is_not_aborted() {
     let resp = runner.run_step_llm(&user_turn()).await.expect("must not be aborted");
     assert_eq!(resp.content, "one-two-three");
 }
+
+/// A body that never terminates a line (no `\n` at all) must not be buffered
+/// without bound, and the reader must still resync on the newline that follows.
+///
+/// This is the end-to-end counterpart of the `push` unframed-tail cap: before
+/// it, `SseAccumulator::push` retained every byte a malformed stream sent, so a
+/// hostile or broken provider could grow the framing buffer for the lifetime of
+/// the request. The oversized run below is deliberately larger than the cap, and
+/// a *well-formed* frame is appended after it to prove the connection recovers
+/// rather than wedging.
+#[tokio::test]
+async fn unterminated_oversized_run_is_capped_and_the_stream_recovers() {
+    // ~2 MiB of newline-free garbage: far past any real SSE frame, and past the
+    // reader's unframed-tail budget.
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+    let garbage = vec![b'x'; 64 * 1024];
+    for _ in 0..32 {
+        segments.push(garbage.clone());
+    }
+    // A real frame right after the garbage, then the terminator.
+    segments.push(b"\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n".to_vec());
+    segments.push(b"data: [DONE]\n\n".to_vec());
+
+    let base = spawn_sse_server(MockSse::sse(segments)).await;
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
+    // The garbage line is dropped, but the reader resynced and delivered the
+    // frame that followed it.
+    assert_eq!(
+        resp.content, "ok",
+        "reader must resync past the garbage run"
+    );
+    assert_eq!(resp.invalid_utf8_lines, 0);
+}

@@ -24,6 +24,20 @@ pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 /// long stream does not repeatedly reallocate as chunks arrive.
 pub(crate) const SSE_BUFFER_HINT_BYTES: usize = 8 * 1024;
 
+/// Hard cap on a single *unterminated* SSE line retained by the framing buffer.
+///
+/// `content` and tool-call `arguments` are already budgeted, but the raw
+/// framing buffer is not: a provider (or a proxy) that streams bytes with no
+/// newline — a huge line, or a `data:` payload larger than any real model emits
+/// — would otherwise make the buffer absorb the entire body chunk by chunk,
+/// with no upper bound. Retaining at most this many unframed bytes caps that
+/// growth; anything longer is dropped and the reader resyncs on the next
+/// newline, so an ill-formed stream degrades instead of exhausting memory.
+///
+/// Sized well above [`SSE_BUFFER_HINT_BYTES`] (a typical frame is ~8 KiB) and
+/// above [`MAX_TOOL_ARGUMENT_BYTES`], so legitimate frames are never truncated.
+pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+
 pub const SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering subagent running in a Linux bash environment.
 You are given a task to complete within a git repository.
 
@@ -374,7 +388,10 @@ mod tests {
     fn test_role_wire_strings() {
         for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
             let expected = role.as_wire_str();
-            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{expected}\"")
+            );
             let back: Role = serde_json::from_str(&format!("\"{expected}\"")).unwrap();
             assert_eq!(back, role);
         }
@@ -412,7 +429,8 @@ mod tests {
     #[test]
     fn test_assistant_with_empty_tool_calls_is_normalised() {
         let msg = ChatMessage::assistant_with_tool_calls(Some("thinking".into()), Vec::new());
-        let value: serde_json::Value = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(msg.role(), Role::Assistant);
         assert!(value.get("tool_calls").is_none(), "got {value}");
         assert_eq!(value["content"], "thinking");
