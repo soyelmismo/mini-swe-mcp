@@ -92,6 +92,10 @@ impl WorktreeGuard {
         }
 
         let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
+        if !base_commit_out.status.success() {
+            let stderr = String::from_utf8_lossy(&base_commit_out.stderr);
+            anyhow::bail!("git rev-parse HEAD failed: {}", stderr.trim());
+        }
         let base_commit = String::from_utf8_lossy(&base_commit_out.stdout)
             .trim()
             .to_string();
@@ -161,6 +165,10 @@ impl WorktreeGuard {
 
         // Check if there are changes to commit
         let status = git(&self.path, "status", &["status", "--porcelain"])?;
+        if !status.status.success() {
+            let stderr = String::from_utf8_lossy(&status.stderr);
+            anyhow::bail!("git status failed: {}", stderr.trim());
+        }
         if status.stdout.is_empty() {
             // Even if working tree is clean, check if branch already has commits beyond base_commit
             let has_commits = if !self.base_commit.is_empty() {
@@ -187,7 +195,7 @@ impl WorktreeGuard {
         }
 
         // Commit with fallback credentials so lack of git config never errors
-        let _ = git(
+        let commit_out = git(
             &self.path,
             "commit",
             &[
@@ -200,6 +208,10 @@ impl WorktreeGuard {
                 message,
             ],
         )?;
+        if !commit_out.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_out.stderr);
+            anyhow::bail!("git commit failed: {}", stderr.trim());
+        }
 
         self.preserve_branch = true;
         Ok(Some(self.branch.clone()))

@@ -300,6 +300,8 @@ fn test_sync_artifacts_preserves_reports_to_repo_root() {
     let content = std::fs::read_to_string(&destination).expect("failed to read copied artifact");
     assert!(content.contains("# Subagent Audit Report"));
 
+    let _ = std::fs::remove_file(&destination);
+
     drop(guard);
 }
 
