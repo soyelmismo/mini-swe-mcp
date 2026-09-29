@@ -1049,7 +1049,6 @@ mod tests {
                     || out.contains("Permiso denegado"),
                 "unexpected touch output: {out:?}, code: {code:?}"
             );
-            self.reader.abort();
         }
 
         let target_dir = crate::worktree::swe_base_dir().join(format!(
@@ -1282,9 +1281,9 @@ mod tests {
              not the size of the retained buffer"
         );
         // The head survives...
-        assert!(out.starts_with("aaaa-1\n"), "head: {out}");
+        assert!(out.starts_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1\n"), "head: {out}");
         // ...and so does the tail.
-        assert!(out.contains("aaaa-40000"), "tail: {out}");
+        assert!(out.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-40000"), "tail: {out}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1345,7 +1344,7 @@ mod tests {
         assert!(group_is_alive(pid), "the child must be running");
 
         // This is the clean-exit path: we disarmed before dropping.
-        let mut guard = ProcessGroupGuard::new(pid);
+        let mut guard = ProcessGroupGuard::new(Some(pid));
         guard.disarm();
         drop(guard);
 
@@ -1490,7 +1489,6 @@ mod tests {
                 !out.contains("leaked-must-not-appear"),
                 "{var} leaked into the child environment: {out:?}"
             );
-            self.reader.abort();
         }
         assert!(
             !out.contains("/tmp/agent.sock"),

@@ -192,9 +192,7 @@ impl SseAccumulator {
     pub(crate) fn push(&mut self, mut bytes: &[u8], buffer: &mut Vec<u8>) -> Option<FrameOutcome> {
         while !bytes.is_empty() {
             if self.discarding_line {
-                let Some(pos) = bytes.iter().position(|&b| b == b'\n') else {
-                    return None;
-                };
+                let pos = bytes.iter().position(|&b| b == b'\n')?;
                 bytes = &bytes[pos + 1..];
                 self.discarding_line = false;
                 continue;

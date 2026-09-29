@@ -319,7 +319,7 @@ impl<'de> Visitor<'de> for RequestVisitor {
         // is what keeps member names allocation-free. `Cow<str>` would have
         // copied *every* key into a `String` — including the four known ones —
         // on every frame.
-        while let Some(key) = map.next_key::<MethodName<'de>>()?.0 {
+        while let Some(MethodName(key)) = map.next_key::<MethodName<'de>>()? {
             match key.as_ref() {
                 // A key that carries a JSON escape (`"tools\u002fcall"`)
                 // arrives owned but still compares equal, so such a frame is
