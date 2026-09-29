@@ -111,13 +111,10 @@ pub(super) enum FrameRejection {
 }
 
 impl FrameRejection {
-    /// The `-32700` reply for a line `serde_json` refused to parse.
-    ///
-    /// JSON-RPC 2.0 §5.1 splits the two cases apart: `-32700` is reserved for
-    /// input that is not valid JSON, while well-formed JSON that is not a
-    /// Request object is `-32600`. `serde_json` reports exactly that split
-    /// through [`serde_json::error::Category`], so classifying the failure
-    /// costs no formatting.
+    /// The `-32700` reply for a line `serde_json` refused to parse, carrying
+    /// serde's own diagnosis. Well-formed JSON that is not a Request object is
+    /// `-32600` instead (JSON-RPC 2.0 §5.1); [`parse_frame`] tells the two
+    /// apart with a syntax-only first pass.
     pub(super) fn malformed(error: &serde_json::Error) -> Self {
         Self::Malformed(format!("Parse error: {error}"))
     }
