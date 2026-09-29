@@ -62,6 +62,14 @@ async fn async_main() -> Result<()> {
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
     if let Some(action) = action_of(&cli_args) {
+        // `monitor` / `supervisor` reach here when a selector flag precedes the
+        // verb (e.g. `--json monitor`); the early argv check above only sees
+        // `raw_args[1]`. Handle them here so every flag ordering behaves the
+        // same as the pre-refactor dispatch.
+        if action == "monitor" || action == "supervisor" {
+            let once = cli_args.iter().any(|arg| arg == "--once");
+            return mini_swe_mcp::monitor::run_monitor(once).await;
+        }
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
 
