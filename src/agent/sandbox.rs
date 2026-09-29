@@ -20,7 +20,6 @@ use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 /// Byte budget above which captured command output is truncated.
 pub const TRUNCATE_LIMIT: usize = 16_384;
@@ -133,16 +132,28 @@ pub fn is_heavy_command(command: &str) -> bool {
     HEAVY_PATTERNS.iter().any(|pattern| lower.contains(pattern))
 }
 
-/// Whether the `bwrap` sandbox utility is available.
-pub fn has_bwrap() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::process::Command::new("bwrap")
+/// Whether a binary is available on this host, probed once per name.
+///
+/// Memoized so the (potentially `fork`+`exec`-bound) probe runs at most once
+/// per process per binary.
+pub(crate) fn binary_available(name: &'static str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static AVAILABLE: LazyLock<Mutex<HashMap<&'static str, bool>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut map = AVAILABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *map.entry(name).or_insert_with(|| {
+        std::process::Command::new(name)
             .arg("--version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     })
+}
+
+/// Whether the `bwrap` sandbox utility is available.
+pub fn has_bwrap() -> bool {
+    binary_available("bwrap")
 }
 
 /// Resolve a worktree's gitdir reference to the common `.git` and worktree gitdir.
