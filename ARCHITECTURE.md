@@ -70,8 +70,10 @@ The agent runner interacts with OpenAI-compatible endpoints using native Server-
      sparse index (e.g. `index: 3` on the first frame) cannot fabricate placeholder calls.
      Placeholders and malformed calls are filtered at finalization, and every emitted id is
      unique and non-empty.
-   - Retention is bounded: `MAX_STREAMED_CONTENT_BYTES` (16 KiB) for assistant text and
-     `MAX_TOOL_ARGUMENT_BYTES` (64 KiB) per tool call; overflow is logged and the call dropped.
+   - Retention is bounded: `MAX_STREAMED_CONTENT_BYTES` (16 KiB) for assistant text,
+     `MAX_TOOL_ARGUMENT_BYTES` (64 KiB) per tool call, and `MAX_SSE_FRAME_BYTES`
+     (1 MiB) per SSE line. Oversized lines are discarded through their newline
+     before framing resumes; complete lines within a chunk need no buffer copy.
 4. **Idle (not whole-request) Timeout**:
    - The client uses `connect_timeout` for the handshake and `read_timeout` for a single
      stalled read; `run_step_llm` additionally wraps each `resp.chunk()` in

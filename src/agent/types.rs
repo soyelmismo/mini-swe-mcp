@@ -24,7 +24,7 @@ pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 /// long stream does not repeatedly reallocate as chunks arrive.
 pub(crate) const SSE_BUFFER_HINT_BYTES: usize = 8 * 1024;
 
-/// Hard cap on a single *unterminated* SSE line retained by the framing buffer.
+/// Hard cap on a single SSE line retained or parsed by the framing buffer.
 ///
 /// `content` and tool-call `arguments` are already budgeted, but the raw
 /// framing buffer is not: a provider (or a proxy) that streams bytes with no
@@ -35,7 +35,7 @@ pub(crate) const SSE_BUFFER_HINT_BYTES: usize = 8 * 1024;
 /// newline, so an ill-formed stream degrades instead of exhausting memory.
 ///
 /// Sized well above [`SSE_BUFFER_HINT_BYTES`] (a typical frame is ~8 KiB) and
-/// above [`MAX_TOOL_ARGUMENT_BYTES`], so legitimate frames are never truncated.
+/// above [`MAX_TOOL_ARGUMENT_BYTES`], leaving room for normal frames.
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
 pub const SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering subagent running in a Linux bash environment.

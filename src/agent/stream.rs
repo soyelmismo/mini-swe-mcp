@@ -171,6 +171,8 @@ pub(crate) struct SseAccumulator {
     /// Latch so the unframed-tail cap is reported once per stream, not once per
     /// offending chunk (a runaway stream would otherwise log in a hot loop).
     frame_cap_logged: bool,
+    /// Ignore bytes until the next newline after an oversized line.
+    discarding_line: bool,
 }
 
 /// Outcome of feeding one complete SSE frame to the accumulator.
@@ -183,63 +185,27 @@ pub(crate) enum FrameOutcome {
 }
 
 impl SseAccumulator {
-    /// Append raw chunk bytes and drain every *complete* frame they finish.
-    ///
-    /// The buffer only ever holds bytes that have not yet been framed, so the
-    /// newline search is bounded by the tail of the buffer instead of the whole
-    /// accumulated stream: each byte is scanned at most once, even when a frame
-    /// is split across thousands of one-byte TCP segments.
-    ///
-    /// An ill-formed stream — one that never emits a newline — would otherwise
-    /// grow `buffer` without bound, since no frame is ever drained. The retained
-    /// unframed tail is therefore capped at [`MAX_SSE_FRAME_BYTES`]: past that
-    /// the pending bytes are dropped (logged once) and the reader resyncs on the
-    /// next newline, so a malformed stream degrades instead of exhausting
-    /// memory. The cap is applied to the *retained tail* only, after this chunk's
-    /// complete frames have been consumed, so it never truncates a well-formed
-    /// frame that happens to arrive across many chunks.
-    pub(crate) fn push(&mut self, bytes: &[u8], buffer: &mut Vec<u8>) -> Option<FrameOutcome> {
-        if bytes.is_empty() {
-            return None;
-        }
-        if buffer.is_empty() {
-            buffer.reserve(SSE_BUFFER_HINT_BYTES);
-        }
-        buffer.extend_from_slice(bytes);
-
-        let mut outcome = None;
-        let mut start = 0usize;
-        // Search for the next newline with a single forward pass. `start` only
-        // ever moves right, so a byte is never re-scanned; and we stop at the
-        // first newline-free remainder instead of rescanning it per chunk.
-        while let Some(rel_pos) = buffer[start..].iter().position(|&b| b == b'\n') {
-            let pos = start + rel_pos;
-            let raw_line = &buffer[start..pos];
-            start = pos + 1;
-
-            match self.handle_line(raw_line) {
-                FrameOutcome::Consumed => {}
-                FrameOutcome::Done => {
-                    outcome = Some(FrameOutcome::Done);
-                    break;
-                }
+    /// Frame chunk bytes line by line. Incomplete lines are retained up to the
+    /// cap; oversized lines are ignored through their terminating newline.
+    /// Complete lines in a single chunk are borrowed directly, without copying
+    /// the entire chunk into the framing buffer.
+    pub(crate) fn push(&mut self, mut bytes: &[u8], buffer: &mut Vec<u8>) -> Option<FrameOutcome> {
+        while !bytes.is_empty() {
+            if self.discarding_line {
+                let Some(pos) = bytes.iter().position(|&b| b == b'\n') else {
+                    return None;
+                };
+                bytes = &bytes[pos + 1..];
+                self.discarding_line = false;
+                continue;
             }
-        }
 
-        // Discard the consumed prefix. `Vec::drain(..start)` memmoves the whole
-        // *remainder* left, so skip it entirely when nothing is left and only
-        // pay for it when an unterminated tail survives. After `[DONE]` nothing
-        // in the buffer matters any more, so drop it outright.
-        if outcome == Some(FrameOutcome::Done) || start >= buffer.len() {
-            buffer.clear();
-        } else {
-            if start > 0 {
-                buffer.drain(..start);
-            }
-            // Bound what is still unframed. Without this, a stream that never
-            // emits `\n` (or one huge line) keeps every byte it sends, so the
-            // buffer grows with the body and pins it for the whole request.
-            if buffer.len() > MAX_SSE_FRAME_BYTES {
+            let newline = bytes.iter().position(|&b| b == b'\n');
+            let (line, rest) = match newline {
+                Some(pos) => (&bytes[..pos], &bytes[pos + 1..]),
+                None => (bytes, &bytes[bytes.len()..]),
+            };
+            if buffer.len().saturating_add(line.len()) > MAX_SSE_FRAME_BYTES {
                 buffer.clear();
                 if !self.frame_cap_logged {
                     self.frame_cap_logged = true;
@@ -248,10 +214,30 @@ impl SseAccumulator {
                         "SSE frame exceeded the unframed-tail budget; dropping the partial frame and resyncing"
                     );
                 }
+                // If this chunk does not end the oversized line, skip future
+                // chunks too: otherwise their suffix could look like `data:`.
+                self.discarding_line = newline.is_none();
+            } else if newline.is_some() {
+                let outcome = if buffer.is_empty() {
+                    self.handle_line(line)
+                } else {
+                    buffer.extend_from_slice(line);
+                    let outcome = self.handle_line(buffer);
+                    buffer.clear();
+                    outcome
+                };
+                if outcome == FrameOutcome::Done {
+                    return Some(FrameOutcome::Done);
+                }
+            } else {
+                if buffer.is_empty() {
+                    buffer.reserve(SSE_BUFFER_HINT_BYTES);
+                }
+                buffer.extend_from_slice(line);
             }
+            bytes = rest;
         }
-
-        outcome
+        None
     }
 
     /// Frame one newline-delimited line: decode, filter, parse, accumulate.
@@ -1038,6 +1024,39 @@ mod tests {
             buffer.is_empty(),
             "no tail may survive the well-formed frame"
         );
+    }
+
+    #[test]
+    fn oversized_line_suffix_cannot_be_parsed_as_a_new_frame() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        acc.push(&vec![b'x'; MAX_SSE_FRAME_BYTES + 1], &mut buffer);
+        // The next chunk still belongs to the dropped line. Its data-looking
+        // suffix must not be interpreted until the first newline is seen.
+        acc.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"forged\"}}]}\n",
+            &mut buffer,
+        );
+        assert!(acc.content.is_empty());
+        acc.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n",
+            &mut buffer,
+        );
+        assert_eq!(acc.content, "ok");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn oversized_complete_data_line_is_skipped() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let mut chunk = b"data: ".to_vec();
+        chunk.extend(vec![b' '; MAX_SSE_FRAME_BYTES]);
+        chunk.extend_from_slice(b"[DONE]\n");
+        assert_eq!(acc.push(&chunk, &mut buffer), None);
+        assert!(acc.frame_cap_logged);
+        assert!(buffer.is_empty());
+        assert!(!acc.discarding_line);
     }
 
     #[test]
