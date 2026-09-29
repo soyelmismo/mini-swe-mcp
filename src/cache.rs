@@ -4,7 +4,7 @@
 //! cache directories (`kache`, `uv`, `pip`, the Node toolchain and Go), and
 //! turns that into (a) `bubblewrap` bind mounts and (b) child-process
 //! environment variables. The directory layout is computed lazily once per
-//! process and ensured to exist before use. The `OnceLock`-memoized tool probes
+//! process and ensured to exist before use. The memoized tool probes
 //! (`has_kache` / `has_sccache`) answer "is this compiler wrapper installed?"
 //! at most once per process.
 
@@ -108,36 +108,22 @@ pub fn parse_custom_cache_binds(raw: &str) -> Vec<(PathBuf, PathBuf)> {
 
 /// Check if `kache` is available in PATH or standard user binary paths.
 ///
-/// Memoized with a `OnceLock` so the (potentially `fork`+`exec`-bound) probe runs
-/// at most once per process.
+/// Memoized so the (potentially `fork`+`exec`-bound) probe runs at most once
+/// per process.
 pub fn has_kache() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-            && home.join(".local/bin/kache").is_file()
-        {
-            return true;
-        }
-        std::process::Command::new("kache")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && home.join(".local/bin/kache").is_file()
+    {
+        return true;
+    }
+    crate::agent::sandbox::binary_available("kache")
 }
 
 /// Check if `sccache` is available in PATH.
 ///
-/// Memoized with a `OnceLock` so the probe runs at most once per process.
+/// Memoized so the probe runs at most once per process.
 pub fn has_sccache() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::process::Command::new("sccache")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    crate::agent::sandbox::binary_available("sccache")
 }
 
 /// Append bubblewrap arguments for mounting the shared cache root, user tool caches,

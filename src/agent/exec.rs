@@ -31,7 +31,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
@@ -52,8 +52,10 @@ const DEFAULT_HEAVY_TIMEOUT_SECS: u64 = 600;
 /// Default wall-clock budget (seconds) for light commands.
 const DEFAULT_LIGHT_TIMEOUT_SECS: u64 = 120;
 
+/// `nice` flag applied to every child so agent work yields to interactive work.
+const NICE_FLAG: &str = "-n";
 /// `nice` level applied to every child so agent work yields to interactive work.
-const NICE_LEVEL: &str = "-n";
+const NICE_VALUE: &str = "10";
 
 /// Grace period after `SIGTERM` before a timed-out group is escalated to
 /// `SIGKILL`. Long enough to flush buffers, short enough that a wedged build
@@ -124,6 +126,7 @@ impl AgentRunner {
 
         // Classify on the model's own command, before the offline wrapper is
         // applied: `unshare -n -- bash -c ...` would otherwise mask the
+        // command's heaviness from the timeout classifier.
         let timeout_secs = command_timeout_secs(&effective_command);
         let final_command = wrap_network_command(&effective_command, self.network_offline);
 
@@ -137,7 +140,7 @@ impl AgentRunner {
             // No bwrap: the kernel's own LSM, applied in the forked child.
             apply_landlock_pre_exec(&mut cmd, dir, &target_dir);
             cmd.current_dir(dir)
-                .args([NICE_LEVEL, "10", "bash", "-c", &final_command]);
+                .args([NICE_FLAG, NICE_VALUE, "bash", "-c", &final_command]);
         }
 
         // Cleared environment + strict allow-list first, so no ambient
@@ -190,14 +193,7 @@ pub fn wrap_network_command(cmd: &str, offline: bool) -> String {
 /// Cached probe: [`wrap_network_command`] runs once per step, and spawning
 /// `unshare` just to ask would add a fork per step.
 pub fn has_unshare() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::process::Command::new(NETWORK_NAMESPACE_TOOL)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    super::sandbox::binary_available(NETWORK_NAMESPACE_TOOL)
 }
 
 /// Single-quote `value` for `bash -c`.
@@ -333,14 +329,11 @@ fn configure_process(cmd: &mut Command) {
     cmd.stderr(std::process::Stdio::piped());
 }
 
-/// Read-only bind for a toolchain cache directory, if present.
+/// Read-only bind for a toolchain cache directory.
 ///
-/// A missing cache is not an error: `--ro-bind-try` keeps the sandbox startable
-/// on a host that never installed the toolchain.
+/// `--ro-bind-try` tolerates a missing path, so a cache that was never
+/// installed on this host does not prevent the sandbox from starting.
 fn ro_bind_toolchain_cache(cmd: &mut Command, path: &Path) {
-    if !path.exists() {
-        return;
-    }
     let path_str = path.to_string_lossy();
     cmd.args(["--ro-bind-try", &path_str, &path_str]);
 }
@@ -356,8 +349,8 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
     let target_str = target_dir.to_string_lossy();
 
     cmd.args([
-        NICE_LEVEL,
-        "10",
+        NICE_FLAG,
+        NICE_VALUE,
         "bwrap",
         "--die-with-parent",
         "--new-session",
@@ -394,33 +387,37 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
     if let Some(home) = home.as_deref() {
         let home_str = home.to_string_lossy();
         cmd.args(["--tmpfs", &home_str]);
-        for cache_dir in [".cargo", ".rustup", ".local/bin"] {
-            let full = home.join(cache_dir);
-            if full.exists() {
-                let full_str = full.to_string_lossy();
-                cmd.args(["--ro-bind-try", &full_str, &full_str]);
-            }
-        }
         let cache_tmp = home.join(".cache");
         let cache_tmp_str = cache_tmp.to_string_lossy();
         cmd.args(["--tmpfs", &cache_tmp_str]);
     }
 
-    // Expose the shared toolchain homes read-only when they exist. The paths
-    // come from the same resolution the child environment uses
-    // (`env::host_cargo_home`, plus `RUSTUP_HOME`), so the mount and the
-    // forwarded `CARGO_HOME` can never disagree: a directory the sandbox binds
-    // but the environment does not point at would leave cargo with an empty
-    // registry, and one the environment points at but the sandbox does not bind
-    // would simply be missing.
+    // Expose the shared toolchain homes read-only. The paths come from the
+    // same resolution the child environment uses (`env::host_cargo_home`, plus
+    // `RUSTUP_HOME`), so the mount and the forwarded `CARGO_HOME` can never
+    // disagree: a directory the sandbox binds but the environment does not
+    // point at would leave cargo with an empty registry, and one the
+    // environment points at but the sandbox does not bind would simply be
+    // missing. Each distinct path is bound once.
+    let mut toolchain_caches: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home.as_deref() {
+        for cache_dir in [".cargo", ".rustup", ".local/bin"] {
+            toolchain_caches.push(home.join(cache_dir));
+        }
+    }
     if let Some(cargo_home) = super::env::host_cargo_home() {
-        ro_bind_toolchain_cache(cmd, &cargo_home);
+        toolchain_caches.push(cargo_home);
     }
     if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
     {
-        ro_bind_toolchain_cache(cmd, &rustup_home);
+        toolchain_caches.push(rustup_home);
+    }
+    toolchain_caches.sort();
+    toolchain_caches.dedup();
+    for path in toolchain_caches {
+        ro_bind_toolchain_cache(cmd, &path);
     }
 
     // Worktree read-write.
