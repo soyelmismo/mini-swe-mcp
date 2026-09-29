@@ -77,7 +77,11 @@ pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bo
     out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
 
     if entries.is_empty() {
-        out.push_str("No active or recent workers found in /tmp/swe-registry.\n");
+        let reg_path = crate::pool::registry_dir();
+        out.push_str(&format!(
+            "No active or recent workers found in {}.\n",
+            reg_path.display()
+        ));
         out.push_str("Waiting for workers to dispatch... (Press Ctrl+C to exit)\n");
         return out;
     }
