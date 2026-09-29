@@ -51,6 +51,10 @@ impl McpServer {
 
     /// Send a `notifications/progress` frame when the caller supplied both a
     /// token and a channel (i.e. the MCP stdio path).
+    ///
+    /// Unthrottled: every call writes one frame. Callers that can fire rapid
+    /// successive updates should route them through [`ProgressThrottle`] via
+    /// [`Self::emit_progress_throttled`] instead.
     pub(super) async fn emit_progress(
         tx: Option<&mpsc::Sender<String>>,
         token: Option<&Value>,
@@ -73,6 +77,27 @@ impl McpServer {
                 let _ = tx.send(serialized + "\n").await;
             }
         }
+    }
+
+    /// Send a `notifications/progress` frame only when the previous one is at
+    /// least [`PROGRESS_MIN_INTERVAL`] old, dropping (coalescing) updates that
+    /// land inside that window.
+    ///
+    /// The first frame is always allowed so the client observes the work start.
+    /// Terminal notifications deliberately keep using the unthrottled
+    /// [`Self::emit_progress`] so a completion is never swallowed.
+    pub(super) async fn emit_progress_throttled(
+        throttle: &mut ProgressThrottle,
+        tx: Option<&mpsc::Sender<String>>,
+        token: Option<&Value>,
+        progress: usize,
+        total: usize,
+        message: impl std::fmt::Display,
+    ) {
+        if !throttle.should_emit() {
+            return;
+        }
+        Self::emit_progress(tx, token, progress, total, message).await;
     }
 
     /// Map a `tools/call` request to its handler.
@@ -372,5 +397,143 @@ impl McpServer {
             "status": "pruned",
             "message": "Stale worktrees and dead worker branches cleaned up"
         }))
+    }
+}
+
+/// Minimum spacing between two `notifications/progress` frames produced by one
+/// throttled emitter (today: the `await_worker_result` step loop).
+///
+/// A worker can finish several steps in far less than 100 ms, and the stdio
+/// writer emits one frame per notification. Without a floor a fast worker would
+/// flood stdout with a frame per step; frames landing inside the window are
+/// coalesced and the next one past the window carries the then-current step, so
+/// the client still converges on the true progress.
+pub(super) const PROGRESS_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Per-invocation micro-throttle for progress notifications.
+///
+/// Holds the monotonic instant of the last frame actually written. The first
+/// [`Self::should_emit`] returns `true` (priming the stream) and thereafter
+/// allows a frame only once [`PROGRESS_MIN_INTERVAL`] has elapsed. It is an
+/// `Instant` comparison with no allocation, and it is created fresh per
+/// `tools/call` so unrelated requests never throttle each other.
+pub(super) struct ProgressThrottle {
+    last_emit: Option<tokio::time::Instant>,
+}
+
+impl ProgressThrottle {
+    /// A throttle that has not emitted a frame yet.
+    pub(super) fn new() -> Self {
+        Self { last_emit: None }
+    }
+
+    /// Whether a progress frame may be written now, latching the clock.
+    ///
+    /// Side effect: on `true` the internal clock advances to `now`, collapsing a
+    /// burst of ticks inside one interval into a single frame.
+    pub(super) fn should_emit(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        match self.last_emit {
+            Some(prev) if now.duration_since(prev) < PROGRESS_MIN_INTERVAL => false,
+            _ => {
+                self.last_emit = Some(now);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A burst of ticks inside one interval must collapse to a single frame:
+    /// this is the whole point of the throttle (no stdio flooding).
+    #[tokio::test]
+    async fn rapid_ticks_are_coalesced_into_one_frame() {
+        let (tx, mut rx) = mpsc::channel::<String>(64);
+        let token = json!("burst-token");
+        let mut throttle = ProgressThrottle::new();
+
+        // Ten "steps" fired back-to-back, far inside the 100 ms window.
+        for step in 1..=10 {
+            McpServer::emit_progress_throttled(
+                &mut throttle,
+                Some(&tx),
+                Some(&token),
+                step,
+                10,
+                format!("Step {step}"),
+            )
+            .await;
+        }
+
+        // Only the priming frame got through.
+        let emitted = rx.try_recv().expect("the first tick must be emitted");
+        assert!(emitted.contains("notifications/progress"), "got: {emitted}");
+        assert!(rx.try_recv().is_err(), "burst must not flood stdio");
+    }
+
+    /// Once the window elapses, progress must flow again, and the frame carries
+    /// the then-current value so the client still converges.
+    #[tokio::test]
+    async fn progress_resumes_after_the_minimum_interval() {
+        let (tx, mut rx) = mpsc::channel::<String>(64);
+        let token = json!("paced-token");
+        let mut throttle = ProgressThrottle::new();
+
+        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 1, 5, "one")
+            .await;
+        // Inside the window: coalesced.
+        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 2, 5, "two")
+            .await;
+        assert!(rx.try_recv().is_ok(), "first frame must be emitted");
+        assert!(rx.try_recv().is_err(), "in-window frame must be dropped");
+
+        // Past the window: emitted again.
+        tokio::time::sleep(PROGRESS_MIN_INTERVAL + std::time::Duration::from_millis(20)).await;
+        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 3, 5, "three")
+            .await;
+
+        let frame = rx.try_recv().expect("frame after the window must be emitted");
+        assert!(frame.contains(r#""progress":3"#), "got: {frame}");
+        assert!(rx.try_recv().is_err(), "only one frame per window");
+    }
+
+    /// The gate itself: first call passes, the rest inside the window do not.
+    #[tokio::test]
+    async fn should_emit_primes_once_then_gates_the_window() {
+        let mut throttle = ProgressThrottle::new();
+        assert!(throttle.should_emit(), "the first frame must prime the stream");
+        for tick in 0..1000 {
+            assert!(
+                !throttle.should_emit(),
+                "tick {tick} landed inside the window and must be coalesced"
+            );
+        }
+        tokio::time::sleep(PROGRESS_MIN_INTERVAL + std::time::Duration::from_millis(20)).await;
+        assert!(
+            throttle.should_emit(),
+            "after the window a frame must be allowed again"
+        );
+    }
+
+    /// The interval is the documented 100 ms floor.
+    #[test]
+    fn min_interval_is_100ms() {
+        assert_eq!(PROGRESS_MIN_INTERVAL, std::time::Duration::from_millis(100));
+    }
+
+    /// Throttling is best-effort framing, never a tool failure: the channel is
+    /// optional, and a missing token/channel simply emits nothing.
+    #[tokio::test]
+    async fn throttled_emit_is_a_noop_without_a_token_or_channel() {
+        let mut throttle = ProgressThrottle::new();
+        // No channel.
+        McpServer::emit_progress_throttled(&mut throttle, None, Some(&json!("t")), 1, 1, "x").await;
+        // No token.
+        McpServer::emit_progress_throttled(&mut throttle, Some(&mpsc::channel(1).0), None, 1, 1, "x")
+            .await;
     }
 }

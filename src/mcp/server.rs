@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use super::handlers::ProgressThrottle;
 use super::protocol::{JsonRpcRequest, JsonRpcResponse, PreSerializedResult};
 use super::schema::build_tools_list;
 use crate::manifest::ModelManifest;
@@ -216,6 +217,12 @@ impl McpServer {
     /// Progress notifications are emitted only when a `progress_token`/`tx` pair is
     /// supplied (i.e. the MCP stdio path); the plain-CLI path passes `None`, and the
     /// polling algorithm stays identical for both callers.
+    ///
+    /// Per-step progress frames pass through a [`ProgressThrottle`] so a worker that
+    /// ticks many steps in quick succession cannot flood stdio: successive frames are
+    /// at least [`PROGRESS_MIN_INTERVAL`](super::handlers::PROGRESS_MIN_INTERVAL)
+    /// apart. Terminal frames (finished / paused) bypass the throttle and are always
+    /// delivered.
     pub async fn await_worker_result(
         &self,
         wid: &str,
@@ -224,6 +231,7 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
     ) -> Result<Value> {
         let mut last_reported_step = 0;
+        let mut throttle = ProgressThrottle::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             // H-5: poll the lightweight progress snapshot. It never clones the
@@ -238,7 +246,8 @@ impl McpServer {
                     if step > last_reported_step {
                         last_reported_step = step;
                         let last_command = progress.last_command.as_deref().unwrap_or("");
-                        Self::emit_progress(
+                        Self::emit_progress_throttled(
+                            &mut throttle,
                             tx,
                             token,
                             step,
