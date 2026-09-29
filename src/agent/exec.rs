@@ -176,7 +176,10 @@ pub fn wrap_network_command(cmd: &str, offline: bool) -> String {
     if !offline {
         return cmd.to_string();
     }
-    format!("{NETWORK_NAMESPACE_TOOL} -n -- {OFFLINE_SHELL} -c {}", shell_quote(cmd))
+    format!(
+        "{NETWORK_NAMESPACE_TOOL} -n -- {OFFLINE_SHELL} -c {}",
+        shell_quote(cmd)
+    )
 }
 
 /// Whether the network-namespace primitive is usable on this host.
@@ -431,8 +434,14 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
     // Take the pipes out of the child's hands and hand them to reader tasks.
     // The readers keep running independently of the wait, so cancelling the
     // wait on timeout cannot throw away output the command already produced.
-    let stdout = child.stdout.take().context("stdout pipe was not captured")?;
-    let stderr = child.stderr.take().context("stderr pipe was not captured")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("stdout pipe was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("stderr pipe was not captured")?;
     let out_buf = PipeBuffer::spawn(stdout);
     let err_buf = PipeBuffer::spawn(stderr);
 
@@ -443,7 +452,10 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
             // The group is already reaped; the guard must not signal it again.
             group_guard.disarm();
             let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
-            Ok((combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped), status.code()))
+            Ok((
+                combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped),
+                status.code(),
+            ))
         }
         // A `wait` error leaves the child's fate unknown, so the guard is left
         // armed on purpose: killing the group is the only cleanup that cannot
@@ -518,7 +530,8 @@ impl Captured {
         if rest.len() >= TRUNCATE_TAIL {
             // The chunk alone fills the window: keep only its last bytes.
             self.tail.clear();
-            self.tail.extend_from_slice(&rest[rest.len() - TRUNCATE_TAIL..]);
+            self.tail
+                .extend_from_slice(&rest[rest.len() - TRUNCATE_TAIL..]);
             return;
         }
         // Append, then drop the oldest bytes that fell off the front. The
@@ -537,9 +550,7 @@ impl Captured {
     /// single place that decides what the model sees and can account for both
     /// streams' elisions in one marker.
     ///
-    /// Borrows rather than consumes: a drain abandoned at [`DRAIN_GRACE_MS`]
-    /// leaves its reader task holding the same `Arc`, so the buffer must stay
-    /// valid after this returns.
+    /// Borrows rather than consumes so the caller can snapshot a partial drain.
     fn captured(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
@@ -571,6 +582,14 @@ impl Captured {
 struct PipeBuffer {
     bytes: Arc<Mutex<Captured>>,
     reader: tokio::task::JoinHandle<()>,
+}
+
+// A cancelled command must not leave detached readers holding pipe descriptors
+// indefinitely (a child can escape the process group with `setsid`).
+impl Drop for PipeBuffer {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// One drained pipe: the bytes worth showing, plus how many were elided.
@@ -615,20 +634,21 @@ impl PipeBuffer {
     ///
     /// Bounded by [`DRAIN_GRACE_MS`] because a grandchild that inherited the
     /// write end can hold the pipe open long after its parent was killed; the
-    /// reader is then abandoned and the bytes captured up to that point
+    /// reader is then cancelled and the bytes captured up to that point
     /// returned.
-    async fn finish(self) -> Stream {
-        if tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS), self.reader)
+    async fn finish(mut self) -> Stream {
+        if tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS), &mut self.reader)
             .await
             .is_err()
         {
-            // Still blocked on a pipe somebody else holds open. Dropping the
-            // handle detaches the reader, and the `Arc` keeps the buffer alive
-            // until the runtime reaps the task when that pipe finally closes.
+            // The pipe is held open outside our process group. Cancel the
+            // reader so its pipe descriptor and task cannot accumulate across
+            // repeated timed-out commands.
             tracing::debug!(
                 timeout_ms = DRAIN_GRACE_MS,
                 "abandoning output drain of a timed-out command"
             );
+            self.reader.abort();
         }
 
         let guard = match self.bytes.lock() {
@@ -642,29 +662,28 @@ impl PipeBuffer {
     }
 }
 
-/// `SIGTERM` the child's process group, then `SIGKILL` it if it is still alive
-/// after [`TERM_GRACE_MS`].
+/// `SIGTERM` the child's process group, then `SIGKILL` any remaining members
+/// after the leader exits or [`TERM_GRACE_MS`] elapses.
 ///
 /// Best-effort at every step: the group may already be gone (the sandbox
-/// wrapper carries `--die-with-parent` and takes its children with it), and a
-/// group that stops promptly on the `SIGTERM` is never escalated.
+/// wrapper carries `--die-with-parent` and takes its children with it).
 async fn terminate_process_group(pid: Option<u32>, child: &mut Child) {
     signal_process_group(pid, libc::SIGTERM);
 
-    // Reap with a bounded wait so a well-behaved child can exit on its own and
-    // close its pipes; the deadline stops a wedged child from extending the
-    // budget by an unbounded amount.
-    if tokio::time::timeout(Duration::from_millis(TERM_GRACE_MS), child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
+    // Reap with a bounded wait so a well-behaved child can exit on its own;
+    // the deadline stops a wedged child from extending the budget indefinitely.
+    let reaped = matches!(
+        tokio::time::timeout(Duration::from_millis(TERM_GRACE_MS), child.wait()).await,
+        Ok(Ok(_))
+    );
 
+    // Reaping the leader does not imply its children stopped: a shell can
+    // terminate on SIGTERM while a child ignores it. Kill any remaining group
+    // members before returning from the timeout path.
     signal_process_group(pid, libc::SIGKILL);
-    // Reap again after the kill, still bounded: `SIGKILL` is uncatchable, so a
-    // child surviving this long is not ours to wait on any further.
-    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
+    if !reaped {
+        let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
+    }
 }
 
 /// Send `sig` to the process group led by `pid`.
@@ -778,21 +797,27 @@ fn combine_streams(stdout: &[u8], stderr: &[u8], dropped: usize) -> String {
     if dropped == 0 {
         return truncate_output(&combined);
     }
-    // The elided bytes sit between the head and the tail of each stream, so the
-    // combined head/tail this builds is already what the marker would retain.
-    // Re-add the elision as a marker in the middle and stop there: the result is
-    // within budget by construction, so no second truncation can run.
+    // The retained portions can themselves exceed the *shared* budget when
+    // both pipes are chatty. Cut the combined, already-bounded text once more
+    // and include those additional bytes in the reported elision count.
+    let head_end = combined.floor_char_boundary(TRUNCATE_HEAD.min(combined.len()));
+    let tail_start = combined.ceil_char_boundary(combined.len().saturating_sub(TRUNCATE_TAIL));
+    let tail_start = tail_start.max(head_end);
+    let dropped = dropped.saturating_add(combined.len() - head_end - (combined.len() - tail_start));
     let mut out = String::with_capacity(
-        combined.len() + TRUNCATE_MARKER_LEN + USIZE_MAX_DIGITS + TRUNCATE_MARKER_SUFFIX_LEN,
+        head_end
+            + TRUNCATE_MARKER_LEN
+            + USIZE_MAX_DIGITS
+            + TRUNCATE_MARKER_SUFFIX_LEN
+            + combined.len()
+            - tail_start,
     );
-    out.push_str(&combined);
+    out.push_str(&combined[..head_end]);
     out.push_str(TRUNCATE_MARKER);
-    // `write!` into the pre-sized buffer rather than `to_string`: the buffer
-    // was sized for exactly `USIZE_MAX_DIGITS` digits, so the count costs no
-    // allocation -- the same trick `truncate_output` uses for its own marker.
     use std::fmt::Write as _;
     write!(out, "{dropped}").expect("writing digits into a String cannot fail");
     out.push_str(TRUNCATE_MARKER_SUFFIX);
+    out.push_str(&combined[tail_start..]);
     out
 }
 
@@ -843,7 +868,10 @@ mod tests {
         assert!(inner.starts_with('\'') && inner.ends_with('\''), "{inner}");
         // The escaped-quote dance keeps the outer quoting balanced.
         assert!(inner.contains("'\\''"), "{inner}");
-        assert!(inner.contains("$HOME"), "no expansion happens at wrap time: {inner}");
+        assert!(
+            inner.contains("$HOME"),
+            "no expansion happens at wrap time: {inner}"
+        );
     }
 
     /// The end-to-end contract from the hardening plan: with the policy on, a
@@ -1021,6 +1049,7 @@ mod tests {
                     || out.contains("Permiso denegado"),
                 "unexpected touch output: {out:?}, code: {code:?}"
             );
+            self.reader.abort();
         }
 
         let target_dir = crate::worktree::swe_base_dir().join(format!(
@@ -1075,11 +1104,14 @@ mod tests {
         );
         // It only went down because of the SIGKILL: it was still running when
         // the SIGTERM was sent, so nothing else could have reaped it.
-        assert!(!group_is_alive(pid), "the SIGKILL escalation must reap the group");
+        assert!(
+            !group_is_alive(pid),
+            "the SIGKILL escalation must reap the group"
+        );
     }
 
-    /// A child that stops on `SIGTERM` is never escalated: it exits inside the
-    /// grace period, so the call returns long before the `SIGKILL` deadline.
+    /// A child that stops on `SIGTERM` exits inside the grace period, so the
+    /// call returns long before the `SIGKILL` deadline.
     #[tokio::test]
     async fn terminate_does_not_escalate_a_child_that_obeys_sigterm() {
         let mut cmd = Command::new("bash");
@@ -1184,6 +1216,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncated_output_keeps_the_final_tail_and_reports_total_elision() {
+        let mut stdout = Captured::new();
+        stdout.push(&[b'a'; 100_000]);
+        let out = combine_streams(&stdout.captured(), b"", stdout.dropped());
+        assert!(out.starts_with(&"a".repeat(TRUNCATE_HEAD)));
+        assert!(out.ends_with(&"a".repeat(TRUNCATE_TAIL)));
+        assert!(out.contains(&format!("... [Truncated {} bytes] ...", stdout.dropped())));
+        let mut stderr = Captured::new();
+        stderr.push(&[b'b'; 100_000]);
+        let out = combine_streams(
+            &stdout.captured(),
+            &stderr.captured(),
+            stdout.dropped() + stderr.dropped(),
+        );
+        let omitted = 200_000 + 1 - TRUNCATE_HEAD - TRUNCATE_TAIL;
+        assert!(out.contains(&format!("... [Truncated {omitted} bytes] ...")));
+        assert!(out.starts_with(&"a".repeat(TRUNCATE_HEAD)));
+        assert!(out.ends_with(&"b".repeat(TRUNCATE_TAIL)));
+        assert!(out.len() < TRUNCATE_LIMIT_FOR_TEST + 100);
+    }
+
     /// Output that fits the budget is untouched -- no marker, no accounting.
     #[test]
     fn small_output_is_captured_whole() {
@@ -1243,41 +1297,34 @@ mod tests {
         let dir = crate::worktree::swe_base_dir().join("exec-cancel-test");
         let _ = std::fs::create_dir_all(&dir);
         let pid_file = dir.join("grandchild.pid");
-
         let mut cmd = Command::new("bash");
-        // A shell that spawns a child in the same process group and then waits,
-        // so the group is alive exactly as long as the shell is.
         cmd.args([
             "-c",
-            &format!("sleep 300 & echo $! > {pid_file}; wait"),
+            &format!("sleep 300 & echo $! > {}; wait", pid_file.display()),
         ]);
         configure_process(&mut cmd);
         cmd.current_dir(&dir);
-        let mut child = cmd.spawn().expect("bash must spawn");
-        let pid = child.id().expect("a spawned child has a pid");
-
-        // Give the shell time to record its child's pid.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let grandchild: u32 = std::fs::read_to_string(&pid_file)
-            .expect("the shell must have recorded its child pid")
-            .trim()
-            .parse()
-            .expect("a numeric pid");
+        let task = tokio::spawn(async move { run_with_timeout(&mut cmd, 300).await });
+        let grandchild = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    break pid.trim().parse::<u32>().expect("numeric pid");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shell must have recorded its child pid");
         assert!(
             group_is_alive(grandchild),
-            "the grandchild must be running before the drop"
+            "grandchild must start before cancellation"
         );
-
-        // This is the cancellation: the owner of the `Child` goes away without
-        // ever calling `wait`, exactly as `pool::kill`'s `handle.abort()` does.
-        drop(child);
-
-        // The guard fires on drop; give the SIGKILL a moment to land.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             !group_is_alive(grandchild),
-            "dropping the child must kill its whole process group, not just the \
-             leader: grandchild {grandchild} of group {pid} survived"
+            "cancelled command left grandchild {grandchild} running"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1301,7 +1348,6 @@ mod tests {
         let mut guard = ProcessGroupGuard::new(pid);
         guard.disarm();
         drop(guard);
-        drop(child);
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -1311,7 +1357,7 @@ mod tests {
 
         // Clean up: now the group really is signalled.
         signal_process_group(Some(pid), libc::SIGKILL);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = child.wait().await;
     }
 
     /// The timeout path must not discard what the command had already printed:
@@ -1333,7 +1379,11 @@ mod tests {
 
         unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
 
-        assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "a timeout reports 124: {out:?}");
+        assert_eq!(
+            code,
+            Some(TIMEOUT_EXIT_CODE),
+            "a timeout reports 124: {out:?}"
+        );
         assert!(
             out.contains("EARLY-STDOUT"),
             "stdout written before the timeout must survive the kill: {out:?}"
@@ -1440,6 +1490,7 @@ mod tests {
                 !out.contains("leaked-must-not-appear"),
                 "{var} leaked into the child environment: {out:?}"
             );
+            self.reader.abort();
         }
         assert!(
             !out.contains("/tmp/agent.sock"),
