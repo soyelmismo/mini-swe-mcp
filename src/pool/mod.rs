@@ -8,6 +8,8 @@
 //! * [`state`] — worker lifecycle state, the in-memory record, progress views
 //!   and the terminal-record TTL.
 //! * [`registry`] — the on-disk JSON registry shared across processes.
+//! * [`steer`] — the disk-backed steering mailbox, the cross-process delivery
+//!   path for orchestrator guidance.
 //! * [`runner`] — the agent execution loop and the orchestrator sentinels.
 //! * [`clock`] — the shared wall-clock helper.
 //!
@@ -29,6 +31,7 @@ mod clock;
 mod registry;
 mod runner;
 mod state;
+mod steer;
 
 pub use self::buffer::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, EmittedLogs, LogBuffer,
@@ -44,12 +47,14 @@ pub use self::registry::{
 pub use self::runner::{
     WorkerLaunchConfig, parse_ask_orchestrator, parse_request_turns, summarize_command,
 };
+pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerPhase, WorkerProgress, WorkerRecord,
     WorkerState,
 };
 
 use self::state::expired_terminal_ids;
+
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -435,21 +440,20 @@ impl WorkerPool {
 
     /// Deliver an orchestrator message to a worker.
     ///
-    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
-    /// held and the guard is dropped *before* the `send().await` is performed:
-    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
-    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
-    /// read). A missing sender is now reported instead of silently dropping the
-    /// guidance.
-    /// Deliver an orchestrator message to a worker.
+    /// Two delivery paths, tried in order:
     ///
-    /// The `resume_tx` sender is extracted with `take()` while the write-guard is
-    /// held and the guard is dropped *before* the `send().await` is performed:
-    /// awaiting a full `mpsc` channel while holding a write-guard serialises the
-    /// whole pool (`dispatch`, `kill`, `collect`, every state update and every
-    /// read). A missing sender is now reported instead of silently dropping the
-    /// guidance.
-    /// Deliver an orchestrator message to a worker.
+    /// 1. **In-process.** The worker lives in this process' pool: a `Running`
+    ///    worker queues the message on `pending_steer` for its next turn, and a
+    ///    `Paused` one is handed to its resume channel.
+    /// 2. **Cross-process mailbox.** The worker is not in this pool — it is
+    ///    owned by a *different* `mini-swe-mcp` process, which is the normal
+    ///    case for `dispatch … --wait` steered from a second terminal. The
+    ///    message is appended atomically to the worker's
+    ///    [`steer`] mailbox, which the owning process drains on every step.
+    ///
+    /// The second path is what turns `steer` from an in-memory-only feature
+    /// into a real IPC one; the first is kept because it delivers immediately
+    /// and lets a paused worker resume mid-step rather than at the next one.
     ///
     /// The `resume_tx` sender is extracted with `take()` while the write-guard is
     /// held and the guard is dropped *before* the `send().await` is performed:
@@ -460,9 +464,22 @@ impl WorkerPool {
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
         let tx_opt = {
             let mut lock = self.workers.write().await;
-            let w = lock
-                .get_mut(id)
-                .ok_or_else(|| anyhow::anyhow!("Worker not found: {id}"))?;
+            let Some(w) = lock.get_mut(id) else {
+                // Not ours: queue the guidance in the worker's on-disk
+                // mailbox so the process that owns it picks it up. The guard is
+                // released before the write, and the write is a blocking
+                // `std::fs` call, so it must happen outside the lock.
+                drop(lock);
+                let path = write_steer_message(id, &message).map_err(|e| {
+                    anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
+                })?;
+                info!(
+                    worker = %id,
+                    path = %path.display(),
+                    "Worker not in this process; steering message queued to mailbox"
+                );
+                return Ok(());
+            };
             match &w.state {
                 WorkerState::Running { .. } => {
                     w.pending_steer.push(message);

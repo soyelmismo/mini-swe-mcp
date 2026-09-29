@@ -113,6 +113,22 @@ Workers communicate status and request human/orchestrator intervention via shell
   - The worker transitions into `WorkerState::Paused { question, step, paused_at }`.
   - A tokio one-shot/MPSC channel pauses the task until the orchestrator calls the MCP `steer` action, passing guidance that resumes the worker seamlessly.
 
+- **Cross-Process Steering (`steer` from another terminal)**:
+  - The in-memory `pending_steer` queue and the resume channel only exist in the
+    process that owns the worker, so a `steer` issued from a different shell used
+    to fail with `Worker not found`.
+  - `steer` therefore has a second delivery path: the message is appended
+    atomically to the worker's mailbox, `<base>/swe-wt-<id>.steer` (`<base>` is
+    `swe_base_dir()`, i.e. `/var/tmp` or `$SWE_TEMP_DIR`).
+  - The mailbox is JSON lines (`{message, sent_at, pid}` per line), so a
+    multi-line message cannot be split into bogus ones. Appends are single
+    `O_APPEND` writes of a `\n`-terminated payload; drains claim the file with
+    an atomic `rename` before reading, so the implementation loop and the review
+    loop can never both deliver the same message.
+  - Both loops drain the mailbox once per turn and append the messages as
+    `ORCHESTRATOR GUIDANCE`. The worker deletes the mailbox on exit, so a
+    finished worker leaves nothing behind for a later worker reusing the id.
+
 ---
 
 ## 5. Persistent Role Memory
