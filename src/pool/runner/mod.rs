@@ -14,29 +14,30 @@
 //!   plus the bounded command label.
 //! * [`review`] — the independent multi-phase review auditor that runs after
 //!   the implementation loop finishes.
+//! * [`turn`] — the unified turn engine shared by both loops.
 //!
 //! What stays here is only the implementer's turn loop, so that the sequence
 //! "steer → warn → LLM step → bash → sentinel → record → next turn" is
 //! readable end to end in one place.
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
-use super::buffer::build_step_log;
-use super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
+use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
-use super::steer::{drain_steer_messages, remove_steer_file};
+use super::steer::remove_steer_file;
 use super::{WorkerPool, unix_timestamp};
-use self::pause::PauseRequest;
 use self::review::ReviewPhase;
+use self::turn::{LlmErrorPolicy, TurnConfig, TurnEngine, TurnOutcome};
 
 mod pause;
 mod review;
 mod sentinels;
+mod turn;
 
 pub use self::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
@@ -152,324 +153,49 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let started_at_ts = unix_timestamp();
 
+        let meta = WorkerMeta {
+            id: worker_id.clone(),
+            task: task.clone(),
+            group: Some(group.clone()),
+            repo_path: Some(repo_path_str.clone()),
+            started_at: started_at_ts,
+            pid: std::process::id(),
+        };
+
         while step < current_max_turns {
             step += 1;
-
-            // Inject any steering instructions queued by the orchestrator.
-            //
-            // Two sources, both drained here: the in-memory `pending_steer`
-            // (guidance from a `steer` handled by *this* process) and the
-            // on-disk mailbox (guidance from another process). The mailbox is
-            // polled once per turn so a cross-process `steer` lands on the next
-            // step, exactly like the local one.
-            let mut steer_msgs = self.take_pending_steer(&worker_id).await;
-            let remote = drain_steer_messages(&worker_id);
-            if !remote.is_empty() {
-                info!(
-                    worker = %worker_id,
-                    count = remote.len(),
-                    "Drained cross-process steering messages from mailbox"
-                );
-                steer_msgs.extend(remote);
-            }
-
-            for msg in steer_msgs {
-                info!(worker = %worker_id, "Injected steering message into subagent turn");
-                messages.push(ChatMessage::text(
-                    Role::User,
-                    format!("STEER / ORCHESTRATOR GUIDANCE:\n{}", msg),
-                ));
-            }
-
-            // Proactive turn warning when approaching limit (at 5 and 2 turns remaining)
-            let remaining = current_max_turns.saturating_sub(step);
-            if remaining == 5 || remaining == 2 {
-                info!(worker = %worker_id, step, current_max_turns, "Injecting proactive turn limit warning");
-                messages.push(ChatMessage::text(
-                    Role::User,
-                    format!(
-                        "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
-                        step, current_max_turns, remaining
-                    ),
-                ));
-            }
-
-            // 1. Run LLM step with automatic pause and checkpoint on network/API failure
-            let mut llm_resp = match runner.run_step_llm(&messages).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    // Safe checkpoint of uncommitted worktree changes so work is never lost
-                    let _ = worktree.commit_changes(&format!(
-                        "worker({}): checkpoint step {} before pause (error: {})",
-                        worker_id, step, e
-                    ));
-
-                    warn!(
-                        worker = %worker_id,
-                        step,
-                        error = %e,
-                        "LLM step failed after retries; pausing worker for orchestrator resume"
-                    );
-
-                    let question = format!(
-                        "LLM API error (step {}): {}. Send steer/resume to retry.",
-                        step, e
-                    );
-                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                    let now = unix_timestamp();
-                    {
-                        let mut lock = self.workers.write().await;
-                        if let Some(w) = lock.get_mut(&worker_id) {
-                            w.state = WorkerState::Paused {
-                                question: question.clone(),
-                                step,
-                                paused_at: now,
-                            };
-                            w.resume_tx = Some(tx);
-                        }
-                    }
-
-                    save_registry_entry(&WorkerRegistryEntry {
-                        id: worker_id.clone(),
-                        pid: std::process::id(),
-                        task: task.clone(),
-                        model: model.clone(),
-                        status: RegistryStatus::Paused,
-                        step,
-                        max_turns: current_max_turns,
-                        last_command: format!("paused_on_error: {e}"),
-                        question: Some(question.clone()),
-                        started_at: started_at_ts,
-                        updated_at: now,
-                        group: Some(group.clone()),
-                        repo_path: Some(repo_path_str.clone()),
-                    });
-
-                    // Wait for orchestrator resume via steer
-                    if let Some(resume_msg) = rx.recv().await {
-                        info!(worker = %worker_id, msg = %resume_msg, "Worker resumed after error by orchestrator");
-                        {
-                            let mut lock = self.workers.write().await;
-                            if let Some(w) = lock.get_mut(&worker_id) {
-                                w.state = WorkerState::Running {
-                                    step,
-                                    last_command: format!("resumed: {}", summarize_command(&resume_msg)),
-                                    started_at: unix_timestamp(),
-                                };
-                                w.resume_tx = None;
-                            }
-                        }
-                        if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
-                            messages.push(ChatMessage::text(
-                                Role::User,
-                                format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
-                            ));
-                        }
-                        // Re-run the LLM step now that network/connectivity is restored
-                        runner.run_step_llm(&messages).await?
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-
-            if llm_resp.command.is_none() {
-                info!(
-                    worker = %worker_id,
-                    "No command found (tool_calls or code block); discarding and silently retrying once without warning"
-                );
-                if let Ok(retry_resp) = runner.run_step_llm(&messages).await
-                    && retry_resp.command.is_some()
-                {
-                    llm_resp = retry_resp;
-                }
-            }
-
-            let cmd_str = match llm_resp.command {
-                Some(ref cmd) if is_completion_request(cmd) => {
-                    info!(worker = %worker_id, step = step, "Worker requested completion");
-                    if !llm_resp.content.trim().is_empty() {
-                        last_assistant_text = llm_resp.content.clone();
-                    }
-                    break;
-                }
-                Some(ref cmd) => {
-                    consecutive_no_cmd = 0;
-                    if !llm_resp.content.trim().is_empty() {
-                        last_assistant_text = llm_resp.content.clone();
-                    }
-                    cmd.clone()
-                }
-                None => {
-                    info!(worker = %worker_id, step = step, "No bash command in response; prompting subagent directly");
-                    messages.push(
-                        ChatMessage::text(
-                            Role::Assistant,
-                            if llm_resp.content.trim().is_empty() {
-                                "I will execute a bash command.".into()
-                            } else {
-                                llm_resp.content
-                            },
-                        )
-                        .with_reasoning_content(llm_resp.reasoning_content),
-                    );
-                    messages.push(ChatMessage::text(
-                        Role::User,
-                        "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
-                    ));
-                    if consecutive_no_cmd < 2 {
-                        consecutive_no_cmd += 1;
-                        step = step.saturating_sub(1);
-                    }
-                    continue;
-                }
-            };
-
-            let cmd_summary = summarize_command(&cmd_str);
-
-            // Update running state
-            {
-                let mut lock = self.workers.write().await;
-                if let Some(w) = lock.get_mut(&worker_id)
-                    && let WorkerState::Running {
-                        step: ref mut s,
-                        ref mut last_command,
-                        ..
-                    } = w.state
-                {
-                    *s = step;
-                    *last_command = cmd_summary.clone();
-                }
-            }
-
-            save_registry_entry(&WorkerRegistryEntry {
-                id: worker_id.clone(),
-                pid: std::process::id(),
-                task: task.clone(),
-                model: model.clone(),
+            let max_turns_for_config = current_max_turns;
+            let turn_config = TurnConfig {
+                label_prefix: "",
+                steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
+                apply_sentinels: true,
+                llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
                 status: RegistryStatus::Running,
-                step,
-                max_turns: current_max_turns,
-                last_command: cmd_summary.clone(),
-                question: None,
-                started_at: started_at_ts,
-                updated_at: unix_timestamp(),
-                group: Some(group.clone()),
-                repo_path: Some(repo_path_str.clone()),
-            });
-
-            info!(worker = %worker_id, step = step, op = %cmd_summary, "Subagent step");
-
-            let (output, code) = {
-                let is_heavy = crate::agent::is_heavy_command(&cmd_str);
-                let _build_permit = if is_heavy {
-                    Some(
-                        self.build_semaphore
-                            .acquire()
-                            .await
-                            .context("Build semaphore closed")?,
-                    )
-                } else {
-                    None
-                };
-                let _bash_permit = self
-                    .bash_semaphore
-                    .acquire()
-                    .await
-                    .context("Bash semaphore closed")?;
-                runner.execute_bash(&worktree.path, &cmd_str).await?
+                model: &model,
+                max_turns: max_turns_for_config,
             };
-
-            // 2. Check for REQUEST_TURNS sentinel in the command itself
-            if let Some(additional) = parse_request_turns(&cmd_str) {
-                let old_max = current_max_turns;
-                current_max_turns = (current_max_turns + additional).max(current_max_turns).min(500);
-                info!(
-                    worker = %worker_id,
-                    requested = additional,
-                    old_max,
-                    new_max = current_max_turns,
-                    "Subagent requested turn extension; granted"
-                );
-            }
-
-            // 3. Check for ASK_ORCHESTRATOR sentinel in the command itself
-            if let Some(question) = parse_ask_orchestrator(&cmd_str) {
-                let answer = self
-                    .pause_for_orchestrator(PauseRequest {
-                        worker_id: &worker_id,
-                        question: &question,
-                        step,
-                        max_turns: current_max_turns,
-                        last_command: &cmd_summary,
-                        task: &task,
-                        model: &model,
-                        group: &group,
-                        repo_path_str: &repo_path_str,
-                        started_at_ts,
-                    })
-                    .await?;
-
-                if let Some(answer) = answer {
-                    messages.push(ChatMessage::text(
-                        Role::User,
-                        format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
-                    ));
-                }
-            }
-
-            if llm_resp.invalid_utf8_lines > 0 {
-                info!(
-                    worker = %worker_id,
-                    step = step,
-                    invalid_utf8_lines = llm_resp.invalid_utf8_lines,
-                    "LLM stream contained non-UTF-8 frames; decoded lossily"
-                );
-            }
-
-            let output_text = format!(
-                "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
-                code.unwrap_or(-1),
-                output
-            );
-
-            // The log entry is built *after* `output_text` so `output` is moved
-            // rather than cloned (audit 07, F3), and both text fields are
-            // clamped to a hard ceiling (audit 07, F6).
-            let step_log = build_step_log(step, &cmd_summary, output, code);
-
-            {
-                let mut lock = self.workers.write().await;
-                if let Some(w) = lock.get_mut(&worker_id) {
-                    w.logs.push(step_log);
-                }
-            }
-
-            if let (Some(tool_calls), Some(tc_id)) = (llm_resp.tool_calls, llm_resp.tool_call_id) {
-                // OpenAI tool_calls protocol: assistant with tool_calls → tool response
-                let content = if llm_resp.content.trim().is_empty() {
-                    None
-                } else {
-                    Some(llm_resp.content)
-                };
-                let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
-                    .with_reasoning_content(llm_resp.reasoning_content);
-                messages.push(msg);
-                messages.push(ChatMessage::tool_result(tc_id, &output_text));
-            } else {
-                // Fallback: code-block models use plain assistant + user messages
-                let assistant_content = if llm_resp.content.trim().is_empty() {
-                    "I will execute a bash command.".to_string()
-                } else {
-                    llm_resp.content
-                };
-                let msg = ChatMessage::text(Role::Assistant, assistant_content)
-                    .with_reasoning_content(llm_resp.reasoning_content);
-                messages.push(msg);
-                messages.push(ChatMessage::text(Role::User, output_text));
+            let mut engine = TurnEngine {
+                pool: self,
+                worktree: &mut worktree,
+                runner: &runner,
+                worker_id: &worker_id,
+                task: &task,
+                group: &group,
+                repo_path_str: &repo_path_str,
+                started_at_ts,
+                meta: &meta,
+                messages: &mut messages,
+                step: &mut step,
+                current_max_turns: &mut current_max_turns,
+                last_assistant_text: &mut last_assistant_text,
+                consecutive_no_cmd: &mut consecutive_no_cmd,
+            };
+            match engine.run_turn(&turn_config).await? {
+                TurnOutcome::Completed => break,
+                TurnOutcome::Continue | TurnOutcome::NoCommand => {}
+                TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
             }
         }
-
 
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
@@ -564,21 +290,14 @@ impl WorkerPool {
             }
         }
 
-        save_registry_entry(&WorkerRegistryEntry {
-            id: worker_id.clone(),
-            pid: std::process::id(),
-            task: task.clone(),
-            model: model.clone(),
-            status: RegistryStatus::Completed,
+        meta.save_status(
+            &model,
+            RegistryStatus::Completed,
             step,
-            max_turns: current_max_turns,
-            last_command: "completed".into(),
-            question: None,
-            started_at: started_at_ts,
-            updated_at: now,
-            group: Some(group.clone()),
-            repo_path: Some(repo_path_str.clone()),
-        });
+            current_max_turns,
+            "completed",
+            None,
+        );
 
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())

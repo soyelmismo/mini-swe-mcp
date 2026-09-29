@@ -12,7 +12,7 @@
 //! reviewer's context never mixes with the implementer's.
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::info;
 
 use std::path::Path;
 
@@ -20,13 +20,9 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
-use super::sentinels::{is_completion_request, summarize_command};
 use super::super::WorkerPool;
-use super::super::buffer::build_step_log;
-use super::super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
-use super::super::state::WorkerState;
-use super::super::steer::drain_steer_messages;
-use super::super::unix_timestamp;
+use super::super::registry::{RegistryStatus, WorkerMeta};
+use super::turn::{LlmErrorPolicy, TurnConfig, TurnEngine, TurnOutcome};
 
 /// Everything the review phase needs, and the step counter it hands back.
 ///
@@ -84,209 +80,124 @@ impl WorkerPool {
             network_offline,
         } = review;
 
-    info!(
-        worker = %worker_id,
-        reviewer = %reviewer_model,
-        "Implementation finished; starting multi-phase review pipeline"
-    );
-
-    // Checkpoint phase 1 implementation changes in git
-    let _ = worktree.commit_changes(&format!(
-        "worker({}): implementation phase completed (checkpoint)",
-        worker_id
-    ));
-
-    let review_prompt = format!(
-        "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
-        YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
-        1. Inspect changes: run `git status`, `git diff HEAD~1` (or `git log -1 -p`).\n\
-        2. Run test suites and static checks (e.g. `cargo clippy --all-targets -- -D warnings`, `cargo test`, linters).\n\
-        3. Fix any regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
-        4. When verified and 100% clean, execute:\n\
-           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
-        task
-    );
-
-    let reviewer_runner = AgentRunner::new(
-        self.api_base.clone(),
-        self.api_key.clone(),
-        reviewer_model.clone(),
-        temperature,
-    )
-    .with_network_offline(network_offline);
-
-    let manifest = ModelManifest::load();
-    let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
-
-    // The reviewer gets *its own* role memory, keyed by the reviewer alias, so
-    // review lessons never bleed into the implementer's prompt (and vice versa).
-    // `reviewer_model` may already be a resolved id (`combo:nerd`), so it is
-    // mapped back to its alias first; an unknown id passes through unchanged and
-    // simply finds no memory file.
-    let reviewer_alias = manifest.alias_for_model(&reviewer_model);
-    let mut review_messages = vec![
-        ChatMessage::text(
-            Role::System,
-            build_system_prompt(Path::new(&repo_path_str), &reviewer_alias),
-        ),
-        ChatMessage::text(Role::User, review_prompt),
-    ];
-    let review_max_turns = if max_turns > 0 {
-        max_turns
-    } else {
-        reviewer_manifest_turns.unwrap_or(current_max_turns)
-    };
-
-    save_registry_entry(&WorkerRegistryEntry {
-        id: worker_id.clone(),
-        pid: std::process::id(),
-        task: task.clone(),
-        model: reviewer_model.clone(),
-        status: RegistryStatus::Reviewing,
-        step,
-        max_turns: current_max_turns + review_max_turns,
-        last_command: "starting review phase".into(),
-        question: None,
-        started_at: started_at_ts,
-        updated_at: unix_timestamp(),
-        group: Some(group.clone()),
-        repo_path: Some(repo_path_str.clone()),
-    });
-
-    let mut review_step = 0;
-
-    while review_step < review_max_turns {
-        review_step += 1;
-        step += 1;
-
-        // Same two sources as the implementation loop: the in-memory queue for
-        // a `steer` handled by this process, and the on-disk mailbox for a
-        // `steer` from another one. The mailbox is polled once per reviewer
-        // turn, and its claim-by-rename means a message delivered during the
-        // implementation phase is never re-read here.
-        let mut steer_msgs = self.take_pending_steer(&worker_id).await;
-        let remote = drain_steer_messages(&worker_id);
-        if !remote.is_empty() {
-            info!(
-                worker = %worker_id,
-                count = remote.len(),
-                "Drained cross-process steering messages from mailbox (review)"
-            );
-            steer_msgs.extend(remote);
-        }
-        for msg in steer_msgs {
-            review_messages.push(ChatMessage::text(
-                Role::User,
-                format!("ORCHESTRATOR GUIDANCE:\n{}", msg),
-            ));
-        }
-
-        let mut llm_resp = match reviewer_runner.run_step_llm(&review_messages).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!(
-                    worker = %worker_id,
-                    step,
-                    error = %e,
-                    "Reviewer LLM step failed; completing review phase"
-                );
-                return Ok(step);
-            }
-        };
-
-        if llm_resp.command.is_none()
-            && let Ok(retry_resp) = reviewer_runner.run_step_llm(&review_messages).await
-            && retry_resp.command.is_some()
-        {
-            llm_resp = retry_resp;
-        }
-
-        let cmd_str = match llm_resp.command {
-            Some(ref cmd) if is_completion_request(cmd) => {
-                info!(
-                    worker = %worker_id,
-                    step = review_step,
-                    "Reviewer completed and approved changes"
-                );
-                return Ok(step);
-            }
-            Some(ref cmd) => cmd.clone(),
-            None => {
-                review_messages.push(ChatMessage::text(
-                    Role::User,
-                    "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
-                ));
-                continue;
-            }
-        };
-
-        let cmd_summary = summarize_command(&cmd_str);
-        let now = unix_timestamp();
-
-        {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                w.state = WorkerState::Running {
-                    step,
-                    last_command: format!("[review] {}", cmd_summary),
-                    started_at: now,
-                };
-            }
-        }
-
-        save_registry_entry(&WorkerRegistryEntry {
-            id: worker_id.clone(),
-            pid: std::process::id(),
-            task: task.clone(),
-            model: reviewer_model.clone(),
-            status: RegistryStatus::Reviewing,
-            step,
-            max_turns: current_max_turns + review_max_turns,
-            last_command: format!("[review] {}", cmd_summary),
-            question: None,
-            started_at: started_at_ts,
-            updated_at: now,
-            group: Some(group.clone()),
-            repo_path: Some(repo_path_str.clone()),
-        });
-
-        let (output, code) = reviewer_runner.execute_bash(&worktree.path, &cmd_str).await?;
-        let output_text = format!(
-            "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
-            code.unwrap_or(-1),
-            output
+        info!(
+            worker = %worker_id,
+            reviewer = %reviewer_model,
+            "Implementation finished; starting multi-phase review pipeline"
         );
 
-        let step_log = build_step_log(step, &format!("[review] {}", cmd_summary), output, code);
-        {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                w.logs.push(step_log);
+        // Checkpoint phase 1 implementation changes in git
+        let _ = worktree.commit_changes(&format!(
+            "worker({}): implementation phase completed (checkpoint)",
+            worker_id
+        ));
+
+        let review_prompt = format!(
+            "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
+            YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
+            1. Inspect changes: run `git status`, `git diff HEAD~1` (or `git log -1 -p`).\n\
+            2. Run test suites and static checks (e.g. `cargo clippy --all-targets -- -D warnings`, `cargo test`, linters).\n\
+            3. Fix any regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
+            4. When verified and 100% clean, execute:\n\
+               echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            task
+        );
+
+        let reviewer_runner = AgentRunner::new(
+            self.api_base.clone(),
+            self.api_key.clone(),
+            reviewer_model.clone(),
+            temperature,
+        )
+        .with_network_offline(network_offline);
+
+        let manifest = ModelManifest::load();
+        let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
+
+        // The reviewer gets *its own* role memory, keyed by the reviewer alias, so
+        // review lessons never bleed into the implementer's prompt (and vice versa).
+        // `reviewer_model` may already be a resolved id (`combo:nerd`), so it is
+        // mapped back to its alias first; an unknown id passes through unchanged and
+        // simply finds no memory file.
+        let reviewer_alias = manifest.alias_for_model(&reviewer_model);
+        let mut review_messages = vec![
+            ChatMessage::text(
+                Role::System,
+                build_system_prompt(Path::new(&repo_path_str), &reviewer_alias),
+            ),
+            ChatMessage::text(Role::User, review_prompt),
+        ];
+        let review_max_turns = if max_turns > 0 {
+            max_turns
+        } else {
+            reviewer_manifest_turns.unwrap_or(current_max_turns)
+        };
+
+        let meta = WorkerMeta {
+            id: worker_id.clone(),
+            task: task.clone(),
+            group: Some(group.clone()),
+            repo_path: Some(repo_path_str.clone()),
+            started_at: started_at_ts,
+            pid: std::process::id(),
+        };
+
+        meta.save_status(
+            &reviewer_model,
+            RegistryStatus::Reviewing,
+            step,
+            current_max_turns + review_max_turns,
+            "starting review phase",
+            None,
+        );
+
+        let mut review_step = 0;
+        let mut last_assistant_text = String::new();
+        let mut consecutive_no_cmd = 0;
+        let mut combined_max_turns = current_max_turns + review_max_turns;
+
+        while review_step < review_max_turns {
+            review_step += 1;
+            step += 1;
+            let max_turns_for_config = current_max_turns + review_max_turns;
+            let turn_config = TurnConfig {
+                label_prefix: "[review] ",
+                steer_prefix: "ORCHESTRATOR GUIDANCE:\n",
+                apply_sentinels: false,
+                llm_error_policy: LlmErrorPolicy::EndQuietly,
+                status: RegistryStatus::Reviewing,
+                model: &reviewer_model,
+                max_turns: max_turns_for_config,
+            };
+            let mut engine = TurnEngine {
+                pool: self,
+                worktree,
+                runner: &reviewer_runner,
+                worker_id: &worker_id,
+                task: &task,
+                group: &group,
+                repo_path_str: &repo_path_str,
+                started_at_ts,
+                meta: &meta,
+                messages: &mut review_messages,
+                step: &mut step,
+                current_max_turns: &mut combined_max_turns,
+                last_assistant_text: &mut last_assistant_text,
+                consecutive_no_cmd: &mut consecutive_no_cmd,
+            };
+            match engine.run_turn(&turn_config).await? {
+                TurnOutcome::Completed => {
+                    info!(
+                        worker = %worker_id,
+                        step = review_step,
+                        "Reviewer completed and approved changes"
+                    );
+                    return Ok(step);
+                }
+                TurnOutcome::Continue | TurnOutcome::NoCommand => {}
+                TurnOutcome::EndReview => return Ok(step),
             }
         }
-
-        if let (Some(tool_calls), Some(tc_id)) = (llm_resp.tool_calls, llm_resp.tool_call_id) {
-            let content = if llm_resp.content.trim().is_empty() {
-                None
-            } else {
-                Some(llm_resp.content)
-            };
-            let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
-                .with_reasoning_content(llm_resp.reasoning_content);
-            review_messages.push(msg);
-            review_messages.push(ChatMessage::tool_result(tc_id, &output_text));
-        } else {
-            let assistant_content = if llm_resp.content.trim().is_empty() {
-                "I will execute a bash command.".to_string()
-            } else {
-                llm_resp.content
-            };
-            let msg = ChatMessage::text(Role::Assistant, assistant_content)
-                .with_reasoning_content(llm_resp.reasoning_content);
-            review_messages.push(msg);
-            review_messages.push(ChatMessage::text(Role::User, output_text));
-        }
-    }
 
         Ok(step)
     }

@@ -10,10 +10,9 @@
 use anyhow::Result;
 use tracing::info;
 
-
 use super::sentinels::summarize_command;
 use super::super::WorkerPool;
-use super::super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
+use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::unix_timestamp;
 
@@ -77,21 +76,22 @@ impl WorkerPool {
             }
         }
 
-        save_registry_entry(&WorkerRegistryEntry {
+        let meta = WorkerMeta {
             id: worker_id.clone(),
-            pid: std::process::id(),
             task: task.to_string(),
-            model: model.to_string(),
-            status: RegistryStatus::Paused,
-            step,
-            max_turns,
-            last_command: last_command.to_string(),
-            question: Some(question.to_string()),
-            started_at: started_at_ts,
-            updated_at: now,
             group: Some(group.to_string()),
             repo_path: Some(repo_path_str.to_string()),
-        });
+            started_at: started_at_ts,
+            pid: std::process::id(),
+        };
+        meta.save_status(
+            model,
+            RegistryStatus::Paused,
+            step,
+            max_turns,
+            last_command,
+            Some(question.to_string()),
+        );
 
         let Some(answer) = rx.recv().await else {
             return Ok(None);
