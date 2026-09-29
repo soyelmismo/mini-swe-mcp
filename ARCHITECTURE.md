@@ -69,8 +69,12 @@ The agent runner interacts with OpenAI-compatible endpoints using native Server-
    - `tool_calls` are accumulated in a `BTreeMap` keyed by the provider's `index`, so a
      sparse index (e.g. `index: 3` on the first frame) cannot fabricate placeholder calls.
      Placeholders and malformed calls are filtered at finalization, and every emitted id is
-     unique and non-empty.
-   - Retention is bounded: `MAX_STREAMED_CONTENT_BYTES` (16 KiB) for assistant text,
+     unique and non-empty. A *conflicting id* on an already-populated `index` is treated as a
+     provider numbering quirk rather than corruption: the delta is redirected to a fresh slot
+     just past the highest index in use, so a provider that sends every call in a turn as
+     `index: 0` (or omits `index`, which serde defaults to `0`) still yields every call instead
+     of an empty turn.
+   - Retention is bounded: `MAX_STREAMED_CONTENT_BYTES` (64 KiB) for assistant text,
      `MAX_TOOL_ARGUMENT_BYTES` (64 KiB) per tool call, and `MAX_SSE_FRAME_BYTES`
      (1 MiB) per SSE line. Oversized lines are discarded through their newline
      before framing resumes; complete lines within a chunk need no buffer copy.
