@@ -5,7 +5,8 @@ use std::time::Duration;
 ///
 /// A *whole-request* deadline is the wrong tool for a token stream: it kills
 /// healthy-but-slow generations regardless of progress. Only a per-chunk
-/// `tokio::time::timeout` aborts genuine stalls.
+/// `tokio::time::timeout` aborts genuine stalls, so no `read_timeout` is set
+/// on the HTTP client.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Hard cap on the assistant text retained from a stream.
@@ -78,18 +79,6 @@ pub enum Role {
     Tool,
 }
 
-impl Role {
-    /// Wire string for this role; asserted against the derive in the tests so
-    /// both spellings cannot drift.
-    pub const fn as_wire_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-}
 
 /// A single outbound conversation message.
 ///
@@ -98,7 +87,7 @@ impl Role {
 /// message with no `tool_call_id`, an `assistant` message with
 /// `tool_calls: Some(vec![])`) while keeping the per-field `skip_serializing_if`
 /// each role's wire shape needs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -399,12 +388,13 @@ mod tests {
 
     #[test]
     fn test_role_wire_strings() {
-        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
-            let expected = role.as_wire_str();
-            assert_eq!(
-                serde_json::to_string(&role).unwrap(),
-                format!("\"{expected}\"")
-            );
+        for (role, expected) in [
+            (Role::System, "system"),
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::Tool, "tool"),
+        ] {
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{expected}\""));
             let back: Role = serde_json::from_str(&format!("\"{expected}\"")).unwrap();
             assert_eq!(back, role);
         }

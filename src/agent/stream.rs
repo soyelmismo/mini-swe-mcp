@@ -14,7 +14,7 @@ use super::types::{
 /// hand, materially cheaper than `captures()`. A literally empty body
 /// (```` ```bash\n``` ````) yields `None` (the pattern requires a newline before
 /// the closing fence); a whitespace-only body yields `Some("")`.
-pub(crate) fn extract_command(text: &str) -> Option<String> {
+pub fn extract_command(text: &str) -> Option<String> {
     let full = BASH_BLOCK_RE.find(text)?.as_str();
     let open_line_end = full.find('\n')?;
     let close_start = full.len() - "\n```".len();
@@ -40,9 +40,6 @@ const DATA_FIELD: &[u8] = b"data:";
 /// The end-of-stream sentinel carried in a `data:` field.
 const DONE_SENTINEL: &[u8] = b"[DONE]";
 
-/// String view of [`DONE_SENTINEL`] for the post-decode parity check.
-const DONE_SENTINEL_STR: &str = "[DONE]";
-
 /// Classify one raw (undecoded) SSE line and return the bytes of its payload.
 ///
 /// Returns `None` for every line carrying no `data` payload — blank lines, SSE
@@ -55,73 +52,14 @@ const DONE_SENTINEL_STR: &str = "[DONE]";
 /// run it *before* UTF-8 validation, so a keep-alive comment costs one
 /// comparison instead of a decode.
 fn data_field(raw_line: &[u8]) -> Option<&[u8]> {
-    let line = trim_ascii(raw_line);
+    let line = raw_line.trim_ascii();
     if line.is_empty() || line[0] == b':' {
         return None;
     }
     // The field name is `data` followed by a colon; anything else is ignored.
     let payload = line.strip_prefix(DATA_FIELD)?;
-    Some(trim_ascii(payload))
+    Some(payload.trim_ascii())
 }
-
-/// Trim ASCII whitespace from both ends of a byte slice.
-///
-/// SSE framing only introduces ASCII spaces/tabs/CR, and a `&[u8]` cannot carry
-/// the full Unicode whitespace set, so this is exact for the lines the spec
-/// allows. A no-op for the common already-trimmed case, which the fast path
-/// detects in four comparisons.
-#[inline]
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    // Leading whitespace: skip while the front is ASCII whitespace.
-    while let [first, rest @ ..] = bytes {
-        if first.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
-    }
-    // Trailing whitespace: find the last non-whitespace byte, then slice.
-    let mut end = bytes.len();
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &bytes[..end]
-}
-
-/// Append the UTF-8-lossy decoding of `bytes` to `out` without allocating a
-/// temporary `String`.
-///
-/// Equivalent to `String::from_utf8_lossy(bytes)` but writes byte-for-byte:
-/// each maximal valid subsequence is copied verbatim and each maximal invalid
-/// one collapses to a single U+FFFD. `out` must be empty; it is cleared and
-/// grown in place.
-fn lossy_decode_into(bytes: &[u8], out: &mut Vec<u8>) {
-    out.clear();
-    out.reserve(bytes.len() + REPLACEMENT_CHAR.len());
-    let mut rest = bytes;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(valid) => {
-                out.extend_from_slice(valid.as_bytes());
-                return;
-            }
-            Err(err) => {
-                let (valid, after_valid) = rest.split_at(err.valid_up_to());
-                out.extend_from_slice(valid);
-                // One replacement char for the invalid run. A truncated trailing
-                // sequence (`error_len() == None`) leaves nothing to append.
-                out.extend_from_slice(REPLACEMENT_CHAR);
-                match err.error_len() {
-                    Some(len) => rest = &after_valid[len..],
-                    None => return,
-                }
-            }
-        }
-    }
-}
-
-/// UTF-8 encoding of U+FFFD, the substitution character the lossy decoder emits.
-const REPLACEMENT_CHAR: &[u8] = "\u{FFFD}".as_bytes();
 
 /// A tool call being assembled from streaming deltas.
 #[derive(Debug, Default)]
@@ -164,9 +102,6 @@ pub(crate) struct SseAccumulator {
     pub(crate) reasoning_capped: bool,
     /// Frames that were not valid UTF-8 (decoded lossily).
     pub(crate) invalid_utf8_lines: usize,
-    /// Reusable decode buffer for the lossy UTF-8 path, so a corrupting stream
-    /// does not allocate one `String` per frame. Never escapes the accumulator.
-    lossy_scratch: Vec<u8>,
     /// Latch so the unframed-tail cap is reported once per stream, not once per
     /// offending chunk (a runaway stream would otherwise log in a hot loop).
     frame_cap_logged: bool,
@@ -267,13 +202,7 @@ impl SseAccumulator {
             Err(err) => err,
         };
 
-        // Slow path: count, log, then decode lossily. The decode reuses
-        // `self.lossy_scratch`'s capacity across frames, so a stream that keeps
-        // sending corrupted lines allocates once and only regrows when a
-        // *larger* corrupted line arrives — instead of one fresh `String` per
-        // line, as `String::from_utf8_lossy` would. Log against `payload`, the
-        // region actually being decoded, so the reported offsets line up with
-        // the lossy substitution that follows.
+        // Slow path: count, log, then decode lossily.
         self.invalid_utf8_lines += 1;
         tracing::warn!(
             valid_up_to = err.valid_up_to(),
@@ -281,22 +210,8 @@ impl SseAccumulator {
             line_len = payload.len(),
             "SSE payload is not valid UTF-8; decoding lossily"
         );
-
-        // `handle_payload` takes `&mut self`, so the decoded `&str` must not be
-        // borrowed from `self`. Decode into a local starting with the capacity
-        // stashed in `lossy_scratch` (moved out, so no allocation after the
-        // first corrupted line), handle the line, then hand the capacity back.
-        let mut decoded = std::mem::take(&mut self.lossy_scratch);
-        lossy_decode_into(payload, &mut decoded);
-        // `lossy_decode_into` only ever emits valid UTF-8, so this cannot fail.
-        let text = match String::from_utf8(decoded) {
-            Ok(text) => text,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        };
-        let outcome = self.handle_payload(&text);
-        // Recycle the allocation for the next corrupted line.
-        self.lossy_scratch = text.into_bytes();
-        outcome
+        let text = String::from_utf8_lossy(payload);
+        self.handle_payload(&text)
     }
 
     /// Parse and accumulate one already-classified `data:` payload.
@@ -305,18 +220,6 @@ impl SseAccumulator {
     /// on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this stage
     /// only turns JSON into deltas.
     fn handle_payload(&mut self, data: &str) -> FrameOutcome {
-        // `data_field` already ASCII-trimmed the payload on bytes (the only
-        // whitespace SSE framing can introduce). This zero-alloc Unicode trim
-        // restores exact parity with the old `str::trim` path for exotic
-        // whitespace (e.g. NBSP) at payload edges, and re-checks the sentinel
-        // for a `[DONE]` wrapped in such whitespace.
-        let data = data.trim();
-        if data.is_empty() {
-            return FrameOutcome::Consumed;
-        }
-        if data == DONE_SENTINEL_STR {
-            return FrameOutcome::Done;
-        }
         if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
             && let Some(choice) = chunk.choices.first()
         {
@@ -333,37 +236,12 @@ impl SseAccumulator {
         FrameOutcome::Consumed
     }
 
-    /// Append streamed reasoning content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
-    pub(crate) fn push_reasoning_content(&mut self, text: &str) {
-        if self.reasoning_content.len() >= MAX_STREAMED_CONTENT_BYTES {
-            if !self.reasoning_capped {
-                self.reasoning_capped = true;
-                tracing::warn!(
-                    limit = MAX_STREAMED_CONTENT_BYTES,
-                    "Streamed assistant reasoning exceeded the retention budget; truncating"
-                );
-            }
-            return;
-        }
-        let room = MAX_STREAMED_CONTENT_BYTES - self.reasoning_content.len();
-        if text.len() <= room {
-            self.reasoning_content.push_str(text);
-            return;
-        }
-        self.reasoning_content
-            .push_str(&text[..text.floor_char_boundary(room)]);
-        self.reasoning_capped = true;
-        tracing::warn!(
-            limit = MAX_STREAMED_CONTENT_BYTES,
-            "Streamed assistant reasoning exceeded the retention budget; truncating"
-        );
-    }
-
-    /// Append streamed content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
-    pub(crate) fn push_content(&mut self, text: &str) {
-        if self.content.len() >= MAX_STREAMED_CONTENT_BYTES {
-            if !self.content_capped {
-                self.content_capped = true;
+    /// Append streamed content to `buffer`, respecting
+    /// [`MAX_STREAMED_CONTENT_BYTES`] and flagging `capped` on overflow.
+    fn push_bounded(buffer: &mut String, capped: &mut bool, text: &str) {
+        if buffer.len() >= MAX_STREAMED_CONTENT_BYTES {
+            if !*capped {
+                *capped = true;
                 tracing::warn!(
                     limit = MAX_STREAMED_CONTENT_BYTES,
                     "Streamed assistant content exceeded the retention budget; truncating"
@@ -371,26 +249,35 @@ impl SseAccumulator {
             }
             return;
         }
-        let room = MAX_STREAMED_CONTENT_BYTES - self.content.len();
+        let room = MAX_STREAMED_CONTENT_BYTES - buffer.len();
         if text.len() <= room {
-            self.content.push_str(text);
+            buffer.push_str(text);
             return;
         }
         // Longest prefix of `text` that fits in `room` bytes, snapped to a char
         // boundary so we never store a partial code point.
         //
         // `floor_char_boundary` is *relative* to `text`, so the slice length is
-        // exactly that value. Adding `self.content.len()` here (an absolute
-        // offset) made the index run past the end of `text` and panic as soon
-        // as the buffer was non-empty — the normal case for a long stream
-        // crossing the cap.
-        self.content
-            .push_str(&text[..text.floor_char_boundary(room)]);
-        self.content_capped = true;
+        // exactly that value. Adding `buffer.len()` here (an absolute offset)
+        // made the index run past the end of `text` and panic as soon as the
+        // buffer was non-empty — the normal case for a long stream crossing the
+        // cap.
+        buffer.push_str(&text[..text.floor_char_boundary(room)]);
+        *capped = true;
         tracing::warn!(
             limit = MAX_STREAMED_CONTENT_BYTES,
             "Streamed assistant content exceeded the retention budget; truncating"
         );
+    }
+
+    /// Append streamed reasoning content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
+    pub(crate) fn push_reasoning_content(&mut self, text: &str) {
+        Self::push_bounded(&mut self.reasoning_content, &mut self.reasoning_capped, text);
+    }
+
+    /// Append streamed content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
+    pub(crate) fn push_content(&mut self, text: &str) {
+        Self::push_bounded(&mut self.content, &mut self.content_capped, text);
     }
 
     /// Fold one streamed `tool_calls` delta into the index-keyed map.
@@ -538,16 +425,6 @@ impl SseAccumulator {
                 serde_json::from_str::<BashArgs>(&tc.arguments)
                     .map(|a| a.command)
                     .ok()
-                    .or_else(|| {
-                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("command")
-                                    .or_else(|| v.get("cmd"))
-                                    .and_then(|c| c.as_str())
-                                    .map(|s| s.to_string())
-                            })
-                    })
             })
             .or_else(|| extract_command(&content));
 
@@ -956,37 +833,6 @@ mod tests {
 
     // ---- UTF-8 decode / lossy regression tests ----
 
-    /// `lossy_decode_into` must match `String::from_utf8_lossy` byte-for-byte,
-    /// including truncated tails and multi-byte sequences split by bad bytes.
-    #[test]
-    fn lossy_decode_into_matches_std() {
-        let cases: Vec<Vec<u8>> = vec![
-            b"plain ascii".to_vec(),
-            b"caf\xc3\xa9 \xe2\x82\xac".to_vec(),  // valid
-            b"caf\xc3\xa9".to_vec(),               // truncated 2-byte tail
-            b"emoji \xf0\x9f\x98\x80 ok".to_vec(), // valid 4-byte
-            b"\xf0\x9f\x98".to_vec(),              // truncated 4-byte tail
-            b"\xff\xfe".to_vec(),                  // two invalid bytes
-            b"a\xffb\xffc".to_vec(),
-            b"pre\xffmid\x80post".to_vec(),
-            b"\xed\xa0\x80".to_vec(), // surrogate half
-            b"\xc0\xaf".to_vec(),     // overlong
-            b"".to_vec(),
-        ];
-        for case in cases {
-            let mut got = Vec::new();
-            lossy_decode_into(&case, &mut got);
-            let want = String::from_utf8_lossy(&case);
-            assert_eq!(
-                std::str::from_utf8(&got).expect("decoder must emit valid UTF-8"),
-                want,
-                "lossy mismatch for {case:?}"
-            );
-            // And the output must itself be valid UTF-8, byte-identical in kind.
-            assert_eq!(got, want.as_bytes());
-        }
-    }
-
     /// The lossy path must preserve the *decoded content* of a corrupted frame,
     /// not just count it. A refactor that empties the buffer before handing it
     /// to the parser would silently drop the model output here.
@@ -1003,30 +849,6 @@ mod tests {
         assert_eq!(
             acc.content, "keep\u{FFFD}me",
             "corrupted frame must still contribute its content"
-        );
-    }
-
-    /// Capacity is recycled across corrupted lines, so a long corrupting stream
-    /// must not allocate one buffer per frame.
-    #[test]
-    fn lossy_scratch_is_reused_across_frames() {
-        let mut acc = SseAccumulator::default();
-        let mut buffer = Vec::new();
-        let mut body = Vec::new();
-        for _ in 0..64 {
-            let mut f = br#"data: {"choices":[{"delta":{"content":"x"}}"#.to_vec();
-            f.extend_from_slice(&[0xFF]);
-            f.extend_from_slice(br#""}}]}"#);
-            f.extend_from_slice(b"\n\n");
-            body.extend_from_slice(&f);
-        }
-        body.extend_from_slice(b"data: [DONE]\n\n");
-        acc.push(&body, &mut buffer);
-        assert_eq!(acc.invalid_utf8_lines, 64);
-        // Capacity is retained (not dropped) after the stream is processed.
-        assert!(
-            acc.lossy_scratch.capacity() > 0,
-            "decode buffer must keep its capacity for reuse"
         );
     }
 

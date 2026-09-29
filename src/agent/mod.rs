@@ -10,14 +10,15 @@ pub mod stream;
 pub mod types;
 
 pub use env::{
-    ALLOWED_VARS, CARGO_HOME_VAR, CommandEnv, RUSTUP_HOME_VAR, TOOLCHAIN_VARS,
-    apply_clean_environment, apply_clean_environment_cmd, build_clean_environment, host_cargo_home,
-    is_sensitive_var, resolve_cargo_home,
+    ALLOWED_VARS, CARGO_HOME_VAR, RUSTUP_HOME_VAR, TOOLCHAIN_VARS, apply_clean_environment_cmd,
+    build_clean_environment, host_cargo_home, resolve_cargo_home,
 };
 pub use exec::{has_unshare, wrap_network_command};
-pub use runner::{
-    AgentRunner, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
+pub use runner::AgentRunner;
+pub use retry::{
+    DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
 };
+pub use stream::extract_command;
 pub use sandbox::{
     DISABLE_LANDLOCK_ENV, LandlockPlan, TRUNCATE_HEAD, TRUNCATE_LIMIT, TRUNCATE_TAIL,
     apply_landlock_sandbox, build_landlock_plan, find_git_common_dir, find_git_dirs, has_bwrap,
