@@ -167,6 +167,9 @@ pub fn clear_catalog_cache() {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_CACHE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod eviction_tests {
     use super::*;
     use crate::manifest::ModelDefinition;
@@ -188,6 +191,9 @@ mod eviction_tests {
     /// O(1) LRU eviction only the least-recently-used foreign bullet is dropped.
     #[test]
     fn hot_manifest_rows_survive_a_flood_of_cold_rows() {
+        let _guard = TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_catalog_cache();
+
         let hot = definition("vendor:hot".to_string());
         let hot_key = catalog_row_key("hot-alias", &hot.id, "Role.").into_boxed_str();
 
@@ -243,6 +249,8 @@ mod eviction_tests {
     /// no matter how many distinct rows are pushed through it.
     #[test]
     fn flood_of_distinct_rows_stays_bounded() {
+        let _guard = TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_catalog_cache();
         for i in 0..(CATALOG_CACHE_CAPACITY * 10) {
             let def = definition(format!("vendor:id{i}"));
             let alias = format!("alias{i}");
@@ -262,6 +270,8 @@ mod eviction_tests {
     /// threads must not panic, lose rows, or breach the capacity bound.
     #[test]
     fn concurrent_catalog_renders_are_safe_and_bounded() {
+        let _guard = TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_catalog_cache();
         use std::sync::Arc;
         use std::sync::Barrier;
         use std::thread;

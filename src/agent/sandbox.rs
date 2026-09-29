@@ -600,6 +600,16 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
             for rule in &rules {
                 add_rule(ruleset_fd, rule)?;
             }
+            // Landlock requires PR_SET_NO_NEW_PRIVS to be set before restrict_self
+            // unless the process has CAP_SYS_ADMIN.
+            // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes integer arguments and is safe.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                anyhow::bail!(
+                    "prctl PR_SET_NO_NEW_PRIVS: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
             // SAFETY: `ruleset_fd` is still open here and no other thread can
             // have closed it; `restrict_self` needs no other argument.
             let ret = landlock_syscall(
@@ -1180,6 +1190,7 @@ fn landlock_actually_denies_paths_outside_the_sandbox() {
         // the sentinel is set through a dedicated "run this test" filter.
         .arg("--exact")
         .arg("agent::sandbox::tests::landlock_actually_denies_paths_outside_the_sandbox")
+        .arg("--nocapture")
         .env(ENFORCE_ENV, "1")
         .env("LL_WORKTREE", &worktree)
         .env("LL_TARGET", &target)

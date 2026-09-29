@@ -359,11 +359,9 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
     );
 }
 
-static TEST_CACHE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
-    let _guard = TEST_CACHE_MUTEX.lock().unwrap();
+    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     let a = ModelDefinition {
@@ -411,7 +409,7 @@ fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
 /// would have split them into two entries holding the same bytes.
 #[test]
 fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
-    let _guard = TEST_CACHE_MUTEX.lock().unwrap();
+    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     let implicit = ModelDefinition {
@@ -435,7 +433,7 @@ fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
 
 #[test]
 fn test_catalog_cache_stays_bounded() {
-    let _guard = TEST_CACHE_MUTEX.lock().unwrap();
+    let _guard = super::cache::TEST_CACHE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     clear_catalog_cache();
 
     for i in 0..(CATALOG_CACHE_CAPACITY + 8) {
