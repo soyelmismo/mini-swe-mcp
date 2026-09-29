@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info};
@@ -8,6 +9,11 @@ pub struct WorktreeGuard {
     pub branch: String,
     pub repo_root: PathBuf,
     pub base_commit: String,
+    /// When set, [`Drop`] leaves the worktree on disk instead of removing it.
+    ///
+    /// The `.pid` lease is deleted on preservation so the abandoned-worktree
+    /// sweep keeps failing open on it instead of eventually treating it as a
+    /// zombie (audit §05/§08).
     pub keep: bool,
     pub preserve_branch: bool,
 }
@@ -38,11 +44,11 @@ impl WorktreeGuard {
         let branch = format!("worker-{}", worker_id);
         let path = swe_base_dir().join(format!("swe-wt-{}", worker_id));
 
-        // Ensure target directory and branch don't exist
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-        let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
+        // Ensure target directory and branch don't exist. `worktree prune` is
+        // deliberately not called here: `prune_stale_worktrees` owns a single
+        // prune per sweep, and the `worktree add` below fails loudly if a stale
+        // registration is still in place (audit §06).
+        force_remove_dir(&path);
         let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
 
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
@@ -69,9 +75,10 @@ impl WorktreeGuard {
             anyhow::bail!("git worktree add failed: {}", stderr);
         }
 
-        // Write host PID to sibling file so running worktrees are never pruned by concurrent instances
-        let pid_file = format!("{}.pid", path.to_string_lossy());
-        let _ = std::fs::write(&pid_file, std::process::id().to_string());
+        // Write host PID (+ owner uid) to a sibling file so running worktrees are
+        // never pruned by concurrent instances, and so a stale marker left by a
+        // different user is never mistaken for ours (audit §12).
+        let _ = std::fs::write(pid_file_for(&path), pid_file_contents());
 
         // Seed unversioned directories into the worktree so subagents can read them without git tracking
         const SEED_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
@@ -79,7 +86,7 @@ impl WorktreeGuard {
             let src = repo_root.join(dir);
             if src.is_dir() {
                 let dst = path.join(dir);
-                let mut dummy = Vec::new();
+                let mut dummy = BTreeSet::new();
                 let _ = copy_dir_all(&src, &dst, &mut dummy, repo_root);
             }
         }
@@ -133,7 +140,7 @@ impl WorktreeGuard {
     /// from the worktree back into the repository root.
     pub fn sync_artifacts(&self) -> Result<Vec<String>> {
         const ARTIFACT_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
-        let mut synced = Vec::new();
+        let mut synced = BTreeSet::new();
 
         for dir in ARTIFACT_DIRS {
             let src_dir = self.path.join(dir);
@@ -143,7 +150,7 @@ impl WorktreeGuard {
             }
         }
 
-        Ok(synced)
+        Ok(synced.into_iter().collect())
     }
 
     /// Commit all dirty changes in the worktree to preserve work in git history,
@@ -199,10 +206,15 @@ impl WorktreeGuard {
     }
 }
 
+/// Recursively copy `src` into `dst`, recording every copied file (relative to
+/// `worktree_root`) in `collected`.
+///
+/// Deduplication uses a `HashSet` so overlapping artifact directories scale
+/// linearly instead of quadratically (audit §11).
 fn copy_dir_all(
     src: &Path,
     dst: &Path,
-    collected: &mut Vec<String>,
+    collected: &mut BTreeSet<String>,
     worktree_root: &Path,
 ) -> std::io::Result<()> {
     if !src.exists() {
@@ -222,76 +234,249 @@ fn copy_dir_all(
         } else if ft.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
             if let Ok(rel) = src_path.strip_prefix(worktree_root) {
-                let rel_str = rel.to_string_lossy().to_string();
-                if !collected.contains(&rel_str) {
-                    collected.push(rel_str);
-                }
+                collected.insert(rel.to_string_lossy().into_owned());
             }
         }
     }
     Ok(())
 }
 
+/// True when a process with `pid` currently exists on this host.
+///
+/// `/proc` is consulted first on Linux because it is the cheapest and most
+/// reliable answer; `kill -0` is the portable fallback (and is also the
+/// authority when `/proc` is unavailable, e.g. inside restricted containers).
 pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
     #[cfg(target_os = "linux")]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
     }
-    #[cfg(not(target_os = "linux"))]
+
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Owner identity recorded inside a `.pid` file so pruning can refuse to touch
+/// worktrees that belong to a different user (mitigates PID reuse across
+/// accounts on shared hosts, see audit §12).
+fn current_uid() -> Option<u32> {
+    #[cfg(unix)]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        *CURRENT_UID.get_or_init(read_proc_uid)
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
-fn prune_worktree_if_stale(
-    repo_root: &Path,
-    wt: &str,
-    br: &str,
-    active_branches: &mut Vec<String>,
-) {
+#[cfg(unix)]
+fn read_proc_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+static CURRENT_UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+/// Contents written to a `<worktree>.pid` file: the owning process id followed
+/// by the owning uid, one per line.
+fn pid_file_contents() -> String {
+    match current_uid() {
+        Some(uid) => format!("{}\n{uid}", std::process::id()),
+        None => std::process::id().to_string(),
+    }
+}
+
+/// The `.pid` sibling path for a worktree directory, built without `format!`
+/// allocations in the common case (audit §10).
+fn pid_file_for(path: &Path) -> PathBuf {
+    let mut sibling = path.as_os_str().to_os_string();
+    sibling.push(".pid");
+    PathBuf::from(sibling)
+}
+
+/// Liveness decision for a `<worktree>.pid` file, expressed as an `Option`:
+///
+/// * `Some(true)`  -> the owner is provably gone, the worktree is abandoned;
+/// * `Some(false)` -> the owner process is alive, the worktree is in use;
+/// * `None`        -> **no usable lease**; the caller must fail open and keep
+///   the worktree.
+///
+/// `None` covers a missing, unreadable, malformed or foreign-owner marker. The
+/// policy is deliberately "keep" in all four cases and is applied identically
+/// by the registered-worktree and orphan-directory paths: a `.pid` holding
+/// only a bare integer that the kernel recycles freely must never be able to
+/// destroy a live worktree, and a corrupt file must not be able to do it
+/// either. Dangling lease files that no longer have a worktree are cleaned up
+/// separately by [`dangling_pid_file`], which is a decision that cannot lose
+/// work (audit §01/§03/§08/§12).
+fn pid_file_is_stale(pid_file: &Path) -> Option<bool> {
+    let content = std::fs::read_to_string(pid_file).ok()?;
+    let mut lines = content.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    // A lease recorded for another uid is not ours to interpret or to act on.
+    if let Some(ours) = current_uid()
+        && lines
+            .next()
+            .is_some_and(|l| l.trim().parse::<u32>().is_ok_and(|uid| uid != ours))
+    {
+        return None;
+    }
+    Some(!is_process_alive(pid))
+}
+
+/// The worktree directory a `swe-wt-*.pid` lease belongs to, if it exists.
+fn worktree_dir_of_pid_file(pid_file: &Path) -> Option<PathBuf> {
+    let name = pid_file.file_name()?.to_str()?;
+    let wt_name = name.strip_suffix(".pid")?;
+    let base = pid_file.parent()?;
+    let dir = base.join(wt_name);
+    dir.is_dir().then_some(dir)
+}
+
+/// Remove a directory tree, tolerating an already-missing path.
+///
+/// Centralises the `exists() && remove_dir_all` pattern that was repeated in
+/// three places (audit §04/§04b).
+fn force_remove_dir(path: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        error!(error = %e, path = %path.display(), "Failed to delete leftover worktree directory");
+    }
+}
+
+/// Delete a worktree's scratch/target directories from every known base dir.
+fn remove_target_dirs(wt_path: &Path) {
+    if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
+        for base in swe_base_dirs() {
+            force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
+        }
+    }
+}
+
+/// All directories that can host `swe-wt-*` / `swe-target-*` scratch data.
+///
+/// Yielded at most once each: `swe_base_dir()` frequently *is* the system temp
+/// dir, and sweeping it twice used to re-scan the same tree (audit §07).
+fn swe_base_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![swe_base_dir()];
+    let tmp = std::env::temp_dir();
+    if !dirs.contains(&tmp) {
+        dirs.push(tmp);
+    }
+    dirs
+}
+
+/// Remove one `worker-*` worktree: its git registration, its directory, its
+/// sibling `.pid` file and its scratch target directory.
+///
+/// The branch is deleted only when it is merged into `HEAD` (or carries no
+/// commits beyond `HEAD`), so unmerged work is never destroyed (audit §02).
+fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
+    let wt_path = Path::new(wt);
+    let pid_file = pid_file_for(wt_path);
+
+    let _ = git(repo_root, "worktree remove", &["worktree", "remove", "--force", wt]);
+    if is_branch_merged(repo_root, br) {
+        let _ = git(repo_root, "branch -D", &["branch", "-D", br]);
+    } else {
+        info!(branch = %br, "Preserving unmerged worker branch with commits");
+    }
+    force_remove_dir(wt_path);
+    let _ = std::fs::remove_file(&pid_file);
+    remove_target_dirs(wt_path);
+}
+
+/// True when `branch` has no commits that are missing from `HEAD`, i.e. deleting
+/// it cannot lose work. Unreadable/absent branches count as safe to delete.
+fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
+    git(
+        repo_root,
+        "merge-base",
+        &["merge-base", "--is-ancestor", branch, "HEAD"],
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// Decide whether the registered worktree `wt` / branch `br` is abandoned.
+///
+/// Process liveness is checked **before** the on-disk directory: a worktree
+/// whose owner is still running must never be destroyed just because something
+/// else removed its directory (audit §02). A missing or unreadable `.pid`
+/// fails open, a malformed or foreign-owned marker fails closed.
+fn registered_worktree_is_stale(wt: &str) -> bool {
+    let wt_path = Path::new(wt);
+    match pid_file_is_stale(&pid_file_for(wt_path)) {
+        // Owner process is gone (or the marker is unusable) -> the worktree is
+        // abandoned regardless of whether the directory still exists.
+        Some(stale) => stale,
+        // No marker at all: fall back to the directory. Without a lease there
+        // is nothing to protect, and an unregistered-but-present directory is
+        // almost always a leftover from a crashed run.
+        None => !wt_path.exists(),
+    }
+}
+
+/// Handle one entry of `git worktree list --porcelain`.
+///
+/// Stale entries are removed together with their branch; live ones are recorded
+/// in `active_branches` so the orphan-branch sweep leaves them alone.
+fn prune_worktree_if_stale(repo_root: &Path, wt: &str, br: &str, active_branches: &mut Vec<String>) {
     if !br.starts_with("worker-") {
         return;
     }
-    let wt_path = Path::new(wt);
-    let pid_file = format!("{wt}.pid");
-    let is_stale = if !wt_path.exists() {
-        true
-    } else if let Ok(content) = std::fs::read_to_string(&pid_file) {
-        content
-            .trim()
-            .parse::<u32>()
-            .is_ok_and(|pid| !is_process_alive(pid))
-    } else {
-        // Directory exists but has no pid file: do not delete, assume active
-        false
-    };
 
-    if is_stale {
+    if registered_worktree_is_stale(wt) {
         info!(path = %wt, branch = %br, "Pruning zombie subagent worktree");
-        let _ = git(repo_root, "worktree remove", &["worktree", "remove", "--force", wt]);
-        let _ = git(repo_root, "branch -D", &["branch", "-D", br]);
-        if wt_path.exists() {
-            let _ = std::fs::remove_dir_all(wt_path);
-        }
-        let _ = std::fs::remove_file(&pid_file);
-        if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
-            for base in [swe_base_dir(), std::env::temp_dir()] {
-                let target_dir = base.join(format!("swe-target-{wt_name}"));
-                if target_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&target_dir);
-                }
-            }
-        }
+        remove_worker_worktree(repo_root, wt, br);
     } else {
         active_branches.push(br.to_string());
     }
 }
 
+/// Exposed for tests: the liveness verdict for a registered worktree path.
+///
+/// The end-to-end sweep cannot reach this decision for a worktree whose
+/// directory was deleted, because `git worktree prune` unregisters it first;
+/// this seam lets the ordering contract be asserted directly.
+#[doc(hidden)]
+pub fn worktree_is_stale_for_test(wt: &str) -> bool {
+    registered_worktree_is_stale(wt)
+}
+
+/// Prune abandoned subagent worktrees registered with `repo_root`, using the
+/// default scratch base directories ([`swe_base_dirs`]).
 pub fn prune_stale_worktrees(repo_root: &Path) {
+    prune_stale_worktrees_in(repo_root, &swe_base_dirs());
+}
+
+/// Test seam: same sweep as [`prune_stale_worktrees`] but with an explicit set
+/// of scratch base directories, so tests never have to mutate `SWE_TEMP_DIR`
+/// (which is process-global and therefore racy across `cargo test` threads).
+///
+/// The sweep is a single pass over each source, with exactly one
+/// `git worktree prune` at the start (audit §06/§07):
+///   1. registered `worker-*` worktrees whose owner process is dead,
+///   2. `worker-*` branches with no worktree at all (merged ones only),
+///   3. unregistered `swe-wt-*` directories in the scratch base dirs,
+///   4. `swe-target-*` scratch dirs whose worktree is gone.
+pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
     let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 
     // 1. Prune registered worktrees whose owner process is dead or directory is missing
@@ -300,7 +485,6 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut current_wt: Option<String> = None;
         let mut current_branch: Option<String> = None;
-
         for line in stdout.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
                 current_wt = Some(path.to_string());
@@ -323,15 +507,7 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         for line in stdout.lines() {
             let branch = line.trim().trim_start_matches('*').trim_start_matches('+').trim();
             if branch.starts_with("worker-") && !active_branches.iter().any(|b| b == branch) {
-                let is_merged = git(
-                    repo_root,
-                    "merge-base",
-                    &["merge-base", "--is-ancestor", branch, "HEAD"],
-                )
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-                if is_merged {
+                if is_branch_merged(repo_root, branch) {
                     info!(branch = %branch, "Pruning merged or empty worker branch");
                     let _ = git(repo_root, "branch -D", &["branch", "-D", branch]);
                 } else {
@@ -341,45 +517,44 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
         }
     }
 
-    // 3. Prune orphaned swe-wt-* directories and .pid files in base dirs whose processes are dead
-    for base in [swe_base_dir(), std::env::temp_dir()] {
-        if let Ok(entries) = std::fs::read_dir(&base) {
+    for base in base_dirs {
+        // 3. Prune orphaned swe-wt-* directories whose owner process is dead.
+        //    Each directory is handled together with its sibling `.pid` file, so
+        //    the result does not depend on `read_dir` ordering and no orphan can
+        //    survive with its lease already removed (audit §01/§09).
+        if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if let Some(name) = p.file_name().and_then(|n| n.to_str())
-                    && name.starts_with("swe-wt-")
-                {
-                    if p.is_dir() {
-                        let pid_file = format!("{}.pid", p.to_string_lossy());
-                        let is_stale = if let Ok(content) = std::fs::read_to_string(&pid_file) {
-                            content
-                                .trim()
-                                .parse::<u32>()
-                                .is_ok_and(|pid| !is_process_alive(pid))
-                        } else {
-                            false
-                        };
-                        if is_stale {
-                            let _ = std::fs::remove_dir_all(&p);
-                            let _ = std::fs::remove_file(&pid_file);
-                        }
-                    } else if name.ends_with(".pid")
-                        && let Ok(content) = std::fs::read_to_string(&p)
-                    {
-                        let is_stale = content
-                            .trim()
-                            .parse::<u32>()
-                            .map_or(true, |pid| !is_process_alive(pid));
-                        if is_stale {
-                            let _ = std::fs::remove_file(&p);
-                        }
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("swe-wt-") {
+                    continue;
+                }
+
+                if p.is_dir() {
+                    // The lease is the sibling file; the directory is judged by
+                    // that single file, so the outcome never depends on the
+                    // order `read_dir` happens to return entries in.
+                    let pid_file = pid_file_for(&p);
+                    if pid_file_is_stale(&pid_file) == Some(true) {
+                        info!(path = %p.display(), "Pruning orphaned worktree directory");
+                        force_remove_dir(&p);
+                        let _ = std::fs::remove_file(&pid_file);
+                        remove_target_dirs(&p);
                     }
+                } else if name.ends_with(".pid") && worktree_dir_of_pid_file(&p).is_none() {
+                    // A lease whose worktree is already gone describes nothing
+                    // and protects nothing; removing it cannot lose work.
+                    // Handled independently of the directory branch above so
+                    // there is no cross-entry ordering hazard (audit §01/§09).
+                    let _ = std::fs::remove_file(&p);
                 }
             }
         }
 
         // 4. Prune orphaned swe-target-* directories in base dirs whose worktrees are gone
-        if let Ok(entries) = std::fs::read_dir(&base) {
+        if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if let Some(name) = p.file_name().and_then(|n| n.to_str())
@@ -387,19 +562,25 @@ pub fn prune_stale_worktrees(repo_root: &Path) {
                 {
                     let wt_path = base.join(wt_name);
                     if !wt_path.exists() {
-                        let _ = std::fs::remove_dir_all(&p);
+                        force_remove_dir(&p);
                     }
                 }
             }
         }
     }
-
-    let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 }
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        let pid_file = pid_file_for(&self.path);
+
         if self.keep {
+            // The worktree outlives this process on purpose. Its lease must not
+            // outlive the leaseholder, or a later sweep would see a dead PID and
+            // delete a worktree the user asked to keep. Dropping the `.pid` makes
+            // the pruner fail open and treat the directory as active forever
+            // (audit §05/§08).
+            let _ = std::fs::remove_file(&pid_file);
             info!(path = %self.path.display(), "Preserving worktree");
             return;
         }
@@ -414,11 +595,6 @@ impl Drop for WorktreeGuard {
             &self.repo_root,
             "worktree remove",
             &["worktree", "remove", "--force", &path_str],
-        );
-        let _ = git(
-            &self.repo_root,
-            "worktree prune",
-            &["worktree", "prune"],
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it
         let has_commits = if !self.base_commit.is_empty() {
@@ -448,23 +624,10 @@ impl Drop for WorktreeGuard {
             );
         }
 
-        if self.path.exists()
-            && let Err(e) = std::fs::remove_dir_all(&self.path)
-        {
-            error!(error = %e, path = %self.path.display(), "Failed to delete leftover worktree directory");
-        }
-
-        let pid_file = format!("{}.pid", self.path.to_string_lossy());
+        // `worktree remove --force` normally deleted the directory already; this
+        // is the fallback for when it could not (audit §04).
+        force_remove_dir(&self.path);
         let _ = std::fs::remove_file(&pid_file);
-
-        let dir_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !dir_name.is_empty() {
-            for base in [swe_base_dir(), std::env::temp_dir()] {
-                let target_dir = base.join(format!("swe-target-{dir_name}"));
-                if target_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&target_dir);
-                }
-            }
-        }
+        remove_target_dirs(&self.path);
     }
 }
