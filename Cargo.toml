@@ -3,8 +3,8 @@ name = "mini-swe-mcp"
 version = "0.1.0"
 edition = "2024"
 description = "High-throughput autonomous SWE subagent server over MCP stdio protocol"
-repository = "https://github.com/oracle/mini-swe-mcp"
-license = "MIT OR Apache-2.0"
+repository = "https://github.com/soyelmismo/mini-swe-mcp"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]

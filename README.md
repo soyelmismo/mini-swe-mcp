@@ -36,7 +36,7 @@ High-throughput autonomous software engineering subagent orchestrator speaking t
 
 ```bash
 # Clone the repository
-git clone https://github.com/oracle/mini-swe-mcp.git
+git clone https://github.com/soyelmismo/mini-swe-mcp.git
 cd mini-swe-mcp
 
 # Build optimized release binary
@@ -191,4 +191,4 @@ cargo clippy -- -D warnings
 
 ## License
 
-MIT OR Apache-2.0
+GNU General Public License v3.0 (GPL-3.0-or-later)
