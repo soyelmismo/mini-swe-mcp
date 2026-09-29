@@ -304,13 +304,13 @@ fn wrap_visible(s: &str, op_width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in s.split_whitespace() {
-        if !current.is_empty() && visible_width(&current) + 1 + word.chars().count() > op_width {
+        if !current.is_empty() && visible_width(&current) + 1 + visible_width(word) > op_width {
             lines.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
             current.push(' ');
         }
-        if word.chars().count() > op_width {
+        if visible_width(word) > op_width {
             // A single oversized word: hard-split it so no line overflows.
             let mut head = String::new();
             for ch in word.chars() {
@@ -505,7 +505,7 @@ fn stack_row(
 }
 
 /// The last-op / task cell, capped to `layout.op` visible columns.
-fn op_cell(w: &WorkerRegistryEntry, layout: &Layout) -> String {
+fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String {
     let first_line = w.task.lines().next().unwrap_or("").trim();
     let detail = if let Some(ref q) = w.question {
         format!("ASK: {q}")
@@ -519,7 +519,7 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout) -> String {
     };
 
     let tag = if w.status == "reviewing" {
-        review_tag(false).to_string()
+        format!("{} ", review_tag(use_color))
     } else {
         match w.group.as_deref() {
             Some(g) if !g.trim().is_empty() => format!("[{}] ", g.trim()),
@@ -649,7 +649,7 @@ pub fn render_dashboard_with_width(
         out.push('\n');
 
         for w in repo_workers {
-            let op = op_cell(w, &layout);
+            let op = op_cell(w, &layout, use_color);
             match layout.shape {
                 RowShape::Inline { .. } => {
                     let prefix = row_prefix(w, &layout, use_color, now);
@@ -672,16 +672,21 @@ pub fn render_dashboard_with_width(
 /// Column header matching the row layout.
 fn header_line(layout: &Layout) -> String {
     let mut line = String::new();
-    for (label, width) in [
+    let cols = [
         ("ID", layout.id),
         ("PID", layout.pid),
         ("STATUS", layout.status),
         ("TURNS", layout.turns),
         ("MODEL", layout.model),
         ("UPTIME", layout.uptime),
-    ] {
-        line.push_str(&pad_visible(label, width));
-        line.push_str(&" ".repeat(GAP));
+    ];
+    for (i, (label, width)) in cols.iter().enumerate() {
+        line.push_str(&pad_visible(label, *width));
+        if i + 1 == cols.len() {
+            line.push_str(&" ".repeat(LAST_GAP));
+        } else {
+            line.push_str(&" ".repeat(GAP));
+        }
     }
     line.push_str("LAST OP / TASK\n");
     line
@@ -690,7 +695,7 @@ fn header_line(layout: &Layout) -> String {
 /// Header for the stacked (narrow terminal) row shape.
 fn stacked_header_line(layout: &Layout) -> String {
     let first = format!(
-        "{} {}  {}",
+        "{}  {}  {}",
         pad_visible("ID", layout.id),
         pad_visible("PID", layout.pid),
         pad_visible("TURNS", layout.turns)
