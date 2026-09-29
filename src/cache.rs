@@ -54,7 +54,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 // ---------- Bounded LRU storage ----------
 
-/// A bounded, thread-safe, least-recently-used cache.
+/// A bounded least-recently-used cache.
 ///
 /// Keys are ordered by recency: the most recently used is at the **back** of an
 /// internal `VecDeque`, the least recently used at the **front**. The map
@@ -183,6 +183,34 @@ where
         if let Some((_, current)) = self.map.get_mut(key) {
             *current = generation;
             self.order.push_back((key.clone(), generation));
+            self.maybe_compact();
+        }
+    }
+
+    /// Drop stale recency records once they meaningfully outnumber live entries.
+    ///
+    /// Every `get`/`insert` pushes one record onto `order` while only eviction
+    /// pops from it, so a workload that mostly *hits* (no evictions) would
+    /// otherwise grow `order` without bound. When the deque exceeds a small
+    /// multiple of `capacity`, retain only the live record per key. The deque
+    /// is already in recency (generation) order, so filtering preserves the LRU
+    /// ordering in O(n) time; the cost is amortized O(1) per access because a
+    /// compaction shrinks `order` back to `map.len()` and only re-triggers
+    /// after another `threshold - capacity` pushes.
+    fn maybe_compact(&mut self) {
+        // `+ 64` (and the `64` floor) keep tiny capacities from compacting on
+        // every access; `4 * capacity` bounds the overhead for large ones.
+        let threshold = self
+            .capacity
+            .saturating_mul(4)
+            .max(self.capacity.saturating_add(64))
+            .max(64);
+        if self.order.len() > threshold {
+            let map = &self.map;
+            self.order.retain(|(key, generation)| {
+                map.get(key).is_some_and(|(_, cur)| *cur == *generation)
+            });
+            debug_assert_eq!(self.order.len(), self.map.len());
         }
     }
 
@@ -197,7 +225,8 @@ where
             .map
             .insert(key.clone(), (value, generation))
             .map(|(v, _)| v);
-        self.order.push_back((key.clone(), generation));
+        self.order.push_back((key, generation));
+        self.maybe_compact();
 
         // Grow (only when this is a new key), then evict least-recently-used
         // until back within capacity. Re-inserting an existing key replaced it
@@ -224,8 +253,17 @@ where
                 .is_some_and(|(_, current)| *current == generation)
             {
                 self.map.remove(&key);
-                break;
+                return;
             }
+        }
+        // Defensive fallback: `order` should always name a live key whenever
+        // `map` is over capacity (each live key owns a live record), but if it
+        // is ever empty here, evict an arbitrary key rather than letting the
+        // caller loop forever.
+        if self.map.len() > self.capacity
+            && let Some(victim) = self.map.keys().next().cloned()
+        {
+            self.map.remove(&victim);
         }
     }
 
@@ -257,9 +295,9 @@ where
 
 /// A thread-safe handle to an [`LruCache`].
 ///
-/// The inner cache lives behind an `RwLock`. [`SharedCache::get`] and
-/// [`SharedCache::peek`] take the shared (read) lock; [`SharedCache::insert`]
-/// takes the exclusive (write) lock.
+/// The inner cache lives behind an `RwLock`. [`SharedCache::peek`] takes the
+/// shared (read) lock; [`SharedCache::get`], [`SharedCache::insert`],
+/// [`SharedCache::remove`] and [`SharedCache::clear`] take the exclusive (write) lock.
 ///
 /// # Why `get` and `peek` differ
 ///
@@ -766,6 +804,37 @@ mod tests {
         for i in (10_000 - 16)..10_000 {
             assert_eq!(c.get(&i), Some(&(i * 2)));
         }
+    }
+
+    #[test]
+    fn lru_get_heavy_workload_keeps_recency_store_bounded() {
+        // Every `get` pushes one recency record while only eviction pops, so a
+        // hit-heavy workload with no evictions must still keep `order` bounded
+        // via periodic compaction of stale records.
+        let mut c = LruCache::with_capacity(8);
+        for i in 0..8 {
+            c.insert(i, i);
+        }
+        for _ in 0..10_000 {
+            assert_eq!(c.get(&0), Some(&0));
+        }
+        let bound = c.capacity() * 4 + 64;
+        assert!(
+            c.order.len() <= bound,
+            "recency store grew without bound: {} > {bound}",
+            c.order.len()
+        );
+        // Compaction must preserve LRU semantics: all live keys intact.
+        assert_eq!(c.len(), 8);
+        for i in 0..8 {
+            assert_eq!(c.peek(&i), Some(&i));
+        }
+        // And eviction still works afterwards: inserting a 9th key evicts the
+        // LRU (key 1 — key 0 was just touched 10k times, so it is MRU).
+        c.insert(8, 8);
+        assert_eq!(c.len(), 8);
+        assert_eq!(c.get(&0), Some(&0), "hot key must survive eviction");
+        assert_eq!(c.peek(&1), None, "least-recently-used key must be evicted");
     }
 
     /// Textbook LRU reference: a `Vec` of keys ordered least-recently-used first.
