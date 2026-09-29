@@ -113,6 +113,8 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -152,6 +154,7 @@ impl ChatMessage {
         Self {
             role,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -167,6 +170,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content,
+            reasoning_content: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             tool_call_id: None,
         }
@@ -177,9 +181,19 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
         }
+    }
+
+    /// Attach reasoning content (chain of thought) to this message.
+    ///
+    /// Thinking-mode models (DeepSeek, etc.) require previous assistant reasoning
+    /// to be replayed back to the API in multi-turn conversation history.
+    pub fn with_reasoning_content(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning_content = reasoning.filter(|r| !r.trim().is_empty());
+        self
     }
 
     /// Read-only view of the (already validated) role.
@@ -193,6 +207,11 @@ impl ChatMessage {
     /// The message content, if any.
     pub fn content(&self) -> Option<&str> {
         self.content.as_deref()
+    }
+
+    /// The reasoning content, if any.
+    pub fn reasoning_content(&self) -> Option<&str> {
+        self.reasoning_content.as_deref()
     }
 }
 
@@ -243,6 +262,8 @@ pub(crate) struct StreamChoice {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct StreamDelta {
     pub(crate) content: Option<String>,
+    #[serde(default, alias = "reasoning")]
+    pub(crate) reasoning_content: Option<String>,
     #[serde(default)]
     pub(crate) tool_calls: Vec<StreamToolCall>,
 }
@@ -275,6 +296,8 @@ pub(crate) struct ChatChoice {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatMessageOutput {
     pub(crate) content: Option<String>,
+    #[serde(default, alias = "reasoning")]
+    pub(crate) reasoning_content: Option<String>,
     #[serde(default)]
     pub(crate) tool_calls: Vec<ToolCallOutput>,
 }
@@ -307,6 +330,8 @@ pub struct AgentStepLog {
 pub struct LlmResponse {
     /// Full text content from the assistant (may be empty if model only used tool_calls)
     pub content: String,
+    /// Captured chain-of-thought reasoning, required for multi-turn history with reasoning models
+    pub reasoning_content: Option<String>,
     /// Extracted bash command — from tool_calls first, regex fallback second
     pub command: Option<String>,
     /// Raw tool_calls from the response, for re-insertion into conversation history

@@ -553,3 +553,63 @@ async fn unterminated_oversized_run_is_capped_and_the_stream_recovers() {
     );
     assert_eq!(resp.invalid_utf8_lines, 0);
 }
+
+/// Thinking-mode models (DeepSeek, etc.) stream chain-of-thought in `reasoning_content`
+/// (or `reasoning`), which must be accumulated and surfaced on `LlmResponse`.
+#[tokio::test]
+async fn reasoning_content_is_captured_from_stream_and_serialized_in_history() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"reasoning_content":"Let's think about this. "}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning_content":"We need to list files.\n"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"```bash\nls -la\n```"}}]}"#,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
+
+    assert_eq!(
+        resp.reasoning_content.as_deref(),
+        Some("Let's think about this. We need to list files.\n")
+    );
+    assert_eq!(resp.command.as_deref(), Some("ls -la"));
+
+    // Verify ChatMessage serialization includes reasoning_content
+    let msg = ChatMessage::text(Role::Assistant, "I will list files")
+        .with_reasoning_content(resp.reasoning_content.clone());
+    let serialized = serde_json::to_string(&msg).expect("serialize");
+    assert!(
+        serialized.contains(r#""reasoning_content":"Let's think about this. We need to list files.\n""#),
+        "reasoning_content must be serialized on assistant message: {serialized}"
+    );
+
+    // Verify ChatMessage without reasoning omits the field completely
+    let plain_msg = ChatMessage::text(Role::Assistant, "I will list files");
+    let plain_serialized = serde_json::to_string(&plain_msg).expect("serialize");
+    assert!(
+        !plain_serialized.contains("reasoning_content"),
+        "reasoning_content must be omitted when None: {plain_serialized}"
+    );
+}
+
+/// The `reasoning` alias used by some OpenAI-compatible proxies must also be accumulated.
+#[tokio::test]
+async fn reasoning_alias_in_delta_is_accumulated() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"reasoning":"Thought step 1. "}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning":"Thought step 2."}}]}"#,
+        r#"{"choices":[{"delta":{"content":"```bash\npwd\n```"}}]}"#,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
+
+    assert_eq!(
+        resp.reasoning_content.as_deref(),
+        Some("Thought step 1. Thought step 2.")
+    );
+    assert_eq!(resp.command.as_deref(), Some("pwd"));
+}

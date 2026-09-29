@@ -299,14 +299,17 @@ impl WorkerPool {
                 }
                 None => {
                     info!(worker = %worker_id, step = step, "No bash command in response; prompting subagent directly");
-                    messages.push(ChatMessage::text(
-                        Role::Assistant,
-                        if llm_resp.content.trim().is_empty() {
-                            "I will execute a bash command.".into()
-                        } else {
-                            llm_resp.content
-                        },
-                    ));
+                    messages.push(
+                        ChatMessage::text(
+                            Role::Assistant,
+                            if llm_resp.content.trim().is_empty() {
+                                "I will execute a bash command.".into()
+                            } else {
+                                llm_resp.content
+                            },
+                        )
+                        .with_reasoning_content(llm_resp.reasoning_content),
+                    );
                     messages.push(ChatMessage::text(
                         Role::User,
                         "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
@@ -446,7 +449,9 @@ impl WorkerPool {
                 } else {
                     Some(llm_resp.content)
                 };
-                messages.push(ChatMessage::assistant_with_tool_calls(content, tool_calls));
+                let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
+                    .with_reasoning_content(llm_resp.reasoning_content);
+                messages.push(msg);
                 messages.push(ChatMessage::tool_result(tc_id, &output_text));
             } else {
                 // Fallback: code-block models use plain assistant + user messages
@@ -455,7 +460,9 @@ impl WorkerPool {
                 } else {
                     llm_resp.content
                 };
-                messages.push(ChatMessage::text(Role::Assistant, assistant_content));
+                let msg = ChatMessage::text(Role::Assistant, assistant_content)
+                    .with_reasoning_content(llm_resp.reasoning_content);
+                messages.push(msg);
                 messages.push(ChatMessage::text(Role::User, output_text));
             }
         }

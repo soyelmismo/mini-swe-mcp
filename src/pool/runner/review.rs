@@ -271,7 +271,9 @@ impl WorkerPool {
             } else {
                 Some(llm_resp.content)
             };
-            review_messages.push(ChatMessage::assistant_with_tool_calls(content, tool_calls));
+            let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
+                .with_reasoning_content(llm_resp.reasoning_content);
+            review_messages.push(msg);
             review_messages.push(ChatMessage::tool_result(tc_id, &output_text));
         } else {
             let assistant_content = if llm_resp.content.trim().is_empty() {
@@ -279,7 +281,9 @@ impl WorkerPool {
             } else {
                 llm_resp.content
             };
-            review_messages.push(ChatMessage::text(Role::Assistant, assistant_content));
+            let msg = ChatMessage::text(Role::Assistant, assistant_content)
+                .with_reasoning_content(llm_resp.reasoning_content);
+            review_messages.push(msg);
             review_messages.push(ChatMessage::text(Role::User, output_text));
         }
     }

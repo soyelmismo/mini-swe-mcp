@@ -157,6 +157,7 @@ impl StreamedToolCall {
 #[derive(Debug, Default)]
 pub(crate) struct SseAccumulator {
     pub(crate) content: String,
+    pub(crate) reasoning_content: String,
     /// Keyed by the provider's `index`, *not* positional. A sparse index
     /// (`index: 3` on the first frame) used to resize a `Vec` and fabricate
     /// empty placeholder tool calls that were later fed back to the model with
@@ -167,6 +168,8 @@ pub(crate) struct SseAccumulator {
     pub(crate) tools: BTreeMap<usize, StreamedToolCall>,
     /// Set when `content` hit [`MAX_STREAMED_CONTENT_BYTES`].
     pub(crate) content_capped: bool,
+    /// Set when `reasoning_content` hit [`MAX_STREAMED_CONTENT_BYTES`].
+    pub(crate) reasoning_capped: bool,
     /// Count of frames that were not valid UTF-8 (decoded lossily).
     pub(crate) invalid_utf8_lines: usize,
     /// Reusable decode buffer for the lossy UTF-8 path, so a corrupting stream
@@ -328,6 +331,9 @@ impl SseAccumulator {
         if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
             && let Some(choice) = chunk.choices.first()
         {
+            if let Some(r) = &choice.delta.reasoning_content {
+                self.push_reasoning_content(r);
+            }
             if let Some(c) = &choice.delta.content {
                 self.push_content(c);
             }
@@ -336,6 +342,32 @@ impl SseAccumulator {
             }
         }
         FrameOutcome::Consumed
+    }
+
+    /// Append streamed reasoning content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
+    pub(crate) fn push_reasoning_content(&mut self, text: &str) {
+        if self.reasoning_content.len() >= MAX_STREAMED_CONTENT_BYTES {
+            if !self.reasoning_capped {
+                self.reasoning_capped = true;
+                tracing::warn!(
+                    limit = MAX_STREAMED_CONTENT_BYTES,
+                    "Streamed assistant reasoning exceeded the retention budget; truncating"
+                );
+            }
+            return;
+        }
+        let room = MAX_STREAMED_CONTENT_BYTES - self.reasoning_content.len();
+        if text.len() <= room {
+            self.reasoning_content.push_str(text);
+            return;
+        }
+        self.reasoning_content
+            .push_str(&text[..text.floor_char_boundary(room)]);
+        self.reasoning_capped = true;
+        tracing::warn!(
+            limit = MAX_STREAMED_CONTENT_BYTES,
+            "Streamed assistant reasoning exceeded the retention budget; truncating"
+        );
     }
 
     /// Append streamed content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
@@ -493,6 +525,7 @@ impl SseAccumulator {
     pub(crate) fn finish(self) -> LlmResponse {
         let SseAccumulator {
             content,
+            reasoning_content,
             tools,
             invalid_utf8_lines,
             ..
@@ -544,8 +577,11 @@ impl SseAccumulator {
             })
         });
 
+        let reasoning = (!reasoning_content.trim().is_empty()).then_some(reasoning_content);
+
         LlmResponse {
             content,
+            reasoning_content: reasoning,
             command,
             tool_calls,
             tool_call_id,
@@ -556,11 +592,15 @@ impl SseAccumulator {
     /// Handle non-streaming JSON response fallback.
     pub(crate) fn handle_non_stream_fallback(&mut self, buffer: &[u8]) {
         if self.content.is_empty()
+            && self.reasoning_content.is_empty()
             && self.tools.is_empty()
             && !buffer.is_empty()
             && let Ok(result) = serde_json::from_slice::<ChatCompletionResponse>(buffer)
             && let Some(choice) = result.choices.first()
         {
+            if let Some(r) = &choice.message.reasoning_content {
+                self.push_reasoning_content(r);
+            }
             self.push_content(choice.message.content.as_deref().unwrap_or(""));
             for (n, tc) in choice.message.tool_calls.iter().enumerate() {
                 let entry = self.tools.entry(n).or_default();
