@@ -21,6 +21,12 @@
 //! one coherent table per repository. The optional swarm/domain tag is
 //! demoted to a `[tag]` prefix inside the task column, where it still shows
 //! but can no longer fracture the dashboard into many tiny tables.
+//!
+//! Each repository heading carries that repository's own counters
+//! (`total`, then every non-zero state), folded in by `RepoGroup::push` on
+//! the same pass that groups the rows. The global counters above stay the
+//! cross-repository view, so one repository finishing early is visible both in
+//! its own table and in the fleet-wide strip.
 
 use crate::pool::{WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
@@ -534,6 +540,99 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
 // Dashboard rendering
 // ---------------------------------------------------------------------------
 
+/// The status buckets the dashboard counts, in heading order.
+///
+/// One classifier feeds both the global strip and the per-repository counters,
+/// so the two views can never disagree about what a status means.
+#[derive(Clone, Copy)]
+enum Bucket {
+    Active,
+    Paused,
+    Reviewing,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+/// Classify a raw registry status; anything unrecognized is `Stopped`, which
+/// is the same catch-all the supervisor already used for terminal workers.
+fn status_bucket(status: &str) -> Bucket {
+    match status {
+        "running" => Bucket::Active,
+        "paused" => Bucket::Paused,
+        "reviewing" => Bucket::Reviewing,
+        "completed" => Bucket::Completed,
+        "failed" => Bucket::Failed,
+        _ => Bucket::Stopped,
+    }
+}
+
+/// One repository's slice of the dashboard: its workers plus the counters
+/// shown in its heading.
+///
+/// The counters are folded in while grouping (one pass over the entries), so
+/// the heading never needs a second scan and the row loop never needs a
+/// per-status branch of its own.
+struct RepoGroup<'a> {
+    workers: Vec<&'a WorkerRegistryEntry>,
+    active: usize,
+    paused: usize,
+    reviewing: usize,
+    completed: usize,
+    failed: usize,
+    stopped: usize,
+}
+
+impl<'a> RepoGroup<'a> {
+    /// An empty group, ready for [`RepoGroup::push`].
+    fn new() -> Self {
+        Self {
+            workers: Vec::new(),
+            active: 0,
+            paused: 0,
+            reviewing: 0,
+            completed: 0,
+            failed: 0,
+            stopped: 0,
+        }
+    }
+
+    /// Append one worker and fold its status into the counters.
+    fn push(&mut self, entry: &'a WorkerRegistryEntry) {
+        match status_bucket(&entry.status) {
+            Bucket::Active => self.active += 1,
+            Bucket::Paused => self.paused += 1,
+            Bucket::Reviewing => self.reviewing += 1,
+            Bucket::Completed => self.completed += 1,
+            Bucket::Failed => self.failed += 1,
+            Bucket::Stopped => self.stopped += 1,
+        }
+        self.workers.push(entry);
+    }
+
+    /// Heading counters: `total` first, then every non-zero state.
+    ///
+    /// A quiet repository reads `total: 4`, a busy one
+    /// `total: 4 | active: 2 | reviewing: 1 | completed: 1`. Every state is
+    /// covered, so no worker is hidden behind a dropped counter, and the zeros
+    /// are dropped so an idle worktree spends its heading on `total` alone.
+    fn summary_items(&self) -> Vec<(&'static str, String, &'static str)> {
+        [
+            ("total", self.workers.len(), bold()),
+            ("active", self.active, green()),
+            ("paused", self.paused, yellow()),
+            ("reviewing", self.reviewing, magenta()),
+            ("completed", self.completed, blue()),
+            ("failed", self.failed, red()),
+            ("stopped", self.stopped, dim()),
+        ]
+        .into_iter()
+        .filter(|(_, count, _)| *count > 0)
+        .map(|(label, count, color)| (label, count.to_string(), color))
+        .collect()
+    }
+}
+
 /// Render the supervisor dashboard at the default width.
 pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bool) -> String {
     render_dashboard_with_width(entries, now, use_color, DEFAULT_TERMINAL_WIDTH)
@@ -560,19 +659,21 @@ pub fn render_dashboard_with_width(
     let mut reviewing = 0;
 
     // Group entries by repository path: a supervisor supervises one worktree
-    // at a time, so this yields one coherent table per repository.
-    let mut repos: BTreeMap<&str, Vec<&WorkerRegistryEntry>> = BTreeMap::new();
+    // at a time, so this yields one coherent table per repository, each with
+    // its own counters. `BTreeMap` keeps repositories in path order, so the
+    // dashboard never reshuffles between ticks.
+    let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
     for entry in entries {
-        match entry.status.as_str() {
-            "running" => active += 1,
-            "paused" => paused += 1,
-            "completed" => completed += 1,
-            "failed" => failed += 1,
-            "reviewing" => reviewing += 1,
-            _ => stopped += 1,
+        match status_bucket(&entry.status) {
+            Bucket::Active => active += 1,
+            Bucket::Paused => paused += 1,
+            Bucket::Reviewing => reviewing += 1,
+            Bucket::Completed => completed += 1,
+            Bucket::Failed => failed += 1,
+            Bucket::Stopped => stopped += 1,
         }
         let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
-        repos.entry(repo).or_default().push(entry);
+        repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
     }
 
     let total = entries.len();
@@ -626,12 +727,13 @@ pub fn render_dashboard_with_width(
         return out;
     }
 
-    for (repo_path, repo_workers) in repos {
-        let count = repo_workers.len();
-        let heading = truncate_visible(
-            &format!("[REPO: {repo_path}] ({count} workers)"),
-            layout.total,
-        );
+    for (repo_path, group) in repos {
+        // The heading carries the path and every per-repo counter, so the rows
+        // below it stay one clean table with no domain sub-sections. The
+        // summary is joined on one line and the whole heading is then capped to
+        // the terminal, so a long path costs counters, never a wrapped header.
+        let summary = summary_line(&group.summary_items(), use_color);
+        let heading = truncate_visible(&format!("[REPO: {repo_path}]  {summary}"), layout.total);
         if use_color {
             out.push_str(&format!("\x1b[1;36m{heading}\x1b[0m\n"));
         } else {
@@ -648,7 +750,7 @@ pub fn render_dashboard_with_width(
         }
         out.push('\n');
 
-        for w in repo_workers {
+        for w in &group.workers {
             let op = op_cell(w, &layout, use_color);
             match layout.shape {
                 RowShape::Inline { .. } => {
@@ -740,6 +842,26 @@ fn red() -> &'static str {
 /// Dim white: stopped.
 fn dim() -> &'static str {
     "\x1b[2;37m"
+}
+
+/// Join `label: value` items onto a single line for a repository heading.
+///
+/// Unlike [`stats_lines`] this never folds and never appends a newline: the
+/// heading must stay one line so the table header sits directly under it, and
+/// the caller caps the whole heading with [`truncate_visible`] afterwards.
+fn summary_line(items: &[(&str, String, &'static str)], use_color: bool) -> String {
+    let mut out = String::new();
+    for (i, (label, value, color)) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  |  ");
+        }
+        if use_color {
+            out.push_str(&format!("{label}: {color}{value}\x1b[0m"));
+        } else {
+            out.push_str(&format!("{label}: {value}"));
+        }
+    }
+    out
 }
 
 /// Render the `label: value | label: value` counter strip, folded to `width`.
@@ -1033,10 +1155,26 @@ mod tests {
 
         let text = render_dashboard(&entries, 1060, false);
 
-        // One unified table per repository, with all of its workers together...
-        assert!(text.contains("[REPO: /home/dev/proj-a] (2 workers)"));
-        assert!(text.contains("[REPO: /home/dev/proj-b] (1 workers)"));
-        assert!(text.contains("[REPO: local] (1 workers)"));
+        // One unified table per repository, with all of its workers together,
+        // each heading carrying that repository's own counters.
+        assert!(
+            text.contains("[REPO: /home/dev/proj-a]  total: 2  |  active: 2"),
+            "missing per-repo summary:\n{text}"
+        );
+        assert!(
+            text.contains("[REPO: /home/dev/proj-b]  total: 1  |  paused: 1"),
+            "missing per-repo summary:\n{text}"
+        );
+        assert!(
+            text.contains("[REPO: local]  total: 1  |  completed: 1"),
+            "missing per-repo summary:\n{text}"
+        );
+        // A repository with nothing but terminal workers spends its heading on
+        // `total` alone, never on the states that are zero.
+        assert!(
+            text.contains("[REPO: local]  total: 1  |  completed: 1\n"),
+            "zero counters must be dropped:\n{text}"
+        );
         assert!(!text.contains("[SWARM:"));
         assert_eq!(text.matches("LAST OP / TASK").count(), 3);
 
@@ -1052,6 +1190,44 @@ mod tests {
         // The counters are global, above every repository table.
         assert!(text.contains("Active: 2"));
         assert!(text.contains("Repos: 3"));
+    }
+
+    #[test]
+    fn test_repository_grouping_ignores_domain_tags() {
+        // Three domain tags, one repository: the tags must not sub-partition
+        // the dashboard, they only prefix the task column of their own row.
+        let entries: Vec<WorkerRegistryEntry> = [
+            ("aud001", "running", "audits"),
+            ("perf001", "running", "perf"),
+            ("sec001", "completed", "sec"),
+        ]
+        .iter()
+        .map(|(id, status, group)| {
+            Row::new(id)
+                .status(status)
+                .task("Task for the domain")
+                .command("cargo test")
+                .turns(3, 100)
+                .group(group)
+                .repo("/home/dev/proj-a")
+                .build()
+        })
+        .collect();
+
+        let text = render_dashboard(&entries, 1060, false);
+
+        // A single table holds all three workers of the repository...
+        assert_eq!(text.matches("[REPO: /home/dev/proj-a]").count(), 1);
+        assert_eq!(text.matches("LAST OP / TASK").count(), 1);
+        // ...with one summary counting every state at once...
+        assert!(
+            text.contains("[REPO: /home/dev/proj-a]  total: 3  |  active: 2  |  completed: 1"),
+            "per-repo summary must consolidate the states:\n{text}"
+        );
+        // ...and the domain tags demoted to a per-row prefix.
+        for tag in ["[audits]", "[perf]", "[sec]"] {
+            assert!(text.contains(tag), "missing {tag} prefix:\n{text}");
+        }
     }
 
     #[test]
@@ -1335,4 +1511,3 @@ mod tests {
         assert!(text.contains("cargo test --all"), "command must survive:\n{text}");
     }
 }
-
