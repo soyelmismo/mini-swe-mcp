@@ -20,7 +20,8 @@ use tokio::process::{Child, Command};
 
 use super::AgentRunner;
 use super::sandbox::{
-    find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command, truncate_output, validate_bash_command,
+    find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command, truncate_output,
+    validate_bash_command,
 };
 
 /// Exit code reported to the model when a command exceeded its wall-clock
