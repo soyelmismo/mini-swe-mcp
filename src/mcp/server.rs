@@ -1,10 +1,10 @@
 //! The [`McpServer`] handle, its handshake, and the stdio run loop.
 //!
-//! The server owns no worker logic of its own: it holds the [`WorkerPool`], the
-//! model manifest and the precomputed `tools/list` payload, then routes each
-//! JSON-RPC request to the right response. Verb handling lives in
-//! [`super::handlers`], the advertised contract in [`super::schema`] and the
-//! envelope types in [`super::protocol`].
+//! The server owns no worker logic: it holds the [`WorkerPool`], the model
+//! manifest and the precomputed `tools/list` payload, then routes each JSON-RPC
+//! request to the right response. Verb handling lives in [`super::handlers`],
+//! the advertised contract in [`super::schema`], the envelope types in
+//! [`super::protocol`].
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -28,9 +28,9 @@ pub struct McpServer {
     pub(super) pool: Arc<WorkerPool>,
     pub(super) default_model: String,
     pub(super) manifest: Arc<ModelManifest>,
-    /// Precomputed, immutable `tools/list` result. The manifest is never mutated
-    /// after construction, so the payload is byte-identical for the process
-    /// lifetime and is cloned (an `Arc` memcpy) instead of rebuilt per request.
+    /// Precomputed, immutable `tools/list` result. The manifest is never
+    /// mutated after construction, so the payload is byte-identical for the
+    /// process lifetime and is cloned (an `Arc` memcpy) instead of rebuilt.
     pub(super) tools_list: Arc<Value>,
 }
 
@@ -134,7 +134,7 @@ impl McpServer {
     ///
     /// The response borrows `req` wherever it can — the echoed `id`, the
     /// unknown method name in the `-32601` message and `tools/list`'s
-    /// precomputed payload all come from the frame that is already in memory.
+    /// precomputed payload all come from the frame already in memory.
     async fn handle_request<'a>(
         &'a self,
         req: JsonRpcRequest<'a>,
@@ -226,18 +226,19 @@ impl McpServer {
     /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
     ///
     /// Returns the terminal payload:
-    /// * `{ worker_id, state, logs }` when the worker reached `Completed`/`Failed`
-    /// * `{ worker_id, status: "needs_input", question, step, message }` when the
-    ///   worker paused waiting for steering.
+    /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
+    /// * `{ worker_id, status: "needs_input", question, step, message }` when
+    ///   paused waiting for steering.
     ///
-    /// Progress notifications are emitted only when a `progress_token`/`tx` pair is
-    /// supplied (i.e. the MCP stdio path); the plain-CLI path passes `None`, and the
-    /// polling algorithm stays identical for both callers.
+    /// Progress notifications are emitted only when a `progress_token`/`tx`
+    /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
+    /// and the polling algorithm stays identical for both callers.
     ///
-    /// Per-step progress frames pass through a [`ProgressThrottle`] so a worker that
-    /// ticks many steps in quick succession cannot flood stdio: successive frames are
-    /// at least [`PROGRESS_MIN_INTERVAL`](super::handlers::PROGRESS_MIN_INTERVAL)
-    /// apart. Terminal frames (finished / paused) bypass the throttle and are always
+    /// Per-step progress frames pass through a [`ProgressThrottle`] so a worker
+    /// that ticks many steps in quick succession cannot flood stdio: successive
+    /// frames are at least
+    /// [`PROGRESS_MIN_INTERVAL`](super::handlers::PROGRESS_MIN_INTERVAL) apart.
+    /// Terminal frames (finished / paused) bypass the throttle and are always
     /// delivered.
     pub async fn await_worker_result(
         &self,
@@ -323,8 +324,8 @@ impl McpServer {
 
 /// Read one newline-delimited frame without letting a peer grow the input
 /// buffer beyond the protocol limit. On overflow, discard through the next
-/// newline so that the following request stays in sync. `false` means the
-/// buffer holds a complete line; `true` means the line was too long.
+/// newline so the following request stays in sync. `false` means the buffer
+/// holds a complete line; `true` means the line was too long.
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
