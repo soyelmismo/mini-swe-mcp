@@ -2,7 +2,7 @@ use anyhow::Result;
 use mini_swe_mcp::config::xdg_config_dir;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::{McpServer, WORKER_ACTIONS};
-use mini_swe_mcp::pool::{WorkerPhase, WorkerPool, emit_view};
+use mini_swe_mcp::pool::WorkerPool;
 use mini_swe_mcp::worktree;
 use std::env;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -362,9 +362,17 @@ where
         }
 
         let mut result = server
-            .execute_tool("worker", serde_json::Value::Object(tool_args))
+            .execute_tool("worker", serde_json::Value::Object(tool_args.clone()))
             .await?;
 
+        // Interactive steering: whenever the shared wait loop reports the worker
+        // paused for input, prompt the operator and resume. Re-waiting goes through
+        // the exact same helper the MCP stdio dispatch path uses, so both callers
+        // share one polling/termination algorithm.
+        let wait_max_turns = tool_args
+            .get("max_turns")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
         while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
             let wid = result["worker_id"].as_str().unwrap_or("").to_string();
             let q = result["question"].as_str().unwrap_or("");
@@ -382,56 +390,9 @@ where
             pool.steer(&wid, input).await?;
             eprintln!("[mini-swe] Guidance sent. Resuming execution...");
 
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                // Lightweight progress poll: no cloning of the worker's
-                // diff/summary/artifacts on every tick (see pool::worker_progress).
-                let Some(progress) = pool.worker_progress(&wid).await else {
-                    continue;
-                };
-                match progress.phase {
-                    WorkerPhase::Completed | WorkerPhase::Failed => {
-                        let state = pool.get_worker_state(&wid).await;
-                        // Bounded emission: the CLI never materialises the
-                        // whole history, and the counters say what is
-                        // missing (audit 07, R4 / R7).
-                        let (logs, logs_omitted, logs_dropped, notice) =
-                            match pool.get_worker_logs(&wid).await {
-                                Some(buffer) => {
-                                    let view =
-                                        emit_view(&buffer, pool.log_policy().max_emitted);
-                                    (
-                                        view.logs,
-                                        view.logs_omitted,
-                                        buffer.dropped(),
-                                        view.logs_truncation_notice,
-                                    )
-                                }
-                                None => (Vec::new(), 0, 0, None),
-                            };
-                        result = serde_json::json!({
-                            "worker_id": wid,
-                            "state": state,
-                            "logs": logs,
-                            "logs_omitted": logs_omitted,
-                            "logs_dropped": logs_dropped,
-                            "logs_truncation_notice": notice,
-                        });
-                        break;
-                    }
-                    WorkerPhase::Paused => {
-                        result = serde_json::json!({
-                            "worker_id": wid,
-                            "status": "needs_input",
-                            "question": progress.question,
-                            "step": progress.step,
-                            "message": "Worker is paused waiting for orchestrator steering."
-                        });
-                        break;
-                    }
-                    WorkerPhase::Running => {}
-                }
-            }
+            result = server
+                .await_worker_result(&wid, wait_max_turns, None, None)
+                .await?;
         }
 
         if json_output {

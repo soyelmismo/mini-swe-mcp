@@ -800,8 +800,11 @@ mod tests {
         );
     }
 
+    static TEST_CACHE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
+        let _guard = TEST_CACHE_MUTEX.lock().unwrap();
         clear_catalog_cache();
 
         let a = ModelDefinition {
@@ -841,6 +844,7 @@ mod tests {
 
     #[test]
     fn test_catalog_cache_stays_bounded() {
+        let _guard = TEST_CACHE_MUTEX.lock().unwrap();
         clear_catalog_cache();
 
         for i in 0..(CATALOG_CACHE_CAPACITY + 8) {

@@ -305,7 +305,11 @@ struct BashArgs {
     command: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One executed step of a subagent run.
+///
+/// `Deserialize` is intentionally absent: step logs are only ever *built* in
+/// `pool::run_worker` and then serialized outward, never parsed back.
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentStepLog {
     pub step: usize,
     pub command: String,
@@ -1815,7 +1819,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_bash_sandbox_runs_and_blocks_write() {
-        let tmp = std::env::temp_dir().join(format!("swe-test-bwrap-{}", std::process::id()));
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = crate::worktree::swe_base_dir().join(format!("bwrap-test-{}-{unique_id}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let r = runner();
 
@@ -1824,7 +1832,7 @@ mod tests {
             .execute_bash(&tmp, "echo 'hello from sandbox'")
             .await
             .unwrap();
-        assert_eq!(code, Some(0));
+        assert_eq!(code, Some(0), "command failed with output: {out:?}");
         assert!(out.contains("hello from sandbox"));
 
         // 2. Writing to read-only host root /usr fails when bwrap is active
@@ -1837,11 +1845,17 @@ mod tests {
             assert!(
                 out.contains("Read-only")
                     || out.contains("sólo lectura")
+                    || out.contains("solo lectura")
                     || out.contains("Permission denied")
+                    || out.contains("Permiso denegado"),
+                "unexpected touch output: {out:?}, code: {code:?}"
             );
         }
 
+        let target_dir = crate::worktree::swe_base_dir()
+            .join(format!("swe-target-bwrap-test-{}-{unique_id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&target_dir);
     }
 
     #[test]

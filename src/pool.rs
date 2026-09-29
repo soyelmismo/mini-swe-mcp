@@ -179,13 +179,10 @@ impl LogRetentionPolicy {
 ///   *tail* of the worker's history.
 /// * [`LogBuffer::dropped`] counts every entry evicted since the buffer was
 ///   created, which is what makes the degradation observable (audit 07, R7).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LogBuffer {
-    #[serde(default)]
     entries: VecDeque<AgentStepLog>,
-    #[serde(default)]
     bytes: usize,
-    #[serde(default)]
     dropped: usize,
     max_retained: usize,
     max_bytes: usize,
@@ -991,8 +988,8 @@ impl WorkerPool {
                 runner.execute_bash(&worktree.path, &cmd_str).await?
             };
 
-            // 2. Check for REQUEST_TURNS sentinel in command or output
-            if let Some(additional) = parse_request_turns(&cmd_str, &output) {
+            // 2. Check for REQUEST_TURNS sentinel in the command itself
+            if let Some(additional) = parse_request_turns(&cmd_str) {
                 let old_max = current_max_turns;
                 current_max_turns = (current_max_turns + additional).max(current_max_turns).min(500);
                 info!(
@@ -1004,8 +1001,8 @@ impl WorkerPool {
                 );
             }
 
-            // 3. Check for ASK_ORCHESTRATOR sentinel in command or output
-            if let Some(question) = parse_ask_orchestrator(&cmd_str, &output) {
+            // 3. Check for ASK_ORCHESTRATOR sentinel in the command itself
+            if let Some(question) = parse_ask_orchestrator(&cmd_str) {
                 info!(
                     worker = %worker_id,
                     question = %question,
@@ -1425,7 +1422,6 @@ impl WorkerPool {
     }
 
     /// Collect a worker's final result and release its in-memory resources.
-    ///
     /// The retained window is *moved* out of the pool and then narrowed to the
     /// emission budget, so a single response can never serialize the full
     /// history (audit 07, R4). Both counters travel with the result so the
@@ -1518,7 +1514,7 @@ pub fn summarize_command(cmd: &str) -> String {
     out
 }
 
-pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
+pub fn parse_request_turns(cmd: &str) -> Option<usize> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("REQUEST_TURNS:")
@@ -1538,7 +1534,7 @@ pub fn parse_request_turns(cmd: &str, _output: &str) -> Option<usize> {
     None
 }
 
-pub fn parse_ask_orchestrator(cmd: &str, _output: &str) -> Option<String> {
+pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
         && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")
@@ -1579,11 +1575,11 @@ mod tests {
 
     #[test]
     fn test_parse_request_turns() {
-        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20", ""), Some(20));
-        assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'", ""), Some(15));
-        assert_eq!(parse_request_turns("cat file.rs", "REQUEST_TURNS: 15"), None);
-        assert_eq!(parse_request_turns("echo nothing", "normal output"), None);
-        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0", ""), None);
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20"), Some(20));
+        assert_eq!(parse_request_turns("printf 'REQUEST_TURNS: 15'"), Some(15));
+        assert_eq!(parse_request_turns("cat file.rs"), None);
+        assert_eq!(parse_request_turns("echo nothing"), None);
+        assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0"), None);
     }
 
     // ----------
@@ -2019,21 +2015,18 @@ mod tests {
     #[test]
     fn test_parse_ask_orchestrator() {
         assert_eq!(
-            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'", ""),
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: should I delete old code?'"),
             Some("should I delete old code?".to_string())
         );
         assert_eq!(
-            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\"", ""),
+            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: is this ok?\""),
             Some("is this ok?".to_string())
         );
+        assert_eq!(parse_ask_orchestrator("cat src/agent.rs"), None);
         assert_eq!(
-            parse_ask_orchestrator("cat src/agent.rs", "echo 'ASK_ORCHESTRATOR: <your specific question>'"),
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'"),
             None
         );
-        assert_eq!(
-            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'", ""),
-            None
-        );
-        assert_eq!(parse_ask_orchestrator("ls -la", "total 12"), None);
+        assert_eq!(parse_ask_orchestrator("ls -la"), None);
     }
 }

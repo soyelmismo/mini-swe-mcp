@@ -559,6 +559,7 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
                 let p = entry.path();
                 if let Some(name) = p.file_name().and_then(|n| n.to_str())
                     && let Some(wt_name) = name.strip_prefix("swe-target-")
+                    && wt_name.starts_with("swe-wt-")
                 {
                     let wt_path = base.join(wt_name);
                     if !wt_path.exists() {
@@ -568,6 +569,12 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
             }
         }
     }
+
+    // Post-pass prune: phase 1 may have removed worktrees, which leaves new
+    // stale administrative entries; this second pass clears them. Together the
+    // pre- and post-passes form a legitimate double pass (pre collects old
+    // garbage, post collects what we just removed) — both are needed.
+    let _ = git(repo_root, "worktree prune", &["worktree", "prune"]);
 }
 
 impl Drop for WorktreeGuard {
@@ -587,7 +594,6 @@ impl Drop for WorktreeGuard {
 
         // Sync report/audit artifacts to repo root before cleanup
         let _ = self.sync_artifacts();
-
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
         let path_str = self.path.to_string_lossy();
