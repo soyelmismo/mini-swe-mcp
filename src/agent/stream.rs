@@ -36,6 +36,97 @@ static BASH_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?s)```(?:bash|sh)[ \t\r\n]*\n.*?\n```").expect("bash block regex must compile")
 });
 
+/// The `data:` field name of the Server-Sent Events wire format, as bytes.
+const DATA_FIELD: &[u8] = b"data:";
+
+/// The end-of-stream sentinel carried in a `data:` field.
+const DONE_SENTINEL: &[u8] = b"[DONE]";
+
+/// Classify one raw (undecoded) SSE line and return the bytes of its payload.
+///
+/// Returns `None` for every line that carries no `data` payload — blank lines,
+/// SSE comments (a leading `:`), and fields such as `event:`, `id:` or
+/// `retry:` — so the caller skips them without decoding or allocating. For a
+/// `data:` line it returns the payload with leading/trailing ASCII whitespace
+/// removed, matching the SSE spec's single optional space after the colon.
+///
+/// Operating on `&[u8]` keeps the filter allocation-free and lets the caller
+/// run it *before* UTF-8 validation, so a keep-alive comment costs one
+/// comparison instead of a decode.
+fn data_field(raw_line: &[u8]) -> Option<&[u8]> {
+    let line = trim_ascii(raw_line);
+    if line.is_empty() || line[0] == b':' {
+        return None;
+    }
+    // The field name is `data` followed by a colon; anything else is ignored.
+    let payload = line.strip_prefix(DATA_FIELD)?;
+    Some(trim_ascii(payload))
+}
+
+/// Trim ASCII whitespace from both ends of a byte slice.
+///
+/// SSE framing only ever introduces ASCII spaces/tabs/CR, and a `&[u8]` cannot
+/// carry the full Unicode whitespace set, so this is exact for the lines the
+/// spec allows. It is a no-op for the overwhelmingly common already-trimmed
+/// case, which the fast path inside `trim_ascii` detects in four comparisons.
+#[inline]
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    // Leading whitespace: skip while the front is ASCII whitespace.
+    while let [first, rest @ ..] = bytes {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    // Trailing whitespace: find the last non-whitespace byte, then slice.
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// Append the UTF-8-lossy decoding of `bytes` to `out` without allocating a
+/// temporary `String`.
+///
+/// Equivalent to `out.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes())`
+/// but writes byte-for-byte: every maximal valid subsequence is copied verbatim,
+/// and each maximal invalid subsequence collapses to the single U+FFFD
+/// replacement character — exactly the substitution `from_utf8_lossy` performs.
+/// `out` must be empty; it is cleared and then grown in place.
+fn lossy_decode_into(bytes: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(bytes.len() + REPLACEMENT_CHAR.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.extend_from_slice(valid.as_bytes());
+                return;
+            }
+            Err(err) => {
+                // Copy the valid prefix verbatim.
+                let (valid, after_valid) = rest.split_at(err.valid_up_to());
+                out.extend_from_slice(valid);
+                // Then one replacement char for the invalid run. When the error
+                // is merely a truncated trailing sequence there is nothing left
+                // to append afterwards, which `from_utf8` reports as
+                // `error_len() == None`; both cases produce a single U+FFFD.
+                out.extend_from_slice(REPLACEMENT_CHAR);
+                match err.error_len() {
+                    Some(len) => rest = &after_valid[len..],
+                    // Incomplete tail: nothing valid remains.
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+/// UTF-8 encoding of U+FFFD, the substitution character the lossy decoder emits.
+const REPLACEMENT_CHAR: &[u8] = "\u{FFFD}".as_bytes();
+
 /// A tool call being assembled from streaming deltas.
 #[derive(Debug, Default)]
 pub(crate) struct StreamedToolCall {
@@ -71,6 +162,9 @@ pub(crate) struct SseAccumulator {
     pub(crate) content_capped: bool,
     /// Count of frames that were not valid UTF-8 (decoded lossily).
     pub(crate) invalid_utf8_lines: usize,
+    /// Reusable decode buffer for the lossy UTF-8 path, so a corrupting stream
+    /// does not allocate one `String` per frame. Never escapes the accumulator.
+    lossy_scratch: Vec<u8>,
 }
 
 /// Outcome of feeding one complete SSE frame to the accumulator.
@@ -131,37 +225,73 @@ impl SseAccumulator {
     }
 
     /// Frame one newline-delimited line: decode, filter, parse, accumulate.
+    ///
+    /// Framing is done purely on `&[u8]`. The SSE field filter only has to
+    /// recognise three cheap byte patterns (empty line, `:` comment, the ASCII
+    /// `data:` field name), so a line is classified *before* any UTF-8 work:
+    /// keep-alive comments and other unknown fields are rejected without ever
+    /// being validated or copied. Only a `data:` line — the payload — reaches
+    /// the decoder, and even then it is borrowed in place, so no intermediate
+    /// `String` is materialised on the happy path.
     pub(crate) fn handle_line(&mut self, raw_line: &[u8]) -> FrameOutcome {
-        let trimmed: &str = match std::str::from_utf8(raw_line) {
-            Ok(s) => s.trim(),
-            Err(e) => {
-                self.invalid_utf8_lines += 1;
-                tracing::warn!(
-                    valid_up_to = e.valid_up_to(),
-                    error_len = e.error_len(),
-                    line_len = raw_line.len(),
-                    "SSE line is not valid UTF-8; decoding lossily"
-                );
-                return self.handle_text_line(String::from_utf8_lossy(raw_line).trim());
-            }
-        };
-
-        self.handle_text_line(trimmed)
-    }
-
-    /// Apply the shared SSE filter/parse/accumulate path to one trimmed line.
-    pub(crate) fn handle_text_line(&mut self, trimmed: &str) -> FrameOutcome {
-        if trimmed.is_empty() || trimmed.starts_with(':') {
-            return FrameOutcome::Consumed;
-        }
-        let Some(data) = trimmed.strip_prefix("data:") else {
+        // Cheap byte classification first: skip blanks, SSE comments
+        // (`:`) and any field other than `data` without decoding.
+        let Some(payload) = data_field(raw_line) else {
             return FrameOutcome::Consumed;
         };
-        let data = data.trim();
-        if data == "[DONE]" {
+
+        // `[DONE]` is a fixed ASCII token, so it is matched on bytes and never
+        // decoded at all.
+        if payload == DONE_SENTINEL {
             return FrameOutcome::Done;
         }
 
+        // Fast path: the payload is valid UTF-8. Borrow it straight out of the
+        // caller's buffer and hand a `&str` to the shared handler.
+        if let Ok(text) = std::str::from_utf8(payload) {
+            return self.handle_payload(text);
+        }
+
+        // Slow path: log and count exactly as before, then decode lossily.
+        // The decode reuses `self.lossy_scratch`'s capacity across frames, so a
+        // stream that keeps sending corrupted lines allocates once and then
+        // only regrows when a *larger* corrupted line arrives — instead of one
+        // fresh `String` per line, as `String::from_utf8_lossy` would.
+        // Log against `payload`, the region actually being decoded, so the
+        // reported offsets line up with the lossy substitution that follows.
+        let err = std::str::from_utf8(payload).unwrap_err();
+        self.invalid_utf8_lines += 1;
+        tracing::warn!(
+            valid_up_to = err.valid_up_to(),
+            error_len = err.error_len(),
+            line_len = payload.len(),
+            "SSE payload is not valid UTF-8; decoding lossily"
+        );
+
+        // `handle_payload` takes `&mut self`, so the decoded `&str` must not be
+        // borrowed from `self`. Decode into a local that starts with the capacity
+        // stashed in `lossy_scratch` (moved out, so there is no allocation after
+        // the first corrupted line), handle the line, then hand the capacity
+        // back for the next frame.
+        let mut decoded = std::mem::take(&mut self.lossy_scratch);
+        lossy_decode_into(payload, &mut decoded);
+        // `lossy_decode_into` only ever emits valid UTF-8, so this cannot fail.
+        let text = match String::from_utf8(decoded) {
+            Ok(text) => text,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        let outcome = self.handle_payload(&text);
+        // Recycle the allocation for the next corrupted line.
+        self.lossy_scratch = text.into_bytes();
+        outcome
+    }
+
+    /// Parse and accumulate one already-classified `data:` payload.
+    ///
+    /// Filtering (blank lines, comments, field name, `[DONE]`) has already been
+    /// done on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this
+    /// stage only has to turn JSON into deltas.
+    fn handle_payload(&mut self, data: &str) -> FrameOutcome {
         if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
             && let Some(choice) = chunk.choices.first()
         {
@@ -192,9 +322,15 @@ impl SseAccumulator {
             self.content.push_str(text);
             return;
         }
-        // Snap to a char boundary so we never store a partial code point.
-        let cut = self.content.len() + text.floor_char_boundary(room);
-        self.content.push_str(&text[..cut]);
+        // Take the longest prefix of `text` that fits in `room` bytes, snapped
+        // to a char boundary so we never store a partial code point.
+        //
+        // `floor_char_boundary` is *relative* to `text`, so the slice length is
+        // exactly that value. Adding `self.content.len()` here (an absolute
+        // offset) made the index run past the end of `text` and panic as soon
+        // as the buffer was non-empty, which is the normal case for a long
+        // stream crossing the cap.
+        self.content.push_str(&text[..text.floor_char_boundary(room)]);
         self.content_capped = true;
         tracing::warn!(
             limit = MAX_STREAMED_CONTENT_BYTES,
@@ -622,5 +758,187 @@ mod tests {
             tcs.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["one", "five"]
         );
+    }
+
+    // ---- UTF-8 decode / lossy regression tests ----
+
+    /// `lossy_decode_into` must match `String::from_utf8_lossy` byte-for-byte,
+    /// including truncated tails and multi-byte sequences split by bad bytes.
+    #[test]
+    fn lossy_decode_into_matches_std() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain ascii".to_vec(),
+            b"caf\xc3\xa9 \xe2\x82\xac".to_vec(),               // valid
+            b"caf\xc3\xa9".to_vec(),                           // truncated 2-byte tail
+            b"emoji \xf0\x9f\x98\x80 ok".to_vec(),              // valid 4-byte
+            b"\xf0\x9f\x98".to_vec(),                           // truncated 4-byte tail
+            b"\xff\xfe".to_vec(),                               // two invalid bytes
+            b"a\xffb\xffc".to_vec(),
+            b"pre\xffmid\x80post".to_vec(),
+            b"\xed\xa0\x80".to_vec(),                           // surrogate half
+            b"\xc0\xaf".to_vec(),                               // overlong
+            b"".to_vec(),
+        ];
+        for case in cases {
+            let mut got = Vec::new();
+            lossy_decode_into(&case, &mut got);
+            let want = String::from_utf8_lossy(&case);
+            assert_eq!(
+                std::str::from_utf8(&got).expect("decoder must emit valid UTF-8"),
+                want,
+                "lossy mismatch for {case:?}"
+            );
+            // And the output must itself be valid UTF-8, byte-identical in kind.
+            assert_eq!(got, want.as_bytes());
+        }
+    }
+
+    /// The lossy path must preserve the *decoded content* of a corrupted frame,
+    /// not just count it. A refactor that empties the buffer before handing it
+    /// to the parser would silently drop the model output here.
+    #[test]
+    fn corrupted_frame_keeps_its_decodable_content() {
+        let mut line = br#"data: {"choices":[{"delta":{"content":"keep"#.to_vec();
+        line.extend_from_slice(&[0xFF]);
+        line.extend_from_slice(br#"me"}}]}"#);
+        line.extend_from_slice(b"\n\ndata: [DONE]\n\n");
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        assert_eq!(acc.push(&line, &mut buffer), Some(FrameOutcome::Done));
+        assert_eq!(acc.invalid_utf8_lines, 1);
+        assert_eq!(
+            acc.content, "keep\u{FFFD}me",
+            "corrupted frame must still contribute its content"
+        );
+    }
+
+    /// Capacity is recycled across corrupted lines, so a long corrupting stream
+    /// must not allocate one buffer per frame.
+    #[test]
+    fn lossy_scratch_is_reused_across_frames() {
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let mut body = Vec::new();
+        for _ in 0..64 {
+            let mut f = br#"data: {"choices":[{"delta":{"content":"x"}}"#.to_vec();
+            f.extend_from_slice(&[0xFF]);
+            f.extend_from_slice(br#""}}]}"#);
+            f.extend_from_slice(b"\n\n");
+            body.extend_from_slice(&f);
+        }
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        acc.push(&body, &mut buffer);
+        assert_eq!(acc.invalid_utf8_lines, 64);
+        // Capacity is retained (not dropped) after the stream is processed.
+        assert!(
+            acc.lossy_scratch.capacity() > 0,
+            "decode buffer must keep its capacity for reuse"
+        );
+    }
+
+    /// Regression: truncating a *partially filled* buffer used to index `text`
+    /// with an absolute offset, panicking with "end byte index out of bounds".
+    #[test]
+    fn content_truncation_from_a_partially_filled_buffer_does_not_panic() {
+        let mut acc = SseAccumulator {
+            content: "x".repeat(MAX_STREAMED_CONTENT_BYTES - 1),
+            ..Default::default()
+        };
+        acc.push_content("abcdefghij");
+        assert_eq!(acc.content.len(), MAX_STREAMED_CONTENT_BYTES);
+        assert!(acc.content_capped);
+    }
+
+    /// Truncation must respect multi-byte boundaries in the delta itself: with
+    /// only 2 bytes of room a 3-byte `€` cannot fit, so it is dropped whole
+    /// rather than split into an invalid partial code point.
+    #[test]
+    fn content_truncation_snaps_to_char_boundary_in_delta() {
+        let mut acc = SseAccumulator {
+            content: "x".repeat(MAX_STREAMED_CONTENT_BYTES - 2),
+            ..Default::default()
+        };
+        acc.push_content("\u{20AC}\u{20AC}\u{20AC}"); // 3 x 3 bytes
+        assert_eq!(
+            acc.content.len(),
+            MAX_STREAMED_CONTENT_BYTES - 2,
+            "a 3-byte char must not be split across a 2-byte remainder"
+        );
+        assert!(acc.content.is_char_boundary(acc.content.len()));
+        assert!(!acc.content.contains('\u{FFFD}'), "no partial code point");
+    }
+
+    // ---- byte-slice field classification ----
+
+    #[test]
+    fn data_field_extracts_and_trims_payload() {
+        assert_eq!(data_field(b"data: {}"), Some(&b"{}"[..]));
+        assert_eq!(data_field(b"data:{}"), Some(&b"{}"[..]));
+        assert_eq!(data_field(b"  data:   {\"a\":1}  \r"), Some(&b"{\"a\":1}"[..]));
+        assert_eq!(data_field(b"\t data: x \t"), Some(&b"x"[..]));
+        // A payload that is itself blank is still a data field (empty payload).
+        assert_eq!(data_field(b"data:   "), Some(&b""[..]));
+    }
+
+    #[test]
+    fn data_field_rejects_non_data_lines() {
+        // Blank lines and every kind of whitespace-only line.
+        assert_eq!(data_field(b""), None);
+        assert_eq!(data_field(b"   "), None);
+        assert_eq!(data_field(b"\r\n"), None);
+        assert_eq!(data_field(b"\t"), None);
+        // SSE comments / keep-alives.
+        assert_eq!(data_field(b": ping"), None);
+        assert_eq!(data_field(b":"), None);
+        assert_eq!(data_field(b"   : keep-alive"), None);
+        // Other SSE fields must not be mistaken for a payload.
+        assert_eq!(data_field(b"event: message"), None);
+        assert_eq!(data_field(b"id: 42"), None);
+        assert_eq!(data_field(b"retry: 100"), None);
+        // Near-misses on the field name.
+        assert_eq!(data_field(b"datax: {}"), None);
+        assert_eq!(data_field(b"data : {}"), None);
+        assert_eq!(data_field(b"dat: {}"), None);
+    }
+
+    #[test]
+    fn data_field_handles_invalid_utf8_without_panicking() {
+        // Classification is byte-wise, so a corrupt line must still be routed
+        // (and counted) rather than crashing on a char-boundary assumption.
+        let bad = b"data: \xff\xfe".to_vec();
+        assert_eq!(data_field(&bad), Some(&b"\xff\xfe"[..]));
+        let bad_comment = b": \xff\xfe".to_vec();
+        assert_eq!(data_field(&bad_comment), None);
+    }
+
+    #[test]
+    fn data_field_is_exhaustively_agreeable_with_trim() {
+        // `data_field` replaces the old `str::trim` + `strip_prefix("data:")`
+        // logic; prove the byte version accepts exactly the same set of lines.
+        for raw in [
+            &b"data: x"[..],
+            &b" data: x "[..],
+            &b"\r\ndata: x\r\n"[..],
+            &b"data:x"[..],
+            &b"data:   "[..],
+        ] {
+            let as_str = std::str::from_utf8(raw).expect("ascii");
+            let via_str = as_str.trim().strip_prefix("data:").map(str::trim);
+            let via_bytes = data_field(raw).map(|b| std::str::from_utf8(b).unwrap());
+            assert_eq!(via_bytes, via_str, "mismatch for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_fields_and_comments_do_not_count_as_invalid_utf8() {
+        // A corrupt comment line carries no payload, so it is filtered out on
+        // bytes and never decoded: it must not inflate the corruption counter.
+        let mut acc = SseAccumulator::default();
+        let mut buffer = Vec::new();
+        let mut body = b": \xff\xfe keep-alive\n\n".to_vec();
+        body.extend_from_slice(b"event: \xff\xfe\n\n");
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        assert_eq!(acc.push(&body, &mut buffer), Some(FrameOutcome::Done));
+        assert_eq!(acc.invalid_utf8_lines, 0, "comments are not payload");
     }
 }
