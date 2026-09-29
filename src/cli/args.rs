@@ -13,9 +13,9 @@ pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-af
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
 ///
-/// Returns `Ok(None)` for verbs the binary handles itself (`monitor` /
-/// `supervisor`) — the caller is expected to have dispatched those earlier — and
-/// `Ok(Some(args))` for every verb that goes through the `worker` tool. An
+/// Returns `Ok(None)` when the verb was already answered here (a `dispatch`
+/// without a task prints its usage) and `Ok(Some(args))` for every verb that
+/// goes through the `worker` tool. An
 /// unrecognised action is a hard error, so the caller can exit non-zero after
 /// printing the "did you mean" hint.
 pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Result<Option<Map<String, Value>>> {
@@ -44,22 +44,21 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
                 tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
             }
         }
-        "monitor" | "supervisor" => return Ok(None),
         "manifest" | "list" | "reap" => {}
         _ => {
             let actions = crate::cli::available_actions();
-            if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {
-                eprintln!(
+            let msg = if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {
+                format!(
                     "Unknown action: {action}. Did you mean '{suggestion}'?\nAvailable: {}",
                     actions.join(", ")
-                );
+                )
             } else {
-                eprintln!(
+                format!(
                     "Unknown action: {action}. Available: {}",
                     actions.join(", ")
-                );
-            }
-            std::process::exit(1);
+                )
+            };
+            anyhow::bail!("{msg}");
         }
     }
 
@@ -228,18 +227,6 @@ mod tests {
     fn test_tool_args_returns_none_for_a_taskless_dispatch() {
         let d = args(&["mini-swe-mcp", "dispatch"]);
         assert!(tool_args("dispatch", &d, true).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_tool_args_defers_the_cli_only_verbs() {
-        for verb in ["monitor", "supervisor"] {
-            assert!(
-                tool_args(verb, &args(&["mini-swe-mcp", verb, "--once"]), true)
-                    .unwrap()
-                    .is_none(),
-                "{verb} must be handled by the binary, not the worker tool"
-            );
-        }
     }
 
     #[test]

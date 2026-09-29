@@ -44,16 +44,20 @@ where
 
 /// Non-blocking stderr writer for tracing.
 struct AsyncStderrWriter {
-    tx: std::sync::mpsc::Sender<String>,
+    tx: std::sync::mpsc::SyncSender<String>,
 }
 
 impl std::io::Write for AsyncStderrWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let text = String::from_utf8_lossy(buf);
-        self.tx
-            .send(text.into_owned())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "log sink gone"))?;
-        Ok(buf.len())
+        match self.tx.try_send(text.into_owned()) {
+            // A full sink drops the line: logging must never stall the caller.
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(buf.len()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "log sink gone",
+            )),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -72,15 +76,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AsyncStderrWriter {
 }
 
 fn non_blocking_stderr() -> AsyncStderrWriter {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Bounded so a burst of telemetry can never stall a runtime thread; lines
+    // are dropped when the sink is full, which is fine for diagnostics.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
     std::thread::Builder::new()
         .name("telemetry-stderr".to_string())
         .spawn(move || {
             use std::io::Write as _;
             let mut stderr = std::io::stderr();
             while let Ok(line) = rx.recv() {
-                if let Err(e) = stderr.write_all(line.as_bytes()) {
-                    let _ = e;
+                if stderr.write_all(line.as_bytes()).is_err() {
                     break;
                 }
                 let _ = stderr.flush();

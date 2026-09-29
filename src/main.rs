@@ -19,8 +19,8 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let raw_args: Vec<String> = env::args().collect();
 
-    // `--version`, `--help` and the dashboards must work without an API key, so
-    // they are answered before any configuration is resolved.
+    // `--version` and `--help` must work without an API key, so they are
+    // answered before any configuration is resolved.
     if let Some(first) = raw_args.get(1).map(String::as_str) {
         match first {
             "--version" | "-V" => {
@@ -31,16 +31,19 @@ async fn async_main() -> Result<()> {
                 print_help();
                 return Ok(());
             }
-            "monitor" | "supervisor" => {
-                let once = raw_args.iter().any(|arg| arg == "--once");
-                return mini_swe_mcp::monitor::run_monitor(once).await;
-            }
             _ => {}
         }
     }
 
     let json_output = json_requested(&raw_args);
     let cli_args = strip_json_flag(raw_args);
+
+    // The dashboards read only the on-disk registry, so they run before any
+    // configuration is resolved and work without an API key in any flag order.
+    if let Some("monitor" | "supervisor") = action_of(&cli_args) {
+        let once = cli_args.iter().any(|arg| arg == "--once");
+        return mini_swe_mcp::monitor::run_monitor(once).await;
+    }
 
     telemetry::init(stdio_requested(&cli_args));
     bootstrap::load_dotenv_files();
@@ -52,13 +55,6 @@ async fn async_main() -> Result<()> {
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
     if let Some(action) = action_of(&cli_args) {
-        // `monitor`/`supervisor` reach here when a selector flag precedes the
-        // verb (e.g. `--json monitor`); the early argv check only sees
-        // `raw_args[1]`. Handle them here so every flag ordering behaves alike.
-        if action == "monitor" || action == "supervisor" {
-            let once = cli_args.iter().any(|arg| arg == "--once");
-            return mini_swe_mcp::monitor::run_monitor(once).await;
-        }
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
 

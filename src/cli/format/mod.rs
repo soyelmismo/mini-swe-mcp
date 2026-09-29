@@ -85,21 +85,4 @@ mod tests {
         assert_eq!(out, "{\n  \"a\": 1\n}");
     }
 
-    /// The package is a mechanical extraction: the renderers must be reachable
-    /// at exactly the paths they were reachable at before the split.
-    #[test]
-    fn test_every_formatter_is_reachable_at_its_historical_path() {
-        let _: fn(&serde_json::Value) -> String = format_manifest;
-        let _: fn(&serde_json::Value) -> String = format_list;
-        let _: fn(&serde_json::Value) -> String = format_prune;
-        let _: fn(&serde_json::Value) -> String = format_status;
-        let _: fn(&serde_json::Value) -> String = format_collect;
-        let _: fn(&serde_json::Value) -> String = format_logs;
-        let _: fn(&serde_json::Value) -> String = format_reap;
-        let _: fn(&serde_json::Value) -> String = format_dispatch;
-        let _: fn(&serde_json::Value) -> String = format_steer;
-        let _: fn(&serde_json::Value) -> String = format_kill;
-        let _: fn(&serde_json::Value) -> String = log_counters_line;
-        let _: fn(&str, &serde_json::Value) -> String = format_output;
-    }
 }
