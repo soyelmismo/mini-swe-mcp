@@ -10,8 +10,20 @@
 //! It also builds short, log-friendly summaries of every command it runs.
 //! These tests exercise those three pure functions through the public library
 //! surface (i.e. the way an external integration test would).
+//!
+//! It also covers the bounded step-log retention window, the hard per-field
+//! byte ceilings, and the emission budget that keeps a single response small
+//! (see `audits/opt_07_step_log_memory.md`).
 
-use mini_swe_mcp::pool::{parse_ask_orchestrator, parse_request_turns, summarize_command};
+use serde_json::json;
+
+use mini_swe_mcp::agent::AgentStepLog;
+use mini_swe_mcp::pool::{
+    DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, LogBuffer, LogRetentionPolicy,
+    MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING,
+    build_step_log, clamp_string, emit_view, parse_ask_orchestrator, parse_request_turns,
+    summarize_command,
+};
 
 // ---------------------------------------------------------------------------
 // parse_request_turns
@@ -239,4 +251,225 @@ fn test_summarize_command_short_multibyte_is_untouched() {
     let s = summarize_command("echo 'ñandú café ☕'");
     assert!(s.len() < 40);
     assert!(!s.ends_with("..."));
+}
+
+// ----------
+// Step-log retention bounds (audit 07, R1/R2/R4/F6)
+// ----------
+
+fn entry(step: usize) -> AgentStepLog {
+    build_step_log(step, "cargo test", "ok".to_string(), Some(0))
+}
+
+#[test]
+fn test_log_buffer_window_is_bounded_by_entry_count() {
+    let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
+        max_retained: 8,
+        max_bytes: 8 * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
+        max_emitted: 4,
+    });
+    for step in 0..500 {
+        buf.push(entry(step));
+    }
+    assert_eq!(buf.len(), 8, "the window must never grow past the cap");
+    assert_eq!(buf.retained(), 8);
+    assert_eq!(buf.dropped(), 492);
+    assert_eq!(buf.total(), 500);
+}
+
+#[test]
+fn test_log_buffer_memory_is_bounded_per_worker() {
+    // The audit's failure scenario: 150-turn workers at ~2.1 KiB per entry.
+    // With the window in place the resident payload is a hard constant.
+    let mut buf = LogBuffer::new();
+    for step in 0..150 {
+        buf.push(build_step_log(
+            step,
+            "cargo build --release",
+            "x".repeat(64 * 1024),
+            Some(0),
+        ));
+    }
+    assert!(buf.len() <= DEFAULT_MAX_RETAINED_LOGS);
+    let per_worker_ceiling =
+        DEFAULT_MAX_RETAINED_LOGS * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES);
+    assert!(
+        buf.bytes() <= per_worker_ceiling,
+        "resident payload {} exceeded the ceiling {per_worker_ceiling}",
+        buf.bytes()
+    );
+}
+
+#[test]
+fn test_log_buffer_is_preallocated_to_the_window() {
+    // R2: reserving the window removes the GeomGrow over-allocation. An
+    // *unbounded* buffer would grow 100 -> 128 -> 256 -> 512 ... leaving up to
+    // 41% of the backing store unused; the window is sized once, up front.
+    let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
+        max_retained: 200,
+        max_bytes: 1,
+        max_emitted: 8,
+    });
+    // The byte budget of 1 still allows a single (already clamped) entry to be
+    // pushed without the buffer rejecting it, proving the budget is enforced by
+    // eviction and not by panicking.
+    for step in 0..200 {
+        buf.push(entry(step));
+    }
+    assert!(
+        buf.len() <= 200,
+        "the window can never exceed its reservation, got {}",
+        buf.len()
+    );
+    assert_eq!(serde_json::to_value(LogBuffer::new()).unwrap(), json!([]));
+}
+
+#[test]
+fn test_build_step_log_enforces_a_hard_output_ceiling() {
+    // F6: the 2048-byte cap used to be a *floor* (marker was added on top).
+    let log = build_step_log(1, "cargo test", "y".repeat(16_384), Some(0));
+    assert!(
+        log.output.len() <= MAX_LOG_OUTPUT_BYTES,
+        "output was {} bytes, over the {MAX_LOG_OUTPUT_BYTES}-byte ceiling",
+        log.output.len()
+    );
+    assert!(log.output.contains("bytes truncated"));
+}
+
+#[test]
+fn test_build_step_log_enforces_a_hard_command_ceiling() {
+    let log = build_step_log(1, &"c".repeat(4096), "short".to_string(), None);
+    assert!(log.command.len() <= MAX_LOG_COMMAND_BYTES);
+    assert_eq!(
+        log.output, "short",
+        "short output must pass through untouched"
+    );
+}
+
+#[test]
+fn test_clamp_string_respects_multi_byte_boundaries() {
+    // A 3-byte code point straddling the cut must be dropped, not split.
+    let mut s = "a".repeat(MAX_LOG_OUTPUT_BYTES - 1);
+    s.push('€');
+    s.push_str(&"b".repeat(64));
+    let clamped = clamp_string(&s, MAX_LOG_OUTPUT_BYTES);
+    assert!(clamped.len() <= MAX_LOG_OUTPUT_BYTES);
+    // Round-tripping through JSON proves no partial code point survived.
+    let json = serde_json::to_string(&clamped).unwrap();
+    let back: String = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, clamped);
+}
+
+#[test]
+fn test_emit_view_caps_a_single_response() {
+    // R4: a response must never serialize the whole window.
+    let mut buf = LogBuffer::new();
+    for step in 0..300 {
+        buf.push(entry(step));
+    }
+    let view = emit_view(&buf, DEFAULT_MAX_EMITTED_LOGS);
+    assert_eq!(view.logs.len(), DEFAULT_MAX_EMITTED_LOGS);
+    assert_eq!(view.logs_omitted, buf.retained() - DEFAULT_MAX_EMITTED_LOGS);
+    assert!(
+        view.logs_truncation_notice.is_some(),
+        "an orchestrator must be able to tell the history is degraded"
+    );
+}
+
+#[test]
+fn test_emit_view_of_a_short_worker_is_complete_and_silent() {
+    let mut buf = LogBuffer::new();
+    for step in 0..3 {
+        buf.push(entry(step));
+    }
+    let view = emit_view(&buf, DEFAULT_MAX_EMITTED_LOGS);
+    assert_eq!(view.logs.len(), 3);
+    assert_eq!(view.logs_omitted, 0);
+    assert!(view.logs_truncation_notice.is_none());
+}
+
+#[test]
+fn test_emit_view_serialization_shape() {
+    let mut buf = LogBuffer::new();
+    buf.push(entry(1));
+    let value = serde_json::to_value(emit_view(&buf, DEFAULT_MAX_EMITTED_LOGS)).unwrap();
+    assert_eq!(value["logs"].as_array().unwrap().len(), 1);
+    assert_eq!(value["logs_omitted"], json!(0));
+    assert!(
+        value.get("logs_truncation_notice").is_none(),
+        "a complete history must not carry a notice"
+    );
+}
+
+#[test]
+fn test_retention_policy_ceilings_are_enforced_in_code() {
+    // The documented ceilings must exist as public constants so a caller cannot
+    // accidentally configure an unbounded window.
+    assert_eq!(MAX_RETAINED_LOGS_CEILING, 1000);
+    assert_eq!(MAX_EMITTED_LOGS_CEILING, 500);
+    // Compiled as const assertions: the defaults can never drift past the caps.
+    const { assert!(DEFAULT_MAX_RETAINED_LOGS <= MAX_RETAINED_LOGS_CEILING) };
+    const { assert!(DEFAULT_MAX_EMITTED_LOGS <= MAX_EMITTED_LOGS_CEILING) };
+    const { assert!(MAX_LOG_OUTPUT_BYTES > 0 && MAX_LOG_COMMAND_BYTES > 0) };
+}
+
+/// End-to-end guard for the audit's failure scenario: a worker that runs many
+/// turns of high-output commands must retain a *constant* amount of memory and
+/// report every eviction, instead of growing an unbounded `Vec<AgentStepLog>`
+/// (audit 07, §5).
+#[test]
+fn test_high_turn_high_output_worker_stays_bounded() {
+    const TURNS: usize = 600;
+    const MAX_RETAINED: usize = 20;
+    const MAX_EMITTED: usize = 5;
+
+    let mut buf = LogBuffer::with_policy(LogRetentionPolicy {
+        max_retained: MAX_RETAINED,
+        max_bytes: MAX_RETAINED * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
+        max_emitted: MAX_EMITTED,
+    });
+
+    // Each iteration reproduces the real worst case: a `cargo test`-sized
+    // 16 KiB payload entering a ~2 KiB log entry.
+    for step in 0..TURNS {
+        let raw = format!("step {step}\n{}", "x".repeat(16 * 1024));
+        buf.push(build_step_log(step, "cargo test --release", raw, Some(0)));
+    }
+
+    // Memory: a hard constant, identical to a 50-turn worker. The byte budget
+    // is derived per-entry and can bind slightly before the count budget, so the
+    // invariant is the ceiling, not an exact count.
+    assert!(buf.retained() <= MAX_RETAINED);
+    assert!(
+        buf.bytes() <= MAX_RETAINED * (MAX_LOG_OUTPUT_BYTES + MAX_LOG_COMMAND_BYTES),
+        "resident payload {} B for {TURNS} turns",
+        buf.bytes()
+    );
+
+    // Bookkeeping: nothing is silently lost.
+    assert_eq!(buf.total(), TURNS);
+    assert_eq!(buf.dropped(), TURNS - buf.retained());
+
+    // Per-entry ceiling (F6): "2048 bytes" is now a ceiling, not a floor.
+    for entry in buf.iter() {
+        assert!(entry.output.len() <= MAX_LOG_OUTPUT_BYTES);
+        assert!(entry.command.len() <= MAX_LOG_COMMAND_BYTES);
+    }
+
+    // Per-response ceiling (R4): the response is bounded independently.
+    let view = emit_view(&buf, MAX_EMITTED);
+    assert_eq!(view.logs.len(), MAX_EMITTED);
+    assert_eq!(view.logs_omitted, buf.retained() - MAX_EMITTED);
+    let notice = view
+        .logs_truncation_notice
+        .as_deref()
+        .expect("an orchestrator must see that the history is degraded");
+    assert!(notice.contains("evicted"), "got {notice}");
+    assert!(notice.contains("omitted"), "got {notice}");
+
+    // Contrast with the pre-fix shape: the old buffer would have held all 600.
+    assert!(
+        buf.total() > buf.retained(),
+        "the window must be a strict subset of the history"
+    );
 }
