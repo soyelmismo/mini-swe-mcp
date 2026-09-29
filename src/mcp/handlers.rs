@@ -5,12 +5,11 @@
 //! [`crate::mcp::server`]'s.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::server::McpServer;
-use crate::agent::AgentStepLog;
 use crate::manifest::ModelManifest;
 use crate::pool::{LogBuffer, emit_view};
 
@@ -56,7 +55,8 @@ impl McpServer {
             "offline" => Ok(true),
             mode if super::schema::NETWORK_MODES.contains(&mode) => Ok(false),
             other => anyhow::bail!(
-                "'{other}' is not a valid 'network' policy for action '{action}';                  expected one of: {}",
+                "'{other}' is not a valid 'network' policy for action '{action}'; \
+                 expected one of: {}",
                 super::schema::NETWORK_MODES.join(", ")
             ),
         }
@@ -73,10 +73,6 @@ impl McpServer {
 
     /// Send a `notifications/progress` frame when the caller supplied both a
     /// token and a channel (the MCP stdio path).
-    ///
-    /// Unthrottled: every call writes one frame. Rapid successive updates
-    /// should route through [`ProgressThrottle`] via
-    /// [`Self::emit_progress_throttled`] instead.
     pub(super) async fn emit_progress(
         tx: Option<&mpsc::Sender<String>>,
         token: Option<&Value>,
@@ -99,27 +95,6 @@ impl McpServer {
                 let _ = tx.send(serialized + "\n").await;
             }
         }
-    }
-
-    /// Send a `notifications/progress` frame only when the previous one is at
-    /// least [`PROGRESS_MIN_INTERVAL`] old, coalescing updates inside that
-    /// window.
-    ///
-    /// The first frame is always allowed so the client observes the work start.
-    /// Terminal notifications keep using the unthrottled [`Self::emit_progress`]
-    /// so a completion is never swallowed.
-    pub(super) async fn emit_progress_throttled(
-        throttle: &mut ProgressThrottle,
-        tx: Option<&mpsc::Sender<String>>,
-        token: Option<&Value>,
-        progress: usize,
-        total: usize,
-        message: impl std::fmt::Display,
-    ) {
-        if !throttle.should_emit() {
-            return;
-        }
-        Self::emit_progress(tx, token, progress, total, message).await;
     }
 
     /// Map a `tools/call` request to its handler.
@@ -240,67 +215,52 @@ impl McpServer {
         let wid = Self::get_worker_id(args, "status")?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
             Ok(json!({ "worker_id": wid, "state": state }))
-        } else {
-            let path = crate::pool::registry_dir().join(format!("{wid}.json"));
-            if let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(entry) =
-                    serde_json::from_str::<crate::pool::WorkerRegistryEntry>(&content)
-            {
-                let is_alive = crate::worktree::is_process_alive(entry.pid);
-                let status = if !is_alive && (entry.status == "running" || entry.status == "paused")
-                {
-                    "stopped"
-                } else {
-                    &entry.status
-                };
-                let state_name = match status {
-                    "running" => "Running",
-                    "reviewing" => "Reviewing",
-                    "completed" => "Completed",
-                    "paused" => "Paused",
-                    "failed" => "Failed",
-                    _ => "Stopped",
-                };
-                return Ok(json!({
-                    "worker_id": wid,
-                    "task": entry.task,
-                    "model": entry.model,
-                    "state": {
-                        "state": state_name,
-                        "details": {
-                            "status": state_name,
-                            "step": entry.step,
-                            "turns": entry.step,
-                            "summary": entry.last_command.clone(),
-                            "error": if entry.status == "failed" { Some(entry.last_command) } else { None },
-                            "question": entry.question,
-                            "pid": entry.pid,
-                            "started_at": entry.started_at,
-                        }
+        } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
+            let state_name = match entry.status.as_str() {
+                "running" => "Running",
+                "reviewing" => "Reviewing",
+                "completed" => "Completed",
+                "paused" => "Paused",
+                "failed" => "Failed",
+                _ => "Stopped",
+            };
+            Ok(json!({
+                "worker_id": wid,
+                "task": entry.task,
+                "model": entry.model,
+                "state": {
+                    "state": state_name,
+                    "details": {
+                        "status": state_name,
+                        "step": entry.step,
+                        "turns": entry.step,
+                        "summary": entry.last_command.clone(),
+                        "error": if entry.status == "failed" { Some(entry.last_command) } else { None },
+                        "question": entry.question,
+                        "pid": entry.pid,
+                        "started_at": entry.started_at,
                     }
-                }));
-            }
+                }
+            }))
+        } else {
             anyhow::bail!("Worker not found: {wid}")
         }
     }
 
     /// Render the bounded tail of a live worker's step history plus the
-    /// counters that make the degradation explicit (audit 07, R4 / R7).
-    pub(super) async fn render_logs(
-        &self,
-        wid: &str,
-    ) -> (Vec<AgentStepLog>, usize, usize, Option<String>) {
+    /// counters that make the degradation explicit.
+    pub(super) async fn render_logs(&self, wid: &str) -> LogView {
         let Some(buffer): Option<std::sync::Arc<LogBuffer>> = self.pool.get_worker_logs(wid).await
         else {
-            return (Vec::new(), 0, 0, None);
+            return LogView::default();
         };
         let view = emit_view(&buffer, self.pool.log_policy().max_emitted);
-        (
-            view.logs,
-            view.logs_omitted,
-            buffer.dropped(),
-            view.logs_truncation_notice,
-        )
+        LogView {
+            logs: view.logs,
+            logs_omitted: view.logs_omitted,
+            logs_dropped: buffer.dropped(),
+            logs_truncation_notice: view.logs_truncation_notice,
+        }
     }
 
     /// `logs` action: inspect a live worker's retained history without
@@ -311,30 +271,28 @@ impl McpServer {
             anyhow::bail!("Worker not found: {wid}")
         };
         let policy = self.pool.log_policy();
-        let (logs, logs_omitted, logs_dropped, logs_truncation_notice) = {
-            let view = emit_view(&buffer, policy.max_emitted);
-            (
-                view.logs,
-                view.logs_omitted,
-                buffer.dropped(),
-                view.logs_truncation_notice,
-            )
+        let view = emit_view(&buffer, policy.max_emitted);
+        let log_view = LogView {
+            logs: view.logs,
+            logs_omitted: view.logs_omitted,
+            logs_dropped: buffer.dropped(),
+            logs_truncation_notice: view.logs_truncation_notice,
         };
-        Ok(json!({
+        let mut result = json!({
             "worker_id": wid,
             "state": self.pool.get_worker_state(wid).await,
-            "logs": logs,
             "total_steps": buffer.total(),
             "logs_retained": buffer.retained(),
-            "logs_omitted": logs_omitted,
-            "logs_dropped": logs_dropped,
-            "logs_truncation_notice": logs_truncation_notice,
             "retention": {
                 "max_retained": policy.max_retained,
                 "max_bytes": policy.max_bytes,
                 "max_emitted": policy.max_emitted,
             },
-        }))
+        });
+        if let serde_json::Value::Object(map) = &mut result {
+            map.extend(log_view.as_map());
+        }
+        Ok(result)
     }
 
     /// `reap` action: evict terminal worker records whose TTL expired.
@@ -350,14 +308,20 @@ impl McpServer {
     async fn handle_collect(&self, args: &Value) -> Result<Value> {
         let wid = Self::get_worker_id(args, "collect")?;
         if let Some(collected) = self.pool.collect(wid).await {
-            Ok(json!({
+            let log_view = LogView {
+                logs: collected.logs,
+                logs_omitted: collected.logs_omitted,
+                logs_dropped: collected.logs_dropped,
+                logs_truncation_notice: collected.logs_truncation_notice,
+            };
+            let mut result = json!({
                 "worker_id": wid,
                 "state": collected.state,
-                "logs": collected.logs,
-                "logs_omitted": collected.logs_omitted,
-                "logs_dropped": collected.logs_dropped,
-                "logs_truncation_notice": collected.logs_truncation_notice,
-            }))
+            });
+            if let serde_json::Value::Object(map) = &mut result {
+                map.extend(log_view.as_map());
+            }
+            Ok(result)
         } else {
             anyhow::bail!("Worker not found: {wid}")
         }
@@ -373,21 +337,19 @@ impl McpServer {
         let killed = self.pool.kill(wid).await;
         if killed {
             Ok(json!({ "worker_id": wid, "killed": true }))
-        } else {
-            let path = crate::pool::registry_dir().join(format!("{wid}.json"));
-            if let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(entry) =
-                    serde_json::from_str::<crate::pool::WorkerRegistryEntry>(&content)
-                && crate::worktree::is_process_alive(entry.pid)
+        } else if let Some(entry) = crate::pool::load_registry_entry(wid)
+            && crate::worktree::is_process_alive(entry.pid)
+        {
+            #[cfg(unix)]
             {
-                #[cfg(unix)]
-                {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &entry.pid.to_string()])
-                        .status();
+                // SAFETY: `entry.pid` is a foreign pid read from the registry;
+                // `kill` only signals, never dereferences, so this is safe.
+                unsafe {
+                    libc::kill(entry.pid as libc::pid_t, libc::SIGTERM);
                 }
-                return Ok(json!({ "worker_id": wid, "killed": true }));
             }
+            Ok(json!({ "worker_id": wid, "killed": true }))
+        } else {
             Ok(json!({ "worker_id": wid, "killed": false }))
         }
     }
@@ -427,123 +389,37 @@ impl McpServer {
     }
 }
 
-/// Minimum spacing between two `notifications/progress` frames from one
-/// throttled emitter (today: the `await_worker_result` step loop).
+/// The four-field log view shared by `logs`, `collect` and `await_worker_result`.
 ///
-/// A worker can finish several steps in far less than 100 ms; without a floor a
-/// fast worker would flood stdout with a frame per step. Frames inside the
-/// window are coalesced and the next one past it carries the then-current step,
-/// so the client still converges on the true progress.
-pub(super) const PROGRESS_MIN_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(100);
-
-/// Per-invocation micro-throttle for progress notifications.
-///
-/// Holds the monotonic instant of the last frame written. The first
-/// [`Self::should_emit`] returns `true` (priming the stream), thereafter a
-/// frame is allowed only once [`PROGRESS_MIN_INTERVAL`] has elapsed. An
-/// allocation-free `Instant` comparison, created fresh per `tools/call` so
-/// unrelated requests never throttle each other.
-pub(super) struct ProgressThrottle {
-    last_emit: Option<tokio::time::Instant>,
+/// [`LogView::as_map`] flattens the keys into the top level of the enclosing
+/// response, exactly as before.
+#[derive(Debug, Default, serde::Serialize)]
+pub(super) struct LogView {
+    pub(super) logs: Vec<crate::agent::AgentStepLog>,
+    pub(super) logs_omitted: usize,
+    pub(super) logs_dropped: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) logs_truncation_notice: Option<String>,
 }
 
-impl ProgressThrottle {
-    /// A throttle that has not emitted a frame yet.
-    pub(super) fn new() -> Self {
-        Self { last_emit: None }
-    }
-
-    /// Whether a progress frame may be written now, latching the clock.
-    ///
-    /// On `true` the clock advances to `now`, collapsing a burst of ticks
-    /// inside one interval into a single frame.
-    pub(super) fn should_emit(&mut self) -> bool {
-        let now = tokio::time::Instant::now();
-        match self.last_emit {
-            Some(prev) if now.duration_since(prev) < PROGRESS_MIN_INTERVAL => false,
-            _ => {
-                self.last_emit = Some(now);
-                true
-            }
-        }
+impl LogView {
+    /// The four log keys as a JSON map, for embedding into a `json!` response.
+    pub(super) fn as_map(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert("logs".to_string(), serde_json::to_value(&self.logs).unwrap_or_default());
+        map.insert("logs_omitted".to_string(), json!(self.logs_omitted));
+        map.insert("logs_dropped".to_string(), json!(self.logs_dropped));
+        map.insert(
+            "logs_truncation_notice".to_string(),
+            serde_json::to_value(&self.logs_truncation_notice).unwrap_or_default(),
+        );
+        map
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A burst of ticks inside one interval must collapse to a single frame:
-    /// this is the whole point of the throttle (no stdio flooding).
-    #[tokio::test]
-    async fn rapid_ticks_are_coalesced_into_one_frame() {
-        let (tx, mut rx) = mpsc::channel::<String>(64);
-        let token = json!("burst-token");
-        let mut throttle = ProgressThrottle::new();
-
-        // Ten "steps" fired back-to-back, far inside the 100 ms window.
-        for step in 1..=10 {
-            McpServer::emit_progress_throttled(
-                &mut throttle,
-                Some(&tx),
-                Some(&token),
-                step,
-                10,
-                format!("Step {step}"),
-            )
-            .await;
-        }
-
-        // Only the priming frame got through.
-        let emitted = rx.try_recv().expect("the first tick must be emitted");
-        assert!(emitted.contains("notifications/progress"), "got: {emitted}");
-        assert!(rx.try_recv().is_err(), "burst must not flood stdio");
-    }
-
-    /// Once the window elapses, progress must flow again, and the frame carries
-    /// the then-current value so the client still converges.
-    #[tokio::test]
-    async fn progress_resumes_after_the_minimum_interval() {
-        let (tx, mut rx) = mpsc::channel::<String>(64);
-        let token = json!("paced-token");
-        let mut throttle = ProgressThrottle::new();
-
-        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 1, 5, "one")
-            .await;
-        // Inside the window: coalesced.
-        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 2, 5, "two")
-            .await;
-        assert!(rx.try_recv().is_ok(), "first frame must be emitted");
-        assert!(rx.try_recv().is_err(), "in-window frame must be dropped");
-
-        // Past the window: emitted again.
-        tokio::time::sleep(PROGRESS_MIN_INTERVAL + std::time::Duration::from_millis(20)).await;
-        McpServer::emit_progress_throttled(&mut throttle, Some(&tx), Some(&token), 3, 5, "three")
-            .await;
-
-        let frame = rx.try_recv().expect("frame after the window must be emitted");
-        assert!(frame.contains(r#""progress":3"#), "got: {frame}");
-        assert!(rx.try_recv().is_err(), "only one frame per window");
-    }
-
-    /// The gate itself: first call passes, the rest inside the window do not.
-    #[tokio::test]
-    async fn should_emit_primes_once_then_gates_the_window() {
-        let mut throttle = ProgressThrottle::new();
-        assert!(throttle.should_emit(), "the first frame must prime the stream");
-        for tick in 0..1000 {
-            assert!(
-                !throttle.should_emit(),
-                "tick {tick} landed inside the window and must be coalesced"
-            );
-        }
-        tokio::time::sleep(PROGRESS_MIN_INTERVAL + std::time::Duration::from_millis(20)).await;
-        assert!(
-            throttle.should_emit(),
-            "after the window a frame must be allowed again"
-        );
-    }
 
     /// An omitted `network` must keep the pre-existing connected behaviour:
     /// the property is additive, so a client that never sends it is unaffected.
@@ -582,23 +458,5 @@ mod tests {
         let err = McpServer::get_network_offline(&json!({ "network": true }), "dispatch")
             .expect_err("a non-string network must not be accepted");
         assert!(err.to_string().contains("must be a string"), "{err}");
-    }
-
-    /// The interval is the documented 100 ms floor.
-    #[test]
-    fn min_interval_is_100ms() {
-        assert_eq!(PROGRESS_MIN_INTERVAL, std::time::Duration::from_millis(100));
-    }
-
-    /// Throttling is best-effort framing, never a tool failure: the channel is
-    /// optional, and a missing token/channel simply emits nothing.
-    #[tokio::test]
-    async fn throttled_emit_is_a_noop_without_a_token_or_channel() {
-        let mut throttle = ProgressThrottle::new();
-        // No channel.
-        McpServer::emit_progress_throttled(&mut throttle, None, Some(&json!("t")), 1, 1, "x").await;
-        // No token.
-        McpServer::emit_progress_throttled(&mut throttle, Some(&mpsc::channel(1).0), None, 1, 1, "x")
-            .await;
     }
 }

@@ -14,7 +14,6 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace};
 
-use super::handlers::ProgressThrottle;
 use super::protocol::{
     FrameRejection, INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse,
     MAX_FRAME_BYTES, code, parse_frame,
@@ -49,7 +48,7 @@ impl McpServer {
     /// Serve MCP over stdin/stdout until the client closes the input.
     pub async fn run_stdio(&self) -> Result<()> {
         // Background reaper: bounds the memory held by terminal worker records
-        // even when the orchestrator never calls `collect` (audit 07, R3).
+        // even when the orchestrator never calls `collect`.
         let reaper = crate::pool::spawn_reaper((*self.pool).clone());
 
         let stdin = tokio::io::stdin();
@@ -75,10 +74,6 @@ impl McpServer {
             }
         });
 
-        // Every request takes ownership of the line it was read from: the
-        // parsed frame borrows that line, so the response can echo the client's
-        // `id` and quote its method name without either being copied into an
-        // owned request first.
         while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
             if oversized {
                 let _ = out_tx
@@ -95,9 +90,6 @@ impl McpServer {
             let tx = out_tx.clone();
             let owned_line = line.to_string();
             tokio::spawn(async move {
-                // Zero-copy parse: `method`, `id` and `params` are borrowed
-                // views of `owned_line` unless the frame carries a string that
-                // would have to be unescaped.
                 let line = owned_line.as_str();
                 let req = match parse_frame(line) {
                     Ok(req) => req,
@@ -131,21 +123,17 @@ impl McpServer {
     }
 
     /// Route one JSON-RPC request to its response envelope.
-    ///
-    /// The response borrows `req` wherever it can — the echoed `id`, the
-    /// unknown method name in the `-32601` message and `tools/list`'s
-    /// precomputed payload all come from the frame already in memory.
-    async fn handle_request<'a>(
-        &'a self,
-        req: JsonRpcRequest<'a>,
+    async fn handle_request(
+        &self,
+        req: JsonRpcRequest,
         progress_tx: Option<mpsc::Sender<String>>,
-    ) -> JsonRpcResponse<'a> {
-        let id = req.id_or_null();
-        match req.method.as_ref() {
+    ) -> JsonRpcResponse {
+        let id = req.id_or_null().map(|v| v.to_owned());
+        match req.method.as_str() {
             "ping" => JsonRpcResponse::ok(id, json!({})),
 
-            // Constant per process: the document lives in a `static` and is
-            // borrowed into the envelope, so a handshake copies no payload.
+            // The handshake document lives in a `static`; it is cloned out of
+            // it per request.
             "initialize" => JsonRpcResponse::ok(id, (*INITIALIZE_RESULT).clone()),
 
             // The schema is immutable for the process lifetime, so it is built
@@ -153,9 +141,7 @@ impl McpServer {
             "tools/list" => JsonRpcResponse::ok(id, (*self.tools_list).clone()),
 
             "tools/call" => {
-                // The one place a frame is materialized: `tools/call` is the
-                // only method that indexes into `params`.
-                let params = req.params_value().unwrap_or_default();
+                let params = req.params.unwrap_or_default();
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -176,8 +162,6 @@ impl McpServer {
                     .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
                     .await
                 {
-                    // Serialized straight into the frame: no intermediate
-                    // pretty-printed `String` for the payload (audit 07, F4).
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
                     Err(error) => {
                         JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Owned(error.to_string()))
@@ -187,7 +171,7 @@ impl McpServer {
 
             // `-32601` for every method the server does not expose, including
             // the MCP notifications a host may send us.
-            _ => JsonRpcResponse::method_not_found(id, req.method),
+            _ => JsonRpcResponse::method_not_found(id, Cow::Owned(req.method.clone())),
         }
     }
 
@@ -233,13 +217,6 @@ impl McpServer {
     /// Progress notifications are emitted only when a `progress_token`/`tx`
     /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
     /// and the polling algorithm stays identical for both callers.
-    ///
-    /// Per-step progress frames pass through a [`ProgressThrottle`] so a worker
-    /// that ticks many steps in quick succession cannot flood stdio: successive
-    /// frames are at least
-    /// [`PROGRESS_MIN_INTERVAL`](super::handlers::PROGRESS_MIN_INTERVAL) apart.
-    /// Terminal frames (finished / paused) bypass the throttle and are always
-    /// delivered.
     pub async fn await_worker_result(
         &self,
         wid: &str,
@@ -248,7 +225,6 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
     ) -> Result<Value> {
         let mut last_reported_step = 0;
-        let mut throttle = ProgressThrottle::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             // H-5: poll the lightweight progress snapshot. It never clones the
@@ -263,8 +239,7 @@ impl McpServer {
                     if step > last_reported_step {
                         last_reported_step = step;
                         let last_command = progress.last_command.as_deref().unwrap_or("");
-                        Self::emit_progress_throttled(
-                            &mut throttle,
+                        Self::emit_progress(
                             tx,
                             token,
                             step,
@@ -284,19 +259,15 @@ impl McpServer {
                     )
                     .await;
                     let state = self.pool.get_worker_state(wid).await;
-                    // Bounded emission: the response never carries the
-                    // whole history, and the counters say so (audit 07,
-                    // R4 / R7).
-                    let (logs, logs_omitted, logs_dropped, logs_truncation_notice) =
-                        self.render_logs(wid).await;
-                    return Ok(json!({
+                    let log_view = self.render_logs(wid).await;
+                    let mut result = json!({
                         "worker_id": wid,
                         "state": state,
-                        "logs": logs,
-                        "logs_omitted": logs_omitted,
-                        "logs_dropped": logs_dropped,
-                        "logs_truncation_notice": logs_truncation_notice,
-                    }));
+                    });
+                    if let serde_json::Value::Object(map) = &mut result {
+                        map.extend(log_view.as_map());
+                    }
+                    return Ok(result);
                 }
                 crate::pool::WorkerPhase::Paused => {
                     let step = progress.step;
