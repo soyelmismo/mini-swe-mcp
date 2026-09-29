@@ -31,7 +31,7 @@
 //! [`FsPolicy`]: super::FsPolicy
 
 use super::types::{
-    ExecutionPolicy, FsPolicy, ModelManifest, NetworkPolicy, FS_POLICIES, NETWORK_POLICIES,
+    ExecutionPolicy, FS_POLICIES, FsPolicy, ModelManifest, NETWORK_POLICIES, NetworkPolicy,
 };
 
 impl ModelManifest {
@@ -49,7 +49,7 @@ impl ModelManifest {
                 "model \"{alias}\": policy.network \"{raw}\" is not a valid network policy; \
                  expected one of: {}. Replaced with \"{}\".",
                 join_known(NETWORK_POLICIES),
-                NetworkPolicy::default().as_str().unwrap_or_default(),
+                NetworkPolicy::default().as_str(),
             ));
         }
 
@@ -58,7 +58,7 @@ impl ModelManifest {
                 "model \"{alias}\": policy.fs \"{raw}\" is not a valid filesystem policy; \
                  expected one of: {}. Replaced with \"{}\".",
                 join_known(FS_POLICIES),
-                FsPolicy::default().as_str().unwrap_or_default(),
+                FsPolicy::default().as_str(),
             ));
         }
 

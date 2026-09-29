@@ -23,9 +23,7 @@
 //! These are exercised through the public library surface only, i.e. the same
 //! way `src/mcp/` and `src/main.rs` consume the manifest.
 
-use mini_swe_mcp::manifest::{
-    DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest,
-};
+use mini_swe_mcp::manifest::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelDefinition, ModelManifest};
 use std::collections::HashMap;
 
 /// Build a `ModelDefinition` with every field filled in.
@@ -1034,17 +1032,20 @@ models:
 "#,
     );
 
-    let sealed = manifest.models["sealed"].policy.as_ref().expect("sealed policy");
-    assert_eq!(
-        sealed.network.as_ref().and_then(|n| n.as_str()),
-        Some("offline")
-    );
-    assert_eq!(sealed.fs.as_ref().and_then(|f| f.as_str()), Some("read-only"));
+    let sealed = manifest.models["sealed"]
+        .policy
+        .as_ref()
+        .expect("sealed policy");
+    assert_eq!(sealed.network.as_ref().map(|n| n.as_str()), Some("offline"));
+    assert_eq!(sealed.fs.as_ref().map(|f| f.as_str()), Some("read-only"));
 
-    let runner = manifest.models["runner"].policy.as_ref().expect("runner policy");
-    assert_eq!(runner.network.as_ref().and_then(|n| n.as_str()), Some("allow"));
+    let runner = manifest.models["runner"]
+        .policy
+        .as_ref()
+        .expect("runner policy");
+    assert_eq!(runner.network.as_ref().map(|n| n.as_str()), Some("allow"));
     assert_eq!(
-        runner.fs.as_ref().and_then(|f| f.as_str()),
+        runner.fs.as_ref().map(|f| f.as_str()),
         Some("worktree-only")
     );
 
@@ -1089,12 +1090,12 @@ models:
     let policy = normalized.models["sealed"].policy.as_ref().expect("policy");
     assert_eq!(
         policy.network.as_ref().map(|n| n.as_str()),
-        Some(Some("offline")),
+        Some("offline"),
         "an unrecognised network must be repaired to the restrictive default"
     );
     assert_eq!(
         policy.fs.as_ref().map(|f| f.as_str()),
-        Some(Some("read-only")),
+        Some("read-only"),
         "an unrecognised fs value must be repaired to the restrictive default"
     );
     assert!(

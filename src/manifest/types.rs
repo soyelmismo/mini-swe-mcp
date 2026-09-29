@@ -104,18 +104,22 @@ impl Serialize for NetworkPolicy {
     /// is one of `offline` / `allow`; round-tripping a value the manifest has
     /// already rejected would only re-export the typo.
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str().unwrap_or_default())
+        s.serialize_str(self.as_str())
     }
 }
 
 impl NetworkPolicy {
-    /// The policy as written in `models.yaml`, or `None` when the model
-    /// declares none at all (which is distinct from declaring `allow`).
-    pub fn as_str(&self) -> Option<&str> {
+    /// The policy as written in `models.yaml`: the canonical spelling for a
+    /// known value, and the user's own text for [`NetworkPolicy::Other`].
+    ///
+    /// "Declares no network policy at all" is not representable here — that is
+    /// an `Option::None` *field*, i.e. an absent [`ExecutionPolicy::network`],
+    /// which is what keeps it distinct from declaring `offline`.
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Offline => Some("offline"),
-            Self::Allow => Some("allow"),
-            Self::Other(raw) => Some(raw),
+            Self::Offline => "offline",
+            Self::Allow => "allow",
+            Self::Other(raw) => raw,
         }
     }
 
@@ -141,9 +145,13 @@ impl NetworkPolicy {
 ///
 /// The three values describe exactly the writable set of a sandboxed worker
 /// (see [`crate::agent::sandbox`]): the widest one is the worktree plus its
-/// build directory, the narrowest is nothing at all. Ordering is from least to
-/// most capable so `Ord` yields a usable "least privilege" comparison.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// build directory, the narrowest is nothing at all. They are listed least to
+/// most capable, and [`FS_POLICIES`] lists them in that same order.
+///
+/// Deliberately not [`Ord`]: the derive would rank [`FsPolicy::Other`] *above*
+/// [`FsPolicy::Full`], so the order would not mean "least privilege" for exactly
+/// the values that most need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsPolicy {
     /// Nothing may be written outside the process' own scratch state.
     ReadOnly,
@@ -176,19 +184,23 @@ impl<'de> Deserialize<'de> for FsPolicy {
 impl Serialize for FsPolicy {
     /// Always emit the canonical spelling.
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str().unwrap_or_default())
+        s.serialize_str(self.as_str())
     }
 }
 
 impl FsPolicy {
-    /// The policy as written in `models.yaml`, or `None` when the model
-    /// declares none at all (which means "inherit the runtime default").
-    pub fn as_str(&self) -> Option<&str> {
+    /// The policy as written in `models.yaml`: the canonical spelling for a
+    /// known value, and the user's own text for [`FsPolicy::Other`].
+    ///
+    /// "Declares no filesystem policy at all" is not representable here — that
+    /// is an `Option::None` *field*, i.e. an absent [`ExecutionPolicy::fs`],
+    /// which is what keeps it distinct from declaring `read-only`.
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::ReadOnly => Some("read-only"),
-            Self::WorktreeOnly => Some("worktree-only"),
-            Self::Full => Some("full"),
-            Self::Other(raw) => Some(raw),
+            Self::ReadOnly => "read-only",
+            Self::WorktreeOnly => "worktree-only",
+            Self::Full => "full",
+            Self::Other(raw) => raw,
         }
     }
 

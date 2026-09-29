@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use super::types::{ModelManifest, DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT};
+use super::types::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelManifest};
 
 impl ModelManifest {
     /// Collect human-readable warnings about suspicious manifest entries.
@@ -117,7 +117,10 @@ impl ModelManifest {
         if !t.is_finite() {
             return None;
         }
-        Some(t.clamp(*super::TEMPERATURE_RANGE.start(), *super::TEMPERATURE_RANGE.end()))
+        Some(t.clamp(
+            *super::TEMPERATURE_RANGE.start(),
+            *super::TEMPERATURE_RANGE.end(),
+        ))
     }
 
     /// Resolve the turn budget from both ingresses, filtering a useless `0`
@@ -142,9 +145,9 @@ impl ModelManifest {
     /// Apply every fixup that [`ModelManifest::validate`] reports.
     ///
     /// Each *fixable* warning is paired with a repair: an unrecognised
-    /// execution policy is replaced by its restrictive default (see
-    /// [`Self::normalize_policy`]), invalid temperatures are
-    /// clamped or dropped, unusable turn budgets are replaced with
+    /// execution policy is replaced by its restrictive default (the
+    /// `normalize_policy` fixup of the `rules` submodule), invalid temperatures
+    /// are clamped or dropped, unusable turn budgets are replaced with
     /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), and a `default` that names
     /// no known alias is dropped so `main.rs` reaches its fallback deliberately.
     ///
