@@ -1,3 +1,4 @@
+pub mod env;
 pub mod exec;
 pub mod retry;
 pub mod runner;
@@ -5,6 +6,10 @@ pub mod sandbox;
 pub mod stream;
 pub mod types;
 
+pub use env::{
+    ALLOWED_VARS, CommandEnv, apply_clean_environment, apply_clean_environment_cmd,
+    build_clean_environment, is_sensitive_var,
+};
 pub use runner::{
     AgentRunner, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
 };
