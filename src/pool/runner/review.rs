@@ -25,6 +25,7 @@ use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
 use super::super::registry::{WorkerRegistryEntry, save_registry_entry};
 use super::super::state::WorkerState;
+use super::super::steer::drain_steer_messages;
 use super::super::unix_timestamp;
 
 /// Everything the review phase needs, and the step counter it hands back.
@@ -158,14 +159,21 @@ impl WorkerPool {
         review_step += 1;
         step += 1;
 
-        let steer_msgs: Vec<String> = {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                std::mem::take(&mut w.pending_steer)
-            } else {
-                Vec::new()
-            }
-        };
+        // Same two sources as the implementation loop: the in-memory queue for
+        // a `steer` handled by this process, and the on-disk mailbox for a
+        // `steer` from another one. The mailbox is polled once per reviewer
+        // turn, and its claim-by-rename means a message delivered during the
+        // implementation phase is never re-read here.
+        let mut steer_msgs = self.take_pending_steer(&worker_id).await;
+        let remote = drain_steer_messages(&worker_id);
+        if !remote.is_empty() {
+            info!(
+                worker = %worker_id,
+                count = remote.len(),
+                "Drained cross-process steering messages from mailbox (review)"
+            );
+            steer_msgs.extend(remote);
+        }
         for msg in steer_msgs {
             review_messages.push(ChatMessage::text(
                 Role::User,

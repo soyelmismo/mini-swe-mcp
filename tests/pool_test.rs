@@ -16,6 +16,7 @@
 //! (see `audits/opt_07_step_log_memory.md`).
 
 use serde_json::json;
+use std::io::Write;
 
 use mini_swe_mcp::agent::AgentStepLog;
 use mini_swe_mcp::pool::{
@@ -248,6 +249,282 @@ fn test_summarize_command_short_multibyte_is_untouched() {
 }
 
 // ----------
+// Cross-process steering mailbox
+// ----------
+
+/// `SWE_TEMP_DIR` is process-global, so every test that redirects the mailbox
+/// root has to run alone. `RUST_TEST_THREADS` caps the harness at two threads,
+/// but the mutex is what actually serialises them (a test that raced would
+/// silently observe another test's base dir).
+static SWE_TEMP_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A unique scratch root under the system temp dir, for `SWE_TEMP_DIR`.
+///
+/// Mirrors the worktree naming so the real `swe_base_dir()` resolution path
+/// (including the `swe-wt-` prefix) is exercised rather than a stub.
+fn scratch_dir(tag: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = format!(
+        "swe-wt-test-{tag}-{}-{}-{n}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let dir = std::env::temp_dir().join(&unique);
+    std::fs::create_dir_all(&dir).expect("create scratch base dir");
+    dir.to_string_lossy().into_owned()
+}
+
+/// Sets `SWE_TEMP_DIR` for its lifetime and holds the global mailbox lock.
+///
+/// Restoring the previous value on drop matters: the rest of the suite asserts
+/// against the default base dir and would otherwise inherit a stale override.
+struct ScopedTempDir {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl ScopedTempDir {
+    fn set(dir: &str) -> Self {
+        let guard = SWE_TEMP_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("SWE_TEMP_DIR").ok();
+        // SAFETY: the mailbox lock above means no other test reads or writes
+        // this variable while it is overridden, and the pool's own tests are
+        // the only consumers of the base dir in this binary.
+        unsafe { std::env::set_var("SWE_TEMP_DIR", dir) };
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var("SWE_TEMP_DIR", v) },
+            None => unsafe { std::env::remove_var("SWE_TEMP_DIR") },
+        }
+    }
+}
+
+#[test]
+fn steer_mailbox_uses_the_documented_path_and_json_lines() {
+    let dir = scratch_dir("steer-path");
+    let _scope = ScopedTempDir::set(&dir);
+
+    // The path is a sibling of the worktree, so one `ls` shows every worker
+    // and `prune` reclaims both together.
+    let path = mini_swe_mcp::pool::steer_path("abc123");
+    assert_eq!(path, std::path::PathBuf::from(&dir).join("swe-wt-abc123.steer"));
+
+    mini_swe_mcp::pool::write_steer_message("abc123", "first").unwrap();
+    mini_swe_mcp::pool::write_steer_message("abc123", "second").unwrap();
+
+    // One JSON object per line, each carrying the sender pid: the format is
+    // self-delimiting, so a multi-line message cannot corrupt its neighbours.
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected one line per message, got: {raw}");
+    for line in &lines {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v["message"].is_string());
+        assert_eq!(v["pid"], json!(std::process::id() as u32));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_mailbox_drain_returns_messages_in_order_and_empties_the_file() {
+    let dir = scratch_dir("steer-drain");
+    let _scope = ScopedTempDir::set(&dir);
+
+    mini_swe_mcp::pool::write_steer_message("d1", "one").unwrap();
+    mini_swe_mcp::pool::write_steer_message("d1", "two").unwrap();
+    mini_swe_mcp::pool::write_steer_message("d1", "three").unwrap();
+
+    assert_eq!(
+        mini_swe_mcp::pool::drain_steer_messages("d1"),
+        vec!["one", "two", "three"],
+        "arrival order must be preserved"
+    );
+    // Draining twice must not re-deliver: guidance is consumed exactly once.
+    assert!(mini_swe_mcp::pool::drain_steer_messages("d1").is_empty());
+    assert!(!mini_swe_mcp::pool::steer_path("d1").exists());
+
+    // A worker nobody ever steered drains empty rather than erroring.
+    assert!(mini_swe_mcp::pool::drain_steer_messages("never-steered").is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
+    let dir = scratch_dir("steer-multiline");
+    let _scope = ScopedTempDir::set(&dir);
+
+    // The real reason the format is JSON lines rather than raw text: a pasted
+    // stack trace or a diff hunk contains newlines, and a line-oriented plain
+    // format would split one message into several truncated ones.
+    let patch = "diff --git a/x b/x\n-old\n+new";
+    let unicode = "corrige la lógica de parseo — ñandú ☕ 日本語";
+    mini_swe_mcp::pool::write_steer_message("m1", patch).unwrap();
+    mini_swe_mcp::pool::write_steer_message("m1", unicode).unwrap();
+
+    assert_eq!(
+        mini_swe_mcp::pool::drain_steer_messages("m1"),
+        vec![patch.to_string(), unicode.to_string()]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
+    let dir = scratch_dir("steer-corrupt");
+    let _scope = ScopedTempDir::set(&dir);
+
+    mini_swe_mcp::pool::write_steer_message("c1", "good one").unwrap();
+    // A truncated write, or a hand-edited file, leaves an unparsable line.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(mini_swe_mcp::pool::steer_path("c1"))
+        .unwrap()
+        .write_all(b"{not json at all\n")
+        .unwrap();
+    mini_swe_mcp::pool::write_steer_message("c1", "good two").unwrap();
+
+    // The bad line is skipped; the guidance either side of it still arrives,
+    // because a single corrupt record must not wedge the worker's turn loop.
+    assert_eq!(
+        mini_swe_mcp::pool::drain_steer_messages("c1"),
+        vec!["good one", "good two"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_mailbox_drain_claims_the_file_so_two_readers_never_both_win() {
+    let dir = scratch_dir("steer-claim");
+    let _scope = ScopedTempDir::set(&dir);
+
+    mini_swe_mcp::pool::write_steer_message("r1", "deliver me once").unwrap();
+
+    // The drain renames before it reads, so the implementer loop and the review
+    // loop can never deliver the same message twice.
+    let first = mini_swe_mcp::pool::drain_steer_messages("r1");
+    let second = mini_swe_mcp::pool::drain_steer_messages("r1");
+    assert_eq!(first, vec!["deliver me once"]);
+    assert!(
+        second.is_empty(),
+        "a second drain must not re-deliver an already-consumed message"
+    );
+
+    // The claim file is removed by the drain, so no scratch is left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("r1"))
+        .collect();
+    assert!(leftovers.is_empty(), "claim file leaked: {leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
+    let dir = scratch_dir("steer-late");
+    let _scope = ScopedTempDir::set(&dir);
+
+    mini_swe_mcp::pool::write_steer_message("l1", "early").unwrap();
+    assert_eq!(mini_swe_mcp::pool::drain_steer_messages("l1"), vec!["early"]);
+
+    // A steer that lands *after* the rename recreated the original path; it
+    // must wait for the next drain rather than being lost in the claim.
+    mini_swe_mcp::pool::write_steer_message("l1", "late").unwrap();
+    assert_eq!(mini_swe_mcp::pool::drain_steer_messages("l1"), vec!["late"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn removing_the_steer_file_clears_the_mailbox_and_its_claim() {
+    let dir = scratch_dir("steer-remove");
+    let _scope = ScopedTempDir::set(&dir);
+
+    mini_swe_mcp::pool::write_steer_message("x1", "guidance").unwrap();
+    assert!(mini_swe_mcp::pool::steer_path("x1").is_file());
+
+    // Worker exit: a finished worker must not leave a mailbox that a future
+    // worker reusing the id would pick up as phantom guidance.
+    mini_swe_mcp::pool::remove_steer_file("x1");
+    assert!(!mini_swe_mcp::pool::steer_path("x1").exists());
+    assert!(
+        mini_swe_mcp::pool::drain_steer_messages("x1").is_empty(),
+        "no guidance may survive the worker's exit"
+    );
+
+    // Removing a mailbox that was never created is a no-op, not an error.
+    mini_swe_mcp::pool::remove_steer_file("never-existed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
+    // The step loop merges two sources into one injection: `pending_steer` for
+    // a `steer` this process handled, and the mailbox for one it did not. Both
+    // must reach the turn -- dropping either would make cross-process steering
+    // unreliable exactly when the local path is also in use.
+    let dir = scratch_dir("steer-merge");
+    let _scope = ScopedTempDir::set(&dir);
+
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("m1")).await;
+
+    // Local guidance (this process) and remote guidance (another process).
+    pool.steer("m1", "from this process".into()).await.unwrap();
+    mini_swe_mcp::pool::write_steer_message("m1", "from another process").unwrap();
+
+    // `take_pending_steer` is the loop's read of the in-memory half.
+    let mut seen = pool.take_pending_steer("m1").await;
+    seen.extend(mini_swe_mcp::pool::drain_steer_messages("m1"));
+
+    assert!(seen.contains(&"from this process".to_string()));
+    assert!(seen.contains(&"from another process".to_string()));
+    assert!(seen.len() == 2, "each message must be delivered once: {seen:?}");
+
+    // A second turn finds nothing left to inject -- guidance is consumed, not
+    // replayed on every subsequent turn.
+    let mut again = pool.take_pending_steer("m1").await;
+    again.extend(mini_swe_mcp::pool::drain_steer_messages("m1"));
+    assert!(again.is_empty(), "guidance was re-delivered: {again:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn draining_the_mailbox_for_an_unknown_worker_is_a_no_op() {
+    // The loop drains on every turn of a worker that may never have been
+    // steered; that must be silent, and must not create a mailbox either.
+    let dir = scratch_dir("steer-drain-unknown");
+    let _scope = ScopedTempDir::set(&dir);
+
+    assert!(mini_swe_mcp::pool::drain_steer_messages("ghost").is_empty());
+    assert!(!mini_swe_mcp::pool::steer_path("ghost").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------
 // Steer / lock-discipline (audit opt_02_pool_locks, H-1)
 // ----------
 
@@ -368,10 +645,35 @@ async fn steer_reports_missing_resume_channel_instead_of_dropping_message() {
 }
 
 #[tokio::test]
-async fn steer_rejects_unknown_and_unsteerable_workers() {
+async fn steer_on_unknown_worker_falls_back_to_the_cross_process_mailbox() {
+    // The old contract was `Err("Worker not found")`. It is now the *normal*
+    // cross-process path: an id this pool does not own is a worker running in
+    // some other `mini-swe-mcp` process, and the guidance is queued in its
+    // on-disk mailbox instead of being refused.
+    let dir = scratch_dir("steer-unknown-mailbox");
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
-    let err = pool.steer("nope", "x".into()).await.unwrap_err();
-    assert!(err.to_string().contains("Worker not found"));
+    let err_guard = ScopedTempDir::set(&dir);
+
+    pool.steer("nope", "focus on the parser".into()).await.unwrap();
+
+    let path = mini_swe_mcp::pool::steer_path("nope");
+    assert!(path.is_file(), "the message must be queued, not dropped");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("focus on the parser"));
+
+    // ...and a worker in *this* process still takes the fast in-memory path,
+    // leaving no mailbox behind.
+    pool.__test_insert_worker(running_worker("local")).await;
+    pool.steer("local", "in memory".into()).await.unwrap();
+    assert!(!mini_swe_mcp::pool::steer_path("local").exists());
+
+    drop(err_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn steer_rejects_unsteerable_workers() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
 
     let mut done = running_worker("w4");
     done.state = WorkerState::Completed {
@@ -726,4 +1028,43 @@ fn test_high_turn_high_output_worker_stays_bounded() {
         buf.total() > buf.retained(),
         "the window must be a strict subset of the history"
     );
+}
+
+#[test]
+fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
+    // Requirement 3 of the feature: the worker removes its mailbox on exit.
+    // The loop returns from many places (completion, bash failure, cancellation,
+    // a propagated error) and a `remove_steer_file` call in each is exactly the
+    // duplication that rots, so cleanup is a `Drop` guard. This pins the
+    // contract that guard depends on: a mailbox left behind is always reclaimed,
+    // whether the worker succeeded or failed, and never leaks a claim file.
+    let dir = scratch_dir("steer-exit-guard");
+    let _scope = ScopedTempDir::set(&dir);
+
+    // A worker that ran, got steered from another process, and finished.
+    mini_swe_mcp::pool::write_steer_message("g1", "guidance").unwrap();
+    assert!(mini_swe_mcp::pool::steer_path("g1").is_file());
+    mini_swe_mcp::pool::remove_steer_file("g1");
+    assert!(!mini_swe_mcp::pool::steer_path("g1").exists());
+
+    // Same for a worker that dies mid-run: the guard fires on the error path
+    // too, so a crashed worker's guidance cannot be inherited later.
+    mini_swe_mcp::pool::write_steer_message("g2", "guidance").unwrap();
+    mini_swe_mcp::pool::remove_steer_file("g2");
+    assert!(!mini_swe_mcp::pool::steer_path("g2").exists());
+
+    // Cleanup is idempotent: an already-removed mailbox must not turn a
+    // successful worker exit into an error (the guard's Drop ignores errors).
+    mini_swe_mcp::pool::remove_steer_file("g2");
+    mini_swe_mcp::pool::remove_steer_file("never-existed");
+
+    // Nothing at all is left in the scratch base afterwards.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "worker exit leaked files: {leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

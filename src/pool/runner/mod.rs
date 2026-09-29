@@ -29,6 +29,7 @@ use crate::worktree::WorktreeGuard;
 use super::buffer::build_step_log;
 use super::registry::{WorkerRegistryEntry, save_registry_entry};
 use super::state::WorkerState;
+use super::steer::{drain_steer_messages, remove_steer_file};
 use super::{WorkerPool, unix_timestamp};
 use self::pause::PauseRequest;
 use self::review::ReviewPhase;
@@ -53,7 +54,48 @@ pub struct WorkerLaunchConfig {
     pub network_offline: bool,
 }
 
+/// Deletes a worker's steering mailbox when the worker exits.
+///
+/// Held as a local `let _steer_cleanup` for the whole duration of
+/// [`WorkerPool::run_worker`]: the loop returns from a dozen places (the
+/// completion sentinel, a failed bash step, a cancelled task, a propagated
+/// error), and a `remove_steer_file` call in each of them is exactly the kind
+/// of duplication that rots. A `Drop` impl cannot be forgotten on a new early
+/// return.
+struct SteerFileGuard(String);
+
+impl SteerFileGuard {
+    fn new(worker_id: String) -> Self {
+        Self(worker_id)
+    }
+}
+
+impl Drop for SteerFileGuard {
+    fn drop(&mut self) {
+        remove_steer_file(&self.0);
+    }
+}
+
 impl WorkerPool {
+    /// Take the guidance queued in this process for `worker_id`, if any.
+    ///
+    /// The in-memory half of the step loop's steering injection; the cross-
+    /// process half is the [`drain_steer_messages`] mailbox polled alongside it.
+    ///
+    /// Split out of the loop so the implementation loop and the review loop
+    /// cannot drift: both must read the same queue under the same lock
+    /// discipline, and a record that has since been collected (a `kill` raced
+    /// the loop) simply yields nothing. Exposed on the public pool so the merge
+    /// of both sources is testable without an LLM round-trip.
+    #[doc(hidden)]
+    pub async fn take_pending_steer(&self, worker_id: &str) -> Vec<String> {
+        let mut lock = self.workers.write().await;
+        match lock.get_mut(worker_id) {
+            Some(w) => std::mem::take(&mut w.pending_steer),
+            None => Vec::new(),
+        }
+    }
+
     pub(super) async fn run_worker(
         &self,
         worker_id: String,
@@ -73,6 +115,11 @@ impl WorkerPool {
         let repo_path_str = repo_path.to_string_lossy().to_string();
         let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
         info!(worker = %worker_id, model = %model, "Starting worker execution");
+
+        // Dropped on *every* exit path -- completion, error, cancellation -- so
+        // a finished worker never leaves a mailbox behind for a future worker
+        // reusing the id to inherit as phantom guidance.
+        let _steer_cleanup = SteerFileGuard::new(worker_id.clone());
 
         let mut worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
         let runner = AgentRunner::new(
@@ -105,15 +152,23 @@ impl WorkerPool {
         while step < current_max_turns {
             step += 1;
 
-            // Inject any steering instructions queued by the orchestrator
-            let steer_msgs: Vec<String> = {
-                let mut lock = self.workers.write().await;
-                if let Some(w) = lock.get_mut(&worker_id) {
-                    std::mem::take(&mut w.pending_steer)
-                } else {
-                    Vec::new()
-                }
-            };
+            // Inject any steering instructions queued by the orchestrator.
+            //
+            // Two sources, both drained here: the in-memory `pending_steer`
+            // (guidance from a `steer` handled by *this* process) and the
+            // on-disk mailbox (guidance from another process). The mailbox is
+            // polled once per turn so a cross-process `steer` lands on the next
+            // step, exactly like the local one.
+            let mut steer_msgs = self.take_pending_steer(&worker_id).await;
+            let remote = drain_steer_messages(&worker_id);
+            if !remote.is_empty() {
+                info!(
+                    worker = %worker_id,
+                    count = remote.len(),
+                    "Drained cross-process steering messages from mailbox"
+                );
+                steer_msgs.extend(remote);
+            }
 
             for msg in steer_msgs {
                 info!(worker = %worker_id, "Injected steering message into subagent turn");

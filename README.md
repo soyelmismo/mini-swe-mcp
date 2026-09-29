@@ -153,9 +153,29 @@ mini-swe-mcp list
 mini-swe-mcp status <worker_id>
 ```
 
-#### 3. Steer a Paused Subagent
+#### 3. Steer a Running or Paused Subagent
 ```bash
 mini-swe-mcp steer <worker_id> "Focus on unit tests first, skip integration tests for now."
+```
+
+`steer` works from **any terminal, including one that did not dispatch the
+worker**. A worker running in another `mini-swe-mcp` process is steered through
+a per-worker mailbox file at `<base>/swe-wt-<worker_id>.steer`, where `<base>` is
+`/var/tmp` by default or `$SWE_TEMP_DIR` when set. The message is appended
+atomically and picked up by the worker on its next step, so guidance sent to a
+worker dispatched with `--wait` in a different shell is never lost.
+
+The mailbox is a JSON-lines file (one `{message, sent_at, pid}` record per line),
+so multi-line messages — a pasted stack trace, a diff hunk — survive intact. The
+worker drains it once per turn in both the implementation loop and the review
+loop, and deletes it on exit.
+
+```bash
+# Terminal A: dispatch and block
+mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
+
+# Terminal B: steer that worker mid-flight
+mini-swe-mcp steer <worker_id> "Skip the integration tests for now."
 ```
 
 #### 4. Collect Diff & Logs
