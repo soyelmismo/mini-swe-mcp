@@ -68,11 +68,18 @@ const HOME_VAR: &str = "HOME";
 
 /// Substrings that mark a variable name as credential-bearing.
 ///
-/// The check is a substring match on the uppercased name, so it covers the
-/// common families without enumerating every vendor: `OPENAI_API_KEY` and
+/// The check is a case-insensitive substring match, so it covers the common
+/// families without enumerating every vendor: `OPENAI_API_KEY` and
 /// `ANTHROPIC_AUTH_TOKEN` both match `API_KEY`/`AUTH_TOKEN`,
 /// `AWS_SECRET_ACCESS_KEY` matches `SECRET`, `GITHUB_TOKEN` matches `TOKEN`,
-/// and `SSH_AUTH_SOCK` matches `SSH`.
+/// and `SSH_AUTH_SOCK` matches `SSH`. HTTP-style `BEARER_*` and
+/// `AUTHORIZATION` headers, key material (`PRIVATE_KEY`, `ENCRYPTION_KEY`,
+/// `SIGNING_KEY`) and session material (`SESSION_TOKEN`, `REFRESH_TOKEN`,
+/// `PASSPHRASE`) are covered by the same mechanism.
+///
+/// Markers are deliberately specific. A bare family prefix such as `NPM_` is
+/// *not* used: `NPM_CONFIG_PREFIX` and `NPM_CONFIG_CACHE` are ordinary
+/// configuration, and `NPM_TOKEN` is already caught by `TOKEN`.
 const SECRET_MARKERS: &[&str] = &[
     "API_KEY",
     "APIKEY",
@@ -82,13 +89,22 @@ const SECRET_MARKERS: &[&str] = &[
     "SECRET",
     "PASSWORD",
     "PASSWD",
+    "PASSPHRASE",
     "TOKEN",
+    "AUTHORIZATION",
     "CREDENTIAL",
     "PRIVATE_KEY",
     "SESSION_KEY",
+    "SESSION_TOKEN",
+    "REFRESH_TOKEN",
+    "ENCRYPTION_KEY",
+    "SIGNING_KEY",
+    "CLIENT_SECRET",
+    "CONNECTION_STRING",
     "AWS_",
     "SSH_",
     "GPG_",
+    "PGP_",
 ];
 
 /// Whether a variable name must never reach an agent-spawned child.
@@ -101,23 +117,83 @@ const SECRET_MARKERS: &[&str] = &[
 /// the canonical spelling. Empty names are rejected: an empty variable name is
 /// never meaningful and is not something to forward.
 pub fn is_sensitive_var(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    if upper.is_empty() {
+    if name.is_empty() {
         return true;
     }
-    if upper.starts_with("AWS_") || upper.starts_with("SSH_") {
+    // Marker matching is case-insensitive without allocating: the allow-list is
+    // re-screened on every child spawn and this predicate is pure, so building
+    // an uppercasing `String` would cost a heap allocation per variable per
+    // command. `eq_ignore_ascii_case` is byte-wise, so a non-ASCII byte can
+    // never compare equal to an ASCII marker.
+    if SECRET_MARKERS
+        .iter()
+        .any(|marker| contains_ignore_ascii_case(name, marker))
+    {
         return true;
     }
-    if SECRET_MARKERS.iter().any(|marker| upper.contains(marker)) {
+    ["AWS_", "SSH_", "GPG_"]
+        .iter()
+        .any(|prefix| starts_with_ignore_ascii_case(name, prefix))
+        // "Personal access token" shorthand: `GITHUB_PAT`, `GLAB_PAT`, `FOO_PAT_X`.
+        // Matched only at a word boundary so a variable that merely contains the
+        // letters (`PATH`, `PATCH_LEVEL`) is not mistaken for a credential.
+        || is_word(name, "PAT")
+        // BEARER_* is a credential; e.g. UNBEARERABLE is not.
+        || is_word(name, "BEARER")
+}
+
+/// Whether `name` starts with `prefix`, comparing ASCII case-insensitively.
+fn starts_with_ignore_ascii_case(name: &str, prefix: &str) -> bool {
+    let (name, prefix) = (name.as_bytes(), prefix.as_bytes());
+    name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Whether `name` contains `needle`, comparing ASCII case-insensitively.
+///
+/// Equivalent to `name.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())`
+/// without the two temporary `String`s.
+fn contains_ignore_ascii_case(name: &str, needle: &str) -> bool {
+    if needle.is_empty() {
         return true;
     }
-    // "Personal access token" shorthand: `GITHUB_PAT`, `GLAB_PAT`, `FOO_PAT_X`.
-    // Matched only at a word boundary so a variable that merely contains the
-    // letters (`PATH`, `PATCH_LEVEL`) is not mistaken for a credential.
-    upper == "PAT"
-        || upper.starts_with("PAT_")
-        || upper.ends_with("_PAT")
-        || upper.contains("_PAT_")
+    let (hay, needle) = (name.as_bytes(), needle.as_bytes());
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Whether `name` contains `word` delimited by a non-alphanumeric boundary.
+///
+/// A bare substring test is too greedy for markers: `PAT` occurs inside
+/// `PATH` and `PATCH_LEVEL`, and `BEARER` occurs inside `UNBEARERABLE`.
+/// Requiring non-alphanumeric delimiters or a string edge on both sides
+/// keeps the match precise while still covering `FOO_PAT_BAR` and `BEARER_TOKEN`.
+fn is_word(name: &str, word: &str) -> bool {
+    let bytes = name.as_bytes();
+    let word = word.as_bytes();
+    if word.is_empty() || word.len() > bytes.len() {
+        return false;
+    }
+    for start in 0..=bytes.len() - word.len() {
+        if !bytes[start..start + word.len()].eq_ignore_ascii_case(word) {
+            continue;
+        }
+        let before_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let after_end = start + word.len();
+        let after_ok = after_end == bytes.len() || !is_word_byte(bytes[after_end]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `byte` is alphanumeric (ASCII letter/digit, or any non-ASCII
+/// UTF-8 byte, which is never treated as a delimiter).
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || !byte.is_ascii()
 }
 
 /// Resolve the isolated `HOME` for a command running in `worktree_path`.
@@ -165,18 +241,24 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
 /// need it to exist (command spawning) create it explicitly, which keeps this
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = ALLOWED_VARS
-        .iter()
-        .filter(|name| !is_sensitive_var(name))
-        .filter_map(|name| {
-            std::env::var(name)
-                .ok()
-                // Empty values carry no information and can only confuse tools
-                // that test "is this configured?" with a truthiness check.
-                .filter(|value| !value.is_empty())
-                .map(|value| ((*name).to_string(), value))
-        })
-        .collect();
+    // Sized up front for the worst case (every allow-listed name set) plus the
+    // `HOME` appended below, so the vector never reallocates mid-build.
+    let mut env: Vec<(String, String)> = Vec::with_capacity(ALLOWED_VARS.len() + 1);
+    for name in ALLOWED_VARS {
+        // Defence in depth: an allow-listed name that trips the secret filter is
+        // dropped regardless of its value.
+        if is_sensitive_var(name) {
+            continue;
+        }
+        // Empty values carry no information and can only confuse tools
+        // that test "is this configured?" with a truthiness check.
+        match std::env::var(name) {
+            // One allocation for the key, one for the value; nothing is
+            // allocated for names that are unset or empty.
+            Ok(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
+            _ => {}
+        }
+    }
 
     // HOME is remapped, never inherited: an empty value would make many tools
     // fall back to the real home (or the passwd database), defeating the point.
@@ -313,6 +395,84 @@ mod tests {
         for name in ["CARGO_TARGET_DIR", "PWD", "TMPDIR", "EDITOR", "CI"] {
             assert!(!is_sensitive_var(name), "{name} is not a credential");
         }
+    }
+
+    #[test]
+    fn bearer_and_authorization_vars_are_treated_as_secret() {
+        for name in [
+            "BEARER",
+            "BEARER_TOKEN",
+            "AUTHORIZATION",
+            "PROXY_AUTHORIZATION",
+            "X_BEARER_CREDENTIAL",
+        ] {
+            assert!(is_sensitive_var(name), "{name} must be treated as secret");
+        }
+    }
+
+    #[test]
+    fn key_and_session_material_is_treated_as_secret() {
+        for name in [
+            "PRIVATE_KEY",
+            "RSA_PRIVATE_KEY_PEM",
+            "ENCRYPTION_KEY",
+            "SIGNING_KEY",
+            "SESSION_TOKEN",
+            "REFRESH_TOKEN",
+            "PASSPHRASE",
+            "PASSPHRASE_FILE",
+            "CLIENT_SECRET",
+            "CONNECTION_STRING",
+        ] {
+            assert!(is_sensitive_var(name), "{name} must be treated as secret");
+        }
+    }
+
+    #[test]
+    fn credential_matching_is_case_insensitive() {
+        for name in [
+            "openai_api_key",
+            "Openai_Api_Key",
+            "aws_secret_access_key",
+            "Aws_Secret_Access_Key",
+            "github_pat",
+            "GITHUB_pat",
+            "Ssh_Auth_Sock",
+            "bearer_token",
+        ] {
+            assert!(
+                is_sensitive_var(name),
+                "{name} must match its uppercase spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn short_markers_do_not_false_positive_on_ordinary_vars() {
+        // Guards the word-boundary match for `PAT` and the absence of broad
+        // family prefixes: none of these carry a credential.
+        for name in [
+            "PATH",
+            "MY_PATH",
+            "PATCH_LEVEL",
+            "PATTERN",
+            "SETUPTOOLS_SCM",
+            "NPM_CONFIG_PREFIX",
+            "NPM_CONFIG_CACHE",
+            "SESSION_TYPE",
+            "XDG_DATA_HOME",
+            "KEYBOARD_LAYOUT",
+            "AUTHOR_NAME",
+            "UNBEARERABLE",
+            "UNBEARERABLE_MODE",
+        ] {
+            assert!(!is_sensitive_var(name), "{name} is not a credential");
+        }
+    }
+
+    #[test]
+    fn empty_name_is_rejected() {
+        assert!(is_sensitive_var(""), "empty name must never be forwarded");
     }
 
     #[test]
