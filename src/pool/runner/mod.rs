@@ -38,7 +38,10 @@ mod pause;
 mod review;
 mod sentinels;
 
-pub use self::sentinels::{parse_ask_orchestrator, parse_request_turns, summarize_command};
+pub use self::sentinels::{
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
+    summarize_command,
+};
 
 /// Everything the execution loop needs to start one worker.
 pub struct WorkerLaunchConfig {
@@ -283,7 +286,7 @@ impl WorkerPool {
             }
 
             let cmd_str = match llm_resp.command {
-                Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
+                Some(ref cmd) if is_completion_request(cmd) => {
                     info!(worker = %worker_id, step = step, "Worker requested completion");
                     if !llm_resp.content.trim().is_empty() {
                         last_assistant_text = llm_resp.content.clone();

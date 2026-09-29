@@ -20,7 +20,7 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
-use super::sentinels::summarize_command;
+use super::sentinels::{is_completion_request, summarize_command};
 use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerRegistryEntry, save_registry_entry};
@@ -202,7 +202,7 @@ impl WorkerPool {
         }
 
         let cmd_str = match llm_resp.command {
-            Some(ref cmd) if cmd.contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT") => {
+            Some(ref cmd) if is_completion_request(cmd) => {
                 info!(
                     worker = %worker_id,
                     step = review_step,

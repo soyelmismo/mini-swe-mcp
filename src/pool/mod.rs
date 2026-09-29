@@ -45,7 +45,8 @@ pub use self::registry::{
     remove_registry_entry, save_registry_entry,
 };
 pub use self::runner::{
-    WorkerLaunchConfig, parse_ask_orchestrator, parse_request_turns, summarize_command,
+    COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
+    parse_request_turns, summarize_command,
 };
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{

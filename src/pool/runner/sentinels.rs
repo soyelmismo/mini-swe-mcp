@@ -42,6 +42,34 @@ pub fn summarize_command(cmd: &str) -> String {
     out
 }
 
+/// The completion sentinel a subagent echoes to finish its task.
+pub const COMPLETION_SENTINEL: &str = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
+
+/// Whether `cmd` is the completion request: the *last* shell segment of the
+/// command is `echo`/`printf` of the sentinel (optionally quoted).
+///
+/// A substring match is not enough: `grep -rn COMPLETE_TASK...`, a heredoc
+/// writing a test fixture, or a code block quoting the system prompt all
+/// contain the sentinel without asking to finish, and used to end the worker
+/// with nothing done. `cargo test && echo COMPLETE_...` still counts.
+pub fn is_completion_request(cmd: &str) -> bool {
+    let Some(last_line) = cmd.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
+        return false;
+    };
+    let segment = last_line
+        .rsplit(['&', ';', '|'])
+        .next()
+        .unwrap_or(last_line)
+        .trim();
+    let Some(arg) = segment
+        .strip_prefix("echo ")
+        .or_else(|| segment.strip_prefix("printf "))
+    else {
+        return false;
+    };
+    arg.trim().trim_matches(|c| c == '"' || c == '\'' ).trim_end_matches("\\n") == COMPLETION_SENTINEL
+}
+
 /// `echo "REQUEST_TURNS: N"` → the extra turns the subagent is asking for.
 ///
 /// Returns `None` for a zero request (a request that grants nothing would let
@@ -94,7 +122,9 @@ pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ask_orchestrator, parse_request_turns, summarize_command};
+    use super::{
+        is_completion_request, parse_ask_orchestrator, parse_request_turns, summarize_command,
+    };
 
     #[test]
     fn test_summarize_command_utf8() {
@@ -108,6 +138,28 @@ mod tests {
         special.push_str(" rest of command");
         let summary_special = summarize_command(&special);
         assert!(summary_special.ends_with("..."));
+    }
+
+    #[test]
+    fn test_completion_request_requires_the_sentinel_as_the_final_echo() {
+        for yes in [
+            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "  echo \"COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\"  ",
+            "cargo test && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\n'",
+            "cargo test\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n",
+        ] {
+            assert!(is_completion_request(yes), "{yes:?} must complete");
+        }
+        for no in [
+            "grep -rn COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT src/",
+            "cat > t.rs <<'EOF'\nlet cmd = \"echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\";\nEOF",
+            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cargo test",
+            "echo not done COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "",
+        ] {
+            assert!(!is_completion_request(no), "{no:?} must not complete");
+        }
     }
 
     #[test]
