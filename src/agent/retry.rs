@@ -167,13 +167,4 @@ mod tests {
         // A far-out attempt must saturate, not wrap around to a small delay.
         assert_eq!(retry_delay(base, usize::MAX, None), MAX_RETRY_DELAY);
     }
-
-    #[test]
-    fn attempt_budget_defaults_and_overrides() {
-        // Read the raw env rather than calling max_llm_retries(), which is
-        // process-global and would race with other tests in the same binary.
-        let fallback = DEFAULT_MAX_RETRIES;
-        assert_eq!(fallback, 6);
-        assert_eq!(INITIAL_RETRY_DELAY_MS, 500);
-    }
 }

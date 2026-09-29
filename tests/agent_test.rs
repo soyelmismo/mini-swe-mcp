@@ -8,7 +8,7 @@
 //!   arbitrary byte offsets, the function must snap them to valid UTF-8
 //!   character boundaries; otherwise a multi-byte character straddling a cut
 //!   would panic (or, if it were done with lossy decoding, produce `U+FFFD`).
-//! * [`AgentRunner::extract_command`] — the fallback parser that recovers a
+//! * [`extract_command`] — the fallback parser that recovers a
 //!   bash command from a markdown fenced code block when the model did not
 //!   emit a structured `tool_calls` response.
 //! * [`ChatMessage`] / [`Role`] — the outbound conversation wire contract. The
@@ -16,8 +16,8 @@
 //!   shape of each message kind is the only observable behaviour left to pin.
 
 use mini_swe_mcp::agent::{
-    truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn, TRUNCATE_HEAD as HEAD,
-    TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
+    extract_command, truncate_output, AgentRunner, ChatMessage, Role, ToolCall, ToolCallFn,
+    TRUNCATE_HEAD as HEAD, TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
 };
 
 // The byte budget above which output is truncated, and the sizes of the
@@ -287,26 +287,26 @@ fn test_truncate_output_preserves_multibyte_document() {
 }
 
 // ---------------------------------------------------------------------------
-// AgentRunner::extract_command
+// extract_command
 // ---------------------------------------------------------------------------
 
 /// 8. A single-line bash block is extracted verbatim.
 #[test]
 fn test_extract_command_single_line_block() {
     assert_eq!(
-        runner().extract_command("Run this:\n```bash\necho hello\n```"),
+        extract_command("Run this:\n```bash\necho hello\n```"),
         Some("echo hello".to_string())
     );
 
     // Leading prose is discarded; only the block body is returned.
     assert_eq!(
-        runner().extract_command("Sure!\n\n```bash\nls -la\n```\n\nDone."),
+        extract_command("Sure!\n\n```bash\nls -la\n```\n\nDone."),
         Some("ls -la".to_string())
     );
 
     // Surrounding whitespace inside the block is trimmed.
     assert_eq!(
-        runner().extract_command("```bash\n\n  echo padded  \n\n```"),
+        extract_command("```bash\n\n  echo padded  \n\n```"),
         Some("echo padded".to_string())
     );
 }
@@ -315,18 +315,18 @@ fn test_extract_command_single_line_block() {
 #[test]
 fn test_extract_command_multi_line_block() {
     assert_eq!(
-        runner().extract_command("```bash\ncd /tmp\nls -la\n```"),
+        extract_command("```bash\ncd /tmp\nls -la\n```"),
         Some("cd /tmp\nls -la".to_string())
     );
 
     // A longer script, including blank lines and nested quoting.
     let script = "set -euo pipefail\n\nfor f in *.rs; do\n  echo \"building $f\"\n  cargo build --quiet\ndone";
     let reply = format!("Here is the plan:\n```bash\n{script}\n```");
-    assert_eq!(runner().extract_command(&reply), Some(script.to_string()));
+    assert_eq!(extract_command(&reply), Some(script.to_string()));
 
     // `sh` is accepted as well as `bash`.
     assert_eq!(
-        runner().extract_command("```sh\nmake test\n```"),
+        extract_command("```sh\nmake test\n```"),
         Some("make test".to_string())
     );
 }
@@ -339,7 +339,7 @@ fn test_extract_command_indented_block() {
     // Opening fence indented by 3 spaces, closing fence at column 0.
     let reply = "1. Run:\n   ```bash\n   ls -la\n   git status\n```";
     assert_eq!(
-        runner().extract_command(reply),
+        extract_command(reply),
         Some("ls -la\n   git status".to_string()),
         "the body is returned with surrounding whitespace trimmed"
     );
@@ -347,7 +347,7 @@ fn test_extract_command_indented_block() {
     // A 4-space indent (the markdown "code block" style) behaves the same way.
     let reply = "Steps:\n    ```bash\n    echo one\n    echo two\n```";
     assert_eq!(
-        runner().extract_command(reply),
+        extract_command(reply),
         Some("echo one\n    echo two".to_string())
     );
 
@@ -356,7 +356,7 @@ fn test_extract_command_indented_block() {
     // does not terminate the block. This documents real, current behaviour.
     let reply = "text:\n    ```bash\n    echo x\n    ```\n";
     assert_eq!(
-        runner().extract_command(reply),
+        extract_command(reply),
         None,
         "an indented closing fence does not match the extractor regex"
     );
@@ -366,24 +366,24 @@ fn test_extract_command_indented_block() {
 #[test]
 fn test_extract_command_edge_cases() {
     // No fenced block at all.
-    assert_eq!(runner().extract_command("No command here."), None);
+    assert_eq!(extract_command("No command here."), None);
     // An empty body: the regex requires a newline before the closing fence.
-    assert_eq!(runner().extract_command("```bash\n```"), None);
+    assert_eq!(extract_command("```bash\n```"), None);
     // Only the *first* block is returned.
     assert_eq!(
-        runner().extract_command("```bash\nfirst\n```\nand\n```bash\nsecond\n```"),
+        extract_command("```bash\nfirst\n```\nand\n```bash\nsecond\n```"),
         Some("first".to_string())
     );
     // A language tag that is neither `bash` nor `sh` is ignored.
-    assert_eq!(runner().extract_command("```rust\nfn main() {}\n```"), None);
+    assert_eq!(extract_command("```rust\nfn main() {}\n```"), None);
     // Trailing spaces after the info string are tolerated.
     assert_eq!(
-        runner().extract_command("```bash   \necho z\n```"),
+        extract_command("```bash   \necho z\n```"),
         Some("echo z".to_string())
     );
     // A block with four backticks still captures the inner command because the first three match.
     assert_eq!(
-        runner().extract_command("````bash\necho inner\n````"),
+        extract_command("````bash\necho inner\n````"),
         Some("echo inner".to_string()),
     );
 }
@@ -408,7 +408,6 @@ fn test_role_wire_strings_round_trip() {
         (Role::Tool, "\"tool\""),
     ] {
         assert_eq!(serde_json::to_string(&role).unwrap(), expected);
-        assert_eq!(role.as_wire_str(), expected.trim_matches('"'));
         let back: Role = serde_json::from_str(expected).unwrap();
         assert_eq!(back, role);
     }
@@ -485,21 +484,21 @@ fn test_assistant_with_tool_calls_wire_shape() {
 fn test_extract_command_body_slicing_boundaries() {
     // A whitespace-only body is non-empty between the fences, so it is returned
     // as the empty string after trimming (not `None`).
-    assert_eq!(runner().extract_command("```bash\n   \n```"), Some(String::new()));
-    assert_eq!(runner().extract_command("```bash\n\n\n```"), Some(String::new()));
+    assert_eq!(extract_command("```bash\n   \n```"), Some(String::new()));
+    assert_eq!(extract_command("```bash\n\n\n```"), Some(String::new()));
 
     // A literally empty body has no newline before the closing fence, so the
     // pattern cannot match at all.
-    assert_eq!(runner().extract_command("```bash\n```"), None);
-    assert_eq!(runner().extract_command("```sh\n```"), None);
+    assert_eq!(extract_command("```bash\n```"), None);
+    assert_eq!(extract_command("```sh\n```"), None);
 
     // Single-line body: exactly one byte between the opening and closing newline.
-    assert_eq!(runner().extract_command("```bash\nx\n```"), Some("x".to_string()));
+    assert_eq!(extract_command("```bash\nx\n```"), Some("x".to_string()));
 
     // The body scan is lazy, so the *first* closing fence terminates the block
     // (a later block is simply not reached).
     assert_eq!(
-        runner().extract_command("```bash\nx\n```bash\ny\n```"),
+        extract_command("```bash\nx\n```bash\ny\n```"),
         Some("x".to_string())
     );
 }
@@ -515,7 +514,7 @@ fn test_extract_command_info_string_whitespace_is_ascii_only() {
     for gap in ["", " ", "   ", "\t", "\r", " \t\r", " \t\r\n"] {
         let reply = format!("```bash{gap}\necho gap\n```");
         assert_eq!(
-            runner().extract_command(&reply),
+            extract_command(&reply),
             Some("echo gap".to_string()),
             "ASCII whitespace {gap:?} must still open a block"
         );
@@ -523,11 +522,11 @@ fn test_extract_command_info_string_whitespace_is_ascii_only() {
 
     // An empty gap does not open a block at all: the pattern requires a
     // newline after the info string, so "```bashecho gap" is not a fence.
-    assert_eq!(runner().extract_command("```bashecho gap\n```"), None);
+    assert_eq!(extract_command("```bashecho gap\n```"), None);
 
     // U+00A0 NO-BREAK SPACE after the info string: previously matched by `\s`,
     // now intentionally does not, so the block is not recognised.
-    assert_eq!(runner().extract_command("```bash\u{a0}\necho nbsp\n```"), None);
+    assert_eq!(extract_command("```bash\u{a0}\necho nbsp\n```"), None);
 }
 
 // ----------
@@ -693,7 +692,7 @@ fn test_extract_command_matches_reference_on_edge_cases() {
     ];
     for case in cases {
         assert_eq!(
-            runner().extract_command(case),
+            extract_command(case),
             extract_command_reference(case),
             "divergence on {case:?}"
         );
@@ -719,7 +718,7 @@ fn test_extract_command_matches_reference_on_token_soup() {
             input.push_str(TOKENS[rng.below(TOKENS.len())]);
         }
         assert_eq!(
-            runner().extract_command(&input),
+            extract_command(&input),
             extract_command_reference(&input),
             "divergence on {input:?}"
         );

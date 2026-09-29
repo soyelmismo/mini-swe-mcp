@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::time::Duration;
 
 use super::retry;
-use super::stream::{FrameOutcome, SseAccumulator, extract_command};
+use super::stream::{FrameOutcome, SseAccumulator};
 use super::types::{
     ChatCompletionRequest, ChatMessage, DEFAULT_STREAM_IDLE_TIMEOUT, LlmResponse, bash_tool,
 };
@@ -42,16 +42,11 @@ pub struct AgentRunner {
     pub initial_retry_delay: Duration,
 }
 
-pub use super::retry::{
-    DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
-};
-
 impl AgentRunner {
     pub fn new(api_base: String, api_key: String, model: String, temperature: Option<f32>) -> Self {
         let http_client = reqwest::Client::builder()
             .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
-            .read_timeout(DEFAULT_STREAM_IDLE_TIMEOUT)
             .build()
             .expect("Failed to build HTTP client");
 
@@ -63,8 +58,8 @@ impl AgentRunner {
             temperature,
             network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-            max_retries: max_llm_retries(),
-            initial_retry_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
+            max_retries: retry::max_llm_retries(),
+            initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
         }
     }
 
@@ -90,19 +85,6 @@ impl AgentRunner {
     pub fn with_initial_retry_delay(mut self, delay: Duration) -> Self {
         self.initial_retry_delay = delay;
         self
-    }
-
-    /// Recover a bash command from the first ```bash / ```sh fenced block.
-    /// Parsing lives in [`super::stream`]; this stays on the runner as part of
-    /// the public agent surface.
-    pub fn extract_command(&self, text: &str) -> Option<String> {
-        extract_command(text)
-    }
-
-    /// Backoff delay before retrying `attempt` (1-based). See
-    /// [`super::retry::retry_delay`] for the policy.
-    pub fn calculate_retry_delay(&self, attempt: usize, retry_after: Option<Duration>) -> Duration {
-        retry::retry_delay(self.initial_retry_delay, attempt, retry_after)
     }
 
     /// Run one agent step: post `messages` and turn the streamed response into
@@ -196,7 +178,7 @@ impl AgentRunner {
                 let status = resp.status();
                 if retry::is_transient_status(status) && attempt < self.max_retries {
                     let retry_after = retry::parse_retry_after(resp.headers());
-                    let delay = self.calculate_retry_delay(attempt, retry_after);
+                    let delay = retry::retry_delay(self.initial_retry_delay, attempt, retry_after);
 
                     tracing::warn!(
                         status = %status,
@@ -211,7 +193,7 @@ impl AgentRunner {
                 Ok(Some(resp))
             }
             Err(e) if attempt < self.max_retries => {
-                let delay = self.calculate_retry_delay(attempt, None);
+                let delay = retry::retry_delay(self.initial_retry_delay, attempt, None);
                 tracing::warn!(
                     attempt,
                     max_retries = self.max_retries,
@@ -284,7 +266,7 @@ impl AgentRunner {
 
     /// Log a stream failure and sleep out the backoff before the next attempt.
     async fn backoff_for_stream_failure(&self, attempt: usize, message: &'static str) {
-        let delay = self.calculate_retry_delay(attempt, None);
+        let delay = retry::retry_delay(self.initial_retry_delay, attempt, None);
         tracing::warn!(
             attempt,
             max_retries = self.max_retries,
