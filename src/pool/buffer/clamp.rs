@@ -3,9 +3,9 @@
 //!
 //! [`LogBuffer`](super::LogBuffer) bounds *how many* entries are held; this
 //! module bounds *how large* each one can be. The truncation marker is charged
-//! against the budget, so a stored value is `<= budget` rather than
-//! "budget + marker" — the content-preserving truncation of audit 07 / F6 made
-//! the 2 KiB ceiling a floor, never a cap.
+//! against the budget, so a stored value is `<= budget`, not "budget + marker"
+//! — the content-preserving truncation of audit 07 / F6 made the 2 KiB ceiling
+//! a floor, never a cap.
 
 #[cfg(test)]
 mod tests;
@@ -17,16 +17,15 @@ use super::{MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES};
 /// Truncate `value` so the *whole result* — truncation marker included — is at
 /// most `budget` bytes, never splitting a UTF-8 code point (audit 07, F6).
 ///
-/// The returned string is always valid UTF-8; when the marker alone would not
-/// fit inside the budget the result degrades to an empty string rather than
-/// exceeding the ceiling.
+/// Always returns valid UTF-8; when the marker alone would not fit the budget
+/// the result degrades to an empty string rather than exceeding the ceiling.
 pub fn clamp_string(value: &str, budget: usize) -> String {
     if value.len() <= budget {
         return value.to_string();
     }
 
-    // The marker length depends on the number of dropped bytes, so reserve room
-    // for the widest plausible marker first and shrink the head until it fits.
+    // Marker length depends on dropped bytes, so reserve room for the widest
+    // plausible marker first and shrink the head until it fits.
     let mut dropped = value.len();
     loop {
         let marker = truncation_marker(dropped);
