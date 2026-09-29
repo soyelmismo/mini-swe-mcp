@@ -1,8 +1,8 @@
 //! The advertised `worker` tool contract: verb list, property table, schema.
 //!
-//! Everything an MCP client sees in `tools/list` is derived from the two
-//! tables below, so the schema can never drift away from what the dispatcher
-//! in [`crate::mcp::handlers`] actually implements.
+//! Everything an MCP client sees in `tools/list` derives from the tables below,
+//! so the schema can never drift from what the dispatcher in
+//! [`crate::mcp::handlers`] actually implements.
 
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
@@ -11,10 +11,9 @@ use crate::manifest::ModelManifest;
 
 /// Every verb accepted by the single `worker` tool.
 ///
-/// This is the *only* place the action list is spelled out: the `tools/list`
-/// schema enum is derived from it, the dispatcher matches on it, and the CLI's
-/// "did you mean …?" hint reuses it. Adding a verb therefore touches one
-/// constant instead of several independent copies.
+/// The *only* place the action list is spelled out: the `tools/list` schema
+/// enum derives from it, the dispatcher matches on it, and the CLI's
+/// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
     "dispatch", "status", "steer", "collect", "logs", "list", "kill", "reap", "manifest", "prune",
 ];
@@ -22,9 +21,9 @@ pub const WORKER_ACTIONS: &[&str] = &[
 /// Declared network policy for a dispatched worker.
 ///
 /// `offline` runs every bash step inside an isolated network namespace (no
-/// egress at all), `allow` keeps the host's connectivity. The value is the
-/// advertised `network` enum of the `worker` tool, and
-/// [`NETWORK_DEFAULT`] is what a dispatch without the property gets.
+/// egress), `allow` keeps the host's connectivity. This is the advertised
+/// `network` enum; [`NETWORK_DEFAULT`] is what a dispatch without the property
+/// gets.
 pub const NETWORK_MODES: &[&str] = &["offline", "allow"];
 
 /// Policy applied when a `tools/call` omits the optional `network` property.
@@ -49,8 +48,8 @@ enum DescriptionSource {
 ///
 /// Each row is `(json_name, json_type, description)` — the same name the
 /// handlers read back with `args.get(json_name)`. Building the schema from this
-/// table keeps the advertised tool contract next to the dispatch table instead
-/// of inlining it as a 60-line `json!` literal.
+/// table keeps the advertised contract next to the dispatch table instead of a
+/// 60-line `json!` literal.
 const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",

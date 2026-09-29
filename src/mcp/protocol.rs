@@ -1,42 +1,36 @@
 //! JSON-RPC 2.0 wire types for the MCP stdio transport.
 //!
-//! Everything that reaches the wire is produced here, so this module carries
-//! three rules for the hot path (a stdio daemon spends its time serialising
-//! frames, not waiting for them):
+//! Everything that reaches the wire is produced here. Hot-path rules for a
+//! stdio daemon that spends its time serialising frames:
 //!
-//! 1. **Borrow the frame you were handed.** [`parse_frame`] hands back a
-//!    request whose `method` is a [`Cow::Borrowed`] slice of the line the
-//!    reader already owns and whose `id` and `params` are [`RawValue`]s — the
-//!    client's own bytes — so a well-formed request costs *zero* allocations
-//!    to parse: no `String` for the method, no `Value` tree for the id, and
-//!    `params` is promoted to a tree only on the `tools/call` path, the one
-//!    place that indexes into it. Only a method name that carries a JSON
-//!    escape (`Cow::Owned`) pays for an unescape.
+//! 1. **Borrow the frame you were handed.** [`parse_frame`] returns a request
+//!    whose `method` is a [`Cow::Borrowed`] slice of the line the reader owns
+//!    and whose `id`/`params` are [`RawValue`]s — the client's own bytes — so a
+//!    well-formed request parses with zero allocations. Only a method carrying
+//!    a JSON escape (`Cow::Owned`) pays for an unescape.
 //! 2. **Stream into one exactly sized buffer.** [`JsonRpcResponse::to_frame`]
-//!    writes the envelope — payload included — straight into one buffer that
-//!    already reserves room for the frame's trailing newline. That replaces
-//!    `to_string(..) + "\n"`, which serializes into a temporary string and then
-//!    reallocates and copies the whole frame to append a single byte. The
-//!    `tools/call` payload is written by the single-pass
-//!    [`PreSerializedResult`] serializer instead of being materialized as a
-//!    pretty-printed `String` and escaped a second time (audit 07, F4).
-//! 3. **Borrow the error text.** The messages for the common JSON-RPC errors
+//!    writes the envelope straight into one buffer that already reserves the
+//!    trailing newline, replacing `to_string(..) + "\n"` (a temporary `String`
+//!    plus a full-frame copy). The `tools/call` payload is written by the
+//!    single-pass [`PreSerializedResult`] serializer instead of being
+//!    materialized as a pretty-printed `String` and escaped twice (audit 07,
+//!    F4).
+//! 3. **Borrow the error text.** Common JSON-RPC error messages
 //!    ([`FrameRejection`]) are borrowed from the frame being answered, and a
-//!    `-32601` quotes the method it rejects, so a rejection allocates nothing
-//!    beyond its output buffer and the name it quotes.
+//!    `-32601` quotes the rejected method, so a rejection allocates nothing
+//!    beyond its output buffer.
 //! 4. **Refuse an oversized frame before touching it.** [`parse_frame`] checks
-//!    [`MAX_FRAME_BYTES`] on the raw line and answers `-32600` for anything
-//!    larger, so a peer cannot make the server parse, borrow and then clone an
-//!    arbitrarily large payload. The bound is on the *frame*, which is the one
-//!    allocation a peer can actually grow without limit, and it is checked
-//!    against a constant so the rejection itself allocates nothing.
+//!    [`MAX_FRAME_BYTES`] on the raw line and answers `-32600`, so a peer
+//!    cannot make the server parse, borrow and clone an arbitrarily large
+//!    payload. The bound is on the frame — the one allocation a peer can grow
+//!    without limit — and is checked against a constant so the rejection
+//!    allocates nothing.
 //!
-//! Spec compliance is enforced by construction rather than by convention: the
-//! `jsonrpc` member is the constant [`JSONRPC_VERSION`], an envelope carries
-//! exactly one of `result`/`error` (see [`Body`]), the reserved `error.code`
-//! values live in [`code`], and notifications — the one case where a server
-//! must stay silent — are recognised by [`JsonRpcRequest::id`] instead of by a
-//! remembered string comparison.
+//! Spec compliance is enforced by construction: `jsonrpc` is the constant
+//! [`JSONRPC_VERSION`], an envelope carries exactly one of `result`/`error`
+//! (see [`Body`]), reserved `error.code` values live in [`code`], and
+//! notifications — the one case where a server must stay silent — are
+//! recognised by [`JsonRpcRequest::id`].
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -50,23 +44,22 @@ use serde_json::value::RawValue;
 /// The `jsonrpc` member of every frame, per JSON-RPC 2.0 §6.
 pub(super) const JSONRPC_VERSION: &str = "2.0";
 
-/// Reserved `error.code` values (JSON-RPC 2.0 §5.1) and the
+/// Reserved `error.code` values (JSON-RPC 2.0 §5.1) plus the
 /// implementation-defined code tool failures are reported under.
 pub(super) mod code {
     /// Invalid JSON was received.
     pub(crate) const PARSE_ERROR: i64 = -32700;
-    /// The payload is valid JSON but not a valid Request object.
+    /// Valid JSON but not a valid Request object.
     pub(crate) const INVALID_REQUEST: i64 = -32600;
     /// The requested method does not exist or is unavailable.
     pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
-    /// Implementation-defined server error. JSON-RPC reserves -32000..-32099
-    /// for exactly this range.
+    /// Implementation-defined server error (JSON-RPC reserves -32000..-32099).
     pub(crate) const SERVER_ERROR: i64 = -32000;
 }
 
-/// Output buffer size that already covers every frame the server emits except
-/// large tool payloads: `ping`, `initialize`, progress notifications and every
-/// error frame fit within it, so they cost exactly one allocation.
+/// Output buffer covering every frame the server emits except large tool
+/// payloads: `ping`, `initialize`, progress notifications and error frames fit
+/// within it, so they cost exactly one allocation.
 const FRAME_CAPACITY: usize = 256;
 
 /// Largest inbound JSON-RPC frame [`parse_frame`] will look at, in bytes.
@@ -78,17 +71,16 @@ const FRAME_CAPACITY: usize = 256;
 /// parse never runs, no `Value` tree is built, and the rejection frame is a
 /// fixed 256-byte buffer.
 ///
-/// The ceiling is set well above the largest frame this server legitimately
-/// receives. [`crate::mcp::schema::build_tools_list`] describes one tool with
+/// The ceiling sits well above the largest frame this server legitimately
+/// receives: [`crate::mcp::schema::build_tools_list`] describes one tool with
 /// an enum of ten actions, and `tools/call` carries a worker's arguments; both
-/// are kilobytes at most, and the agent side already caps its own payloads
-/// far lower ([`crate::agent::MAX_TOOL_ARGUMENT_BYTES`], 64 KiB). A megabyte
-/// leaves two orders of magnitude of headroom while still bounding a single
-/// frame's memory at something a client cannot use as an amplifier.
+/// are kilobytes at most, and the agent side already caps its own payloads far
+/// lower ([`crate::agent::MAX_TOOL_ARGUMENT_BYTES`], 64 KiB). A megabyte leaves
+/// two orders of magnitude of headroom while bounding a single frame's memory.
 pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// Why a frame could not be serialized. Kept as its own type (rather than
-/// swallowed) so no caller can accidentally drop a response without noticing.
+/// Why a frame could not be serialized. Kept as its own type so no caller can
+/// accidentally drop a response without noticing.
 #[derive(Debug)]
 pub(super) enum ProtocolWarning {
     /// An outgoing frame failed to serialize. `serde_json::Value` payloads
@@ -108,17 +100,17 @@ pub(super) const INTERNAL_ERROR_FRAME: &str =
 const NO_METHOD: &str = "Invalid Request: missing or non-string \"method\" member";
 
 /// Diagnosis for a line refused on length alone, quoting the ceiling as a byte
-/// count so an operator can size a client against it. Borrowed from the
-/// binary, so an oversized frame costs only the reply's own buffer.
+/// count so an operator can size a client against it. Borrowed from the binary,
+/// so an oversized frame costs only the reply's own buffer.
 ///
 /// The figure is written out rather than derived: `stringify!` would emit the
-/// constant's *name*, not its value, so it cannot build this text. A test below
-/// fails if the message and [`MAX_FRAME_BYTES`] ever disagree.
+/// constant's *name*, not its value. A test below fails if the message and
+/// [`MAX_FRAME_BYTES`] ever disagree.
 const FRAME_TOO_LARGE: &str = "Invalid Request: frame exceeds the 1048576-byte limit";
 
-// ---------------------------------------------------------------------------
+// ----------
 // Incoming frames
-// ---------------------------------------------------------------------------
+// ----------
 
 /// An incoming JSON-RPC request; `id: None` marks a notification.
 ///
@@ -158,17 +150,16 @@ impl<'a> JsonRpcRequest<'a> {
 #[derive(Debug)]
 pub(super) enum FrameRejection {
     /// The line is not valid JSON (`-32700`). The message carries serde's own
-    /// diagnosis — line, column and cause — because that is the only thing an
-    /// operator can act on. This is the one JSON-RPC error whose text cannot
-    /// be borrowed: `serde_json::Error` owns its diagnosis and hands it back by
-    /// reference only for the borrow's lifetime.
+    /// diagnosis — line, column and cause — the only thing an operator can act
+    /// on. This is the one JSON-RPC error whose text cannot be borrowed:
+    /// `serde_json::Error` owns its diagnosis.
     Malformed(String),
-    /// The line is valid JSON but not a JSON-RPC Request object (`-32600`):
-    /// not an object, or no string `method`.
+    /// Valid JSON but not a JSON-RPC Request object (`-32600`): not an object,
+    /// or no string `method`.
     InvalidRequest(&'static str),
     /// The line is longer than [`MAX_FRAME_BYTES`] (`-32600`), rejected before
     /// it is parsed. The text is a borrowed constant, so a flood of oversized
-    /// frames costs one fixed output buffer each and no diagnostics string.
+    /// frames costs one fixed output buffer each.
     FrameTooLarge,
 }
 
@@ -206,11 +197,11 @@ impl FrameRejection {
 /// `frame`.
 ///
 /// Unknown members are ignored rather than rejected (MCP peers legitimately add
-/// members of their own, and `serde`'s derived structs reject them by default)
-/// and a UTF-8 BOM is tolerated, but everything JSON-RPC 2.0 requires is
-/// enforced: the frame must be an object and must carry a string `method`.
-/// `params` and `id` may be absent, `null`, or any JSON value, and are handed
-/// back exactly as written.
+/// their own, and `serde`'s derived structs reject them by default) and a UTF-8
+/// BOM is tolerated, but everything JSON-RPC 2.0 requires is enforced: the
+/// frame must be an object and must carry a string `method`. `params` and `id`
+/// may be absent, `null`, or any JSON value, and are handed back exactly as
+/// written.
 pub(super) fn parse_frame(frame: &str) -> Result<JsonRpcRequest<'_>, FrameRejection> {
     // Checked first, on the raw line and before the BOM strip, so the bound
     // covers every byte the peer sent and an oversized frame never reaches a
@@ -252,17 +243,17 @@ pub(super) fn parse_frame(frame: &str) -> Result<JsonRpcRequest<'_>, FrameReject
     Ok(parsed)
 }
 
-/// A string borrowed from the frame when it is escape-free, unescaped into an
-/// owned `String` only when it carries a JSON escape.
+/// A string borrowed from the frame when escape-free, unescaped into an owned
+/// `String` only when it carries a JSON escape.
 ///
 /// `serde` implements `Deserialize` for `&'de str` (borrowing through
-/// `visit_borrowed_str`), but not for `Cow<'de, str>` — the blanket impl
-/// always materializes `Owned`. This visitor recovers the borrow: it asks for
-/// `&str` first and falls back to `String` only when the frame's escapes force
-/// it, so an escaped method name is answered instead of rejected.
+/// `visit_borrowed_str`), but not for `Cow<'de, str>` — the blanket impl always
+/// materializes `Owned`. This visitor recovers the borrow: it asks for `&str`
+/// first and falls back to `String` only when the frame's escapes force it, so
+/// an escaped method name is answered instead of rejected.
 ///
-/// It reads both the `method` value and the member names, which are the two
-/// strings the frame parser has to name in order to route it.
+/// It reads both the `method` value and the member names, the two strings the
+/// frame parser has to name in order to route it.
 struct MethodName<'de>(Cow<'de, str>);
 
 impl<'de> serde::Deserialize<'de> for MethodName<'de> {
@@ -314,11 +305,10 @@ impl<'de> Visitor<'de> for RequestVisitor {
         let mut id: Option<&'de RawValue> = None;
         let mut params: Option<&'de RawValue> = None;
 
-        // `MethodName` doubles as the key reader: it is the same
-        // borrowed-when-escape-free string deserializer, and asking for it here
-        // is what keeps member names allocation-free. `Cow<str>` would have
-        // copied *every* key into a `String` — including the four known ones —
-        // on every frame.
+        // `MethodName` doubles as the key reader: the same
+        // borrowed-when-escape-free string deserializer, which keeps member
+        // names allocation-free. `Cow<str>` would have copied *every* key into
+        // a `String` — including the four known ones — on every frame.
         while let Some(MethodName(key)) = map.next_key::<MethodName<'de>>()? {
             match key.as_ref() {
                 // A key that carries a JSON escape (`"tools\u002fcall"`)
@@ -345,9 +335,9 @@ impl<'de> Visitor<'de> for RequestVisitor {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ----------
 // Outgoing frames
-// ---------------------------------------------------------------------------
+// ----------
 
 /// An outgoing JSON-RPC 2.0 response envelope.
 ///
@@ -393,7 +383,7 @@ impl<'a> JsonRpcResponse<'a> {
     /// [`PreSerializedResult`] embeds the payload as the `text` of a single
     /// content block, pretty-printed by [`PayloadWriter`] and escaped by
     /// `collect_str` while the frame is written — the payload is materialized
-    /// once, and never as an escaped `String` copy (audit 07, F4).
+    /// once, never as an escaped `String` copy (audit 07, F4).
     pub(super) fn tool_call(id: Option<&'a RawValue>, payload: Value) -> Self {
         Self {
             id,
@@ -484,7 +474,7 @@ impl Serialize for JsonRpcResponse<'_> {
 }
 
 // MCP envelopes built once per process
-// ---------------------------------------------------------------------------
+// ----------
 
 // The handshake is spelled out as a wire literal above: `protocolVersion` is the
 // MCP revision this server speaks (2024-11-05) and `serverInfo.name` is the
@@ -508,9 +498,9 @@ pub(super) static INITIALIZE_RESULT: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str::<Value>(wire).expect("the initialize result must be valid JSON")
 });
 
-// ---------------------------------------------------------------------------
+// ----------
 // MCP `tools/call` result
-// ---------------------------------------------------------------------------
+// ----------
 
 /// A JSON-RPC `result` whose single text content is a tool payload.
 ///
@@ -645,7 +635,6 @@ impl std::io::Write for FmtSink<'_, '_> {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

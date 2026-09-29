@@ -1,8 +1,8 @@
 //! Tool-call dispatch: the `worker` verb table and the handlers behind it.
 //!
-//! The `tools/call` request is turned into a [`Value`] payload here; the
-//! JSON-RPC envelope around it is [`crate::mcp::protocol`]'s business and the
-//! stdio plumbing is [`crate::mcp::server`]'s.
+//! Turns `tools/call` into a [`Value`] payload; the JSON-RPC envelope is
+//! [`crate::mcp::protocol`]'s business and the stdio plumbing is
+//! [`crate::mcp::server`]'s.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -15,10 +15,8 @@ use crate::manifest::ModelManifest;
 use crate::pool::{LogBuffer, emit_view};
 
 impl McpServer {
-    /// Shared argument extraction and progress reporting.
-    ///
-    /// Defined here next to the verbs that use them so the request-shape
-    /// contract stays in one file.
+    /// Shared argument extraction and progress reporting, defined next to the
+    /// verbs that use them so the request-shape contract stays in one file.
     pub(super) fn required_string<'a>(
         args: &'a Value,
         name: &str,
@@ -42,13 +40,11 @@ impl McpServer {
 
     /// Resolve the declarative network policy of a `dispatch` call.
     ///
-    /// The property is optional and defaults to
-    /// [`super::schema::NETWORK_DEFAULT`] (`"allow"`), so a client that never
-    /// sends it keeps exactly the behaviour it had before the property existed.
-    /// An explicit value outside [`NETWORK_MODES`](super::schema::NETWORK_MODES)
-    /// is a hard error rather than a silent fallback: a request asking for
-    /// isolation and getting connectivity (or the reverse) is worse than a
-    /// rejected call, and the enum is right there in the advertised schema.
+    /// Optional, defaulting to [`super::schema::NETWORK_DEFAULT`] (`"allow"`),
+    /// so a client that never sends it keeps its prior behaviour. A value
+    /// outside [`NETWORK_MODES`](super::schema::NETWORK_MODES) is a hard error
+    /// rather than a silent fallback: asking for isolation and getting
+    /// connectivity (or the reverse) is worse than a rejected call.
     pub(super) fn get_network_offline(args: &Value, action: &str) -> Result<bool> {
         let Some(value) = args.get("network") else {
             return Ok(false);
@@ -76,10 +72,10 @@ impl McpServer {
     }
 
     /// Send a `notifications/progress` frame when the caller supplied both a
-    /// token and a channel (i.e. the MCP stdio path).
+    /// token and a channel (the MCP stdio path).
     ///
-    /// Unthrottled: every call writes one frame. Callers that can fire rapid
-    /// successive updates should route them through [`ProgressThrottle`] via
+    /// Unthrottled: every call writes one frame. Rapid successive updates
+    /// should route through [`ProgressThrottle`] via
     /// [`Self::emit_progress_throttled`] instead.
     pub(super) async fn emit_progress(
         tx: Option<&mpsc::Sender<String>>,
@@ -106,12 +102,12 @@ impl McpServer {
     }
 
     /// Send a `notifications/progress` frame only when the previous one is at
-    /// least [`PROGRESS_MIN_INTERVAL`] old, dropping (coalescing) updates that
-    /// land inside that window.
+    /// least [`PROGRESS_MIN_INTERVAL`] old, coalescing updates inside that
+    /// window.
     ///
     /// The first frame is always allowed so the client observes the work start.
-    /// Terminal notifications deliberately keep using the unthrottled
-    /// [`Self::emit_progress`] so a completion is never swallowed.
+    /// Terminal notifications keep using the unthrottled [`Self::emit_progress`]
+    /// so a completion is never swallowed.
     pub(super) async fn emit_progress_throttled(
         throttle: &mut ProgressThrottle,
         tx: Option<&mpsc::Sender<String>>,
@@ -128,9 +124,9 @@ impl McpServer {
 
     /// Map a `tools/call` request to its handler.
     ///
-    /// The verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`,
-    /// `prune` and `await_worker_result` may emit progress notifications, the
-    /// remaining verbs answer immediately.
+    /// Verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`, `prune`
+    /// and `await_worker_result` may emit progress notifications, the rest
+    /// answer immediately.
     pub(super) async fn dispatch(
         &self,
         action: &str,
@@ -288,7 +284,7 @@ impl McpServer {
         }
     }
 
-    /// Render the bounded tail of a live worker's step history together with the
+    /// Render the bounded tail of a live worker's step history plus the
     /// counters that make the degradation explicit (audit 07, R4 / R7).
     pub(super) async fn render_logs(
         &self,
@@ -431,24 +427,23 @@ impl McpServer {
     }
 }
 
-/// Minimum spacing between two `notifications/progress` frames produced by one
+/// Minimum spacing between two `notifications/progress` frames from one
 /// throttled emitter (today: the `await_worker_result` step loop).
 ///
-/// A worker can finish several steps in far less than 100 ms, and the stdio
-/// writer emits one frame per notification. Without a floor a fast worker would
-/// flood stdout with a frame per step; frames landing inside the window are
-/// coalesced and the next one past the window carries the then-current step, so
-/// the client still converges on the true progress.
+/// A worker can finish several steps in far less than 100 ms; without a floor a
+/// fast worker would flood stdout with a frame per step. Frames inside the
+/// window are coalesced and the next one past it carries the then-current step,
+/// so the client still converges on the true progress.
 pub(super) const PROGRESS_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 
 /// Per-invocation micro-throttle for progress notifications.
 ///
-/// Holds the monotonic instant of the last frame actually written. The first
-/// [`Self::should_emit`] returns `true` (priming the stream) and thereafter
-/// allows a frame only once [`PROGRESS_MIN_INTERVAL`] has elapsed. It is an
-/// `Instant` comparison with no allocation, and it is created fresh per
-/// `tools/call` so unrelated requests never throttle each other.
+/// Holds the monotonic instant of the last frame written. The first
+/// [`Self::should_emit`] returns `true` (priming the stream), thereafter a
+/// frame is allowed only once [`PROGRESS_MIN_INTERVAL`] has elapsed. An
+/// allocation-free `Instant` comparison, created fresh per `tools/call` so
+/// unrelated requests never throttle each other.
 pub(super) struct ProgressThrottle {
     last_emit: Option<tokio::time::Instant>,
 }
@@ -461,8 +456,8 @@ impl ProgressThrottle {
 
     /// Whether a progress frame may be written now, latching the clock.
     ///
-    /// Side effect: on `true` the internal clock advances to `now`, collapsing a
-    /// burst of ticks inside one interval into a single frame.
+    /// On `true` the clock advances to `now`, collapsing a burst of ticks
+    /// inside one interval into a single frame.
     pub(super) fn should_emit(&mut self) -> bool {
         let now = tokio::time::Instant::now();
         match self.last_emit {

@@ -1,13 +1,13 @@
 //! MCP server: JSON-RPC stdio transport, tool schema and worker verbs.
 //!
-//! The package is split by responsibility while keeping the historical
+//! Split by responsibility while keeping the historical
 //! `mini_swe_mcp::mcp::*` surface byte-for-byte identical through the
 //! re-exports below:
 //!
 //! * `protocol` — JSON-RPC 2.0 envelopes and the single-pass
 //!   `tools/call` result serializer.
-//! * `schema` — the advertised `worker` tool contract: the verb list, the
-//!   property table and the precomputed `tools/list` payload.
+//! * `schema` — the advertised `worker` tool contract: verb list, property
+//!   table and precomputed `tools/list` payload.
 //! * `handlers` — argument extraction, progress notifications and the handler
 //!   behind every verb in [`WORKER_ACTIONS`].
 //! * `server` — [`McpServer`] itself: construction, the `initialize`
