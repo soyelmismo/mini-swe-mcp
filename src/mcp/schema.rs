@@ -23,8 +23,9 @@ pub const WORKER_ACTIONS: &[&str] = &[
 /// `offline` runs every bash step inside an isolated network namespace (no
 /// egress), `allow` keeps the host's connectivity. This is the advertised
 /// `network` enum; [`NETWORK_DEFAULT`] is what a dispatch without the property
-/// gets.
-pub const NETWORK_MODES: &[&str] = &["offline", "allow"];
+/// gets. Derived from [`crate::manifest::NETWORK_POLICIES`] so the MCP
+/// vocabulary and the manifest vocabulary can never drift apart.
+pub const NETWORK_MODES: &[&str] = crate::manifest::NETWORK_POLICIES;
 
 /// Policy applied when a `tools/call` omits the optional `network` property.
 ///

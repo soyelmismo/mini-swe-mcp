@@ -1047,6 +1047,43 @@ models:
 }
 
 #[test]
+fn test_network_policy_resolves_by_alias_and_id() {
+    let manifest = parse_manifest(
+        r#"
+models:
+  sealed:
+    id: vendor:sealed
+    policy:
+      network: "offline"
+  runner:
+    id: vendor:runner
+    policy:
+      network: "allow"
+  bare:
+    id: vendor:bare
+"#,
+    );
+
+    // By alias.
+    assert_eq!(
+        manifest.network_policy("sealed").as_ref().map(|n| n.as_str()),
+        Some("offline")
+    );
+    assert_eq!(
+        manifest.network_policy("runner").as_ref().map(|n| n.as_str()),
+        Some("allow")
+    );
+    // By full id.
+    assert_eq!(
+        manifest.network_policy("vendor:sealed").as_ref().map(|n| n.as_str()),
+        Some("offline")
+    );
+    // A model with no policy block, and an unknown model, both yield `None`.
+    assert_eq!(manifest.network_policy("bare"), None);
+    assert_eq!(manifest.network_policy("unknown"), None);
+}
+
+#[test]
 fn test_policy_is_validated_and_repaired_without_failing_the_load() {
     // A bad policy value must not make the manifest unparseable: the rest of the
     // catalog still has to be served, with the bad value named in a warning.

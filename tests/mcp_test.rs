@@ -768,6 +768,102 @@ fn test_tools_call_ignores_network_on_non_dispatch_verbs() {
     assert_eq!(payload["status"], json!("reaped"));
 }
 
+/// A dispatch with an explicit `network: "offline"` reports `offline` in the
+/// response: the explicit argument wins over the manifest policy.
+#[test]
+fn test_dispatch_reports_explicit_offline_network() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 510,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": {
+                "action": "dispatch",
+                "task": "tidy the docs",
+                "repo_path": ".",
+                "network": "offline"
+            }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call dispatch with explicit offline")
+        .expect("the call must be answered");
+    let result = expect_result(&response);
+    let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+        .expect("tool text must be JSON");
+    assert_eq!(payload["network"], json!("offline"));
+    assert_eq!(payload["status"], json!("dispatched"));
+}
+
+/// A dispatch that omits `network` inherits the resolved model's manifest
+/// policy. The shipped `ninja` declares `allow`, so the response reports it.
+#[test]
+fn test_dispatch_reports_manifest_network_policy_when_argument_omitted() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 511,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": {
+                "action": "dispatch",
+                "task": "tidy the docs",
+                "repo_path": ".",
+                "model": "ninja"
+            }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call dispatch with omitted network")
+        .expect("the call must be answered");
+    let result = expect_result(&response);
+    let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+        .expect("tool text must be JSON");
+    assert_eq!(payload["network"], json!("allow"));
+    assert_eq!(payload["status"], json!("dispatched"));
+}
+
+/// A dispatch with no `network` argument and a model that declares no policy
+/// falls back to the runtime default (`allow`).
+#[test]
+fn test_dispatch_reports_default_network_when_nothing_declared() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 512,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": {
+                "action": "dispatch",
+                "task": "tidy the docs",
+                "repo_path": ".",
+                "model": "some/unknown-model"
+            }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call dispatch with nothing declared")
+        .expect("the call must be answered");
+    let result = expect_result(&response);
+    let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+        .expect("tool text must be JSON");
+    assert_eq!(payload["network"], json!("allow"));
+    assert_eq!(payload["status"], json!("dispatched"));
+}
+
 /// The wrapper itself: connected stays byte-identical, `offline` enters a
 /// network namespace and keeps the command verbatim inside it.
 #[test]

@@ -169,6 +169,20 @@ impl ModelManifest {
             .map_or_else(|| model.to_string(), |(alias, _)| (*alias).to_string())
     }
 
+    /// The declared network policy for a resolved model id, or `None` when the
+    /// model declares none.
+    ///
+    /// `model` may be an alias or a full id; the owning definition is found the
+    /// same way [`Self::alias_for_model`] finds it, so a pass-through id that
+    /// matches no entry yields `None` (the runtime default applies).
+    pub fn network_policy(&self, model: &str) -> Option<NetworkPolicy> {
+        let alias = self.alias_for_model(model);
+        self.models
+            .get(&alias)
+            .and_then(|def| def.policy.as_ref())
+            .and_then(|policy| policy.network.clone())
+    }
+
     /// Find the first (sorted-alias) entry whose `id` equals `id`.
     ///
     /// Shared by [`Self::resolve_model`] and [`Self::alias_for_model`], which

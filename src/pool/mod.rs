@@ -54,6 +54,7 @@ pub use self::state::{
 };
 
 use self::state::expired_terminal_ids;
+use crate::manifest::ModelManifest;
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -65,6 +66,9 @@ pub struct WorkerPool {
     api_key: String,
     log_policy: LogRetentionPolicy,
     terminal_ttl: Duration,
+    /// The model manifest this pool's workers resolve against. Shared with the
+    /// MCP server so a dispatch and its worker never disagree on the catalog.
+    manifest: Arc<ModelManifest>,
 }
 
 impl WorkerPool {
@@ -111,7 +115,28 @@ impl WorkerPool {
             api_key,
             log_policy,
             terminal_ttl,
+            manifest: Arc::new(ModelManifest::default()),
         }
+    }
+
+    /// Attach the model manifest this pool's workers resolve against.
+    ///
+    /// The pool is constructed before the manifest is loaded in `main.rs`, so
+    /// the manifest is attached afterwards; the MCP server reads it back from
+    /// the pool so both share one `Arc`.
+    pub fn with_manifest(mut self, manifest: Arc<ModelManifest>) -> Self {
+        self.manifest = manifest;
+        self
+    }
+
+    /// The model manifest this pool's workers resolve against.
+    pub fn manifest(&self) -> &ModelManifest {
+        &self.manifest
+    }
+
+    /// Clone of the shared manifest `Arc`, for the MCP server to share.
+    pub(crate) fn manifest_arc(&self) -> Arc<ModelManifest> {
+        self.manifest.clone()
     }
 
     /// The active step-log retention policy.
