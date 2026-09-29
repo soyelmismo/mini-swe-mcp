@@ -15,8 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, trace};
 
 use super::protocol::{
-    INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse, PreSerializedResult,
-    RawText, code, parse_frame,
+    INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse, code, parse_frame,
 };
 use super::schema::build_tools_list;
 use crate::manifest::ModelManifest;
@@ -122,25 +121,6 @@ impl McpServer {
         Ok(())
     }
 
-    /// Wrap a tool payload in the MCP `content` block the frame serializer
-    /// writes verbatim.
-    ///
-    /// `PreSerializedResult` is a serializer, not a `Value`: feeding it through
-    /// `to_value` would materialize the pretty-printed payload *and* escape it
-    /// into a `String` only for [`JsonRpcResponse::to_frame`] to write that
-    /// `String` out again. Keeping the serializer inside the envelope writes
-    /// the payload straight into the frame buffer, once (audit 07, F4).
-    ///
-    /// The payload is wrapped in [`RawText`], which is the only `Value` the
-    /// frame serializer has to understand.
-    fn raw_tool_result(payload: Value) -> Value {
-        serde_json::to_value(RawText(PreSerializedResult::text(payload))).unwrap_or_else(|_| {
-            // Unreachable: a wrapper of `Value` payloads always serializes.
-            error!("Failed to wrap a tool payload; answering with an empty result");
-            json!({ "content": [{ "type": "text", "text": "{}" }] })
-        })
-    }
-
     /// Route one JSON-RPC request to its response envelope.
     ///
     /// The response borrows `req` wherever it can — the echoed `id`, the
@@ -164,21 +144,16 @@ impl McpServer {
             "tools/list" => JsonRpcResponse::ok(id, (*self.tools_list).clone()),
 
             "tools/call" => {
-                let params = req.params_value();
-                let tool_name = params
-                    .and_then(|params| params.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let arguments = params
-                    .and_then(|params| params.get("arguments"))
-                    .cloned()
-                    .unwrap_or(json!({}));
+                // The one place a frame is materialized: `tools/call` is the
+                // only method that indexes into `params`.
+                let params = req.params_value().unwrap_or_default();
+                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-                // The token is a client-supplied id: it rides along as raw
-                // JSON text and is only materialized where it has to appear in
-                // a payload (progress notifications).
+                // The token is a client-supplied id: it is echoed verbatim into
+                // the progress notifications.
                 let progress_token = params
-                    .and_then(|params| params.get("_meta"))
+                    .get("_meta")
                     .and_then(|meta| meta.get("progressToken"))
                     .or_else(|| arguments.get("_meta").and_then(|meta| meta.get("progressToken")))
                     .or_else(|| arguments.get("progressToken"))
@@ -190,7 +165,7 @@ impl McpServer {
                 {
                     // Serialized straight into the frame: no intermediate
                     // pretty-printed `String` for the payload (audit 07, F4).
-                    Ok(payload) => JsonRpcResponse::ok(id, Self::raw_tool_result(payload)),
+                    Ok(payload) => JsonRpcResponse::tool_call(id, payload),
                     Err(error) => {
                         JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Owned(error.to_string()))
                     }

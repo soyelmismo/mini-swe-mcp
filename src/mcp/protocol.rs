@@ -5,11 +5,13 @@
 //! frames, not waiting for them):
 //!
 //! 1. **Borrow the frame you were handed.** [`parse_frame`] hands back a
-//!    request whose `method`, `id` and `params` are [`Cow::Borrowed`] slices of
-//!    the line the reader already owns, so a well-formed request costs *zero*
-//!    allocations to parse — no `String` for the method, no `Value` tree for
-//!    `id`, no owned clone of `params`. Only values that would have to be
-//!    unescaped to be represented (`Cow::Owned`, e.g. a string `id`) pay.
+//!    request whose `method` is a [`Cow::Borrowed`] slice of the line the
+//!    reader already owns and whose `id` and `params` are [`RawValue`]s — the
+//!    client's own bytes — so a well-formed request costs *zero* allocations
+//!    to parse: no `String` for the method, no `Value` tree for the id, and
+//!    `params` is promoted to a tree only on the `tools/call` path, the one
+//!    place that indexes into it. Only a method name that carries a JSON
+//!    escape (`Cow::Owned`) pays for an unescape.
 //! 2. **Stream into one exactly sized buffer.** [`JsonRpcResponse::to_frame`]
 //!    writes the envelope — payload included — straight into one buffer that
 //!    already reserves room for the frame's trailing newline. That replaces
@@ -19,9 +21,9 @@
 //!    [`PreSerializedResult`] serializer instead of being materialized as a
 //!    pretty-printed `String` and escaped a second time (audit 07, F4).
 //! 3. **Borrow the error text.** The messages for the common JSON-RPC errors
-//!    ([`JsonRpcResponse::method_not_found`], [`FrameRejection`]) are built out
-//!    of the frame being answered, so rejecting a request allocates nothing
-//!    beyond its output buffer.
+//!    ([`FrameRejection`]) are borrowed from the frame being answered, and a
+//!    `-32601` quotes the method it rejects, so a rejection allocates nothing
+//!    beyond its output buffer and the name it quotes.
 //!
 //! Spec compliance is enforced by construction rather than by convention: the
 //! `jsonrpc` member is the constant [`JSONRPC_VERSION`], an envelope carries
@@ -35,8 +37,9 @@ use std::sync::LazyLock;
 
 use serde::Deserializer as _;
 use serde::de::{self, IgnoredAny, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// The `jsonrpc` member of every frame, per JSON-RPC 2.0 §6.
 pub(super) const JSONRPC_VERSION: &str = "2.0";
@@ -84,155 +87,37 @@ const NO_METHOD: &str = "Invalid Request: missing or non-string \"method\" membe
 // Incoming frames
 // ---------------------------------------------------------------------------
 
-/// A JSON value that may be a view of the frame it was parsed out of.
-///
-/// Every `serde_json` input value is a fresh [`Value`] tree, so `Cow<str>`
-/// around it always degrades to `Owned`: a value that happens to need no
-/// unescaping is still rebuilt, member by member, before the server ever looks
-/// at it. `params` is read as text for that reason — the frame's own bytes,
-/// promoted to a `Value` only where a handler actually indexes into it (see
-/// `src/mcp/server.rs`). The wire contract is identical either way; this is
-/// purely about not paying for a tree nobody inspects.
-#[derive(Clone, Debug, Deserialize)]
-#[repr(transparent)]
-pub(super) struct RawValue<'a>(#[serde(borrow)] Cow<'a, Value>);
-
-impl RawValue<'_> {
-    /// Takes ownership of a value the server already materialized.
-    pub(super) fn owned(value: Value) -> Self {
-        Self(Cow::Owned(value))
-    }
-}
-
-impl std::ops::Deref for RawValue<'_> {
-    type Target = Value;
-
-    fn deref(&self) -> &Value {
-        &self.0
-    }
-}
-
-impl Serialize for RawValue<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-/// The `id` member of an incoming request, kept in the client's own encoding.
-///
-/// JSON-RPC 2.0 §4 allows a String, a Number or `null`, and it forbids neither
-/// fractions (`1.0`) nor absurd precision (`9007199254740993`) because that is
-/// precisely what a peer may have sent. Materializing the id into a `Value`
-/// therefore risks *changing* it — the echo stops being the id the client sent —
-/// so it is borrowed straight from the frame instead: a slice of the input is
-/// always byte-identical to what arrived, and costs nothing to take.
-#[derive(Clone, Debug)]
-#[repr(transparent)]
-pub(super) struct RequestId<'a>(pub(super) Cow<'a, str>);
-
-impl<'de> Deserialize<'de> for RequestId<'de> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // An id is String or Number (§4). Anything else is refused here rather
-        // than silently coerced.
-        deserializer.deserialize_any(RequestIdVisitor)
-    }
-}
-
-/// Reads a JSON-RPC id as the *text* the client sent.
-///
-/// A String id is borrowed from the frame, and a Number id is borrowed as its
-/// own digits — `"9007199254740993"` keeps every digit instead of collapsing to
-/// a `f64`, and `"1.0"` keeps its decimal point instead of becoming `1`. Both are
-/// what an echo has to reproduce byte for byte.
-struct RequestIdVisitor;
-
-impl<'de> Visitor<'de> for RequestIdVisitor {
-    type Value = RequestId<'de>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON-RPC id: a string or a number")
-    }
-
-    fn visit_borrowed_str<E: de::Error>(self, id: &'de str) -> Result<Self::Value, E> {
-        Ok(RequestId(Cow::Borrowed(id)))
-    }
-
-    fn visit_u64<E: de::Error>(self, id: u64) -> Result<Self::Value, E> {
-        Ok(RequestId(Cow::Owned(id.to_string())))
-    }
-
-    fn visit_i64<E: de::Error>(self, id: i64) -> Result<Self::Value, E> {
-        Ok(RequestId(Cow::Owned(id.to_string())))
-    }
-
-    fn visit_f64<E: de::Error>(self, id: f64) -> Result<Self::Value, E> {
-        Ok(RequestId(Cow::Owned(id.to_string())))
-    }
-}
-
-impl Serialize for RequestId<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Written as the raw JSON text the client sent. Re-parsing it into a
-        // `Value` is not an option: that is the round-trip which could change
-        // an id — `9007199254740993` would collapse to `9007199254740992`.
-        // What comes back instead is `Cow::Borrowed`, so a string id costs
-        // nothing to echo.
-        match self.0.as_ref() {
-            // No escape sequence to fold, no unescaping to undo: the text is
-            // already its own JSON encoding, so it goes out verbatim — one
-            // borrowed write, one allocation-free escape scan.
-            json if !json.contains('\\') => serializer.serialize_str(json),
-            // Escaped text (a `"` inside a string id, a `\uXXXX` escape, …) is
-            // the only case that has to be unescaped and re-escaped. It costs
-            // one `String`, and it is the only reason this serializer exists.
-            json => {
-                let value: Value = serde_json::from_str(json)
-                    .map_err(|error| serde::ser::Error::custom(error.to_string()))?;
-                value.serialize(serializer)
-            }
-        }
-    }
-}
-
-impl<'a> RequestId<'a> {
-    /// The id JSON-RPC 2.0 §5 asks for when the real one cannot be
-    /// determined: an unparseable frame, or a notification that must not be
-    /// answered. Borrowed, so it costs nothing.
-    pub(super) const NULL: &'static str = "null";
-
-    /// The id as an opaque JSON value for handlers that must echo it into a
-    /// payload (`progressToken`, for instance). Only paid on those paths.
-    pub(super) fn to_value(&self) -> Value {
-        serde_json::from_str(&self.0).unwrap_or(Value::Null)
-    }
-}
-
-
 /// An incoming JSON-RPC request; `id: None` marks a notification.
 ///
 /// Every field borrows from the line the reader owns, so a request can be
 /// answered on the spot (see [`JsonRpcResponse`]) without copying the frame.
 #[derive(Debug)]
 pub(super) struct JsonRpcRequest<'a> {
-    /// The method being invoked, borrowed from the frame.
+    /// The method being invoked, borrowed from the frame unless it carries a
+    /// JSON escape (`"tools\u002fcall"`), which has to be unescaped.
     pub(super) method: Cow<'a, str>,
-    /// The request id, borrowed from the frame. `None` (absent or `null`)
+    /// The request id, the client's own JSON text. `None` (absent or `null`)
     /// marks a notification, which the server must not answer.
-    pub(super) id: Option<Cow<'a, RequestId<'a>>>,
-    /// Method parameters, borrowed unless the frame carries a string member
-    /// that would need unescaping.
-    pub(super) params: Option<Cow<'a, RawValue<'a>>>,
+    pub(super) id: Option<&'a RawValue>,
+    /// Method parameters, the client's own JSON text; parsed only on the
+    /// `tools/call` path, the one place that indexes into them.
+    pub(super) params: Option<&'a RawValue>,
 }
 
 impl<'a> JsonRpcRequest<'a> {
-    /// The id to echo back, or `null` when the frame carried none.
-    pub(super) fn id_or_null(&self) -> Cow<'a, RequestId<'a>> {
-        self.id.clone().unwrap_or(Cow::Owned(RequestId(Cow::Borrowed(RequestId::NULL))))
+    /// The id to echo back, or `None` — serialized as `null`, which JSON-RPC
+    /// 2.0 §5 asks for when the real one cannot be determined.
+    pub(super) fn id_or_null(&self) -> Option<&'a RawValue> {
+        self.id
     }
 
-    /// The method parameters, if the frame carried any.
-    pub(super) fn params_value(&self) -> Option<&Value> {
-        self.params.as_ref().map(|params| &***params)
+    /// The method parameters as a value, if the frame carried any.
+    ///
+    /// This is the one place a frame is materialized: the `tools/call` handler
+    /// indexes into `name`, `arguments` and `_meta`, which a raw slice cannot
+    /// answer. Every other method keeps its params as raw text and never pays.
+    pub(super) fn params_value(&self) -> Option<Value> {
+        serde_json::from_str(self.params?.get()).ok()
     }
 }
 
@@ -271,8 +156,7 @@ impl FrameRejection {
             Self::Malformed(message) => (code::PARSE_ERROR, Cow::Owned(message)),
             Self::InvalidRequest(message) => (code::INVALID_REQUEST, Cow::Borrowed(message)),
         };
-        JsonRpcResponse::err(Cow::Owned(RequestId(Cow::Borrowed(RequestId::NULL))), code, message)
-            .to_frame()
+        JsonRpcResponse::err(None, code, message).to_frame()
             .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME))
     }
 }
@@ -321,13 +205,43 @@ pub(super) fn parse_frame(frame: &str) -> Result<JsonRpcRequest<'_>, FrameReject
     Ok(parsed)
 }
 
-/// A borrowed `&str` from the frame, for the members the server hands out as
-/// plain text.
+/// A method name borrowed from the frame when it is escape-free, unescaped
+/// into an owned `String` only when it carries a JSON escape.
 ///
-/// `serde` implements `Deserialize` for `&'de str`, not for `Cow<'de, str>`
-/// (it is transparent over `str`, which is), so the borrow is declared once
-/// here and the request borrows its method name through it.
-type BorrowedStr<'de> = &'de str;
+/// `serde` implements `Deserialize` for `&'de str` (borrowing through
+/// `visit_borrowed_str`), but not for `Cow<'de, str>` — the blanket impl
+/// always materializes `Owned`. This visitor recovers the borrow: it asks for
+/// `&str` first and falls back to `String` only when the frame's escapes force
+/// it, so an escaped method name is answered instead of rejected.
+struct MethodName<'de>(Cow<'de, str>);
+
+impl<'de> serde::Deserialize<'de> for MethodName<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MethodVisitor<'de>(std::marker::PhantomData<&'de ()>);
+
+        impl<'de> Visitor<'de> for MethodVisitor<'de> {
+            type Value = MethodName<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON-RPC method name")
+            }
+
+            fn visit_borrowed_str<E: de::Error>(self, method: &'de str) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Borrowed(method)))
+            }
+
+            fn visit_str<E: de::Error>(self, method: &str) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Owned(method.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, method: String) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Owned(method)))
+            }
+        }
+
+        deserializer.deserialize_str(MethodVisitor(std::marker::PhantomData))
+    }
+}
 
 /// Streams the members the server needs out of one map access.
 ///
@@ -344,15 +258,21 @@ impl<'de> Visitor<'de> for RequestVisitor {
     }
 
     fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut method: Option<&'de str> = None;
-        let mut id: Option<Cow<'de, RequestId<'de>>> = None;
-        let mut params: Option<Cow<'de, RawValue<'de>>> = None;
+        let mut method: Option<Cow<'de, str>> = None;
+        let mut id: Option<&'de RawValue> = None;
+        let mut params: Option<&'de RawValue> = None;
 
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
             match key.as_ref() {
-                "method" => method = Some(map.next_value::<BorrowedStr<'de>>()?),
-                "id" => id = map.next_value::<Option<Cow<'de, RequestId<'de>>>>()?,
-                "params" => params = map.next_value::<Option<Cow<'de, RawValue<'de>>>>()?,
+                // `&str` borrows the frame when the name is escape-free and
+                // errors only when it carries a JSON escape, in which case the
+                // fallback below unescapes it into an owned `String` — so
+                // `"tools\u002fcall"` is answered instead of rejected.
+                "method" => method = Some(map.next_value::<MethodName<'de>>()?.0),
+                // Raw text: the id is echoed byte for byte (§4 — the server may
+                // not round `9007199254740993` or re-quote a string id).
+                "id" => id = map.next_value::<Option<&'de RawValue>>()?,
+                "params" => params = map.next_value::<Option<&'de RawValue>>()?,
                 // Unknown members (`jsonrpc`, `_meta`, host extensions, …) are
                 // dropped without being parsed into a `Value`.
                 _ => {
@@ -362,7 +282,7 @@ impl<'de> Visitor<'de> for RequestVisitor {
         }
 
         Ok(JsonRpcRequest {
-            method: Cow::Borrowed(method.ok_or_else(|| de::Error::custom(NO_METHOD))?),
+            method: method.ok_or_else(|| de::Error::custom(NO_METHOD))?,
             id,
             params,
         })
@@ -380,17 +300,21 @@ impl<'de> Visitor<'de> for RequestVisitor {
 /// produce a frame that is neither, or both — which the spec forbids.
 #[derive(Debug)]
 pub(super) struct JsonRpcResponse<'a> {
-    /// The id to echo, in the encoding the client used (`null` when the id
-    /// could not be determined).
-    pub(super) id: Cow<'a, RequestId<'a>>,
+    /// The id to echo, in the encoding the client used; `None` serializes as
+    /// `null`, which JSON-RPC 2.0 §5 permits when the id cannot be determined.
+    id: Option<&'a RawValue>,
     body: Body<'a>,
 }
 
 /// The mutually exclusive payload of a JSON-RPC response.
 #[derive(Debug)]
 enum Body<'a> {
-    /// A successful `result`.
-    Result(Cow<'a, RawValue<'a>>),
+    /// A successful `result` the caller built as a value.
+    Result(Value),
+    /// A successful `tools/call` result: the payload is pretty-printed and
+    /// escaped straight into the frame buffer, never materialized as a `String`
+    /// first (audit 07, F4).
+    ToolCall(PreSerializedResult),
     /// An `error` object: a reserved `code` plus a message that is borrowed
     /// from the frame whenever possible.
     Error {
@@ -401,16 +325,29 @@ enum Body<'a> {
 
 impl<'a> JsonRpcResponse<'a> {
     /// Successful JSON-RPC 2.0 response whose `result` the caller owns.
-    pub(super) fn ok(id: Cow<'a, RequestId<'a>>, result: Value) -> Self {
+    pub(super) fn ok(id: Option<&'a RawValue>, result: Value) -> Self {
         Self {
             id,
-            body: Body::Result(Cow::Owned(RawValue::owned(result))),
+            body: Body::Result(result),
+        }
+    }
+
+    /// Successful `tools/call` response carrying a tool payload.
+    ///
+    /// [`PreSerializedResult`] embeds the payload as the `text` of a single
+    /// content block, pretty-printed by [`PayloadWriter`] and escaped by
+    /// `collect_str` while the frame is written — the payload is materialized
+    /// once, and never as an escaped `String` copy (audit 07, F4).
+    pub(super) fn tool_call(id: Option<&'a RawValue>, payload: Value) -> Self {
+        Self {
+            id,
+            body: Body::ToolCall(PreSerializedResult::text(payload)),
         }
     }
 
     /// JSON-RPC 2.0 error response carrying a reserved `code` and a message
     /// borrowed from the frame being answered.
-    pub(super) fn err(id: Cow<'a, RequestId<'a>>, code: i64, message: Cow<'a, str>) -> Self {
+    pub(super) fn err(id: Option<&'a RawValue>, code: i64, message: Cow<'a, str>) -> Self {
         Self {
             id,
             body: Body::Error { code, message },
@@ -418,8 +355,8 @@ impl<'a> JsonRpcResponse<'a> {
     }
 
     /// `-32601 Method not found` for a method the server does not expose; the
-    /// rejected name is borrowed straight from the frame.
-    pub(super) fn method_not_found(id: Cow<'a, RequestId<'a>>, method: Cow<'a, str>) -> Self {
+    /// rejected name is quoted straight from the frame.
+    pub(super) fn method_not_found(id: Option<&'a RawValue>, method: Cow<'a, str>) -> Self {
         Self::err(
             id,
             code::METHOD_NOT_FOUND,
@@ -434,12 +371,12 @@ impl<'a> JsonRpcResponse<'a> {
     /// the writer task without the extra `serialized + "\n"` copy.
     pub(super) fn to_frame(&self) -> Result<String, ProtocolWarning> {
         let mut frame = String::with_capacity(FRAME_CAPACITY);
+        // The default (compact) formatter writes straight into the frame
+        // buffer through the `io::Write` bridge, so no intermediate `String`
+        // is produced and the trailing newline costs no reallocation.
         let mut serializer = serde_json::Serializer::new(StrSink(&mut frame));
-        let serialized = self.serialize(&mut serializer);
-        // The serializer's borrow of the buffer ends here.
-        drop(serializer);
-        if let Err(error) = serialized {
-            // A `serde_json::Value` payload cannot fail to serialize, so this is
+        if let Err(error) = self.serialize(&mut serializer) {
+            // A `Value` payload cannot fail to serialize, so this is
             // unreachable in practice; it is handled instead of unwrapped
             // because a daemon must not abort mid-stream.
             tracing::error!(%error, "Failed to serialize a JSON-RPC response");
@@ -448,19 +385,13 @@ impl<'a> JsonRpcResponse<'a> {
         frame.push('\n');
         Ok(frame)
     }
-
-    /// The envelope as a value, for the few callers that need to reason about
-    /// a response structurally rather than as bytes.
-    pub(super) fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
-    }
 }
 
 /// The `error` member of a response: a reserved `code` plus a message that is
 /// borrowed from the frame whenever possible.
 struct ErrorPayload<'a> {
     code: i64,
-    message: Cow<'a, str>,
+    message: &'a str,
 }
 
 impl Serialize for ErrorPayload<'_> {
@@ -468,7 +399,7 @@ impl Serialize for ErrorPayload<'_> {
         use serde::ser::SerializeStruct;
         let mut error = serializer.serialize_struct("Error", 2)?;
         error.serialize_field("code", &self.code)?;
-        error.serialize_field("message", &self.message)?;
+        error.serialize_field("message", self.message)?;
         error.end()
     }
 }
@@ -476,20 +407,26 @@ impl Serialize for ErrorPayload<'_> {
 impl Serialize for JsonRpcResponse<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut frame = serializer.serialize_struct("JsonRpcResponse", 4)?;
+        let mut frame = serializer.serialize_struct("JsonRpcResponse", 3)?;
         frame.serialize_field("jsonrpc", JSONRPC_VERSION)?;
         frame.serialize_field("id", &self.id)?;
         match &self.body {
             Body::Result(result) => frame.serialize_field("result", result)?,
+            Body::ToolCall(result) => frame.serialize_field("result", result)?,
             Body::Error { code, message } => {
-                frame.serialize_field("error", &ErrorPayload { code: *code, message: message.clone() })?;
+                frame.serialize_field(
+                    "error",
+                    &ErrorPayload {
+                        code: *code,
+                        message: message.as_ref(),
+                    },
+                )?;
             }
         }
         frame.end()
     }
 }
 
-// ---------------------------------------------------------------------------
 // MCP envelopes built once per process
 // ---------------------------------------------------------------------------
 
@@ -528,11 +465,13 @@ pub(super) static INITIALIZE_RESULT: LazyLock<Value> = LazyLock::new(|| {
 /// same bytes. `PreSerializedResult` keeps the payload as a `Value` and lets the
 /// envelope write it straight into the frame buffer, so the payload is
 /// materialized once (audit 07, F4).
+#[derive(Debug)]
 pub(super) struct PreSerializedResult {
     pub(super) content: [PreSerializedContent; 1],
 }
 
 /// The one `{"type": "text", "text": …}` content block a tool reply carries.
+#[derive(Debug)]
 pub(super) struct PreSerializedContent {
     kind: &'static str,
     pub(super) payload: Value,
@@ -651,34 +590,13 @@ impl std::io::Write for FmtSink<'_, '_> {
     }
 }
 
-/// Carries an already-correct JSON fragment through a [`Value`] slot.
-///
-/// The envelope's `result` is a `Value` so handlers can hand back payloads they
-/// built with `json!`, but a `tools/call` result is *not* meant to be
-/// materialized: its payload has to be pretty-printed and escaped by
-/// [`PreSerializedResult`] inside the frame, which a `Value` cannot express
-/// (serde escapes control characters itself, so wrapping it in a
-/// `Value::String` would emit `\\n` instead of the newlines MCP clients expect).
-///
-/// Wrapping the serializer keeps the fast path intact and removes the second
-/// materialization, at the cost of one map allocation per `tools/call`
-/// response. The value is only ever written out, never inspected, so the
-/// delegated `Serialize` impl is enough.
-pub(super) struct RawText<T>(pub(super) T);
-
-impl<T: Serialize> Serialize for RawText<T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A frame the reader can answer without copying: the id and the params are
-    /// views of the input, not freshly built trees.
+    /// A frame the reader can answer without copying; the `id` and `params`
+    /// are the client's own bytes, not freshly built trees.
     #[test]
     fn parsed_frames_borrow_the_line() {
         let line = r#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{"action":"reap"}}"#;
@@ -686,22 +604,17 @@ mod tests {
 
         assert_eq!(req.method, "ping");
         assert!(matches!(req.method, Cow::Borrowed(_)), "method must borrow");
-        assert!(matches!(req.id, Some(Cow::Owned(_))), "a number id is materialized");
-        assert!(
-            matches!(req.params, Some(Cow::Owned(_))),
-            "a params object is a fresh `Value` tree: it can only be owned"
-        );
         // The id is the client's own text, so every digit of it survives.
-        assert_eq!(req.id_or_null().0, "7");
+        assert_eq!(req.id.unwrap().get(), "7");
         assert_eq!(
-            req.params_value().and_then(|params| params["action"].as_str()),
-            Some("reap")
+            req.params_value().and_then(|params| params["action"].as_str().map(str::to_owned)),
+            Some("reap".to_owned())
         );
     }
 
-    /// Values that carry a JSON escape have to be unescaped to be represented,
-    /// so they materialize. A `/` is a JSON escape even though it reads as
-    /// itself, which is why `tools/call` is the escaping method name here.
+    /// A method name that carries a JSON escape has to be unescaped to be
+    /// represented, so it materializes. A `/` is a JSON escape even though it
+    /// reads as itself, which is why `tools/call` is the escaping method.
     #[test]
     fn escaped_members_fall_back_to_owned_values() {
         let req = parse_frame(r#"{"id":"c-1","method":"tools\u002fcall"}"#).expect("parse");
@@ -710,25 +623,18 @@ mod tests {
             "an escaped method name has to be unescaped to be represented"
         );
         assert_eq!(req.method, "tools/call");
-        assert!(
-            matches!(req.id, Some(Cow::Borrowed(_))),
-            "a plain string id is borrowed from the frame"
-        );
-        assert_eq!(req.id_or_null().0, "c-1");
+        assert_eq!(req.id.unwrap().get(), r#""c-1""#, "the raw id keeps its quotes");
     }
 
-    /// Borrowed and owned representations agree on the wire.
+    /// The raw params survive exactly as written (quoted strings stay quoted,
+    /// numbers stay numbers), and an absent `params` member stays absent.
     #[test]
-    fn borrowed_and_owned_frames_agree() {
-        let borrowed = parse_frame(r#"{"id":7,"method":"ping","params":{"n":1}}"#).expect("parse");
-        let owned = parse_frame(r#"{"id":"7","method":"ping","params":{"s":"x\ny"}}"#).expect("parse");
-
-        assert!(matches!(owned.params, Some(Cow::Owned(_))));
-        assert_eq!(borrowed.params_value(), Some(&json!({ "n": 1 })));
+    fn params_stay_raw_until_indexed() {
+        let req = parse_frame(r#"{"id":1,"method":"ping","params":{"s":"x\ny"}}"#).expect("parse");
         assert_eq!(
-            owned.params_value(),
-            Some(&json!({ "s": "x\ny" })),
-            "the escaped string arrives unescaped"
+            req.params.unwrap().get(),
+            r#"{"s":"x\ny"}"#,
+            "params are raw text: escapes are not unescaped until indexed"
         );
         assert_eq!(
             parse_frame(r#"{"id":7,"method":"ping"}"#)
@@ -762,8 +668,6 @@ mod tests {
         ] {
             let req = parse_frame(line).expect("notification");
             assert!(req.id.is_none(), "`{line}` must be a notification");
-            // …and an echoable id still has to exist for anything else.
-            assert_eq!(req.id_or_null().0, "null");
         }
         assert!(
             parse_frame(r#"{"id":0,"method":"ping"}"#)
@@ -803,33 +707,40 @@ mod tests {
             );
         }
 
-        // The `-32600` wording is borrowed, so it stays byte-identical.
+        // The `-32600` wording is a constant, so it stays byte-identical.
+        let expected = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":\"{}\"}}}}\n",
+            code::INVALID_REQUEST,
+            NO_METHOD.replace('"', "\\\"")
+        );
         assert_eq!(
             parse_frame(r#"{"id":1}"#).expect_err("no method").into_frame(),
-            format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{},\"message\":\"{NO_METHOD}\"}}}}\n",
-                code::INVALID_REQUEST
-            )
+            expected
         );
     }
 
     /// The `ok` / `err` constructors emit spec-shaped JSON-RPC 2.0 envelopes.
     #[test]
     fn json_rpc_constructors_are_spec_shaped() {
-        let ok = JsonRpcResponse::ok(owned_id(json!(7)), json!({ "a": 1 })).to_frame();
-        assert_eq!(ok.expect("frame"), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"a\":1}}\n");
+        let ok = JsonRpcResponse::ok(None, json!({ "a": 1 })).to_frame();
+        assert_eq!(ok.expect("frame"), "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"a\":1}}\n");
 
-        let err =
-            JsonRpcResponse::err(owned_id(Value::Null), code::METHOD_NOT_FOUND, Cow::Borrowed("nope"))
-                .to_value();
+        // A value the server built itself, serialized as raw JSON text.
+        let err = JsonRpcResponse::err(
+            id(r#"{"id":"server-1","method":"ping"}"#),
+            code::METHOD_NOT_FOUND,
+            Cow::Borrowed("nope"),
+        )
+            .to_frame()
+            .expect("frame");
+        let value: Value = serde_json::from_str(&err).expect("frame is JSON");
+        assert_eq!(value["jsonrpc"], json!(JSONRPC_VERSION));
+        assert_eq!(value["id"], json!("server-1"));
         assert_eq!(
-            err,
-            json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32601, "message": "nope" }
-            })
+            value["error"],
+            json!({ "code": -32601, "message": "nope" })
         );
+        assert!(value.get("result").is_none());
     }
 
     /// `-32601` quotes the method it rejected, borrowed from the frame.
@@ -841,7 +752,7 @@ mod tests {
         assert_eq!(
             response.to_frame().expect("frame"),
             concat!(
-                r#"{"jsonrpc":"2.0","id":"3","error":{"code":-32601,"#,
+                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"#,
                 r#""message":"Method not found: does/not/exist"}}"#,
                 "\n",
             )
@@ -853,9 +764,7 @@ mod tests {
     /// number, and no id is rounded on the way through.
     #[test]
     fn ids_are_echoed_verbatim() {
-        for id in ["7", "0", "-3", r#""call-1""#] {
-            let line = format!(r#"{{"id":{id},"method":"ping"}}"#);
-            let req = parse_frame(&line).expect("parse");
+        for id in ["7", "0", "-3", r#""call-1""#, "1.50", "9007199254740993"] {
             let frame = frame_of(id);
             assert_eq!(
                 frame,
@@ -869,7 +778,7 @@ mod tests {
     /// is reserved up front, so the newline must not cost a second copy.
     #[test]
     fn frames_are_newline_terminated_documents() {
-        let response = JsonRpcResponse::ok(owned_id(json!(1)), json!({}));
+        let response = JsonRpcResponse::ok(None, json!({}));
         let frame = response.to_frame().expect("a `Value` payload always serializes");
         assert!(frame.ends_with('\n'));
         assert_eq!(frame.matches('\n').count(), 1, "one line per frame: {frame:?}");
@@ -878,7 +787,7 @@ mod tests {
     }
 
     /// Tool payloads are embedded as pretty-printed JSON text, exactly as
-    /// before, but the envelope no longer materializes an escaped copy of it.
+    /// before, and the envelope no longer materializes an escaped copy of it.
     #[test]
     fn pre_serialized_result_embeds_the_payload_as_text() {
         let envelope =
@@ -896,16 +805,18 @@ mod tests {
     }
 
     /// A `tools/call` response keeps the pretty-printed payload *and* its
-    /// newlines: the raw wrapper is what stops serde from escaping them twice.
+    /// newlines: `collect_str` escapes the payload once, while the frame is
+    /// written, instead of the outer serializer escaping an already-escaped
+    /// `String`.
     #[test]
     fn tool_results_survive_the_value_slot_intact() {
         let payload = json!({ "status": "reaped", "worker_ids": [] });
-        let result = serde_json::to_value(RawText(PreSerializedResult::text(payload)))
-            .expect("the raw wrapper always serializes");
-        let response = JsonRpcResponse::ok(owned_id(Value::Null), result);
+        let response =
+            JsonRpcResponse::tool_call(id(r#"{"id":7,"method":"ping"}"#), payload);
         let frame = response.to_frame().expect("frame");
 
         let wire: Value = serde_json::from_str(&frame).expect("frame");
+        assert_eq!(wire["id"], json!(7));
         let text = wire["result"]["content"][0]["text"]
             .as_str()
             .expect("text content");
@@ -931,10 +842,9 @@ mod tests {
         assert_eq!(initialize["capabilities"]["tools"]["listChanged"], json!(false));
     }
 
-    /// The id a response that is not answering a frame is given: a value the
-    /// server built itself, serialized as the JSON text of that value.
-    fn owned_id(value: Value) -> Cow<'static, RequestId<'static>> {
-        Cow::Owned(RequestId(Cow::Owned(value.to_string())))
+    /// A raw id value, for constructors that answer frames the test built.
+    fn id(line: &'static str) -> Option<&'static RawValue> {
+        parse_frame(line).expect("frame").id
     }
 
     /// An id as it arrives on the wire, for the round-trip assertions below.
@@ -946,3 +856,4 @@ mod tests {
             .expect("frame")
     }
 }
+
