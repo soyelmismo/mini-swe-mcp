@@ -28,12 +28,12 @@ pub const TRUNCATE_TAIL: usize = 4_096;
 
 /// Literal text of the marker inserted in place of the discarded middle,
 /// excluding the decimal byte count that is rendered between the two halves.
-const TRUNCATE_MARKER: &str = "\n... [Truncated ";
+pub const TRUNCATE_MARKER: &str = "\n... [Truncated ";
 /// Literal text of the second half of the marker, after the byte count.
-const TRUNCATE_MARKER_SUFFIX: &str = " bytes] ...\n";
+pub const TRUNCATE_MARKER_SUFFIX: &str = " bytes] ...\n";
 /// Upper bound on the decimal digits of a `usize` (2^64 - 1 has 20 digits).
 /// Used to size the result buffer up front so the marker needs no allocation.
-const USIZE_MAX_DIGITS: usize = 20;
+pub const USIZE_MAX_DIGITS: usize = 20;
 
 /// Bound command output to [`TRUNCATE_LIMIT`] bytes, keeping the head and the
 /// tail of the text and reporting how many bytes were discarded.
