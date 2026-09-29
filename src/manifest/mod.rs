@@ -5,8 +5,6 @@
 //!
 //! * `types` — the serializable [`ModelManifest`] / [`ModelDefinition`] pair
 //!   and the process-wide constants that bound them.
-//! * `cache` — the bounded, process-wide memoization of rendered catalog
-//!   bullets.
 //! * `catalog` — the markdown catalog rendering used by the MCP `tools/list`
 //!   payload ([`ModelManifest::build_tool_description`]).
 //! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
@@ -27,7 +25,6 @@ use tracing::{error, info, warn};
 
 use crate::config::xdg_config_dir;
 
-mod cache;
 mod catalog;
 mod memory;
 mod rules;
@@ -37,10 +34,9 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use self::cache::{CATALOG_CACHE_CAPACITY, catalog_cache_len, clear_catalog_cache};
 pub use self::catalog::build_system_prompt;
 pub use self::memory::{
-    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, append_agent_memory, load_agent_memory,
+    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory,
 };
 pub use self::types::{
     BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, FS_POLICIES, FsPolicy,
@@ -85,7 +81,7 @@ impl ModelManifest {
         }
 
         info!("No models.yaml found; using default built-in manifest (ninja & nerd)");
-        Self::default().normalized()
+        Self::default().normalize()
     }
 
     /// Parse and normalize a manifest from an explicit `models.yaml` path.
@@ -97,10 +93,7 @@ impl ModelManifest {
     /// discovery path, and the returned manifest is always normalized.
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let manifest = Self::from_file(path)?;
-        for warning in manifest.validate() {
-            warn!(path = %path.display(), "Model manifest warning: {warning}");
-        }
-        Ok(manifest.normalized())
+        Ok(Self::warn_and_normalize(manifest, path))
     }
 
     fn from_candidate(path: &Path, source: &str) -> Option<Self> {
@@ -111,18 +104,23 @@ impl ModelManifest {
         match Self::from_file(path) {
             Ok(manifest) => {
                 info!(path = %path.display(), "Loaded model manifest from {source}");
-                for warning in manifest.validate() {
-                    warn!(path = %path.display(), "Model manifest warning: {warning}");
-                }
                 // Validation is advisory, so fixups are applied here: a manifest
                 // with warnings is still served, but as a working configuration.
-                Some(manifest.normalized())
+                Some(Self::warn_and_normalize(manifest, path))
             }
             Err(e) => {
                 error!(error = %e, path = %path.display(), "Failed to parse models.yaml from {source}");
                 None
             }
         }
+    }
+
+    /// Log the advisory warnings for `manifest` and return it normalized.
+    fn warn_and_normalize(manifest: Self, path: &Path) -> Self {
+        for warning in manifest.validate() {
+            warn!(path = %path.display(), "Model manifest warning: {warning}");
+        }
+        manifest.normalize()
     }
 
     fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -148,13 +146,10 @@ impl ModelManifest {
             return (def.id.clone(), def.temperature, def.max_turns);
         }
 
-        self.sorted_models()
-            .iter()
-            .find(|(_, def)| def.id == requested)
-            .map_or_else(
-                || (requested.to_string(), None, None),
-                |(_, def)| (def.id.clone(), def.temperature, def.max_turns),
-            )
+        self.lookup_by_id(requested).map_or_else(
+            || (requested.to_string(), None, None),
+            |(_, def)| (def.id.clone(), def.temperature, def.max_turns),
+        )
     }
 
     /// Resolve the *alias* that owns `model`, whether `model` is already an alias
@@ -170,10 +165,19 @@ impl ModelManifest {
         if self.models.contains_key(model) {
             return model.to_string();
         }
+        self.lookup_by_id(model)
+            .map_or_else(|| model.to_string(), |(alias, _)| (*alias).to_string())
+    }
+
+    /// Find the first (sorted-alias) entry whose `id` equals `id`.
+    ///
+    /// Shared by [`Self::resolve_model`] and [`Self::alias_for_model`], which
+    /// both perform the same sorted scan by id.
+    fn lookup_by_id(&self, id: &str) -> Option<(&str, &ModelDefinition)> {
         self.sorted_models()
             .iter()
-            .find(|(_, def)| def.id == model)
-            .map_or_else(|| model.to_string(), |(alias, _)| (*alias).to_string())
+            .find(|(_, def)| def.id == id)
+            .copied()
     }
 
     /// Model entries in alias order.

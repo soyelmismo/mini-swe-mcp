@@ -4,7 +4,6 @@
 //! pool runner uses when it builds a worker's system prompt:
 //!
 //! * [`load_agent_memory`] reads `<repo>/.agents/memory/<alias>.md`.
-//! * [`append_agent_memory`] records an atomic takeaway into the same file.
 //! * [`build_system_prompt`] splices that memory into the system prompt, and is a
 //!   byte-for-byte no-op when the repository has no memory for the role.
 //!
@@ -14,8 +13,8 @@
 
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{
-    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, ModelManifest, agent_memory_path, append_agent_memory,
-    build_system_prompt, load_agent_memory,
+    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, ModelManifest, agent_memory_path, build_system_prompt,
+    load_agent_memory,
 };
 use std::path::{Path, PathBuf};
 
@@ -46,19 +45,19 @@ impl Drop for ScratchRepo {
 }
 
 #[test]
-fn test_load_agent_memory_round_trips_an_appended_takeaway() {
+fn test_load_agent_memory_reads_a_written_takeaway() {
     let repo = ScratchRepo::new("roundtrip");
 
     // A fresh repository has no memory at all — the loader degrades to `None`
     // instead of failing, so a dispatch never breaks on a missing file.
     assert_eq!(load_agent_memory(repo.path(), "ninja"), None);
 
-    append_agent_memory(
-        repo.path(),
-        "ninja",
-        "Always run `cargo test --all-targets`.",
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    std::fs::write(
+        agent_memory_path(repo.path(), "ninja").expect("path"),
+        "PERSISTENT ROLE MEMORY (from .agents/memory/):\n- Always run `cargo test --all-targets`.\n",
     )
-    .expect("append creates the memory directory and file");
+    .expect("fixture written");
 
     assert!(repo.memory_dir().join("ninja.md").is_file());
     let memory = load_agent_memory(repo.path(), "ninja").expect("memory is readable back");
@@ -82,7 +81,12 @@ fn test_build_system_prompt_is_a_no_op_without_memory() {
 #[test]
 fn test_build_system_prompt_injects_memory_after_the_static_prompt() {
     let repo = ScratchRepo::new("inject");
-    append_agent_memory(repo.path(), "nerd", "Reproduce before you patch.").expect("append");
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    std::fs::write(
+        agent_memory_path(repo.path(), "nerd").expect("path"),
+        "PERSISTENT ROLE MEMORY (from .agents/memory/):\n- Reproduce before you patch.\n",
+    )
+    .expect("fixture written");
 
     let prompt = build_system_prompt(repo.path(), "nerd");
     assert!(
