@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use super::AgentRunner;
+use super::intercept::{CommandPipeline, InterceptDecision};
 use super::sandbox::{
     find_git_dirs, has_bwrap, is_heavy_command, truncate_output, validate_bash_command,
 };
@@ -66,7 +67,19 @@ impl AgentRunner {
     /// non-zero code so it can recover on the next step. Only a failure to
     /// spawn the child propagates as an `Err`.
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
-        if let Err(reason) = validate_bash_command(command) {
+        // Pre-execution interceptor middleware: destructive-pattern guard +
+        // telemetry. A block is reported to the model like a guardrail
+        // rejection; a rewrite replaces the command seen below.
+        let pipeline = CommandPipeline::default_pipeline();
+        let effective_command: String = match pipeline.process(command)? {
+            InterceptDecision::Allow => command.to_string(),
+            InterceptDecision::Block(reason) => {
+                return Ok((blocked_by_interceptor(&reason), Some(1)));
+            }
+            InterceptDecision::Rewrite(next) => next,
+        };
+
+        if let Err(reason) = validate_bash_command(&effective_command) {
             return Ok((blocked_by_guardrail(reason), Some(1)));
         }
 
@@ -80,18 +93,25 @@ impl AgentRunner {
         if sandbox_enabled() {
             apply_sandbox_args(&mut cmd, dir, &target_dir);
             cmd.args(["--chdir", &dir.to_string_lossy()]);
-            cmd.args(["/usr/bin/bash", "-c", command]);
+            cmd.args(["/usr/bin/bash", "-c", &effective_command]);
         } else {
             cmd.current_dir(dir)
-                .args([NICE_LEVEL, "10", "bash", "-c", command]);
+                .args([NICE_LEVEL, "10", "bash", "-c", &effective_command]);
         }
 
         apply_build_env(&mut cmd, &target_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
 
-        let timeout_secs = command_timeout_secs(command);
+        let timeout_secs = command_timeout_secs(&effective_command);
         run_with_timeout(&mut cmd, timeout_secs).await
     }
+}
+
+/// Message shown to the model when an interceptor blocks a command.
+fn blocked_by_interceptor(reason: &str) -> String {
+    format!(
+        "COMMAND BLOCKED BY INTERCEPTOR:\n{reason}\nPlease use a safe, non-destructive command within the current repository directory ($PWD)."
+    )
 }
 
 /// Message shown to the model when the worktree guardrail rejects a command.
