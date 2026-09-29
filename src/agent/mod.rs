@@ -1,5 +1,6 @@
 pub mod env;
 pub mod exec;
+pub mod intercept;
 pub mod retry;
 pub mod runner;
 pub mod sandbox;
