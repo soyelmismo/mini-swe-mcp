@@ -44,7 +44,7 @@ where
 
 /// Non-blocking stderr writer for tracing.
 struct AsyncStderrWriter {
-    tx: std::sync::mpsc::Sender<String>,
+    tx: std::sync::mpsc::SyncSender<String>,
 }
 
 impl std::io::Write for AsyncStderrWriter {
@@ -72,15 +72,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AsyncStderrWriter {
 }
 
 fn non_blocking_stderr() -> AsyncStderrWriter {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Bounded so a burst of telemetry can never stall a runtime thread; lines
+    // are dropped when the sink is full, which is fine for diagnostics.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
     std::thread::Builder::new()
         .name("telemetry-stderr".to_string())
         .spawn(move || {
             use std::io::Write as _;
             let mut stderr = std::io::stderr();
             while let Ok(line) = rx.recv() {
-                if let Err(e) = stderr.write_all(line.as_bytes()) {
-                    let _ = e;
+                if stderr.write_all(line.as_bytes()).is_err() {
                     break;
                 }
                 let _ = stderr.flush();

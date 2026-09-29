@@ -48,18 +48,18 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
         "manifest" | "list" | "reap" => {}
         _ => {
             let actions = crate::cli::available_actions();
-            if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {
-                eprintln!(
+            let msg = if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {
+                format!(
                     "Unknown action: {action}. Did you mean '{suggestion}'?\nAvailable: {}",
                     actions.join(", ")
-                );
+                )
             } else {
-                eprintln!(
+                format!(
                     "Unknown action: {action}. Available: {}",
                     actions.join(", ")
-                );
-            }
-            std::process::exit(1);
+                )
+            };
+            anyhow::bail!("{msg}");
         }
     }
 

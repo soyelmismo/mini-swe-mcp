@@ -393,11 +393,6 @@ fn turns_cell(step: usize, max_turns: usize, layout: &Layout) -> String {
     format!("{}{cell}", " ".repeat(layout.turns - cell.chars().count()))
 }
 
-/// Whether a status is terminal (its uptime is frozen, not still counting).
-fn is_terminal_status(status: RegistryStatus) -> bool {
-    status.is_terminal()
-}
-
 /// Status cell for a worker: badge text plus colour, padded by the caller.
 ///
 /// `reviewing` is deliberately distinct from `running`: the implementer is
@@ -429,7 +424,7 @@ fn status_cell(status: RegistryStatus, use_color: bool) -> &'static str {
 fn row_prefix(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool, now: u64) -> String {
     let id = truncate_visible(&w.id, layout.id);
     let pid = format!("{:<width$}", w.pid, width = PID_WIDTH);
-    let duration_secs = if is_terminal_status(w.status) {
+    let duration_secs = if w.status.is_terminal() {
         w.updated_at.saturating_sub(w.started_at)
     } else {
         now.saturating_sub(w.started_at)
@@ -469,7 +464,7 @@ fn stack_row(
     now: u64,
     op: &str,
 ) -> String {
-    let duration_secs = if is_terminal_status(w.status) {
+    let duration_secs = if w.status.is_terminal() {
         w.updated_at.saturating_sub(w.started_at)
     } else {
         now.saturating_sub(w.started_at)
@@ -533,33 +528,6 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
 // Dashboard rendering
 // ---------------------------------------------------------------------------
 
-/// The status buckets the dashboard counts, in heading order.
-///
-/// One classifier feeds both the global strip and the per-repository counters,
-/// so the two views can never disagree about what a status means.
-#[derive(Clone, Copy)]
-enum Bucket {
-    Active,
-    Paused,
-    Reviewing,
-    Completed,
-    Failed,
-    Stopped,
-}
-
-/// Classify a raw registry status; anything unrecognized is `Stopped`, which
-/// is the same catch-all the supervisor already used for terminal workers.
-fn status_bucket(status: RegistryStatus) -> Bucket {
-    match status {
-        RegistryStatus::Running => Bucket::Active,
-        RegistryStatus::Paused => Bucket::Paused,
-        RegistryStatus::Reviewing => Bucket::Reviewing,
-        RegistryStatus::Completed => Bucket::Completed,
-        RegistryStatus::Failed => Bucket::Failed,
-        RegistryStatus::Stopped => Bucket::Stopped,
-    }
-}
-
 /// One repository's slice of the dashboard: its workers plus the counters
 /// shown in its heading.
 ///
@@ -592,13 +560,13 @@ impl<'a> RepoGroup<'a> {
 
     /// Append one worker and fold its status into the counters.
     fn push(&mut self, entry: &'a WorkerRegistryEntry) {
-        match status_bucket(entry.status) {
-            Bucket::Active => self.active += 1,
-            Bucket::Paused => self.paused += 1,
-            Bucket::Reviewing => self.reviewing += 1,
-            Bucket::Completed => self.completed += 1,
-            Bucket::Failed => self.failed += 1,
-            Bucket::Stopped => self.stopped += 1,
+        match entry.status {
+            RegistryStatus::Running => self.active += 1,
+            RegistryStatus::Paused => self.paused += 1,
+            RegistryStatus::Reviewing => self.reviewing += 1,
+            RegistryStatus::Completed => self.completed += 1,
+            RegistryStatus::Failed => self.failed += 1,
+            RegistryStatus::Stopped => self.stopped += 1,
         }
         self.workers.push(entry);
     }
@@ -611,13 +579,13 @@ impl<'a> RepoGroup<'a> {
     /// dropped so an idle worktree spends its heading on `total` alone.
     fn summary_items(&self) -> Vec<(&'static str, String, &'static str)> {
         [
-            ("total", self.workers.len(), bold()),
-            ("active", self.active, green()),
-            ("paused", self.paused, yellow()),
-            ("reviewing", self.reviewing, magenta()),
-            ("completed", self.completed, blue()),
-            ("failed", self.failed, red()),
-            ("stopped", self.stopped, dim()),
+            ("total", self.workers.len(), BOLD),
+            ("active", self.active, GREEN),
+            ("paused", self.paused, YELLOW),
+            ("reviewing", self.reviewing, MAGENTA),
+            ("completed", self.completed, BLUE),
+            ("failed", self.failed, RED),
+            ("stopped", self.stopped, DIM),
         ]
         .into_iter()
         .filter(|(_, count, _)| *count > 0)
@@ -657,13 +625,13 @@ pub fn render_dashboard_with_width(
     // dashboard never reshuffles between ticks.
     let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
     for entry in entries {
-        match status_bucket(entry.status) {
-            Bucket::Active => active += 1,
-            Bucket::Paused => paused += 1,
-            Bucket::Reviewing => reviewing += 1,
-            Bucket::Completed => completed += 1,
-            Bucket::Failed => failed += 1,
-            Bucket::Stopped => stopped += 1,
+        match entry.status {
+            RegistryStatus::Running => active += 1,
+            RegistryStatus::Paused => paused += 1,
+            RegistryStatus::Reviewing => reviewing += 1,
+            RegistryStatus::Completed => completed += 1,
+            RegistryStatus::Failed => failed += 1,
+            RegistryStatus::Stopped => stopped += 1,
         }
         let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
         repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
@@ -695,14 +663,14 @@ pub fn render_dashboard_with_width(
     // of wrapping mid-item on a narrow window.
     out.push_str(&stats_lines(
         &[
-            ("Active", active.to_string(), green()),
-            ("Paused", paused.to_string(), yellow()),
-            ("Reviewing", reviewing.to_string(), magenta()),
-            ("Completed", completed.to_string(), blue()),
-            ("Failed", failed.to_string(), red()),
-            ("Stopped", stopped.to_string(), dim()),
-            ("Total", total.to_string(), bold()),
-            ("Repos", repos.len().to_string(), bold()),
+            ("Active", active.to_string(), GREEN),
+            ("Paused", paused.to_string(), YELLOW),
+            ("Reviewing", reviewing.to_string(), MAGENTA),
+            ("Completed", completed.to_string(), BLUE),
+            ("Failed", failed.to_string(), RED),
+            ("Stopped", stopped.to_string(), DIM),
+            ("Total", total.to_string(), BOLD),
+            ("Repos", repos.len().to_string(), BOLD),
         ],
         layout.total,
         use_color,
@@ -809,32 +777,27 @@ fn stacked_header_line(layout: &Layout) -> String {
 // ---------------------------------------------------------------------------
 
 /// Bold, used for the totals.
-fn bold() -> &'static str {
-    "\x1b[1m"
-}
+const BOLD: &str = "\x1b[1m";
 /// Bold green: active work.
-fn green() -> &'static str {
-    "\x1b[1;32m"
-}
+const GREEN: &str = "\x1b[1;32m";
 /// Bold yellow: paused.
-fn yellow() -> &'static str {
-    "\x1b[1;33m"
-}
+const YELLOW: &str = "\x1b[1;33m";
 /// Bold magenta: reviewing.
-fn magenta() -> &'static str {
-    "\x1b[1;35m"
-}
+const MAGENTA: &str = "\x1b[1;35m";
 /// Bold blue: completed.
-fn blue() -> &'static str {
-    "\x1b[1;34m"
-}
+const BLUE: &str = "\x1b[1;34m";
 /// Bold red: failed.
-fn red() -> &'static str {
-    "\x1b[1;31m"
-}
+const RED: &str = "\x1b[1;31m";
 /// Dim white: stopped.
-fn dim() -> &'static str {
-    "\x1b[2;37m"
+const DIM: &str = "\x1b[2;37m";
+
+/// Render one `label: value` item, coloured when requested.
+fn item_text(label: &str, value: &str, color: &str, use_color: bool) -> String {
+    if use_color {
+        format!("{label}: {color}{value}\x1b[0m")
+    } else {
+        format!("{label}: {value}")
+    }
 }
 
 /// Join `label: value` items onto a single line for a repository heading.
@@ -848,11 +811,7 @@ fn summary_line(items: &[(&str, String, &'static str)], use_color: bool) -> Stri
         if i > 0 {
             out.push_str("  |  ");
         }
-        if use_color {
-            out.push_str(&format!("{label}: {color}{value}\x1b[0m"));
-        } else {
-            out.push_str(&format!("{label}: {value}"));
-        }
+        out.push_str(&item_text(label, value, color, use_color));
     }
     out
 }
@@ -878,11 +837,7 @@ fn stats_lines(items: &[(&str, String, &'static str)], width: usize, use_color: 
             out.push_str(SEP);
             line_width += sep_width;
         }
-        if use_color {
-            out.push_str(&format!("{label}: {color}{value}\x1b[0m"));
-        } else {
-            out.push_str(&plain);
-        }
+        out.push_str(&item_text(label, value, color, use_color));
         line_width += item_width;
         if i + 1 == items.len() {
             out.push('\n');
@@ -906,50 +861,31 @@ pub fn terminal_width() -> Option<usize> {
 }
 
 /// Terminal width from `/dev/tty` (or `COLUMNS`), if it can be read.
-///
-/// Standard library only: no new dependency for two ioctls.
 #[cfg(unix)]
 fn terminal_size_via_tty() -> Option<usize> {
-    if let Some(cols) = query_terminal_width("/dev/tty") {
-        return Some(cols);
-    }
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|c| *c > 0)
-}
-
-#[cfg(unix)]
-fn query_terminal_width(path: &str) -> Option<usize> {
     use std::os::fd::AsRawFd;
 
-    #[repr(C)]
-    #[derive(Default)]
-    struct WinSize {
-        rows: u16,
-        cols: u16,
-        xpixel: u16,
-        ypixel: u16,
+    let file = std::fs::OpenOptions::new().read(true).open("/dev/tty").ok()?;
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    if rc == 0 && size.ws_col > 0 {
+        return Some(size.ws_col as usize);
     }
-
-    unsafe extern "C" {
-        fn ioctl(fd: i32, request: u64, ...) -> i32;
-    }
-
-    const TIOCGWINSZ: u64 = 0x5413;
-
-    let file = std::fs::OpenOptions::new().read(true).open(path).ok()?;
-    let mut size = WinSize::default();
-    let rc = unsafe { ioctl(file.as_raw_fd(), TIOCGWINSZ, &mut size as *mut WinSize) };
-    if rc == 0 && size.cols > 0 {
-        Some(size.cols as usize)
-    } else {
-        None
-    }
+    columns_env()
 }
 
 #[cfg(not(unix))]
 fn terminal_size_via_tty() -> Option<usize> {
+    columns_env()
+}
+
+/// `COLUMNS` fallback shared by both platforms.
+fn columns_env() -> Option<usize> {
     std::env::var("COLUMNS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())

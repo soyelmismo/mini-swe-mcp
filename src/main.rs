@@ -31,10 +31,6 @@ async fn async_main() -> Result<()> {
                 print_help();
                 return Ok(());
             }
-            "monitor" | "supervisor" => {
-                let once = raw_args.iter().any(|arg| arg == "--once");
-                return mini_swe_mcp::monitor::run_monitor(once).await;
-            }
             _ => {}
         }
     }
@@ -52,9 +48,8 @@ async fn async_main() -> Result<()> {
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
     if let Some(action) = action_of(&cli_args) {
-        // `monitor`/`supervisor` reach here when a selector flag precedes the
-        // verb (e.g. `--json monitor`); the early argv check only sees
-        // `raw_args[1]`. Handle them here so every flag ordering behaves alike.
+        // `monitor`/`supervisor` are answered before any configuration is
+        // resolved, so they work without an API key regardless of flag order.
         if action == "monitor" || action == "supervisor" {
             let once = cli_args.iter().any(|arg| arg == "--once");
             return mini_swe_mcp::monitor::run_monitor(once).await;
