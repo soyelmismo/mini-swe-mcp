@@ -112,6 +112,7 @@ pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bo
             let status_colored = if use_color {
                 match w.status.as_str() {
                     "running" => "\x1b[1;32mRUNNING \x1b[0m",
+                    "reviewing" => "\x1b[1;35mREVIEW  \x1b[0m",
                     "paused" => "\x1b[1;33mPAUSED  \x1b[0m",
                     "completed" => "\x1b[1;34mDONE    \x1b[0m",
                     "failed" => "\x1b[1;31mFAILED  \x1b[0m",
@@ -120,6 +121,7 @@ pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bo
             } else {
                 match w.status.as_str() {
                     "running" => "RUNNING ",
+                    "reviewing" => "REVIEW  ",
                     "paused" => "PAUSED  ",
                     "completed" => "DONE    ",
                     "failed" => "FAILED  ",

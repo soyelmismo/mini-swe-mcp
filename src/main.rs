@@ -46,7 +46,7 @@ async fn async_main() -> Result<()> {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
                 println!("Usage: mini-swe-mcp [--stdio | [--json] <action> [args...]]");
                 println!("\nActions:");
-                println!("  dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]");
+                println!("  dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]");
                 println!("  status <worker_id>");
                 println!("  collect <worker_id>");
                 println!("  logs <worker_id>");
@@ -264,7 +264,7 @@ where
                 }
                 if cli_args.len() < 3 {
                     eprintln!(
-                        "Usage: mini-swe-mcp dispatch <task> [--model <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]"
+                        "Usage: mini-swe-mcp dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>]"
                     );
                     return Ok(());
                 }
@@ -279,6 +279,15 @@ where
                             if i + 1 < cli_args.len() {
                                 tool_args.insert(
                                     "model".into(),
+                                    serde_json::Value::String(cli_args[i + 1].clone()),
+                                );
+                                i += 1;
+                            }
+                        }
+                        "--review-after" => {
+                            if i + 1 < cli_args.len() {
+                                tool_args.insert(
+                                    "review_after".into(),
                                     serde_json::Value::String(cli_args[i + 1].clone()),
                                 );
                                 i += 1;

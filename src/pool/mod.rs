@@ -156,6 +156,7 @@ impl WorkerPool {
         expired.len()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch(
         &self,
         task: String,
@@ -164,6 +165,7 @@ impl WorkerPool {
         repo_path: PathBuf,
         max_turns: usize,
         group: Option<String>,
+        review_after: Option<String>,
     ) -> Result<String> {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
@@ -230,6 +232,7 @@ impl WorkerPool {
             repo_path,
             max_turns,
             group: resolved_group,
+            review_after,
         };
 
         let join_handle = tokio::spawn(async move {

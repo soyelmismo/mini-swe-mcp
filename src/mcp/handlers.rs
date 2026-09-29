@@ -144,6 +144,13 @@ impl McpServer {
             .get("group")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let review_after = args
+            .get("review_after")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                let (resolved, _, _) = self.manifest.resolve_model(s);
+                resolved
+            });
 
         let wid = self
             .pool
@@ -154,6 +161,7 @@ impl McpServer {
                 repo_path,
                 max_turns,
                 group,
+                review_after,
             )
             .await?;
 

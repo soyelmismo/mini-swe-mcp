@@ -104,6 +104,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "number",
         DescriptionSource::Static("Model sampling temperature (overrides manifest default)."),
     ),
+    (
+        "review_after",
+        "string",
+        DescriptionSource::Static(
+            "Optional reviewer model (e.g. 'nerd') to automatically audit and finalize the worktree after implementation completes, using a fresh context window.",
+        ),
+    ),
 ];
 
 /// Render one table row as a JSON Schema property object.
