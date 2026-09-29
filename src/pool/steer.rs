@@ -11,9 +11,16 @@
 //!
 //! The mailbox is `<base>/swe-wt-<worker_id>.steer`, where `<base>` is
 //! [`swe_base_dir`](crate::worktree::swe_base_dir) — i.e. `/var/tmp` by
-//! default, or `$SWE_TEMP_DIR` when set. It deliberately sits next to the
-//! worktree directory so `prune_stale_worktrees` reclaims it with everything
-//! else, and so one `ls` shows the full set of live workers.
+//! default, or `$SWE_TEMP_DIR` when set. It sits next to the worktree
+//! directory so one `ls` shows the full set of live workers.
+//!
+//! Note that `prune_stale_worktrees` does *not* reclaim these files: its sweep
+//! matches `swe-wt-*` directories and `swe-wt-*.pid` leases, and a
+//! `swe-wt-<id>.steer` file matches neither. Cleanup is therefore the worker
+//! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
+//! held for the worker's whole lifetime), not the pruner's — a mailbox only
+//! exists while some `steer` call created it, and every worker removes its own
+//! on exit.
 //!
 //! Messages are **JSON lines**, one object per line:
 //! `{"message": "…", "sent_at": 1700000000, "pid": 4242}`.

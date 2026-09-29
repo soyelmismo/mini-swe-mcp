@@ -1029,3 +1029,42 @@ fn test_high_turn_high_output_worker_stays_bounded() {
         "the window must be a strict subset of the history"
     );
 }
+
+#[test]
+fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
+    // Requirement 3 of the feature: the worker removes its mailbox on exit.
+    // The loop returns from many places (completion, bash failure, cancellation,
+    // a propagated error) and a `remove_steer_file` call in each is exactly the
+    // duplication that rots, so cleanup is a `Drop` guard. This pins the
+    // contract that guard depends on: a mailbox left behind is always reclaimed,
+    // whether the worker succeeded or failed, and never leaks a claim file.
+    let dir = scratch_dir("steer-exit-guard");
+    let _scope = ScopedTempDir::set(&dir);
+
+    // A worker that ran, got steered from another process, and finished.
+    mini_swe_mcp::pool::write_steer_message("g1", "guidance").unwrap();
+    assert!(mini_swe_mcp::pool::steer_path("g1").is_file());
+    mini_swe_mcp::pool::remove_steer_file("g1");
+    assert!(!mini_swe_mcp::pool::steer_path("g1").exists());
+
+    // Same for a worker that dies mid-run: the guard fires on the error path
+    // too, so a crashed worker's guidance cannot be inherited later.
+    mini_swe_mcp::pool::write_steer_message("g2", "guidance").unwrap();
+    mini_swe_mcp::pool::remove_steer_file("g2");
+    assert!(!mini_swe_mcp::pool::steer_path("g2").exists());
+
+    // Cleanup is idempotent: an already-removed mailbox must not turn a
+    // successful worker exit into an error (the guard's Drop ignores errors).
+    mini_swe_mcp::pool::remove_steer_file("g2");
+    mini_swe_mcp::pool::remove_steer_file("never-existed");
+
+    // Nothing at all is left in the scratch base afterwards.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "worker exit leaked files: {leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

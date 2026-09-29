@@ -55,7 +55,6 @@ pub use self::state::{
 
 use self::state::expired_terminal_ids;
 
-
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
@@ -448,8 +447,8 @@ impl WorkerPool {
     /// 2. **Cross-process mailbox.** The worker is not in this pool — it is
     ///    owned by a *different* `mini-swe-mcp` process, which is the normal
     ///    case for `dispatch … --wait` steered from a second terminal. The
-    ///    message is appended atomically to the worker's
-    ///    [`steer`] mailbox, which the owning process drains on every step.
+    ///    message is appended atomically to the worker's mailbox (see
+    ///    [`steer_path`]), which the owning process drains on every step.
     ///
     /// The second path is what turns `steer` from an in-memory-only feature
     /// into a real IPC one; the first is kept because it delivers immediately
