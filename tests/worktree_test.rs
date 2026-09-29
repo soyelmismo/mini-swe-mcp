@@ -339,3 +339,162 @@ fn test_commit_changes_preserves_branch_on_drop() {
         "commit message not found in preserved branch: {log}"
     );
 }
+
+#[test]
+fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
+    let test_repo = TestRepo::new("unchanged");
+    let repo = test_repo.path();
+    let id = unique_worker_id("unchanged");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    let audit_dir = guard.path.join("audits");
+    std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
+    let worktree_file = audit_dir.join("stable_audit.md");
+    std::fs::write(&worktree_file, "content v1\n").expect("failed to write audit file");
+
+    // First sync copies the file and reports it.
+    let first = guard.sync_artifacts().expect("first sync_artifacts failed");
+    assert!(
+        first.contains(&"audits/stable_audit.md".to_string()),
+        "expected the first sync to report audits/stable_audit.md, got: {first:?}"
+    );
+
+    let destination = repo.join("audits/stable_audit.md");
+    assert!(destination.exists(), "artifact was not copied to repo root");
+
+    // Stamp the destination with a distinctive mtime. An unchanged file must not
+    // be rewritten, so the stamp has to survive a second sync untouched.
+    let sentinel = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&destination)
+        .expect("failed to open destination for stamping")
+        .set_times(std::fs::FileTimes::new().set_modified(sentinel))
+        .expect("failed to stamp destination mtime");
+
+    // The unchanged file is still reported as in sync...
+    let second = guard
+        .sync_artifacts()
+        .expect("second sync_artifacts failed");
+    assert!(
+        second.contains(&"audits/stable_audit.md".to_string()),
+        "an unchanged but present artifact must still be reported, got: {second:?}"
+    );
+    // ...but it was not rewritten.
+    let mtime = std::fs::metadata(&destination)
+        .expect("failed to stat destination")
+        .modified()
+        .expect("failed to read destination mtime");
+    assert_eq!(
+        mtime, sentinel,
+        "unchanged file was rewritten during re-sync (mtime advanced)"
+    );
+
+    // Once the worktree copy actually changes, the sync must pick it up.
+    std::fs::write(&worktree_file, "content v2\n").expect("failed to modify audit file");
+    guard.sync_artifacts().expect("third sync_artifacts failed");
+    let body = std::fs::read_to_string(&destination).expect("failed to read copied artifact");
+    assert_eq!(body, "content v2\n", "changed artifact was not re-copied");
+
+    let _ = std::fs::remove_file(&destination);
+    drop(guard);
+}
+
+#[test]
+fn test_sync_artifacts_never_mirrors_git_build_or_node_modules() {
+    let test_repo = TestRepo::new("guards");
+    let repo = test_repo.path();
+    let id = unique_worker_id("guards");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    // A worker that ran a build or an install inside an artifact directory
+    // leaves dependency caches and build output behind. None of it may cross
+    // into the repository root.
+    let skipped = [
+        ".git",
+        "node_modules",
+        "target",
+        "build",
+        "dist",
+        "__pycache__",
+        ".venv",
+    ];
+    let audit_dir = guard.path.join("audits");
+    for name in skipped {
+        let nested = audit_dir.join(name).join("nested");
+        std::fs::create_dir_all(&nested).expect("failed to create skipped dir in worktree");
+        std::fs::write(nested.join("payload.bin"), "should never be mirrored")
+            .expect("failed to write payload");
+    }
+    std::fs::write(audit_dir.join("keep.md"), "keep me\n").expect("failed to write artifact");
+
+    let synced = guard.sync_artifacts().expect("sync_artifacts failed");
+
+    // The genuine artifact is synced and lands in the repo root.
+    assert!(
+        synced.contains(&"audits/keep.md".to_string()),
+        "expected audits/keep.md to be synced, got: {synced:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("audits/keep.md")).expect("failed to read artifact"),
+        "keep me\n"
+    );
+
+    for name in skipped {
+        assert!(
+            !synced.iter().any(|p| p.contains(name)),
+            "skipped directory {name} leaked into the synced list: {synced:?}"
+        );
+        assert!(
+            !repo.join("audits").join(name).exists(),
+            "skipped directory {name} was materialized in the repo root"
+        );
+    }
+
+    drop(guard);
+}
+
+#[test]
+fn test_sync_artifacts_publishes_files_atomically_without_staging_debris() {
+    let test_repo = TestRepo::new("atomic");
+    let repo = test_repo.path();
+    let id = unique_worker_id("atomic");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    let report_dir = guard.path.join("reports");
+    std::fs::create_dir_all(&report_dir).expect("failed to create reports dir in worktree");
+    const FILES: usize = 50;
+    for i in 0..FILES {
+        std::fs::write(
+            report_dir.join(format!("report_{i}.md")),
+            format!("payload {i}\n"),
+        )
+        .expect("failed to write report");
+    }
+
+    guard.sync_artifacts().expect("sync_artifacts failed");
+
+    let destination = repo.join("reports");
+    // Every file landed with its exact contents...
+    for i in 0..FILES {
+        let name = format!("report_{i}.md");
+        assert_eq!(
+            std::fs::read_to_string(destination.join(&name)).expect("failed to read report"),
+            format!("payload {i}\n"),
+            "artifact {name} did not survive the sync"
+        );
+    }
+    // ...and no staging file from the atomic write was left behind.
+    let staging: Vec<String> = std::fs::read_dir(&destination)
+        .expect("failed to read destination reports dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "atomic sync left staging files behind in the repo root: {staging:?}"
+    );
+
+    drop(guard);
+}

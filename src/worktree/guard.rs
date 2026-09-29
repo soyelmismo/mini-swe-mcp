@@ -12,11 +12,47 @@ use super::{
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
+use tracing::{debug, info};
 
 /// Unversioned directories that are copied into a fresh worktree so subagents
 /// can read them without git tracking, and synced back on the way out.
 const ARTIFACT_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
+
+/// Directory names that are never mirrored between a worktree and the repo root.
+///
+/// A subagent that installs dependencies or runs a build inside an artifact
+/// directory would otherwise drag an entire `.git`, `node_modules` or compiled
+/// output tree across the boundary on every sync — megabytes of files the repo
+/// root neither wants nor can meaningfully merge. Skipping by name at every
+/// recursion level keeps the guard cheap and, more importantly, keeps foreign
+/// build output and dependency caches out of the repository working tree.
+const SKIP_DIR_NAMES: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cargo",
+    ".next",
+    ".turbo",
+];
+
+/// True when a directory entry must never be copied out of a worktree.
+///
+/// Matching the basename at every level is enough to stop `.git`,
+/// `node_modules` and the various build/output directories *before* their
+/// contents are walked, which is where the real cost would be.
+fn is_skipped_dir_name(name: &str) -> bool {
+    SKIP_DIR_NAMES.contains(&name)
+}
 
 /// RAII guard around one subagent's `git` worktree.
 pub struct WorktreeGuard {
@@ -67,7 +103,11 @@ impl WorktreeGuard {
         // different user is never mistaken for ours (audit §12).
         let _ = std::fs::write(pid_file_for(&path), pid_file_contents());
 
-        // Seed unversioned directories into the worktree so subagents can read them without git tracking
+        // Seed unversioned directories into the worktree so subagents can read
+        // them without git tracking. Uses the same copy path (and therefore the
+        // same skipped-directory guards) as the sync back, so a `.git` or
+        // `node_modules` tree planted inside an artifact directory is never
+        // mirrored in either direction.
         for dir in ARTIFACT_DIRS {
             let src = repo_root.join(dir);
             if src.is_dir() {
@@ -128,6 +168,18 @@ impl WorktreeGuard {
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
     /// from the worktree back into the repository root.
+    ///
+    /// Returns the sorted, duplicate-free list of repository-relative files that
+    /// are in sync after the call. The copy itself is conservative: unchanged
+    /// files are left untouched, dependency caches and build output
+    /// ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is published
+    /// atomically so a concurrent reader in the repo root never observes a
+    /// partially written artifact.
+    ///
+    /// Per-directory I/O errors are logged rather than propagated: both call
+    /// sites discard the `Result` (`pool::runner` wants the artifact count,
+    /// `Drop` is a best-effort safety net), so failing here would abort a
+    /// worker's teardown over a single unreadable report.
     pub fn sync_artifacts(&self) -> Result<Vec<String>> {
         let mut synced = BTreeSet::new();
 
@@ -135,7 +187,14 @@ impl WorktreeGuard {
             let src_dir = self.path.join(dir);
             if src_dir.is_dir() {
                 let dest_dir = self.repo_root.join(dir);
-                let _ = copy_dir_all(&src_dir, &dest_dir, &mut synced, &self.path);
+                if let Err(e) = copy_dir_all(&src_dir, &dest_dir, &mut synced, &self.path) {
+                    debug!(
+                        dir = %dir,
+                        path = %src_dir.display(),
+                        error = %e,
+                        "Artifact sync failed for directory"
+                    );
+                }
             }
         }
 
@@ -229,7 +288,10 @@ impl Drop for WorktreeGuard {
             return;
         }
 
-        // Sync report/audit artifacts to repo root before cleanup
+        // Sync report/audit artifacts to repo root before cleanup. This is the
+        // safety net for teardown paths that never reached the explicit call in
+        // `pool::runner`; a second run is cheap because unchanged files are
+        // skipped rather than recopied.
         let _ = self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
@@ -260,11 +322,91 @@ impl Drop for WorktreeGuard {
     }
 }
 
+/// Process-unique counter backing [`tmp_sibling_name`], so two concurrent
+/// workers writing into the same repo root never collide on a staging path.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A staging filename in `dir` that no other writer can pick: it combines the
+/// process id, a monotonic counter and the clock, so neither a concurrent
+/// worker nor a stale file from a crashed one can share it.
+fn tmp_sibling_name(dir: &Path, file_name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        ".{file_name}.{}.{nanos}.{seq}.tmp",
+        std::process::id()
+    ))
+}
+
+/// True when `dst` already holds `src`'s exact bytes.
+///
+/// Length is compared first (one `stat`, and it rules out the overwhelming
+/// majority of files), then content: a partial or truncated write from an
+/// interrupted earlier sync must never be mistaken for a completed one.
+/// Timestamps alone are not enough — coarse `mtime` granularity would hide two
+/// distinct writes made inside the same tick.
+fn is_up_to_date(src: &Path, dst: &Path) -> bool {
+    let Ok(src_meta) = std::fs::metadata(src) else {
+        return false;
+    };
+    let Ok(dst_meta) = std::fs::metadata(dst) else {
+        return false;
+    };
+    if !src_meta.is_file() || !dst_meta.is_file() || src_meta.len() != dst_meta.len() {
+        return false;
+    }
+    match (std::fs::read(src), std::fs::read(dst)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Copy `src` onto `dst` atomically.
+///
+/// The bytes land in a uniquely named staging file *in the destination
+/// directory* first, then a single `rename` publishes them. Because the staging
+/// path shares the destination's filesystem, the `rename` is atomic: a reader in
+/// the repo root observes either the previous file or the complete new one,
+/// never a half-written artifact — which the previous in-place `std::fs::copy`
+/// could produce, and which the orchestrator reading artifacts while a second
+/// sync overwrote them would then report as corrupt.
+fn copy_file_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let file_name = dst.file_name().unwrap_or_default().to_string_lossy();
+    let staging = tmp_sibling_name(dst.parent().unwrap_or(dst), &file_name);
+
+    // Any failure must not leave staging debris in the repository root.
+    let result = (|| {
+        std::fs::copy(src, &staging)?;
+        std::fs::rename(&staging, dst)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
 /// Recursively copy `src` into `dst`, recording every copied file (relative to
 /// `worktree_root`) in `collected`.
 ///
-/// Deduplication uses a `HashSet` so overlapping artifact directories scale
-/// linearly instead of quadratically (audit §11).
+/// Three properties make the sync cheap enough to run on every worker teardown:
+///
+/// * **Skipped directories** ([`SKIP_DIR_NAMES`]) are pruned before their
+///   contents are walked, so `.git`, `node_modules` and build output never
+///   cross the worktree boundary.
+/// * **Symlinks are not followed**, so the walk cannot escape the worktree or
+///   publish a link pointing at arbitrary host paths.
+/// * **Unchanged files are left alone.** A destination that already holds the
+///   exact same bytes is not rewritten, which turns a repeated sync into a
+///   metadata scan and keeps destination mtimes stable for downstream watchers.
+///
+/// A file that is already in sync is still recorded in `collected`, so callers
+/// see a complete and stable artifact list across repeated syncs. The set also
+/// deduplicates by relative path instead of re-checking membership per file,
+/// so overlapping artifact directories scale linearly (audit §11).
 fn copy_dir_all(
     src: &Path,
     dst: &Path,
@@ -284,9 +426,19 @@ fn copy_dir_all(
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if ft.is_dir() {
+            // Never mirror dependency caches or build output into the repo root.
+            if entry.file_name().to_str().is_some_and(is_skipped_dir_name) {
+                debug!(
+                    path = %src_path.display(),
+                    "Skipping build/cache directory during artifact sync"
+                );
+                continue;
+            }
             copy_dir_all(&src_path, &dst_path, collected, worktree_root)?;
         } else if ft.is_file() {
-            std::fs::copy(&src_path, &dst_path)?;
+            if !is_up_to_date(&src_path, &dst_path) {
+                copy_file_atomic(&src_path, &dst_path)?;
+            }
             if let Ok(rel) = src_path.strip_prefix(worktree_root) {
                 collected.insert(rel.to_string_lossy().into_owned());
             }
