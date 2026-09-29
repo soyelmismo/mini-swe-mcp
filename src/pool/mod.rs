@@ -41,7 +41,7 @@ pub use self::buffer::{
 };
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
-    WorkerRegistryEntry, extract_group, load_all_registry_entries, registry_dir,
+    WorkerRegistryEntry, extract_group, load_all_registry_entries, load_registry_entry, registry_dir,
     remove_registry_entry, save_registry_entry,
 };
 pub use self::runner::{

@@ -142,3 +142,25 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     entries.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     entries
 }
+
+/// Load a single registry entry by id, normalizing its liveness exactly as
+/// [`load_all_registry_entries`] does: a `running`/`paused`/`reviewing` row
+/// whose pid is dead is reported as `stopped`.
+pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
+    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
+        let path = dir.join(format!("{worker_id}.json"));
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
+        {
+            if (item.status == "running"
+                || item.status == "paused"
+                || item.status == "reviewing")
+                && !crate::worktree::is_process_alive(item.pid)
+            {
+                item.status = "stopped".to_string();
+            }
+            return Some(item);
+        }
+    }
+    None
+}
