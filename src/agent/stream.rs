@@ -42,6 +42,9 @@ const DATA_FIELD: &[u8] = b"data:";
 /// The end-of-stream sentinel carried in a `data:` field.
 const DONE_SENTINEL: &[u8] = b"[DONE]";
 
+/// String view of [`DONE_SENTINEL`] for the post-decode parity check.
+const DONE_SENTINEL_STR: &str = "[DONE]";
+
 /// Classify one raw (undecoded) SSE line and return the bytes of its payload.
 ///
 /// Returns `None` for every line that carries no `data` payload — blank lines,
@@ -292,6 +295,18 @@ impl SseAccumulator {
     /// done on bytes by [`data_field`] / the `DONE_SENTINEL` check, so this
     /// stage only has to turn JSON into deltas.
     fn handle_payload(&mut self, data: &str) -> FrameOutcome {
+        // `data_field` already ASCII-trimmed the payload on bytes (the only
+        // whitespace the SSE framing can introduce). This zero-alloc Unicode
+        // trim restores exact parity with the old `str::trim` path for exotic
+        // whitespace (e.g. NBSP) at payload edges, and re-checks the sentinel
+        // for a `[DONE]` wrapped in such whitespace.
+        let data = data.trim();
+        if data.is_empty() {
+            return FrameOutcome::Consumed;
+        }
+        if data == DONE_SENTINEL_STR {
+            return FrameOutcome::Done;
+        }
         if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data)
             && let Some(choice) = chunk.choices.first()
         {
@@ -330,7 +345,8 @@ impl SseAccumulator {
         // offset) made the index run past the end of `text` and panic as soon
         // as the buffer was non-empty, which is the normal case for a long
         // stream crossing the cap.
-        self.content.push_str(&text[..text.floor_char_boundary(room)]);
+        self.content
+            .push_str(&text[..text.floor_char_boundary(room)]);
         self.content_capped = true;
         tracing::warn!(
             limit = MAX_STREAMED_CONTENT_BYTES,
@@ -768,15 +784,15 @@ mod tests {
     fn lossy_decode_into_matches_std() {
         let cases: Vec<Vec<u8>> = vec![
             b"plain ascii".to_vec(),
-            b"caf\xc3\xa9 \xe2\x82\xac".to_vec(),               // valid
-            b"caf\xc3\xa9".to_vec(),                           // truncated 2-byte tail
-            b"emoji \xf0\x9f\x98\x80 ok".to_vec(),              // valid 4-byte
-            b"\xf0\x9f\x98".to_vec(),                           // truncated 4-byte tail
-            b"\xff\xfe".to_vec(),                               // two invalid bytes
+            b"caf\xc3\xa9 \xe2\x82\xac".to_vec(),  // valid
+            b"caf\xc3\xa9".to_vec(),               // truncated 2-byte tail
+            b"emoji \xf0\x9f\x98\x80 ok".to_vec(), // valid 4-byte
+            b"\xf0\x9f\x98".to_vec(),              // truncated 4-byte tail
+            b"\xff\xfe".to_vec(),                  // two invalid bytes
             b"a\xffb\xffc".to_vec(),
             b"pre\xffmid\x80post".to_vec(),
-            b"\xed\xa0\x80".to_vec(),                           // surrogate half
-            b"\xc0\xaf".to_vec(),                               // overlong
+            b"\xed\xa0\x80".to_vec(), // surrogate half
+            b"\xc0\xaf".to_vec(),     // overlong
             b"".to_vec(),
         ];
         for case in cases {
@@ -874,7 +890,10 @@ mod tests {
     fn data_field_extracts_and_trims_payload() {
         assert_eq!(data_field(b"data: {}"), Some(&b"{}"[..]));
         assert_eq!(data_field(b"data:{}"), Some(&b"{}"[..]));
-        assert_eq!(data_field(b"  data:   {\"a\":1}  \r"), Some(&b"{\"a\":1}"[..]));
+        assert_eq!(
+            data_field(b"  data:   {\"a\":1}  \r"),
+            Some(&b"{\"a\":1}"[..])
+        );
         assert_eq!(data_field(b"\t data: x \t"), Some(&b"x"[..]));
         // A payload that is itself blank is still a data field (empty payload).
         assert_eq!(data_field(b"data:   "), Some(&b""[..]));
