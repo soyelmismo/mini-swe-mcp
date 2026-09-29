@@ -37,11 +37,10 @@ pub use self::buffer::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, EmittedLogs, LogBuffer,
     LogRetentionPolicy, LogStats, MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES,
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
-    emit_view_with, worst_case_entry_bytes,
 };
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
-    WorkerRegistryEntry, extract_group, load_all_registry_entries, registry_dir,
+    WorkerMeta, WorkerRegistryEntry, extract_group, load_all_registry_entries, registry_dir,
     remove_registry_entry, save_registry_entry,
 };
 pub use self::runner::{
@@ -77,11 +76,14 @@ impl WorkerPool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_build_slots);
 
-        let default_bash_slots = max_concurrent.max(8);
+        // Each worker runs one command at a time, so the bash semaphore can
+        // never block unless the operator opts in via BASH_CONCURRENT_LIMIT;
+        // default it to the build-slot count so it stays a real (if loose)
+        // ceiling rather than a no-op.
         let bash_slots = std::env::var("BASH_CONCURRENT_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(default_bash_slots);
+            .unwrap_or(build_slots);
 
         let log_policy = LogRetentionPolicy::from_env();
         let terminal_ttl = Duration::from_secs(
@@ -122,8 +124,13 @@ impl WorkerPool {
     /// `collect` / `wait: true` still finds them (audit 07, R3).
     pub async fn reap(&self) -> Vec<String> {
         let mut lock = self.workers.write().await;
+        self.reap_locked(&mut lock)
+    }
+
+    /// Shared eviction helper: removes expired terminal records from `lock`.
+    fn reap_locked(&self, lock: &mut HashMap<String, WorkerRecord>) -> Vec<String> {
         let ttl = self.terminal_ttl.as_secs();
-        let expired = expired_terminal_ids(&lock, ttl);
+        let expired = expired_terminal_ids(lock, ttl);
         for id in &expired {
             lock.remove(id);
             remove_registry_entry(id);
@@ -136,28 +143,6 @@ impl WorkerPool {
             );
         }
         expired
-    }
-
-    /// Lazily reap terminal records so a long-running server that never calls
-    /// [`WorkerPool::reap`] explicitly still bounds its residency.
-    async fn prune_terminal_records_locked(
-        &self,
-        lock: &mut HashMap<String, WorkerRecord>,
-    ) -> usize {
-        let ttl = self.terminal_ttl.as_secs();
-        let expired = expired_terminal_ids(lock, ttl);
-        for id in &expired {
-            lock.remove(id);
-            remove_registry_entry(id);
-        }
-        if !expired.is_empty() {
-            tracing::info!(
-                count = expired.len(),
-                ttl_secs = ttl,
-                "Pruned expired terminal worker records on dispatch"
-            );
-        }
-        expired.len()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -180,9 +165,16 @@ impl WorkerPool {
             .or_else(|| extract_group(&task))
             .unwrap_or_else(|| "default".to_string());
 
-        // H-6: the record keeps its own `String`s, so the original `task`/
-        // `model` are cloned exactly once here and then *moved* into the launch
-        // config instead of being cloned again below.
+        let repo_path_str = repo_path.to_string_lossy().to_string();
+        let meta = WorkerMeta {
+            id: worker_id.clone(),
+            task: task.clone(),
+            group: Some(resolved_group.clone()),
+            repo_path: Some(repo_path_str.clone()),
+            started_at: now,
+            pid: std::process::id(),
+        };
+
         let initial_record = WorkerRecord {
             id: worker_id.clone(),
             task: task.clone(),
@@ -200,40 +192,20 @@ impl WorkerPool {
             handle: None,
         };
 
-        let repo_path_str = repo_path.to_string_lossy().to_string();
-
-        save_registry_entry(&WorkerRegistryEntry {
-            id: worker_id.clone(),
-            pid: std::process::id(),
-            task: task.clone(),
-            model: model.clone(),
-            status: "running".into(),
-            step: 0,
-            max_turns,
-            last_command: "initializing".into(),
-            question: None,
-            started_at: now,
-            updated_at: now,
-            group: Some(resolved_group.clone()),
-            repo_path: Some(repo_path_str.clone()),
-        });
+        meta.save_status(&model, "running", 0, max_turns, "initializing", None, now);
 
         {
             // Prune stale terminal records *before* inserting, so a long-lived
             // server bounds residency even without the background reaper
             // (audit 07, R3).
             let mut lock = self.workers.write().await;
-            self.prune_terminal_records_locked(&mut lock).await;
+            self.reap_locked(&mut lock);
             lock.insert(worker_id.clone(), initial_record);
         }
 
         let pool = self.clone();
         let wid = worker_id.clone();
-        let task_clone = task.clone();
-        let model_clone = model.clone();
-        let group_clone = resolved_group.clone();
-        let repo_path_for_fail = repo_path_str;
-
+        let meta_for_fail = meta;
         let config = WorkerLaunchConfig {
             task,
             model,
@@ -252,21 +224,15 @@ impl WorkerPool {
                 if let Some(w) = lock.get_mut(&wid) {
                     w.fail(e.to_string());
                 }
-                save_registry_entry(&WorkerRegistryEntry {
-                    id: wid.clone(),
-                    pid: std::process::id(),
-                    task: task_clone,
-                    model: model_clone,
-                    status: "failed".into(),
-                    step: 0,
+                meta_for_fail.save_status(
+                    &meta_for_fail.task.clone(),
+                    "failed",
+                    0,
                     max_turns,
-                    last_command: format!("error: {e}"),
-                    question: None,
-                    started_at: now,
-                    updated_at: unix_timestamp(),
-                    group: Some(group_clone),
-                    repo_path: Some(repo_path_for_fail),
-                });
+                    &format!("error: {e}"),
+                    None,
+                    unix_timestamp(),
+                );
             }
         });
 
@@ -289,15 +255,10 @@ impl WorkerPool {
 
     /// Cheap snapshot of a worker's step history.
     ///
-    /// Returns an `Arc` clone of the *bounded* buffer, so a read never
-    /// duplicates the history nor holds the `RwLock` while copying (audit 07, R5).
-    pub async fn get_worker_logs(&self, id: &str) -> Option<Arc<LogBuffer>> {
-        self.workers.read().await.get(id).map(|w| Arc::new(w.logs.clone()))
-    }
-
-    /// Retention counters for one worker, for the observability surface.
-    pub async fn get_worker_log_stats(&self, id: &str) -> Option<LogStats> {
-        self.workers.read().await.get(id).map(|w| w.log_stats())
+    /// Returns a clone of the *bounded* buffer, so a read never duplicates the
+    /// history nor holds the `RwLock` while copying (audit 07, R5).
+    pub async fn get_worker_logs(&self, id: &str) -> Option<LogBuffer> {
+        self.workers.read().await.get(id).map(|w| w.logs.clone())
     }
 
     /// Insert a synthetic record into the pool (test support).
@@ -330,53 +291,28 @@ impl WorkerPool {
                 step: *step,
                 last_command: Some(last_command.clone()),
                 question: None,
-                terminal: false,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
                 step: *step,
                 last_command: None,
                 question: Some(question.clone()),
-                terminal: false,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
                 step: *turns,
                 last_command: None,
                 question: None,
-                terminal: true,
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
                 step: *step,
                 last_command: None,
                 question: None,
-                terminal: true,
             },
         };
         drop(lock);
         Some(progress)
-    }
-
-    /// Number of recorded steps for a worker, without copying the log history.
-    pub async fn worker_step_count(&self, id: &str) -> Option<usize> {
-        self.workers.read().await.get(id).map(|w| w.logs.len())
-    }
-
-    /// Move a worker's log history out of the pool (terminal path).
-    ///
-    /// O(1) `Vec` take with no per-step copy; the record stays registered so its
-    /// final state remains inspectable via `get_worker_state`.
-    pub async fn take_worker_logs(&self, id: &str) -> Option<LogBuffer> {
-        let mut lock = self.workers.write().await;
-        lock.get_mut(id).map(|w| std::mem::take(&mut w.logs))
-    }
-
-    /// Take a worker's record out of the pool.
-    ///
-    /// Delegates to [`collect`](Self::collect) with bounded emission view.
-    pub async fn take_worker(&self, id: &str) -> Option<CollectedWorker> {
-        self.collect(id).await
     }
 
     pub async fn list_workers(&self) -> Vec<serde_json::Value> {

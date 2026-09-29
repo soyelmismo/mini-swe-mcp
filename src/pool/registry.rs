@@ -27,6 +27,50 @@ pub struct WorkerRegistryEntry {
     pub repo_path: Option<String>,
 }
 
+/// The immutable per-worker fields shared by every registry write for a worker.
+///
+/// Only the status/step/max_turns/last_command/question/updated_at/model vary
+/// between writes, so a worker builds this once and reuses it via
+/// [`WorkerMeta::save_status`].
+pub struct WorkerMeta {
+    pub id: String,
+    pub task: String,
+    pub group: Option<String>,
+    pub repo_path: Option<String>,
+    pub started_at: u64,
+    pub pid: u32,
+}
+
+impl WorkerMeta {
+    /// Persist one status update for this worker.
+    pub fn save_status(
+        &self,
+        model: &str,
+        status: &str,
+        step: usize,
+        max_turns: usize,
+        last_command: &str,
+        question: Option<String>,
+        updated_at: u64,
+    ) {
+        save_registry_entry(&WorkerRegistryEntry {
+            id: self.id.clone(),
+            pid: self.pid,
+            task: self.task.clone(),
+            model: model.to_string(),
+            status: status.into(),
+            step,
+            max_turns,
+            last_command: last_command.into(),
+            question,
+            started_at: self.started_at,
+            updated_at,
+            group: self.group.clone(),
+            repo_path: self.repo_path.clone(),
+        });
+    }
+}
+
 pub fn extract_group(task: &str) -> Option<String> {
     let trimmed = task.trim();
     if trimmed.starts_with('[')
@@ -54,8 +98,8 @@ pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
 }
 
 pub fn remove_registry_entry(worker_id: &str) {
-    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
-        let path = dir.join(format!("{worker_id}.json"));
+    for dir in crate::worktree::swe_base_dirs() {
+        let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         let _ = std::fs::remove_file(path);
     }
 }
@@ -65,7 +109,7 @@ fn is_terminal_status(status: &str) -> bool {
 }
 
 fn worktree_exists(worker_id: &str) -> bool {
-    for base in [crate::worktree::swe_base_dir(), std::env::temp_dir()] {
+    for base in crate::worktree::swe_base_dirs() {
         if base.join(format!("swe-wt-{worker_id}")).is_dir() {
             return true;
         }
@@ -86,11 +130,11 @@ fn branch_exists(
 
     let branches = cache.entry(repo_dir.clone()).or_insert_with(|| {
         let mut set = std::collections::HashSet::new();
-        if let Ok(output) = std::process::Command::new("git")
-            .current_dir(&repo_dir)
-            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/worker-*"])
-            .output()
-            && output.status.success()
+        if let Ok(output) = crate::worktree::git(
+            &repo_dir,
+            "for-each-ref",
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/worker-*"],
+        ) && output.status.success()
         {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let branch = line.trim();
@@ -111,7 +155,8 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     let mut branches_by_repo: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
-    for dir in [registry_dir(), std::env::temp_dir().join("swe-registry")] {
+    for dir in crate::worktree::swe_base_dirs() {
+        let dir = dir.join("swe-registry");
         if let Ok(read_dir) = std::fs::read_dir(dir) {
             for entry in read_dir.flatten() {
                 let p = entry.path();
