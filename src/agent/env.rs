@@ -1,42 +1,41 @@
 //! Environment hygiene for agent-spawned child processes.
 //!
 //! A subagent's shell is a *hostile* environment by default: the worker
-//! process inherits the operator's entire environment, so every API key, cloud
-//! credential, registry token and SSH agent socket that happens to be exported
-//! in the operator's shell is one `echo $OPENAI_API_KEY` (or a stray
-//! `git push`) away from being exfiltrated by a model that was handed an
-//! unrelated bug-fix task. Inheriting a large ambient environment also makes
-//! runs non-reproducible: two workers can behave differently purely because of
-//! unrelated variables.
+//! inherits the operator's entire environment, so every API key, cloud
+//! credential, registry token and SSH agent socket exported in the operator's
+//! shell is one `echo $OPENAI_API_KEY` (or a stray `git push`) away from being
+//! exfiltrated by a model handed an unrelated bug-fix task. A large ambient
+//! environment also makes runs non-reproducible.
 //!
 //! This module replaces that inheritance with an explicit, minimal contract:
 //!
-//! 1. **Deny by default.** The child is spawned with [`std::process::Command::env_clear`],
-//!    so *nothing* from the parent leaks unless it is deliberately re-added.
-//! 2. **Strict allow-list.** Only the handful of runtime variables a compiler or
-//!    shell genuinely needs survive ([`ALLOWED_VARS`]): binary discovery
+//! 1. **Deny by default.** The child is spawned with
+//!    [`std::process::Command::env_clear`], so *nothing* leaks unless
+//!    deliberately re-added.
+//! 2. **Strict allow-list.** Only the handful of runtime variables a compiler
+//!    or shell genuinely needs survive ([`ALLOWED_VARS`]): binary discovery
 //!    (`PATH`), identity (`USER`, `LOGNAME`, `SHELL`) and locale/terminal
 //!    presentation (`LANG`, `LC_ALL`, `TERM`).
 //! 3. **Toolchain cache forwarding.** `CARGO_HOME` and `RUSTUP_HOME`
-//!    ([`TOOLCHAIN_VARS`]) are *resolved* rather than copied — `CARGO_HOME`
+//!    ([`TOOLCHAIN_VARS`]) are *resolved* rather than copied - `CARGO_HOME`
 //!    falls back to the host's `~/.cargo` when the parent did not set it
-//!    ([`host_cargo_home`]). This is what keeps a sandboxed worktree able to
-//!    build offline: `HOME` is remapped to an empty scratch directory, so with
-//!    no explicit `CARGO_HOME` Cargo would find an empty registry and try to
-//!    reach `index.crates.io` for crates the operator already has cached. These
+//!    ([`host_cargo_home`]). This keeps a sandboxed worktree able to build
+//!    offline: `HOME` is remapped to an empty scratch directory, so with no
+//!    explicit `CARGO_HOME` Cargo would find an empty registry and reach for
+//!    `index.crates.io` for crates the operator already has cached. These
 //!    variables name *directories*, not secrets, and are still re-screened by
 //!    [`is_sensitive_var`] on the way out.
 //! 4. **Isolated `HOME`.** `HOME` is remapped to a per-worktree scratch
 //!    directory so a command that reads `~/.aws/credentials`, writes
-//!    `~/.gitconfig` or drops a stray `~/.npmrc` touches only the sandbox, never
-//!    the operator's real home.
+//!    `~/.gitconfig` or drops a stray `~/.npmrc` touches only the sandbox,
+//!    never the operator's real home.
 //! 5. **Explicit secret purge.** [`is_sensitive_var`] is a second, independent
-//!    line of defence: even if a sensitive name were somehow added to the
-//!    allow-list (or reintroduced by a later `env(...)` call), it is stripped
-//!    before the child is spawned.
+//!    line of defence: even if a sensitive name were added to the allow-list
+//!    (or reintroduced by a later `env(...)` call), it is stripped before the
+//!    child is spawned.
 //!
 //! [`build_clean_environment`] is the single entry point. It returns a plain
-//! `Vec<(String, String)>` rather than mutating a `Command` so that the exact
+//! `Vec<(String, String)>` rather than mutating a `Command` so the exact
 //! contract can be unit-tested without spawning anything, and so callers can
 //! log/inspect the child environment in a debugging story.
 
@@ -48,11 +47,11 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Variables copied verbatim from the parent process into the agent's shell.
 ///
-/// Deliberately tiny: every entry here is a variable whose *absence* breaks
-/// ordinary execution, and none of them can carry a credential. `PATH` locates
-/// the binaries (the command is spawned as `nice`/`bwrap`, which are then
-/// resolved through it), `USER`/`LOGNAME`/`SHELL` keep `id` and prompt-oriented
-/// tools sane, and `LANG`/`LC_ALL`/`TERM` keep output and diagnostics readable.
+/// Deliberately tiny: every entry is a variable whose *absence* breaks ordinary
+/// execution, and none can carry a credential. `PATH` locates the binaries (the
+/// command is spawned as `nice`/`bwrap`, resolved through it),
+/// `USER`/`LOGNAME`/`SHELL` keep `id` and prompt-oriented tools sane, and
+/// `LANG`/`LC_ALL`/`TERM` keep output and diagnostics readable.
 ///
 /// The Rust toolchain locations are deliberately **not** here: `CARGO_HOME` and
 /// `RUSTUP_HOME` need discovery rather than a verbatim copy (see
@@ -90,14 +89,13 @@ const HOME_VAR: &str = "HOME";
 
 /// Substrings that mark a variable name as credential-bearing.
 ///
-/// The check is a case-insensitive substring match, so it covers the common
-/// families without enumerating every vendor: `OPENAI_API_KEY` and
-/// `ANTHROPIC_AUTH_TOKEN` both match `API_KEY`/`AUTH_TOKEN`,
-/// `AWS_SECRET_ACCESS_KEY` matches `SECRET`, `GITHUB_TOKEN` matches `TOKEN`,
-/// and `SSH_AUTH_SOCK` matches `SSH`. HTTP-style `BEARER_*` and
-/// `AUTHORIZATION` headers, key material (`PRIVATE_KEY`, `ENCRYPTION_KEY`,
-/// `SIGNING_KEY`) and session material (`SESSION_TOKEN`, `REFRESH_TOKEN`,
-/// `PASSPHRASE`) are covered by the same mechanism.
+/// A case-insensitive substring match covers the common families without
+/// enumerating every vendor: `OPENAI_API_KEY` and `ANTHROPIC_AUTH_TOKEN` both
+/// match `API_KEY`/`AUTH_TOKEN`, `AWS_SECRET_ACCESS_KEY` matches `SECRET`,
+/// `GITHUB_TOKEN` matches `TOKEN`, and `SSH_AUTH_SOCK` matches `SSH`. HTTP-style
+/// `BEARER_*` and `AUTHORIZATION` headers, key material (`PRIVATE_KEY`,
+/// `ENCRYPTION_KEY`, `SIGNING_KEY`) and session material (`SESSION_TOKEN`,
+/// `REFRESH_TOKEN`, `PASSPHRASE`) are covered by the same mechanism.
 ///
 /// Markers are deliberately specific. A bare family prefix such as `NPM_` is
 /// *not* used: `NPM_CONFIG_PREFIX` and `NPM_CONFIG_CACHE` are ordinary
@@ -131,9 +129,9 @@ const SECRET_MARKERS: &[&str] = &[
 
 /// Whether a variable name must never reach an agent-spawned child.
 ///
-/// Used as a defence-in-depth filter over the allow-list: a name that trips
-/// this predicate is dropped even if it is explicitly allowed, so a future
-/// (mis)edit that widens [`ALLOWED_VARS`] cannot quietly re-expose a secret.
+/// Defence-in-depth filter over the allow-list: a name that trips this
+/// predicate is dropped even if explicitly allowed, so a future (mis)edit that
+/// widens [`ALLOWED_VARS`] cannot quietly re-expose a secret.
 ///
 /// Matching is case-insensitive so `aws_secret_access_key` is caught alongside
 /// the canonical spelling. Empty names are rejected: an empty variable name is
@@ -142,11 +140,10 @@ pub fn is_sensitive_var(name: &str) -> bool {
     if name.is_empty() {
         return true;
     }
-    // Marker matching is case-insensitive without allocating: the allow-list is
-    // re-screened on every child spawn and this predicate is pure, so building
-    // an uppercasing `String` would cost a heap allocation per variable per
-    // command. `eq_ignore_ascii_case` is byte-wise, so a non-ASCII byte can
-    // never compare equal to an ASCII marker.
+    // Case-insensitive without allocating: the allow-list is re-screened on
+    // every spawn and this predicate is pure, so an uppercasing `String` would
+    // cost a heap allocation per variable per command. `eq_ignore_ascii_case`
+    // is byte-wise, so a non-ASCII byte can never equal an ASCII marker.
     if SECRET_MARKERS
         .iter()
         .any(|marker| contains_ignore_ascii_case(name, marker))
@@ -156,21 +153,22 @@ pub fn is_sensitive_var(name: &str) -> bool {
     ["AWS_", "SSH_", "GPG_"]
         .iter()
         .any(|prefix| starts_with_ignore_ascii_case(name, prefix))
-        // "Personal access token" shorthand: `GITHUB_PAT`, `GLAB_PAT`, `FOO_PAT_X`.
-        // Matched only at a word boundary so a variable that merely contains the
-        // letters (`PATH`, `PATCH_LEVEL`) is not mistaken for a credential.
+        // "Personal access token" shorthand: `GITHUB_PAT`, `GLAB_PAT`,
+        // `FOO_PAT_X`. Matched only at a word boundary so a variable that
+        // merely contains the letters (`PATH`, `PATCH_LEVEL`) is not mistaken
+        // for a credential.
         || is_word(name, "PAT")
         // BEARER_* is a credential; e.g. UNBEARERABLE is not.
         || is_word(name, "BEARER")
 }
 
-/// Whether `name` starts with `prefix`, comparing ASCII case-insensitively.
+/// Whether `name` starts with `prefix`, ASCII case-insensitively.
 fn starts_with_ignore_ascii_case(name: &str, prefix: &str) -> bool {
     let (name, prefix) = (name.as_bytes(), prefix.as_bytes());
     name.len() >= prefix.len() && name[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-/// Whether `name` contains `needle`, comparing ASCII case-insensitively.
+/// Whether `name` contains `needle`, ASCII case-insensitively.
 ///
 /// Equivalent to `name.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())`
 /// without the two temporary `String`s.
@@ -188,10 +186,10 @@ fn contains_ignore_ascii_case(name: &str, needle: &str) -> bool {
 
 /// Whether `name` contains `word` delimited by a non-alphanumeric boundary.
 ///
-/// A bare substring test is too greedy for markers: `PAT` occurs inside
-/// `PATH` and `PATCH_LEVEL`, and `BEARER` occurs inside `UNBEARERABLE`.
-/// Requiring non-alphanumeric delimiters or a string edge on both sides
-/// keeps the match precise while still covering `FOO_PAT_BAR` and `BEARER_TOKEN`.
+/// A bare substring test is too greedy for markers: `PAT` occurs inside `PATH`
+/// and `PATCH_LEVEL`, and `BEARER` occurs inside `UNBEARERABLE`. Requiring
+/// non-alphanumeric delimiters or a string edge on both sides keeps the match
+/// precise while still covering `FOO_PAT_BAR` and `BEARER_TOKEN`.
 fn is_word(name: &str, word: &str) -> bool {
     let bytes = name.as_bytes();
     let word = word.as_bytes();
@@ -212,8 +210,8 @@ fn is_word(name: &str, word: &str) -> bool {
     false
 }
 
-/// Whether `byte` is alphanumeric (ASCII letter/digit, or any non-ASCII
-/// UTF-8 byte, which is never treated as a delimiter).
+/// Whether `byte` is alphanumeric (ASCII letter/digit, or any non-ASCII UTF-8
+/// byte, which is never treated as a delimiter).
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || !byte.is_ascii()
 }
@@ -251,7 +249,7 @@ pub fn isolated_home(repo_path: &Path, worktree_path: &Path) -> PathBuf {
 ///
 /// 1. `CARGO_HOME` as set in the parent, forwarded verbatim so a non-default
 ///    install layout keeps working;
-/// 2. `$HOME/.cargo`, **only when it actually exists** — a host with no Cargo
+/// 2. `$HOME/.cargo`, **only when it actually exists** - a host with no Cargo
 ///    directory has no cache to forward, and pointing at a non-existent path
 ///    would be worse than omitting the variable and letting Cargo apply its own
 ///    default resolution;
@@ -272,8 +270,8 @@ pub fn host_cargo_home() -> Option<PathBuf> {
 /// The pure core of [`host_cargo_home`], with the parent's `CARGO_HOME` and
 /// `HOME` passed in instead of read from the process environment.
 ///
-/// Split out so the resolution *policy* — explicit wins, `~/.cargo` only when it
-/// exists, nothing otherwise — is unit-testable against synthetic layouts (a
+/// Split out so the resolution *policy* - explicit wins, `~/.cargo` only when it
+/// exists, nothing otherwise - is unit-testable against synthetic layouts (a
 /// home that does have a `.cargo`, one that does not, an unset variable) rather
 /// than only against whatever the machine running the tests happens to have. It
 /// also keeps the `is_dir` filesystem probe out of the "forwarded verbatim" path,
@@ -300,13 +298,13 @@ pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Optio
 /// child is allowed to see:
 ///
 /// * each allow-listed variable that is set in the parent, copied verbatim;
-/// * each toolchain cache location that could be resolved — `CARGO_HOME` from
+/// * each toolchain cache location that could be resolved - `CARGO_HOME` from
 ///   the host, falling back to `~/.cargo` when it exists ([`host_cargo_home`]),
 ///   and `RUSTUP_HOME` when the parent sets it. This is what lets a sandboxed
 ///   worktree build against the host's crates cache offline: `HOME` is remapped
 ///   to an empty scratch directory, so with no explicit `CARGO_HOME` Cargo
 ///   would find an empty registry and try the network;
-/// * `HOME`, always remapped to [`isolated_home`] — never the real home.
+/// * `HOME`, always remapped to [`isolated_home`] - never the real home.
 ///
 /// The toolchain variables name *directories*, not secrets: no credential-
 /// bearing variable name is introduced, and every name is re-screened by
@@ -324,18 +322,17 @@ pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Optio
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
     // Sized up front for the worst case (every allow-listed name set, every
-    // toolchain cache resolved) plus the `HOME` appended below, so the vector
-    // never reallocates mid-build.
+    // toolchain cache resolved) plus `HOME`, so the vector never reallocates.
     let mut env: Vec<(String, String)> =
         Vec::with_capacity(ALLOWED_VARS.len() + TOOLCHAIN_VARS.len() + 1);
     for name in ALLOWED_VARS {
-        // Defence in depth: an allow-listed name that trips the secret filter is
-        // dropped regardless of its value.
+        // Defence in depth: an allow-listed name that trips the secret filter
+        // is dropped regardless of its value.
         if is_sensitive_var(name) {
             continue;
         }
-        // Empty values carry no information and can only confuse tools
-        // that test "is this configured?" with a truthiness check.
+        // Empty values carry no information and can only confuse tools that
+        // test "is this configured?" with a truthiness check.
         match std::env::var(name) {
             // One allocation for the key, one for the value; nothing is
             // allocated for names that are unset or empty.
@@ -456,11 +453,12 @@ fn is_safe_home(value: &OsString) -> bool {
 /// Serializes tests that mutate the process environment.
 ///
 /// `std::env::set_var` is process-global, and the harness runs unit tests on
-/// parallel threads, so a test that overrides `HOME`/`CARGO_HOME` would otherwise
-/// be observed by an unrelated test running at the same instant — in this module
-/// *and* in `exec`, which spawns real children that read the same variables.
-/// Holding this lock for the whole mutating test, rather than just around the
-/// `set_var` calls, is what makes those tests atomic against their neighbours.
+/// parallel threads, so a test that overrides `HOME`/`CARGO_HOME` would
+/// otherwise be observed by an unrelated test running at the same instant - in
+/// this module *and* in `exec`, which spawns real children that read the same
+/// variables. Holding this lock for the whole mutating test, rather than just
+/// around the `set_var` calls, is what makes those tests atomic against their
+/// neighbours.
 ///
 /// Exposed as a crate-visible test seam because sibling modules cannot reach a
 /// test-private item.
@@ -481,8 +479,8 @@ pub(crate) fn env_test_guard() -> MutexGuard<'static, ()> {
 
 /// Run `body` with exclusive access to the process environment.
 ///
-/// The lock is a std `Mutex`, so `body` must be synchronous: holding it across an
-/// `.await` would park a runtime thread and can deadlock a multi-threaded
+/// The lock is a std `Mutex`, so `body` must be synchronous: holding it across
+/// an `.await` would park a runtime thread and can deadlock a multi-threaded
 /// runtime, which is exactly what `clippy::await_holding_lock` rejects. A test
 /// that needs both an environment override and an await therefore drives the
 /// future to completion inside this closure (see the `runtime.block_on` call in
@@ -756,10 +754,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The toolchain-cache contract: with the parent's `CARGO_HOME` unset, a
-    /// host that *does* have a `~/.cargo` gets that directory forwarded, so a
-    /// cargo command in a sandboxed worktree sees the populated registry instead
-    /// of the empty isolated `HOME`.
+    /// Toolchain-cache contract: with the parent's `CARGO_HOME` unset, a host
+    /// that *does* have a `~/.cargo` gets that directory forwarded, so a cargo
+    /// command in a sandboxed worktree sees the populated registry instead of
+    /// the empty isolated `HOME`.
     #[test]
     fn cargo_home_falls_back_to_the_host_dot_cargo() {
         let _guard = env_test_guard();
@@ -795,9 +793,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// No host cache means no forwarded variable: inventing a path that does not
-    /// exist would be worse than staying quiet and letting Cargo apply its own
-    /// default resolution.
+    /// No host cache means no forwarded variable: inventing a path that does
+    /// not exist would be worse than staying quiet and letting Cargo apply its
+    /// own default resolution.
     #[test]
     fn cargo_home_is_omitted_when_the_host_has_none() {
         let _guard = env_test_guard();

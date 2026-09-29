@@ -44,80 +44,71 @@ use super::sandbox::{
     truncate_output, validate_bash_command,
 };
 
-/// Exit code reported to the model when a command exceeded its wall-clock
-/// budget and its process group was killed.
+/// Exit code reported when a command exceeded its wall-clock budget.
 const TIMEOUT_EXIT_CODE: i32 = 124;
 
-/// Default wall-clock budget (seconds) for commands `is_heavy_command`
-/// classifies as heavy (builds, test suites, package installs).
+/// Default wall-clock budget (seconds) for heavy commands (builds, test suites).
 const DEFAULT_HEAVY_TIMEOUT_SECS: u64 = 600;
 
-/// Default wall-clock budget (seconds) for every other command.
+/// Default wall-clock budget (seconds) for light commands.
 const DEFAULT_LIGHT_TIMEOUT_SECS: u64 = 120;
 
-/// `nice` level applied to every child so agent work yields to interactive
-/// work on a shared machine.
+/// `nice` level applied to every child so agent work yields to interactive work.
 const NICE_LEVEL: &str = "-n";
 
-/// Grace period a timed-out command gets to stop itself after `SIGTERM` before
-/// its process group is escalated to `SIGKILL`.
-///
-/// Long enough for a tool to flush its buffers and tidy up after itself, short
-/// enough that a wedged build still fails close to its wall-clock budget.
+/// Grace period after `SIGTERM` before a timed-out group is escalated to
+/// `SIGKILL`. Long enough to flush buffers, short enough that a wedged build
+/// still fails near its budget.
 const TERM_GRACE_MS: u64 = 5_000;
 
-/// Bound on the second, post-`SIGKILL` reap. `SIGKILL` cannot be caught or
-/// ignored, so a child still unreaped here is not ours to wait on any longer
-/// and must not stall the tool result.
+/// Bound on the post-`SIGKILL` reap. `SIGKILL` cannot be caught, so a child
+/// still unreaped here is not ours to wait on and must not stall the result.
 const KILL_GRACE_MS: u64 = 2_000;
 
-/// Program used to place a command in a fresh network namespace.
+/// Program that places a command in a fresh network namespace.
 ///
-/// `unshare -n` is the only primitive that gives a step a *kernel-level* "no
-/// egress" guarantee without containers or an external firewall: the child gets
-/// its own empty network stack, so every connect() fails immediately with
-/// `ENETUNREACH` instead of hanging out a TCP timeout.
+/// `unshare -n` gives a *kernel-level* "no egress" guarantee without containers
+/// or an external firewall: the child gets its own empty network stack, so
+/// every connect() fails immediately with `ENETUNREACH` instead of hanging out
+/// a TCP timeout.
 const NETWORK_NAMESPACE_TOOL: &str = "unshare";
 
-/// Command run by an offline step that is asked to produce output at all.
+/// Shell run by an offline step.
 ///
 /// Wrapping in `bash -c` keeps the model's command semantics (pipes,
 /// redirections, `&&`) intact instead of re-parsing the string into argv.
 const OFFLINE_SHELL: &str = "bash";
 
-/// Bound on draining the output pipes of a command that has been terminated.
+/// Bound on draining the output pipes of a terminated command.
 ///
 /// A grandchild that inherited stdout/stderr can hold the write end open long
 /// after its parent was killed, so the drain is abandoned at this deadline
-/// rather than being allowed to hang the worker.
+/// rather than hanging the worker.
 const DRAIN_GRACE_MS: u64 = 2_000;
 
-/// Upper bound on the decimal digits of the dropped-byte count in the
-/// truncation marker the pipe buffer splices in itself.
+/// Upper bound on the dropped-byte count's decimal digits in the marker.
 const TRUNCATE_MARKER_LEN: usize = TRUNCATE_MARKER.len();
 
-/// Size of the marker suffix appended after the dropped-byte count.
+/// Size of the marker suffix after the dropped-byte count.
 const TRUNCATE_MARKER_SUFFIX_LEN: usize = TRUNCATE_MARKER_SUFFIX.len();
 
 /// Granularity of a single pipe read.
 ///
-/// Large enough that the per-read syscall overhead stays negligible next to
-/// the copy, small enough that a reader task holds only this much scratch
-/// beyond its retained buffer.
+/// Large enough that per-read syscall overhead stays negligible, small enough
+/// that a reader task holds only this much scratch beyond its retained buffer.
 const DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 
 impl AgentRunner {
-    /// Run `command` with `bash -c` inside `dir` and return its combined
-    /// stdout/stderr (truncated to the shared byte budget) plus the exit code.
+    /// Run `command` with `bash -c` inside `dir`; return combined
+    /// stdout/stderr (truncated to the shared budget) plus the exit code.
     ///
-    /// Validation failures are *not* errors: a command rejected by the
-    /// worktree guardrail is reported back to the model as output with a
-    /// non-zero code so it can recover on the next step. Only a failure to
-    /// spawn the child propagates as an `Err`.
+    /// Validation failures are *not* errors: a guardrail-rejected command is
+    /// reported to the model as output with a non-zero code so it can recover.
+    /// Only a failure to spawn the child propagates as an `Err`.
     pub async fn execute_bash(&self, dir: &Path, command: &str) -> Result<(String, Option<i32>)> {
-        // Pre-execution interceptor middleware: destructive-pattern guard +
-        // telemetry. A block is reported to the model like a guardrail
-        // rejection; a rewrite replaces the command seen below.
+        // Interceptor middleware: destructive-pattern guard + telemetry. A
+        // block is reported like a guardrail rejection; a rewrite replaces the
+        // command seen below.
         let pipeline = CommandPipeline::default_pipeline();
         let effective_command: String = match pipeline.process(command)? {
             InterceptDecision::Allow => command.to_string(),
@@ -144,24 +135,21 @@ impl AgentRunner {
         let final_command = wrap_network_command(&effective_command, self.network_offline);
 
         if sandbox_enabled() {
-            // bubblewrap is present: it builds the mount namespace itself, so
-            // there is nothing left for Landlock to add. Adding it here would
-            // only risk re-confining a process bwrap has already confined.
+            // bwrap builds the mount namespace itself; adding Landlock here
+            // would only risk re-confining a process bwrap already confined.
             apply_sandbox_args(&mut cmd, dir, &target_dir);
             cmd.args(["--chdir", &dir.to_string_lossy()]);
             cmd.args(["/usr/bin/bash", "-c", &final_command]);
         } else {
-            // No bubblewrap: the only isolation left is the kernel's own LSM,
-            // applied in the forked child (see `apply_landlock_pre_exec`).
+            // No bwrap: the kernel's own LSM, applied in the forked child.
             apply_landlock_pre_exec(&mut cmd, dir, &target_dir);
             cmd.current_dir(dir)
                 .args([NICE_LEVEL, "10", "bash", "-c", &final_command]);
         }
 
-        // Environment hygiene first: the child is spawned with a cleared
-        // environment and a strict allow-list, so no ambient credential from
-        // the operator's shell can reach the model. Build/cache variables are
-        // layered on top of the sanitized base afterwards.
+        // Cleared environment + strict allow-list first, so no ambient
+        // credential from the operator's shell reaches the model. Build/cache
+        // variables are layered on top afterwards.
         apply_sanitized_environment(&mut cmd, dir);
         apply_build_env(&mut cmd, &target_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
@@ -180,22 +168,20 @@ fn blocked_by_interceptor(reason: &str) -> String {
 /// Wrap `cmd` in an isolated network namespace when the worker declared
 /// `network: "offline"`.
 ///
-/// The wrapped form is `unshare -n -- bash -c '<cmd>'`, which is idempotent
-/// with respect to the rest of the execution path: the child is still a bash
-/// process spawned by `nice`, so the worktree `current_dir`, the build
-/// environment, the timeout and the output plumbing are all unchanged. Inside
-/// the namespace there is no route and no interface, so a `curl`/`git fetch`/
+/// The wrapped form `unshare -n -- bash -c '<cmd>'` is idempotent with the rest
+/// of the execution path: the child is still a bash process spawned by `nice`,
+/// so `current_dir`, build env, timeout and output plumbing are unchanged.
+/// Inside the namespace there is no route or interface, so `curl`/`git fetch`/
 /// `cargo add` fails immediately (`Network is unreachable`) rather than
 /// blocking for its own connect timeout.
 ///
 /// `offline == false` returns `cmd` verbatim: connectivity is the default, and
-/// a wrapper there would only add a process for no isolation benefit.
+/// a wrapper would only add a process for no isolation benefit.
 ///
 /// The wrapper is applied even when `unshare` is missing: the command then
 /// fails fast with a clear "not found" instead of silently running *with*
-/// network access, because a policy that quietly does not apply is worse than
-/// one that is loudly unavailable. Callers that must degrade can inspect
-/// [`has_unshare`] first.
+/// network access - a policy that quietly does not apply is worse than one
+/// loudly unavailable. Callers that must degrade can inspect [`has_unshare`].
 pub fn wrap_network_command(cmd: &str, offline: bool) -> String {
     if !offline {
         return cmd.to_string();
@@ -208,8 +194,8 @@ pub fn wrap_network_command(cmd: &str, offline: bool) -> String {
 
 /// Whether the network-namespace primitive is usable on this host.
 ///
-/// A cached probe: [`wrap_network_command`] is called once per agent step and
-/// spawning `unshare` just to ask would add a fork per step.
+/// Cached probe: [`wrap_network_command`] runs once per step, and spawning
+/// `unshare` just to ask would add a fork per step.
 pub fn has_unshare() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -223,10 +209,10 @@ pub fn has_unshare() -> bool {
 
 /// Single-quote `value` for `bash -c`.
 ///
-/// The command reaches us as a model-authored string that may contain every
-/// metacharacter, so the wrapping layer must not be able to re-interpret it:
-/// single quotes suppress all expansion, and the embedded `'` is closed,
-/// escaped and reopened (the standard `'"'"'` dance).
+/// The command is model-authored and may contain every metacharacter, so the
+/// wrapping layer must not re-interpret it: single quotes suppress all
+/// expansion, and an embedded `'` is closed, escaped and reopened (the standard
+/// `'"'"'` dance).
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -238,8 +224,8 @@ fn blocked_by_guardrail(reason: &str) -> String {
     )
 }
 
-/// Build/test parallelism shared by the child, honouring `BUILD_PARALLELISM`
-/// and defaulting to half the available cores (never below one).
+/// Build/test parallelism for the child: `BUILD_PARALLELISM` or half the
+/// available cores (never below one).
 fn build_parallelism() -> String {
     let default_parallelism = std::thread::available_parallelism()
         .map(|n| (n.get() / 2).max(1))
@@ -252,8 +238,8 @@ fn build_parallelism() -> String {
 }
 
 /// Directory the child builds into: `CARGO_TARGET_DIR` when set, otherwise a
-/// per-worktree directory under the SWE base dir so concurrent workers never
-/// share a build cache.
+/// per-worktree dir under the SWE base so concurrent workers never share a
+/// build cache.
 fn resolve_target_dir(dir: &Path) -> PathBuf {
     if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
         return PathBuf::from(custom);
@@ -275,24 +261,23 @@ fn sandbox_enabled() -> bool {
 ///
 /// # Why a `pre_exec` hook and not a call in the parent
 ///
-/// Landlock is confined through `landlock_restrict_self`, which restricts
-/// **the calling process** and is irreversible. Calling it in the daemon would
-/// confine the daemon: it could no longer read its own worktree management
-/// state, its config or its caches, and no later call could undo it. The only
-/// correct place to confine a worker is in the process that is about to become
-/// that worker, which is precisely what a `Command::pre_exec` closure is - it
-/// runs in the child between `fork(2)` and `exec(2)`.
+/// `landlock_restrict_self` restricts **the calling process** and is
+/// irreversible. Calling it in the daemon would confine the daemon: it could no
+/// longer read its own worktree state, config or caches, and no later call
+/// could undo it. The only correct place to confine a worker is the process
+/// about to become that worker - exactly what a `Command::pre_exec` closure is
+/// (it runs in the child between `fork(2)` and `exec(2)`).
 ///
 /// # Why the work happens in the parent
 ///
 /// A `pre_exec` closure runs in a forked child of a *multi-threaded* server, so
 /// only async-signal-safe operations are permitted; `malloc`, `tracing` and
-/// `anyhow` are not (a thread that held the allocator lock at the instant of
-/// the fork leaves the child permanently deadlocked). [`build_landlock_plan`]
+/// `anyhow` are not (a thread holding the allocator lock at the instant of the
+/// fork leaves the child permanently deadlocked). [`build_landlock_plan`]
 /// therefore resolves the whole policy - ABI probe, path canonicalisation,
-/// `CString` construction, syscall-backed existence checks - here in the
-/// parent, where allocating is safe, and the closure is left with nothing but
-/// raw syscalls.
+/// `CString` construction, syscall-backed existence checks - in the parent,
+/// where allocating is safe, and the closure is left with nothing but raw
+/// syscalls.
 ///
 /// # Failure policy
 ///
@@ -308,9 +293,9 @@ fn sandbox_enabled() -> bool {
 ///   directory that is not there has no correct behaviour.
 ///
 /// A hook that *does* run and then fails is fatal to the child: an `Err` out of
-/// `pre_exec` aborts the spawn and is reported to the parent, which is the right
-/// outcome - it means the kernel promised a domain and did not deliver one,
-/// and silently continuing would be a confinement that is only advertised.
+/// `pre_exec` aborts the spawn and is reported to the parent, which is the
+/// right outcome - the kernel promised a domain and did not deliver one, and
+/// silently continuing would be a confinement that is only advertised.
 #[cfg(unix)]
 fn apply_landlock_pre_exec(cmd: &mut Command, dir: &Path, target_dir: &Path) {
     // Parent side of the hook: everything that allocates happens here, so the
@@ -340,13 +325,12 @@ fn apply_landlock_pre_exec(cmd: &mut Command, dir: &Path, target_dir: &Path) {
     }
 }
 
-/// Non-unix stub: there is no Landlock LSM and no `fork` to hook, so the child
-/// is spawned exactly as it was before this confinement existed.
+/// Non-unix stub: no Landlock LSM and no `fork` to hook.
 #[cfg(not(unix))]
 fn apply_landlock_pre_exec(_cmd: &mut Command, _dir: &Path, _target_dir: &Path) {}
 
-/// Baseline child process setup: kill the whole process group on drop, detach
-/// stdin, and capture both output streams.
+/// Baseline child setup: kill the process group on drop, detach stdin, capture
+/// both output streams.
 fn configure_process(cmd: &mut Command) {
     cmd.kill_on_drop(true);
     #[cfg(unix)]
@@ -356,10 +340,10 @@ fn configure_process(cmd: &mut Command) {
     cmd.stderr(std::process::Stdio::piped());
 }
 
-/// Read-only bind for a toolchain cache directory, if it is present.
+/// Read-only bind for a toolchain cache directory, if present.
 ///
 /// A missing cache is not an error: `--ro-bind-try` keeps the sandbox startable
-/// on a host that never installed the toolchain in question.
+/// on a host that never installed the toolchain.
 fn ro_bind_toolchain_cache(cmd: &mut Command, path: &Path) {
     if !path.exists() {
         return;
@@ -370,10 +354,10 @@ fn ro_bind_toolchain_cache(cmd: &mut Command, path: &Path) {
 
 /// Append the full `bwrap` argument vector.
 ///
-/// The sandbox is read-only by default: only the worktree, its own gitdir, the
-/// isolated build target dir and a handful of toolchain caches are bound
-/// writable. `$HOME` is replaced by an empty tmpfs so the agent cannot read or
-/// clobber SSH keys, dotfiles or package-manager credentials.
+/// Read-only by default: only the worktree, its own gitdir, the isolated build
+/// target dir and a handful of toolchain caches are bound writable. `$HOME` is
+/// an empty tmpfs so the agent cannot read or clobber SSH keys, dotfiles or
+/// package-manager credentials.
 fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
     let dir_str = dir.to_string_lossy();
     let target_str = target_dir.to_string_lossy();
@@ -412,7 +396,7 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
         "/tmp",
     ]);
 
-    // Isolate user home: mount empty tmpfs, expose only toolchain caches read-only
+    // Isolate user home: empty tmpfs, toolchain caches read-only.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(home) = home.as_deref() {
         let home_str = home.to_string_lossy();
@@ -446,16 +430,16 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
         ro_bind_toolchain_cache(cmd, &rustup_home);
     }
 
-    // Expose the worktree directory read-write
+    // Worktree read-write.
     cmd.args(["--bind", &dir_str, &dir_str]);
 
-    // Expose the common .git directory READ-ONLY so git can resolve refs/objects
-    // without permitting the sandbox to prune or delete repository branches!
+    // Common .git READ-ONLY so git resolves refs/objects without the sandbox
+    // being able to prune or delete repository branches.
     if let Some((common_git, worktree_gitdir)) = find_git_dirs(dir) {
         let common_str = common_git.to_string_lossy();
         cmd.args(["--ro-bind", &common_str, &common_str]);
 
-        // Expose ONLY this worker's worktree gitdir read-write so it can update its local index
+        // Only this worker's worktree gitdir read-write, so it can update its index.
         if let Some(wt_gitdir) = worktree_gitdir
             && wt_gitdir.is_dir()
         {
@@ -464,29 +448,29 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
         }
     }
 
-    // Bind isolated build target directory read-write
+    // Isolated build target read-write.
     cmd.args(["--bind", &target_str, &target_str]);
 
-    // Modular shared package/compiler caches
+    // Modular shared package/compiler caches.
     crate::cache::append_bwrap_cache_args(cmd, home.as_deref());
 }
 
 /// Replace the inherited environment with the sanitized allow-list.
 ///
-/// The parent process environment is cleared wholesale and rebuilt from
-/// `env::build_clean_environment`, which forwards only the essential runtime
+/// The parent environment is cleared wholesale and rebuilt from
+/// `env::build_clean_environment`, which forwards only essential runtime
 /// variables, remaps `HOME` to an isolated per-worktree scratch directory and
 /// purges credential-bearing names (`OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_*`,
-/// `SSH_*`, ...). The child therefore cannot read back the operator's secrets
-/// through the ambient environment, and two runs are reproducible regardless of
-/// what else the operator happens to have exported.
+/// `SSH_*`, ...). The child cannot read back the operator's secrets through the
+/// ambient environment, and runs are reproducible regardless of what else the
+/// operator exported.
 ///
-/// The `repo_path` argument is the original checkout; the worker's worktree
-/// `dir` is what the command is chdir'ed into, so the isolated `HOME` is placed
-/// under `dir` where the sandbox bind makes it writable.
+/// `repo_path` is the original checkout; the worker's worktree `dir` is what
+/// the command is chdir'ed into, so the isolated `HOME` is placed under `dir`
+/// where the sandbox bind makes it writable.
 fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
-    // The worker's worktree `dir`; the original repository is its git common
-    // dir when one can be resolved, else the worktree itself.
+    // The original repository is the worktree's git common dir when one can
+    // be resolved, else the worktree itself.
     let repo_path = find_git_common_dir(dir).unwrap_or_else(|| dir.to_path_buf());
     let repo_path = repo_path
         .parent()
@@ -495,8 +479,8 @@ fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
     super::env::apply_clean_environment_cmd(cmd, &repo_path, dir);
 }
 
-/// Universal build and test parallelism caps, so a command cannot oversubscribe
-/// the machine no matter which build tool it drives.
+/// Universal build/test parallelism caps so a command cannot oversubscribe the
+/// machine no matter which build tool it drives.
 fn apply_build_env(cmd: &mut Command, target_dir: &Path, parallelism: &str) {
     cmd.env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_BUILD_JOBS", parallelism)
@@ -511,8 +495,8 @@ fn apply_build_env(cmd: &mut Command, target_dir: &Path, parallelism: &str) {
         .env("GOMAXPROCS", parallelism);
 }
 
-/// Wall-clock budget for `command` in seconds: heavy commands get a longer
-/// default, and `COMMAND_TIMEOUT_SECS` overrides either tier.
+/// Wall-clock budget (seconds) for `command`: heavy commands get a longer
+/// default; `COMMAND_TIMEOUT_SECS` overrides either tier.
 fn command_timeout_secs(command: &str) -> u64 {
     let default_timeout = if is_heavy_command(command) {
         std::env::var("COMMAND_HEAVY_TIMEOUT_SECS")
@@ -533,25 +517,23 @@ fn command_timeout_secs(command: &str) -> u64 {
 
 /// Spawn `cmd`, wait up to `timeout_secs`, and collect the combined output.
 ///
-/// On timeout the child's whole process group is asked to stop with a graceful
-/// `SIGTERM` and escalated to `SIGKILL` only if it refuses to stop within
-/// [`TERM_GRACE_MS`] (a lingering compiler or test runner would otherwise
-/// outlive its budget). Whatever the command printed before the budget expired
-/// is still reported, so the model sees the last diagnostics instead of a bare
-/// "timed out". The timeout itself is reported as ordinary output with exit
-/// code [`TIMEOUT_EXIT_CODE`].
+/// On timeout the whole process group gets a graceful `SIGTERM`, escalated to
+/// `SIGKILL` only if it refuses to stop within [`TERM_GRACE_MS`] (a lingering
+/// compiler or test runner would otherwise outlive its budget). Whatever the
+/// command printed before the budget expired is still reported, so the model
+/// sees the last diagnostics instead of a bare "timed out". The timeout is
+/// reported as ordinary output with exit code [`TIMEOUT_EXIT_CODE`].
 async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(String, Option<i32>)> {
     let mut child = cmd.spawn().context("Failed to spawn bash process")?;
     let child_pid = child.id();
 
-    // Covers the cancellation path: if this future is dropped (pool kill,
-    // shutdown, a cancelled request) the guard takes the whole process group
-    // down, where `kill_on_drop` would only reach the leader PID.
+    // Covers cancellation: if this future is dropped (pool kill, shutdown,
+    // cancelled request) the guard takes the whole process group down, where
+    // `kill_on_drop` would only reach the leader PID.
     let mut group_guard = ProcessGroupGuard::new(child_pid);
 
-    // Take the pipes out of the child's hands and hand them to reader tasks.
-    // The readers keep running independently of the wait, so cancelling the
-    // wait on timeout cannot throw away output the command already produced.
+    // Hand the pipes to reader tasks that run independently of the wait, so
+    // cancelling the wait on timeout cannot throw away output already produced.
     let stdout = child
         .stdout
         .take()
@@ -575,10 +557,10 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
                 status.code(),
             ))
         }
-        // A `wait` error leaves the child's fate unknown, so the guard is left
-        // armed on purpose: killing the group is the only cleanup that cannot
-        // leave a build running behind us. Signalling a reaped group is inert
-        // (`ESRCH`), and the PID cannot be recycled while tokio still holds the
+        // A `wait` error leaves the child's fate unknown, so the guard stays
+        // armed: killing the group is the only cleanup that cannot leave a
+        // build running behind us. Signalling a reaped group is inert
+        // (`ESRCH`), and the PID cannot be recycled while tokio holds the
         // unreaped `Child`.
         Ok(Err(e)) => Err(e).context("Failed waiting for bash process"),
         // The child outlived its budget: stop it, then report what it printed.
@@ -587,8 +569,8 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
             // `terminate_process_group` reaped the group (or gave up after the
             // SIGKILL), so the drop guard has nothing left to do.
             group_guard.disarm();
-            // The group is gone by now, so the readers are released and the
-            // drain converges instead of waiting out the whole drain budget.
+            // The group is gone, so the readers are released and the drain
+            // converges instead of waiting out the whole drain budget.
             let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
             let mut output = combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped);
             output.push_str(&format!(
@@ -602,14 +584,13 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
 /// Head and tail of a command's output stream, bounded to exactly the bytes
 /// [`truncate_output`] would have kept.
 struct Captured {
-    /// First [`TRUNCATE_HEAD`] bytes seen. Later input spills into `tail`.
+    /// First [`TRUNCATE_HEAD`] bytes seen; later input spills into `tail`.
     head: Vec<u8>,
     /// Last [`TRUNCATE_TAIL`] bytes seen, kept in a rolling window so the
     /// buffer never grows with the output.
     tail: Vec<u8>,
-    /// Total bytes this stream has produced, including the ones we will not
-    /// keep. Comparing it against what we hold *is* the elision count, so the
-    /// two can never drift apart.
+    /// Total bytes produced, including the ones not kept. Comparing it against
+    /// what we hold *is* the elision count, so the two never drift apart.
     seen: usize,
 }
 
@@ -624,11 +605,10 @@ impl Captured {
 
     /// Absorb `chunk`, retaining only what the truncation budget can use.
     ///
-    /// Bounding here rather than after the read is what keeps a chatty command
-    /// from costing unbounded memory: the sink is a fixed 16 KiB per pipe no
-    /// matter whether the child printed 16 KiB or 16 GiB. What survives is
-    /// exactly the head and tail [`truncate_output`] would have kept, so the
-    /// only thing lost by not buffering is the discarded middle -- and that is
+    /// Bounding here rather than after the read keeps a chatty command from
+    /// costing unbounded memory: the sink is a fixed 16 KiB per pipe whether
+    /// the child printed 16 KiB or 16 GiB. What survives is exactly the head
+    /// and tail [`truncate_output`] would have kept; the discarded middle is
     /// counted, not forgotten, in [`dropped`](Self::dropped).
     fn push(&mut self, chunk: &[u8]) {
         self.seen += chunk.len();
@@ -666,9 +646,8 @@ impl Captured {
     /// Deliberately *unmarked*: the elision is reported through
     /// [`dropped`](Self::dropped) instead, so [`combine_streams`] stays the
     /// single place that decides what the model sees and can account for both
-    /// streams' elisions in one marker.
-    ///
-    /// Borrows rather than consumes so the caller can snapshot a partial drain.
+    /// streams' elisions in one marker. Borrows rather than consumes so the
+    /// caller can snapshot a partial drain.
     fn captured(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
@@ -685,25 +664,24 @@ impl Captured {
 /// One of a command's output pipes, drained in the background into a bounded
 /// buffer that outlives the command's own timeout.
 ///
-/// Running the read as a detached task is what makes the drain robust. A read
+/// Running the read as a detached task is what makes the drain robust: a read
 /// inlined into the awaited future is cancelled wholesale when the wait times
 /// out, discarding every byte it had already received; here the task keeps
 /// draining while the caller is free to stop waiting, and
 /// [`finish`](Self::finish) later collects whatever arrived.
 ///
 /// "Draining" and "retaining" are deliberately separate. The reader keeps
-/// consuming from the pipe no matter how much the child writes -- that is what
-/// stops a full pipe buffer from wedging the child in `write` -- while
-/// [`Captured`] discards everything the truncation budget cannot show. The two
-/// together are what let a multi-gigabyte build log cost 16 KiB of memory and
-/// still not deadlock.
+/// consuming from the pipe no matter how much the child writes -- that stops a
+/// full pipe buffer from wedging the child in `write` -- while [`Captured`]
+/// discards everything the truncation budget cannot show. Together they let a
+/// multi-gigabyte build log cost 16 KiB of memory and still not deadlock.
 struct PipeBuffer {
     bytes: Arc<Mutex<Captured>>,
     reader: tokio::task::JoinHandle<()>,
 }
 
-// A cancelled command must not leave detached readers holding pipe descriptors
-// indefinitely (a child can escape the process group with `setsid`).
+// A cancelled command must not leave detached readers holding pipe
+// descriptors indefinitely (a child can escape the process group with `setsid`).
 impl Drop for PipeBuffer {
     fn drop(&mut self) {
         self.reader.abort();
@@ -712,9 +690,8 @@ impl Drop for PipeBuffer {
 
 /// One drained pipe: the bytes worth showing, plus how many were elided.
 ///
-/// `dropped` is what lets [`combine_streams`] tell the difference between "the
-/// child printed 20 KB" and "the child printed 4 GB" and report the right
-/// figure in the truncation marker.
+/// `dropped` lets [`combine_streams`] tell "the child printed 20 KB" from "the
+/// child printed 4 GB" and report the right figure in the truncation marker.
 struct Stream {
     bytes: Vec<u8>,
     dropped: usize,
@@ -788,16 +765,16 @@ impl PipeBuffer {
 async fn terminate_process_group(pid: Option<u32>, child: &mut Child) {
     signal_process_group(pid, libc::SIGTERM);
 
-    // Reap with a bounded wait so a well-behaved child can exit on its own;
-    // the deadline stops a wedged child from extending the budget indefinitely.
+    // Bounded reap so a well-behaved child can exit on its own; the deadline
+    // stops a wedged child from extending the budget indefinitely.
     let reaped = matches!(
         tokio::time::timeout(Duration::from_millis(TERM_GRACE_MS), child.wait()).await,
         Ok(Ok(_))
     );
 
     // Reaping the leader does not imply its children stopped: a shell can
-    // terminate on SIGTERM while a child ignores it. Kill any remaining group
-    // members before returning from the timeout path.
+    // terminate on SIGTERM while a child ignores it. Kill remaining members
+    // before returning from the timeout path.
     signal_process_group(pid, libc::SIGKILL);
     if !reaped {
         let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
@@ -807,18 +784,17 @@ async fn terminate_process_group(pid: Option<u32>, child: &mut Child) {
 /// Send `sig` to the process group led by `pid`.
 ///
 /// `configure_process` places the child in its own process group (`bwrap` adds
-/// `--new-session`), so the negated PID addresses the group and also reaches
+/// `--new-session`), so the negated PID addresses the group and reaches
 /// grandchildren that `child.wait` alone would never reap.
 ///
-/// This is a direct `kill(2)` rather than a forked `kill` binary: signalling
-/// is on the cancellation path, where a `PATH` lookup and a `fork`/`exec` race
-/// are both a delay and a way to lose the signal entirely. `libc` is already a
-/// hard dependency of the crate (see [`super::sandbox`]), so this adds no
-/// dependency weight.
+/// A direct `kill(2)` rather than a forked `kill` binary: signalling is on the
+/// cancellation path, where a `PATH` lookup and a `fork`/`exec` race are both a
+/// delay and a way to lose the signal entirely. `libc` is already a hard
+/// dependency (see [`super::sandbox`]), so this adds no dependency weight.
 ///
 /// `ESRCH` means the group is already gone -- the sandbox wrapper carries
 /// `--die-with-parent` and routinely takes its children down before the timeout
-/// fires -- which is a success for our purposes, not an error.
+/// fires -- which is a success, not an error.
 #[cfg(unix)]
 fn signal_process_group(pid: Option<u32>, sig: libc::c_int) {
     let Some(pid) = pid.map(|p| p as libc::pid_t) else {
@@ -837,27 +813,26 @@ fn signal_process_group(pid: Option<u32>, sig: libc::c_int) {
     }
 }
 
-/// Non-unix stub: there is no process group signalling outside unix, and the
-/// `Child` guard's `SIGKILL` is the only cleanup available there.
+/// Non-unix stub: no process group signalling outside unix; the `Child`
+/// guard's `SIGKILL` is the only cleanup there.
 #[cfg(not(unix))]
 fn signal_process_group(_pid: Option<u32>, _sig: i32) {}
 
-/// Kills a command's whole process group unless it is explicitly disarmed.
+/// Kill a command's whole process group unless explicitly disarmed.
 ///
-/// `kill_on_drop` only ever reaches the child itself, so this guard closes the
-/// hole where a cancelled future (`pool::kill`, `kill_all`, a shutting-down
-/// runtime) drops the `Child` while its grandchildren keep running -- a
-/// `cargo build` interrupted mid-compile would otherwise leave its `rustc`
-/// children running, holding the worktree's `target/` open and burning CPU
-/// against the operator.
+/// `kill_on_drop` only reaches the child itself, so this guard closes the hole
+/// where a cancelled future (`pool::kill`, `kill_all`, a shutting-down runtime)
+/// drops the `Child` while its grandchildren keep running -- an interrupted
+/// `cargo build` would otherwise leave its `rustc` children running, holding
+/// the worktree's `target/` open and burning CPU.
 ///
-/// The signal is `SIGKILL` rather than [`terminate_process_group`]'s
-/// `SIGTERM`-then-`SIGKILL`, because a `Drop` cannot await: there is no grace
-/// period to give, and no reap to perform. `SIGKILL` cannot be caught, blocked
-/// or ignored, so the group is gone by the time the caller resumes.
+/// `SIGKILL` rather than [`terminate_process_group`]'s `SIGTERM`-then-`SIGKILL`,
+/// because a `Drop` cannot await: there is no grace period to give and no reap
+/// to perform. `SIGKILL` cannot be caught, blocked or ignored, so the group is
+/// gone by the time the caller resumes.
 ///
-/// The guard is inert on non-unix targets, where
-/// [`signal_process_group`] does nothing and there is no group to reach.
+/// Inert on non-unix targets, where [`signal_process_group`] does nothing and
+/// there is no group to reach.
 struct ProcessGroupGuard {
     pid: Option<u32>,
     armed: bool,
@@ -869,8 +844,8 @@ impl ProcessGroupGuard {
         Self { pid, armed: true }
     }
 
-    /// Stop guarding: the caller has already reaped the group itself, so a
-    /// drop-time `SIGKILL` would be redundant.
+    /// Stop guarding: the caller already reaped the group, so a drop-time
+    /// `SIGKILL` would be redundant.
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -890,16 +865,15 @@ impl Drop for ProcessGroupGuard {
 /// Each pipe keeps only [`TRUNCATE_HEAD`] + [`TRUNCATE_TAIL`] bytes, so a
 /// command that printed megabytes arrives here as two short slices plus
 /// `dropped`, the count of bytes the buffers already elided. The marker spliced
-/// between the halves carries that count, which is what makes it report the
-/// child's *true* output size rather than the size of our own buffer -- without
-/// it a 4 GB build log would be reported as "16 KB" and the model could never
-/// tell a truncated stream from a small one.
+/// between the halves carries that count, so it reports the child's *true*
+/// output size rather than the size of our own buffer -- without it a 4 GB
+/// build log would be reported as "16 KB" and the model could never tell a
+/// truncated stream from a small one.
 ///
 /// The newline separator is unconditional, so a stdout that already ends in
-/// `\n` yields a blank line between the streams. That is pre-existing
-/// behaviour the model sees verbatim in the tool result, so it is preserved
-/// as-is rather than quietly changing the transcripts this crate already
-/// produced.
+/// `\n` yields a blank line between the streams. That is pre-existing behaviour
+/// the model sees verbatim in the tool result, so it is preserved as-is rather
+/// than quietly changing the transcripts this crate already produced.
 fn combine_streams(stdout: &[u8], stderr: &[u8], dropped: usize) -> String {
     let mut combined = String::new();
     if !stdout.is_empty() {
@@ -992,13 +966,12 @@ mod tests {
         );
     }
 
-    /// The end-to-end contract from the hardening plan: with the policy on, a
-    /// request that would need egress fails *immediately* (no interface, no
-    /// route) instead of hanging out a connect timeout, while a local command
-    /// still runs normally.
+    /// End-to-end contract: with the policy on, a request needing egress fails
+    /// *immediately* (no interface, no route) instead of hanging out a connect
+    /// timeout, while a local command still runs normally.
     ///
-    /// Where the host forbids namespace creation (an unprivileged container,
-    /// a kernel without `CONFIG_NET_NS`) the wrapper is still applied and the
+    /// Where the host forbids namespace creation (an unprivileged container, a
+    /// kernel without `CONFIG_NET_NS`) the wrapper is still applied and the
     /// step fails loudly; that fallback is asserted separately below rather
     /// than letting the test quietly pass in isolation.
     #[tokio::test]
@@ -1059,8 +1032,8 @@ mod tests {
     /// Whether this host actually lets us build a network namespace.
     ///
     /// `has_unshare` only proves the binary exists; inside an unprivileged
-    /// container `unshare -n` still fails with EPERM, and the isolation the
-    /// policy promises cannot be created there.
+    /// container `unshare -n` still fails with EPERM, so the promised
+    /// isolation cannot be created there.
     fn can_create_network_namespace() -> bool {
         std::process::Command::new(NETWORK_NAMESPACE_TOOL)
             .args(["-n", "--", "true"])
@@ -1557,7 +1530,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The end-to-end guarantee: a secret exported in the *worker's* own
+    /// End-to-end guarantee: a secret exported in the *worker's* own
     /// environment is invisible to the command the model runs, and the command
     /// sees the remapped, isolated `HOME` instead of the operator's.
     ///
@@ -1629,14 +1602,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The end-to-end toolchain contract: a command the model runs inside the
+    /// End-to-end toolchain contract: a command the model runs inside the
     /// sandbox observes a `CARGO_HOME` pointing at the *host's* registry cache,
     /// even though its own `HOME` is an empty scratch directory.
     ///
     /// Without this, a worktree builds against an empty registry and reaches for
     /// `index.crates.io` for crates the operator already has locally, which fails
     /// on an offline host. Asserting on the *relationship* between the two
-    /// variables — the cache must not be the sandboxed home — is what makes the
+    /// variables -- the cache must not be the sandboxed home -- is what makes the
     /// test meaningful on a host that has no `~/.cargo` at all.
     ///
     // Deliberately *not* a `#[tokio::test]`: the spawn has to run while the
@@ -1666,10 +1639,9 @@ mod tests {
         let host_cargo = tmp.join("host-cargo");
         std::fs::create_dir_all(&host_cargo).expect("create host cargo home");
 
-        // The whole spawn runs under the environment lock: it has to, because
-        // the child reads `CARGO_HOME` when it is built, and a concurrent
-        // mutating test would otherwise swap the value out from under the
-        // assertion.
+        // The whole spawn runs under the environment lock: the child reads
+        // `CARGO_HOME` when it is built, and a concurrent mutating test would
+        // otherwise swap the value out from under the assertion.
         let spawned = crate::agent::env::with_env_lock(|| {
             // SAFETY: serialized against every other test that reads or writes
             // the process environment, including the ones in `env`.
