@@ -218,6 +218,31 @@ const DENIED_HOME_SUBDIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".gpg", ".kube"
 /// Absolute system paths that must never be reachable, even read-only.
 const DENIED_ABSOLUTE_PATHS: &[&str] = &["/root", "/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
+/// Individual `/etc` files a sandboxed build is allowed to read.
+///
+/// Landlock is allow-only, so a rule on `/etc` would also grant `/etc/shadow`.
+/// Granting these files individually keeps the toolchain working while the
+/// secrets stay unreachable by omission. Every entry is a non-secret
+/// configuration file; nothing here is a directory whose subtree would carry a
+/// secret other than the `certs` bundles, which are public by design.
+const CONFIG_PATHS: &[&str] = &[
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/host.conf",
+    "/etc/gai.conf",
+    "/etc/ld.so.cache",
+    "/etc/localtime",
+    "/etc/os-release",
+    "/etc/protocols",
+    "/etc/services",
+    "/etc/ssl/certs",
+    "/etc/ca-certificates",
+    "/etc/pki/tls/certs",
+];
+
 /// `LANDLOCK_ACCESS_FS_EXECUTE`: run a file.
 const ACCESS_FS_EXECUTE: u64 = 1 << 0;
 /// `LANDLOCK_ACCESS_FS_WRITE_FILE`: open a file for writing.
@@ -307,6 +332,61 @@ struct RulesetAttr {
 struct PathBeneathAttr {
     allowed_access: u64,
     parent_fd: libc::c_int,
+}
+
+/// An owned file descriptor that never escapes into a child process.
+///
+/// Two independent mechanisms are needed, and they are complementary:
+///
+/// * `open(2)` is called with `O_CLOEXEC` wherever the crate chooses the
+///   descriptor itself;
+/// * descriptors the *kernel* hands back (notably `landlock_create_ruleset`,
+///   which takes no flags) have `FD_CLOEXEC` set explicitly, because the
+///   `O_CLOEXEC` bit only exists in the `open` call that created the descriptor
+///   and is not retroactive.
+///
+/// Without this, a ruleset descriptor opened before a `Command::spawn` is
+/// inherited by every worker process the daemon starts, leaking a handle to a
+/// live Landlock ruleset (and, in a multi-threaded server, keeping a
+/// privileged capability reachable from code that was never granted it).
+/// Dropping the value closes the descriptor exactly once, so the descriptor is
+/// also not leaked for the lifetime of the long-running daemon.
+struct Fd(libc::c_int);
+
+impl Fd {
+    /// Adopt a raw descriptor, marking it close-on-exec.
+    ///
+    /// Returns `None` (rather than a usable value) if `FD_CLOEXEC` cannot be
+    /// set, so a descriptor that could leak into a child is never held.
+    fn new(raw: libc::c_int) -> Option<Self> {
+        if raw < 0 {
+            return None;
+        }
+        // SAFETY: `raw` is a live descriptor owned by this function until the
+        // `Fd` below takes over. `F_GETFD`/`F_SETFD` only read and write the
+        // descriptor's own flag word, and the previous value is preserved.
+        unsafe {
+            let flags = libc::fcntl(raw, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                libc::close(raw);
+                return None;
+            }
+        }
+        Some(Self(raw))
+    }
+
+    /// The raw descriptor, for passing into a syscall.
+    fn raw(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor came from a successful `open`/syscall, is owned
+        // by this value, and is closed exactly once here.
+        unsafe { libc::close(self.0) };
+    }
 }
 
 /// Every filesystem right a sandboxed child needs to *read* a path: listing
@@ -444,7 +524,10 @@ fn home_dir() -> Option<PathBuf> {
 /// explicit, testable list stops that from silently regressing into "granted by
 /// accident" if a broad prefix rule is ever added above.
 fn denied_paths() -> Vec<PathBuf> {
-    let mut denied: Vec<PathBuf> = DENIED_ABSOLUTE_PATHS.iter().map(PathBuf::from).collect();
+    // One allocation: the home-relative entries are only present when $HOME is
+    // discoverable, but the common case reserves for both lists up front.
+    let mut denied = Vec::with_capacity(DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len());
+    denied.extend(DENIED_ABSOLUTE_PATHS.iter().map(PathBuf::from));
     if let Some(home) = home_dir() {
         denied.extend(DENIED_HOME_SUBDIRS.iter().map(|d| home.join(d)));
     }
@@ -453,11 +536,33 @@ fn denied_paths() -> Vec<PathBuf> {
 
 /// True when `path` is `denied` or lives underneath it.
 ///
-/// Purely lexical (no canonicalisation): the rules handed to Landlock are
-/// matched on the paths actually opened, and this check exists to keep the
-/// *policy* honest rather than to mirror the kernel's resolution.
+/// Purely lexical: this check keeps the *policy* honest, and it is sound
+/// because every caller-supplied path has already been resolved by
+/// [`canonical_root`] before it reaches here. The fixed system prefixes are
+/// literal absolute paths with no symbolic components, so they need no
+/// resolution and comparing them as strings matches what the kernel will open.
 fn is_denied(path: &Path, denied: &[PathBuf]) -> bool {
     denied.iter().any(|d| path == d || path.starts_with(d))
+}
+
+/// Resolve a caller-supplied writable root to the real directory it names.
+///
+/// The two writable roots are the only paths in the policy that come from
+/// outside the crate, so they are the only ones a symlink can influence. The
+/// kernel resolves a `PATH_BENEATH` rule onto the *real* inode, but
+/// [`is_denied`] compares path strings - so a worktree supplied as
+/// `/tmp/wt` that is really a symlink to `~/.ssh` would pass the lexical
+/// deny-check and then hand the sandbox a write grant over the operator's
+/// private keys. Canonicalising first makes the string check and the rule agree
+/// on the same directory.
+///
+/// A root that cannot be canonicalised (it does not exist, or a component is
+/// unreadable) is returned unchanged: the caller has already validated that it
+/// exists, and the subsequent `O_PATH` open in [`add_rule`] is the real
+/// existence check. Falling back to the original path is the safe direction -
+/// it keeps the current behaviour instead of silently dropping a writable root.
+fn canonical_root(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Build the set of `PATH_BENEATH` rules for a sandboxed child.
@@ -468,12 +573,17 @@ fn is_denied(path: &Path, denied: &[PathBuf]) -> bool {
 /// [`denied_paths`]).
 ///
 /// Every path is filtered through [`is_denied`], so a denied directory can never
-/// be granted access even if it is also reachable from an allowed prefix.
+/// be granted access even if it is also reachable from an allowed prefix. The
+/// two caller-supplied roots are canonicalised first ([`canonical_root`]) so a
+/// symlink cannot point one of them at a denied directory.
 fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     let denied = denied_paths();
-    let mut rules = Vec::new();
+    // The number of candidates is fixed by the policy, so the vector is sized
+    // once instead of growing through four reallocations on every call.
+    let capacity = READ_ONLY_SYSTEM_PATHS.len() + CONFIG_PATHS.len() + 2 + 2;
+    let mut rules = Vec::with_capacity(capacity);
 
-    let push = |path: PathBuf, allowed: u64, rules: &mut Vec<PathRule>| {
+    let mut push = |path: PathBuf, allowed: u64| {
         if path.is_absolute() && !is_denied(&path, &denied) {
             rules.push(PathRule { path, allowed });
         }
@@ -481,27 +591,26 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
 
     // 1. System prefixes: readable and executable, never writable.
     for sys in READ_ONLY_SYSTEM_PATHS {
-        push(PathBuf::from(sys), READ_ONLY_RIGHTS, &mut rules);
+        push(PathBuf::from(sys), READ_ONLY_RIGHTS);
     }
 
     // Landlock is allow-only: a rule on /etc would also grant /etc/shadow.
     // Grant only the individual non-secret configuration files needed by tools.
-    for config in [
-        "/etc/passwd", "/etc/group", "/etc/nsswitch.conf", "/etc/resolv.conf",
-        "/etc/hosts", "/etc/host.conf", "/etc/gai.conf", "/etc/ld.so.cache",
-        "/etc/localtime", "/etc/os-release", "/etc/protocols", "/etc/services",
-        "/etc/ssl/certs", "/etc/ca-certificates", "/etc/pki/tls/certs",
-    ] {
-        push(PathBuf::from(config), ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR, &mut rules);
+    for config in CONFIG_PATHS {
+        push(PathBuf::from(config), ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR);
     }
 
     // 3. Pseudo-filesystems, always readable.
-    push(PathBuf::from("/dev"), READ_ONLY_RIGHTS, &mut rules);
-    push(PathBuf::from("/proc"), READ_ONLY_RIGHTS, &mut rules);
+    push(PathBuf::from("/dev"), READ_ONLY_RIGHTS);
+    push(PathBuf::from("/proc"), READ_ONLY_RIGHTS);
 
     // 4. The worker's own writable roots: the only writable paths in the domain.
-    push(worktree.to_path_buf(), WRITE_RIGHTS, &mut rules);
-    push(target_dir.to_path_buf(), WRITE_RIGHTS, &mut rules);
+    // These are the only caller-supplied paths, so they are the only ones that
+    // can be symlinks: they are canonicalised first (see
+    // [`canonical_root`]) so the deny-check and the rule both name the real
+    // directory rather than whatever a link points at.
+    push(canonical_root(worktree), WRITE_RIGHTS);
+    push(canonical_root(target_dir), WRITE_RIGHTS);
 
     rules
 }
@@ -598,7 +707,7 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
     create_ruleset(handled)
         .and_then(|ruleset_fd| {
             for rule in &rules {
-                add_rule(ruleset_fd, rule)?;
+                add_rule(ruleset_fd.raw(), rule)?;
             }
             // Landlock requires PR_SET_NO_NEW_PRIVS to be set before restrict_self
             // unless the process has CAP_SYS_ADMIN.
@@ -610,11 +719,12 @@ fn apply_with_abi(worktree: &Path, target_dir: &Path, abi: Option<i64>) -> Resul
                 );
             }
 
-            // SAFETY: `ruleset_fd` is still open here and no other thread can
-            // have closed it; `restrict_self` needs no other argument.
+            // SAFETY: `ruleset_fd` is still open here (it is only closed when
+            // this closure's `Fd` is dropped) and no other thread can have
+            // closed it; `restrict_self` needs no other argument.
             let ret = landlock_syscall(
                 SYS_LANDLOCK_RESTRICT_SELF,
-                [ruleset_fd.into(), 0, 0, 0],
+                [ruleset_fd.raw().into(), 0, 0, 0],
             );
             if ret < 0 {
                 anyhow::bail!(
@@ -637,33 +747,25 @@ fn add_rule(ruleset_fd: libc::c_int, rule: &PathRule) -> Result<()> {
     // caller could not `File::open` for reading. A genuinely missing path
     // simply has nothing to protect; skipping it keeps the sandbox working on
     // minimal images that lack, say, `/opt`.
-    // SAFETY: `path` is a NUL-free OS string converted via `CString`; the fd
-    // returned by `open` is owned here and closed exactly once below.
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let fd: libc::c_int = match CString::new(rule.path.as_os_str().as_bytes()) {
-        Ok(c) => unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) },
-        Err(_) => return Ok(()),
-    };
-    if fd < 0 {
+    let Some(c_path) = CString::new(rule.path.as_os_str().as_bytes()).ok() else {
         return Ok(());
-    }
-    struct FdGuard(libc::c_int);
-    impl Drop for FdGuard {
-        fn drop(&mut self) {
-            // SAFETY: fd was returned by a successful `open` above and is
-            // closed exactly once here.
-            unsafe { libc::close(self.0) };
-        }
-    }
-    let _guard = FdGuard(fd);
-    let parent: libc::c_int = fd;
+    };
+    // SAFETY: `c_path` is a NUL-terminated OS string that outlives the call and
+    // `O_PATH` needs no permission on the target itself. `O_CLOEXEC` keeps the
+    // descriptor out of any child spawned later; `Fd` also sets `FD_CLOEXEC` as
+    // a belt-and-braces measure and owns the descriptor until it is dropped.
+    let fd = Fd::new(unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) });
+    let Some(parent) = fd else {
+        return Ok(());
+    };
     let allowed = if rule.path.is_file() { rule.allowed & ACCESS_FS_READ_FILE } else { rule.allowed };
     let attr = PathBeneathAttr {
         allowed_access: allowed,
-        parent_fd: parent,
+        parent_fd: parent.raw(),
     };
-    // SAFETY: `attr` is a live `landlock_path_beneath_attr` and `_guard` keeps
+    // SAFETY: `attr` is a live `landlock_path_beneath_attr` and `parent` keeps
     // the referenced file or directory open for the duration of the call.
     let ret = landlock_syscall(
         SYS_LANDLOCK_ADD_RULE,
@@ -687,7 +789,12 @@ fn add_rule(ruleset_fd: libc::c_int, rule: &PathRule) -> Result<()> {
 }
 
 /// Create a Landlock ruleset handling `handled_access_fs`, returning its fd.
-fn create_ruleset(handled_access_fs: u64) -> Result<libc::c_int> {
+///
+/// The returned [`Fd`] carries `FD_CLOEXEC`: the kernel hands the ruleset
+/// descriptor back without it, and a leaked ruleset fd would be inherited by
+/// every command the daemon spawns from here on. [`Fd`] also closes it once the
+/// ruleset has been applied.
+fn create_ruleset(handled_access_fs: u64) -> Result<Fd> {
     let attr = RulesetAttr { handled_access_fs };
     // SAFETY: `attr` is a live, correctly laid out `landlock_ruleset_attr`
     // prefix and `size` is its exact size, which is what the kernel validates.
@@ -706,7 +813,15 @@ fn create_ruleset(handled_access_fs: u64) -> Result<libc::c_int> {
             std::io::Error::last_os_error()
         );
     }
-    Ok(ret as libc::c_int)
+    // The kernel cannot fail to return a usable descriptor here, but a
+    // descriptor we could not mark close-on-exec must not be used, or it would
+    // leak into children.
+    Fd::new(ret as libc::c_int).ok_or_else(|| {
+        anyhow::anyhow!(
+            "landlock_create_ruleset: could not mark the ruleset fd close-on-exec: {}",
+            std::io::Error::last_os_error()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -995,6 +1110,92 @@ fn relative_roots_are_never_granted() {
     // silently useless, so it is dropped rather than granted.
     let rules = build_path_rules(Path::new("relative-worktree"), Path::new("relative-target"));
     assert!(!rules.iter().any(|r| r.path == Path::new("relative-worktree")));
+}
+
+/// Descriptors that outlive the call must never reach a child process.
+///
+/// `O_CLOEXEC` in `open(2)` only covers descriptors *this* code creates;
+/// `landlock_create_ruleset` returns one the kernel made, with no flags it
+/// could honour, so `FD_CLOEXEC` has to be set explicitly. A ruleset fd
+/// inherited by a spawned worker would be a live handle to a policy the child
+/// was never meant to be able to reach.
+#[test]
+fn landlock_descriptors_are_close_on_exec() {
+    let ruleset = create_ruleset(ALL_ACCESS_FS).expect("create a ruleset");
+    // SAFETY: `ruleset` owns a live descriptor for the whole block.
+    let flags = unsafe { libc::fcntl(ruleset.raw(), libc::F_GETFD) };
+    assert!(flags >= 0, "F_GETFD must succeed on a live descriptor");
+    assert_ne!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "the ruleset descriptor must be close-on-exec or it leaks into children"
+    );
+}
+
+/// Dropping the ruleset must close the descriptor.
+///
+/// Before the [`Fd`] wrapper, `landlock_create_ruleset`'s descriptor was never
+/// closed at all: it stayed open for the remaining life of the (long-running,
+/// multi-threaded) daemon, and was inherited by every process subsequently
+/// spawned. Closing on drop is what actually bounds its lifetime to the one
+/// call that needs it.
+#[test]
+fn the_ruleset_descriptor_is_closed_when_it_goes_out_of_scope() {
+    let fd = {
+        let ruleset = create_ruleset(ALL_ACCESS_FS).expect("create a ruleset");
+        let raw = ruleset.raw();
+        // Still valid here: the `Fd` is alive and owns it.
+        // SAFETY: `raw` is a live descriptor at this point.
+        assert!(unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0);
+        raw
+    };
+    // `fcntl` on a stale descriptor must now fail; a leaked one would still
+    // answer. (`F_GETFD` cannot be confused with a *different* live descriptor
+    // reusing the number because the number was just freed here.)
+    // SAFETY: the descriptor is expected to be closed, so this probes, not uses.
+    let reopened = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert_eq!(
+        reopened, -1,
+        "the ruleset descriptor must be closed on drop, not leaked for the process lifetime"
+    );
+}
+
+/// A symlinked writable root must not smuggle a grant onto a denied directory.
+///
+/// This is the whole point of [`canonical_root`]: Landlock resolves a
+/// `PATH_BENEATH` rule onto the real inode, but [`is_denied`] compares path
+/// strings. A root supplied as a symlink pointing at `~/.ssh` therefore looks
+/// innocent to the lexical check while the rule would really cover the
+/// operator's private keys. Canonicalising makes the two agree.
+#[test]
+fn a_symlinked_root_cannot_smuggle_a_grant_onto_a_denied_directory() {
+    let scratch = Scratch::new("symlink");
+    let home = home_dir().expect("tests run with a discoverable $HOME");
+    let secret_dir = home.join(".ssh");
+    std::fs::create_dir_all(&secret_dir).expect("create a denied directory");
+
+    // A path that looks like ordinary scratch space...
+    let link = scratch.0.join("looks-innocent");
+    // ...but is really a symlink onto the operator's key material.
+    std::os::unix::fs::symlink(&secret_dir, &link).expect("create the symlink");
+
+    // Without canonicalisation the lexical deny-check would pass and the rule
+    // would cover ~/.ssh. With it, the rule is filtered out entirely.
+    let resolved = canonical_root(&link);
+    assert_eq!(
+        resolved, secret_dir,
+        "canonicalisation must resolve the link to its real target"
+    );
+
+    let rules = build_path_rules(&link, &scratch.target());
+    assert!(
+        !rules.iter().any(|r| r.path.starts_with(&secret_dir) || r.path == secret_dir),
+        "a symlinked root must never be granted once it resolves into a denied path"
+    );
+    assert!(
+        !rules.iter().any(|r| r.path == link),
+        "the un-resolved symlink path must not be granted either"
+    );
 }
 
 #[test]
