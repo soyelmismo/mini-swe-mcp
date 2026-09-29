@@ -162,10 +162,12 @@ async fn duplicate_tool_call_ids_are_replaced_with_unique_ids() {
     let base = spawn_sse_server(body).await;
     let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
 
+    // Only the executed call is replayed into history (protocol-correct); the
+    // sibling call is dropped. The surviving id must be non-empty.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 2);
-    assert_ne!(calls[0].id, calls[1].id, "ids must be unique");
-    assert!(calls.iter().all(|c| !c.id.is_empty()));
+    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert!(!calls[0].id.is_empty());
+    assert_eq!(resp.tool_call_id.as_deref(), Some(calls[0].id.as_str()));
 }
 
 /// A repeated `index` across deltas keeps accumulating into one call rather than
@@ -205,19 +207,15 @@ async fn sequential_calls_reusing_index_zero_both_survive() {
     let base = spawn_sse_server(body).await;
     let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
 
+    // Both calls are accumulated, but only the executed one is replayed into
+    // history (protocol-correct); the sibling is dropped.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(
-        calls.len(),
-        2,
-        "a numbering quirk must not drop calls: {calls:?}"
-    );
+    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
     assert_eq!(calls[0].id, "a");
-    assert_eq!(calls[1].id, "b");
     assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
-    assert_eq!(calls[1].function.arguments, r#"{"command":"pwd"}"#);
     // The whole point of the fix: the turn is no longer empty.
     assert_eq!(resp.command.as_deref(), Some("ls"));
-    assert!(resp.tool_call_id.is_some(), "tool_call_id must be reported");
+    assert_eq!(resp.tool_call_id.as_deref(), Some("a"));
 }
 
 /// A delta with **no** `index` field at all deserializes to `0`; two such calls
@@ -231,14 +229,11 @@ async fn calls_without_an_index_field_are_not_dropped() {
     let base = spawn_sse_server(body).await;
     let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
 
+    // Both calls are accumulated, but only the executed one is replayed.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(
-        calls.len(),
-        2,
-        "index-less calls must both survive: {calls:?}"
-    );
+    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
     assert_eq!(calls[0].function.arguments, r#"{"command":"whoami"}"#);
-    assert_eq!(calls[1].function.arguments, r#"{"command":"id"}"#);
+    assert_eq!(resp.tool_call_id.as_deref(), Some(calls[0].id.as_str()));
 }
 
 // ---------------------------------------------------------------------------
@@ -612,4 +607,71 @@ async fn reasoning_alias_in_delta_is_accumulated() {
         Some("Thought step 1. Thought step 2.")
     );
     assert_eq!(resp.command.as_deref(), Some("pwd"));
+}
+
+// ----------
+// §5 — real-provider chunk shapes: one tool call, reasoning once, no slot split
+// ----------
+
+/// Feeds the exact chunk shapes captured from the OpenAI-compatible proxy
+/// (model combo:nerd) through the full SSE path and asserts: a single tool call
+/// with full arguments parsed to `command: "ls"`, reasoning captured exactly
+/// once (both `reasoning` and `reasoning_content` keys present), no WARN-path
+/// slot splitting, and reasoning_content serialized on the next turn's
+/// assistant message.
+#[tokio::test]
+async fn real_provider_chunks_yield_one_call_and_reasoning_in_history() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"chatcmpl-tool-9d6a7c55214c5666","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
+        r##"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"{\"command\": "}}]}}]}"##,
+        r#"{"choices":[{"delta":{"role":"assistant","content":"","reasoning":"thought A","reasoning_content":"thought A"}}]}"#,
+        r##"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"\"ls\"}"}}]}}]}"##,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+
+    let calls = resp.tool_calls.expect("tool_calls present");
+    assert_eq!(calls.len(), 1, "one call, not one per fragment: {calls:?}");
+    assert_eq!(calls[0].id, "chatcmpl-tool-9d6a7c55214c5666");
+    assert_eq!(calls[0].function.arguments, r#"{"command": "ls"}"#);
+    assert_eq!(resp.command.as_deref(), Some("ls"));
+    assert_eq!(resp.tool_call_id.as_deref(), Some("chatcmpl-tool-9d6a7c55214c5666"));
+    assert_eq!(
+        resp.reasoning_content.as_deref(),
+        Some("thought A"),
+        "reasoning must be captured exactly once"
+    );
+
+    // The next turn's assistant message must carry reasoning_content so the
+    // thinking-mode model accepts the request.
+    let msg = ChatMessage::assistant_with_tool_calls(None, calls)
+        .with_reasoning_content(resp.reasoning_content.clone());
+    let serialized = serde_json::to_string(&msg).expect("serialize");
+    assert!(
+        serialized.contains(r#""reasoning_content":"thought A""#),
+        "reasoning_content must be serialized on the next turn: {serialized}"
+    );
+    assert!(
+        !serialized.contains(r#""reasoning":"thought A""#),
+        "the reasoning alias must not be emitted on the wire: {serialized}"
+    );
+}
+
+/// A provider that returns more than one tool call in a response: only the
+/// executed call is replayed into history (matching `tool_call_id`), so the
+/// assistant turn never advertises unanswered tool_calls.
+#[tokio::test]
+async fn multiple_tool_calls_replay_only_the_executed_one() {
+    let body = MockSse::frames(&[
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
+    ]);
+    let base = spawn_sse_server(body).await;
+    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+
+    assert_eq!(resp.command.as_deref(), Some("ls"));
+    let calls = resp.tool_calls.expect("tool_calls present");
+    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert_eq!(calls[0].id, "a");
+    assert_eq!(resp.tool_call_id.as_deref(), Some("a"));
 }
