@@ -13,13 +13,6 @@
 //! * [`ModelManifest::build_tool_description`] renders the catalog that is
 //!   embedded in the `dispatch` tool description.
 //!
-//! The rendered-*output* assertions live here. The assertions about the
-//! process-wide memoization cache live in `manifest_catalog_cache_test.rs`:
-//! that cache is a single global shared by every thread in a test binary,
-//! and a test that counts its entries cannot be made reliable while other
-//! tests render into the same map in parallel. One test binary owns the
-//! cache exclusively, so the count is deterministic there.
-//!
 //! These are exercised through the public library surface only, i.e. the same
 //! way `src/mcp/` and `src/main.rs` consume the manifest.
 
@@ -617,7 +610,7 @@ fn test_validate_reports_each_rule_and_normalize_repairs_it() {
             "case `{case}` must report exactly its warning"
         );
 
-        let normalized = manifest.normalized();
+        let normalized = manifest.normalize();
         // Every warning but the empty-`id` one has a mechanical fixup, so a
         // normalized manifest reports nothing except an unrepairable id.
         let residual: Vec<String> = normalized
@@ -780,7 +773,7 @@ models:
     max_turns: 0
 "#,
     )
-    .normalized();
+    .normalize();
 
     assert_eq!(manifest.default, None, "the dangling default is dropped");
     assert_eq!(manifest.models.len(), 1, "the entry is still served");
@@ -797,7 +790,7 @@ models:
 #[test]
 fn test_normalize_preserves_a_resolvable_default() {
     let manifest =
-        parse_manifest("default: solo\nmodels:\n  solo:\n    id: combo:solo\n").normalized();
+        parse_manifest("default: solo\nmodels:\n  solo:\n    id: combo:solo\n").normalize();
 
     assert_eq!(manifest.default, Some("solo".to_string()));
 }
@@ -850,7 +843,7 @@ fn test_shipped_models_yaml_validates_cleanly() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml");
     let content = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("models.yaml must be readable: {e}"));
-    let manifest = parse_manifest(&content).normalized();
+    let manifest = parse_manifest(&content).normalize();
 
     assert!(
         manifest.validate().is_empty(),
@@ -860,7 +853,7 @@ fn test_shipped_models_yaml_validates_cleanly() {
 }
 
 // ----------
-// 6. Catalog memoization + determinism (audit opt_06)
+// 6. Catalog determinism
 // ----------
 
 #[test]
@@ -1086,7 +1079,7 @@ models:
         "the unknown fs value must be reported: {warnings:?}"
     );
 
-    let normalized = manifest.normalized();
+    let normalized = manifest.normalize();
     let policy = normalized.models["sealed"].policy.as_ref().expect("policy");
     assert_eq!(
         policy.network.as_ref().map(|n| n.as_str()),

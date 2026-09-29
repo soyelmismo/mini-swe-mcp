@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use super::rules::join_known;
 use super::types::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelManifest};
 
 impl ModelManifest {
@@ -32,6 +33,7 @@ impl ModelManifest {
     /// across runs; callers may rely on the ordering.
     pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        let entries = self.sorted_models();
 
         // `default` is looked up by alias, so the lookup is trimmed the same way
         // `resolve_model` would match it: an over-indented `default:` is not a
@@ -50,7 +52,7 @@ impl ModelManifest {
         // resolution is stable, but the manifest is still ambiguous and the user
         // should know. Non-fatal by design, like every other warning here.
         let mut by_id: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (alias, def) in self.sorted_models() {
+        for (alias, def) in &entries {
             let id = def.id.trim();
             if !id.is_empty() {
                 by_id.entry(id).or_default().push(alias);
@@ -60,11 +62,11 @@ impl ModelManifest {
             if aliases.len() > 1 {
                 warnings.push(format!(
                     "duplicate model id \"{id}\" shared by aliases {}; resolving the full id returns the first alias",
-                    quote_list(aliases)
+                    join_known(aliases)
                 ));
             }
         }
-        for (alias, def) in self.sorted_models() {
+        for (alias, def) in &entries {
             if def.id.trim().is_empty() {
                 warnings.push(format!("model \"{alias}\": id cannot be empty"));
             }
@@ -172,19 +174,4 @@ impl ModelManifest {
 
         self
     }
-
-    /// [`ModelManifest::normalize`] behind a borrow, for callers that keep the
-    /// original manifest around (the unit tests here, mainly).
-    pub fn normalized(&self) -> Self {
-        self.clone().normalize()
-    }
-}
-
-/// Render aliases as `"a", "b", "c"` for a warning message.
-fn quote_list(aliases: &[&str]) -> String {
-    aliases
-        .iter()
-        .map(|alias| format!("\"{alias}\""))
-        .collect::<Vec<_>>()
-        .join(", ")
 }

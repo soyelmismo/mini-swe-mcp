@@ -5,16 +5,11 @@
 //! surface (`super::…`), i.e. exactly the API the rest of the crate sees:
 //! manifest discovery/loading, id resolution, catalog rendering, the advisory
 //! `validate` rules and the `normalize` fixups.
-//!
-//! The catalog-row cache assertions additionally lock a process-wide mutex
-//! (`TEST_CACHE_MUTEX`) because the memoization cache is a global shared by
-//! every manifest instance in the process.
 
 use super::{
-    BUILTIN_DEFAULT_MODEL, CATALOG_CACHE_CAPACITY, DEFAULT_MAX_TURNS, DEFAULT_ROLE,
-    MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, MEMORY_DIR, ModelDefinition, ModelManifest,
-    agent_memory_path, append_agent_memory, build_system_prompt, catalog::catalog_row,
-    catalog_cache_len, clear_catalog_cache, load_agent_memory,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_MEMORY_PROMPT_BYTES,
+    MAX_TURNS_LIMIT, MEMORY_DIR, ModelDefinition, ModelManifest, agent_memory_path,
+    build_system_prompt, load_agent_memory,
 };
 
 fn single(definition: ModelDefinition) -> ModelManifest {
@@ -248,7 +243,7 @@ fn test_normalize_repairs_every_fixable_warning() {
         "the fixture must start out invalid"
     );
 
-    let normalized = manifest.normalized();
+    let normalized = manifest.normalize();
     assert_eq!(normalized.default, None, "a dangling default is dropped");
     assert_eq!(normalized.models.len(), 2, "entries are still served");
 
@@ -288,7 +283,7 @@ fn test_normalize_keeps_a_resolvable_default_and_is_idempotent() {
         policy: None,
     });
 
-    let normalized = manifest.normalized();
+    let normalized = manifest.normalize();
     assert_eq!(normalized.default, Some("solo".to_string()));
     assert_eq!(
         normalized.resolve_model("solo"),
@@ -319,7 +314,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
     };
 
     assert!(!manifest.validate().is_empty());
-    assert_eq!(manifest.normalized().default, None);
+    assert_eq!(manifest.normalize().default, None);
 }
 
 #[test]
@@ -364,111 +359,6 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
             "model \"gamma\": max_turns must be greater than 0; replaced with 100",
         ]
     );
-}
-
-#[test]
-fn test_catalog_row_is_memoized_and_keyed_on_every_input() {
-    let _guard = super::cache::TEST_CACHE_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    clear_catalog_cache();
-
-    let a = ModelDefinition {
-        id: "vendor:a".to_string(),
-        role: Some("Role A.".to_string()),
-        temperature: None,
-        max_turns: None,
-        policy: None,
-    };
-    let b = ModelDefinition {
-        id: "vendor:b".to_string(),
-        role: Some("Role A.".to_string()),
-        temperature: None,
-        max_turns: None,
-        policy: None,
-    };
-    let no_role = ModelDefinition {
-        id: "vendor:a".to_string(),
-        role: None,
-        temperature: None,
-        max_turns: None,
-        policy: None,
-    };
-
-    let first = catalog_row("a", &a);
-    assert_eq!(&*first, "- `a` (id: `vendor:a`): Role A.\n");
-    assert_eq!(catalog_cache_len(), 1);
-
-    // Same key twice -> memoized, no new entry AND no re-render: the cache
-    // hands back the very same `Arc`, so a hit is a refcount bump, not a copy.
-    let second = catalog_row("a", &a);
-    assert_eq!(&*second, "- `a` (id: `vendor:a`): Role A.\n");
-    assert!(std::sync::Arc::ptr_eq(&first, &second));
-    assert_eq!(catalog_cache_len(), 1);
-
-    // Different id, different role and a missing role are all distinct keys.
-    let other_id = catalog_row("a", &b);
-    assert_eq!(&*other_id, "- `a` (id: `vendor:b`): Role A.\n");
-    let fallback = catalog_row("a", &no_role);
-    assert_eq!(&*fallback, "- `a` (id: `vendor:a`): Autonomous subagent\n");
-    assert_eq!(catalog_cache_len(), 3);
-}
-
-/// The cache key is built from the **effective** role, so a model that declares
-/// no role and one that spells out `DEFAULT_ROLE` verbatim render identical text
-/// and therefore correctly share one entry. Keying on the raw `Option` (as the
-/// previous `(String, String, String)` tuple did, via `unwrap_or_default()`)
-/// would have split them into two entries holding the same bytes.
-#[test]
-fn test_catalog_row_shares_an_entry_with_an_explicit_default_role() {
-    let _guard = super::cache::TEST_CACHE_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    clear_catalog_cache();
-
-    let implicit = ModelDefinition {
-        id: "vendor:role".to_string(),
-        role: None,
-        temperature: None,
-        max_turns: None,
-        policy: None,
-    };
-    let explicit = ModelDefinition {
-        role: Some(DEFAULT_ROLE.to_string()),
-        ..implicit.clone()
-    };
-
-    let a = catalog_row("r", &implicit);
-    let b = catalog_row("r", &explicit);
-
-    assert_eq!(a, b, "both render the same bullet");
-    assert!(std::sync::Arc::ptr_eq(&a, &b), "and share one cache entry");
-    assert_eq!(catalog_cache_len(), 1);
-}
-
-#[test]
-fn test_catalog_cache_stays_bounded() {
-    let _guard = super::cache::TEST_CACHE_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    clear_catalog_cache();
-
-    for i in 0..(CATALOG_CACHE_CAPACITY + 8) {
-        let def = ModelDefinition {
-            id: format!("vendor:id{i}"),
-            role: Some("Role.".to_string()),
-            temperature: None,
-            max_turns: None,
-            policy: None,
-        };
-        let row = catalog_row(&format!("alias{i}"), &def);
-        assert_eq!(&*row, format!("- `alias{i}` (id: `vendor:id{i}`): Role.\n"));
-        assert!(
-            catalog_cache_len() <= CATALOG_CACHE_CAPACITY,
-            "catalog cache must stay bounded, got {}",
-            catalog_cache_len()
-        );
-    }
 }
 
 #[test]
@@ -577,7 +467,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
 }
 
 #[test]
-fn test_tool_description_is_reproducible_and_cached() {
+fn test_tool_description_is_reproducible() {
     let manifest = ModelManifest::default();
 
     let first = manifest.build_tool_description();
@@ -602,7 +492,7 @@ fn test_from_path_parses_and_normalizes_an_explicit_file() {
     let dir = std::env::temp_dir().join(format!(
         "swe-manifest-from-path-{}-{}",
         std::process::id(),
-        catalog_cache_len() as u64 ^ DEFAULT_MAX_TURNS as u64
+        DEFAULT_MAX_TURNS as u64
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join("models.yaml");
@@ -652,7 +542,7 @@ impl MemoryRepo {
         let path = std::env::temp_dir().join(format!(
             "swe-manifest-memory-{}-{tag}-{}",
             std::process::id(),
-            CATALOG_CACHE_CAPACITY as u64
+            DEFAULT_MAX_TURNS as u64
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch repo");
@@ -756,65 +646,6 @@ fn test_load_agent_memory_falls_back_to_none() {
 }
 
 #[test]
-fn test_append_agent_memory_creates_and_appends() {
-    let repo = MemoryRepo::new("append");
-
-    append_agent_memory(&repo.path, "ninja", "Both clippy and cargo test must pass.")
-        .expect("first append");
-
-    let memory = load_agent_memory(&repo.path, "ninja").expect("memory exists");
-    assert!(
-        memory.contains("Both clippy and cargo test must pass."),
-        "the note must be readable back: {memory}"
-    );
-    // The directory is created on demand, at the documented location.
-    assert!(repo.memory_dir().join("ninja.md").is_file());
-
-    append_agent_memory(&repo.path, "ninja", "Prefer the smallest diff.").expect("second append");
-
-    let memory = load_agent_memory(&repo.path, "ninja").expect("memory exists");
-    assert!(memory.contains("Both clippy and cargo test must pass."));
-    assert!(memory.contains("Prefer the smallest diff."));
-    // Appends accumulate; they never overwrite.
-    assert_eq!(memory.lines().filter(|l| l.starts_with("- ")).count(), 2);
-    // A second role has its own, independent file.
-    assert_eq!(load_agent_memory(&repo.path, "nerd"), None);
-    append_agent_memory(&repo.path, "nerd", "Reproduce before you patch.").expect("nerd append");
-    let nerd = load_agent_memory(&repo.path, "nerd").expect("nerd memory");
-    assert!(nerd.contains("Reproduce before you patch."));
-    assert!(!nerd.contains("smallest diff"));
-}
-
-/// A takeaway must land as exactly one list item: a multi-line note cannot break
-/// the line-oriented format, and an empty note is refused rather than written as a
-/// blank bullet that would load back as noise.
-#[test]
-fn test_append_agent_memory_normalizes_notes_and_rejects_empty() {
-    let repo = MemoryRepo::new("normalize");
-
-    append_agent_memory(&repo.path, "nerd", "  reproduce\n\tbefore   patching  ").expect("append");
-    let memory = load_agent_memory(&repo.path, "nerd").expect("memory exists");
-    assert_eq!(
-        memory.lines().filter(|l| l.starts_with("- ")).count(),
-        1,
-        "a multi-line note must collapse into a single entry: {memory}"
-    );
-    assert!(memory.contains("- reproduce before patching"));
-
-    for empty in ["", "   ", "\n\t "] {
-        assert!(
-            append_agent_memory(&repo.path, "nerd", empty).is_err(),
-            "an empty note must be rejected, not written"
-        );
-    }
-    // An alias with no usable slug has no memory file to write to.
-    assert!(append_agent_memory(&repo.path, "///", "note").is_err());
-}
-
-/// Memory is appended to forever, so what reaches the prompt is capped: the
-/// system instructions must not be squeezed out by a bloated memory file, and the
-/// cut must land on a line boundary rather than mid-line.
-#[test]
 fn test_loaded_memory_is_bounded() {
     let repo = MemoryRepo::new("bounded");
     std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
@@ -848,7 +679,12 @@ fn test_build_system_prompt_injects_memory_only_when_present() {
         crate::agent::SYSTEM_PROMPT
     );
 
-    append_agent_memory(&repo.path, "ninja", "Verify with cargo clippy.").expect("append");
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    std::fs::write(
+        agent_memory_path(&repo.path, "ninja").expect("path"),
+        "PERSISTENT ROLE MEMORY (from .agents/memory/):\n- Verify with cargo clippy.\n",
+    )
+    .expect("fixture written");
     let prompt = build_system_prompt(&repo.path, "ninja");
     assert!(prompt.starts_with(crate::agent::SYSTEM_PROMPT));
     assert!(
@@ -877,55 +713,14 @@ fn test_alias_for_model_bridges_resolved_ids() {
 
     // And the round trip actually finds the file the worker asked for.
     let repo = MemoryRepo::new("alias");
-    append_agent_memory(&repo.path, "ninja", "Round trip note.").expect("append");
+    std::fs::create_dir_all(repo.memory_dir()).expect("memory dir");
+    std::fs::write(
+        agent_memory_path(&repo.path, "ninja").expect("path"),
+        "PERSISTENT ROLE MEMORY (from .agents/memory/):\n- Round trip note.\n",
+    )
+    .expect("fixture written");
     let alias = manifest.alias_for_model("combo:ninja");
     assert!(build_system_prompt(&repo.path, &alias).contains("Round trip note."));
-}
-
-/// `rename` makes each write atomic and the lock serializes the
-/// read-modify-write; the second property is what stops two agents finishing at
-/// the same time from silently discarding each other's takeaway, so it is
-/// asserted rather than assumed.
-#[test]
-fn test_concurrent_appends_do_not_lose_notes() {
-    use std::sync::Arc;
-
-    let repo = Arc::new(MemoryRepo::new("concurrent"));
-    const THREADS: usize = 8;
-
-    std::thread::scope(|scope| {
-        for i in 0..THREADS {
-            let repo = Arc::clone(&repo);
-            scope.spawn(move || {
-                append_agent_memory(&repo.path, "nerd", &format!("takeaway {i}"))
-                    .expect("concurrent append");
-            });
-        }
-    });
-
-    let memory = load_agent_memory(&repo.path, "nerd").expect("memory exists");
-    for i in 0..THREADS {
-        assert!(
-            memory.contains(&format!("takeaway {i}")),
-            "every concurrent append must survive; missing takeaway {i}: {memory}"
-        );
-    }
-    assert_eq!(
-        memory.lines().filter(|l| l.starts_with("- ")).count(),
-        THREADS,
-        "and no append may be duplicated"
-    );
-    // The staging file never survives a successful append.
-    let leftovers: Vec<_> = std::fs::read_dir(repo.memory_dir())
-        .expect("memory dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".tmp"))
-        .collect();
-    assert!(
-        leftovers.is_empty(),
-        "staging debris left behind: {leftovers:?}"
-    );
 }
 
 // ----------
@@ -955,7 +750,7 @@ fn test_a_model_without_a_policy_stays_none_and_warns_about_nothing() {
         manifest.validate()
     );
     assert_eq!(
-        manifest.normalized().models["solo"].policy,
+        manifest.normalize().models["solo"].policy,
         None,
         "None must survive normalization, so \"declared nothing\" stays \
          distinguishable from \"declared the default\""
@@ -1000,7 +795,7 @@ fn test_every_declared_policy_value_is_accepted_verbatim() {
         manifest.validate()
     );
     assert_eq!(
-        manifest.normalized().models["a"].policy,
+        manifest.clone().normalize().models["a"].policy,
         manifest.models["a"].policy,
         "an already-valid policy must survive normalization byte-for-byte"
     );
@@ -1052,7 +847,10 @@ fn test_an_unknown_policy_value_warns_and_repairs_to_the_restrictive_default() {
         "the fs warning must name the value the user wrote: {warnings:?}"
     );
 
-    let policy = manifest.normalized().models["solo"]
+    let policy = manifest
+        .clone()
+        .normalize()
+        .models["solo"]
         .policy
         .clone()
         .expect("still a policy after repair");
@@ -1068,7 +866,7 @@ fn test_an_unknown_policy_value_warns_and_repairs_to_the_restrictive_default() {
         "an unknown fs value must fall back to the restrictive default"
     );
     assert!(
-        manifest.normalized().validate().is_empty(),
+        manifest.clone().normalize().validate().is_empty(),
         "every reported policy warning must be repaired by normalize"
     );
 }
@@ -1083,7 +881,7 @@ fn test_policy_values_are_matched_case_insensitively_and_after_trimming() {
         manifest.validate()
     );
     assert_eq!(
-        manifest.normalized().models["solo"]
+        manifest.normalize().models["solo"]
             .policy
             .as_ref()
             .and_then(|p| p.network.as_ref())
@@ -1198,7 +996,7 @@ fn test_normalizing_an_undeclared_or_empty_policy_preserves_the_declaration_shap
         "an empty block declares nothing: {policy:?}"
     );
 
-    let normalized = empty.normalized();
+    let normalized = empty.normalize();
     assert_eq!(
         normalized.models["solo"].policy,
         Some(ExecutionPolicy::default()),
@@ -1210,7 +1008,7 @@ fn test_normalizing_an_undeclared_or_empty_policy_preserves_the_declaration_shap
     );
 
     assert_eq!(
-        absent.normalized().models["solo"].policy,
+        absent.normalize().models["solo"].policy,
         None,
         "normalize must never invent a policy the manifest did not declare",
     );

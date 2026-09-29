@@ -95,7 +95,7 @@ impl ModelManifest {
 }
 
 /// Render the accepted values as `"a", "b"` for a warning message.
-fn join_known(values: &[&str]) -> String {
+pub(super) fn join_known(values: &[&str]) -> String {
     values
         .iter()
         .map(|v| format!("\"{v}\""))
