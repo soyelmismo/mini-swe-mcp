@@ -16,7 +16,7 @@ pub use runner::{
     AgentRunner, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries,
 };
 pub use sandbox::{
-    DISABLE_LANDLOCK_ENV, TRUNCATE_HEAD, TRUNCATE_LIMIT, TRUNCATE_TAIL, LandlockPlan,
+    DISABLE_LANDLOCK_ENV, LandlockPlan, TRUNCATE_HEAD, TRUNCATE_LIMIT, TRUNCATE_TAIL,
     apply_landlock_sandbox, build_landlock_plan, find_git_common_dir, find_git_dirs, has_bwrap,
     is_heavy_command, truncate_output, validate_bash_command,
 };

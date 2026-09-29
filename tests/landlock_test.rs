@@ -62,10 +62,8 @@ impl Roots {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "swe-landlock-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("swe-landlock-{tag}-{}-{nanos}", std::process::id()));
         let worktree = base.join("worktree");
         let target = base.join("target");
         std::fs::create_dir_all(&worktree).expect("create worktree");
@@ -105,7 +103,10 @@ fn the_plan_builder_is_exported_and_degrades_instead_of_failing() {
             0,
             "a plan handling no rights would deny the worker everything"
         );
-        eprintln!("landlock enforced in this test run ({} rules)", plan.rule_count());
+        eprintln!(
+            "landlock enforced in this test run ({} rules)",
+            plan.rule_count()
+        );
     } else {
         eprintln!("skipping enforcement assertions: this kernel has no Landlock");
     }
@@ -263,10 +264,7 @@ fn run_exec_confined_probe() -> ! {
     // 2. The worktree must still be writable - a sandbox that denies the
     //    agent its own worktree is not a sandbox, it is an outage.
     let (out, code) = runtime
-        .block_on(r.execute_bash(
-            &worktree,
-            "printf built > artifact.txt; echo rc=$?",
-        ))
+        .block_on(r.execute_bash(&worktree, "printf built > artifact.txt; echo rc=$?"))
         .expect("a worktree write must not be a spawn error");
     assert_eq!(code, Some(0), "the worktree must stay writable: {out:?}");
     assert!(out.contains("rc=0"), "{out:?}");
@@ -296,7 +294,11 @@ fn run_exec_confined_probe() -> ! {
 fn bin_dir_without_bwrap(roots: &Roots) -> PathBuf {
     let dest = roots.base.join("bin");
     std::fs::create_dir_all(&dest).expect("create the shim PATH");
-    for dir in std::env::var_os("PATH").unwrap_or_default().to_string_lossy().split(':') {
+    for dir in std::env::var_os("PATH")
+        .unwrap_or_default()
+        .to_string_lossy()
+        .split(':')
+    {
         if dir.is_empty() {
             continue;
         }

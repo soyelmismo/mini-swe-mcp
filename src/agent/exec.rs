@@ -1644,8 +1644,10 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let base = crate::worktree::swe_base_dir()
-                .join(format!("exec-landlock-{tag}-{}-{unique_id}", std::process::id()));
+            let base = crate::worktree::swe_base_dir().join(format!(
+                "exec-landlock-{tag}-{}-{unique_id}",
+                std::process::id()
+            ));
             let worktree = base.join("worktree");
             let target = base.join("target");
             std::fs::create_dir_all(&worktree).expect("create worktree");
@@ -1698,14 +1700,15 @@ mod tests {
     fn a_missing_root_is_reported_rather_than_silently_dropped() {
         let scratch = LandlockScratch::new("missing");
         let missing = scratch.worktree.join("no-such-dir");
-        let err = super::super::sandbox::build_landlock_plan(&missing, &scratch.target).unwrap_err();
+        let err =
+            super::super::sandbox::build_landlock_plan(&missing, &scratch.target).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a missing worktree must be reported, got: {err:#}"
         );
 
-        let err = super::super::sandbox::build_landlock_plan(&scratch.worktree, &missing)
-            .unwrap_err();
+        let err =
+            super::super::sandbox::build_landlock_plan(&scratch.worktree, &missing).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a missing target dir must be reported, got: {err:#}"
@@ -1762,7 +1765,10 @@ mod tests {
         apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
         cmd.arg("-c").arg("echo confined-and-alive");
 
-        let out = cmd.output().await.expect("a confined child must still spawn");
+        let out = cmd
+            .output()
+            .await
+            .expect("a confined child must still spawn");
         assert!(
             out.status.success(),
             "the confined child must run: {}",
@@ -1803,7 +1809,11 @@ mod tests {
         // exactly two writable roots - the worktree and the target dir - so a
         // sibling of the scratch base is outside the domain by construction,
         // without depending on what else happens to live on this host.
-        let secret = scratch.worktree.parent().expect("scratch has a parent").join("secret");
+        let secret = scratch
+            .worktree
+            .parent()
+            .expect("scratch has a parent")
+            .join("secret");
         std::fs::write(&secret, b"PRIVATE KEY").expect("seed a decoy secret");
 
         // Report the real errno rather than a shell `if`: `touch` on an
@@ -1870,7 +1880,11 @@ mod tests {
         }
 
         // Something outside the domain the parent has legitimate access to.
-        let outside = scratch.worktree.parent().expect("scratch has a parent").join("outside");
+        let outside = scratch
+            .worktree
+            .parent()
+            .expect("scratch has a parent")
+            .join("outside");
         std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
 
         let mut cmd = Command::new("/bin/sh");
@@ -1922,5 +1936,4 @@ mod tests {
             "bwrap must still lead the argv: {rendered:?}"
         );
     }
-
 }

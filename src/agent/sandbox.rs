@@ -19,10 +19,10 @@
 use anyhow::{Context, Result};
 #[cfg(unix)]
 use std::ffi::CString;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Byte budget above which captured command output is truncated.
 pub const TRUNCATE_LIMIT: usize = 16_384;
@@ -745,7 +745,10 @@ pub fn apply_landlock_sandbox(worktree: &Path, target_dir: &Path) -> Result<()> 
         anyhow::bail!("landlock worktree does not exist: {}", worktree.display());
     }
     if !target_dir.is_dir() {
-        anyhow::bail!("landlock target dir does not exist: {}", target_dir.display());
+        anyhow::bail!(
+            "landlock target dir does not exist: {}",
+            target_dir.display()
+        );
     }
 
     apply_with_abi(worktree, target_dir, query_abi_version())
@@ -870,7 +873,9 @@ impl LandlockPlan {
         // cannot contain an interior NUL, so the byte slice up to the
         // terminator is exactly the original path.
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        Some(std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..end])))
+        Some(std::path::Path::new(std::ffi::OsStr::from_bytes(
+            &bytes[..end],
+        )))
     }
 
     /// Number of `PATH_BENEATH` rules this plan will install.
@@ -932,9 +937,7 @@ impl LandlockPlan {
         for (c_path, &allowed_access) in self.paths.iter().zip(&self.allowed) {
             // SAFETY: `c_path` is a NUL-terminated OS string that outlives the
             // call, as `open(2)` requires.
-            let parent_fd = unsafe {
-                libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC)
-            };
+            let parent_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
             if parent_fd < 0 {
                 // A path that cannot be opened grants nothing. Skipping it
                 // keeps the sandbox working on minimal images that lack, say,
@@ -993,9 +996,7 @@ impl LandlockPlan {
         // 4. One-way door: confine this process and everything it forks.
         // SAFETY: the ruleset descriptor is live and fully populated here, and
         // `restrict_self` takes no other argument.
-        let ret = {
-            landlock_syscall(SYS_LANDLOCK_RESTRICT_SELF, [ruleset_fd, 0, 0, 0])
-        };
+        let ret = { landlock_syscall(SYS_LANDLOCK_RESTRICT_SELF, [ruleset_fd, 0, 0, 0]) };
         // `landlock_restrict_self` has consumed the ruleset, so the descriptor
         // is dead weight from here on. It is closed on *both* outcomes: on
         // success the child is about to `exec` and must not carry a handle to
@@ -1066,7 +1067,10 @@ fn build_plan_with_abi(
         anyhow::bail!("landlock worktree does not exist: {}", worktree.display());
     }
     if !target_dir.is_dir() {
-        anyhow::bail!("landlock target dir does not exist: {}", target_dir.display());
+        anyhow::bail!(
+            "landlock target dir does not exist: {}",
+            target_dir.display()
+        );
     }
 
     // A kernel without Landlock is not a reason to fail a worker: the caller
