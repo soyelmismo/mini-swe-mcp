@@ -54,6 +54,84 @@ fn is_skipped_dir_name(name: &str) -> bool {
     SKIP_DIR_NAMES.contains(&name)
 }
 
+/// Ceiling on a sanitized worker id, so a caller cannot force a path or branch
+/// name long enough to hit a filesystem or git limit.
+const MAX_WORKER_ID_LEN: usize = 64;
+
+/// Reduce a caller-supplied worker id to a token that is safe in *both* a path
+/// component and a git branch name.
+///
+/// `WorktreeGuard::new` is a public constructor, so its `worker_id` argument is
+/// untrusted input; ids minted by the pool are hexadecimal, but nothing stops a
+/// caller from passing anything at all. Only `[A-Za-z0-9_-]` survives and every
+/// rejected byte collapses to a single `-`, which makes two classes of abuse
+/// impossible before the value reaches either a path or an argv entry:
+///
+/// * **Traversal.** A `/` can no longer appear, so `../../home/user/.ssh`
+///   degrades to `-home-user-.ssh` and stays a single component inside
+///   `swe_base_dir()`. This matters beyond the worktree itself: the same value
+///   names the directory that `Drop` recursively removes.
+/// * **Option injection.** A leading `-` is stripped, so the id cannot turn
+///   `git worktree add -b <id>` or `git branch -D <id>` into a flag. Git
+///   refuses `-b` values starting with `-`; rejecting them here converts a
+///   silent misparse into a clear error.
+///
+/// An id that sanitizes away to nothing (empty, or nothing but separators and
+/// control bytes) has no safe rendering, so it is replaced with a fresh random
+/// one rather than collapsing two distinct callers onto the same worktree.
+fn sanitize_worker_id(worker_id: &str) -> String {
+    let mut out = String::with_capacity(worker_id.len().min(MAX_WORKER_ID_LEN));
+    let mut last_was_dash = false;
+    for ch in worker_id.chars() {
+        if out.len() >= MAX_WORKER_ID_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            // Collapse a whole run of rejected bytes into one separator, so
+            // `"a///b"` and `"a/b"` cannot produce two different worktrees for
+            // what a caller almost certainly meant as the same id.
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        return format!("w{}", uuid::Uuid::new_v4().simple());
+    }
+    trimmed.to_string()
+}
+
+/// Restrict a worktree directory to its owner (audit §guard-01).
+///
+/// `git worktree add` creates the directory with the process umask applied,
+/// which on a default `022` host is `0755`: on a shared machine every local
+/// account could read the subagent's full checkout of the repository, plus any
+/// secrets and artifacts the orchestrator placed there. The subagent's
+/// workspace is meant to be private, so the mode is pinned to `0o700`.
+///
+/// Best effort by design: the worktree has already been created, so a failure
+/// to tighten it must not fail the dispatch. Group/other bits are never set, so
+/// a concurrent reader can never observe a partially-permissioned tree.
+fn harden_worktree_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "Could not restrict worktree directory to 0700"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// RAII guard around one subagent's `git` worktree.
 pub struct WorktreeGuard {
     pub path: PathBuf,
@@ -71,8 +149,12 @@ pub struct WorktreeGuard {
 
 impl WorktreeGuard {
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
-        let branch = format!("worker-{}", worker_id);
-        let path = swe_base_dir().join(format!("swe-wt-{}", worker_id));
+        // Both the branch name and the directory name are derived from the
+        // *sanitized* id, so the two can never describe different worktrees and
+        // neither can escape `swe_base_dir()` or be read as a git option.
+        let worker_id = sanitize_worker_id(worker_id);
+        let branch = format!("worker-{worker_id}");
+        let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
 
         // Ensure target directory and branch don't exist. `worktree prune` is
         // deliberately not called here: `prune_stale_worktrees` owns a single
@@ -97,6 +179,11 @@ impl WorktreeGuard {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git worktree add failed: {}", stderr);
         }
+
+        // Lock the fresh checkout down to its owner *before* anything else is
+        // written into it, so no artifact is ever written under a permissive
+        // mode (audit §guard-01).
+        harden_worktree_dir(&path);
 
         // Write host PID (+ owner uid) to a sibling file so running worktrees are
         // never pruned by concurrent instances, and so a stale marker left by a
@@ -295,11 +382,13 @@ impl Drop for WorktreeGuard {
         let _ = self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        let path_str = self.path.to_string_lossy();
+        // Inline the lossy conversion: the previous binding kept a heap-allocated
+        // `Cow` alive for the duration of the call, and `worktree remove` never
+        // outlives the argument slice.
         let _ = git(
             &self.repo_root,
             "worktree remove",
-            &["worktree", "remove", "--force", &path_str],
+            &["worktree", "remove", "--force", &self.path.to_string_lossy()],
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it
         let has_commits = self.branch_has_commits();
@@ -445,4 +534,81 @@ fn copy_dir_all(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sanitized id is spliced into a branch name and into a path that
+    /// `Drop` recursively deletes, so these are the two properties it must hold.
+    #[test]
+    fn sanitized_id_is_a_single_safe_path_and_branch_component() {
+        for raw in [
+            "deadbeef",
+            "../../home/user/.ssh",
+            "a/b\\c",
+            "  spaced  ",
+            "--upload-pack=/bin/sh",
+            "trailing///",
+            "///leading",
+        ] {
+            let id = sanitize_worker_id(raw);
+            assert!(!id.is_empty(), "id {raw:?} must not sanitize to nothing");
+            assert!(!id.starts_with('-'), "id {raw:?} would be read as a git flag");
+            assert!(!id.contains('/') && !id.contains('\\'), "id {raw:?} kept a separator");
+            assert!(!id.contains('.'), "id {raw:?} kept a dot");
+            assert!(
+                id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "id {raw:?} kept a byte outside [A-Za-z0-9_-]: {id:?}"
+            );
+            assert!(id.len() <= MAX_WORKER_ID_LEN, "id {raw:?} exceeded the cap");
+        }
+    }
+
+    /// Two spellings of the same logical id must not produce two worktrees, and
+    /// a genuinely hostile id must still get a usable worktree of its own.
+    #[test]
+    fn sanitize_collapses_equivalent_ids_and_replaces_unusable_ones() {
+        assert_eq!(sanitize_worker_id("a/b"), sanitize_worker_id("a//b"));
+        assert_eq!(sanitize_worker_id("deadbeef"), "deadbeef");
+
+        // Nothing usable survives: replaced, not collapsed to an empty id that
+        // every such caller would then share.
+        for raw in ["", "///", "   "] {
+            let id = sanitize_worker_id(raw);
+            assert!(!id.is_empty(), "id {raw:?} must be replaced, not emptied");
+            assert!(id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+        }
+        assert_ne!(sanitize_worker_id(""), sanitize_worker_id(""));
+
+        // The cap is enforced before the trim, so a long id cannot outrun it.
+        assert!(sanitize_worker_id(&"x".repeat(500)).len() <= MAX_WORKER_ID_LEN);
+    }
+
+    /// The worktree directory must never be group- or world-readable: it holds
+    /// the full checkout plus any secrets and artifacts seeded into it.
+    #[cfg(unix)]
+    #[test]
+    fn harden_worktree_dir_leaves_only_owner_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "swe-harden-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Start world-readable, the way `git worktree add` under umask 022 does.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        harden_worktree_dir(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "worktree dir ended up {mode:o}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

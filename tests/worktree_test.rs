@@ -498,3 +498,70 @@ fn test_sync_artifacts_publishes_files_atomically_without_staging_debris() {
 
     drop(guard);
 }
+
+/// `WorktreeGuard::new` is public, so its `worker_id` is untrusted input even
+/// though the pool only ever mints hex ids. A hostile id must not be able to
+/// steer the worktree directory out of the scratch base, nor reach git as an
+/// option.
+#[test]
+fn hostile_worker_id_cannot_escape_the_scratch_base_or_become_a_git_flag() {
+    let test_repo = TestRepo::new("hostile");
+    let repo = test_repo.path();
+
+    // A traversal payload and a leading-dash flag payload, in one dispatch each.
+    let traversal = unique_worker_id("hostile/../../escape");
+    let flag = format!("--upload-pack=/bin/sh-{traversal}");
+
+    for (id, label) in [(&traversal, "traversal"), (&flag, "option-injection")] {
+        let guard = WorktreeGuard::new(repo, id).expect("worktree creation failed");
+
+        let name = guard
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("worktree path has a UTF-8 name");
+        assert!(
+            name.starts_with("swe-wt-"),
+            "{label}: worktree dir {name:?} escaped the swe-wt- namespace"
+        );
+        assert!(
+            !name.contains('/') && !name.contains(".."),
+            "{label}: worktree dir {name:?} still contains a separator or traversal"
+        );
+
+        // The worktree must still be a real, registered git worktree: hardening
+        // the id may not break the checkout itself.
+        assert!(guard.path.is_dir(), "{label}: worktree directory missing");
+        assert!(worktree_is_registered(repo, &guard.path), "{label}: git does not know this worktree");
+        assert!(branch_exists(repo, &guard.branch), "{label}: branch was not created");
+
+        drop(guard);
+    }
+}
+
+/// The worktree holds a full checkout of the repository plus whatever secrets
+/// and artifacts the subagent writes. It must not be readable by any other
+/// local account, regardless of the host umask.
+#[cfg(unix)]
+#[test]
+fn worktree_directory_is_private_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_repo = TestRepo::new("private");
+    let repo = test_repo.path();
+    let id = unique_worker_id("private");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    let mode = std::fs::metadata(&guard.path)
+        .expect("failed to stat the worktree directory")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "worktree directory is {mode:o}; it must be 0700 so no other local \
+         account can read the checkout, its secrets or its artifacts"
+    );
+
+    drop(guard);
+}
