@@ -13,6 +13,7 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
+use mini_swe_mcp::mcp::WORKER_ACTIONS;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -426,23 +427,13 @@ fn test_tools_list_schema() {
         .iter()
         .map(|v| v.as_str().unwrap_or_default())
         .collect();
-    for expected in [
-        "prune",
-        "dispatch",
-        "status",
-        "steer",
-        "collect",
-        "logs",
-        "list",
-        "kill",
-        "reap",
-        "manifest",
-    ] {
-        assert!(
-            actions.contains(&expected),
-            "worker action enum must contain '{expected}', got: {actions:?}"
-        );
-    }
+    // Sourced from the crate constant so the wire contract and the dispatch
+    // table cannot drift apart.
+    assert_eq!(
+        actions,
+        WORKER_ACTIONS.to_vec(),
+        "worker action enum must mirror the dispatch table, got: {actions:?}"
+    );
 
     // `path` and `id` are the documented aliases for repo_path / worker_id.
     for prop in ["path", "id"] {
