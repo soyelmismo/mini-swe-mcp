@@ -16,18 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use tracing::{debug, info};
 
-/// Unversioned directories that are copied into a fresh worktree so subagents
-/// can read them without git tracking, and synced back on the way out.
+/// Unversioned dirs copied into a fresh worktree (readable without git
+/// tracking) and synced back on the way out.
 const ARTIFACT_DIRS: &[&str] = &["audits", "reports", ".agents", "artifacts"];
 
-/// Directory names that are never mirrored between a worktree and the repo root.
+/// Directory names never mirrored between a worktree and the repo root.
 ///
-/// A subagent that installs dependencies or runs a build inside an artifact
-/// directory would otherwise drag an entire `.git`, `node_modules` or compiled
-/// output tree across the boundary on every sync — megabytes of files the repo
-/// root neither wants nor can meaningfully merge. Skipping by name at every
-/// recursion level keeps the guard cheap and, more importantly, keeps foreign
-/// build output and dependency caches out of the repository working tree.
+/// Skipping by name at every recursion level keeps dependency caches and build
+/// output out of the repository working tree.
 const SKIP_DIR_NAMES: &[&str] = &[
     ".git",
     "node_modules",
@@ -46,10 +42,6 @@ const SKIP_DIR_NAMES: &[&str] = &[
 ];
 
 /// True when a directory entry must never be copied out of a worktree.
-///
-/// Matching the basename at every level is enough to stop `.git`,
-/// `node_modules` and the various build/output directories *before* their
-/// contents are walked, which is where the real cost would be.
 fn is_skipped_dir_name(name: &str) -> bool {
     SKIP_DIR_NAMES.contains(&name)
 }
@@ -58,25 +50,22 @@ fn is_skipped_dir_name(name: &str) -> bool {
 /// name long enough to hit a filesystem or git limit.
 const MAX_WORKER_ID_LEN: usize = 64;
 
-/// Reduce a caller-supplied worker id to a token that is safe in *both* a path
+/// Reduce a caller-supplied worker id to a token safe in *both* a path
 /// component and a git branch name.
 ///
-/// `WorktreeGuard::new` is a public constructor, so its `worker_id` argument is
-/// untrusted input; ids minted by the pool are hexadecimal, but nothing stops a
-/// caller from passing anything at all. Only `[A-Za-z0-9_-]` survives and every
-/// rejected byte collapses to a single `-`, which makes two classes of abuse
-/// impossible before the value reaches either a path or an argv entry:
+/// `WorktreeGuard::new` is public, so `worker_id` is untrusted input. Only
+/// `[A-Za-z0-9_-]` survives and every rejected byte collapses to a single `-`,
+/// which blocks two classes of abuse before the value reaches a path or argv:
 ///
 /// * **Traversal.** A `/` can no longer appear, so `../../home/user/.ssh`
 ///   degrades to `home-user-ssh` and stays a single component inside
-///   `swe_base_dir()`. This matters beyond the worktree itself: the same value
-///   names the directory that `Drop` recursively removes.
-/// * **Option injection.** Leading `-` is stripped even for callers that
-///   later use the sanitized id directly as a git argument.
+///   `swe_base_dir()`. The same value names the directory `Drop` removes.
+/// * **Option injection.** Leading `-` is stripped even when the id is later
+///   used directly as a git argument.
 ///
-/// An id that sanitizes away to nothing (empty, or nothing but separators and
-/// control bytes) has no safe rendering, so it is replaced with a fresh random
-/// one rather than collapsing two distinct callers onto the same worktree.
+/// An id that sanitizes away to nothing has no safe rendering, so it is
+/// replaced with a fresh random one rather than collapsing distinct callers
+/// onto the same worktree.
 fn sanitize_worker_id(worker_id: &str) -> String {
     let mut out = String::with_capacity(worker_id.len().min(MAX_WORKER_ID_LEN));
     let mut last_was_dash = false;
@@ -88,9 +77,8 @@ fn sanitize_worker_id(worker_id: &str) -> String {
             out.push(ch);
             last_was_dash = false;
         } else if !last_was_dash {
-            // Collapse a whole run of rejected bytes into one separator, so
-            // `"a///b"` and `"a/b"` cannot produce two different worktrees for
-            // what a caller almost certainly meant as the same id.
+            // Collapse a run of rejected bytes into one separator so `"a///b"`
+            // and `"a/b"` cannot produce two different worktrees.
             out.push('-');
             last_was_dash = true;
         }
@@ -105,10 +93,9 @@ fn sanitize_worker_id(worker_id: &str) -> String {
 
 /// Create the checkout directory private *before* git writes into it.
 /// Git accepts an existing empty directory for `worktree add` and preserves
-/// its mode; chmodding only after checkout exposes its contents under umask 022.
+/// its mode; chmodding only after checkout exposes contents under umask 022.
 fn create_private_worktree_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        // Git used to create missing SWE_TEMP_DIR parents during `worktree add`.
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create worktree base {}", parent.display()))?;
     }
@@ -159,16 +146,15 @@ pub struct WorktreeGuard {
 
 impl WorktreeGuard {
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
-        // Both the branch name and the directory name are derived from the
-        // *sanitized* id, so the two can never describe different worktrees and
-        // neither can escape `swe_base_dir()` or be read as a git option.
+        // Branch and directory names derive from the *sanitized* id, so they
+        // can never describe different worktrees nor escape `swe_base_dir()`.
         let worker_id = sanitize_worker_id(worker_id);
         let branch = format!("worker-{worker_id}");
         let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
 
         // Ensure target directory and branch don't exist. `worktree prune` is
         // deliberately not called here: `prune_stale_worktrees` owns a single
-        // prune per sweep, and the `worktree add` below fails loudly if a stale
+        // prune per sweep, and `worktree add` fails loudly if a stale
         // registration is still in place (audit §06).
         force_remove_dir(&path);
         let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
@@ -178,8 +164,8 @@ impl WorktreeGuard {
         let path_str = path
             .to_str()
             .context("Worktree path contains invalid UTF-8")?;
-        // Git accepts an existing empty directory. Create it private before
-        // checkout so no reader can observe files under a permissive umask.
+        // Create it private before checkout so no reader observes files under
+        // a permissive umask.
         create_private_worktree_dir(&path)?;
 
         let output = git(
@@ -196,16 +182,15 @@ impl WorktreeGuard {
         // Verify git left the checkout private before seeding artifacts.
         harden_worktree_dir(&path)?;
 
-        // Write host PID (+ owner uid) to a sibling file so running worktrees are
-        // never pruned by concurrent instances, and so a stale marker left by a
-        // different user is never mistaken for ours (audit §12).
+        // Write host PID (+ owner uid) to a sibling file so running worktrees
+        // are never pruned by concurrent instances, and a stale marker left by
+        // a different user is never mistaken for ours (audit §12).
         let _ = std::fs::write(pid_file_for(&path), pid_file_contents());
 
-        // Seed unversioned directories into the worktree so subagents can read
-        // them without git tracking. Uses the same copy path (and therefore the
-        // same skipped-directory guards) as the sync back, so a `.git` or
-        // `node_modules` tree planted inside an artifact directory is never
-        // mirrored in either direction.
+        // Seed unversioned directories so subagents can read them without git
+        // tracking. Uses the same copy path (and skipped-directory guards) as
+        // the sync back, so a `.git` or `node_modules` tree planted inside an
+        // artifact directory is never mirrored in either direction.
         for dir in ARTIFACT_DIRS {
             let src = repo_root.join(dir);
             if src.is_dir() {
@@ -235,7 +220,7 @@ impl WorktreeGuard {
     }
 
     pub fn get_diff(&self) -> Result<String> {
-        // Stage untracked files intent-to-add so git diff captures new files as well
+        // Stage untracked files intent-to-add so git diff captures new files.
         let _ = git(&self.path, "add", &["add", "-N", "."]);
 
         let output = git(&self.path, "diff HEAD", &["diff", "HEAD"])?;
@@ -246,7 +231,7 @@ impl WorktreeGuard {
             }
         }
 
-        // If working tree diff is empty, check if subagent committed changes to this branch
+        // If the working tree diff is empty, check for commits on this branch.
         if !self.base_commit.is_empty() {
             let output = git(
                 &self.path,
@@ -267,12 +252,11 @@ impl WorktreeGuard {
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
     /// from the worktree back into the repository root.
     ///
-    /// Returns the sorted, duplicate-free list of repository-relative files that
-    /// are in sync after the call. The copy itself is conservative: unchanged
-    /// files are left untouched, dependency caches and build output
-    /// ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is published
-    /// atomically so a concurrent reader in the repo root never observes a
-    /// partially written artifact.
+    /// Returns the sorted, duplicate-free list of repository-relative files in
+    /// sync after the call. The copy is conservative: unchanged files are left
+    /// untouched, dependency caches and build output ([`SKIP_DIR_NAMES`]) are
+    /// never mirrored, and each file is published atomically so a concurrent
+    /// reader never observes a partially written artifact.
     ///
     /// Per-directory I/O errors are logged rather than propagated: both call
     /// sites discard the `Result` (`pool::runner` wants the artifact count,
@@ -302,17 +286,18 @@ impl WorktreeGuard {
     /// Commit all dirty changes in the worktree to preserve work in git history,
     /// marking the branch to be retained upon worktree cleanup.
     pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
-        // Stage all changes (both tracked and untracked)
+        // Stage all changes (both tracked and untracked).
         let _ = git(&self.path, "add", &["add", "-A"]);
 
-        // Check if there are changes to commit
+        // Check if there are changes to commit.
         let status = git(&self.path, "status", &["status", "--porcelain"])?;
         if !status.status.success() {
             let stderr = String::from_utf8_lossy(&status.stderr);
             anyhow::bail!("git status failed: {}", stderr.trim());
         }
         if status.stdout.is_empty() {
-            // Even if working tree is clean, check if branch already has commits beyond base_commit
+            // Even if the working tree is clean, check if the branch already
+            // has commits beyond base_commit.
             if self.branch_has_commits() {
                 self.preserve_branch = true;
                 return Ok(Some(self.branch.clone()));
@@ -320,7 +305,7 @@ impl WorktreeGuard {
             return Ok(None);
         }
 
-        // Commit with fallback credentials so lack of git config never errors
+        // Commit with fallback credentials so lack of git config never errors.
         let commit_out = git(
             &self.path,
             "commit",
@@ -393,7 +378,6 @@ impl Drop for WorktreeGuard {
         let _ = self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        // Git only borrows the path for the duration of this call.
         let _ = git(
             &self.repo_root,
             "worktree remove",
@@ -404,7 +388,7 @@ impl Drop for WorktreeGuard {
                 &self.path.to_string_lossy(),
             ],
         );
-        // If the branch has commits beyond base_commit, ALWAYS preserve it
+        // If the branch has commits beyond base_commit, ALWAYS preserve it.
         let has_commits = self.branch_has_commits();
 
         if self.preserve_branch || has_commits {
