@@ -7,7 +7,7 @@
 //! exactly when something is missing (audit 07, R4/R7).
 
 use super::super::{
-    LogRetentionPolicy, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES, build_step_log,
+    build_step_log, LogRetentionPolicy, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES,
 };
 use super::*;
 

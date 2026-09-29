@@ -29,7 +29,7 @@ mod emit;
 mod tests;
 
 pub use self::clamp::{build_step_log, clamp_string};
-pub use self::emit::{EmittedLogs, LogStats, emit_view, emit_view_with};
+pub use self::emit::{emit_view, emit_view_with, EmittedLogs, LogStats};
 
 use serde::Serialize;
 use std::collections::VecDeque;
