@@ -24,6 +24,12 @@
 //!    ([`FrameRejection`]) are borrowed from the frame being answered, and a
 //!    `-32601` quotes the method it rejects, so a rejection allocates nothing
 //!    beyond its output buffer and the name it quotes.
+//! 4. **Refuse an oversized frame before touching it.** [`parse_frame`] checks
+//!    [`MAX_FRAME_BYTES`] on the raw line and answers `-32600` for anything
+//!    larger, so a peer cannot make the server parse, borrow and then clone an
+//!    arbitrarily large payload. The bound is on the *frame*, which is the one
+//!    allocation a peer can actually grow without limit, and it is checked
+//!    against a constant so the rejection itself allocates nothing.
 //!
 //! Spec compliance is enforced by construction rather than by convention: the
 //! `jsonrpc` member is the constant [`JSONRPC_VERSION`], an envelope carries
@@ -63,6 +69,24 @@ pub(super) mod code {
 /// error frame fit within it, so they cost exactly one allocation.
 const FRAME_CAPACITY: usize = 256;
 
+/// Largest inbound JSON-RPC frame [`parse_frame`] will look at, in bytes.
+///
+/// A stdio MCP peer is a program on the same host, but the transport is a pipe
+/// an operator can point at anything: a frame is the one value that grows with
+/// the sender's appetite, and every downstream consumer copies or borrows it.
+/// Refusing the line up front is cheaper than any bound placed later — the
+/// parse never runs, no `Value` tree is built, and the rejection frame is a
+/// fixed 256-byte buffer.
+///
+/// The ceiling is set well above the largest frame this server legitimately
+/// receives. [`crate::mcp::schema::build_tools_list`] describes one tool with
+/// an enum of ten actions, and `tools/call` carries a worker's arguments; both
+/// are kilobytes at most, and the agent side already caps its own payloads
+/// far lower ([`crate::agent::MAX_TOOL_ARGUMENT_BYTES`], 64 KiB). A megabyte
+/// leaves two orders of magnitude of headroom while still bounding a single
+/// frame's memory at something a client cannot use as an amplifier.
+pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Why a frame could not be serialized. Kept as its own type (rather than
 /// swallowed) so no caller can accidentally drop a response without noticing.
 #[derive(Debug)]
@@ -82,6 +106,15 @@ pub(super) const INTERNAL_ERROR_FRAME: &str =
 /// Diagnosis for a frame that carries no usable `method`. Borrowed, so the
 /// `-32600` reply allocates nothing beyond its output buffer.
 const NO_METHOD: &str = "Invalid Request: missing or non-string \"method\" member";
+
+/// Diagnosis for a line refused on length alone, quoting the ceiling as a byte
+/// count so an operator can size a client against it. Borrowed from the
+/// binary, so an oversized frame costs only the reply's own buffer.
+///
+/// The figure is written out rather than derived: `stringify!` would emit the
+/// constant's *name*, not its value, so it cannot build this text. A test below
+/// fails if the message and [`MAX_FRAME_BYTES`] ever disagree.
+const FRAME_TOO_LARGE: &str = "Invalid Request: frame exceeds the 1048576-byte limit";
 
 // ---------------------------------------------------------------------------
 // Incoming frames
@@ -133,6 +166,10 @@ pub(super) enum FrameRejection {
     /// The line is valid JSON but not a JSON-RPC Request object (`-32600`):
     /// not an object, or no string `method`.
     InvalidRequest(&'static str),
+    /// The line is longer than [`MAX_FRAME_BYTES`] (`-32600`), rejected before
+    /// it is parsed. The text is a borrowed constant, so a flood of oversized
+    /// frames costs one fixed output buffer each and no diagnostics string.
+    FrameTooLarge,
 }
 
 impl FrameRejection {
@@ -155,6 +192,10 @@ impl FrameRejection {
         let (code, message) = match self {
             Self::Malformed(message) => (code::PARSE_ERROR, Cow::Owned(message)),
             Self::InvalidRequest(message) => (code::INVALID_REQUEST, Cow::Borrowed(message)),
+            // Rejected before it was parsed, so the honest code is `-32600`:
+            // nothing about the line's syntax was ever decided, and a `-32700`
+            // would claim the bytes were not JSON when they may well be.
+            Self::FrameTooLarge => (code::INVALID_REQUEST, Cow::Borrowed(FRAME_TOO_LARGE)),
         };
         JsonRpcResponse::err(None, code, message).to_frame()
             .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME))
@@ -171,6 +212,12 @@ impl FrameRejection {
 /// `params` and `id` may be absent, `null`, or any JSON value, and are handed
 /// back exactly as written.
 pub(super) fn parse_frame(frame: &str) -> Result<JsonRpcRequest<'_>, FrameRejection> {
+    // Checked first, on the raw line and before the BOM strip, so the bound
+    // covers every byte the peer sent and an oversized frame never reaches a
+    // parser. `len()` is a field read on a `&str`, so the guard is free.
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(FrameRejection::FrameTooLarge);
+    }
     let frame = frame.strip_prefix('\u{feff}').unwrap_or(frame);
 
     // Pass 1 — is this JSON at all? `IgnoredAny` walks the frame without
@@ -205,14 +252,17 @@ pub(super) fn parse_frame(frame: &str) -> Result<JsonRpcRequest<'_>, FrameReject
     Ok(parsed)
 }
 
-/// A method name borrowed from the frame when it is escape-free, unescaped
-/// into an owned `String` only when it carries a JSON escape.
+/// A string borrowed from the frame when it is escape-free, unescaped into an
+/// owned `String` only when it carries a JSON escape.
 ///
 /// `serde` implements `Deserialize` for `&'de str` (borrowing through
 /// `visit_borrowed_str`), but not for `Cow<'de, str>` — the blanket impl
 /// always materializes `Owned`. This visitor recovers the borrow: it asks for
 /// `&str` first and falls back to `String` only when the frame's escapes force
 /// it, so an escaped method name is answered instead of rejected.
+///
+/// It reads both the `method` value and the member names, which are the two
+/// strings the frame parser has to name in order to route it.
 struct MethodName<'de>(Cow<'de, str>);
 
 impl<'de> serde::Deserialize<'de> for MethodName<'de> {
@@ -222,20 +272,22 @@ impl<'de> serde::Deserialize<'de> for MethodName<'de> {
         impl<'de> Visitor<'de> for MethodVisitor<'de> {
             type Value = MethodName<'de>;
 
+            // The visitor serves both the `method` value and the member names,
+            // so the expectation is worded for either.
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a JSON-RPC method name")
+                formatter.write_str("a JSON-RPC method name or member name")
             }
 
-            fn visit_borrowed_str<E: de::Error>(self, method: &'de str) -> Result<Self::Value, E> {
-                Ok(MethodName(Cow::Borrowed(method)))
+            fn visit_borrowed_str<E: de::Error>(self, name: &'de str) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Borrowed(name)))
             }
 
-            fn visit_str<E: de::Error>(self, method: &str) -> Result<Self::Value, E> {
-                Ok(MethodName(Cow::Owned(method.to_owned())))
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Owned(name.to_owned())))
             }
 
-            fn visit_string<E: de::Error>(self, method: String) -> Result<Self::Value, E> {
-                Ok(MethodName(Cow::Owned(method)))
+            fn visit_string<E: de::Error>(self, name: String) -> Result<Self::Value, E> {
+                Ok(MethodName(Cow::Owned(name)))
             }
         }
 
@@ -262,12 +314,16 @@ impl<'de> Visitor<'de> for RequestVisitor {
         let mut id: Option<&'de RawValue> = None;
         let mut params: Option<&'de RawValue> = None;
 
-        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+        // `MethodName` doubles as the key reader: it is the same
+        // borrowed-when-escape-free string deserializer, and asking for it here
+        // is what keeps member names allocation-free. `Cow<str>` would have
+        // copied *every* key into a `String` — including the four known ones —
+        // on every frame.
+        while let Some(key) = map.next_key::<MethodName<'de>>()?.0 {
             match key.as_ref() {
-                // `&str` borrows the frame when the name is escape-free and
-                // errors only when it carries a JSON escape, in which case the
-                // fallback below unescapes it into an owned `String` — so
-                // `"tools\u002fcall"` is answered instead of rejected.
+                // A key that carries a JSON escape (`"tools\u002fcall"`)
+                // arrives owned but still compares equal, so such a frame is
+                // answered instead of rejected.
                 "method" => method = Some(map.next_value::<MethodName<'de>>()?.0),
                 // Raw text: the id is echoed byte for byte (§4 — the server may
                 // not round `9007199254740993` or re-quote a string id).
@@ -626,6 +682,29 @@ mod tests {
         assert_eq!(req.id.unwrap().get(), r#""c-1""#, "the raw id keeps its quotes");
     }
 
+    /// Member names borrow the line too. The key reader is the same
+    /// borrowed-when-escape-free visitor the method name uses, so a spec-shaped
+    /// frame allocates no `String` for its keys — the `Cow<str>` key type it
+    /// replaced copied every one of them.
+    #[test]
+    fn member_names_are_borrowed_from_the_line() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let req = parse_frame(line).expect("frame");
+        // Nothing owned: the method and the raw id both point into `line`
+        // rather than into a fresh `String`, which is what proves the key
+        // reader and the value reader both borrowed.
+        assert!(matches!(req.method, Cow::Borrowed(_)));
+        // `rfind` picks the id's `1` rather than the `1` inside `2.0`, so the
+        // expected offset is unambiguous even if the fixture grows.
+        let id_offset = line.rfind('1').expect("the id is in the line");
+        assert_eq!(
+            req.id
+                .map(|id| id.get().as_ptr() as usize - line.as_ptr() as usize),
+            Some(id_offset),
+            "the id must point into the line, not into a fresh allocation"
+        );
+    }
+
     /// The raw params survive exactly as written (quoted strings stay quoted,
     /// numbers stay numbers), and an absent `params` member stays absent.
     #[test]
@@ -716,6 +795,64 @@ mod tests {
         assert_eq!(
             parse_frame(r#"{"id":1}"#).expect_err("no method").into_frame(),
             expected
+        );
+    }
+
+    /// The ceiling is a real bound, not decoration: a frame one byte past it is
+    /// refused before it is parsed, and the refusal is the spec-shaped
+    /// `-32600` with an `id` of `null` (nothing was read, so nothing to echo).
+    #[test]
+    fn oversized_frames_are_refused_before_they_are_parsed() {
+        // A syntactically perfect request that is simply too large: if the
+        // guard ran after parsing, this would succeed.
+        let padding = "x".repeat(MAX_FRAME_BYTES);
+        let oversize = format!(r#"{{"id":1,"method":"ping","params":"{padding}"}}"#);
+        assert!(
+            oversize.len() > MAX_FRAME_BYTES,
+            "the fixture must exceed the bound to mean anything"
+        );
+
+        let frame = parse_frame(&oversize)
+            .expect_err("an oversized frame must be refused")
+            .into_frame();
+        let value: Value = serde_json::from_str(&frame).expect("frame is JSON");
+        assert_eq!(value["jsonrpc"], json!(JSONRPC_VERSION));
+        assert_eq!(value["id"], json!(null), "nothing was read to echo");
+        assert_eq!(value["error"]["code"], json!(code::INVALID_REQUEST));
+        assert_eq!(value["error"]["message"], json!(FRAME_TOO_LARGE));
+    }
+
+    /// The bound is inclusive: a frame of exactly [`MAX_FRAME_BYTES`] bytes is
+    /// served, so a client that sizes itself to the advertised limit is never
+    /// rejected for being one byte under.
+    #[test]
+    fn the_limit_is_inclusive_and_large_frames_still_parse() {
+        // `{"id":1,"method":"ping","params":"<pad>"}` — pad to land on the bound.
+        let envelope = r#"{"id":1,"method":"ping","params":""#;
+        let tail = r#""}"#;
+        let pad = MAX_FRAME_BYTES - envelope.len() - tail.len();
+        let line = format!("{envelope}{}{tail}", "x".repeat(pad));
+        assert_eq!(line.len(), MAX_FRAME_BYTES, "the fixture must sit on the bound");
+
+        let req = parse_frame(&line).expect("a frame at the bound is served");
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.id.unwrap().get(), "1");
+    }
+
+    /// The message quotes the bound it enforces. The two are written separately
+    /// (`stringify!` cannot build a value from a constant), so this is what
+    /// keeps the wire text from drifting away from the limit.
+    #[test]
+    fn the_diagnostic_quotes_the_bound_it_enforces() {
+        assert_eq!(
+            MAX_FRAME_BYTES,
+            1024 * 1024,
+            "the message text is written against this figure"
+        );
+        assert!(
+            FRAME_TOO_LARGE.contains(&MAX_FRAME_BYTES.to_string()),
+            "`{FRAME_TOO_LARGE}` must quote {} so a client can size itself",
+            MAX_FRAME_BYTES
         );
     }
 
