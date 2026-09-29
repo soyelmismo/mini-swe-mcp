@@ -1,17 +1,7 @@
 //! `mini-swe-mcp` entry point: hand argv to the CLI, or serve MCP over stdio.
 //!
-//! This file is deliberately thin. Everything it used to hold now lives in the
-//! library so it can be unit-tested directly:
-//!
-//! * [`bootstrap`] — runtime sizing and `.env` discovery.
-//! * [`telemetry`] — the terse, non-blocking stderr log sink.
-//! * [`cli::args`] — argv → `worker` tool arguments and the flag selectors.
-//! * [`cli::format`] — the plain-text renderers for every tool payload.
-//! * [`cli::suggest`] — the accepted verb list and the typo suggestions.
-//!
-//! What remains here is dispatch and orchestration: build the server, route one
-//! argv-selected action through it, print the answer, and otherwise enter the
-//! stdio run loop.
+//! Deliberately thin: dispatch and orchestration only. Everything else lives in
+//! the library so it can be unit-tested directly.
 
 use anyhow::Result;
 use mini_swe_mcp::cli::args::{action_of, json_requested, stdio_requested, strip_json_flag, tool_args};
@@ -62,10 +52,9 @@ async fn async_main() -> Result<()> {
     let server = McpServer::new(pool.clone(), default_model, manifest);
 
     if let Some(action) = action_of(&cli_args) {
-        // `monitor` / `supervisor` reach here when a selector flag precedes the
-        // verb (e.g. `--json monitor`); the early argv check above only sees
-        // `raw_args[1]`. Handle them here so every flag ordering behaves the
-        // same as the pre-refactor dispatch.
+        // `monitor`/`supervisor` reach here when a selector flag precedes the
+        // verb (e.g. `--json monitor`); the early argv check only sees
+        // `raw_args[1]`. Handle them here so every flag ordering behaves alike.
         if action == "monitor" || action == "supervisor" {
             let once = cli_args.iter().any(|arg| arg == "--once");
             return mini_swe_mcp::monitor::run_monitor(once).await;
@@ -120,8 +109,8 @@ async fn run_action(
 
     // Interactive steering: whenever the shared wait loop reports the worker
     // paused for input, prompt the operator and resume. Re-waiting goes through
-    // the exact same helper the MCP stdio dispatch path uses, so both callers
-    // share one polling/termination algorithm.
+    // the same helper the MCP stdio dispatch path uses, so both callers share
+    // one polling/termination algorithm.
     let wait_max_turns = tool_args
         .get("max_turns")
         .and_then(|v| v.as_u64())

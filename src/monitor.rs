@@ -1,32 +1,31 @@
 //! Live terminal supervisor and dashboard monitor for `mini-swe-mcp`.
 //!
-//! Provides an interactive, in-place overwriting TUI that monitors running
-//! agent swarms and isolated worker pods without spamming log lines.
+//! Interactive, in-place overwriting TUI that monitors running agent swarms
+//! and isolated worker pods without spamming log lines.
 //!
 //! # Layout contract
 //!
-//! The dashboard is a table, not a paragraph: every worker occupies exactly
-//! one row and the row is *bounded* so a narrow terminal wraps nothing and a
-//! wide terminal is not filled with dead space. That bounding is driven by
-//! [`Layout`], a pure struct derived from the terminal width (see
-//! [`Layout::for_terminal_width`]). All measurement happens on the visible
-//! (ANSI-stripped) text, never on escape sequences, so colour never shifts a
-//! column.
+//! The dashboard is a table: every worker occupies exactly one *bounded* row,
+//! so a narrow terminal wraps nothing and a wide one is not filled with dead
+//! space. Bounding is driven by [`Layout`], a pure struct derived from the
+//! terminal width (see [`Layout::for_terminal_width`]). All measurement runs on
+//! the visible (ANSI-stripped) text, never on escape sequences, so colour never
+//! shifts a column.
 //!
 //! # Grouping contract
 //!
 //! Rows are grouped **by repository** (`WorkerRegistryEntry::repo_path`,
 //! [`DEFAULT_REPO_KEY`] when absent), never by the swarm tag: a supervisor
 //! watches *one worktree at a time*, so grouping by repository yields exactly
-//! one coherent table per repository. The optional swarm/domain tag is
-//! demoted to a `[tag]` prefix inside the task column, where it still shows
-//! but can no longer fracture the dashboard into many tiny tables.
+//! one coherent table per repository. The optional swarm/domain tag is demoted
+//! to a `[tag]` prefix inside the task column, where it still shows but can no
+//! longer fracture the dashboard into many tiny tables.
 //!
-//! Each repository heading carries that repository's own counters
-//! (`total`, then every non-zero state), folded in by `RepoGroup::push` on
-//! the same pass that groups the rows. The global counters above stay the
-//! cross-repository view, so one repository finishing early is visible both in
-//! its own table and in the fleet-wide strip.
+//! Each repository heading carries its own counters (`total`, then every
+//! non-zero state), folded in by `RepoGroup::push` on the same pass that groups
+//! the rows. The global counters above stay the cross-repository view, so one
+//! repository finishing early is visible both in its own table and in the
+//! fleet-wide strip.
 
 use crate::pool::{WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
@@ -142,18 +141,12 @@ pub struct Layout {
 impl Layout {
     /// Derive the responsive layout for a terminal of `term_width` columns.
     ///
-    /// Three tiers, picked purely by available width:
-    ///
-    /// 1. **inline + progress bar** when the bar and a usable task column both
-    ///    fit -- the wide-terminal layout.
-    /// 2. **inline, no bar** when one line still fits a usable task column --
-    ///    the bar is the first thing dropped, since the `step/max` counter
-    ///    carries the same information exactly.
-    /// 3. **stacked** when even that does not fit: two short label lines and a
-    ///    wrapped task, so no line ever overflows the terminal.
-    ///
-    /// Never panics and never returns a zero-width task column; widths below
-    /// [`MIN_TERMINAL_WIDTH`] are raised to that floor.
+    /// Three tiers by available width: **inline + progress bar** when both fit;
+    /// **inline, no bar** when one line still fits a usable task column (the
+    /// bar is dropped first, since `step/max` carries the same information);
+    /// **stacked** otherwise — two short label lines and a wrapped task, so no
+    /// line overflows. Never panics and never returns a zero-width task column;
+    /// widths below [`MIN_TERMINAL_WIDTH`] are raised to that floor.
     pub fn for_terminal_width(term_width: usize) -> Self {
         let total = term_width.max(MIN_TERMINAL_WIDTH);
 
@@ -228,8 +221,8 @@ impl Layout {
 /// Number of columns a string occupies, ignoring SGR escape sequences.
 ///
 /// ANSI escapes are zero-width on screen but take bytes in `String`, so any
-/// byte-length arithmetic over a coloured cell would drift. This keeps all
-/// padding and capping decisions on the visible text.
+/// byte-length arithmetic over a coloured cell would drift. Keeps all padding
+/// and capping decisions on the visible text.
 pub fn visible_width(s: &str) -> usize {
     let mut width = 0usize;
     let mut in_escape = false;
@@ -252,10 +245,10 @@ pub fn visible_width(s: &str) -> usize {
 /// Split `s` into at most `max_len` visible columns, appending `…` when it had
 /// to cut.
 ///
-/// The result is at most `max_len` visible columns wide, ellipsis included.
-/// Escapes inside the kept prefix are preserved verbatim (they are invisible)
-/// but do not consume budget, and an unterminated escape sequence is dropped
-/// so a truncated colour never leaks into the next row.
+/// Result is at most `max_len` visible columns wide, ellipsis included. Escapes
+/// inside the kept prefix are preserved verbatim (invisible) but do not consume
+/// budget; an unterminated escape sequence is dropped so a truncated colour
+/// never leaks into the next row.
 pub fn truncate_visible(s: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
@@ -365,8 +358,8 @@ fn review_tag(use_color: bool) -> &'static str {
 
 /// Progress indicator for the turn budget: a filled/empty bar plus `step/max`.
 ///
-/// The bar makes "how far along is this worker" readable at a glance without
-/// reading the numbers, and the numbers stay for precision.
+/// The bar makes "how far along is this worker" readable at a glance; the
+/// numbers stay for precision.
 fn progress_bar(step: usize, max_turns: usize) -> String {
     // `checked_div` keeps a zero budget (never written by the pool, but a
     // hand-edited registry file can hold it) from panicking the whole TUI.
@@ -385,9 +378,9 @@ fn progress_bar(step: usize, max_turns: usize) -> String {
 
 /// The turns column: a progress bar followed by the exact `step/max` counter.
 ///
-/// The bar answers "how far along is this worker" at a glance, the counter
-/// answers "exactly how far" without counting pixels. The bar is dropped when
-/// the terminal is too narrow to show both without wrapping.
+/// The bar answers "how far along" at a glance, the counter "exactly how far".
+/// The bar is dropped when the terminal is too narrow to show both without
+/// wrapping.
 fn turns_cell(step: usize, max_turns: usize, layout: &Layout) -> String {
     let counter = format!("{step}/{max_turns}");
     let cell = match layout.shows_progress() {
@@ -570,8 +563,8 @@ fn status_bucket(status: &str) -> Bucket {
 /// One repository's slice of the dashboard: its workers plus the counters
 /// shown in its heading.
 ///
-/// The counters are folded in while grouping (one pass over the entries), so
-/// the heading never needs a second scan and the row loop never needs a
+/// Counters are folded in while grouping (one pass over the entries), so the
+/// heading never needs a second scan and the row loop never needs a
 /// per-status branch of its own.
 struct RepoGroup<'a> {
     workers: Vec<&'a WorkerRegistryEntry>,
@@ -614,8 +607,8 @@ impl<'a> RepoGroup<'a> {
     ///
     /// A quiet repository reads `total: 4`, a busy one
     /// `total: 4 | active: 2 | reviewing: 1 | completed: 1`. Every state is
-    /// covered, so no worker is hidden behind a dropped counter, and the zeros
-    /// are dropped so an idle worktree spends its heading on `total` alone.
+    /// covered, so no worker is hidden behind a dropped counter; zeros are
+    /// dropped so an idle worktree spends its heading on `total` alone.
     fn summary_items(&self) -> Vec<(&'static str, String, &'static str)> {
         [
             ("total", self.workers.len(), bold()),

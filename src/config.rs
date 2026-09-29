@@ -1,10 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Resolve the directory that holds the agent configuration file.
+/// Resolve the agent configuration directory.
 ///
-/// Prefers `XDG_CONFIG_HOME` (when non-blank) and otherwise falls back to
-/// `$HOME/.config`. Returns `None` when neither variable yields a usable value.
+/// Prefers `XDG_CONFIG_HOME` (when non-blank), else `$HOME/.config`. Returns
+/// `None` when neither variable yields a usable value.
 pub fn xdg_config_dir() -> Option<PathBuf> {
     xdg_config_dir_from(
         env::var("XDG_CONFIG_HOME").ok().as_deref(),
@@ -14,7 +14,7 @@ pub fn xdg_config_dir() -> Option<PathBuf> {
 
 /// Pure core of [`xdg_config_dir`], parameterized over the two environment
 /// variables so the fallback rules can be tested without mutating (unsafe in
-/// edition 2024) process state. Private: it has no consumer outside this module.
+/// edition 2024) process state. Private: no consumer outside this module.
 fn xdg_config_dir_from(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     if let Some(xdg) = xdg.filter(|s| !s.trim().is_empty()) {
         Some(PathBuf::from(xdg))
@@ -28,8 +28,8 @@ fn xdg_config_dir_from(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf>
 mod tests {
     use super::*;
 
-    /// 1. A custom `XDG_CONFIG_HOME` wins outright and is returned verbatim,
-    ///    even when `HOME` is also set.
+    /// A custom `XDG_CONFIG_HOME` wins outright and is returned verbatim,
+    /// even when `HOME` is also set.
     #[test]
     fn test_custom_xdg_config_dir_is_returned() {
         let dir = xdg_config_dir_from(Some("/custom/xdg"), Some("/home/user"));
@@ -48,7 +48,7 @@ mod tests {
         assert_eq!(with_home, Some(PathBuf::from("/custom/xdg")));
     }
 
-    /// 2. When `XDG_CONFIG_HOME` is absent, fall back to `$HOME/.config`.
+    /// When `XDG_CONFIG_HOME` is absent, fall back to `$HOME/.config`.
     #[test]
     fn test_missing_xdg_config_dir_falls_back_to_home() {
         let dir = xdg_config_dir_from(None, Some("/home/user"));
@@ -59,8 +59,8 @@ mod tests {
         );
     }
 
-    /// 3. Blank/whitespace-only `XDG_CONFIG_HOME` values are ignored, so the
-    ///    `$HOME/.config` fallback still applies.
+    /// Blank/whitespace-only `XDG_CONFIG_HOME` values are ignored, so the
+    /// `$HOME/.config` fallback still applies.
     #[test]
     fn test_blank_xdg_config_dir_falls_back_to_home() {
         for blank in ["", " ", "   ", "\t", "\n", " \t\n "] {
@@ -73,7 +73,7 @@ mod tests {
         }
     }
 
-    /// 4. With neither variable usable there is nothing to resolve, so `None`.
+    /// With neither variable usable there is nothing to resolve, so `None`.
     #[test]
     fn test_no_xdg_and_no_home_returns_none() {
         assert_eq!(xdg_config_dir_from(None, None), None);

@@ -1,7 +1,7 @@
 //! Process bootstrap: runtime sizing and `.env` discovery.
 //!
-//! These are one-shot, side-effecting steps that must run before any CLI action
-//! is dispatched, and none of them is interesting to the dispatch logic itself.
+//! One-shot, side-effecting steps that must run before any CLI action is
+//! dispatched; none is interesting to the dispatch logic itself.
 
 use crate::config::xdg_config_dir;
 use anyhow::Result;
@@ -37,17 +37,17 @@ pub fn resolve_worker_threads() -> usize {
 /// precedence order. `dotenvy` never overrides an already-set variable, so the
 /// first source to define a key wins.
 pub fn load_dotenv_files() {
-    // 1. Try loading from current working directory or ancestor directories
+    // 1. Current working directory or ancestor directories
     dotenvy::dotenv().ok();
 
-    // 2. Try loading from XDG standard config directory ($XDG_CONFIG_HOME/mini-swe/.env or ~/.config/mini-swe/.env)
+    // 2. XDG standard config directory ($XDG_CONFIG_HOME/mini-swe/.env or ~/.config/mini-swe/.env)
     if env::var("OPENAI_API_KEY").is_err()
         && let Some(dir) = xdg_config_dir()
     {
         dotenvy::from_path(dir.join("mini-swe").join(".env")).ok();
     }
 
-    // 3. Try loading alongside the executable or from ancestor folders
+    // 3. Alongside the executable or from ancestor folders
     if env::var("OPENAI_API_KEY").is_err()
         && let Ok(exe) = env::current_exe()
         && let Some(parent) = exe.parent()
@@ -58,7 +58,7 @@ pub fn load_dotenv_files() {
         }
     }
 
-    // 4. Try loading from explicitly specified ENV_FILE
+    // 4. Explicitly specified ENV_FILE
     if env::var("OPENAI_API_KEY").is_err()
         && let Ok(custom_env) = env::var("ENV_FILE")
     {
