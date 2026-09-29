@@ -68,13 +68,11 @@ const MAX_WORKER_ID_LEN: usize = 64;
 /// impossible before the value reaches either a path or an argv entry:
 ///
 /// * **Traversal.** A `/` can no longer appear, so `../../home/user/.ssh`
-///   degrades to `-home-user-.ssh` and stays a single component inside
+///   degrades to `home-user-ssh` and stays a single component inside
 ///   `swe_base_dir()`. This matters beyond the worktree itself: the same value
 ///   names the directory that `Drop` recursively removes.
-/// * **Option injection.** A leading `-` is stripped, so the id cannot turn
-///   `git worktree add -b <id>` or `git branch -D <id>` into a flag. Git
-///   refuses `-b` values starting with `-`; rejecting them here converts a
-///   silent misparse into a clear error.
+/// * **Option injection.** Leading `-` is stripped even for callers that
+///   later use the sanitized id directly as a git argument.
 ///
 /// An id that sanitizes away to nothing (empty, or nothing but separators and
 /// control bytes) has no safe rendering, so it is replaced with a fresh random
@@ -105,31 +103,43 @@ fn sanitize_worker_id(worker_id: &str) -> String {
     trimmed.to_string()
 }
 
-/// Restrict a worktree directory to its owner (audit §guard-01).
-///
-/// `git worktree add` creates the directory with the process umask applied,
-/// which on a default `022` host is `0755`: on a shared machine every local
-/// account could read the subagent's full checkout of the repository, plus any
-/// secrets and artifacts the orchestrator placed there. The subagent's
-/// workspace is meant to be private, so the mode is pinned to `0o700`.
-///
-/// Best effort by design: the worktree has already been created, so a failure
-/// to tighten it must not fail the dispatch. Group/other bits are never set, so
-/// a concurrent reader can never observe a partially-permissioned tree.
-fn harden_worktree_dir(path: &Path) {
+/// Create the checkout directory private *before* git writes into it.
+/// Git accepts an existing empty directory for `worktree add` and preserves
+/// its mode; chmodding only after checkout exposes its contents under umask 022.
+fn create_private_worktree_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        // Git used to create missing SWE_TEMP_DIR parents during `worktree add`.
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create worktree base {}", parent.display()))?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("Could not create worktree directory {}", path.display()))
+}
+
+/// Verify that git did not relax the directory mode after checkout.
+fn harden_worktree_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
-            debug!(
-                path = %path.display(),
-                error = %e,
-                "Could not restrict worktree directory to 0700"
-            );
-        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "Could not restrict worktree directory {} to 0700",
+                    path.display()
+                )
+            },
+        )?;
     }
     #[cfg(not(unix))]
     let _ = path;
+    Ok(())
 }
 
 /// RAII guard around one subagent's `git` worktree.
@@ -168,6 +178,9 @@ impl WorktreeGuard {
         let path_str = path
             .to_str()
             .context("Worktree path contains invalid UTF-8")?;
+        // Git accepts an existing empty directory. Create it private before
+        // checkout so no reader can observe files under a permissive umask.
+        create_private_worktree_dir(&path)?;
 
         let output = git(
             repo_root,
@@ -180,10 +193,8 @@ impl WorktreeGuard {
             anyhow::bail!("git worktree add failed: {}", stderr);
         }
 
-        // Lock the fresh checkout down to its owner *before* anything else is
-        // written into it, so no artifact is ever written under a permissive
-        // mode (audit §guard-01).
-        harden_worktree_dir(&path);
+        // Verify git left the checkout private before seeding artifacts.
+        harden_worktree_dir(&path)?;
 
         // Write host PID (+ owner uid) to a sibling file so running worktrees are
         // never pruned by concurrent instances, and so a stale marker left by a
@@ -382,13 +393,16 @@ impl Drop for WorktreeGuard {
         let _ = self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        // Inline the lossy conversion: the previous binding kept a heap-allocated
-        // `Cow` alive for the duration of the call, and `worktree remove` never
-        // outlives the argument slice.
+        // Git only borrows the path for the duration of this call.
         let _ = git(
             &self.repo_root,
             "worktree remove",
-            &["worktree", "remove", "--force", &self.path.to_string_lossy()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &self.path.to_string_lossy(),
+            ],
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it
         let has_commits = self.branch_has_commits();
@@ -555,11 +569,18 @@ mod tests {
         ] {
             let id = sanitize_worker_id(raw);
             assert!(!id.is_empty(), "id {raw:?} must not sanitize to nothing");
-            assert!(!id.starts_with('-'), "id {raw:?} would be read as a git flag");
-            assert!(!id.contains('/') && !id.contains('\\'), "id {raw:?} kept a separator");
+            assert!(
+                !id.starts_with('-'),
+                "id {raw:?} would be read as a git flag"
+            );
+            assert!(
+                !id.contains('/') && !id.contains('\\'),
+                "id {raw:?} kept a separator"
+            );
             assert!(!id.contains('.'), "id {raw:?} kept a dot");
             assert!(
-                id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                id.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                 "id {raw:?} kept a byte outside [A-Za-z0-9_-]: {id:?}"
             );
             assert!(id.len() <= MAX_WORKER_ID_LEN, "id {raw:?} exceeded the cap");
@@ -578,12 +599,33 @@ mod tests {
         for raw in ["", "///", "   "] {
             let id = sanitize_worker_id(raw);
             assert!(!id.is_empty(), "id {raw:?} must be replaced, not emptied");
-            assert!(id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+            assert!(id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
         }
         assert_ne!(sanitize_worker_id(""), sanitize_worker_id(""));
 
         // The cap is enforced before the trim, so a long id cannot outrun it.
         assert!(sanitize_worker_id(&"x".repeat(500)).len() <= MAX_WORKER_ID_LEN);
+    }
+
+    /// Git must receive a private directory, not create a public one and wait
+    /// for a post-checkout chmod to close the exposure window.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_dir_is_private_before_git_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "swe-precheckout-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = root.join("missing-base").join("worktree");
+        create_private_worktree_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The worktree directory must never be group- or world-readable: it holds
@@ -605,7 +647,7 @@ mod tests {
         // Start world-readable, the way `git worktree add` under umask 022 does.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        harden_worktree_dir(&dir);
+        harden_worktree_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "worktree dir ended up {mode:o}");
 
