@@ -1,9 +1,40 @@
+use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::LazyLock;
 
 use super::types::{
-    generate_call_id, ChatCompletionResponse, StreamChunk, StreamToolCall, ToolCall, ToolCallFn,
-    MAX_STREAMED_CONTENT_BYTES, MAX_TOOL_ARGUMENT_BYTES, SSE_BUFFER_HINT_BYTES,
+    BashArgs, ChatCompletionResponse, LlmResponse, MAX_STREAMED_CONTENT_BYTES,
+    MAX_TOOL_ARGUMENT_BYTES, SSE_BUFFER_HINT_BYTES, StreamChunk, StreamToolCall, ToolCall,
+    ToolCallFn, generate_call_id,
 };
+
+/// Recover a bash command from the first ```bash / ```sh fenced block.
+///
+/// Uses a single `find()` on a capture-free pattern and slices the body out
+/// of the match by hand, which is materially cheaper than `captures()`.
+/// A literally empty body (```` ```bash\n``` ````) yields `None`, because
+/// the pattern requires a newline before the closing fence; a
+/// whitespace-only body yields `Some("")`.
+pub(crate) fn extract_command(text: &str) -> Option<String> {
+    let full = BASH_BLOCK_RE.find(text)?.as_str();
+    let open_line_end = full.find('\n')?;
+    let close_start = full.len() - "\n```".len();
+    if close_start <= open_line_end {
+        return None;
+    }
+    Some(full[open_line_end + 1..close_start].trim().to_string())
+}
+
+/// Pattern used to recover a shell command from a ```bash/```sh fenced block
+/// when the model did not use the structured `bash` tool call.
+///
+/// The pattern is a compile-time constant (no interpolation), so the compiled
+/// program is memoized process-wide: it is built at most once, no matter how
+/// many `AgentRunner`s (one per worker) exist, and the compiled automaton's
+/// lazy DFA cache is shared instead of duplicated per worker.
+static BASH_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)```(?:bash|sh)[ \t\r\n]*\n.*?\n```").expect("bash block regex must compile")
+});
 
 /// A tool call being assembled from streaming deltas.
 #[derive(Debug, Default)]
@@ -254,11 +285,77 @@ impl SseAccumulator {
         (tcs, seen_ids)
     }
 
+    /// Turn the accumulated stream into the [`LlmResponse`] the agent loop consumes.
+    ///
+    /// The command comes from the structured `bash` tool call when the model
+    /// emitted one, and falls back to a fenced code block in the content
+    /// otherwise. The reported tool-call id is only kept when it survived
+    /// streaming, so the next request never carries a dangling id.
+    pub(crate) fn finish(self) -> LlmResponse {
+        let SseAccumulator {
+            content,
+            tools,
+            invalid_utf8_lines,
+            ..
+        } = self;
+
+        if invalid_utf8_lines > 0 {
+            tracing::warn!(
+                invalid_utf8_lines,
+                "Streamed response contained frames that were not valid UTF-8; decoded lossily"
+            );
+        }
+
+        let bash_tc = tools.values().find(|tc| {
+            !tc.malformed
+                && (tc.name == "bash" || tc.name.trim().is_empty())
+                && !tc.arguments.trim().is_empty()
+        });
+
+        let command = bash_tc
+            .and_then(|tc| {
+                serde_json::from_str::<BashArgs>(&tc.arguments)
+                    .map(|a| a.command)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("command")
+                                    .or_else(|| v.get("cmd"))
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                    })
+            })
+            .or_else(|| extract_command(&content));
+
+        let (finalized, known_ids) = SseAccumulator::finalize_from(&tools);
+        let tool_calls = (!finalized.is_empty()).then_some(finalized);
+        let tool_call_id = tool_calls.as_ref().and_then(|tcs| {
+            bash_tc.and_then(|tc| {
+                let candidate = if tc.id.trim().is_empty() {
+                    tcs.iter()
+                        .find(|t| t.function.arguments == tc.arguments)
+                        .map(|t| t.id.clone())
+                } else {
+                    Some(tc.id.trim().to_string())
+                };
+                candidate.filter(|id| known_ids.contains(id))
+            })
+        });
+
+        LlmResponse {
+            content,
+            command,
+            tool_calls,
+            tool_call_id,
+            invalid_utf8_lines,
+        }
+    }
+
     /// Handle non-streaming JSON response fallback.
-    pub(crate) fn handle_non_stream_fallback(
-        &mut self,
-        buffer: &[u8],
-    ) {
+    pub(crate) fn handle_non_stream_fallback(&mut self, buffer: &[u8]) {
         if self.content.is_empty()
             && self.tools.is_empty()
             && !buffer.is_empty()
@@ -290,7 +387,12 @@ mod tests {
         v
     }
 
-    fn tc(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> StreamToolCall {
+    fn tc(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> StreamToolCall {
         let function = if name.is_some() || args.is_some() {
             Some(StreamFunction {
                 name: name.map(str::to_string),
@@ -421,8 +523,18 @@ mod tests {
     #[test]
     fn duplicate_ids_are_made_unique() {
         let mut acc = SseAccumulator::default();
-        acc.accumulate_tool_call(&tc(0, Some("dup"), Some("bash"), Some(r#"{"command":"a"}"#)));
-        acc.accumulate_tool_call(&tc(1, Some("dup"), Some("bash"), Some(r#"{"command":"b"}"#)));
+        acc.accumulate_tool_call(&tc(
+            0,
+            Some("dup"),
+            Some("bash"),
+            Some(r#"{"command":"a"}"#),
+        ));
+        acc.accumulate_tool_call(&tc(
+            1,
+            Some("dup"),
+            Some("bash"),
+            Some(r#"{"command":"b"}"#),
+        ));
         let (tcs, ids) = SseAccumulator::finalize_from(&acc.tools);
         assert_eq!(tcs.len(), 2);
         assert_ne!(tcs[0].id, tcs[1].id, "ids must be unique");
