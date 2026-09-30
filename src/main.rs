@@ -9,7 +9,7 @@ use mini_swe_mcp::cli::format::format_output;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
-use mini_swe_mcp::{bootstrap, telemetry, worktree};
+use mini_swe_mcp::{bootstrap, config, telemetry, worktree};
 use std::env;
 use std::sync::Arc;
 
@@ -174,10 +174,7 @@ fn print_help() {
 
 /// Concurrent subagents supported out of the box.
 fn max_concurrent_workers() -> usize {
-    env::var("MAX_CONCURRENT_WORKERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+    config::env_parse("MAX_CONCURRENT_WORKERS").unwrap_or(64)
 }
 
 /// OpenAI-compatible base URL, overridable through `OPENAI_API_BASE`.

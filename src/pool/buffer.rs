@@ -30,6 +30,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 
 use crate::agent::AgentStepLog;
+use crate::config::env_parse;
 
 // ----------
 // Step-log retention policy (audit 07 — R1/R2/F1/F2/F6)
@@ -80,15 +81,11 @@ impl LogRetentionPolicy {
     /// and falling back to defaults for zero / non-numeric input.
     pub fn from_env() -> Self {
         let default = Self::default();
-        let max_retained = std::env::var("WORKER_MAX_RETAINED_LOGS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        let max_retained = env_parse::<usize>("WORKER_MAX_RETAINED_LOGS")
             .filter(|&v| v > 0)
             .map(|v| v.min(MAX_RETAINED_LOGS_CEILING))
             .unwrap_or(default.max_retained);
-        let max_emitted = std::env::var("WORKER_MAX_EMITTED_LOGS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+        let max_emitted = env_parse::<usize>("WORKER_MAX_EMITTED_LOGS")
             .filter(|&v| v > 0)
             .map(|v| v.min(MAX_EMITTED_LOGS_CEILING))
             .unwrap_or(default.max_emitted);

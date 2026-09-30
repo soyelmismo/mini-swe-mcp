@@ -212,12 +212,8 @@ fn blocked_by_guardrail(reason: &str) -> String {
 /// Build/test parallelism for the child: `BUILD_PARALLELISM` or half the
 /// available cores (never below one).
 fn build_parallelism() -> String {
-    let default_parallelism = std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(1))
-        .unwrap_or(2);
-    std::env::var("BUILD_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let default_parallelism = crate::config::half_the_cores();
+    crate::config::env_parse("BUILD_PARALLELISM")
         .unwrap_or(default_parallelism)
         .to_string()
 }
@@ -485,20 +481,13 @@ fn apply_build_env(cmd: &mut Command, target_dir: &Path, parallelism: &str) {
 /// default; `COMMAND_TIMEOUT_SECS` overrides either tier.
 fn command_timeout_secs(command: &str) -> u64 {
     let default_timeout = if is_heavy_command(command) {
-        std::env::var("COMMAND_HEAVY_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        crate::config::env_parse("COMMAND_HEAVY_TIMEOUT_SECS")
             .unwrap_or(DEFAULT_HEAVY_TIMEOUT_SECS)
     } else {
-        std::env::var("COMMAND_LIGHT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        crate::config::env_parse("COMMAND_LIGHT_TIMEOUT_SECS")
             .unwrap_or(DEFAULT_LIGHT_TIMEOUT_SECS)
     };
-    std::env::var("COMMAND_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default_timeout)
+    crate::config::env_parse("COMMAND_TIMEOUT_SECS").unwrap_or(default_timeout)
 }
 
 /// Spawn `cmd`, wait up to `timeout_secs`, and collect the combined output.

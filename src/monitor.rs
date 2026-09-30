@@ -27,6 +27,7 @@
 //! repository finishing early is visible both in its own table and in the
 //! fleet-wide strip.
 
+use crate::config::env_parse;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -851,10 +852,7 @@ fn stats_lines(items: &[(&str, String, &'static str)], width: usize, use_color: 
 
 /// Best-effort terminal width in columns.
 pub fn terminal_width() -> Option<usize> {
-    if let Ok(w) = std::env::var("MONITOR_WIDTH")
-        && let Ok(parsed) = w.trim().parse::<usize>()
-        && parsed > 0
-    {
+    if let Some(parsed) = env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0) {
         return Some(parsed);
     }
     terminal_size_via_tty()
@@ -886,10 +884,7 @@ fn terminal_size_via_tty() -> Option<usize> {
 
 /// `COLUMNS` fallback shared by both platforms.
 fn columns_env() -> Option<usize> {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|c| *c > 0)
+    env_parse::<usize>("COLUMNS").filter(|c| *c > 0)
 }
 
 pub async fn run_monitor(once: bool) -> Result<()> {
