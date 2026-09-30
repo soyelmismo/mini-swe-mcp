@@ -294,19 +294,27 @@ impl WorktreeGuard {
     }
 
     pub fn get_diff(&self) -> Result<String> {
+        Self::diff_at(&self.path, &self.base_commit)
+    }
+
+    /// The final diff of the checkout at `path` against `base_commit`.
+    ///
+    /// Shared core of [`WorktreeGuard::get_diff`] so the worker's final tail
+    /// can run off the runtime thread on owned copies of the paths.
+    pub fn diff_at(path: &Path, base_commit: &str) -> Result<String> {
         // Stage untracked files intent-to-add so git diff captures new files.
-        let _ = git(&self.path, "add", &["add", "-N", "."]);
+        let _ = git(path, "add", &["add", "-N", "."]);
 
         // Diff the working tree against the commit the worker started from, so
         // checkpoint commits made along the way (auto-checkpoints, pause on an
         // LLM error) and the still-uncommitted tail are reported together.
         // Diffing against HEAD would hide everything before the last checkpoint.
-        let base = if self.base_commit.is_empty() {
+        let base = if base_commit.is_empty() {
             "HEAD"
         } else {
-            self.base_commit.as_str()
+            base_commit
         };
-        let output = git(&self.path, "diff base", &["diff", base])?;
+        let output = git(path, "diff base", &["diff", base])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("git diff {base} failed: {}", stderr.trim());
@@ -337,19 +345,26 @@ impl WorktreeGuard {
     /// `Drop` is a best-effort safety net), so failing here would abort a
     /// worker's teardown over a single unreadable report.
     pub fn sync_artifacts(&self) -> Vec<String> {
+        Self::sync_artifacts_at(&self.path, &self.repo_root, &self.seeded)
+    }
+
+    /// Sync artifacts from `path` (a worker's checkout) back into `repo_root`,
+    /// skipping files still matching `seeded`.
+    ///
+    /// Shared core of [`WorktreeGuard::sync_artifacts`] so the worker's final
+    /// tail can run off the runtime thread on owned copies of the paths.
+    pub fn sync_artifacts_at(
+        path: &Path,
+        repo_root: &Path,
+        seeded: &BTreeMap<String, FileFingerprint>,
+    ) -> Vec<String> {
         let mut synced = BTreeMap::new();
 
         for dir in ARTIFACT_DIRS {
-            let src_dir = self.path.join(dir);
+            let src_dir = path.join(dir);
             if src_dir.is_dir() {
-                let dest_dir = self.repo_root.join(dir);
-                if let Err(e) = copy_dir_all(
-                    &src_dir,
-                    &dest_dir,
-                    &mut synced,
-                    &self.path,
-                    Some(&self.seeded),
-                ) {
+                let dest_dir = repo_root.join(dir);
+                if let Err(e) = copy_dir_all(&src_dir, &dest_dir, &mut synced, path, Some(seeded)) {
                     debug!(
                         dir = %dir,
                         path = %src_dir.display(),
@@ -361,6 +376,12 @@ impl WorktreeGuard {
         }
 
         synced.into_keys().collect()
+    }
+
+    /// The seeded artifact fingerprints, cloned so the final tail can cross
+    /// into a `spawn_blocking` thread.
+    pub fn seeded(&self) -> BTreeMap<String, FileFingerprint> {
+        self.seeded.clone()
     }
 
     /// Stage and commit everything in the worktree at `path`, reporting
@@ -409,15 +430,34 @@ impl WorktreeGuard {
     /// Commit all dirty changes in the worktree to preserve work in git history,
     /// marking the branch to be retained upon worktree cleanup.
     pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
-        if Self::commit_all(&self.path, message)? {
+        let committed = Self::commit_changes_at(
+            &self.path,
+            &self.repo_root,
+            &self.branch,
+            &self.base_commit,
+            message,
+        )?;
+        if committed.is_some() {
             self.preserve_branch = true;
-            return Ok(Some(self.branch.clone()));
         }
-        // Even if the working tree is clean, check if the branch already
-        // has commits beyond base_commit.
-        if self.branch_has_commits() {
-            self.preserve_branch = true;
-            return Ok(Some(self.branch.clone()));
+        Ok(committed)
+    }
+
+    /// Shared core of [`WorktreeGuard::commit_changes`] on owned paths, so it
+    /// can run off the runtime thread: commit the checkout at `path` when it is
+    /// dirty, and name `branch` when it carries work (new or already
+    /// committed beyond `base_commit`). The caller marks the branch preserved.
+    pub fn commit_changes_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        message: &str,
+    ) -> Result<Option<String>> {
+        if Self::commit_all(path, message)?
+            || Self::branch_has_commits_at(repo_root, base_commit, branch)
+        {
+            return Ok(Some(branch.to_string()));
         }
         Ok(None)
     }
@@ -427,17 +467,17 @@ impl WorktreeGuard {
     /// Shared by [`WorktreeGuard::commit_changes`] and [`Drop`]: a branch with
     /// committed work is never deleted, whatever else cleanup decides.
     fn branch_has_commits(&self) -> bool {
-        if self.base_commit.is_empty() {
+        Self::branch_has_commits_at(&self.repo_root, &self.base_commit, &self.branch)
+    }
+
+    fn branch_has_commits_at(repo_root: &Path, base_commit: &str, branch: &str) -> bool {
+        if base_commit.is_empty() {
             return false;
         }
         git(
-            &self.repo_root,
+            repo_root,
             "rev-list",
-            &[
-                "rev-list",
-                "--count",
-                &format!("{}..{}", self.base_commit, self.branch),
-            ],
+            &["rev-list", "--count", &format!("{base_commit}..{branch}")],
         )
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
@@ -517,7 +557,7 @@ fn tmp_sibling_name(dir: &Path, file_name: &str) -> PathBuf {
 /// Length is the cheap discriminator and the hash only has to separate files of
 /// the same size, so a collision costs a redundant re-copy, never a lost edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileFingerprint {
+pub struct FileFingerprint {
     len: u64,
     hash: u64,
 }

@@ -20,6 +20,43 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+/// Raise this process's soft `RLIMIT_NOFILE` to the hard limit, so ~100 worker
+/// tasks each owning pipes, sockets and subprocess fds never bump into the
+/// login-shell default (typically 1024).
+pub fn raise_nofile_limit() {
+    use std::mem::MaybeUninit;
+    // SAFETY: `getrlimit`/`setrlimit` take `RLIMIT_NOFILE` and a valid rlimit
+    // pointer, and nothing else in this process touches the fd limit.
+    unsafe {
+        let mut limits = MaybeUninit::<libc::rlimit>::uninit();
+        let get = libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr());
+        if get != 0 {
+            warn!(error = ?std::io::Error::last_os_error(), "Could not read RLIMIT_NOFILE");
+            return;
+        }
+        let limits = limits.assume_init();
+        if limits.rlim_cur >= limits.rlim_max {
+            debug!(soft = limits.rlim_cur, hard = limits.rlim_max, "RLIMIT_NOFILE already raised");
+            return;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: limits.rlim_max,
+            rlim_max: limits.rlim_max,
+        };
+        let old = limits.rlim_cur;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+            debug!(old, new = raised.rlim_cur, "Raised RLIMIT_NOFILE soft limit to the hard limit");
+        } else {
+            warn!(
+                old,
+                hard = limits.rlim_max,
+                error = ?std::io::Error::last_os_error(),
+                "Could not raise RLIMIT_NOFILE"
+            );
+        }
+    }
+}
+
 use crate::mcp::McpServer;
 
 /// Default idle window before the daemon exits on its own.
@@ -164,6 +201,7 @@ impl HubServer {
     /// Returns `Ok(false)` when another daemon already holds the lock, so the
     /// caller can report it and exit 0 without disturbing the live daemon.
     pub async fn run(&self) -> Result<bool> {
+        raise_nofile_limit();
         let paths = self.config.paths();
         let lock = acquire_lock(&paths.lock())?;
         let Some(lock) = lock else {

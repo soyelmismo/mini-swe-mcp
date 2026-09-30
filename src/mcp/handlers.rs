@@ -722,8 +722,16 @@ impl McpServer {
             "Pruning stale worktrees and dead worker branches",
         )
         .await;
-        crate::worktree::prune_stale_worktrees(&repo_path);
-        crate::pool::prune_orphan_histories(&repo_path);
+        // Both sweeps walk directories, shell out to git and salvage dead
+        // worktrees, so they run off the runtime thread.
+        let pruned = tokio::task::spawn_blocking(move || {
+            crate::worktree::prune_stale_worktrees(&repo_path);
+            crate::pool::prune_orphan_histories(&repo_path);
+        })
+        .await;
+        if pruned.is_err() {
+            tracing::warn!("Worktree prune task could not run");
+        }
         Self::emit_progress(tx, token, 1, 1, "Prune complete").await;
         Ok(json!({
             "status": "pruned",

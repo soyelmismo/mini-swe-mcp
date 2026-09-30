@@ -20,12 +20,15 @@
 //! "steer → warn → checkpoint → stagnation → LLM step → repeat check → bash →
 //! sentinel → record → next turn" is readable end to end in one place.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
-use crate::worktree::WorktreeGuard;
+use crate::worktree::{FileFingerprint, WorktreeGuard};
 
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
@@ -163,11 +166,17 @@ impl WorkerPool {
 
         // A revision re-attaches to the branch the previous run committed to,
         // so the worker keeps its id, its checkpoints and its diff base; a
-        // fresh dispatch creates the branch instead.
-        let mut worktree = match &resume_base_commit {
-            Some(base) => WorktreeGuard::reopen(&repo_path, &worker_id, base)?,
-            None => WorktreeGuard::new(&repo_path, &worker_id)?,
-        };
+        // fresh dispatch creates the branch instead. Checkout shells out to
+        // git and walks the tree, so it runs off the runtime thread.
+        let resume_base_commit = resume_base_commit.clone();
+        let repo_path_owned = repo_path.clone();
+        let worker_id_owned = worker_id.clone();
+        let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
+            Some(base) => WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base),
+            None => WorktreeGuard::new(&repo_path_owned, &worker_id_owned),
+        })
+        .await
+        .context("Worktree checkout task failed")??;
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -349,7 +358,38 @@ impl WorkerPool {
                 .await?;
         }
 
-        let artifacts = worktree.sync_artifacts();
+        // The artifact sync, the final diff and the final commit all shell
+        // out to git and walk files, so the whole tail runs off the runtime
+        // thread on owned copies of the guard's paths.
+        let task_headline: String = task
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("completed task")
+            .to_string();
+        let agent_summary = last_assistant_text.trim().to_string();
+        let path = worktree.path.clone();
+        let repo_root = worktree.repo_root.clone();
+        let base_commit = worktree.base_commit.clone();
+        let branch = worktree.branch.clone();
+        let seeded = worktree.seeded();
+        let metrics_path = path.clone();
+        let metrics_base = base_commit.clone();
+        let (artifacts, diff, summary, branch, now) = tokio::task::spawn_blocking(move || {
+            finalize_worktree(FinalizeInput {
+                path,
+                repo_root,
+                base_commit,
+                branch,
+                seeded,
+                task_headline,
+                agent_summary,
+                step,
+            })
+        })
+        .await
+        .context("Worktree finalization task failed")??;
+        worktree.preserve_branch = worktree.preserve_branch || branch.is_some();
         if !artifacts.is_empty() {
             info!(
                 worker = %worker_id,
@@ -358,59 +398,18 @@ impl WorkerPool {
             );
         }
 
-        let diff = worktree.get_diff()?;
-        let now = unix_timestamp();
-
         // Health counters measured once, at the end: the turn total the record
         // reports and the size of the diff it produced. `git` is a blocking
         // subprocess, so the shortstat sample is taken off the runtime.
         meta.metrics.turns_used = step;
         if let Some((files, insertions, deletions)) =
-            shortstat_of(&worktree.path, &worktree.base_commit).await
+            shortstat_of(&metrics_path, &metrics_base).await
         {
             meta.metrics.diff_files = files;
             meta.metrics.diff_insertions = insertions;
             meta.metrics.diff_deletions = deletions;
         }
 
-        let task_headline = task
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("completed task");
-
-        let agent_summary = last_assistant_text.trim();
-        let summary = if !agent_summary.is_empty() {
-            agent_summary.to_string()
-        } else if !diff.trim().is_empty() {
-            format!("{task_headline} (produced diff in {step} turns)")
-        } else {
-            format!("{task_headline} (completed in {step} turns)")
-        };
-
-        let branch = if !diff.trim().is_empty() {
-            let commit_subject = if !agent_summary.is_empty() {
-                let first_line = agent_summary.lines().next().unwrap_or(task_headline).trim();
-                let stripped = first_line.trim_start_matches('#').trim();
-                if stripped.is_empty() {
-                    task_headline
-                } else {
-                    stripped
-                }
-            } else {
-                task_headline
-            };
-            let clean_subject = if commit_subject.len() > 72 {
-                let cut = commit_subject.floor_char_boundary(69);
-                format!("{}...", &commit_subject[..cut])
-            } else {
-                commit_subject.to_string()
-            };
-            let commit_msg = format!("worker({worker_id}): {clean_subject}");
-            worktree.commit_changes(&commit_msg).unwrap_or(None)
-        } else {
-            None
-        };
 
         // A worker that exhausted its verification budget completes anyway but
         // is flagged: both the completion summary and the registry last_command
@@ -464,4 +463,71 @@ impl WorkerPool {
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())
     }
+}
+
+/// Everything the worker's final tail needs, owned so it can cross into a
+/// `spawn_blocking` thread.
+struct FinalizeInput {
+    path: PathBuf,
+    repo_root: PathBuf,
+    base_commit: String,
+    branch: String,
+    seeded: BTreeMap<String, FileFingerprint>,
+    task_headline: String,
+    agent_summary: String,
+    step: usize,
+}
+
+/// Sync the worker's artifacts, take its final diff and commit it.
+///
+/// The worker's finished output: synced artifacts, final diff, completion
+/// summary, the branch the commit landed on (`None` when there was nothing to
+/// commit) and the completion timestamp.
+type FinalizedWork = (Vec<String>, String, String, Option<String>, u64);
+
+/// Sync the worker's artifacts, take its final diff and commit it.
+fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
+    let FinalizeInput {
+        path,
+        repo_root,
+        base_commit,
+        branch,
+        seeded,
+        task_headline,
+        agent_summary,
+        step,
+    } = input;
+    let artifacts = WorktreeGuard::sync_artifacts_at(&path, &repo_root, &seeded);
+    let diff = WorktreeGuard::diff_at(&path, &base_commit)?;
+    let summary = if !agent_summary.is_empty() {
+        agent_summary.to_string()
+    } else if !diff.trim().is_empty() {
+        format!("{task_headline} (produced diff in {step} turns)")
+    } else {
+        format!("{task_headline} (completed in {step} turns)")
+    };
+    let committed = if diff.trim().is_empty() {
+        None
+    } else {
+        let commit_subject: &str = if !agent_summary.is_empty() {
+            let first_line = agent_summary.lines().next().unwrap_or(&task_headline).trim();
+            let stripped = first_line.trim_start_matches('#').trim();
+            if stripped.is_empty() {
+                &task_headline
+            } else {
+                stripped
+            }
+        } else {
+            &task_headline
+        };
+        let clean_subject = if commit_subject.len() > 72 {
+            let cut = commit_subject.floor_char_boundary(69);
+            format!("{}...", &commit_subject[..cut])
+        } else {
+            commit_subject.to_string()
+        };
+        let commit_msg = format!("worker({branch}): {clean_subject}");
+        WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &commit_msg)?
+    };
+    Ok((artifacts, diff, summary, committed, unix_timestamp()))
 }

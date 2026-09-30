@@ -59,6 +59,7 @@ impl AgentRunner {
     }
 }
 
+#[derive(Clone)]
 pub struct AgentRunner {
     pub http_client: reqwest::Client,
     pub api_base: String,
@@ -75,6 +76,10 @@ pub struct AgentRunner {
     pub command_timeout_override: Option<u64>,
     pub max_retries: usize,
     pub initial_retry_delay: Duration,
+    /// Jobs granted by the heavy-command admission controller for the next
+    /// `execute_bash` call. `None` keeps the default parallelism; `BUILD_PARALLELISM`
+    /// still overrides either way.
+    pub build_jobs: Option<usize>,
 }
 
 impl AgentRunner {
@@ -92,12 +97,20 @@ impl AgentRunner {
             command_timeout_override: None,
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
+            build_jobs: None,
         }
     }
 
     /// Confine every bash step to an isolated network namespace (`unshare -n`).
     pub fn with_network_offline(mut self, offline: bool) -> Self {
         self.network_offline = offline;
+        self
+    }
+
+    /// Carry the admission controller's granted job count into the next
+    /// `execute_bash` call (one command; the caller clones per command).
+    pub fn with_build_jobs(mut self, jobs: usize) -> Self {
+        self.build_jobs = Some(jobs.max(1));
         self
     }
 

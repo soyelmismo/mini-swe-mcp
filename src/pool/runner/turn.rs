@@ -18,6 +18,7 @@
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -302,7 +303,7 @@ impl<'a> TurnEngine<'a> {
 
         // --- Automatic checkpoint (both phases) ---
         if *self.step > 0 && (*self.step).is_multiple_of(AUTO_CHECKPOINT_TURNS) {
-            self.checkpoint();
+            self.checkpoint().await;
         }
 
         // --- Stagnation detector (implementer only, like the sentinels) ---
@@ -325,11 +326,24 @@ impl<'a> TurnEngine<'a> {
                         return Ok(TurnOutcome::EndReview);
                     }
                     LlmErrorPolicy::PauseForOrchestrator => {
-                        // Safe checkpoint of uncommitted worktree changes so work is never lost
-                        let _ = self.worktree.commit_changes(&format!(
-                            "worker({}): checkpoint step {} before pause (error: {})",
-                            self.worker_id, *self.step, e
-                        ));
+                        // Safe checkpoint of uncommitted worktree changes so work is never lost.
+                        // `commit_changes` shells out to git, so it runs off the runtime thread.
+                        {
+                            let path = self.worktree.path.clone();
+                            let message = format!(
+                                "worker({}): checkpoint step {} before pause (error: {})",
+                                self.worker_id, *self.step, e
+                            );
+                            let committed =
+                                tokio::task::spawn_blocking(move || {
+                                    WorktreeGuard::commit_all(&path, &message)
+                                })
+                                .await
+                                .unwrap_or(Ok(false));
+                            if committed.unwrap_or(false) {
+                                self.worktree.preserve_branch = true;
+                            }
+                        }
 
                         warn!(
                             worker = %self.worker_id,
@@ -709,18 +723,32 @@ impl<'a> TurnEngine<'a> {
 
     /// Commit whatever the worker has uncommitted, so a kill or a crash never
     /// costs more than one checkpoint interval of work.
-    fn checkpoint(&mut self) {
+    ///
+    /// `commit_changes` shells out to git, so it runs off the runtime thread.
+    async fn checkpoint(&mut self) {
         let message = format!(
             "worker({}): auto-checkpoint step {}",
             self.worker_id, *self.step
         );
-        match self.worktree.commit_changes(&message) {
-            Ok(Some(branch)) => info!(
-                worker = %self.worker_id,
-                step = *self.step,
-                branch = %branch,
-                "Committed worker checkpoint"
-            ),
+        let path = self.worktree.path.clone();
+        let repo_root = self.worktree.repo_root.clone();
+        let branch = self.worktree.branch.clone();
+        let base_commit = self.worktree.base_commit.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &message)
+        })
+        .await
+        .unwrap_or(Ok(None));
+        match committed {
+            Ok(Some(kept)) => {
+                self.worktree.preserve_branch = true;
+                info!(
+                    worker = %self.worker_id,
+                    step = *self.step,
+                    branch = %kept,
+                    "Committed worker checkpoint"
+                )
+            }
             Ok(None) => {}
             Err(e) => warn!(
                 worker = %self.worker_id,
@@ -757,17 +785,17 @@ impl<'a> TurnEngine<'a> {
             .push(ChatMessage::text(Role::User, stagnation_nudge()));
     }
 
-    /// Run `command` through the worker's semaphores: heavy commands take a
-    /// build slot, every command takes a bash slot.
+    /// Run `command` through the worker's semaphores: heavy commands are
+    /// admitted by the resource-aware controller, every command takes a bash
+    /// slot.
+    ///
+    /// A granted heavy command also carries the job count the controller
+    /// divided over the builds already running, which rides on a runner clone
+    /// for this one command; a light command keeps the default parallelism.
     async fn run_gated(&self, command: &str) -> Result<(String, Option<i32>)> {
-        let _build_permit = if crate::agent::is_heavy_command(command) {
-            Some(
-                self.pool
-                    .build_semaphore
-                    .acquire()
-                    .await
-                    .context("Build semaphore closed")?,
-            )
+        let heavy = crate::agent::is_heavy_command(command);
+        let build_permit = if heavy {
+            Some(self.pool.admission.acquire().await)
         } else {
             None
         };
@@ -777,7 +805,11 @@ impl<'a> TurnEngine<'a> {
             .acquire()
             .await
             .context("Bash semaphore closed")?;
-        self.runner.execute_bash(&self.worktree.path, command).await
+        let runner = match &build_permit {
+            Some(permit) => Cow::Owned(self.runner.clone().with_build_jobs(permit.jobs())),
+            None => Cow::Borrowed(self.runner),
+        };
+        runner.execute_bash(&self.worktree.path, command).await
     }
 
     /// Record one executed exchange in the history: an assistant turn that
