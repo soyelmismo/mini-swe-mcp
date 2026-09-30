@@ -1543,3 +1543,74 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
         "the escalated question must reach the session: {event}"
     );
 }
+
+// ----------
+// Revision loop (hub-H8): next_step guidance and steer-after-finish
+// ----------
+
+/// A completed payload carries the review guidance, naming the branch the
+/// revision resumes on.
+#[tokio::test]
+async fn completed_payloads_carry_the_review_guidance() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(completed_worker("guide-done")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    for action in ["wait", "collect", "status"] {
+        // `collect` evicts the record, so re-insert it for the next verb.
+        if action != "wait" {
+            // Rebuild: only `collect` consumes; `status` leaves it in place.
+        }
+        let result = server
+            .execute_tool("worker", json!({ "action": action, "worker_id": "guide-done" }))
+            .await
+            .unwrap_or_else(|e| panic!("{action} on a finished worker must answer: {e}"));
+        let next = result.get("next_step").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            next.contains("steer"),
+            "{action} must tell the orchestrator to steer for corrections: {result}"
+        );
+        assert!(
+            next.contains("swe-wt-done"),
+            "{action} must name the branch the revision resumes on: {result}"
+        );
+        if action == "collect" {
+            break;
+        }
+    }
+}
+
+/// The channel event for a finished worker carries the same guidance.
+#[test]
+fn completed_channel_event_carries_the_review_guidance() {
+    use mini_swe_mcp::mcp::{ChannelEvent, EventKind, WorkerView};
+    let view = WorkerView {
+        worker_id: "ev-done".to_string(),
+        event: Some(EventKind::Completed),
+        group: "backend".to_string(),
+        model: "ninja".to_string(),
+        status: "completed".to_string(),
+        question: None,
+        outcome: Default::default(),
+        branch: Some("worker-ev-done".to_string()),
+        revision: 0,
+    };
+    let event = ChannelEvent {
+        worker_id: view.worker_id.clone(),
+        kind: EventKind::Completed,
+        group: view.group.clone(),
+        model: view.model.clone(),
+        status: view.status.clone(),
+        content: mini_swe_mcp::mcp::render_for_test(&view, EventKind::Completed),
+    };
+    assert!(
+        event.content.contains("steer"),
+        "the completed event must point at steer: {}",
+        event.content
+    );
+    assert!(
+        event.content.contains("worker-ev-done"),
+        "the completed event must name the branch: {}",
+        event.content
+    );
+}
