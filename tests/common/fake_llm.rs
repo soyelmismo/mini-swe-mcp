@@ -120,7 +120,10 @@ async fn serve_turn(
 }
 
 /// Read one HTTP request head plus its `Content-Length` body.
-async fn read_request(socket: &mut TcpStream) -> Option<String> {
+///
+/// Returns `None` when the peer closes the connection before the head is
+/// complete, so a client killed mid-request cannot take the server down.
+pub async fn read_request(socket: &mut TcpStream) -> Option<String> {
     let mut head: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {

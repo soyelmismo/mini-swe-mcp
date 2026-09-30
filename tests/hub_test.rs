@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{TcpListener, UnixStream};
 
 static TAG: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +50,29 @@ async fn wait_for_socket(path: &Path) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("hub socket {} never came up", path.display());
+}
+
+/// Wait until the worker's registry row reports `status`, or return the last
+/// row read at the deadline.
+///
+/// The hub recovers orphans before it binds its socket, but a child of the
+/// killed hub can keep the previous listener alive, so [`wait_for_socket`] may
+/// return while the row still carries its pre-crash status: poll for the write.
+async fn wait_for_registry_status(
+    registry: &Path,
+    wid: &str,
+    status: mini_swe_mcp::pool::RegistryStatus,
+) -> mini_swe_mcp::pool::WorkerRegistryEntry {
+    let path = registry.join(format!("{wid}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let row: mini_swe_mcp::pool::WorkerRegistryEntry =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if row.status == status || std::time::Instant::now() >= deadline {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 struct Client {
@@ -907,8 +930,6 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
 #[tokio::test]
 async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
 
     let root = common::TempDir::new_in_tmp("hub-checkpoint-revision");
     // Unix socket paths are bounded by sockaddr_un, unlike scratch paths.
@@ -927,43 +948,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}/v1", listener.local_addr().unwrap());
-    let llm = tokio::spawn(async move {
-        for turn in 1..=21 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let header_end = loop {
-                let mut byte = [0];
-                socket.read_exact(&mut byte).await.unwrap();
-                bytes.push(byte[0]);
-                if bytes.ends_with(b"\r\n\r\n") {
-                    break bytes.len();
-                }
-            };
-            let headers = String::from_utf8_lossy(&bytes).to_lowercase();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
-                .unwrap();
-            bytes.resize(header_end + length, 0);
-            socket.read_exact(&mut bytes[header_end..]).await.unwrap();
-            if turn == 20 {
-                // Leave the post-checkpoint LLM call unfinished until SIGKILL.
-                continue;
-            }
-            let command = match turn {
-                19 => "echo checkpoint > kept.txt".to_string(),
-                21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
-                _ => format!("echo turn {turn}"),
-            };
-            let chunk = serde_json::json!({"choices":[{"delta":{
-                "content": format!("```bash\n{command}\n```"),
-            }}]});
-            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
-            socket.write_all(format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
-            ).as_bytes()).await.unwrap();
-        }
-    });
+    let llm = tokio::spawn(serve_checkpoint_revision_script(listener));
     let command = || {
         let mut cmd = tokio::process::Command::new(common::binary_path());
         cmd.env("SWE_HUB_DIR", &hub)
@@ -1057,10 +1042,12 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         .spawn()
         .unwrap();
     wait_for_socket(&hub.join("hub.sock")).await;
-    let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
-        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap(),
+    let recovered = wait_for_registry_status(
+        &swe.join("swe-registry"),
+        wid,
+        mini_swe_mcp::pool::RegistryStatus::Interrupted,
     )
-    .unwrap();
+    .await;
     // Interrupted, not failed: the worker stopped because the hub did, and its
     // conversation survived, so the steer below continues it.
     assert_eq!(
@@ -1118,6 +1105,85 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         .expect("LLM completed all turns")
         .unwrap();
     std::fs::remove_dir_all(&hub).unwrap();
+}
+
+/// Script the fake LLM for `a_checkpointed_worker_survives_hub_sigkill_and_revision`:
+/// turn 19 writes the checkpoint marker, turn 20 is deliberately left unanswered
+/// so the hub can be SIGKILLed mid-call, and turn 21 finishes the worker.
+async fn serve_checkpoint_revision_script(listener: TcpListener) {
+    for turn in 1..=21 {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // A SIGKILL can drop the connection mid-request: skip that turn and keep
+        // accepting, or the restarted worker would find no LLM left.
+        if common::fake_llm::read_request(&mut socket).await.is_none() {
+            continue;
+        }
+        if turn == 20 {
+            // Leave the post-checkpoint LLM call unfinished until SIGKILL.
+            continue;
+        }
+        let command = match turn {
+            19 => "echo checkpoint > kept.txt".to_string(),
+            21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
+            _ => format!("echo turn {turn}"),
+        };
+        let chunk = serde_json::json!({"choices":[{"delta":{
+            "content": format!("```bash\n{command}\n```"),
+        }}]});
+        let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        // A client killed mid-response is not an error: the next turn's
+        // connection is the one the worker needs.
+        let _ = socket.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+        ).as_bytes()).await;
+    }
+}
+
+/// A hub killed mid-request closes its socket before the fake LLM has read the
+/// request whole. The script must skip that connection and move on, so the retry
+/// from the restarted worker still gets the closing turn.
+#[tokio::test]
+async fn the_revision_script_answers_after_a_connection_closed_mid_request() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+
+    async fn ask(addr: std::net::SocketAddr) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        reply
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_checkpoint_revision_script(listener));
+
+    for turn in 1..=18 {
+        assert!(ask(addr).await.contains(&format!("echo turn {turn}")));
+    }
+    assert!(ask(addr).await.contains("kept.txt"));
+
+    // Turn 20's request is in flight when the hub dies: half a head, then the
+    // socket drops.
+    let mut torn = TcpStream::connect(addr).await.unwrap();
+    torn.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    drop(torn);
+
+    // The resumed worker's retry is answered with the closing turn.
+    assert!(
+        ask(addr)
+            .await
+            .contains("COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")
+    );
+    server.abort();
 }
 
 fn event_worker(id: &str, owner: &str) -> mini_swe_mcp::pool::WorkerRecord {
