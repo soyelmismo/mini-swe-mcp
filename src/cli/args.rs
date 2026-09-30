@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>]";
+pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--timeout <secs>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>]";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
@@ -31,17 +31,26 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
                 eprintln!("Usage: mini-swe-mcp {DISPATCH_USAGE}");
                 return Ok(None);
             }
-            dispatch_args(cli_args, &mut tool_args);
+            dispatch_args(cli_args, &mut tool_args)?;
         }
-        "status" | "collect" | "logs" | "kill" => {
+        "status" | "collect" | "logs" | "kill" | "wait" => {
             if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
+            }
+            if let Some(mut i) = flag_index(cli_args, &["--timeout"]) {
+                take_timeout(cli_args, &mut i, &mut tool_args)?;
             }
         }
         "steer" => {
             if cli_args.len() > 3 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
                 tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
+                if flag_index(cli_args, &["--wait", "-w"]).is_some() {
+                    tool_args.insert("wait".into(), Value::Bool(true));
+                }
+                if let Some(mut i) = flag_index(cli_args, &["--timeout"]) {
+                    take_timeout(cli_args, &mut i, &mut tool_args)?;
+                }
             }
         }
         "manifest" | "list" | "reap" => {}
@@ -69,7 +78,7 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
 ///
 /// A value flag consumes the next word verbatim; one with nothing after it is
 /// dropped rather than defaulted to an empty string.
-fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
+fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Result<()> {
     tool_args.insert("task".into(), Value::String(cli_args[2].clone()));
     let mut i = 3;
     while i < cli_args.len() {
@@ -98,10 +107,40 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
                 tool_args.insert("network".into(), Value::String("offline".into()));
             }
             "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
+            "--timeout" => take_timeout(cli_args, &mut i, tool_args)?,
             _ => {}
         }
         i += 1;
     }
+    Ok(())
+}
+
+/// Position of the first of `flags` in `cli_args`, if the operator passed one.
+fn flag_index(cli_args: &[String], flags: &[&str]) -> Option<usize> {
+    cli_args
+        .iter()
+        .position(|arg| flags.contains(&arg.as_str()))
+}
+
+/// Fold `--timeout <secs>` into the tool's `timeout_secs` argument.
+///
+/// Unlike the other value flags, a malformed value is an error instead of a
+/// silently dropped flag: the deadline exists to bound the wait, and dropping
+/// it is exactly the unbounded wait the operator asked to avoid.
+fn take_timeout(
+    cli_args: &[String],
+    i: &mut usize,
+    tool_args: &mut Map<String, Value>,
+) -> Result<()> {
+    let Some(raw) = cli_args.get(*i + 1) else {
+        anyhow::bail!("--timeout expects a whole number of seconds");
+    };
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--timeout expects a whole number of seconds, got '{raw}'"))?;
+    tool_args.insert("timeout_secs".into(), Value::from(secs));
+    *i += 1;
+    Ok(())
 }
 
 /// Consume the value after a flag, if present.
@@ -253,6 +292,43 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(with["verify"], "cargo test --all-targets");
+    }
+
+    /// `wait <id>` is the CLI spelling of the tool's `wait` action: the verb
+    /// carries the worker id and nothing else.
+    #[test]
+    fn test_wait_maps_the_worker_id_onto_the_wait_action() {
+        let a = args(&["mini-swe-mcp", "wait", "w1"]);
+        let out = tool_args("wait", &a, true).unwrap().unwrap();
+        assert_eq!(out["action"], "wait");
+        assert_eq!(out["worker_id"], "w1");
+        assert!(!out.contains_key("wait"), "the verb already implies waiting: {out:?}");
+
+        let bare = tool_args("wait", &args(&["mini-swe-mcp", "wait"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare.len(), 1, "a workerless `wait` stays argument-free: {bare:?}");
+    }
+
+    /// `--wait` on `steer` is the same `wait` property `dispatch` uses, so
+    /// steer-and-wait stays one tool call.
+    #[test]
+    fn test_steer_wait_flag_maps_to_the_wait_property() {
+        let plain = args(&["mini-swe-mcp", "steer", "w1", "focus on the parser"]);
+        let without = tool_args("steer", &plain, true).unwrap().unwrap();
+        assert_eq!(without["worker_id"], "w1");
+        assert_eq!(without["message"], "focus on the parser");
+        assert!(
+            !without.contains_key("wait"),
+            "an omitted flag must not make steer block: {without:?}"
+        );
+
+        for flag in ["--wait", "-w"] {
+            let flagged = args(&["mini-swe-mcp", "steer", "w1", "focus on the parser", flag]);
+            let with = tool_args("steer", &flagged, true).unwrap().unwrap();
+            assert_eq!(with["wait"], Value::Bool(true), "flag {flag}");
+            assert_eq!(with["message"], "focus on the parser", "flag {flag}");
+        }
     }
 
     #[test]

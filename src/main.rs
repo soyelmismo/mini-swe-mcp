@@ -159,7 +159,8 @@ fn print_help() {
     println!("  collect <worker_id>");
     println!("  logs <worker_id>");
     println!("  reap");
-    println!("  steer <worker_id> <message>");
+    println!("  steer <worker_id> <message> [--wait]");
+    println!("  wait <worker_id>");
     println!("  list");
     println!("  monitor [--once]");
     println!("  supervisor [--once]");
