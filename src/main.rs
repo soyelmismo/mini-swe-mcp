@@ -221,7 +221,10 @@ fn print_help() {
     println!("  {DISPATCH_USAGE}");
     println!("           Start a worker on its own branch; always detaches.");
     println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
-    println!("           Next worker event, replaying events missed before connecting.");
+    println!(
+        "           Block until the next worker event (replaying missed ones), print it and exit;"
+    );
+    println!("           run it in the background and the host CLI wakes you when it ends.");
     println!("  status <worker_id> | status --line");
     println!("           Final status/diff, or a one-line pool summary for statusLine.");
     println!("  collect <worker_id>");

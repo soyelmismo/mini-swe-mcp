@@ -384,6 +384,9 @@ fn tool_description_carries_the_orchestrator_guidelines() {
     for needle in [
         "ONE focused concern",
         "mini-swe-mcp watch",
+        "timeout_secs",
+        "no_event",
+        "push notifications",
         "steer",
         "merge only when it is right",
     ] {

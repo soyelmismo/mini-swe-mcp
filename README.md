@@ -58,7 +58,7 @@ Write the task as ONE focused concern with the files in scope and an acceptance 
 
 ### 2. watch
 
-`watch` is the only way to wait. It reports an event when a watched worker **completes, fails, needs input or stalls**, and **replays events a late watcher missed**, so there is no `wait` action and no `--wait` flag.
+`watch` is the only way to wait, and you should run it in the **background**: it blocks until a watched worker **completes, fails, needs input or stalls**, prints it and exits -- so the host CLI wakes you when the command ends -- and **replays events a late watcher missed** first.
 
 ```bash
 mini-swe-mcp watch --follow             # every worker this agent owns
@@ -67,6 +67,8 @@ mini-swe-mcp watch --group build        # first event in the group, then return
 ```
 
 Without `--follow` it prints the next event and returns; with `--follow` it streams until every watched worker is terminal. `--timeout <secs>` bounds the wait; `--json` emits the raw event stream.
+
+An agent with no shell can call the `watch` action instead, passing `timeout_secs` below its host's tool deadline and calling it again on `no_event`. A Claude Code session started with channels enabled also receives the same events as push notifications.
 
 ### 3. review
 
