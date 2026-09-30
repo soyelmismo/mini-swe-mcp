@@ -18,7 +18,6 @@
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -33,11 +32,22 @@ use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::super::WorkerPool;
+use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
     summarize_command,
 };
+
+/// Prefix used by both tool results and code-block command output messages.
+pub(super) const COMMAND_OUTPUT_PREFIX: &str = "COMMAND OUTPUT (exit code: ";
+
+/// Prefix of verification feedback; user-role feedback remains an instruction.
+pub(super) const VERIFICATION_OUTPUT_PREFIX: &str = "VERIFICATION FAILED (exit ";
+
+/// Follow-up when the model produced no executable bash command.
+pub(super) const NO_COMMAND_NUDGE: &str =
+    "ERROR: No bash command found. You MUST call the `bash` tool with your command.";
 
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
@@ -336,6 +346,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         // --- LLM call with error handling ---
+        compact_history(self.messages);
         let llm_resp = match self.runner.run_step_llm(self.messages).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -408,6 +419,7 @@ impl<'a> TurnEngine<'a> {
                                     ));
                                 }
                                 // Re-run the LLM step now that network/connectivity is restored
+                                compact_history(self.messages);
                                 self.runner.run_step_llm(self.messages).await?
                             }
                             None => return Err(e),
@@ -607,7 +619,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         let output_text = format!(
-            "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
+            "{COMMAND_OUTPUT_PREFIX}{}):\n```\n{}\n```",
             code.unwrap_or(-1),
             output
         );
@@ -708,7 +720,7 @@ impl<'a> TurnEngine<'a> {
             " Base {branch} was merged before this check; verification ran on the integrated tree."
         )).unwrap_or_default();
         let output_text = format!(
-            "VERIFICATION FAILED (exit {exit}) - fix these problems before completing.{integration}\n{output}"
+            "{VERIFICATION_OUTPUT_PREFIX}{exit}) - fix these problems before completing:{integration}\n{output}"
         );
         // The completion turn is replayed with the same rules as a command
         // turn, so the next request never carries a dangling tool_call.
@@ -897,7 +909,7 @@ impl<'a> TurnEngine<'a> {
     /// A granted heavy command also carries the job count the controller
     /// divided over the builds already running, which rides on a runner clone
     /// for this one command; a light command keeps the default parallelism.
-    async fn run_gated(&self, command: &str) -> Result<(String, Option<i32>)> {
+    async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {
             Some(self.pool.admission.acquire().await)
@@ -910,10 +922,14 @@ impl<'a> TurnEngine<'a> {
             .acquire()
             .await
             .context("Bash semaphore closed")?;
-        let runner = match &build_permit {
-            Some(permit) => Cow::Owned(self.runner.clone().with_build_jobs(permit.jobs())),
-            None => Cow::Borrowed(self.runner),
-        };
+        let mut runner = self.runner.clone();
+        if let Some(permit) = &build_permit {
+            self.worktree.last_build_slot = Some(permit.slot());
+            runner = runner.with_build_jobs(permit.jobs());
+        }
+        runner.build_target_dir = self.worktree.last_build_slot
+            .map(|slot| crate::cache::slot_target_dir(&self.worktree.repo_root, slot))
+            .transpose()?;
         runner.execute_bash(&self.worktree.path, command).await
     }
 
@@ -993,7 +1009,7 @@ impl<'a> TurnEngine<'a> {
             self.messages.push(msg);
             self.messages.push(ChatMessage::text(
                 Role::User,
-                "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
+                NO_COMMAND_NUDGE,
             ));
         }
     }

@@ -538,12 +538,12 @@ fn rights_for(rule_path: &Path, allowed: u64) -> u64 {
 /// Build the `PATH_BENEATH` rules for a sandboxed child.
 ///
 /// Landlock is allow-only: every granted path widens access, so the policy
-/// grants read-only system prefixes plus exactly two writable roots and
-/// nothing else. Sensitive paths stay unreachable by omission (see
+/// grants read-only system prefixes plus the worker, target and private scratch
+/// roots. Sensitive paths stay unreachable by omission (see
 /// [`denied_paths`]).
 ///
 /// Every path is filtered through [`is_denied`], so a denied directory can
-/// never be granted even if reachable from an allowed prefix. The two
+/// never be granted even if reachable from an allowed prefix. The
 /// caller-supplied roots are canonicalised first ([`canonical_root`]) so a
 /// symlink cannot point one at a denied directory.
 fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
@@ -589,6 +589,7 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     // deny-check and the rule name the same real directory.
     push(canonical_root(worktree), WRITE_RIGHTS);
     push(canonical_root(target_dir), WRITE_RIGHTS);
+    push(canonical_root(&crate::worktree::scratch_dir(worktree)), WRITE_RIGHTS);
 
     // Toolchain caches, readable and executable but never writable: the child
     // environment forwards `CARGO_HOME`/`RUSTUP_HOME` at these locations so an
@@ -1630,7 +1631,8 @@ mod tests {
         }
         let cache_root = crate::cache::shared_cache_root();
         for path in &writable {
-            let is_root = *path == worktree || *path == target;
+            let is_root = *path == worktree || *path == target
+                || *path == crate::worktree::scratch_dir(worktree);
             let is_sink = WRITABLE_SINKS.contains(&path.to_str().unwrap_or_default());
             let is_cache = path.starts_with(&cache_root)
                 || path.ends_with(".cache/kache")

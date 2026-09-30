@@ -158,6 +158,8 @@ pub struct WorktreeGuard {
     pub path: PathBuf,
     pub branch: String,
     pub repo_root: PathBuf,
+    /// Slot affinity survives the implementer/reviewer phase boundary.
+    pub(crate) last_build_slot: Option<usize>,
     pub base_commit: String,
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
@@ -302,6 +304,7 @@ impl WorktreeGuard {
             path,
             branch: branch.to_string(),
             repo_root: repo_root.to_path_buf(),
+            last_build_slot: None,
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,

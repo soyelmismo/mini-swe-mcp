@@ -189,6 +189,8 @@ fn loadavg_1m_from(loadavg: &str) -> Option<f64> {
 struct Gate {
     /// Heavy commands holding a slot right now.
     running: usize,
+    /// Occupied slot indices; allocation always chooses the lowest free one.
+    slots: Vec<bool>,
     /// Ids of the queued requests, oldest first.
     queue: VecDeque<u64>,
 }
@@ -236,6 +238,7 @@ impl AdmissionController {
                 estimate_mb,
                 gate: std::sync::Mutex::new(Gate {
                     running: 0,
+                    slots: vec![false; max_heavy.max(1)],
                     queue: VecDeque::new(),
                 }),
                 wake: Notify::new(),
@@ -251,6 +254,7 @@ impl AdmissionController {
     /// Limits from the environment: `BASH_BUILD_LIMIT` (default the core
     /// count), `HUB_MEM_RESERVE_MB` and `HUB_BUILD_MEM_MB`.
     pub fn from_env() -> Self {
+        crate::cache::start_target_sweep();
         let cores = crate::config::cores();
         let max_heavy = crate::config::env_parse(BUILD_LIMIT_ENV).unwrap_or(cores);
         Self::new(
@@ -330,15 +334,17 @@ impl AdmissionController {
                     }) {
                         Decision::Granted { jobs } => {
                             gate.queue.pop_front();
+                            let slot = gate.slots.iter().position(|used| !used).expect("free slot");
+                            gate.slots[slot] = true;
                             gate.running += 1;
-                            Some(Ok(jobs))
+                            Some(Ok((jobs, slot)))
                         }
                         Decision::Waiting(blocked) => Some(Err(blocked)),
                     }
                 }
             };
             match outcome {
-                Some(Ok(jobs)) => {
+                Some(Ok((jobs, slot))) => {
                     // Granted: the ticket already left the queue.
                     std::mem::forget(ticket);
                     // The slot this request took may be the one the next
@@ -347,6 +353,7 @@ impl AdmissionController {
                     return HeavyPermit {
                         controller: self.clone(),
                         jobs,
+                        slot,
                     };
                 }
                 Some(Err(blocked)) => debug!(
@@ -437,9 +444,15 @@ impl Drop for QueueTicket<'_> {
 pub struct HeavyPermit {
     controller: AdmissionController,
     jobs: usize,
+    slot: usize,
 }
 
 impl HeavyPermit {
+    /// Exclusive build slot index, held until this permit is dropped.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
     /// Jobs the command may use.
     pub fn jobs(&self) -> usize {
         self.jobs
@@ -455,6 +468,7 @@ impl Drop for HeavyPermit {
     fn drop(&mut self) {
         {
             let mut gate = self.controller.lock_gate();
+            gate.slots[self.slot] = false;
             gate.running = gate.running.saturating_sub(1);
         }
         self.controller.inner.wake.notify_waiters();
@@ -475,6 +489,23 @@ mod tests {
             load1: Some(1.0),
             cores: 4,
         }
+    }
+
+    #[tokio::test]
+    async fn slots_are_exclusive_and_reuse_the_lowest_free_index() {
+        let controller = AdmissionController::new(3, 4, 0, 0);
+        controller.__test_set_host_sample(Some(HostSample::default()));
+        let first = controller.acquire().await;
+        let second = controller.acquire().await;
+        let third = controller.acquire().await;
+        assert_eq!((first.slot(), second.slot(), third.slot()), (0, 1, 2));
+        drop(second);
+        let reused = controller.acquire().await;
+        assert_eq!(reused.slot(), 1);
+        assert_eq!(controller.running_heavy(), 3);
+        drop((first, third, reused));
+        assert_eq!(controller.running_heavy(), 0);
+        assert_eq!(controller.acquire().await.slot(), 0);
     }
 
     #[test]

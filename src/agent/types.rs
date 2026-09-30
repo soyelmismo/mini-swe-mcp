@@ -261,6 +261,16 @@ impl ChatMessage {
         self.content.as_deref()
     }
 
+    /// Replace text without changing the message's role or tool-call linkage.
+    pub(crate) fn replace_content(&mut self, content: String) {
+        self.content = Some(content);
+    }
+
+    /// Replace existing reasoning while preserving thinking-mode replay.
+    pub(crate) fn replace_reasoning_content(&mut self, reasoning: String) {
+        self.reasoning_content = Some(reasoning);
+    }
+
     /// The reasoning content, if any.
     pub fn reasoning_content(&self) -> Option<&str> {
         self.reasoning_content.as_deref()

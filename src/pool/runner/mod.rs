@@ -40,6 +40,7 @@ use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 
+mod history;
 mod pause;
 mod review;
 mod sentinels;
@@ -233,6 +234,7 @@ impl WorkerPool {
         // Completion and propagated errors save the final conversation.
         // Aborted tasks cannot reach this tail; auto-checkpoints persist their
         // most recent conversation for crash recovery instead.
+        history::compact_history(&mut messages);
         let history = WorkerHistory {
             task,
             group: meta.group.clone(),
