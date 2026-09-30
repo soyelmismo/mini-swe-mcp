@@ -56,6 +56,9 @@ pub struct WorkerLaunchConfig {
     /// Declared network policy: `true` confines every bash step to an
     /// isolated network namespace (`network: "offline"` on the dispatch).
     pub network_offline: bool,
+    /// Optional shell command run through the same bash path before a
+    /// completion sentinel is honoured. `None` disables the gate.
+    pub verify: Option<String>,
 }
 
 /// Deletes a worker's steering mailbox when the worker exits.
@@ -114,6 +117,7 @@ impl WorkerPool {
             group,
             review_after,
             network_offline,
+            verify,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
@@ -151,6 +155,8 @@ impl WorkerPool {
         let mut current_max_turns = max_turns;
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
+        let mut verify_failures = 0;
+        let mut verified: Option<bool> = None;
         let started_at_ts = unix_timestamp();
 
         let meta = WorkerMeta {
@@ -189,9 +195,14 @@ impl WorkerPool {
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
+                verify: verify.as_deref(),
+                verify_failures: &mut verify_failures,
             };
             match engine.run_turn(&turn_config).await? {
-                TurnOutcome::Completed => break,
+                TurnOutcome::Completed { verified: v } => {
+                    verified = v;
+                    break;
+                }
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
                 TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
             }
@@ -272,6 +283,18 @@ impl WorkerPool {
             None
         };
 
+        // A worker that exhausted its verification budget completes anyway but
+        // is flagged: both the completion summary and the registry last_command
+        // must say so, so the harness never mistakes it for a clean pass.
+        let (summary, last_command) = if verified == Some(false) {
+            (
+                format!("{summary} (completed with failing verification)"),
+                "completed with failing verification".to_string(),
+            )
+        } else {
+            (summary, "completed".to_string())
+        };
+
         // The completion payload (diff/summary/artifacts/branch) is assembled
         // *before* the write-guard is taken: the critical section only performs
         // the O(1) move of the pre-built value into the record.
@@ -282,6 +305,7 @@ impl WorkerPool {
             completed_at: now,
             artifacts,
             branch,
+            verified,
         };
         {
             let mut lock = self.workers.write().await;
@@ -295,7 +319,7 @@ impl WorkerPool {
             RegistryStatus::Completed,
             step,
             current_max_turns,
-            "completed",
+            &last_command,
             None,
         );
 

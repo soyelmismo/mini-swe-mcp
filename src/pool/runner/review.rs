@@ -155,6 +155,7 @@ impl WorkerPool {
         let mut review_step = 0;
         let mut last_assistant_text = String::new();
         let mut consecutive_no_cmd = 0;
+        let mut verify_failures = 0;
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -185,9 +186,11 @@ impl WorkerPool {
                 current_max_turns: &mut combined_max_turns,
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
+                verify: None,
+                verify_failures: &mut verify_failures,
             };
             match engine.run_turn(&turn_config).await? {
-                TurnOutcome::Completed => {
+                TurnOutcome::Completed { .. } => {
                     info!(
                         worker = %worker_id,
                         step = review_step,

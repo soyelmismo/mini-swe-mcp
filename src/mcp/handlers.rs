@@ -198,6 +198,13 @@ impl McpServer {
         let network_offline =
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
+        // Optional verify gate: an explicit string (possibly empty to disable)
+        // is passed through; an absent argument lets the pool auto-detect.
+        let verify = args
+            .get("verify")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let wid = self
             .pool
             .dispatch(
@@ -209,6 +216,7 @@ impl McpServer {
                 group,
                 review_after,
                 network_offline,
+                verify,
             )
             .await?;
 

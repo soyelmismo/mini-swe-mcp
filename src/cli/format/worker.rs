@@ -76,6 +76,7 @@ pub fn format_status(val: &serde_json::Value) -> String {
                     if let Some(q) = d.get("question").and_then(|v| v.as_str()) {
                         out.push_str(&format!("Question: {q}\n"));
                     }
+                    push_verified_line(&mut out, d.get("verified"));
                 }
             } else if let Some(obj) = state.as_object() {
                 for (state_name, d) in obj {
@@ -95,11 +96,26 @@ pub fn format_status(val: &serde_json::Value) -> String {
                     if let Some(q) = d.get("question").and_then(|v| v.as_str()) {
                         out.push_str(&format!("Question: {q}\n"));
                     }
+                    push_verified_line(&mut out, d.get("verified"));
                 }
             }
         }
     }
     out.trim_end().to_string()
+}
+
+/// Append the verification outcome when the worker reports one.
+///
+/// A worker that exhausted its verification budget completes flagged
+/// unverified, so the plain-text status must not present it as a clean pass.
+fn push_verified_line(out: &mut String, verified: Option<&serde_json::Value>) {
+    match verified {
+        Some(serde_json::Value::Bool(true)) => out.push_str("Verified: yes\n"),
+        Some(serde_json::Value::Bool(false)) => {
+            out.push_str("Verified: no (completed with failing verification)\n");
+        }
+        _ => {}
+    }
 }
 
 pub fn format_collect(val: &serde_json::Value) -> String {
@@ -178,6 +194,9 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                 }
                 if let Some(summary) = details.and_then(|d| d.get("summary")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Summary: {summary}\n"));
+                }
+                if let Some(d) = details {
+                    push_verified_line(&mut out, d.get("verified"));
                 }
                 if let Some(branch) = details.and_then(|d| d.get("branch")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Branch: {branch}\n"));
@@ -311,6 +330,39 @@ mod tests {
             r#"{"worker_id":"w","state":{"Failed":{"error":"exploded"}}}"#,
         ));
         assert_eq!(failed, "✓ Worker w finished.\nState: Failed\nError: exploded");
+    }
+
+    /// A worker that exhausted its verification budget must not be presented
+    /// as a clean pass by the plain-text views.
+    #[test]
+    fn test_completed_views_surface_the_verification_outcome() {
+        let verified = format_status(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3,"verified":true}}}"#,
+        ));
+        assert!(verified.contains("Verified: yes"), "{verified}");
+
+        let unverified = format_status(&v(
+            r#"{"worker_id":"w","state":{"Completed":{"turns":3,"verified":false}}}"#,
+        ));
+        assert!(
+            unverified.contains("Verified: no (completed with failing verification)"),
+            "{unverified}"
+        );
+
+        let dispatched = format_dispatch(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3,"verified":false}}}"#,
+        ));
+        assert!(
+            dispatched.contains("Verified: no (completed with failing verification)"),
+            "{dispatched}"
+        );
+
+        // An absent field must add nothing, so pre-existing payloads render
+        // exactly as before.
+        let unflagged = format_status(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3}}}"#,
+        ));
+        assert!(!unflagged.contains("Verified"), "{unflagged}");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>] [--offline]";
+pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>]";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
@@ -97,6 +97,7 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
             "--offline" => {
                 tool_args.insert("network".into(), Value::String("offline".into()));
             }
+            "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
             _ => {}
         }
         i += 1;
@@ -221,6 +222,37 @@ mod tests {
         .unwrap();
         assert_eq!(with["network"], "offline");
         assert!(crate::mcp::NETWORK_MODES.contains(&with["network"].as_str().unwrap()));
+    }
+
+    /// `--verify <cmd>` is the CLI spelling of the tool's `verify` property.
+    #[test]
+    fn test_dispatch_verify_flag_maps_to_the_verify_property() {
+        let without = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "tidy docs"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !without.contains_key("verify"),
+            "an omitted flag must leave auto-detection in place"
+        );
+
+        let with = tool_args(
+            "dispatch",
+            &args(&[
+                "mini-swe-mcp",
+                "dispatch",
+                "tidy docs",
+                "--verify",
+                "cargo test --all-targets",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["verify"], "cargo test --all-targets");
     }
 
     #[test]

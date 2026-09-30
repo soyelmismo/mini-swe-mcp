@@ -54,8 +54,10 @@ pub(super) struct TurnConfig<'a> {
 
 /// Outcome of one turn.
 pub(super) enum TurnOutcome {
-    /// The completion sentinel was found; stop the loop.
-    Completed,
+    /// The completion sentinel was found; stop the loop. `verified` is
+    /// `Some(true)` when the verify gate passed, `Some(false)` when it was
+    /// exhausted after repeated failures, and `None` when no gate was set.
+    Completed { verified: Option<bool> },
     /// A command was executed; continue the loop.
     Continue,
     /// No command was found; history was updated; continue the loop.
@@ -80,6 +82,11 @@ pub(super) struct TurnEngine<'a> {
     pub current_max_turns: &'a mut usize,
     pub last_assistant_text: &'a mut String,
     pub consecutive_no_cmd: &'a mut usize,
+    /// Optional shell command run through the same bash path before a
+    /// completion sentinel is honoured. `None` disables the gate.
+    pub verify: Option<&'a str>,
+    /// Number of consecutive failed verification runs for this phase.
+    pub verify_failures: &'a mut usize,
 }
 
 impl<'a> TurnEngine<'a> {
@@ -209,15 +216,7 @@ impl<'a> TurnEngine<'a> {
         // --- Command extraction ---
         let cmd_str = match llm_resp.command {
             Some(ref cmd) if is_completion_request(cmd) => {
-                info!(
-                    worker = %self.worker_id,
-                    step = *self.step,
-                    "Worker requested completion"
-                );
-                if !llm_resp.content.trim().is_empty() {
-                    *self.last_assistant_text = llm_resp.content.clone();
-                }
-                return Ok(TurnOutcome::Completed);
+                return self.handle_completion(&llm_resp).await;
             }
             Some(ref cmd) => {
                 *self.consecutive_no_cmd = 0;
@@ -281,27 +280,7 @@ impl<'a> TurnEngine<'a> {
         );
 
         // --- Execute command with semaphores ---
-        let (output, code) = {
-            let is_heavy = crate::agent::is_heavy_command(&cmd_str);
-            let _build_permit = if is_heavy {
-                Some(
-                    self.pool
-                        .build_semaphore
-                        .acquire()
-                        .await
-                        .context("Build semaphore closed")?,
-                )
-            } else {
-                None
-            };
-            let _bash_permit = self
-                .pool
-                .bash_semaphore
-                .acquire()
-                .await
-                .context("Bash semaphore closed")?;
-            self.runner.execute_bash(&self.worktree.path, &cmd_str).await?
-        };
+        let (output, code) = self.run_gated(&cmd_str).await?;
 
         // --- Orchestrator control sentinels (implementer only) ---
         if config.apply_sentinels {
@@ -373,32 +352,119 @@ impl<'a> TurnEngine<'a> {
             }
         }
 
-        // --- History push ---
-        if let (Some(tool_calls), Some(tc_id)) = (llm_resp.tool_calls, llm_resp.tool_call_id) {
-            // OpenAI tool_calls protocol: assistant with tool_calls → tool response
-            let content = if llm_resp.content.trim().is_empty() {
-                None
-            } else {
-                Some(llm_resp.content)
-            };
-            let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
-                .with_reasoning_content(llm_resp.reasoning_content);
-            self.messages.push(msg);
-            self.messages.push(ChatMessage::tool_result(tc_id, &output_text));
+        self.push_exchange(
+            llm_resp.content,
+            llm_resp.reasoning_content,
+            llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+            output_text,
+        );
+
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Handle a completion sentinel: run the verify gate (if any) and either
+    /// complete or push the failure back to the model for another turn.
+    async fn handle_completion(&mut self, llm_resp: &LlmResponse) -> Result<TurnOutcome> {
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            "Worker requested completion"
+        );
+        if !llm_resp.content.trim().is_empty() {
+            *self.last_assistant_text = llm_resp.content.clone();
+        }
+
+        let Some(verify) = self.verify.filter(|v| !v.is_empty()) else {
+            return Ok(TurnOutcome::Completed { verified: None });
+        };
+
+        let (output, code) = self.run_gated(verify).await?;
+
+        let exit = code.unwrap_or(-1);
+        if exit == 0 {
+            return Ok(TurnOutcome::Completed { verified: Some(true) });
+        }
+
+        // Verification failed. Record a step log and push the output back to
+        // the model so it can fix the problems before completing again. After
+        // three failed verifications the worker completes anyway, flagged
+        // unverified.
+        *self.verify_failures += 1;
+        if *self.verify_failures >= 3 {
+            return Ok(TurnOutcome::Completed { verified: Some(false) });
+        }
+        let label = format!("[verify] {}", summarize_command(verify));
+        let step_log = build_step_log(*self.step, &label, output.clone(), code);
+        {
+            let mut lock = self.pool.workers.write().await;
+            if let Some(w) = lock.get_mut(self.worker_id) {
+                w.logs.push(step_log);
+            }
+        }
+        let output_text = format!(
+            "VERIFICATION FAILED (exit {exit}) - fix these problems before completing:\n{output}"
+        );
+        // The completion turn is replayed with the same rules as a command
+        // turn, so the next request never carries a dangling tool_call.
+        self.push_exchange(
+            llm_resp.content.clone(),
+            llm_resp.reasoning_content.clone(),
+            llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+            output_text,
+        );
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Run `command` through the worker's semaphores: heavy commands take a
+    /// build slot, every command takes a bash slot.
+    async fn run_gated(&self, command: &str) -> Result<(String, Option<i32>)> {
+        let _build_permit = if crate::agent::is_heavy_command(command) {
+            Some(
+                self.pool
+                    .build_semaphore
+                    .acquire()
+                    .await
+                    .context("Build semaphore closed")?,
+            )
         } else {
-            // Fallback: code-block models use plain assistant + user messages
-            let assistant_content = if llm_resp.content.trim().is_empty() {
+            None
+        };
+        let _bash_permit = self
+            .pool
+            .bash_semaphore
+            .acquire()
+            .await
+            .context("Bash semaphore closed")?;
+        self.runner.execute_bash(&self.worktree.path, command).await
+    }
+
+    /// Record one executed exchange in the history: an assistant turn that
+    /// called a tool is answered by a `tool` message with that call's id; a
+    /// code-block (prose) turn is answered by a user message. The assistant
+    /// turn always carries the response's reasoning.
+    fn push_exchange(
+        &mut self,
+        content: String,
+        reasoning: Option<String>,
+        tool_call: Option<(Vec<ToolCall>, String)>,
+        output_text: String,
+    ) {
+        if let Some((tool_calls, tc_id)) = tool_call {
+            let content = (!content.trim().is_empty()).then_some(content);
+            let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
+                .with_reasoning_content(reasoning);
+            self.messages.push(msg);
+            self.messages.push(ChatMessage::tool_result(tc_id, output_text));
+        } else {
+            let content = if content.trim().is_empty() {
                 "I will execute a bash command.".to_string()
             } else {
-                llm_resp.content
+                content
             };
-            let msg = ChatMessage::text(Role::Assistant, assistant_content)
-                .with_reasoning_content(llm_resp.reasoning_content);
+            let msg = ChatMessage::text(Role::Assistant, content).with_reasoning_content(reasoning);
             self.messages.push(msg);
             self.messages.push(ChatMessage::text(Role::User, output_text));
         }
-
-        Ok(TurnOutcome::Continue)
     }
 
     /// Push the protocol-correct history for a response with no usable command.

@@ -34,6 +34,8 @@ pub enum WorkerState {
         artifacts: Vec<String>,
         #[serde(default)]
         branch: Option<String>,
+        #[serde(default)]
+        verified: Option<bool>,
     },
     Failed {
         error: String,
@@ -66,13 +68,14 @@ impl WorkerState {
                 "question": question,
                 "paused_at": paused_at,
             }),
-            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, .. } => serde_json::json!({
+            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, .. } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
                 "completed_at": completed_at,
                 "artifacts": artifacts,
                 "branch": branch,
+                "verified": verified,
             }),
             WorkerState::Failed { error, step, failed_at } => serde_json::json!({
                 "status": "Failed",
@@ -236,6 +239,7 @@ mod tests {
                 completed_at: 0,
                 artifacts: Vec::new(),
                 branch: None,
+                verified: None,
             }
             .step(),
             12
@@ -266,6 +270,7 @@ mod tests {
             completed_at: 1_700_000_000,
             artifacts: Vec::new(),
             branch: None,
+            verified: None,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
@@ -298,6 +303,7 @@ mod tests {
             completed_at: when,
             artifacts: Vec::new(),
             branch: None,
+            verified: None,
         }
     }
 

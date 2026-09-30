@@ -314,6 +314,7 @@ async fn dispatch_and_wait(
     repo: &Path,
     max_turns: usize,
     review_after: Option<String>,
+    verify: Option<String>,
 ) -> (WorkerPool, String, WorkerState) {
     let pool = WorkerPool::new(1, base_url.to_string(), "test-key".to_string());
     let worker_id = pool
@@ -326,6 +327,7 @@ async fn dispatch_and_wait(
             Some("agent-loop".to_string()),
             review_after,
             false,
+            verify,
         )
         .await
         .expect("dispatch the worker");
@@ -352,7 +354,7 @@ async fn implementer_replays_the_unparseable_tool_call_turn_with_its_reasoning()
     .await;
 
     let (pool, worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None).await;
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     match state {
         WorkerState::Completed { .. } => {}
@@ -431,7 +433,7 @@ async fn implementer_replays_a_prose_only_turn_before_the_error_message() {
     .await;
 
     let (_pool, _worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None).await;
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -490,7 +492,7 @@ async fn the_parse_error_quotes_at_most_two_hundred_argument_bytes() {
     .await;
 
     let (_pool, _worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None).await;
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
         "worker must complete, got {state:?}"
@@ -541,6 +543,7 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
         repo.path(),
         5,
         Some("test-reviewer-model".to_string()),
+        None,
     )
     .await;
 
@@ -580,4 +583,100 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
     );
 
     let _ = pool.kill(&worker_id).await;
+}
+
+// ----------
+// Verify gate (selfimprove-I1)
+// ----------
+
+/// A verify gate that passes lets the worker complete immediately, flagged
+/// verified.
+#[tokio::test]
+async fn verify_gate_passes_and_worker_completes() {
+    let repo = TestRepo::new("verify-pass");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::completion_turn("call_done"),
+    ])
+    .await;
+
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some("true".to_string())).await;
+
+    match state {
+        WorkerState::Completed { verified, .. } => {
+            assert_eq!(verified, Some(true), "a passing gate must verify the worker");
+        }
+        other => panic!("worker must complete, got {other:?}"),
+    }
+}
+
+/// A gate that fails then passes lets the worker fix and complete: the first
+/// completion is rejected with a VERIFICATION FAILED message, and the second
+/// completion passes the gate.
+#[tokio::test]
+async fn verify_gate_fails_then_passes_after_fix_turn() {
+    let repo = TestRepo::new("verify-fix");
+    // The verify command fails on the first run (count 1) and passes on the
+    // second (count 2), so the worker must get a fix turn before completing.
+    let verify = "if [ -f verify_count ]; then c=$(cat verify_count); else c=0; fi; c=$((c+1)); echo $c > verify_count; [ $c -ge 2 ]";
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::completion_turn("call_done_1"),
+        ScriptedSseServer::completion_turn("call_done_2"),
+    ])
+    .await;
+
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some(verify.to_string())).await;
+
+    match state {
+        WorkerState::Completed { verified, .. } => {
+            assert_eq!(verified, Some(true), "the worker must pass after the fix turn");
+        }
+        other => panic!("worker must complete, got {other:?}"),
+    }
+
+    // The model must have been told the verification failed, and the completion
+    // turn must stay answered: a `tool_calls` turn is replayed with a tool
+    // result rather than left dangling.
+    let requests = server.requests.all().await;
+    assert_eq!(requests.len(), 2, "one fix turn then completion: {requests:?}");
+    let results = tool_results(&requests[1]);
+    let content = results
+        .get("call_done_1")
+        .unwrap_or_else(|| panic!("the rejected completion call must be answered, got {results:?}"));
+    assert!(
+        content.contains("VERIFICATION FAILED"),
+        "the tool result must explain the failure, got {content:?}"
+    );
+    assert!(
+        content.contains("fix these problems before completing"),
+        "the tool result must tell the model what to do, got {content:?}"
+    );
+}
+
+/// Three failed verifications exhaust the budget and the worker completes
+/// flagged unverified, with the summary saying so.
+#[tokio::test]
+async fn verify_gate_exhausts_after_three_failures() {
+    let repo = TestRepo::new("verify-exhaust");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::completion_turn("call_done_1"),
+        ScriptedSseServer::completion_turn("call_done_2"),
+        ScriptedSseServer::completion_turn("call_done_3"),
+    ])
+    .await;
+
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some("exit 1".to_string())).await;
+
+    match state {
+        WorkerState::Completed { verified, summary, .. } => {
+            assert_eq!(verified, Some(false), "three failures must flag the worker unverified");
+            assert!(
+                summary.contains("failing verification"),
+                "the summary must say the verification failed, got {summary:?}"
+            );
+        }
+        other => panic!("worker must complete, got {other:?}"),
+    }
 }
