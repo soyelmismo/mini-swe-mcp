@@ -7,9 +7,8 @@
 //! `validate` rules and the `normalize` fixups.
 
 use super::{
-    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_MEMORY_PROMPT_BYTES,
-    MAX_TURNS_LIMIT, MEMORY_DIR, ModelDefinition, ModelManifest, agent_memory_path,
-    build_system_prompt, load_agent_memory,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, MEMORY_DIR,
+    ModelDefinition, ModelManifest, agent_memory_path, build_system_prompt, load_agent_memory,
 };
 
 fn single(definition: ModelDefinition) -> ModelManifest {
@@ -793,9 +792,7 @@ fn test_every_declared_network_policy_value_is_accepted_verbatim() {
 #[test]
 fn test_policy_round_trips_through_yaml() {
     for network in ["offline", "allow"] {
-        let manifest = policy_manifest(&format!(
-            "    policy:\n      network: {network}\n"
-        ));
+        let manifest = policy_manifest(&format!("    policy:\n      network: {network}\n"));
         let policy = manifest.models["solo"]
             .policy
             .clone()
@@ -826,10 +823,7 @@ fn test_an_unknown_network_policy_warns_and_repairs_to_the_restrictive_default()
         "the network warning must name the value the user wrote: {warnings:?}"
     );
 
-    let policy = manifest
-        .clone()
-        .normalize()
-        .models["solo"]
+    let policy = manifest.clone().normalize().models["solo"]
         .policy
         .clone()
         .expect("still a policy after repair");

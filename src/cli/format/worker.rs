@@ -71,7 +71,11 @@ fn metrics_of(val: &serde_json::Value) -> Option<&serde_json::Value> {
     }
     if let Some(metrics) = ["Completed", "Failed", "Running", "Paused"]
         .iter()
-        .find_map(|tag| state.and_then(|s| s.get(tag)).and_then(|d| d.get("metrics")))
+        .find_map(|tag| {
+            state
+                .and_then(|s| s.get(tag))
+                .and_then(|d| d.get("metrics"))
+        })
     {
         return Some(metrics);
     }
@@ -87,8 +91,16 @@ fn metrics_of(val: &serde_json::Value) -> Option<&serde_json::Value> {
 pub fn health_line(val: &serde_json::Value) -> Option<String> {
     let metrics = metrics_of(val)?;
     let count = |key: &str| metrics.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-    let (turns, granted, refused) = (count("turns_used"), count("extensions_granted"), count("extensions_refused"));
-    let (repeats, nudges, pauses) = (count("repeat_blocks"), count("stagnation_nudges"), count("loop_pauses"));
+    let (turns, granted, refused) = (
+        count("turns_used"),
+        count("extensions_granted"),
+        count("extensions_refused"),
+    );
+    let (repeats, nudges, pauses) = (
+        count("repeat_blocks"),
+        count("stagnation_nudges"),
+        count("loop_pauses"),
+    );
     let (verify_runs, verify_failures) = (count("verify_runs"), count("verify_failures"));
     let (files, insertions, deletions) = (
         count("diff_files"),
@@ -109,9 +121,7 @@ pub fn health_line(val: &serde_json::Value) -> Option<String> {
         return None;
     }
 
-    let plural = |n: u64, word: &str| {
-        format!("{n} {word}{}", if n == 1 { "" } else { "s" })
-    };
+    let plural = |n: u64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     let mut parts = vec![
         plural(turns, "turn"),
         format!("+{granted}/-{refused} ext"),
@@ -225,7 +235,9 @@ pub fn format_collect(val: &serde_json::Value) -> String {
         .unwrap_or("");
 
     let counters = log_counters_line(val);
-    let health = health_line(val).map(|h| format!("\n{h}")).unwrap_or_default();
+    let health = health_line(val)
+        .map(|h| format!("\n{h}"))
+        .unwrap_or_default();
     let next = val
         .get("next_step")
         .and_then(|v| v.as_str())
@@ -288,7 +300,9 @@ fn is_awaited_result(val: &serde_json::Value) -> bool {
 pub fn format_dispatch(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
-        format!("✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress.")
+        format!(
+            "✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress."
+        )
     } else if val.get("status").and_then(|v| v.as_str()) == Some("still_running") {
         // A bounded wait hands the worker back unfinished; say so instead of
         // implying it finished.
@@ -311,19 +325,30 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                 .or_else(|| state.get("Failed"));
 
             if state_name == "Completed" || state.get("Completed").is_some() {
-                if let Some(turns) = details.and_then(|d| d.get("turns")).and_then(|v| v.as_u64()) {
+                if let Some(turns) = details
+                    .and_then(|d| d.get("turns"))
+                    .and_then(|v| v.as_u64())
+                {
                     out.push_str(&format!("Turns: {turns}\n"));
                 }
-                if let Some(summary) = details.and_then(|d| d.get("summary")).and_then(|v| v.as_str()) {
+                if let Some(summary) = details
+                    .and_then(|d| d.get("summary"))
+                    .and_then(|v| v.as_str())
+                {
                     out.push_str(&format!("Summary: {summary}\n"));
                 }
                 if let Some(d) = details {
                     push_verified_line(&mut out, d.get("verified"));
                 }
-                if let Some(branch) = details.and_then(|d| d.get("branch")).and_then(|v| v.as_str()) {
+                if let Some(branch) = details
+                    .and_then(|d| d.get("branch"))
+                    .and_then(|v| v.as_str())
+                {
                     out.push_str(&format!("Branch: {branch}\n"));
                 }
-                if let Some(artifacts) = details.and_then(|d| d.get("artifacts")).and_then(|v| v.as_array())
+                if let Some(artifacts) = details
+                    .and_then(|d| d.get("artifacts"))
+                    .and_then(|v| v.as_array())
                     && !artifacts.is_empty()
                 {
                     let list: Vec<&str> = artifacts.iter().filter_map(|a| a.as_str()).collect();
@@ -344,7 +369,10 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                 }
             } else if state_name == "Failed" || state.get("Failed").is_some() {
                 out.push_str("State: Failed\n");
-                if let Some(err) = details.and_then(|d| d.get("error")).and_then(|v| v.as_str()) {
+                if let Some(err) = details
+                    .and_then(|d| d.get("error"))
+                    .and_then(|v| v.as_str())
+                {
                     out.push_str(&format!("Error: {err}\n"));
                 }
                 if let Some(health) = &health {
@@ -397,7 +425,10 @@ mod tests {
         let tagged = format_status(&v(
             r#"{"worker_id":"w","state":{"state":"Paused","details":{"turns":4,"step":2,"summary":"s","question":"q"}}}"#,
         ));
-        assert_eq!(tagged, "Worker: w\nState: Paused\nTurns: 4\nStep: 2\nSummary: s\nQuestion: q");
+        assert_eq!(
+            tagged,
+            "Worker: w\nState: Paused\nTurns: 4\nStep: 2\nSummary: s\nQuestion: q"
+        );
 
         let keyed = format_status(&v(
             r#"{"worker_id":"w","state":{"Failed":{"turns":1,"error":"e"}}}"#,
@@ -432,7 +463,9 @@ mod tests {
     #[test]
     fn test_log_counters_line_appends_an_explicit_truncation_notice() {
         assert_eq!(
-            log_counters_line(&v(r#"{"logs_truncation_notice":"head of the window was evicted"}"#)),
+            log_counters_line(&v(
+                r#"{"logs_truncation_notice":"head of the window was evicted"}"#
+            )),
             "head of the window was evicted"
         );
     }
@@ -441,7 +474,9 @@ mod tests {
     /// by the worker-result view rather than as a bare acknowledgement.
     #[test]
     fn test_format_steer_renders_an_awaited_result_as_the_worker_result() {
-        let queued = format_steer(&v(r#"{"worker_id":"w","status":"steered","message":"queued"}"#));
+        let queued = format_steer(&v(
+            r#"{"worker_id":"w","status":"steered","message":"queued"}"#,
+        ));
         assert_eq!(queued, "✓ Worker w: queued");
 
         let awaited = format_steer(&v(
@@ -493,7 +528,10 @@ mod tests {
         let failed = format_dispatch(&v(
             r#"{"worker_id":"w","state":{"Failed":{"error":"exploded"}}}"#,
         ));
-        assert_eq!(failed, "✓ Worker w finished.\nState: Failed\nError: exploded");
+        assert_eq!(
+            failed,
+            "✓ Worker w finished.\nState: Failed\nError: exploded"
+        );
     }
 
     /// A worker that exhausted its verification budget must not be presented
@@ -572,9 +610,15 @@ mod tests {
     #[test]
     fn test_health_line_is_omitted_when_nothing_was_measured() {
         // No metrics at all: a payload from a build that did not record them.
-        assert_eq!(health_line(&v(r#"{"worker_id":"w","state":"Running"}"#)), None);
+        assert_eq!(
+            health_line(&v(r#"{"worker_id":"w","state":"Running"}"#)),
+            None
+        );
         // Metrics present but untouched: a worker killed before its first turn.
-        assert_eq!(health_line(&v(r#"{"state":{"details":{"metrics":{}}}}"#)), None);
+        assert_eq!(
+            health_line(&v(r#"{"state":{"details":{"metrics":{}}}}"#)),
+            None
+        );
         assert_eq!(
             health_line(&v(
                 r#"{"state":{"state":"Failed","details":{"metrics":{"turns_used":0,"repeat_blocks":0}}}}"#

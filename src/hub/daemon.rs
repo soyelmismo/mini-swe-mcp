@@ -196,14 +196,16 @@ pub struct HubServer {
 
 impl HubServer {
     /// Whether the daemon continues interrupted workers at startup.
-///
-/// `HUB_AUTO_RESUME=0` opts out: every interrupted worker then stays
-/// interrupted, and only an explicit `steer <id> "..."` moves it.
-fn auto_resume_enabled() -> bool {
-    std::env::var("HUB_AUTO_RESUME").map(|v| v != "0").unwrap_or(true)
-}
+    ///
+    /// `HUB_AUTO_RESUME=0` opts out: every interrupted worker then stays
+    /// interrupted, and only an explicit `steer <id> "..."` moves it.
+    fn auto_resume_enabled() -> bool {
+        std::env::var("HUB_AUTO_RESUME")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
 
-/// A daemon serving `server` on the socket described by `config`.
+    /// A daemon serving `server` on the socket described by `config`.
     pub fn new(server: Arc<McpServer>, config: HubConfig) -> Self {
         Self {
             server,

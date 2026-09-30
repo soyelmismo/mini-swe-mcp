@@ -58,12 +58,27 @@ fn test_cli_help_flag() {
             !stdout.contains("[--wait]"),
             "dispatch/steer must no longer advertise --wait: {stdout}"
         );
-        assert!(stdout.contains("watch [<worker_id>...]"), "help missing the watch usage: {stdout}");
+        assert!(
+            stdout.contains("watch [<worker_id>...]"),
+            "help missing the watch usage: {stdout}"
+        );
         // The orchestrator guidelines live where every orchestrator reads them.
-        assert!(stdout.contains("Workflow:"), "help missing the workflow section: {stdout}");
-        assert!(stdout.contains("ONE focused concern"), "help missing the task guidance: {stdout}");
-        assert!(stdout.contains("mini-swe-mcp watch"), "help must name watch: {stdout}");
-        assert!(stdout.contains("watch [<worker_id>...]"), "help missing the watch usage: {stdout}");
+        assert!(
+            stdout.contains("Workflow:"),
+            "help missing the workflow section: {stdout}"
+        );
+        assert!(
+            stdout.contains("ONE focused concern"),
+            "help missing the task guidance: {stdout}"
+        );
+        assert!(
+            stdout.contains("mini-swe-mcp watch"),
+            "help must name watch: {stdout}"
+        );
+        assert!(
+            stdout.contains("watch [<worker_id>...]"),
+            "help missing the watch usage: {stdout}"
+        );
     }
 }
 
@@ -108,7 +123,8 @@ fn test_cli_flags_without_api_key() {
             "output should identify the binary for {flag}: {stdout}"
         );
         assert!(
-            !stdout.contains("Missing OPENAI_API_KEY") && !stderr.contains("Missing OPENAI_API_KEY"),
+            !stdout.contains("Missing OPENAI_API_KEY")
+                && !stderr.contains("Missing OPENAI_API_KEY"),
             "flag {flag} must not require OPENAI_API_KEY; stderr: {stderr}"
         );
 
@@ -130,7 +146,7 @@ fn test_cli_flags_without_api_key() {
 fn test_cli_unknown_action() {
     let exe = binary_path();
     let output = Command::new(&exe)
-            .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_NO_DAEMON", "1")
         .arg("nonexistent_action_xyz")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -158,7 +174,7 @@ fn test_cli_unknown_action() {
 fn test_cli_typo_suggestion() {
     let exe = binary_path();
     let output = Command::new(&exe)
-            .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_NO_DAEMON", "1")
         .arg("statsu")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -175,7 +191,7 @@ fn test_cli_typo_suggestion() {
 fn test_cli_prefix_suggestion() {
     let exe = binary_path();
     let output = Command::new(&exe)
-            .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_NO_DAEMON", "1")
         .arg("disp")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -193,11 +209,14 @@ fn test_cli_prune_action() {
     let exe = binary_path();
     let temp = std::env::temp_dir().join(format!("test-prune-cli-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&temp);
-    let _ = Command::new("git").args(["init"]).current_dir(&temp).output();
+    let _ = Command::new("git")
+        .args(["init"])
+        .current_dir(&temp)
+        .output();
 
     // 1. Plain text format (default)
     let output = Command::new(&exe)
-            .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .arg("prune")
         .output()
@@ -212,7 +231,7 @@ fn test_cli_prune_action() {
 
     // 2. JSON format with --json flag
     let output_json = Command::new(&exe)
-            .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .args(["prune", "--json"])
         .output()
@@ -233,8 +252,14 @@ fn run_action(exe: &std::path::Path, args: &[&str]) -> std::process::Output {
         .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("OPENAI_API_KEY", "test-key-not-used-by-manifest-or-list")
-        .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
-        .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
+        .env(
+            "ENV_FILE",
+            env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist",
+        )
+        .env(
+            "MODELS_FILE",
+            env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml",
+        )
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} {args:?}: {e}", exe.display()))
 }
@@ -257,7 +282,10 @@ fn test_cli_manifest_plain_text() {
     let output = run_action(&exe, &["manifest"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.trim().starts_with('{'), "manifest without --json must not be JSON: {stdout}");
+    assert!(
+        !stdout.trim().starts_with('{'),
+        "manifest without --json must not be JSON: {stdout}"
+    );
     assert!(stdout.contains("Default model: ninja"));
     assert!(stdout.contains("Models:"));
     assert!(stdout.contains("- ninja (id: combo:ninja"));
@@ -270,7 +298,10 @@ fn test_cli_manifest_json() {
     let output = run_action(&exe, &["manifest", "--json"]);
     let val = parse_json("manifest --json", &output);
 
-    assert!(val.is_object(), "manifest output must be a JSON object, got: {val}");
+    assert!(
+        val.is_object(),
+        "manifest output must be a JSON object, got: {val}"
+    );
 
     let default_model = val
         .get("default_model")
@@ -283,7 +314,10 @@ fn test_cli_manifest_json() {
     let models = models
         .as_object()
         .unwrap_or_else(|| panic!("`models` must be a JSON object, got: {models}"));
-    assert!(!models.is_empty(), "`models` must expose at least one model, got: {val}");
+    assert!(
+        !models.is_empty(),
+        "`models` must expose at least one model, got: {val}"
+    );
 }
 
 #[test]
@@ -330,8 +364,14 @@ fn test_cli_status_renders_the_health_line() {
             .args(["status", wid, "--admin"])
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-status")
-            .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
-            .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
+            .env(
+                "ENV_FILE",
+                env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist",
+            )
+            .env(
+                "MODELS_FILE",
+                env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml",
+            )
             .output()
             .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
         assert!(output.status.success(), "`status {wid}` must succeed");
@@ -361,12 +401,18 @@ fn test_cli_list_json() {
     let output = run_action(&exe, &["list", "--json"]);
     let val = parse_json("list --json", &output);
 
-    assert!(val.is_object(), "list output must be a JSON object, got: {val}");
+    assert!(
+        val.is_object(),
+        "list output must be a JSON object, got: {val}"
+    );
 
     let workers = val
         .get("workers")
         .unwrap_or_else(|| panic!("list output missing `workers`: {val}"));
-    assert!(workers.is_array(), "`workers` must be a JSON array, got: {workers}");
+    assert!(
+        workers.is_array(),
+        "`workers` must be a JSON array, got: {workers}"
+    );
 }
 
 /// `watch <worker_id>` reaches the `worker` tool's `watch` verb: an unknown
@@ -397,7 +443,8 @@ fn test_cli_status_line_never_autostarts_the_hub() {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("test-status-line-{}-{nanos}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("test-status-line-{}-{nanos}", std::process::id()));
     let hub = root.join("hub");
     let swe = root.join("swe");
     let _ = std::fs::remove_dir_all(&root);
@@ -418,7 +465,8 @@ fn test_cli_status_line_never_autostarts_the_hub() {
     // One live worker and one recent completion; the line names both buckets.
     let registry = |id: &str, status: &str, updated_at: u64| {
         format!(
-            r#"{{"id":"{id}","pid":{},"task":"t","model":"ninja","status":"{status}","step":1,"max_turns":10,"last_command":"done","started_at":1,"updated_at":{updated_at}}}"#, std::process::id()
+            r#"{{"id":"{id}","pid":{},"task":"t","model":"ninja","status":"{status}","step":1,"max_turns":10,"last_command":"done","started_at":1,"updated_at":{updated_at}}}"#,
+            std::process::id()
         )
     };
     std::fs::write(
@@ -440,8 +488,14 @@ fn test_cli_status_line_never_autostarts_the_hub() {
             .env("TMPDIR", &swe)
             .env_remove("MINI_SWE_NO_DAEMON")
             .env_remove("OPENAI_API_KEY")
-            .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
-            .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
+            .env(
+                "ENV_FILE",
+                env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist",
+            )
+            .env(
+                "MODELS_FILE",
+                env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml",
+            )
             .output()
             .unwrap_or_else(|e| panic!("failed to run {} {args:?}: {e}", exe.display()))
     };
@@ -449,7 +503,11 @@ fn test_cli_status_line_never_autostarts_the_hub() {
     let output = run(&["status", "--line"]);
     assert!(output.status.success(), "status --line must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "⚙ 1 running · 1 done", "unexpected status line: {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "⚙ 1 running · 1 done",
+        "unexpected status line: {stdout:?}"
+    );
     assert!(
         !hub.join("hub.sock").exists(),
         "status --line must never auto-start the daemon"

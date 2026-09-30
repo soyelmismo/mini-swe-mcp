@@ -378,7 +378,12 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     let mut dispatch = Command::new(&exe);
     envs(&mut dispatch);
     let out = dispatch
-        .args(["dispatch", "thin-client lifecycle probe", "--json", "--repo"])
+        .args([
+            "dispatch",
+            "thin-client lifecycle probe",
+            "--json",
+            "--repo",
+        ])
         .arg(&repo)
         .env("OPENAI_API_BASE", "http://127.0.0.1:1")
         .output()
@@ -728,7 +733,11 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
             .args(args)
             .output()
             .unwrap_or_else(|_| panic!("git {args:?} failed to run"));
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     let root = scratch_dir();
@@ -738,7 +747,9 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
     for dir in [&hub, &swe, &repo] {
         std::fs::create_dir_all(dir).expect("create scratch dir");
     }
-    let mut dead = Command::new("true").spawn().expect("spawn short-lived owner");
+    let mut dead = Command::new("true")
+        .spawn()
+        .expect("spawn short-lived owner");
     let dead_pid = dead.id();
     dead.wait().expect("reap owner");
     assert!(!mini_swe_mcp::worktree::is_process_alive(dead_pid));
@@ -762,9 +773,17 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
     git(&repo, &["commit", "-m", "seed"]);
     let branch = format!("worker-{wid}");
     let checkout = swe.join(format!("swe-wt-{wid}"));
-    git(&repo, &[
-        "worktree", "add", "-b", &branch, &checkout.to_string_lossy(), "HEAD",
-    ]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ],
+    );
     std::fs::write(checkout.join("dirty.txt"), "unsaved\n").expect("dirty the checkout");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -779,11 +798,17 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         "repo_path": repo,
     });
     std::fs::create_dir_all(swe.join("swe-registry")).expect("create the registry");
-    std::fs::write(swe.join("swe-registry").join(format!("{wid}.json")), row.to_string())
-        .expect("write the orphan row");
+    std::fs::write(
+        swe.join("swe-registry").join(format!("{wid}.json")),
+        row.to_string(),
+    )
+    .expect("write the orphan row");
     let history = serde_json::json!({"worker": wid});
-    std::fs::write(swe.join(format!("swe-wt-{wid}.history.json")), history.to_string())
-        .expect("write the history file");
+    std::fs::write(
+        swe.join(format!("swe-wt-{wid}.history.json")),
+        history.to_string(),
+    )
+    .expect("write the history file");
 
     let mut daemon = Command::new(common::binary_path())
         .arg("daemon")
@@ -794,7 +819,10 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         // Auto-resume off, so the row keeps the status recovery gave it.
         .env("HUB_AUTO_RESUME", "0")
         .env("ENV_FILE", root.join("absent.env"))
-        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+        .env(
+            "MODELS_FILE",
+            format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -803,14 +831,21 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         if std::os::unix::net::UnixStream::connect(hub.join("hub.sock")).is_ok() {
             break;
         }
-        assert!(daemon.try_wait().expect("probe daemon").is_none(), "daemon exited early");
+        assert!(
+            daemon.try_wait().expect("probe daemon").is_none(),
+            "daemon exited early"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(hub.join("hub.sock").exists(), "daemon must listen after recovery");
+    assert!(
+        hub.join("hub.sock").exists(),
+        "daemon must listen after recovery"
+    );
     let entry: WorkerRegistryEntry = serde_json::from_slice(
         &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json")))
             .expect("the orphan row survives recovery"),
-    ).expect("registry JSON");
+    )
+    .expect("registry JSON");
     // Interrupted, not failed: the worker stopped because the hub did, so it is
     // terminal for listing but continuable with `steer`.
     assert_eq!(
@@ -819,7 +854,10 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         "the orphan row must be interrupted"
     );
     let expected = format!("hub restarted; work salvaged on branch worker-{wid}");
-    assert_eq!(entry.last_command, expected, "the owner must see the salvage branch");
+    assert_eq!(
+        entry.last_command, expected,
+        "the owner must see the salvage branch"
+    );
     let log = Command::new("git")
         .current_dir(&repo)
         .args(["log", &branch, "--oneline"])
@@ -855,7 +893,10 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(daemon.try_wait().expect("probe exit").is_some(), "daemon must idle out");
+    assert!(
+        daemon.try_wait().expect("probe exit").is_some(),
+        "daemon must idle out"
+    );
     let log = std::fs::read_to_string(hub.join("hub.log")).expect("read recovery log");
     assert!(log.contains("recovered 1 orphaned workers"), "{log}");
     let _ = std::fs::remove_dir_all(&root);
@@ -894,12 +935,15 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
                 let mut byte = [0];
                 socket.read_exact(&mut byte).await.unwrap();
                 bytes.push(byte[0]);
-                if bytes.ends_with(b"\r\n\r\n") { break bytes.len(); }
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break bytes.len();
+                }
             };
             let headers = String::from_utf8_lossy(&bytes).to_lowercase();
-            let length: usize = headers.lines().find_map(|line| {
-                line.strip_prefix("content-length:")?.trim().parse().ok()
-            }).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:")?.trim().parse().ok())
+                .unwrap();
             bytes.resize(header_end + length, 0);
             socket.read_exact(&mut bytes[header_end..]).await.unwrap();
             if turn == 20 {
@@ -922,21 +966,50 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     });
     let command = || {
         let mut cmd = tokio::process::Command::new(common::binary_path());
-        cmd.env("SWE_HUB_DIR", &hub).env("SWE_TEMP_DIR", &swe).env("TMPDIR", &swe)
+        cmd.env("SWE_HUB_DIR", &hub)
+            .env("SWE_TEMP_DIR", &swe)
+            .env("TMPDIR", &swe)
             .env_remove("MINI_SWE_NO_DAEMON")
-            .env("OPENAI_API_BASE", &api_base).env("OPENAI_API_KEY", "test-key")
+            .env("OPENAI_API_BASE", &api_base)
+            .env("OPENAI_API_KEY", "test-key")
             .env("ENV_FILE", root.path().join("absent.env"))
-            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .env(
+                "MODELS_FILE",
+                format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+            )
             .env("HUB_IDLE_SECS", "60");
         cmd
     };
-    let mut first = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
-        .kill_on_drop(true).spawn().unwrap();
+    let mut first = command()
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     wait_for_socket(&hub.join("hub.sock")).await;
-    let out = command().args(["dispatch", "checkpoint recovery", "--repo", repo.to_str().unwrap(),
-        "--model", "test-model", "--max-turns", "30", "--verify", "", "--json"])
-        .output().await.unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = command()
+        .args([
+            "dispatch",
+            "checkpoint recovery",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--model",
+            "test-model",
+            "--max-turns",
+            "30",
+            "--verify",
+            "",
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let dispatched: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let wid = dispatched["worker_id"].as_str().unwrap();
     // The durable store is the append-only log, written one line per message.
@@ -948,12 +1021,15 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         let lines = std::fs::read_to_string(&history_path)
             .map(|raw| raw.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
-        if lines >= 40 { break; }
+        if lines >= 40 {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     // Read the log directly: it lives under this test's `SWE_TEMP_DIR`, which
     // the test process itself does not share with the daemon that wrote it.
-    let raw = std::fs::read_to_string(&history_path).expect("checkpoint must save history before exit");
+    let raw =
+        std::fs::read_to_string(&history_path).expect("checkpoint must save history before exit");
     let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
     let mut checkpoint: mini_swe_mcp::pool::WorkerHistory =
         serde_json::from_str(lines.next().expect("the log has a metadata line")).unwrap();
@@ -963,36 +1039,84 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
             .push(serde_json::from_str(line).expect("one message per line"));
     }
     assert!(mini_swe_mcp::pool::is_replayable(&checkpoint.messages));
-    assert!(checkpoint.messages.len() >= 40, "must retain exchanges before turn 20");
+    assert!(
+        checkpoint.messages.len() >= 40,
+        "must retain exchanges before turn 20"
+    );
     assert_eq!(checkpoint.owner.as_deref(), Some("cli"));
     assert_eq!(checkpoint.verify, None);
     first.kill().await.unwrap();
     first.wait().await.unwrap();
 
-    let mut second = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+    let mut second = command()
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .env("HUB_AUTO_RESUME", "0")
-        .kill_on_drop(true).spawn().unwrap();
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
     wait_for_socket(&hub.join("hub.sock")).await;
     let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
-        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap()
-    ).unwrap();
+        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap(),
+    )
+    .unwrap();
     // Interrupted, not failed: the worker stopped because the hub did, and its
     // conversation survived, so the steer below continues it.
-    assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Interrupted);
-    assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
-    let out = tokio::time::timeout(std::time::Duration::from_secs(15),
-        command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--json"])
-            .output()).await.expect("steer must return").unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let watched = tokio::time::timeout(std::time::Duration::from_secs(15),
-        command().args(["watch", wid, "--timeout", "10", "--json"]).output())
-        .await.expect("revision watch must finish").unwrap();
-    assert!(watched.status.success(), "{}", String::from_utf8_lossy(&watched.stderr));
+    assert_eq!(
+        recovered.status,
+        mini_swe_mcp::pool::RegistryStatus::Interrupted
+    );
+    assert_eq!(
+        recovered.last_command,
+        format!("hub restarted; work salvaged on branch worker-{wid}")
+    );
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        command()
+            .args([
+                "steer",
+                wid,
+                "resume after crash",
+                "--max-turns",
+                "2",
+                "--json",
+            ])
+            .output(),
+    )
+    .await
+    .expect("steer must return")
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let watched = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        command()
+            .args(["watch", wid, "--timeout", "10", "--json"])
+            .output(),
+    )
+    .await
+    .expect("revision watch must finish")
+    .unwrap();
+    assert!(
+        watched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&watched.stderr)
+    );
     assert!(String::from_utf8_lossy(&watched.stdout).contains(&checkpoint.branch));
-    assert_eq!(common::git(&repo, &["show", &format!("{}:kept.txt", checkpoint.branch)]).trim(), "checkpoint");
+    assert_eq!(
+        common::git(&repo, &["show", &format!("{}:kept.txt", checkpoint.branch)]).trim(),
+        "checkpoint"
+    );
     second.kill().await.unwrap();
     second.wait().await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), llm).await.expect("LLM completed all turns").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), llm)
+        .await
+        .expect("LLM completed all turns")
+        .unwrap();
     std::fs::remove_dir_all(&hub).unwrap();
 }
 
@@ -1122,7 +1246,11 @@ async fn events_are_owner_scoped_and_replayed_after_hello() {
             break;
         }
     }
-    assert_eq!(admin_saw.last(), Some(&serde_json::json!("h4-late")), "{admin_saw:?}");
+    assert_eq!(
+        admin_saw.last(),
+        Some(&serde_json::json!("h4-late")),
+        "{admin_saw:?}"
+    );
     drop(a);
     drop(b);
     drop(late);
@@ -1411,8 +1539,13 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
         .await;
     let steered = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        waiter.worker(serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go"})),
-    ).await.expect("steer returns immediately").expect("steer succeeds");
+        waiter.worker(
+            serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go"}),
+        ),
+    )
+    .await
+    .expect("steer returns immediately")
+    .expect("steer succeeds");
     assert_eq!(steered["status"], "steered");
     let mut closer = Client::connect(&socket).await;
     closer
@@ -1472,7 +1605,9 @@ fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
                     "error": {"code": -32601, "message": "Method not found: hub/hello"}})),
                 ("tools/call", Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id,
                     "result": {"content": [{"type": "text", "text": "{\"workers\":[]}"}]}})),
-                (_, Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+                (_, Some(id)) => {
+                    Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                }
             };
             methods.push((method.clone(), frame.get("id").is_some()));
             if let Some(reply) = reply {
@@ -1582,7 +1717,9 @@ fn a_hub_without_a_build_field_falls_back_to_the_release() {
     let (methods, hello) = list_against_fake_hub(env!("CARGO_PKG_VERSION"));
     assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
     assert!(
-        hello["build"]["id"].as_str().is_some_and(|id| !id.is_empty()),
+        hello["build"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
         "{hello}"
     );
     assert!(hello["build"]["ts"].is_u64(), "{hello}");

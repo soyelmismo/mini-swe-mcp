@@ -65,23 +65,38 @@ pub fn format_list(val: &serde_json::Value) -> String {
         if group != "default" {
             details.push(format!("group: {group}"));
         }
-        if let Some(pid) = state_obj.and_then(|s| s.get("pid")).and_then(|v| v.as_u64()) {
+        if let Some(pid) = state_obj
+            .and_then(|s| s.get("pid"))
+            .and_then(|v| v.as_u64())
+        {
             details.push(format!("pid: {pid}"));
         }
         if !model.is_empty() {
             details.push(format!("model: {model}"));
         }
-        if let Some(turns) = state_obj.and_then(|s| s.get("turns")).and_then(|v| v.as_u64()) {
+        if let Some(turns) = state_obj
+            .and_then(|s| s.get("turns"))
+            .and_then(|v| v.as_u64())
+        {
             details.push(format!("turns: {turns}"));
-        } else if let Some(step) = state_obj.and_then(|s| s.get("step")).and_then(|v| v.as_u64()) {
+        } else if let Some(step) = state_obj
+            .and_then(|s| s.get("step"))
+            .and_then(|v| v.as_u64())
+        {
             details.push(format!("step: {step}"));
         }
-        if let Some(op) = state_obj.and_then(|s| s.get("last_command")).and_then(|v| v.as_str())
-            && !op.is_empty() && op != "initializing"
+        if let Some(op) = state_obj
+            .and_then(|s| s.get("last_command"))
+            .and_then(|v| v.as_str())
+            && !op.is_empty()
+            && op != "initializing"
         {
             details.push(format!("op: {op}"));
         }
-        if let Some(err) = state_obj.and_then(|s| s.get("error")).and_then(|v| v.as_str()) {
+        if let Some(err) = state_obj
+            .and_then(|s| s.get("error"))
+            .and_then(|v| v.as_str())
+        {
             details.push(format!("error: {err}"));
         }
 
@@ -123,11 +138,9 @@ mod tests {
 
     #[test]
     fn test_format_manifest_lists_models_sorted_with_metadata() {
-        let out = format_manifest(&v(
-            r#"{"default_model":"z","models":{
+        let out = format_manifest(&v(r#"{"default_model":"z","models":{
                  "zeta":{"id":"z-model","temperature":0.0,"max_turns":7,"role":"coder"},
-                 "alpha":{"id":"a-model","temperature":0.75}}}"#,
-        ));
+                 "alpha":{"id":"a-model","temperature":0.75}}}"#));
         assert!(out.starts_with("Default model: z\n\nModels:\n"));
         // Sorted by alias, not by insertion order.
         let alpha = out.find("- alpha").expect("alpha row");
@@ -140,13 +153,13 @@ mod tests {
 
     #[test]
     fn test_format_list_renders_worker_rows_and_previews() {
-        let out = format_list(&v(
-            r#"{"workers":[{
+        let out = format_list(&v(r#"{"workers":[{
                  "id":"w1","model":"m","group":"g","task":"a long task description that goes well past the sixty character preview limit",
-                 "state":{"status":"Running","pid":42,"turns":3,"last_command":"cargo test","error":"boom"}}]}"#,
-        ));
+                 "state":{"status":"Running","pid":42,"turns":3,"last_command":"cargo test","error":"boom"}}]}"#));
         assert!(out.starts_with("Workers (1):\n"));
-        assert!(out.contains("- w1 [Running] (group: g, pid: 42, model: m, turns: 3, op: cargo test, error: boom)"));
+        assert!(out.contains(
+            "- w1 [Running] (group: g, pid: 42, model: m, turns: 3, op: cargo test, error: boom)"
+        ));
         assert!(out.contains("Task: a long task description that goes well past the "));
         assert!(out.contains("..."), "long tasks are elided: {out}");
     }

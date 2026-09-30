@@ -478,7 +478,10 @@ mod budget_tests {
     fn budget_counts_all_tool_results_and_fallback_outputs_not_guidance() {
         let mut messages = history(&[10_000; 5]);
         // A second result in the fifth-oldest exchange tips it over 55 KB.
-        messages.insert(4, ChatMessage::tool_result("extra".into(), "x".repeat(10_000)));
+        messages.insert(
+            4,
+            ChatMessage::tool_result("extra".into(), "x".repeat(10_000)),
+        );
         let original = serde_json::to_value(&messages).unwrap();
         let policy = KeepPolicy::Budget(55_000);
         compact_with_policy(&mut messages, policy, false);

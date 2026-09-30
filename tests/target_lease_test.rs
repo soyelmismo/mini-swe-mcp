@@ -21,8 +21,10 @@ struct Pool {
 
 impl Pool {
     fn new(tag: &str) -> Self {
-        let repo = std::env::temp_dir()
-            .join(format!("swe-lease-repo-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        let repo = std::env::temp_dir().join(format!(
+            "swe-lease-repo-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&repo).expect("repository root must be creatable");
         Self {
             repo,
@@ -52,8 +54,12 @@ impl Pool {
             Err(_) => return false,
         };
         // SAFETY: `file` owns a live descriptor for the duration of the call.
-        let locked =
-            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+        let locked = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
         if locked == 0 {
             // SAFETY: releasing a lock this call just took.
             unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN) };
@@ -87,8 +93,14 @@ fn two_live_workers_of_one_repo_never_share_a_build_dir() {
         "two live workers of one repository shared {}",
         first.dir().display()
     );
-    assert!(!pool.is_free(first.dir()), "the first worker's dir must stay locked");
-    assert!(!pool.is_free(second.dir()), "the second worker's dir must stay locked");
+    assert!(
+        !pool.is_free(first.dir()),
+        "the first worker's dir must stay locked"
+    );
+    assert!(
+        !pool.is_free(second.dir()),
+        "the second worker's dir must stay locked"
+    );
 }
 
 /// The warm-cache benefit survives: a directory freed by a finished worker is
@@ -137,9 +149,15 @@ fn a_lease_survives_heavy_and_light_alternation() {
 
     // Ending one worker releases exactly its directory, and nothing else.
     let ended = held.remove(1).dir().to_path_buf();
-    assert!(pool.is_free(&ended), "the ended worker's dir must be free again");
+    assert!(
+        pool.is_free(&ended),
+        "the ended worker's dir must be free again"
+    );
     for lease in &held {
-        assert!(!pool.is_free(lease.dir()), "another live worker lost its dir");
+        assert!(
+            !pool.is_free(lease.dir()),
+            "another live worker lost its dir"
+        );
     }
 }
 
@@ -157,7 +175,11 @@ fn dropping_the_worker_releases_its_dir() {
     assert!(pool.is_free(&dir), "a dropped worker must release its dir");
 
     let next = pool.lease();
-    assert_eq!(next.dir(), dir, "the released dir must go back into the pool");
+    assert_eq!(
+        next.dir(),
+        dir,
+        "the released dir must go back into the pool"
+    );
 }
 
 /// The sweep must never take a directory a live worker is building in.

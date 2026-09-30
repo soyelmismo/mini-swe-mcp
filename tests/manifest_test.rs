@@ -1066,16 +1066,25 @@ models:
 
     // By alias.
     assert_eq!(
-        manifest.network_policy("sealed").as_ref().map(|n| n.as_str()),
+        manifest
+            .network_policy("sealed")
+            .as_ref()
+            .map(|n| n.as_str()),
         Some("offline")
     );
     assert_eq!(
-        manifest.network_policy("runner").as_ref().map(|n| n.as_str()),
+        manifest
+            .network_policy("runner")
+            .as_ref()
+            .map(|n| n.as_str()),
         Some("allow")
     );
     // By full id.
     assert_eq!(
-        manifest.network_policy("vendor:sealed").as_ref().map(|n| n.as_str()),
+        manifest
+            .network_policy("vendor:sealed")
+            .as_ref()
+            .map(|n| n.as_str()),
         Some("offline")
     );
     // A model with no policy block, and an unknown model, both yield `None`.

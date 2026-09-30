@@ -21,10 +21,10 @@ use std::io::Write;
 use mini_swe_mcp::agent::AgentStepLog;
 use mini_swe_mcp::pool::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, LogBuffer, LogRetentionPolicy,
-    MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING,
-    RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRecord, WorkerRegistryEntry,
-    WorkerState, build_step_log, clamp_string, emit_view, parse_ask_orchestrator,
-    parse_request_turns, summarize_command,
+    MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES,
+    MAX_RETAINED_LOGS_CEILING, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool,
+    WorkerRecord, WorkerRegistryEntry, WorkerState, build_step_log, clamp_string, emit_view,
+    parse_ask_orchestrator, parse_request_turns, summarize_command,
 };
 
 /// Owner recorded for the synthetic workers these tests insert: the pool's
@@ -47,11 +47,17 @@ fn test_parse_request_turns_variants() {
     // Different counts, and surrounding whitespace is irrelevant.
     assert_eq!(parse_request_turns("echo REQUEST_TURNS: 20"), Some(20));
     assert_eq!(parse_request_turns("echo REQUEST_TURNS: 1"), Some(1));
-    assert_eq!(parse_request_turns("   echo REQUEST_TURNS: 42   "), Some(42));
+    assert_eq!(
+        parse_request_turns("   echo REQUEST_TURNS: 42   "),
+        Some(42)
+    );
     // Leading whitespace between the token and the number is skipped.
     assert_eq!(parse_request_turns("echo REQUEST_TURNS:   7"), Some(7));
     // Trailing characters after the number are ignored.
-    assert_eq!(parse_request_turns("echo REQUEST_TURNS: 15 # more"), Some(15));
+    assert_eq!(
+        parse_request_turns("echo REQUEST_TURNS: 15 # more"),
+        Some(15)
+    );
 }
 
 #[test]
@@ -135,7 +141,10 @@ fn test_parse_ask_orchestrator_non_matching_commands_return_none() {
     assert_eq!(parse_ask_orchestrator("echo done"), None);
     // A bare command that merely mentions the token.
     assert_eq!(parse_ask_orchestrator("ASK_ORCHESTRATOR: why?"), None);
-    assert_eq!(parse_ask_orchestrator("grepecho ASK_ORCHESTRATOR: why?"), None);
+    assert_eq!(
+        parse_ask_orchestrator("grepecho ASK_ORCHESTRATOR: why?"),
+        None
+    );
 }
 
 #[test]
@@ -145,10 +154,16 @@ fn test_parse_ask_orchestrator_placeholders_and_blanks_are_rejected() {
         parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: <your specific question>'"),
         None
     );
-    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: <question>\""), None);
+    assert_eq!(
+        parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: <question>\""),
+        None
+    );
     // Empty question.
     assert_eq!(parse_ask_orchestrator("echo ASK_ORCHESTRATOR:"), None);
-    assert_eq!(parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR:   \""), None);
+    assert_eq!(
+        parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR:   \""),
+        None
+    );
     assert_eq!(parse_ask_orchestrator(""), None);
 }
 
@@ -188,7 +203,10 @@ fn test_summarize_command_truncates_long_summaries() {
     // at most 37 bytes plus an ellipsis.
     let cmd = "echo alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-india-juliett";
     let summary = summarize_command(cmd);
-    assert!(summary.ends_with("..."), "expected truncation, got {summary:?}");
+    assert!(
+        summary.ends_with("..."),
+        "expected truncation, got {summary:?}"
+    );
     assert_eq!(summary.len(), 40, "summary should be 37 bytes + '...'");
     assert!(summary.is_char_boundary(summary.len()));
 }
@@ -198,7 +216,10 @@ fn test_summarize_command_multibyte_utf8() {
     // A long word containing non-ASCII characters is still truncated safely.
     let cmd = "echo 'esta_es_una_palabra_extremadamente_larga_con_ñ_y_acentos_para_superar_limite'";
     let summary = summarize_command(cmd);
-    assert!(summary.ends_with("..."), "expected truncation, got {summary:?}");
+    assert!(
+        summary.ends_with("..."),
+        "expected truncation, got {summary:?}"
+    );
     assert_eq!(summary.len(), 40);
     // The visible prefix must be valid UTF-8 and made of whole characters.
     let visible = summary.trim_end_matches("...");
@@ -215,7 +236,10 @@ fn test_summarize_command_multibyte_boundary_is_not_split() {
     special.push('€');
     special.push_str(" rest of command");
     let summary = summarize_command(&special);
-    assert!(summary.ends_with("..."), "expected truncation, got {summary:?}");
+    assert!(
+        summary.ends_with("..."),
+        "expected truncation, got {summary:?}"
+    );
     assert_eq!(summary, format!("{}...", "a".repeat(36)));
     assert_eq!(summary.len(), 39);
     assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
@@ -245,8 +269,14 @@ fn test_summarize_command_other_multibyte_boundaries() {
 #[test]
 fn test_summarize_command_short_multibyte_is_untouched() {
     // No truncation: the summary is returned verbatim.
-    assert_eq!(summarize_command("echo 'ñandú café ☕'"), "echo 'ñandú café ☕'");
-    assert_eq!(summarize_command("ls 日本語 ファイル"), "ls 日本語 ファイル");
+    assert_eq!(
+        summarize_command("echo 'ñandú café ☕'"),
+        "echo 'ñandú café ☕'"
+    );
+    assert_eq!(
+        summarize_command("ls 日本語 ファイル"),
+        "ls 日本語 ファイル"
+    );
     // Byte length above 40 is not reached by this one.
     let s = summarize_command("echo 'ñandú café ☕'");
     assert!(s.len() < 40);
@@ -326,7 +356,10 @@ fn steer_mailbox_uses_the_documented_path_and_json_lines() {
     // The path is a sibling of the worktree, so one `ls` shows every worker
     // and `prune` reclaims both together.
     let path = mini_swe_mcp::pool::steer_path("abc123");
-    assert_eq!(path, std::path::PathBuf::from(&dir).join("swe-wt-abc123.steer"));
+    assert_eq!(
+        path,
+        std::path::PathBuf::from(&dir).join("swe-wt-abc123.steer")
+    );
 
     mini_swe_mcp::pool::write_steer_message("abc123", "first").unwrap();
     mini_swe_mcp::pool::write_steer_message("abc123", "second").unwrap();
@@ -450,7 +483,10 @@ fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
     let _scope = ScopedTempDir::set(&dir);
 
     mini_swe_mcp::pool::write_steer_message("l1", "early").unwrap();
-    assert_eq!(mini_swe_mcp::pool::drain_steer_messages("l1"), vec!["early"]);
+    assert_eq!(
+        mini_swe_mcp::pool::drain_steer_messages("l1"),
+        vec!["early"]
+    );
 
     // A steer that lands *after* the rename recreated the original path; it
     // must wait for the next drain rather than being lost in the claim.
@@ -505,7 +541,10 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
 
     assert!(seen.contains(&"from this process".to_string()));
     assert!(seen.contains(&"from another process".to_string()));
-    assert!(seen.len() == 2, "each message must be delivered once: {seen:?}");
+    assert!(
+        seen.len() == 2,
+        "each message must be delivered once: {seen:?}"
+    );
 
     // A second turn finds nothing left to inject -- guidance is consumed, not
     // replayed on every subsequent turn.
@@ -669,7 +708,9 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
         .expect("spawn a stand-in owner");
     let row = live_row_elsewhere("remote", owner.id());
     mini_swe_mcp::pool::save_registry_entry(&row);
-    pool.steer("remote", "focus on the parser".into()).await.unwrap();
+    pool.steer("remote", "focus on the parser".into())
+        .await
+        .unwrap();
     let path = mini_swe_mcp::pool::steer_path("remote");
     assert!(path.is_file(), "the message must be queued, not dropped");
     let raw = std::fs::read_to_string(&path).unwrap();
@@ -857,7 +898,8 @@ fn test_log_buffer_memory_is_bounded_per_worker() {
     assert!(buf.len() <= DEFAULT_MAX_RETAINED_LOGS);
     assert!(
         buf.iter()
-            .all(|e| e.output.len() <= MAX_LOG_OUTPUT_BYTES && e.command.len() <= MAX_LOG_COMMAND_BYTES),
+            .all(|e| e.output.len() <= MAX_LOG_OUTPUT_BYTES
+                && e.command.len() <= MAX_LOG_COMMAND_BYTES),
         "every retained entry must be clamped, which bounds the window's payload"
     );
 }
@@ -1058,11 +1100,13 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(leftovers.is_empty(), "worker exit leaked files: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "worker exit leaked files: {leftovers:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 // ----------
 // Per-worker health metrics (selfimprove-I7)
@@ -1218,7 +1262,11 @@ async fn test_a_killed_worker_reports_what_the_run_had_measured() {
 
 /// Build a minimal saved history for `id`: a system prompt, a task and one
 /// completed exchange, plus the relaunch facts a revision needs.
-fn sample_history(repo_path: &std::path::Path, base_commit: &str, branch: &str) -> mini_swe_mcp::pool::WorkerHistory {
+fn sample_history(
+    repo_path: &std::path::Path,
+    base_commit: &str,
+    branch: &str,
+) -> mini_swe_mcp::pool::WorkerHistory {
     use mini_swe_mcp::agent::{ChatMessage, Role};
     mini_swe_mcp::pool::WorkerHistory {
         task: "fix the parser".to_string(),
@@ -1274,7 +1322,11 @@ fn scratch_repo(tag: &str) -> std::path::PathBuf {
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     run(&["init", "-b", "master"]);
     run(&["config", "user.name", "mini-swe-test"]);
@@ -1298,7 +1350,10 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     assert_eq!(legacy["base_branch"], "master");
     legacy.as_object_mut().unwrap().remove("base_branch");
     let restored: mini_swe_mcp::pool::WorkerHistory = serde_json::from_value(legacy).unwrap();
-    assert_eq!(restored.base_branch, None, "old history files remain readable");
+    assert_eq!(
+        restored.base_branch, None,
+        "old history files remain readable"
+    );
 
     // Atomic write, owner-only permissions, beside the mailbox.
     let path = mini_swe_mcp::pool::history_path("rev1");
@@ -1306,7 +1361,11 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).expect("stat history").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&path)
+            .expect("stat history")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
     }
 
@@ -1346,12 +1405,21 @@ fn prune_retires_histories_whose_branch_is_gone() {
     git(&["branch", "worker-alive"]);
     mini_swe_mcp::pool::save_worker_history("alive", &sample_history(&repo, "abc", "worker-alive"))
         .expect("save the revisable history");
-    mini_swe_mcp::pool::save_worker_history("merged", &sample_history(&repo, "abc", "worker-merged"))
-        .expect("save the orphaned history");
+    mini_swe_mcp::pool::save_worker_history(
+        "merged",
+        &sample_history(&repo, "abc", "worker-merged"),
+    )
+    .expect("save the orphaned history");
 
     assert_eq!(mini_swe_mcp::pool::prune_orphan_histories(&repo), 1);
-    assert!(mini_swe_mcp::pool::history_path("alive").is_file(), "a live branch keeps its history");
-    assert!(!mini_swe_mcp::pool::history_path("merged").exists(), "a deleted branch loses it");
+    assert!(
+        mini_swe_mcp::pool::history_path("alive").is_file(),
+        "a live branch keeps its history"
+    );
+    assert!(
+        !mini_swe_mcp::pool::history_path("merged").exists(),
+        "a deleted branch loses it"
+    );
 
     mini_swe_mcp::pool::remove_worker_history("alive");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1372,7 +1440,9 @@ async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     assert_eq!(
         pool.worker_owner("reaped").await,
-        Some(mini_swe_mcp::pool::WorkerOwner::Agent("agent-x".to_string()))
+        Some(mini_swe_mcp::pool::WorkerOwner::Agent(
+            "agent-x".to_string()
+        ))
     );
 
     mini_swe_mcp::pool::remove_worker_history("reaped");
@@ -1396,7 +1466,11 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     run(&["checkout", "-b", branch]);
     std::fs::write(repo.join("fix.txt"), "fix\n").expect("worker change");
@@ -1434,7 +1508,10 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
         .expect("steer on a completed worker must start a revision, not error");
 
     // The record is Running again on the same id, with the revision counted.
-    let progress = pool.worker_progress("revwork").await.expect("worker still tracked");
+    let progress = pool
+        .worker_progress("revwork")
+        .await
+        .expect("worker still tracked");
     assert_eq!(progress.phase, WorkerPhase::Running);
     // Two steers that both saw the worker finished race into `revise`; the
     // loser must be refused instead of launching a second loop on the branch.
@@ -1443,7 +1520,8 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
         .await
         .expect_err("a running revision must not be revised again");
     assert!(
-        err.to_string().contains("already running (revision 1 in progress)"),
+        err.to_string()
+            .contains("already running (revision 1 in progress)"),
         "{err}"
     );
 
@@ -1461,7 +1539,10 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(wt_path.join(".git").exists(), "the revision must re-create the worktree");
+    assert!(
+        wt_path.join(".git").exists(),
+        "the revision must re-create the worktree"
+    );
     let out = std::process::Command::new("git")
         .current_dir(&wt_path)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1564,10 +1645,7 @@ async fn change_subscription_fires_on_every_state_change() {
     let mut changes = pool.subscribe_changes();
     // The subscription starts at the current generation, so only the state
     // change below may resolve it.
-    let changed = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        changes.changed(),
-    );
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed());
     pool.__test_set_worker_state(
         "h5a-sub",
         WorkerState::Paused {
@@ -1577,7 +1655,10 @@ async fn change_subscription_fires_on_every_state_change() {
         },
     )
     .await;
-    changed.await.expect("the waiter must observe the change").expect("watch open");
+    changed
+        .await
+        .expect("the waiter must observe the change")
+        .expect("watch open");
 }
 
 /// Step-only registry updates coalesce; a status transition writes at once.
@@ -1598,9 +1679,14 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         revision: 0,
         auto_continues: 0,
     };
-    let row_path =
-        std::path::PathBuf::from(&dir).join("swe-registry").join("h5a-reg.json");
-    let mtime = || std::fs::metadata(&row_path).ok().and_then(|m| m.modified().ok());
+    let row_path = std::path::PathBuf::from(&dir)
+        .join("swe-registry")
+        .join("h5a-reg.json");
+    let mtime = || {
+        std::fs::metadata(&row_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    };
 
     // First write always lands (there is no row yet to coalesce with)...
     pool.__test_save_status(&meta, "m", RegistryStatus::Running, 1, 10, "ls", None);
@@ -1610,23 +1696,41 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
     for step in 2..=10usize {
         pool.__test_save_status(&meta, "m", RegistryStatus::Running, step, 10, "ls", None);
     }
-    assert_eq!(mtime(), first, "rapid step updates must coalesce to one file write");
+    assert_eq!(
+        mtime(),
+        first,
+        "rapid step updates must coalesce to one file write"
+    );
 
     // Past the throttle window a step update lands again, so the final state
     // can never be stuck behind the throttle.
     pool.__test_reset_registry_throttle("h5a-reg");
     pool.__test_save_status(&meta, "m", RegistryStatus::Running, 11, 10, "ls", None);
-    assert!(mtime() >= first, "a step update past the window must be written");
+    assert!(
+        mtime() >= first,
+        "a step update past the window must be written"
+    );
     let stepped = mtime();
 
     // A status transition is never throttled.
-    pool.__test_save_status(&meta, "m", RegistryStatus::Paused, 11, 10, "ls", Some("q?".into()));
+    pool.__test_save_status(
+        &meta,
+        "m",
+        RegistryStatus::Paused,
+        11,
+        10,
+        "ls",
+        Some("q?".into()),
+    );
     let entry: WorkerRegistryEntry =
         serde_json::from_str(&std::fs::read_to_string(&row_path).expect("row readable"))
             .expect("row parses");
     assert_eq!(entry.status, RegistryStatus::Paused);
     assert_eq!(entry.question.as_deref(), Some("q?"));
-    assert!(mtime() >= stepped, "a status transition must write immediately");
+    assert!(
+        mtime() >= stepped,
+        "a status transition must write immediately"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1743,7 +1847,11 @@ async fn admission_a_cancelled_waiter_releases_its_place() {
 
     doomed.abort();
     let _ = doomed.await;
-    assert_eq!(gate.waiting(), 1, "the aborted request must leave the queue");
+    assert_eq!(
+        gate.waiting(),
+        1,
+        "the aborted request must leave the queue"
+    );
     drop(held);
     let jobs = tokio::time::timeout(std::time::Duration::from_secs(5), survivor)
         .await
@@ -1821,8 +1929,10 @@ async fn listing_is_scoped_to_the_owning_agent() {
     let dir = scratch_dir("h3-list-inmemory");
     let _scope = ScopedTempDir::set(&dir);
     let pool = WorkerPool::new(4, "http://x".into(), "k".into());
-    pool.__test_insert_worker(owned_worker("h3-mine", "agent-a")).await;
-    pool.__test_insert_worker(owned_worker("h3-theirs", "agent-b")).await;
+    pool.__test_insert_worker(owned_worker("h3-mine", "agent-a"))
+        .await;
+    pool.__test_insert_worker(owned_worker("h3-theirs", "agent-b"))
+        .await;
 
     let ids = |rows: Vec<serde_json::Value>| -> Vec<String> {
         rows.iter()
@@ -1886,7 +1996,9 @@ async fn worker_ownership_falls_back_to_the_registry_row() {
     mini_swe_mcp::pool::save_registry_entry(&row);
     assert_eq!(
         pool.worker_owner("h3-foreign").await,
-        Some(mini_swe_mcp::pool::WorkerOwner::Agent("agent-a".to_string()))
+        Some(mini_swe_mcp::pool::WorkerOwner::Agent(
+            "agent-a".to_string()
+        ))
     );
 
     row.id = "h3-ancient".to_string();
@@ -1923,9 +2035,12 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
     let dir = scratch_dir("h3-cap-count");
     let _scope = ScopedTempDir::set(&dir);
     let pool = WorkerPool::new(8, "http://x".into(), "k".into());
-    pool.__test_insert_worker(owned_worker("h3-a1", "agent-a")).await;
-    pool.__test_insert_worker(owned_worker("h3-a2", "agent-a")).await;
-    pool.__test_insert_worker(owned_worker("h3-b1", "agent-b")).await;
+    pool.__test_insert_worker(owned_worker("h3-a1", "agent-a"))
+        .await;
+    pool.__test_insert_worker(owned_worker("h3-a2", "agent-a"))
+        .await;
+    pool.__test_insert_worker(owned_worker("h3-b1", "agent-b"))
+        .await;
     // A finished worker of the same agent no longer occupies the cap.
     pool.__test_insert_worker(WorkerRecord {
         state: WorkerState::Completed {
@@ -1943,7 +2058,10 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
     })
     .await;
 
-    assert_eq!(pool.active_workers_of("agent-a").await, vec!["h3-a1", "h3-a2"]);
+    assert_eq!(
+        pool.active_workers_of("agent-a").await,
+        vec!["h3-a1", "h3-a2"]
+    );
     assert_eq!(pool.active_workers_of("agent-b").await, vec!["h3-b1"]);
     assert!(pool.active_workers_of("agent-c").await.is_empty());
 }

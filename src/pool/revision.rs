@@ -63,11 +63,9 @@ pub fn detect_base_branch(repo_path: &std::path::Path) -> Option<String> {
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
     )
     .ok()?;
-    out.status.success().then(|| {
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .to_string()
-    })
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Fill in `base_branch` on a history that predates base-branch tracking.
@@ -183,10 +181,13 @@ pub fn append_history_message(
         // is the lines that follow it, one per message.
         let mut meta = meta.clone();
         meta.messages.clear();
-        payload.push_str(&serde_json::to_string(&meta).context("Could not serialize history metadata")?);
+        payload.push_str(
+            &serde_json::to_string(&meta).context("Could not serialize history metadata")?,
+        );
         payload.push('\n');
     }
-    payload.push_str(&serde_json::to_string(message).context("Could not serialize history message")?);
+    payload
+        .push_str(&serde_json::to_string(message).context("Could not serialize history message")?);
     payload.push('\n');
     let mut file = file;
     std::io::Write::write_all(&mut file, payload.as_bytes())
@@ -346,16 +347,16 @@ pub fn remove_worker_history(worker_id: &str) {
 }
 
 fn remove_quietly(worker_id: &str, path: &Path) {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                worker = %worker_id,
-                path = %path.display(),
-                error = %e,
-                "Failed to remove worker history file"
-            ),
-        }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            worker = %worker_id,
+            path = %path.display(),
+            error = %e,
+            "Failed to remove worker history file"
+        ),
+    }
 }
 
 /// Delete the saved conversations of `repo_root`'s workers whose branch is
@@ -392,15 +393,12 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
             else {
                 continue;
             };
-            let Some(owner) = std::fs::read_to_string(entry.path())
-                .ok()
-                .and_then(|raw| {
-                    // The log's first line is the metadata; the whole-file
-                    // form is the same object, so both parse the same way.
-                    let first = raw.lines().find(|l| !l.trim().is_empty())?;
-                    serde_json::from_str::<Owner>(first).ok()
-                })
-            else {
+            let Some(owner) = std::fs::read_to_string(entry.path()).ok().and_then(|raw| {
+                // The log's first line is the metadata; the whole-file
+                // form is the same object, so both parse the same way.
+                let first = raw.lines().find(|l| !l.trim().is_empty())?;
+                serde_json::from_str::<Owner>(first).ok()
+            }) else {
                 continue;
             };
             if Path::new(&owner.repo_path).canonicalize().ok().as_deref() != Some(root.as_path()) {
@@ -435,10 +433,7 @@ pub enum SteerOutcome {
     /// A stopped worker was continued on its own id and branch. `revision`
     /// counts the run; `cold` is true when the conversation had to be rebuilt
     /// from the registry row because no history survived.
-    Continuing {
-        revision: usize,
-        cold: bool,
-    },
+    Continuing { revision: usize, cold: bool },
 }
 
 impl SteerOutcome {
@@ -713,7 +708,12 @@ impl super::WorkerPool {
                 crate::worktree::git(
                     &repo,
                     "show-ref",
-                    &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{branch}"),
+                    ],
                 )
                 .map(|o| o.status.success())
                 .unwrap_or(false)
@@ -773,12 +773,16 @@ impl super::WorkerPool {
             match lock.get_mut(id) {
                 // Two steers racing on one finished worker must not launch
                 // two revisions on the same branch.
-                Some(w) if matches!(
-                    w.state,
-                    super::WorkerState::Running { .. } | super::WorkerState::Paused { .. }
-                ) =>
+                Some(w)
+                    if matches!(
+                        w.state,
+                        super::WorkerState::Running { .. } | super::WorkerState::Paused { .. }
+                    ) =>
                 {
-                    anyhow::bail!("Worker {id} is already running (revision {} in progress)", w.revision);
+                    anyhow::bail!(
+                        "Worker {id} is already running (revision {} in progress)",
+                        w.revision
+                    );
                 }
                 Some(w) => {
                     w.state = running;
@@ -862,7 +866,10 @@ impl super::WorkerPool {
             resume_base_branch: history.base_branch.clone(),
         };
         let handle = tokio::spawn(async move {
-            if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
+            if let Err(e) = pool
+                .run_worker(wid.clone(), config, &mut meta_for_fail)
+                .await
+            {
                 tracing::error!(worker = %wid, error = %e, "Revision failed with error");
                 pool.update_worker(&wid, |w| w.fail(e.to_string())).await;
                 pool.save_status(
@@ -890,4 +897,3 @@ impl super::WorkerPool {
         })
     }
 }
-

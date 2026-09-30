@@ -48,16 +48,11 @@ pub use self::buffer::{
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
 };
 pub use self::clock::unix_timestamp;
+pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
-    load_all_registry_entries, load_registry_entries_read_only, load_registry_entry, registry_dir, registry_owner_label,
-    remove_registry_entry, save_registry_entry,
-};
-pub(crate) use self::registry::recover_orphaned_workers;
-pub(crate) use self::runner::parse_shortstat;
-pub use self::runner::{
-    COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_request_turns, summarize_command,
+    load_all_registry_entries, load_registry_entries_read_only, load_registry_entry, registry_dir,
+    registry_owner_label, remove_registry_entry, save_registry_entry,
 };
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
@@ -66,11 +61,16 @@ pub use self::revision::{
     remove_worker_history, save_worker_history,
 };
 pub use self::runner::RunConfig;
-pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
+pub(crate) use self::runner::parse_shortstat;
+pub use self::runner::{
+    COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
+    parse_request_turns, summarize_command,
+};
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
     WorkerProgress, WorkerRecord, WorkerState,
 };
+pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
@@ -97,7 +97,9 @@ pub fn compact_for_request(
 /// nobody to drain it, so the message continues the worker instead.
 fn registry_row_live_elsewhere(id: &str) -> bool {
     load_registry_entry(id).is_some_and(|e| {
-        e.status.is_live() && e.pid != std::process::id() && crate::worktree::is_process_alive(e.pid)
+        e.status.is_live()
+            && e.pid != std::process::id()
+            && crate::worktree::is_process_alive(e.pid)
     })
 }
 
@@ -205,7 +207,8 @@ impl WorkerPool {
     }
 
     fn notify_change(&self) {
-        self.changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// All worker progress and lifecycle mutations notify under the write lock.
@@ -228,9 +231,10 @@ impl WorkerPool {
         last_command: &str,
         question: Option<String>,
     ) {
-        self.registry.lock().expect("registry lock poisoned").save(
-            meta.entry(model, status, step, max_turns, last_command, question),
-        );
+        self.registry
+            .lock()
+            .expect("registry lock poisoned")
+            .save(meta.entry(model, status, step, max_turns, last_command, question));
     }
 
     /// Attach the model manifest this pool's workers resolve against (the
@@ -289,7 +293,10 @@ impl WorkerPool {
         for id in &expired {
             lock.remove(id);
             remove_registry_entry(id);
-            self.registry.lock().expect("registry lock poisoned").remove(id);
+            self.registry
+                .lock()
+                .expect("registry lock poisoned")
+                .remove(id);
         }
         if !expired.is_empty() {
             self.notify_change();
@@ -364,7 +371,15 @@ impl WorkerPool {
             revision: 0,
         };
 
-        self.save_status(&meta, &model, RegistryStatus::Running, 0, max_turns, "initializing", None);
+        self.save_status(
+            &meta,
+            &model,
+            RegistryStatus::Running,
+            0,
+            max_turns,
+            "initializing",
+            None,
+        );
 
         // Prune stale terminal records *before* inserting, so a long-lived
         // server bounds residency even without the background reaper
@@ -408,7 +423,10 @@ impl WorkerPool {
         let join_handle = tokio::spawn(async move {
             // `meta_for_fail` is lent to the loop, so the counters it moved
             // before failing are still readable here.
-            if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
+            if let Err(e) = pool
+                .run_worker(wid.clone(), config, &mut meta_for_fail)
+                .await
+            {
                 error!(worker = %wid, error = %e, "Worker failed with error");
                 pool.update_worker(&wid, |w| w.fail(e.to_string())).await;
                 pool.save_status(
@@ -473,10 +491,7 @@ impl WorkerPool {
     /// write-guard) without spinning up a real LLM-backed worker.
     #[doc(hidden)]
     pub async fn __test_insert_worker(&self, record: WorkerRecord) {
-        self.workers
-            .write()
-            .await
-            .insert(record.id.clone(), record);
+        self.workers.write().await.insert(record.id.clone(), record);
         self.notify_change();
     }
 
@@ -523,9 +538,7 @@ impl WorkerPool {
         let w = lock.get(id)?;
         let progress = match &w.state {
             WorkerState::Running {
-                step,
-                last_command,
-                ..
+                step, last_command, ..
             } => WorkerProgress {
                 phase: WorkerPhase::Running,
                 step: *step,
@@ -595,7 +608,10 @@ impl WorkerPool {
         let mut seen = std::collections::HashSet::new();
         {
             let lock = self.workers.read().await;
-            for w in lock.values().filter(|w| owner.is_none_or(|owner| w.owner == owner)) {
+            for w in lock
+                .values()
+                .filter(|w| owner.is_none_or(|owner| w.owner == owner))
+            {
                 let stats = w.log_stats();
                 seen.insert(w.id.clone());
                 rows.push(serde_json::json!({
@@ -789,17 +805,12 @@ impl WorkerPool {
         let base_branch = base_branch.clone();
         let branch = branch.to_string();
         tokio::task::spawn_blocking(move || {
-            let out = crate::worktree::git(
-                &repo,
-                "merge-base",
-                &["merge-base", &base_branch, &branch],
-            )
-            .ok()?;
-            out.status.success().then(|| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .to_string()
-            })
+            let out =
+                crate::worktree::git(&repo, "merge-base", &["merge-base", &base_branch, &branch])
+                    .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         })
         .await
         .ok()
@@ -979,7 +990,10 @@ impl WorkerPool {
             let mut count = 0usize;
             let mut entries = Vec::new();
             for worker in lock.values_mut() {
-                if !matches!(worker.state, WorkerState::Running { .. } | WorkerState::Paused { .. }) {
+                if !matches!(
+                    worker.state,
+                    WorkerState::Running { .. } | WorkerState::Paused { .. }
+                ) {
                     continue;
                 }
                 if let Some(handle) = worker.handle.take() {
@@ -1009,7 +1023,10 @@ impl WorkerPool {
         let record = {
             let mut lock = self.workers.write().await;
             let record = lock.remove(id)?;
-            self.registry.lock().expect("registry lock poisoned").remove(id);
+            self.registry
+                .lock()
+                .expect("registry lock poisoned")
+                .remove(id);
             self.notify_change();
             drop(lock);
             record

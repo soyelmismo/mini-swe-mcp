@@ -63,7 +63,6 @@ impl CapturedRequests {
     async fn all(&self) -> Vec<Value> {
         self.0.lock().await.clone()
     }
-
 }
 
 /// A loopback HTTP server that answers `POST /chat/completions` with the next
@@ -305,7 +304,10 @@ fn tool_results(request: &Value) -> HashMap<String, String> {
         .filter(|m| m["role"] == json!("tool"))
         .map(|m| {
             (
-                m["tool_call_id"].as_str().expect("tool_call_id").to_string(),
+                m["tool_call_id"]
+                    .as_str()
+                    .expect("tool_call_id")
+                    .to_string(),
                 m["content"].as_str().unwrap_or_default().to_string(),
             )
         })
@@ -447,7 +449,8 @@ async fn implementer_replays_the_unparseable_tool_call_turn_with_its_reasoning()
         "the call of the dropped turn must be replayed"
     );
     assert_eq!(
-        assistant["reasoning_content"], json!(TURN_ONE_REASONING),
+        assistant["reasoning_content"],
+        json!(TURN_ONE_REASONING),
         "thinking-mode providers reject a follow-up whose history dropped the reasoning"
     );
 
@@ -630,7 +633,8 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
 
     let review_turn_two = &requests[2];
     assert_eq!(
-        review_turn_two["model"], json!("test-reviewer-model"),
+        review_turn_two["model"],
+        json!("test-reviewer-model"),
         "the third request is the reviewer's, on its own model"
     );
 
@@ -638,7 +642,8 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
         .expect("the reviewer's unparseable turn must be replayed to its next turn");
     assert_eq!(assistant["reasoning_content"], json!(TURN_ONE_REASONING));
     assert_eq!(
-        assistant["tool_calls"][0]["id"], json!("call_review_bad"),
+        assistant["tool_calls"][0]["id"],
+        json!("call_review_bad"),
         "the reviewer's own call must be replayed: {assistant}"
     );
 
@@ -663,17 +668,25 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
 #[tokio::test]
 async fn verify_gate_passes_and_worker_completes() {
     let repo = TestRepo::new("verify-pass");
-    let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_done"),
-    ])
-    .await;
+    let server =
+        ScriptedSseServer::spawn(vec![ScriptedSseServer::completion_turn("call_done")]).await;
 
-    let (_pool, _worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some("true".to_string())).await;
+    let (_pool, _worker_id, state) = dispatch_and_wait(
+        &server.base_url,
+        repo.path(),
+        5,
+        None,
+        Some("true".to_string()),
+    )
+    .await;
 
     match state {
         WorkerState::Completed { verified, .. } => {
-            assert_eq!(verified, Some(true), "a passing gate must verify the worker");
+            assert_eq!(
+                verified,
+                Some(true),
+                "a passing gate must verify the worker"
+            );
         }
         other => panic!("worker must complete, got {other:?}"),
     }
@@ -694,12 +707,22 @@ async fn verify_gate_fails_then_passes_after_fix_turn() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some(verify.to_string())).await;
+    let (_pool, _worker_id, state) = dispatch_and_wait(
+        &server.base_url,
+        repo.path(),
+        5,
+        None,
+        Some(verify.to_string()),
+    )
+    .await;
 
     match state {
         WorkerState::Completed { verified, .. } => {
-            assert_eq!(verified, Some(true), "the worker must pass after the fix turn");
+            assert_eq!(
+                verified,
+                Some(true),
+                "the worker must pass after the fix turn"
+            );
         }
         other => panic!("worker must complete, got {other:?}"),
     }
@@ -715,11 +738,15 @@ async fn verify_gate_fails_then_passes_after_fix_turn() {
     // turn must stay answered: a `tool_calls` turn is replayed with a tool
     // result rather than left dangling.
     let requests = server.requests.all().await;
-    assert_eq!(requests.len(), 2, "one fix turn then completion: {requests:?}");
+    assert_eq!(
+        requests.len(),
+        2,
+        "one fix turn then completion: {requests:?}"
+    );
     let results = tool_results(&requests[1]);
-    let content = results
-        .get("call_done_1")
-        .unwrap_or_else(|| panic!("the rejected completion call must be answered, got {results:?}"));
+    let content = results.get("call_done_1").unwrap_or_else(|| {
+        panic!("the rejected completion call must be answered, got {results:?}")
+    });
     assert!(
         content.contains("VERIFICATION FAILED"),
         "the tool result must explain the failure, got {content:?}"
@@ -742,12 +769,26 @@ async fn verify_gate_exhausts_after_three_failures() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) =
-        dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some("exit 1".to_string())).await;
+    let (_pool, _worker_id, state) = dispatch_and_wait(
+        &server.base_url,
+        repo.path(),
+        5,
+        None,
+        Some("exit 1".to_string()),
+    )
+    .await;
 
     match state {
-        WorkerState::Completed { verified, ref summary, .. } => {
-            assert_eq!(verified, Some(false), "three failures must flag the worker unverified");
+        WorkerState::Completed {
+            verified,
+            ref summary,
+            ..
+        } => {
+            assert_eq!(
+                verified,
+                Some(false),
+                "three failures must flag the worker unverified"
+            );
             assert!(
                 summary.contains("failing verification"),
                 "the summary must say the verification failed, got {summary:?}"
@@ -800,7 +841,10 @@ async fn a_repeated_command_is_answered_without_being_executed() {
         metrics.repeat_blocks, 1,
         "the one repeated command must be counted, got {metrics:?}"
     );
-    assert_eq!(metrics.loop_pauses, 0, "one repetition does not park a worker");
+    assert_eq!(
+        metrics.loop_pauses, 0,
+        "one repetition does not park a worker"
+    );
 
     let requests = server.requests.all().await;
     assert_eq!(requests.len(), 4, "got {requests:?}");
@@ -867,9 +911,12 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
         "the pause must name the loop and the repeated command, got {question:?}"
     );
 
-    pool.steer(&worker_id, "stop re-reading the file; make the edit".to_string())
-        .await
-        .expect("steer the paused worker");
+    pool.steer(
+        &worker_id,
+        "stop re-reading the file; make the edit".to_string(),
+    )
+    .await
+    .expect("steer the paused worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -1002,11 +1049,18 @@ async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
 
     let metrics = metrics_of(&state);
     assert_eq!(
-        (metrics.diff_files, metrics.diff_insertions, metrics.diff_deletions),
+        (
+            metrics.diff_files,
+            metrics.diff_insertions,
+            metrics.diff_deletions
+        ),
         (1, 1, 0),
         "the final diff must be measured against the worker's base commit, got {metrics:?}"
     );
-    assert_eq!(metrics.turns_used, 25, "every scripted turn must be counted");
+    assert_eq!(
+        metrics.turns_used, 25,
+        "every scripted turn must be counted"
+    );
 
     let branch = format!("worker-{worker_id}");
     let subjects = git_capture(repo.path(), &["log", "--format=%s", &branch]);
@@ -1065,7 +1119,10 @@ async fn killing_a_worker_checkpoints_its_uncommitted_work() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(reached_second_turn, "the worker never reached its second turn");
+    assert!(
+        reached_second_turn,
+        "the worker never reached its second turn"
+    );
 
     assert!(pool.kill(&worker_id).await, "kill must find the worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
@@ -1098,7 +1155,9 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
         .map(|turn| {
             ScriptedSseServer::bash_turn(&format!("call_{turn}"), &format!("echo turn {turn}"))
         })
-        .chain(std::iter::once(ScriptedSseServer::completion_turn("call_done")))
+        .chain(std::iter::once(ScriptedSseServer::completion_turn(
+            "call_done",
+        )))
         .collect();
     let server = ScriptedSseServer::spawn(script).await;
 
@@ -1138,7 +1197,10 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
         metrics.stagnation_nudges, 1,
         "the single nudge must be counted, got {metrics:?}"
     );
-    assert_eq!(metrics.turns_used, 41, "implementer and reviewer turns together");
+    assert_eq!(
+        metrics.turns_used, 41,
+        "implementer and reviewer turns together"
+    );
 }
 
 /// Large outputs and thinking-mode responses must age out of the full window,
@@ -1180,16 +1242,32 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
                 assert!(pending.remove(message["tool_call_id"].as_str().unwrap()));
             }
         }
-        assert!(pending.is_empty(), "every advertised tool call must be answered");
+        assert!(
+            pending.is_empty(),
+            "every advertised tool call must be answered"
+        );
     }
     let final_messages = messages_of(requests.last().unwrap());
-    let assistants: Vec<_> = final_messages.iter().filter(|m| m["role"] == "assistant").collect();
+    let assistants: Vec<_> = final_messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
     assert_eq!(assistants.len(), 40);
     for (i, assistant) in assistants.iter().enumerate() {
         // Nine 16 KB results, including their wrappers, fit the byte budget.
         if i < 31 {
-            assert!(assistant["reasoning_content"].as_str().unwrap().ends_with(" [reasoning elided]"));
-            assert!(assistant["content"].as_str().unwrap().ends_with(" [prose elided]"));
+            assert!(
+                assistant["reasoning_content"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" [reasoning elided]")
+            );
+            assert!(
+                assistant["content"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" [prose elided]")
+            );
         } else {
             assert_eq!(assistant["reasoning_content"], reasoning);
             assert_eq!(assistant["content"], prose);
@@ -1199,7 +1277,10 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     assert!(outputs["call_1"].starts_with("[output elided: exit 0, "));
     assert!(outputs["call_40"].len() > 16000);
     let size = |i| serde_json::to_vec(&requests[i]).unwrap().len();
-    assert!(size(40) - size(24) < 16 * 1500, "older turns must add only compact stubs");
+    assert!(
+        size(40) - size(24) < 16 * 1500,
+        "older turns must add only compact stubs"
+    );
 
     // Persistence can lag the terminal state notification by a few milliseconds.
     // The on-disk log is append-only, so it holds the *uncompacted* conversation:

@@ -113,7 +113,6 @@ pub enum Role {
     Tool,
 }
 
-
 /// A single outbound conversation message.
 ///
 /// All fields are private, so the three constructors below are the *only* way to
@@ -144,7 +143,8 @@ pub struct ChatMessage {
 /// the model produced none. A conversation that never showed reasoning is sent
 /// unchanged, so providers that reject unknown message fields never see it.
 pub fn with_replayed_reasoning(messages: &[ChatMessage]) -> std::borrow::Cow<'_, [ChatMessage]> {
-    let is_bare_assistant = |m: &ChatMessage| m.role == Role::Assistant && m.reasoning_content.is_none();
+    let is_bare_assistant =
+        |m: &ChatMessage| m.role == Role::Assistant && m.reasoning_content.is_none();
     let thinking = messages
         .iter()
         .any(|m| m.role == Role::Assistant && m.reasoning_content.is_some());
@@ -463,8 +463,8 @@ mod tests {
     /// is sent untouched.
     #[test]
     fn reasoning_is_replayed_on_every_assistant_turn_in_thinking_mode() {
-        let thought = ChatMessage::text(Role::Assistant, "a")
-            .with_reasoning_content(Some("because".into()));
+        let thought =
+            ChatMessage::text(Role::Assistant, "a").with_reasoning_content(Some("because".into()));
         let bare = ChatMessage::assistant_with_tool_calls(None, Vec::new());
         let user = ChatMessage::text(Role::User, "u");
 
@@ -472,14 +472,23 @@ mod tests {
         let wire = super::with_replayed_reasoning(&history);
         let json = serde_json::to_value(wire.as_ref()).expect("serialize");
         assert_eq!(json[1]["reasoning_content"], "because");
-        assert_eq!(json[3]["reasoning_content"], "", "the bare turn gets an empty field");
-        assert!(json[0].get("reasoning_content").is_none(), "user turns are untouched");
+        assert_eq!(
+            json[3]["reasoning_content"], "",
+            "the bare turn gets an empty field"
+        );
+        assert!(
+            json[0].get("reasoning_content").is_none(),
+            "user turns are untouched"
+        );
 
         let plain = vec![user, bare];
         let wire = super::with_replayed_reasoning(&plain);
         assert!(matches!(wire, std::borrow::Cow::Borrowed(_)));
         let json = serde_json::to_value(wire.as_ref()).expect("serialize");
-        assert!(json[1].get("reasoning_content").is_none(), "no thinking mode, no field");
+        assert!(
+            json[1].get("reasoning_content").is_none(),
+            "no thinking mode, no field"
+        );
     }
 
     #[test]
@@ -550,7 +559,10 @@ mod tests {
             (Role::Assistant, "assistant"),
             (Role::Tool, "tool"),
         ] {
-            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{expected}\"")
+            );
             let back: Role = serde_json::from_str(&format!("\"{expected}\"")).unwrap();
             assert_eq!(back, role);
         }

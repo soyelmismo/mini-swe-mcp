@@ -55,7 +55,14 @@ pub fn format_status_line(entries: &[WorkerRegistryEntry], now: u64) -> String {
     }
     let parts: Vec<_> = counts
         .into_iter()
-        .zip(["running", "needs input", "done", "failed", "stopped", "interrupted"])
+        .zip([
+            "running",
+            "needs input",
+            "done",
+            "failed",
+            "stopped",
+            "interrupted",
+        ])
         .filter(|(count, _)| *count > 0)
         .map(|(count, label)| format!("{count} {label}"))
         .collect();
@@ -234,7 +241,9 @@ impl Layout {
             turns,
             model: MODEL_WIDTH,
             uptime: UPTIME_WIDTH,
-            op: total.saturating_sub(fixed).clamp(MIN_OP_WIDTH, MAX_OP_WIDTH),
+            op: total
+                .saturating_sub(fixed)
+                .clamp(MIN_OP_WIDTH, MAX_OP_WIDTH),
             shape: RowShape::Inline { progress },
         }
     }
@@ -519,7 +528,10 @@ fn stack_row(
     let first = format!(
         "{}  {}  {}",
         pad_visible(&truncate_visible(&w.id, layout.id), layout.id),
-        pad_visible(&format!("{:<width$}", w.pid, width = layout.pid), layout.pid),
+        pad_visible(
+            &format!("{:<width$}", w.pid, width = layout.pid),
+            layout.pid
+        ),
         turns_cell(w.step, w.max_turns, layout),
     );
     let mut second = format!(
@@ -917,7 +929,10 @@ pub fn terminal_width() -> Option<usize> {
 fn terminal_size_via_tty() -> Option<usize> {
     use std::os::fd::AsRawFd;
 
-    let file = std::fs::OpenOptions::new().read(true).open("/dev/tty").ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .ok()?;
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -1250,9 +1265,18 @@ mod tests {
             ..text.find("[REPO: /home/dev/proj-b]").unwrap()];
         assert!(proj_a.contains("[audits] cargo test"));
         // The ID column is 8 columns wide, so a full UUID is capped there.
-        assert!(proj_a.contains("a1b2c3d\u{2026}"), "missing worker a:\n{proj_a}");
-        assert!(proj_a.contains("c3d4e5f\u{2026}"), "missing worker c:\n{proj_a}");
-        assert!(!proj_a.contains("b2c3d4e"), "proj-b worker leaked into proj-a");
+        assert!(
+            proj_a.contains("a1b2c3d\u{2026}"),
+            "missing worker a:\n{proj_a}"
+        );
+        assert!(
+            proj_a.contains("c3d4e5f\u{2026}"),
+            "missing worker c:\n{proj_a}"
+        );
+        assert!(
+            !proj_a.contains("b2c3d4e"),
+            "proj-b worker leaked into proj-a"
+        );
 
         // The counters are global, above every repository table.
         assert!(text.contains("Active: 2"));
@@ -1299,17 +1323,22 @@ mod tests {
 
     #[test]
     fn test_render_dashboard_completed_uptime_is_frozen() {
-        let entries = vec![Row::new("done01")
-            .status(RegistryStatus::Completed)
-            .task("Finished task")
-            .command("completed")
-            .repo("local")
-            .updated_at(1065) // Ran 65s (started_at = 1000)
-            .build()];
+        let entries = vec![
+            Row::new("done01")
+                .status(RegistryStatus::Completed)
+                .task("Finished task")
+                .command("completed")
+                .repo("local")
+                .updated_at(1065) // Ran 65s (started_at = 1000)
+                .build(),
+        ];
 
         // Rendered long after completion (now = 5000) the uptime must stay 65s.
         let text = render_dashboard(&entries, 5000, false);
-        assert!(text.contains("01m 05s"), "expected frozen duration 01m 05s, got:\n{text}");
+        assert!(
+            text.contains("01m 05s"),
+            "expected frozen duration 01m 05s, got:\n{text}"
+        );
     }
 
     #[test]
@@ -1331,15 +1360,27 @@ mod tests {
         ];
 
         let plain = render_dashboard(&entries, 1100, false);
-        assert!(plain.contains("REVIEWING"), "missing review badge:\n{plain}");
+        assert!(
+            plain.contains("REVIEWING"),
+            "missing review badge:\n{plain}"
+        );
         assert!(plain.contains("[REVIEW]"), "missing review tag:\n{plain}");
-        assert!(plain.contains("Reviewing: 1"), "reviewing not counted:\n{plain}");
+        assert!(
+            plain.contains("Reviewing: 1"),
+            "reviewing not counted:\n{plain}"
+        );
         // The review marker must not be mistaken for a running row.
         assert!(plain.contains("\u{25c6} REVIEWING"));
-        assert!(!plain.contains("[audits]"), "review tag replaces the group tag");
+        assert!(
+            !plain.contains("[audits]"),
+            "review tag replaces the group tag"
+        );
 
         let colored = render_dashboard(&entries, 1100, true);
-        assert!(colored.contains("\u{25c6}"), "missing review marker:\n{colored}");
+        assert!(
+            colored.contains("\u{25c6}"),
+            "missing review marker:\n{colored}"
+        );
         assert!(colored.contains("1;35m"));
     }
 
@@ -1370,7 +1411,10 @@ mod tests {
         let narrow = Layout::for_terminal_width(80);
         assert!(!narrow.shows_progress(), "80 cols must drop the bar");
         let cell = turns_cell(5, 10, &narrow);
-        assert!(cell.contains("5/10") && !cell.contains('#'), "bad cell: {cell:?}");
+        assert!(
+            cell.contains("5/10") && !cell.contains('#'),
+            "bad cell: {cell:?}"
+        );
     }
 
     #[test]
@@ -1411,12 +1455,14 @@ mod tests {
     #[test]
     fn test_long_command_is_capped_by_width() {
         let long_command = format!("echo {}", "x".repeat(400));
-        let entries = vec![Row::new("long001")
-            .task("A task with a very long description that should also be capped")
-            .command(&long_command)
-            .turns(1, 10)
-            .repo("local")
-            .build()];
+        let entries = vec![
+            Row::new("long001")
+                .task("A task with a very long description that should also be capped")
+                .command(&long_command)
+                .turns(1, 10)
+                .repo("local")
+                .build(),
+        ];
 
         let narrow = render_dashboard_with_width(&entries, 1060, false, 84);
         let narrow_row = narrow.lines().find(|l| l.starts_with("long001")).unwrap();
@@ -1424,7 +1470,10 @@ mod tests {
             narrow_row.contains('\u{2026}'),
             "narrow render must ellipsize the long command:\n{narrow_row}"
         );
-        assert!(narrow_row.chars().count() <= 84, "row overflows 84 cols:\n{narrow_row}");
+        assert!(
+            narrow_row.chars().count() <= 84,
+            "row overflows 84 cols:\n{narrow_row}"
+        );
 
         let wide = render_dashboard_with_width(&entries, 1060, false, 240);
         let wide_row = wide.lines().find(|l| l.starts_with("long001")).unwrap();
@@ -1432,7 +1481,10 @@ mod tests {
             wide_row.contains('\u{2026}'),
             "even wide renders stay capped:\n{wide_row}"
         );
-        assert!(wide_row.chars().count() <= 240, "row overflows 240 cols:\n{wide_row}");
+        assert!(
+            wide_row.chars().count() <= 240,
+            "row overflows 240 cols:\n{wide_row}"
+        );
         // The cap is dynamic: a wider terminal reveals more of the command.
         assert!(
             wide_row.chars().count() > narrow_row.chars().count(),
@@ -1466,7 +1518,10 @@ mod tests {
         let colored = truncate_visible("\x1b[1;32mRUNNING\x1b[0m", 4);
         assert_eq!(visible_width(&colored), 4);
         assert!(colored.starts_with("\x1b[1;32m"));
-        assert!(!colored.contains("\x1b[0m"), "trailing reset must be dropped");
+        assert!(
+            !colored.contains("\x1b[0m"),
+            "trailing reset must be dropped"
+        );
         assert!(colored.ends_with('\u{2026}'));
     }
 
@@ -1527,8 +1582,18 @@ mod tests {
     #[test]
     fn test_every_line_fits_every_width() {
         let entries: Vec<WorkerRegistryEntry> = [
-            ("w1", RegistryStatus::Running, "/home/dev/very-long-project-name-here", "[audits]"),
-            ("w2", RegistryStatus::Reviewing, "/home/dev/very-long-project-name-here", "[audits]"),
+            (
+                "w1",
+                RegistryStatus::Running,
+                "/home/dev/very-long-project-name-here",
+                "[audits]",
+            ),
+            (
+                "w2",
+                RegistryStatus::Reviewing,
+                "/home/dev/very-long-project-name-here",
+                "[audits]",
+            ),
             ("w3", RegistryStatus::Failed, "local", ""),
         ]
         .iter()
@@ -1564,12 +1629,14 @@ mod tests {
     /// counts ride its label line — and never overflow it.
     #[test]
     fn test_stacked_row_carries_the_repeat_and_nudge_counts() {
-        let entries = vec![Row::new("health01")
-            .task("Refactor the authentication middleware into smaller pieces")
-            .command("cargo test --all")
-            .metrics(3, 1)
-            .repo("local")
-            .build()];
+        let entries = vec![
+            Row::new("health01")
+                .task("Refactor the authentication middleware into smaller pieces")
+                .command("cargo test --all")
+                .metrics(3, 1)
+                .repo("local")
+                .build(),
+        ];
 
         let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
         assert!(
@@ -1590,11 +1657,13 @@ mod tests {
 
     #[test]
     fn test_narrow_terminal_stacks_rows() {
-        let entries = vec![Row::new("wrap001")
-            .task("Refactor the authentication middleware into smaller cohesive pieces")
-            .command("cargo test --all")
-            .repo("local")
-            .build()];
+        let entries = vec![
+            Row::new("wrap001")
+                .task("Refactor the authentication middleware into smaller cohesive pieces")
+                .command("cargo test --all")
+                .repo("local")
+                .build(),
+        ];
 
         let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
         let layout = Layout::for_terminal_width(MIN_TERMINAL_WIDTH);
@@ -1607,7 +1676,13 @@ mod tests {
         }
         // All fixed columns survive, and so does the task text.
         assert!(text.contains("wrap001") && text.contains("1234") && text.contains("ninja"));
-        assert!(text.contains("Refactor"), "task text must survive stacking:\n{text}");
-        assert!(text.contains("cargo test --all"), "command must survive:\n{text}");
+        assert!(
+            text.contains("Refactor"),
+            "task text must survive stacking:\n{text}"
+        );
+        assert!(
+            text.contains("cargo test --all"),
+            "command must survive:\n{text}"
+        );
     }
 }

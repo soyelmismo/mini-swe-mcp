@@ -22,6 +22,6 @@ pub use self::args::{
     DISPATCH_USAGE, action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag,
     strip_json_flag, tool_args,
 };
-pub use self::help::HELP_FLAGS;
 pub use self::format::format_output;
+pub use self::help::HELP_FLAGS;
 pub use self::suggest::{available_actions, suggest_action};

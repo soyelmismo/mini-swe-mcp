@@ -13,12 +13,12 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
+use mini_swe_mcp::agent::wrap_network_command;
 use mini_swe_mcp::mcp::{
     ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
-    WorkerSnapshot, WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
+    WORKER_ACTIONS, WorkerSnapshot, WorkerView, channel_frame, diff_events,
 };
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
-use mini_swe_mcp::agent::wrap_network_command;
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerRegistryEntry, remove_registry_entry, save_registry_entry,
 };
@@ -76,7 +76,11 @@ impl ScopedEnv {
         let previous = std::env::var(name).ok();
         // SAFETY: the lock above excludes every other test in this binary.
         unsafe { std::env::set_var(name, value) };
-        Self { _guard: guard, name, previous }
+        Self {
+            _guard: guard,
+            name,
+            previous,
+        }
     }
 }
 
@@ -116,7 +120,10 @@ impl McpProcess {
             // `dotenvy` never overrides a variable that is already set, so
             // this dummy also keeps the suite independent of (and unable to
             // read) whatever key the developer happens to have exported.
-            .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
+            .env(
+                "OPENAI_API_KEY",
+                "test-key-not-used-by-these-protocol-tests",
+            )
             // Protocol tests exercise the in-process server; the hub transport
             // has its own end-to-end tests (tests/hub_test.rs).
             .env("MINI_SWE_NO_DAEMON", "1");
@@ -354,10 +361,7 @@ fn binary_command() -> (PathBuf, Vec<String>) {
     if path.ends_with("deps") {
         path.pop();
     }
-    (
-        path.join("mini-swe-mcp"),
-        vec!["--stdio".to_string()],
-    )
+    (path.join("mini-swe-mcp"), vec!["--stdio".to_string()])
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +376,10 @@ fn expect_result(response: &Value) -> Value {
     let result = response
         .get("result")
         .unwrap_or_else(|| panic!("response is missing a result field: {response}"));
-    assert!(result.is_object(), "result must be an object, got: {result}");
+    assert!(
+        result.is_object(),
+        "result must be an object, got: {result}"
+    );
     result.clone()
 }
 
@@ -423,8 +430,16 @@ fn ping_returns_empty_object_result() {
         .expect_response("ping")
         .unwrap_or_else(|| panic!("ping must be answered"));
 
-    assert_eq!(response["id"], json!("ping-1"), "id must be echoed verbatim");
-    assert_eq!(expect_result(&response), json!({}), "ping result must be {{}}");
+    assert_eq!(
+        response["id"],
+        json!("ping-1"),
+        "id must be echoed verbatim"
+    );
+    assert_eq!(
+        expect_result(&response),
+        json!({}),
+        "ping result must be {{}}"
+    );
 }
 
 /// 3. Notifications (no id, or `id: null`) are ignored: no response is emitted.
@@ -587,11 +602,14 @@ fn test_tools_list_schema() {
     }
 
     // `action` stays the only required argument.
-    let required = schema["required"]
-        .as_array()
-        .unwrap_or_else(|| panic!("worker inputSchema must declare required fields, got: {schema}"));
+    let required = schema["required"].as_array().unwrap_or_else(|| {
+        panic!("worker inputSchema must declare required fields, got: {schema}")
+    });
     assert_eq!(
-        required.iter().filter(|v| v.as_str() == Some("action")).count(),
+        required
+            .iter()
+            .filter(|v| v.as_str() == Some("action"))
+            .count(),
         1,
         "'action' must be required exactly once, got: {required:?}"
     );
@@ -653,10 +671,7 @@ fn test_tools_call_prune_with_progress_token_emits_notifications() {
         .expect_response("first progress notification")
         .expect("must receive notification");
     assert_eq!(notif1["method"], json!("notifications/progress"));
-    assert_eq!(
-        notif1["params"]["progressToken"],
-        json!("token-prune-xyz")
-    );
+    assert_eq!(notif1["params"]["progressToken"], json!("token-prune-xyz"));
     assert_eq!(notif1["params"]["progress"], json!(0));
 
     // Expect progress notification 1/1
@@ -664,10 +679,7 @@ fn test_tools_call_prune_with_progress_token_emits_notifications() {
         .expect_response("second progress notification")
         .expect("must receive notification");
     assert_eq!(notif2["method"], json!("notifications/progress"));
-    assert_eq!(
-        notif2["params"]["progressToken"],
-        json!("token-prune-xyz")
-    );
+    assert_eq!(notif2["params"]["progressToken"], json!("token-prune-xyz"));
     assert_eq!(notif2["params"]["progress"], json!(1));
 
     // Expect final response
@@ -785,9 +797,9 @@ fn test_tools_list_advertises_the_optional_network_policy() {
         .find(|tool| tool["name"] == "worker")
         .expect("tools/list must expose the 'worker' tool");
     let schema = &worker["inputSchema"];
-    let network = schema["properties"]
-        .get("network")
-        .unwrap_or_else(|| panic!("the worker tool must advertise a 'network' property, got: {schema}"));
+    let network = schema["properties"].get("network").unwrap_or_else(|| {
+        panic!("the worker tool must advertise a 'network' property, got: {schema}")
+    });
 
     assert_eq!(network["type"], json!("string"));
     assert_eq!(
@@ -828,9 +840,9 @@ fn test_tools_list_advertises_the_optional_verify_gate() {
         .find(|tool| tool["name"] == "worker")
         .expect("tools/list must expose the 'worker' tool");
     let schema = &worker["inputSchema"];
-    let verify = schema["properties"]
-        .get("verify")
-        .unwrap_or_else(|| panic!("the worker tool must advertise a 'verify' property, got: {schema}"));
+    let verify = schema["properties"].get("verify").unwrap_or_else(|| {
+        panic!("the worker tool must advertise a 'verify' property, got: {schema}")
+    });
 
     assert_eq!(verify["type"], json!("string"));
     assert!(
@@ -973,12 +985,14 @@ fn test_dispatch_reports_explicit_offline_network() {
     assert_eq!(payload["network"], json!("offline"));
     assert_eq!(payload["status"], json!("dispatched"));
 
-    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    let wid = payload["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
     kill_worker(&mut server, 610, &wid);
     drop(server);
     crate_branches.assert_untouched();
 }
-
 
 /// A dispatch that omits `network` inherits the resolved model's manifest
 /// policy. The shipped `ninja` declares `allow`, so the response reports it.
@@ -1014,12 +1028,14 @@ fn test_dispatch_reports_manifest_network_policy_when_argument_omitted() {
     assert_eq!(payload["network"], json!("allow"));
     assert_eq!(payload["status"], json!("dispatched"));
 
-    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    let wid = payload["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
     kill_worker(&mut server, 611, &wid);
     drop(server);
     crate_branches.assert_untouched();
 }
-
 
 /// A dispatch with no `network` argument and a model that declares no policy
 /// falls back to the runtime default (`allow`).
@@ -1055,12 +1071,14 @@ fn test_dispatch_reports_default_network_when_nothing_declared() {
     assert_eq!(payload["network"], json!("allow"));
     assert_eq!(payload["status"], json!("dispatched"));
 
-    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    let wid = payload["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
     kill_worker(&mut server, 612, &wid);
     drop(server);
     crate_branches.assert_untouched();
 }
-
 
 /// The wrapper itself: connected stays byte-identical, `offline` enters a
 /// network namespace and keeps the command verbatim inside it.
@@ -1129,7 +1147,6 @@ fn can_create_network_namespace() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-
 // ----------
 // `wait`: re-attaching to a worker, and the wait heartbeat
 // ----------
@@ -1141,7 +1158,8 @@ fn can_create_network_namespace() -> bool {
 async fn a_blocked_wait_returns_promptly_on_a_state_change() {
     use std::time::{Duration, Instant};
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(running_worker("wait-test-wakes")).await;
+    pool.__test_insert_worker(running_worker("wait-test-wakes"))
+        .await;
     let server = McpServer::new(pool.clone(), "ninja".to_string());
 
     let waiter = tokio::spawn(async move {
@@ -1233,11 +1251,16 @@ async fn watch_on_an_unknown_worker_is_a_clear_error() {
     );
 
     let error = server
-        .execute_tool("worker", json!({ "action": "watch", "worker_id": "watch-test-ghost" }))
+        .execute_tool(
+            "worker",
+            json!({ "action": "watch", "worker_id": "watch-test-ghost" }),
+        )
         .await
         .expect_err("watching a worker that was never dispatched must fail");
     assert!(
-        error.to_string().contains("Worker not found: watch-test-ghost"),
+        error
+            .to_string()
+            .contains("Worker not found: watch-test-ghost"),
         "the error must name the worker: {error}"
     );
 }
@@ -1250,10 +1273,7 @@ async fn watch_with_a_deadline_returns_no_event() {
     let server = McpServer::new(pool, "ninja".to_string());
 
     let result = server
-        .execute_tool(
-            "worker",
-            json!({ "action": "watch", "timeout_secs": 0 }),
-        )
+        .execute_tool("worker", json!({ "action": "watch", "timeout_secs": 0 }))
         .await
         .expect("an expired deadline must answer, not hang");
 
@@ -1266,11 +1286,15 @@ async fn watch_with_a_deadline_returns_no_event() {
 #[tokio::test]
 async fn watch_on_a_completed_worker_returns_its_event() {
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(completed_worker("watch-test-done")).await;
+    pool.__test_insert_worker(completed_worker("watch-test-done"))
+        .await;
     let server = McpServer::new(pool, "ninja".to_string());
 
     let result = server
-        .execute_tool("worker", json!({ "action": "watch", "worker_id": "watch-test-done" }))
+        .execute_tool(
+            "worker",
+            json!({ "action": "watch", "worker_id": "watch-test-done" }),
+        )
         .await
         .expect("a finished worker must answer without waiting");
 
@@ -1695,7 +1719,8 @@ fn owned_server() -> (WorkerPool, McpServer) {
 #[tokio::test]
 async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
+        .await;
     let agent_b = agent_context("agent-b");
 
     for arguments in [
@@ -1777,7 +1802,8 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
 #[tokio::test]
 async fn an_admin_connection_bypasses_the_ownership_check() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-admin", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h3-admin", "agent-a"))
+        .await;
 
     let steered = server
         .execute_tool_for(
@@ -1875,10 +1901,17 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 
     // A typo is a hard error, not a silent fallback to the caller's own rows.
     let error = server
-        .execute_tool_for("worker", json!({ "action": "list", "scope": "everything" }), &agent_a)
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "list", "scope": "everything" }),
+            &agent_a,
+        )
         .await
         .expect_err("an unknown scope must not be accepted");
-    assert!(error.to_string().contains("'scope' must be one of"), "{error}");
+    assert!(
+        error.to_string().contains("'scope' must be one of"),
+        "{error}"
+    );
 }
 
 /// One agent may not fill the pool: past `MAX_WORKERS_PER_AGENT` a dispatch is
@@ -1886,7 +1919,8 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 #[tokio::test]
 async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent")).await;
+    pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
+        .await;
     let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
     let capped = agent_context("cap-agent");
 
@@ -1919,16 +1953,23 @@ async fn a_dispatch_past_the_per_agent_cap_is_refused() {
 #[tokio::test]
 async fn completed_payloads_carry_the_review_guidance() {
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(completed_worker("guide-done")).await;
+    pool.__test_insert_worker(completed_worker("guide-done"))
+        .await;
     let server = McpServer::new(pool, "ninja".to_string());
 
     // `collect` evicts the record, so it goes last.
     for action in ["status", "collect"] {
         let result = server
-            .execute_tool("worker", json!({ "action": action, "worker_id": "guide-done" }))
+            .execute_tool(
+                "worker",
+                json!({ "action": action, "worker_id": "guide-done" }),
+            )
             .await
             .unwrap_or_else(|e| panic!("{action} on a finished worker must answer: {e}"));
-        let next = result.get("next_step").and_then(|v| v.as_str()).unwrap_or("");
+        let next = result
+            .get("next_step")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert!(
             next.contains("steer"),
             "{action} must tell the orchestrator to steer for corrections: {result}"
@@ -1944,7 +1985,8 @@ async fn completed_payloads_carry_the_review_guidance() {
 #[tokio::test]
 async fn steer_with_a_malformed_budget_is_a_hard_error() {
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(running_worker("budget-bad")).await;
+    pool.__test_insert_worker(running_worker("budget-bad"))
+        .await;
     let server = McpServer::new(pool, "ninja".to_string());
 
     let err = server
@@ -1954,7 +1996,10 @@ async fn steer_with_a_malformed_budget_is_a_hard_error() {
         )
         .await
         .expect_err("a string budget must not be accepted");
-    assert!(err.to_string().contains("max_turns"), "the error must name the argument: {err}");
+    assert!(
+        err.to_string().contains("max_turns"),
+        "the error must name the argument: {err}"
+    );
 }
 
 /// The channel event for a finished worker carries the same guidance.
@@ -2122,7 +2167,11 @@ fn kill_worker(server: &mut McpProcess, id: u64, worker_id: &str) {
     let result = expect_result(&response);
     let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
         .expect("tool text must be JSON");
-    assert_eq!(payload["worker_id"], json!(worker_id), "kill must echo the worker id");
+    assert_eq!(
+        payload["worker_id"],
+        json!(worker_id),
+        "kill must echo the worker id"
+    );
 }
 
 // ----------
@@ -2192,7 +2241,8 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
 #[tokio::test]
 async fn watch_action_answers_no_event_on_an_expired_deadline() {
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(running_worker("h11-watch-running")).await;
+    pool.__test_insert_worker(running_worker("h11-watch-running"))
+        .await;
     let server = McpServer::new(pool, "ninja".to_string());
 
     let result = tokio::time::timeout(
@@ -2216,8 +2266,10 @@ async fn watch_action_answers_no_event_on_an_expired_deadline() {
 #[tokio::test]
 async fn an_agent_cannot_read_another_agents_worker() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h11-mine", "agent-a")).await;
-    pool.__test_insert_worker(owned_worker("h11-theirs", "agent-b")).await;
+    pool.__test_insert_worker(owned_worker("h11-mine", "agent-a"))
+        .await;
+    pool.__test_insert_worker(owned_worker("h11-theirs", "agent-b"))
+        .await;
 
     for arguments in [
         json!({ "action": "status", "worker_id": "h11-theirs" }),
@@ -2239,7 +2291,11 @@ async fn an_agent_cannot_read_another_agents_worker() {
 
     // `list` shows the caller its own workers only.
     let mine = server
-        .execute_tool_for("worker", json!({ "action": "list" }), &agent_context("agent-a"))
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "list" }),
+            &agent_context("agent-a"),
+        )
         .await
         .expect("list answers");
     let ids: Vec<String> = mine["workers"]
@@ -2253,7 +2309,11 @@ async fn an_agent_cannot_read_another_agents_worker() {
 
     // The admin override still sees and acts on everything.
     let admin = server
-        .execute_tool_for("worker", json!({ "action": "list", "scope": "all" }), &admin_context("op"))
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "list", "scope": "all" }),
+            &admin_context("op"),
+        )
         .await
         .expect("admin scope=all answers");
     let admin_ids: Vec<String> = admin["workers"]

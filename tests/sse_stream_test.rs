@@ -39,8 +39,10 @@ impl MockSse {
     /// Convenience: a well-formed SSE body of `data:` frames, terminated by
     /// `data: [DONE]`.
     fn frames(frames: &[&str]) -> Self {
-        let mut segments: Vec<Vec<u8>> =
-            frames.iter().map(|f| format!("data: {f}\n\n").into_bytes()).collect();
+        let mut segments: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| format!("data: {f}\n\n").into_bytes())
+            .collect();
         segments.push(b"data: [DONE]\n\n".to_vec());
         Self::sse(segments)
     }
@@ -55,7 +57,9 @@ impl MockSse {
 ///
 /// Returns the base URL to point an [`AgentRunner`] at.
 async fn spawn_sse_server(body: MockSse) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
     let addr: SocketAddr = listener.local_addr().expect("local addr");
 
     tokio::spawn(async move {
@@ -138,7 +142,10 @@ async fn sparse_tool_call_index_yields_single_real_call_with_command() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":3,"id":"real","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp: LlmResponse = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp: LlmResponse = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     assert_eq!(
         resp.command.as_deref(),
@@ -146,7 +153,11 @@ async fn sparse_tool_call_index_yields_single_real_call_with_command() {
         "the real command must survive a sparse index"
     );
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "placeholders must not be fabricated: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "placeholders must not be fabricated: {calls:?}"
+    );
     assert_eq!(calls[0].id, "real");
     assert_eq!(calls[0].function.name, "bash");
     assert_eq!(resp.tool_call_id.as_deref(), Some("real"));
@@ -160,12 +171,19 @@ async fn duplicate_tool_call_ids_are_replaced_with_unique_ids() {
     let frame = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"dup","function":{"name":"bash","arguments":"{\"command\":\"a\"}"}},{"index":1,"id":"dup","function":{"name":"bash","arguments":"{\"command\":\"b\"}"}}]}}]}"#;
     let body = MockSse::frames(&[frame]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     // Only the executed call is replayed into history (protocol-correct); the
     // sibling call is dropped. The surviving id must be non-empty.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the executed call may be replayed: {calls:?}"
+    );
     assert!(!calls[0].id.is_empty());
     assert_eq!(resp.tool_call_id.as_deref(), Some(calls[0].id.as_str()));
 }
@@ -179,7 +197,10 @@ async fn repeated_index_deltas_accumulate_into_one_call() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"pwd\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     let calls = resp.tool_calls.expect("tool_calls present");
     assert_eq!(calls.len(), 1, "same index must stay one call: {calls:?}");
@@ -205,12 +226,19 @@ async fn sequential_calls_reusing_index_zero_both_survive() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     // Both calls are accumulated, but only the executed one is replayed into
     // history (protocol-correct); the sibling is dropped.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the executed call may be replayed: {calls:?}"
+    );
     assert_eq!(calls[0].id, "a");
     assert_eq!(calls[0].function.arguments, r#"{"command":"ls"}"#);
     // The whole point of the fix: the turn is no longer empty.
@@ -227,11 +255,18 @@ async fn calls_without_an_index_field_are_not_dropped() {
         r#"{"choices":[{"delta":{"tool_calls":[{"id":"y","function":{"name":"bash","arguments":"{\"command\":\"id\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     // Both calls are accumulated, but only the executed one is replayed.
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the executed call may be replayed: {calls:?}"
+    );
     assert_eq!(calls[0].function.arguments, r#"{"command":"whoami"}"#);
     assert_eq!(resp.tool_call_id.as_deref(), Some(calls[0].id.as_str()));
 }
@@ -254,7 +289,10 @@ async fn invalid_utf8_frame_is_lossy_decoded_and_counted() {
         b"data: [DONE]\n\n".to_vec(),
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     assert_eq!(
         resp.invalid_utf8_lines, 1,
@@ -277,11 +315,12 @@ async fn invalid_utf8_frame_is_lossy_decoded_and_counted() {
 /// A healthy stream reports zero corruption.
 #[tokio::test]
 async fn valid_stream_reports_no_invalid_utf8() {
-    let body = MockSse::frames(&[
-        r#"{"choices":[{"delta":{"content":"clean"}}]}"#,
-    ]);
+    let body = MockSse::frames(&[r#"{"choices":[{"delta":{"content":"clean"}}]}"#]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.invalid_utf8_lines, 0);
     assert_eq!(resp.content, "clean");
 }
@@ -307,7 +346,10 @@ async fn multibyte_utf8_split_across_tiny_tcp_segments_is_exact() {
         let segments: Vec<Vec<u8>> = bytes.chunks(seg).map(|c| c.to_vec()).collect();
         let body = MockSse::sse(segments);
         let base = spawn_sse_server(body).await;
-        let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+        let resp = runner(&base)
+            .run_step_llm(&user_turn())
+            .await
+            .expect("step");
         assert_eq!(
             resp.content, text,
             "content corrupted at {seg}-byte TCP segments"
@@ -332,7 +374,10 @@ async fn byte_at_a_time_frames_reassemble() {
     }
     let segments: Vec<Vec<u8>> = all.chunks(1).map(|c| c.to_vec()).collect();
     let base = spawn_sse_server(MockSse::sse(segments)).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.content, "abc");
 }
 
@@ -344,7 +389,10 @@ async fn arguments_split_mid_json_reassemble() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls -la\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.command.as_deref(), Some("ls -la"));
 }
 
@@ -355,16 +403,15 @@ async fn comments_keepalives_and_done_sentinel_are_handled() {
     let mut body = Vec::new();
     body.extend_from_slice(b": keep-alive\n\n");
     body.extend_from_slice(b"\n");
-    body.extend_from_slice(
-        b"data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n",
-    );
+    body.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n");
     // [DONE] then a trailing frame: everything after [DONE] must be ignored.
     body.extend_from_slice(b"data: [DONE]\n\n");
-    body.extend_from_slice(
-        b"data: {\"choices\":[{\"delta\":{\"content\":\"dropped\"}}]}\n\n",
-    );
+    body.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"dropped\"}}]}\n\n");
     let base = spawn_sse_server(MockSse::sse(vec![body])).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.content, "kept", "frames after [DONE] must be ignored");
 }
 
@@ -376,7 +423,10 @@ async fn stream_without_done_sentinel_is_finalized() {
         b"data: {\"choices\":[{\"delta\":{\"content\":\"no-done\"}}]}\n\n".to_vec(),
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.content, "no-done");
 }
 
@@ -386,7 +436,10 @@ async fn stream_without_done_sentinel_is_finalized() {
 async fn non_streaming_json_body_is_parsed_via_fallback() {
     let body = r#"{"choices":[{"message":{"content":"plain","tool_calls":[{"id":"nc1","function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#;
     let base = spawn_sse_server(MockSse::sse(vec![body.as_bytes().to_vec()])).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert_eq!(resp.content, "plain");
     assert_eq!(resp.command.as_deref(), Some("echo hi"));
     let calls = resp.tool_calls.expect("tool_calls present");
@@ -415,7 +468,10 @@ async fn streamed_content_is_capped() {
     );
     let body = MockSse::sse(vec![payload.into_bytes(), b"data: [DONE]\n\n".to_vec()]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
     assert!(
         resp.content.len() <= limit,
         "content must be capped, got {} bytes",
@@ -441,7 +497,10 @@ async fn long_reasoning_stream_is_not_truncated() {
     })
     .to_string()]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     assert_eq!(
         resp.content.len(),
@@ -463,15 +522,10 @@ async fn stalled_stream_hits_idle_timeout_and_errors_after_retries() {
     let body = MockSse::frames(&[r#"{"choices":[{"delta":{"content":"start"}}]}"#])
         .with_delay(1, Duration::from_secs(30));
     let base = spawn_sse_server(body).await;
-    let runner = AgentRunner::new(
-        base,
-        "test-key".to_string(),
-        "test-model".to_string(),
-        None,
-    )
-    .with_stream_idle_timeout(Duration::from_millis(200))
-    .with_max_retries(3)
-    .with_initial_retry_delay(Duration::from_millis(50));
+    let runner = AgentRunner::new(base, "test-key".to_string(), "test-model".to_string(), None)
+        .with_stream_idle_timeout(Duration::from_millis(200))
+        .with_max_retries(3)
+        .with_initial_retry_delay(Duration::from_millis(50));
 
     let err = runner
         .run_step_llm(&user_turn())
@@ -503,7 +557,10 @@ async fn an_unreachable_provider_is_reported_as_unavailable() {
         .run_step_llm(&user_turn())
         .await
         .expect_err("nothing listens on port 1");
-    assert!(mini_swe_mcp::agent::retry::is_llm_unavailable(&err), "{err:#}");
+    assert!(
+        mini_swe_mcp::agent::retry::is_llm_unavailable(&err),
+        "{err:#}"
+    );
 }
 
 /// A slow-but-progressing stream that exceeds any single-read budget is *not*
@@ -523,15 +580,13 @@ async fn slow_but_progressing_stream_is_not_aborted() {
     .with_delay(1, Duration::from_millis(120))
     .with_delay(2, Duration::from_millis(120));
     let base = spawn_sse_server(body).await;
-    let runner = AgentRunner::new(
-        base,
-        "test-key".to_string(),
-        "test-model".to_string(),
-        None,
-    )
-    .with_stream_idle_timeout(Duration::from_millis(400));
+    let runner = AgentRunner::new(base, "test-key".to_string(), "test-model".to_string(), None)
+        .with_stream_idle_timeout(Duration::from_millis(400));
 
-    let resp = runner.run_step_llm(&user_turn()).await.expect("must not be aborted");
+    let resp = runner
+        .run_step_llm(&user_turn())
+        .await
+        .expect("must not be aborted");
     assert_eq!(resp.content, "one-two-three");
 }
 
@@ -597,7 +652,8 @@ async fn reasoning_content_is_captured_from_stream_and_serialized_in_history() {
         .with_reasoning_content(resp.reasoning_content.clone());
     let serialized = serde_json::to_string(&msg).expect("serialize");
     assert!(
-        serialized.contains(r#""reasoning_content":"Let's think about this. We need to list files.\n""#),
+        serialized
+            .contains(r#""reasoning_content":"Let's think about this. We need to list files.\n""#),
         "reasoning_content must be serialized on assistant message: {serialized}"
     );
 
@@ -650,14 +706,20 @@ async fn real_provider_chunks_yield_one_call_and_reasoning_in_history() {
         r##"{"choices":[{"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"\"ls\"}"}}]}}]}"##,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     let calls = resp.tool_calls.expect("tool_calls present");
     assert_eq!(calls.len(), 1, "one call, not one per fragment: {calls:?}");
     assert_eq!(calls[0].id, "chatcmpl-tool-9d6a7c55214c5666");
     assert_eq!(calls[0].function.arguments, r#"{"command": "ls"}"#);
     assert_eq!(resp.command.as_deref(), Some("ls"));
-    assert_eq!(resp.tool_call_id.as_deref(), Some("chatcmpl-tool-9d6a7c55214c5666"));
+    assert_eq!(
+        resp.tool_call_id.as_deref(),
+        Some("chatcmpl-tool-9d6a7c55214c5666")
+    );
     assert_eq!(
         resp.reasoning_content.as_deref(),
         Some("thought A"),
@@ -689,11 +751,18 @@ async fn multiple_tool_calls_replay_only_the_executed_one() {
         r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
     ]);
     let base = spawn_sse_server(body).await;
-    let resp = runner(&base).run_step_llm(&user_turn()).await.expect("step");
+    let resp = runner(&base)
+        .run_step_llm(&user_turn())
+        .await
+        .expect("step");
 
     assert_eq!(resp.command.as_deref(), Some("ls"));
     let calls = resp.tool_calls.expect("tool_calls present");
-    assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the executed call may be replayed: {calls:?}"
+    );
     assert_eq!(calls[0].id, "a");
     assert_eq!(resp.tool_call_id.as_deref(), Some("a"));
 }

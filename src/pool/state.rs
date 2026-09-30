@@ -131,19 +131,37 @@ impl WorkerState {
 
     pub fn to_summary(&self) -> serde_json::Value {
         match self {
-            WorkerState::Running { step, last_command, started_at } => serde_json::json!({
+            WorkerState::Running {
+                step,
+                last_command,
+                started_at,
+            } => serde_json::json!({
                 "status": "Running",
                 "step": step,
                 "last_command": last_command,
                 "started_at": started_at,
             }),
-            WorkerState::Paused { question, step, paused_at } => serde_json::json!({
+            WorkerState::Paused {
+                question,
+                step,
+                paused_at,
+            } => serde_json::json!({
                 "status": "Paused",
                 "step": step,
                 "question": question,
                 "paused_at": paused_at,
             }),
-            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, metrics, revision, .. } => serde_json::json!({
+            WorkerState::Completed {
+                turns,
+                summary,
+                completed_at,
+                artifacts,
+                branch,
+                verified,
+                metrics,
+                revision,
+                ..
+            } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
@@ -154,7 +172,13 @@ impl WorkerState {
                 "metrics": metrics,
                 "revision": revision,
             }),
-            WorkerState::Failed { error, step, failed_at, metrics, revision } => serde_json::json!({
+            WorkerState::Failed {
+                error,
+                step,
+                failed_at,
+                metrics,
+                revision,
+            } => serde_json::json!({
                 "status": "Failed",
                 "step": step,
                 "error": error,

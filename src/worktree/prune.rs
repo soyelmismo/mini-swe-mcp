@@ -533,7 +533,8 @@ pub fn prune_stale_worktrees_in(repo_root: &Path, base_dirs: &[PathBuf]) {
                 } else if !is_dir && is_worktree_lease_name(name) {
                     reclaim_dangling_lease(&p);
                 } else if is_dir
-                    && let Some(wt_name) = name.strip_prefix("swe-target-")
+                    && let Some(wt_name) = name
+                        .strip_prefix("swe-target-")
                         .or_else(|| name.strip_prefix("swe-tmp-"))
                     && wt_name.starts_with("swe-wt-")
                     && !base.join(wt_name).exists()
