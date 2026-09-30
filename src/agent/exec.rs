@@ -132,7 +132,8 @@ impl AgentRunner {
         let sandbox_target = target_dir.as_deref().unwrap_or(dir);
         let tmp_dir = crate::worktree::scratch_dir(dir);
         std::fs::create_dir_all(&tmp_dir).context("Failed to create worker scratch directory")?;
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))
                 .context("Failed to make worker scratch private")?;
