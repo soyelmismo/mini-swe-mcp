@@ -1580,6 +1580,23 @@ async fn completed_payloads_carry_the_review_guidance() {
     }
 }
 
+/// A non-integer `max_turns` on a steer is a hard error, like on dispatch.
+#[tokio::test]
+async fn steer_with_a_malformed_budget_is_a_hard_error() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("budget-bad")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let err = server
+        .execute_tool(
+            "worker",
+            json!({ "action": "steer", "worker_id": "budget-bad", "message": "go", "max_turns": "many" }),
+        )
+        .await
+        .expect_err("a string budget must not be accepted");
+    assert!(err.to_string().contains("max_turns"), "the error must name the argument: {err}");
+}
+
 /// The channel event for a finished worker carries the same guidance.
 #[test]
 fn completed_channel_event_carries_the_review_guidance() {

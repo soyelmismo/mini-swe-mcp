@@ -324,6 +324,26 @@ mod tests {
         assert_eq!(bare.len(), 1, "a workerless `wait` stays argument-free: {bare:?}");
     }
 
+    /// `--max-turns <n>` on `steer` is the revision's fresh turn budget: the
+    /// same tool argument `dispatch` uses, so a revision is spelled exactly
+    /// like the dispatch that preceded it.
+    #[test]
+    fn test_steer_max_turns_flag_maps_to_the_budget_property() {
+        let plain = args(&["mini-swe-mcp", "steer", "w1", "fix the edge case"]);
+        let without = tool_args("steer", &plain, true).unwrap().unwrap();
+        assert!(
+            !without.contains_key("max_turns"),
+            "an omitted flag must not set a budget: {without:?}"
+        );
+
+        for flag in ["--max-turns", "-t"] {
+            let flagged = args(&["mini-swe-mcp", "steer", "w1", "fix the edge case", flag, "25"]);
+            let with = tool_args("steer", &flagged, true).unwrap().unwrap();
+            assert_eq!(with["max_turns"], 25, "flag {flag}");
+            assert_eq!(with["message"], "fix the edge case", "flag {flag}");
+        }
+    }
+
     /// `--wait` on `steer` is the same `wait` property `dispatch` uses, so
     /// steer-and-wait stays one tool call.
     #[test]

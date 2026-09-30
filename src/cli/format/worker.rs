@@ -614,6 +614,34 @@ mod tests {
     }
 
     #[test]
+    fn test_finished_views_render_the_next_step_guidance() {
+        let next = "Review the diff (collect) and run the project's checks.";
+        let payload = format!(
+            "{{"worker_id":"w","state":{{"state":"Completed","details":{{"turns":3,"summary":"done"}}}},"next_step":"{next}"}}"
+        );
+        assert!(
+            format_status(&v(&payload)).ends_with(&format!("Next step: {next}")),
+            "status must end with the guidance: {}",
+            format_status(&v(&payload))
+        );
+        assert!(
+            format_collect(&v(&payload)).ends_with(&format!("Next step: {next}")),
+            "collect must end with the guidance: {}",
+            format_collect(&v(&payload))
+        );
+        assert!(
+            format_dispatch(&v(&payload)).contains(&format!("Next step: {next}")),
+            "dispatch --wait must carry the guidance: {}",
+            format_dispatch(&v(&payload))
+        );
+        // A payload without guidance renders exactly as before.
+        assert!(
+            !format_status(&v(r#"{"worker_id":"w","state":"Running"}"#)).contains("Next step"),
+            "a running worker has no next step"
+        );
+    }
+
+    #[test]
     fn test_format_kill_and_steer_reflect_the_tool_answer() {
         assert_eq!(
             format_kill(&v(r#"{"worker_id":"w","killed":true}"#)),

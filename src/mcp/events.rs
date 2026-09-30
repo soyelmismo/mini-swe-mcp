@@ -205,6 +205,18 @@ pub fn channel_frame(event: &ChannelEvent) -> Option<String> {
 /// with. The verb is repeated in every notification because a `wait: false`
 /// dispatch may be the only trace of the worker left in the session.
 fn render(view: &WorkerView, kind: EventKind) -> String {
+    render_event(view, kind)
+}
+
+/// Test seam for the notification text: the decision (what to say) is pure and
+/// asserted without standing up the polling loop.
+#[doc(hidden)]
+pub fn render_for_test(view: &WorkerView, kind: EventKind) -> String {
+    render_event(view, kind)
+}
+
+/// The text the model reads, shared by the producer and the test seam.
+fn render_event(view: &WorkerView, kind: EventKind) -> String {
     let header = if view.revision > 0 {
         format!(
             "Worker {} is {} (model {}, group {}, revision {}).",

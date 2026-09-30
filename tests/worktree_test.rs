@@ -687,3 +687,49 @@ fn worktree_directory_is_private_to_its_owner() {
 
     drop(guard);
 }
+
+/// `reopen` re-attaches to the preserved branch: same branch name, previous
+/// commits intact, original diff base, and a missing branch is a clear error.
+#[test]
+fn reopen_reattaches_to_the_preserved_branch() {
+    let test_repo = TestRepo::new("reopen");
+    let repo = test_repo.path();
+    let id = unique_worker_id("reopen");
+
+    let base = run(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let branch = format!("worker-{id}");
+    let first_path = {
+        let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+        std::fs::write(guard.path.join("fix.txt"), "fix\n").expect("worker change");
+        guard.commit_changes("worker: fix").expect("checkpoint commit");
+        guard.path.clone()
+    };
+    assert!(branch_exists(repo, &branch), "the finished run must preserve its branch");
+    assert!(!first_path.exists(), "the finished run must remove its checkout");
+
+    let guard = WorktreeGuard::reopen(repo, &id, &base).expect("reopen must re-attach");
+    assert_eq!(guard.branch, branch, "the revision keeps the same branch");
+    assert_eq!(guard.base_commit, base, "the diff base stays the original commit");
+    assert!(guard.path.join("fix.txt").is_file(), "checkpoints survive the re-attach");
+    assert!(
+        worktree_is_registered(repo, &guard.path),
+        "the re-attached checkout is a registered worktree"
+    );
+}
+
+/// Reopening a branch that no longer exists names the branch in the error.
+#[test]
+fn reopen_on_a_missing_branch_is_a_clear_error() {
+    let test_repo = TestRepo::new("reopen-missing");
+    let repo = test_repo.path();
+    let id = unique_worker_id("reopen-missing");
+
+    let err = match WorktreeGuard::reopen(repo, &id, "abc123") {
+        Ok(_) => panic!("no such branch exists"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains(&format!("worker-{id}")),
+        "the error must name the missing branch, got: {err}"
+    );
+}
