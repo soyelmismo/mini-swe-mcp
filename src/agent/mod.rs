@@ -15,7 +15,7 @@ pub use env::{
 };
 pub use exec::{has_unshare, wrap_network_command};
 pub use retry::{DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries};
-pub use runner::{AgentRunner, llm_gate_from_env};
+pub use runner::AgentRunner;
 pub use sandbox::{
     DISABLE_LANDLOCK_ENV, KernelConfinement, LandlockPlan, SeccompFilter, TRUNCATE_HEAD,
     TRUNCATE_LIMIT, TRUNCATE_TAIL, build_landlock_plan, find_git_common_dir, find_git_dirs,

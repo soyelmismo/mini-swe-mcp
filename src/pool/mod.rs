@@ -107,8 +107,6 @@ pub struct WorkerPool {
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
     /// Checkout directory of every live worker. The `WorktreeGuard` stays the
-    /// Process-wide in-flight LLM request cap shared by every worker's runner.
-    llm_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// owner of the worktree itself; the pool only needs to know *where* a
     /// worker works so `kill` can commit what it leaves behind before the
     /// aborted task tears the checkout down.
@@ -146,7 +144,6 @@ impl WorkerPool {
                 .unwrap_or(DEFAULT_TERMINAL_TTL_SECS),
         );
 
-        let llm_gate = crate::agent::llm_gate_from_env();
         info!(
             bash_slots,
             max_heavy = admission.max_heavy(),
@@ -156,12 +153,10 @@ impl WorkerPool {
             max_emitted_logs = log_policy.max_emitted,
             terminal_ttl_secs = terminal_ttl.as_secs(),
             worker_slots = max_concurrent,
-            llm_concurrency = llm_gate.as_ref().map_or(0, |gate| gate.available_permits()),
             "Worker slots, bash semaphore and heavy-command admission controller initialized"
         );
         Self {
             worker_slots: fair::FairScheduler::new(max_concurrent),
-            llm_gate,
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -486,11 +481,6 @@ impl WorkerPool {
             .lock()
             .expect("registry lock poisoned")
             .reset_throttle(id);
-    }
-
-    /// Workers queued for a slot, oldest first.
-    pub fn waiting_worker_slots(&self) -> usize {
-        self.worker_slots.waiting()
     }
 
     /// Lightweight snapshot for progress waiters.

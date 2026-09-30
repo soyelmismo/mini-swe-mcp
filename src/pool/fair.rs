@@ -75,18 +75,6 @@ impl FairScheduler {
         }
     }
 
-    /// Requests queued for a slot, oldest first.
-    pub(super) fn waiting(&self) -> usize {
-        self.lock_gate()
-            .rotation
-            .owners
-            .iter()
-            .map(|(_, queue)| queue.len())
-            .sum()
-    }
-
-
-
     fn lock_gate(&self) -> MutexGuard<'_, Gate> {
         self.inner.gate.lock().unwrap_or_else(|e| e.into_inner())
     }

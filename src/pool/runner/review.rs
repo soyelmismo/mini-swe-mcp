@@ -123,8 +123,7 @@ impl WorkerPool {
             reviewer_model.clone(),
             temperature,
         )
-        .with_network_offline(network_offline)
-        .with_llm_gate(self.llm_gate.clone());
+        .with_network_offline(network_offline);
 
         let manifest = self.manifest();
         let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
