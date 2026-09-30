@@ -5,7 +5,9 @@
 //! every state transition and removed exactly once.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::state::WorkerMetrics;
 
@@ -96,8 +98,12 @@ pub struct WorkerMeta {
 }
 
 impl WorkerMeta {
-    /// Persist one status update for this worker.
-    pub fn save_status(
+    /// The row this worker's next status update describes.
+    ///
+    /// Built as a value so the pool's [`RegistryWriter`] can decide whether it
+    /// is worth a write at all; `save_status` stays the unconditional path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn entry(
         &self,
         model: &str,
         status: RegistryStatus,
@@ -105,8 +111,8 @@ impl WorkerMeta {
         max_turns: usize,
         last_command: &str,
         question: Option<String>,
-    ) {
-        save_registry_entry(&WorkerRegistryEntry {
+    ) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
             id: self.id.clone(),
             pid: self.pid,
             task: self.task.clone(),
@@ -121,7 +127,81 @@ impl WorkerMeta {
             group: self.group.clone(),
             repo_path: self.repo_path.clone(),
             metrics: self.metrics,
-        });
+        }
+    }
+
+    /// Persist one status update for this worker, unconditionally.
+    pub fn save_status(
+        &self,
+        model: &str,
+        status: RegistryStatus,
+        step: usize,
+        max_turns: usize,
+        last_command: &str,
+        question: Option<String>,
+    ) {
+        save_registry_entry(&self.entry(model, status, step, max_turns, last_command, question));
+    }
+}
+
+/// How often one worker's *step-only* registry row may be rewritten.
+///
+/// A step update carries no lifecycle information — the monitor reads the
+/// status, and a step counter that lags by a few seconds changes nothing an
+/// operator acts on — while a busy worker would otherwise rewrite its row on
+/// every turn. Status transitions are never throttled (see [`RegistryWriter`]).
+const STEP_WRITE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Coalescing front-end to the on-disk registry.
+///
+/// The registry is the cross-process view of the pool, so it has to stay
+/// accurate about *lifecycle*: `running -> paused -> running` and every
+/// terminal state are written the moment they happen, because the monitor and
+/// crash recovery act on them. Everything else — a step counter moving, a
+/// `last_command` label changing — is coalesced to at most one write per
+/// worker per [`STEP_WRITE_INTERVAL`].
+///
+/// The last row written per worker is kept in memory so a kill (which has no
+/// `WorkerMeta` at hand, the loop owning it is being aborted) can still end
+/// that worker's row on a terminal status. The map is bounded by the number of
+/// live workers: entries leave with `collect` and `reap`.
+#[derive(Default)]
+pub struct RegistryWriter {
+    rows: HashMap<String, WorkerRegistryEntry>,
+    last_write: HashMap<String, Instant>,
+}
+
+impl RegistryWriter {
+    /// Write `entry`, unless it is a step-only update inside the throttle
+    /// window of a row that already says the same thing.
+    pub fn save(&mut self, entry: WorkerRegistryEntry) {
+        let now = Instant::now();
+        let transition = self
+            .rows
+            .get(&entry.id)
+            .is_none_or(|last| last.status != entry.status);
+        if !transition
+            && self
+                .last_write
+                .get(&entry.id)
+                .is_some_and(|at| now.duration_since(*at) < STEP_WRITE_INTERVAL)
+        {
+            return;
+        }
+        self.last_write.insert(entry.id.clone(), now);
+        self.rows.insert(entry.id.clone(), entry.clone());
+        save_registry_entry(&entry);
+    }
+
+    /// The row last written for `worker_id`, if this process wrote one.
+    pub fn entry(&self, worker_id: &str) -> Option<&WorkerRegistryEntry> {
+        self.rows.get(worker_id)
+    }
+
+    /// Forget a worker whose record left the pool, so the map stays bounded.
+    pub fn remove(&mut self, worker_id: &str) {
+        self.rows.remove(worker_id);
+        self.last_write.remove(worker_id);
     }
 }
 

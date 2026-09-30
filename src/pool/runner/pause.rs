@@ -60,19 +60,19 @@ impl WorkerPool {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let now = unix_timestamp();
-        {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                w.state = WorkerState::Paused {
-                    question: question.to_string(),
-                    step,
-                    paused_at: now,
-                };
-                w.resume_tx = Some(tx);
-            }
-        }
+        self.update_worker(&worker_id, |w| {
+            w.state = WorkerState::Paused {
+                question: question.to_string(),
+                step,
+                paused_at: now,
+            };
+            w.resume_tx = Some(tx);
+        })
+        .await;
 
-        meta.save_status(
+        // A pause is a status transition, so it is written at once.
+        self.save_status(
+            meta,
             model,
             RegistryStatus::Paused,
             step,
@@ -85,17 +85,15 @@ impl WorkerPool {
             return Ok(None);
         };
         info!(worker = %worker_id, "Worker resumed by orchestrator guidance");
-        {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                w.state = WorkerState::Running {
-                    step,
-                    last_command: format!("resumed: {}", summarize_command(&answer)),
-                    started_at: now,
-                };
-                w.resume_tx = None;
-            }
-        }
+        self.update_worker(&worker_id, |w| {
+            w.state = WorkerState::Running {
+                step,
+                last_command: format!("resumed: {}", summarize_command(&answer)),
+                started_at: now,
+            };
+            w.resume_tx = None;
+        })
+        .await;
         Ok(Some(answer))
     }
 }

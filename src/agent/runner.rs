@@ -6,6 +6,7 @@
 //! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::retry;
@@ -27,6 +28,17 @@ enum StreamRun {
     Retry,
 }
 
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
+
 pub struct AgentRunner {
     pub http_client: reqwest::Client,
     pub api_base: String,
@@ -44,11 +56,7 @@ pub struct AgentRunner {
 
 impl AgentRunner {
     pub fn new(api_base: String, api_key: String, model: String, temperature: Option<f32>) -> Self {
-        let http_client = reqwest::Client::builder()
-            .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HTTP client");
+        let http_client = shared_http_client().clone();
 
         Self {
             http_client,

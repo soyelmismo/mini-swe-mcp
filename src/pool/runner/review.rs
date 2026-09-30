@@ -135,7 +135,8 @@ impl WorkerPool {
             reviewer_manifest_turns.unwrap_or(current_max_turns)
         };
 
-        meta.save_status(
+        self.save_status(
+            meta,
             &reviewer_model,
             RegistryStatus::Reviewing,
             step,
