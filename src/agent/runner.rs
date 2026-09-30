@@ -6,8 +6,9 @@
 //! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::retry;
 use super::stream::{FrameOutcome, SseAccumulator};
@@ -48,6 +49,28 @@ fn shared_http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Initialized once for the process, just like the shared HTTP client.
+fn shared_llm_gate() -> &'static Option<Arc<Semaphore>> {
+    static GATE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+    GATE.get_or_init(|| llm_gate(crate::config::llm_concurrency()))
+}
+
+fn llm_gate(limit: usize) -> Option<Arc<Semaphore>> {
+    (limit > 0).then(|| Arc::new(Semaphore::new(limit)))
+}
+
+async fn acquire_llm(gate: &Option<Arc<Semaphore>>) -> Result<Option<OwnedSemaphorePermit>> {
+    match gate {
+        Some(gate) => Ok(Some(
+            gate.clone()
+                .acquire_owned()
+                .await
+                .context("LLM gate closed")?,
+        )),
+        None => Ok(None),
+    }
+}
+
 impl AgentRunner {
     /// How many process-wide HTTP clients have been built (test support).
     ///
@@ -71,6 +94,9 @@ pub struct AgentRunner {
     pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
+    /// Process-wide in-flight LLM request cap. `None` (the default) is
+    /// unlimited; `Some` gates every `run_step_llm` request and stream.
+    pub llm_gate: Option<Arc<Semaphore>>,
     /// Fixed per-step command budget in seconds, replacing the light/heavy
     /// classification (tests use it to avoid mutating the process env).
     pub command_timeout_override: Option<u64>,
@@ -96,6 +122,7 @@ impl AgentRunner {
             temperature,
             network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            llm_gate: shared_llm_gate().clone(),
             command_timeout_override: None,
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
@@ -117,9 +144,21 @@ impl AgentRunner {
         self
     }
 
+    /// Route the LLM request through one process-wide in-flight cap (test seam).
+    #[doc(hidden)]
+    pub fn __test_with_llm_permits(&mut self, limit: usize) {
+        self.llm_gate = llm_gate(limit);
+    }
+
     /// Give every bash step the same `secs` budget, whatever the command.
     pub fn with_command_timeout(mut self, secs: u64) -> Self {
         self.command_timeout_override = Some(secs);
+        self
+    }
+
+    /// Cap this runner's concurrent LLM requests at `limit` (0 is unlimited).
+    pub fn with_llm_concurrency(mut self, limit: usize) -> Self {
+        self.llm_gate = llm_gate(limit);
         self
     }
 
@@ -156,7 +195,11 @@ impl AgentRunner {
         let accumulator = loop {
             attempts += 1;
 
-            let Some(mut resp) = self.send_with_retry(&payload, attempts).await? else {
+            let mut permit = acquire_llm(&self.llm_gate).await?;
+            let Some(mut resp) = self
+                .send_with_retry(&payload, attempts, &mut permit)
+                .await?
+            else {
                 continue;
             };
 
@@ -177,7 +220,16 @@ impl AgentRunner {
                     acc.handle_non_stream_fallback(&buffer);
                     break acc;
                 }
-                StreamRun::Retry => continue,
+                StreamRun::Retry => {
+                    // The slot does not survive into the retry backoff.
+                    drop(permit);
+                    self.backoff_for_stream_failure(
+                        attempts,
+                        "LLM SSE stream failed; retrying request with backoff",
+                    )
+                    .await;
+                    continue;
+                }
             }
         };
 
@@ -216,6 +268,7 @@ impl AgentRunner {
         &self,
         payload: &ChatCompletionRequest<'_>,
         attempt: usize,
+        permit: &mut Option<OwnedSemaphorePermit>,
     ) -> Result<Option<reqwest::Response>> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
 
@@ -242,6 +295,7 @@ impl AgentRunner {
                         delay_ms = delay.as_millis(),
                         "LLM API rate-limited or unavailable; retrying with backoff"
                     );
+                    drop(permit.take());
                     tokio::time::sleep(delay).await;
                     return Ok(None);
                 }
@@ -256,6 +310,7 @@ impl AgentRunner {
                     error = %e,
                     "LLM API network error; retrying with backoff"
                 );
+                drop(permit.take());
                 tokio::time::sleep(delay).await;
                 Ok(None)
             }
@@ -276,26 +331,21 @@ impl AgentRunner {
         attempt: usize,
     ) -> Result<StreamRun> {
         loop {
-            let next_chunk = match tokio::time::timeout(self.stream_idle_timeout, resp.chunk())
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    if attempt < self.max_retries {
-                        self.backoff_for_stream_failure(
-                                attempt,
-                                "LLM SSE stream stalled (no chunk within the idle timeout); retrying request with backoff",
-                            )
-                            .await;
-                        return Ok(StreamRun::Retry);
+            let next_chunk =
+                match tokio::time::timeout(self.stream_idle_timeout, resp.chunk()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if attempt < self.max_retries {
+                            tracing::warn!(attempt, "LLM SSE stream stalled (idle timeout)");
+                            return Ok(StreamRun::Retry);
+                        }
+                        anyhow::bail!(
+                            "LLM SSE stream stalled for {}s and did not resume after {} attempts",
+                            self.stream_idle_timeout.as_secs(),
+                            attempt
+                        );
                     }
-                    anyhow::bail!(
-                        "LLM SSE stream stalled for {}s and did not resume after {} attempts",
-                        self.stream_idle_timeout.as_secs(),
-                        attempt
-                    );
-                }
-            };
+                };
 
             match next_chunk {
                 Ok(Some(bytes)) => {
@@ -306,11 +356,7 @@ impl AgentRunner {
                 Ok(None) => return Ok(StreamRun::Completed),
                 Err(e) => {
                     if attempt < self.max_retries {
-                        self.backoff_for_stream_failure(
-                            attempt,
-                            "LLM SSE stream chunk read failed; retrying request with backoff",
-                        )
-                        .await;
+                        tracing::warn!(attempt, error = %e, "LLM SSE stream chunk read failed");
                         return Ok(StreamRun::Retry);
                     }
                     return Err(e).context("Failed reading stream chunk after retries");

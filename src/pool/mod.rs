@@ -15,7 +15,7 @@
 //! * [`admission`] — resource-aware admission control for heavy commands,
 //!   replacing the fixed-width build semaphore.
 //!
-//! [`WorkerPool`] itself stays here: it owns the concurrency semaphores and the
+//! [`WorkerPool`] itself stays here: it owns the concurrency gates and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
 //! reap) must stay in one place to keep the lock discipline auditable.
 
@@ -31,6 +31,7 @@ use tracing::{error, info, warn};
 pub mod admission;
 mod buffer;
 mod clock;
+mod fair;
 mod registry;
 pub(crate) mod revision;
 mod runner;
@@ -97,7 +98,7 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
 
 #[derive(Clone)]
 pub struct WorkerPool {
-    semaphore: Arc<Semaphore>,
+    worker_slots: fair::FairScheduler,
     bash_semaphore: Arc<Semaphore>,
     /// Resource-aware gate for heavy commands: the slot count, the memory and
     /// load criteria and the job count all live here.
@@ -154,7 +155,7 @@ impl WorkerPool {
             "Bash semaphore and heavy-command admission controller initialized"
         );
         Self {
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            worker_slots: fair::FairScheduler::new(max_concurrent),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -479,6 +480,18 @@ impl WorkerPool {
             .lock()
             .expect("registry lock poisoned")
             .reset_throttle(id);
+    }
+
+    /// Requests queued for a worker slot (test support).
+    #[doc(hidden)]
+    pub fn __test_worker_slots_waiting(&self) -> usize {
+        self.worker_slots.waiting()
+    }
+
+    /// Owner recorded for `id` (test support).
+    #[doc(hidden)]
+    pub async fn __test_worker_owner(&self, id: &str) -> Option<String> {
+        self.workers.read().await.get(id).map(|w| w.owner.clone())
     }
 
     /// Lightweight snapshot for progress waiters.
