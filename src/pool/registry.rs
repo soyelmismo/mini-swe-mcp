@@ -26,12 +26,19 @@ pub enum RegistryStatus {
     Completed,
     Failed,
     Stopped,
+    /// A hub crash interrupted a live worker. Terminal for listing -- its
+    /// uptime is frozen -- but continuable: its branch and its conversation
+    /// are intact, so `steer <id> "..."` resumes it on the same id.
+    Interrupted,
 }
 
 impl RegistryStatus {
     /// Whether the worker has finished and its uptime is frozen.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Stopped | Self::Interrupted
+        )
     }
 
     /// Whether the worker is still live (its uptime keeps counting).
@@ -48,6 +55,7 @@ impl RegistryStatus {
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
+            Self::Interrupted => "Interrupted",
         }
     }
 }
@@ -89,6 +97,22 @@ pub struct WorkerRegistryEntry {
     /// row written by an older build still parses.
     #[serde(default)]
     pub metrics: WorkerMetrics,
+    /// Base branch the worker's diff is measured against, detected at dispatch
+    /// or at the first continuation. `None` on a row written before base-branch
+    /// tracking existed, which is why it deserializes with a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Base commit the worker branched from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// How many revisions this worker has run. `0` on a row written before
+    /// revisions were counted.
+    #[serde(default)]
+    pub revision: usize,
+    /// Automatic "the hub restarted" continuations already spent on this
+    /// worker, capped at [`super::MAX_AUTO_CONTINUES`].
+    #[serde(default)]
+    pub auto_continues: usize,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -106,6 +130,12 @@ pub struct WorkerMeta {
     pub owner: String,
     pub started_at: u64,
     pub pid: u32,
+    /// How many revisions this worker has run; the history log's metadata line
+    /// carries the same counter.
+    pub revision: usize,
+    /// Automatic "the hub restarted" continuations already spent, so the
+    /// daemon's cap survives a restart.
+    pub auto_continues: usize,
     /// The phase loop's running counters, written with every status update.
     ///
     /// The loop owns the counters and lends them to the turn engine, which
@@ -146,6 +176,10 @@ impl WorkerMeta {
             repo_path: self.repo_path.clone(),
             owner: Some(self.owner.clone()),
             metrics: self.metrics,
+            base_branch: None,
+            base_commit: None,
+            revision: self.revision,
+            auto_continues: self.auto_continues,
         }
     }
 
@@ -352,12 +386,23 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
         })
 }
 
-/// Rewrite the dead rows of a crashed hub into failed ones before serving.
+/// Rewrite the dead rows of a crashed hub into interrupted ones before serving.
 ///
 /// Recovery treats any `running`/`paused`/`reviewing` row with a dead pid as
 /// an orphan of the previous hub: salvage the checkout onto `worker-<id>` and
-/// mark it failed with the branch name, keeping branch and history for revision.
+/// mark it interrupted with the branch name, keeping branch and history for revision.
 /// The checkout is released only after a successful salvage. Rows of this daemon are live work, so they are never orphans.
+/// Ids of every registry row the last hub left `interrupted`.
+///
+/// Read at daemon startup to decide which workers to continue: the row is
+/// terminal for listing but its branch and conversation are intact.
+pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
+    raw_registry_entries()
+        .map(|(_, entry)| entry)
+        .filter(|e| e.status == RegistryStatus::Interrupted)
+        .collect()
+}
+
 pub(crate) fn recover_orphaned_workers() -> usize {
     let mut recovered = 0;
     for (path, mut entry) in raw_registry_entries() {
@@ -386,7 +431,10 @@ pub(crate) fn recover_orphaned_workers() -> usize {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
             }
         }
-        entry.status = RegistryStatus::Failed;
+        // Interrupted, not failed: the worker stopped because the hub did, not
+        // because it cannot continue. Its branch and conversation survive, so
+        // the daemon continues it and the orchestrator can steer it.
+        entry.status = RegistryStatus::Interrupted;
         entry.question = None;
         entry.last_command = if salvaged {
             format!("hub restarted; work salvaged on branch worker-{}", entry.id)

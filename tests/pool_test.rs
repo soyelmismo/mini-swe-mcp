@@ -653,21 +653,41 @@ async fn steer_reports_missing_resume_channel_instead_of_dropping_message() {
 }
 
 #[tokio::test]
-async fn steer_on_unknown_worker_falls_back_to_the_cross_process_mailbox() {
-    // The old contract was `Err("Worker not found")`. It is now the *normal*
-    // cross-process path: an id this pool does not own is a worker running in
-    // some other `mini-swe-mcp` process, and the guidance is queued in its
-    // on-disk mailbox instead of being refused.
-    let dir = scratch_dir("steer-unknown-mailbox");
+async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
+    // The mailbox is for a worker whose registry row is live in another
+    // process: an id with no live row is continued here instead, and a mailbox
+    // nobody reads is never written.
+    let dir = scratch_dir("steer-live-row-mailbox");
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
-    let err_guard = ScopedTempDir::set(&dir);
+    let guard = ScopedTempDir::set(&dir);
 
-    pool.steer("nope", "focus on the parser".into()).await.unwrap();
-
-    let path = mini_swe_mcp::pool::steer_path("nope");
+    // A live pid in another process: the row's owner is alive, so the message
+    // is queued for it rather than continued here.
+    let mut owner = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a stand-in owner");
+    let row = live_row_elsewhere("remote", owner.id());
+    mini_swe_mcp::pool::save_registry_entry(&row);
+    pool.steer("remote", "focus on the parser".into()).await.unwrap();
+    let path = mini_swe_mcp::pool::steer_path("remote");
     assert!(path.is_file(), "the message must be queued, not dropped");
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(raw.contains("focus on the parser"));
+    let _ = owner.kill();
+    let _ = owner.wait();
+
+    // ...and an id with no live row has nobody to read a mailbox, so it is
+    // continued here -- which fails, because there is nothing to continue.
+    let err = pool.steer("nope", "guidance".into()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("nope"),
+        "the error must name the worker, got: {err}"
+    );
+    assert!(
+        !mini_swe_mcp::pool::steer_path("nope").exists(),
+        "no mailbox may be written for a dead owner"
+    );
 
     // ...and a worker in *this* process still takes the fast in-memory path,
     // leaving no mailbox behind.
@@ -675,7 +695,7 @@ async fn steer_on_unknown_worker_falls_back_to_the_cross_process_mailbox() {
     pool.steer("local", "in memory".into()).await.unwrap();
     assert!(!mini_swe_mcp::pool::steer_path("local").exists());
 
-    drop(err_guard);
+    drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1048,6 +1068,31 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
 // Per-worker health metrics (selfimprove-I7)
 // ----------
 
+/// A registry row for a worker owned by a live process elsewhere.
+fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
+    WorkerRegistryEntry {
+        id: id.to_string(),
+        pid,
+        task: "t".into(),
+        group: None,
+        model: "ninja".into(),
+        status: mini_swe_mcp::pool::RegistryStatus::Running,
+        step: 1,
+        max_turns: 10,
+        last_command: "cargo test".into(),
+        question: None,
+        repo_path: None,
+        started_at: 0,
+        updated_at: 0,
+        owner: None,
+        metrics: WorkerMetrics::default(),
+        base_branch: None,
+        base_commit: None,
+        revision: 0,
+        auto_continues: 0,
+    }
+}
+
 /// A registry row with every counter moved, as a finished run would write it.
 fn measured_entry() -> WorkerRegistryEntry {
     WorkerRegistryEntry {
@@ -1065,6 +1110,10 @@ fn measured_entry() -> WorkerRegistryEntry {
         group: Some("g".into()),
         repo_path: Some("/tmp/repo".into()),
         owner: Some(TEST_OWNER.into()),
+        base_branch: Some("master".into()),
+        base_commit: Some("abc123".into()),
+        revision: 1,
+        auto_continues: 0,
         metrics: WorkerMetrics {
             turns_used: 142,
             extensions_granted: 4,
@@ -1185,6 +1234,7 @@ fn sample_history(repo_path: &std::path::Path, base_commit: &str, branch: &str) 
         max_turns: 10,
         review_after: None,
         revision: 0,
+        auto_continues: 0,
         owner: Some("test-owner".to_string()),
         messages: vec![
             ChatMessage::text(Role::System, "system prompt"),
@@ -1545,6 +1595,8 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         started_at: 0,
         pid: std::process::id(),
         metrics: WorkerMetrics::default(),
+        revision: 0,
+        auto_continues: 0,
     };
     let row_path =
         std::path::PathBuf::from(&dir).join("swe-registry").join("h5a-reg.json");

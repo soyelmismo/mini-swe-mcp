@@ -508,6 +508,9 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             RegistryStatus::Paused => Some(EventKind::NeedsInput),
             RegistryStatus::Completed => Some(EventKind::Completed),
             RegistryStatus::Failed => Some(EventKind::Failed),
+            // Interrupted is terminal for listing but continuable, so it is
+            // not a terminal event: the worker is expected back.
+            RegistryStatus::Interrupted => None,
             RegistryStatus::Running | RegistryStatus::Reviewing | RegistryStatus::Stopped => None,
         },
         group: entry
@@ -601,6 +604,7 @@ fn registry_status(status: RegistryStatus) -> &'static str {
         RegistryStatus::Completed => "completed",
         RegistryStatus::Failed => "failed",
         RegistryStatus::Stopped => "stopped",
+        RegistryStatus::Interrupted => "interrupted",
     }
 }
 

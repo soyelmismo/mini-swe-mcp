@@ -195,7 +195,15 @@ pub struct HubServer {
 }
 
 impl HubServer {
-    /// A daemon serving `server` on the socket described by `config`.
+    /// Whether the daemon continues interrupted workers at startup.
+///
+/// `HUB_AUTO_RESUME=0` opts out: every interrupted worker then stays
+/// interrupted, and only an explicit `steer <id> "..."` moves it.
+fn auto_resume_enabled() -> bool {
+    std::env::var("HUB_AUTO_RESUME").map(|v| v != "0").unwrap_or(true)
+}
+
+/// A daemon serving `server` on the socket described by `config`.
     pub fn new(server: Arc<McpServer>, config: HubConfig) -> Self {
         Self {
             server,
@@ -209,6 +217,45 @@ impl HubServer {
     ///
     /// Returns `Ok(false)` when another daemon already holds the lock, so the
     /// caller can report it and exit 0 without disturbing the live daemon.
+    /// Continue every `interrupted` worker that has a history, at most
+    /// [`MAX_AUTO_CONTINUES`] times per worker.
+    ///
+    /// Returns how many workers were continued. `HUB_AUTO_RESUME=0` disables
+    /// it, leaving every interrupted worker for the orchestrator to steer.
+    async fn auto_resume_interrupted(&self) -> usize {
+        if !Self::auto_resume_enabled() {
+            info!("HUB_AUTO_RESUME=0; interrupted workers stay interrupted");
+            return 0;
+        }
+        let pool = self.server.pool();
+        let candidates = pool.interrupted_workers().await;
+        let mut resumed = 0;
+        for id in candidates {
+            let budget = pool.auto_continue_budget(&id).await;
+            if budget == 0 {
+                info!(
+                    worker = %id,
+                    "Interrupted worker has spent its automatic continuations; leaving it for the orchestrator"
+                );
+                continue;
+            }
+            let message = "the hub restarted".to_string();
+            match pool.continue_worker(&id, message, None).await {
+                Ok(_) => {
+                    // Count it before anything else can, so a worker the hub
+                    // keeps losing stops being restarted after the cap.
+                    pool.count_auto_continue(&id).await;
+                    resumed += 1;
+                    info!(worker = %id, "Auto-continued interrupted worker");
+                }
+                Err(e) => {
+                    warn!(worker = %id, error = %e, "Could not auto-continue an interrupted worker");
+                }
+            }
+        }
+        resumed
+    }
+
     pub async fn run(&self) -> Result<bool> {
         raise_nofile_limit();
         let paths = self.config.paths();
@@ -230,6 +277,16 @@ impl HubServer {
             &paths.log(),
             &format!("recovered {recovered} orphaned workers"),
         );
+
+        // Every interrupted worker with a surviving conversation is continued
+        // automatically: it stopped because the hub did, not because it could
+        // not go on. Capped per worker so a worker the hub keeps losing is left
+        // to the orchestrator instead of being restarted forever.
+        let resumed = self.auto_resume_interrupted().await;
+        if resumed > 0 {
+            info!(workers = resumed, "Auto-continued interrupted workers");
+            append_log(&paths.log(), &format!("auto-continued {resumed} workers"));
+        }
 
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("Could not bind hub socket {}", socket.display()))?;

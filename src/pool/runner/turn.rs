@@ -33,6 +33,7 @@ use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::history::compact_history;
+use super::super::revision::{WorkerHistory, append_history_message};
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
@@ -289,6 +290,9 @@ pub(super) struct TurnEngine<'a> {
     /// the point it fires, and the row is written from the same struct.
     pub meta: &'a mut WorkerMeta,
     pub messages: &'a mut Vec<ChatMessage>,
+    /// Messages pushed since the last [`Self::flush_history_log`], waiting to
+    /// be appended to the durable log.
+    pub unsaved_messages: Vec<ChatMessage>,
     pub step: &'a mut usize,
     pub current_max_turns: &'a mut usize,
     pub last_assistant_text: &'a mut String,
@@ -319,7 +323,7 @@ impl<'a> TurnEngine<'a> {
         }
         for msg in steer_msgs {
             info!(worker = %self.worker_id, "Injected steering message into subagent turn");
-            self.messages.push(ChatMessage::text(
+            self.push_message(ChatMessage::text(
                 Role::User,
                 format!("{}{}", config.steer_prefix, msg),
             ));
@@ -335,7 +339,7 @@ impl<'a> TurnEngine<'a> {
                     max_turns = *self.current_max_turns,
                     "Injecting proactive turn limit warning"
                 );
-                self.messages.push(ChatMessage::text(
+                self.push_message(ChatMessage::text(
                     Role::User,
                     format!(
                         "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
@@ -445,7 +449,7 @@ impl<'a> TurnEngine<'a> {
                         "Worker resumed after error by orchestrator"
                     );
                     if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
-                        self.messages.push(ChatMessage::text(
+                        self.push_message(ChatMessage::text(
                             Role::User,
                             format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
                         ));
@@ -605,7 +609,7 @@ impl<'a> TurnEngine<'a> {
                         budget,
                         "Refused turn extension beyond the self-grant budget"
                     );
-                    self.messages.push(ChatMessage::text(
+                    self.push_message(ChatMessage::text(
                         Role::User,
                         format!(
                             "TURN EXTENSION REFUSED: {additional} more turns would take you to {requested_max}, past the {budget} turns you may self-grant on a {} turn budget. Wrap up your changes and execute `echo {COMPLETION_SENTINEL}`, or execute `echo \"ASK_ORCHESTRATOR: what is blocking you?\"` if you need a decision.",
@@ -631,7 +635,7 @@ impl<'a> TurnEngine<'a> {
                     .await?;
 
                 if let Some(answer) = answer {
-                    self.messages.push(ChatMessage::text(
+                    self.push_message(ChatMessage::text(
                         Role::User,
                         format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
                     ));
@@ -825,7 +829,7 @@ impl<'a> TurnEngine<'a> {
             && !answer.trim().is_empty()
             && answer.trim() != "resume"
         {
-            self.messages.push(ChatMessage::text(
+            self.push_message(ChatMessage::text(
                 Role::User,
                 format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
             ));
@@ -871,56 +875,14 @@ impl<'a> TurnEngine<'a> {
         }
     }
 
-    /// Persist the conversation at an auto-checkpoint, so a killed hub
-    /// leaves a revisable history file behind instead of only the branch.
+    /// Persist the conversation at an auto-checkpoint, so a killed hub leaves a
+    /// revisable history log behind instead of only the branch.
     ///
-    /// The exit path's history format is serialized off the runtime thread.
-    /// A failed snapshot warns without interrupting the worker.
-    async fn persist_checkpoint_history(&self, config: &TurnConfig<'_>) {
-        use super::super::revision::{WorkerHistory, save_worker_history};
-        let revision = self
-            .pool
-            .workers
-            .read()
-            .await
-            .get(self.worker_id)
-            .map(|worker| worker.revision)
-            .unwrap_or(0);
-        let history = WorkerHistory {
-            task: config.task.to_string(),
-            group: self.meta.group.clone(),
-            model: config.model.to_string(),
-            temperature: config.temperature,
-            repo_path: self
-                .meta
-                .repo_path
-                .clone()
-                .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
-            base_commit: self.worktree.base_commit.clone(),
-            base_branch: self.worktree.base_branch.clone(),
-            branch: self.worktree.branch.clone(),
-            network_offline: config.network_offline,
-            verify: self.verify.map(str::to_string),
-            max_turns: config.max_turns,
-            review_after: config.review_after.map(str::to_string),
-            revision,
-            owner: Some(self.meta.owner.clone()),
-            messages: self.messages.clone(),
-        };
-        let worker_id = self.worker_id.to_string();
-        let step = *self.step;
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || save_worker_history(&worker_id, &history))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("history snapshot task failed: {e}")))
-        {
-            warn!(
-                worker = %self.worker_id,
-                step,
-                error = %e,
-                "Checkpoint history snapshot failed; the worker continues without it"
-            );
-        }
+    /// The log is append-only and already holds every message pushed up to the
+    /// previous turn boundary, so a checkpoint is a flush of what this turn
+    /// added: one line per message, never a whole-file rewrite.
+    async fn persist_checkpoint_history(&mut self, config: &TurnConfig<'_>) {
+        self.flush_history_log(config).await;
     }
 
     /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
@@ -997,9 +959,8 @@ impl<'a> TurnEngine<'a> {
             let content = (!content.trim().is_empty()).then_some(content);
             let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::tool_result(tc_id, output_text));
+            self.push_message(msg);
+            self.push_message(ChatMessage::tool_result(tc_id, output_text));
         } else {
             let content = if content.trim().is_empty() {
                 "I will execute a bash command.".to_string()
@@ -1007,9 +968,81 @@ impl<'a> TurnEngine<'a> {
                 content
             };
             let msg = ChatMessage::text(Role::Assistant, content).with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::text(Role::User, output_text));
+            self.push_message(msg);
+            self.push_message(ChatMessage::text(Role::User, output_text));
+        }
+    }
+
+    /// Append one message to the live conversation *and* to the durable
+    /// append-only log, so a crash costs at most the in-flight turn.
+    ///
+    /// The append is buffered and flushed by [`Self::flush_history_log`] at the
+    /// end of the turn, keeping the blocking write off the async runtime while
+    /// still writing one line per message.
+    fn push_message(&mut self, msg: ChatMessage) {
+        self.messages.push(msg.clone());
+        self.unsaved_messages.push(msg);
+    }
+
+    /// Write the messages buffered by [`Self::push_message`] to the worker's
+    /// append-only history log.
+    ///
+    /// The metadata line is written with the first message, so a log always
+    /// opens with the facts a continuation needs. A failed append warns and
+    /// carries on: the checkpoint snapshot still covers the whole conversation.
+    pub(super) async fn flush_history_log(&mut self, config: &TurnConfig<'_>) {
+        if self.unsaved_messages.is_empty() {
+            return;
+        }
+        let meta = self.history_meta(config);
+        let pending = std::mem::take(&mut self.unsaved_messages);
+        let worker_id = self.worker_id.to_string();
+        let step = *self.step;
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for msg in &pending {
+                append_history_message(&worker_id, &meta, msg)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("history append task failed: {e}")))
+        {
+            warn!(
+                worker = %self.worker_id,
+                step,
+                error = %e,
+                "Incremental history append failed; the worker continues without it"
+            );
+        }
+    }
+
+    /// The metadata line of this run's history log.
+    ///
+    /// The dispatch facts (`task`, `temperature`, `review_after`,
+    /// `network_offline`) are replayed from the turn config rather than kept
+    /// twice, so a continuation describes the run it continues.
+    fn history_meta(&self, config: &TurnConfig<'_>) -> WorkerHistory {
+        WorkerHistory {
+            task: config.task.to_string(),
+            group: self.meta.group.clone(),
+            model: config.model.to_string(),
+            temperature: config.temperature,
+            repo_path: self
+                .meta
+                .repo_path
+                .clone()
+                .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
+            base_commit: self.worktree.base_commit.clone(),
+            base_branch: self.worktree.base_branch.clone(),
+            branch: self.worktree.branch.clone(),
+            network_offline: config.network_offline,
+            verify: self.verify.map(str::to_string),
+            max_turns: config.max_turns,
+            review_after: config.review_after.map(str::to_string),
+            revision: self.meta.revision,
+            auto_continues: self.meta.auto_continues,
+            owner: Some(self.meta.owner.clone()),
+            messages: Vec::new(),
         }
     }
 
@@ -1033,7 +1066,7 @@ impl<'a> TurnEngine<'a> {
             };
             let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
+            self.push_message(msg);
             for tc in tool_calls {
                 let args = tc.function.arguments;
                 let truncated = if args.len() > 200 {
@@ -1042,7 +1075,7 @@ impl<'a> TurnEngine<'a> {
                 } else {
                     args
                 };
-                self.messages.push(ChatMessage::tool_result(
+                self.push_message(ChatMessage::tool_result(
                     tc.id,
                     format!(
                         "ERROR: could not parse a `command` from the bash tool arguments: {truncated}"
@@ -1057,9 +1090,8 @@ impl<'a> TurnEngine<'a> {
             };
             let msg = ChatMessage::text(Role::Assistant, assistant_content)
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::text(Role::User, NO_COMMAND_NUDGE));
+            self.push_message(msg);
+            self.push_message(ChatMessage::text(Role::User, NO_COMMAND_NUDGE));
         }
     }
 }

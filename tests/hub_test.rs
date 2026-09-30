@@ -794,6 +794,8 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         .env("SWE_TEMP_DIR", &swe)
         .env("TMPDIR", &swe)
         .env("HUB_IDLE_SECS", "1")
+        // Auto-resume off, so the row keeps the status recovery gave it.
+        .env("HUB_AUTO_RESUME", "0")
         .env("ENV_FILE", root.join("absent.env"))
         .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
         .stdout(Stdio::null())
@@ -812,7 +814,13 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json")))
             .expect("the orphan row survives recovery"),
     ).expect("registry JSON");
-    assert_eq!(entry.status, RegistryStatus::Failed, "the orphan row must be failed");
+    // Interrupted, not failed: the worker stopped because the hub did, so it is
+    // terminal for listing but continuable with `steer`.
+    assert_eq!(
+        entry.status,
+        RegistryStatus::Interrupted,
+        "the orphan row must be interrupted"
+    );
     let expected = format!("hub restarted; work salvaged on branch worker-{wid}");
     assert_eq!(entry.last_command, expected, "the owner must see the salvage branch");
     let log = Command::new("git")
@@ -934,14 +942,29 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let dispatched: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let wid = dispatched["worker_id"].as_str().unwrap();
-    let history_path = swe.join(format!("swe-wt-{wid}.history.json"));
+    // The durable store is the append-only log, written one line per message.
+    let history_path = swe.join(format!("swe-wt-{wid}.history.jsonl"));
+    // The log is seeded with the opening messages and then grows one line per
+    // message, so wait for the checkpoint's worth of exchanges rather than for
+    // the file to appear.
     for _ in 0..400 {
-        if history_path.is_file() { break; }
+        let lines = std::fs::read_to_string(&history_path)
+            .map(|raw| raw.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if lines >= 40 { break; }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let checkpoint: mini_swe_mcp::pool::WorkerHistory = serde_json::from_slice(
-        &std::fs::read(&history_path).expect("checkpoint must save history before exit")
-    ).unwrap();
+    // Read the log directly: it lives under this test's `SWE_TEMP_DIR`, which
+    // the test process itself does not share with the daemon that wrote it.
+    let raw = std::fs::read_to_string(&history_path).expect("checkpoint must save history before exit");
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let mut checkpoint: mini_swe_mcp::pool::WorkerHistory =
+        serde_json::from_str(lines.next().expect("the log has a metadata line")).unwrap();
+    for line in lines {
+        checkpoint
+            .messages
+            .push(serde_json::from_str(line).expect("one message per line"));
+    }
     assert!(mini_swe_mcp::pool::is_replayable(&checkpoint.messages));
     assert!(checkpoint.messages.len() >= 40, "must retain exchanges before turn 20");
     assert_eq!(checkpoint.owner.as_deref(), Some("cli"));
@@ -950,12 +973,15 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     first.wait().await.unwrap();
 
     let mut second = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+        .env("HUB_AUTO_RESUME", "0")
         .kill_on_drop(true).spawn().unwrap();
     wait_for_socket(&hub.join("hub.sock")).await;
     let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
         &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap()
     ).unwrap();
-    assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Failed);
+    // Interrupted, not failed: the worker stopped because the hub did, and its
+    // conversation survived, so the steer below continues it.
+    assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Interrupted);
     assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
     let out = tokio::time::timeout(std::time::Duration::from_secs(15),
         command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--wait", "--json"])

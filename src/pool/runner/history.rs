@@ -17,7 +17,7 @@ const PROSE_SUFFIX: &str = " [prose elided]";
 const REASONING_SUFFIX: &str = " [reasoning elided]";
 const OUTPUT_PREFIX: &str = "[output elided: exit ";
 
-pub(super) fn compact_history(messages: &mut [ChatMessage]) {
+pub(crate) fn compact_history(messages: &mut [ChatMessage]) {
     compact_with_policy(
         messages,
         env_parse::<usize>("HISTORY_FULL_TURNS").unwrap_or(DEFAULT_FULL_TURNS),

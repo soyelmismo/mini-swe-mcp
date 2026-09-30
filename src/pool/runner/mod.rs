@@ -33,14 +33,14 @@ use crate::worktree::{FileFingerprint, WorktreeGuard};
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
 use super::steer::remove_steer_file;
-use super::revision::{WorkerHistory, save_worker_history};
+use super::revision::{WorkerHistory, append_history_message};
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 
-mod history;
+pub(crate) mod history;
 mod pause;
 mod review;
 mod sentinels;
@@ -212,64 +212,73 @@ impl WorkerPool {
             ],
         };
 
-        let result = self
-            .run_phases(
-                &worker_id,
-                &RunConfig {
-                    task: &task,
-                    model: &model,
-                    temperature,
-                    max_turns,
-                    review_after: review_after.clone(),
-                    network_offline,
-                    verify: verify.as_deref(),
-                    repo_path_str: &repo_path_str,
-                },
-                meta,
-                &mut worktree,
-                &mut messages,
-            )
-            .await;
-
-        // Completion and propagated errors save the final conversation.
-        // Aborted tasks cannot reach this tail; auto-checkpoints persist their
-        // most recent conversation for crash recovery instead.
-        history::compact_history(&mut messages);
-        let history = WorkerHistory {
-            task,
+        // The opening messages are the log's first lines, so a worker that dies
+        // before its first turn still leaves a continuable conversation behind.
+        let opening_meta = WorkerHistory {
+            task: task.clone(),
             group: meta.group.clone(),
-            model,
+            model: model.clone(),
             temperature,
-            repo_path: repo_path_str,
+            repo_path: repo_path_str.clone(),
             base_commit: worktree.base_commit.clone(),
             base_branch: worktree.base_branch.clone(),
             branch: worktree.branch.clone(),
             network_offline,
-            verify: verify.map(|v| v.to_string()),
+            verify: verify.clone(),
             max_turns,
-            review_after,
-            revision: self
-                .workers
-                .read()
-                .await
-                .get(&worker_id)
-                .map(|w| w.revision)
-                .unwrap_or(0),
+            review_after: review_after.clone(),
+            revision: meta.revision,
+            auto_continues: meta.auto_continues,
             owner: Some(meta.owner.clone()),
-            messages,
+            messages: Vec::new(),
         };
-        if let Err(e) = save_worker_history(&worker_id, &history) {
+        if !super::revision::history_log_path(&worker_id).exists()
+            && let Err(e) = Self::append_history_messages(&worker_id, &opening_meta, &messages)
+        {
             warn!(
                 worker = %worker_id,
                 error = %e,
                 "Could not persist the worker conversation; this worker can no longer be revised"
             );
         }
-        result
+
+        // The conversation is durable one line per message (see
+        // `TurnEngine::push_message`), so nothing is rewritten here: a crash may
+        // lose only the in-flight turn.
+        self.run_phases(
+            &worker_id,
+            &RunConfig {
+                task: &task,
+                model: &model,
+                temperature,
+                max_turns,
+                review_after: review_after.clone(),
+                network_offline,
+                verify: verify.as_deref(),
+                repo_path_str: &repo_path_str,
+            },
+            meta,
+            &mut worktree,
+            &mut messages,
+        )
+        .await
     }
 
     /// The implementer loop, the review phase and the completion payload.
     ///
+    /// Append `messages` to `worker_id`'s history log, creating it with the
+    /// metadata line when it does not exist yet.
+    fn append_history_messages(
+        worker_id: &str,
+        meta: &WorkerHistory,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        for msg in messages {
+            append_history_message(worker_id, meta, msg)?;
+        }
+        Ok(())
+    }
+
     /// Split from [`WorkerPool::run_worker`] so the caller owns the worktree and
     /// the conversation: whatever happens in here -- a completion sentinel, a
     /// failed bash step, a cancelled task -- the caller still holds both and can
@@ -329,6 +338,7 @@ impl WorkerPool {
                 worker_id,
                 meta,
                 messages,
+                unsaved_messages: Vec::new(),
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
@@ -345,6 +355,9 @@ impl WorkerPool {
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
                 TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
             }
+            // One line per message, flushed at the turn boundary: a crash can
+            // only lose the turn that was in flight.
+            engine.flush_history_log(&turn_config).await;
         }
 
         // --- MULTI-PHASE REVIEW PIPELINE ---

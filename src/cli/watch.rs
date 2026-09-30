@@ -45,7 +45,7 @@ impl Options {
 pub fn registry_snapshot(entry: &WorkerRegistryEntry, now: u64) -> Value {
     json!({"worker_id":entry.id, "owner":entry.owner.as_deref().unwrap_or("unattributed"),
         "model":entry.model, "group":entry.group.as_deref().unwrap_or("default"),
-        "status":match entry.status { crate::pool::RegistryStatus::Running=>"running", crate::pool::RegistryStatus::Paused=>"paused", crate::pool::RegistryStatus::Reviewing=>"reviewing", crate::pool::RegistryStatus::Completed=>"completed", crate::pool::RegistryStatus::Failed=>"failed", crate::pool::RegistryStatus::Stopped=>"stopped" }.to_string(),
+        "status":match entry.status { crate::pool::RegistryStatus::Running=>"running", crate::pool::RegistryStatus::Paused=>"paused", crate::pool::RegistryStatus::Reviewing=>"reviewing", crate::pool::RegistryStatus::Completed=>"completed", crate::pool::RegistryStatus::Failed=>"failed", crate::pool::RegistryStatus::Stopped=>"stopped", crate::pool::RegistryStatus::Interrupted=>"interrupted" }.to_string(),
         "step":entry.step, "turns":entry.step, "max_turns":entry.max_turns,
         "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
         "metrics":entry.metrics, "branch":null, "revision":0, "summary":null,

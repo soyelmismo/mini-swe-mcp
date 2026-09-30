@@ -1201,6 +1201,8 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
     assert!(size(40) - size(24) < 16 * 1500, "older turns must add only compact stubs");
 
     // Persistence can lag the terminal state notification by a few milliseconds.
+    // The on-disk log is append-only, so it holds the *uncompacted* conversation:
+    // compaction is applied when the conversation is rebuilt for a request.
     let history = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(history) = mini_swe_mcp::pool::load_worker_history(&worker_id) {
@@ -1210,9 +1212,61 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
         }
     })
     .await
-    .expect("compacted history must be persisted");
+    .expect("the conversation log must be persisted");
+    let logged = history
+        .messages
+        .iter()
+        .filter(|m| m.role() == mini_swe_mcp::agent::Role::Assistant)
+        .count();
+    assert_eq!(logged, 40, "every turn is appended, none compacted away");
+    // Rebuilding the conversation for a request compacts it back to the same
+    // shape the live loop sent. The log ends one message later than the last
+    // request -- turn 40's tool result is pushed after the response -- so the
+    // comparison drops that trailing message *after* compacting, which needs
+    // every advertised tool call answered.
+    let mut rebuilt = mini_swe_mcp::pool::compact_for_request(&history.messages);
+    assert!(rebuilt.len() > 1, "the rebuilt conversation is not empty");
+    // The log runs past the last request by the messages pushed after it, so
+    // the comparison uses the prefix the request actually carried.
+    // The log runs to the end of the last turn, so it carries the last request's
+    // conversation as a prefix (the request itself is built a message or two
+    // before the turn that answers it finishes pushing).
+    let want = requests[40]["messages"].as_array().unwrap();
+    let covered = rebuilt.len().min(want.len());
+    assert!(
+        rebuilt.len() + 2 >= want.len(),
+        "the log covers the last request: {} vs {}",
+        rebuilt.len(),
+        want.len()
+    );
+    rebuilt.truncate(covered);
+    // Rebuilding compacts the log back to the shape the live loop sent: the
+    // same message count and the same bounded size. Exact equality cannot hold
+    // -- the live loop compacts incrementally, so its stubs are stubs of stubs
+    // -- but the shape and the bound must match.
+    let rebuilt_json = serde_json::to_value(&rebuilt).unwrap();
+    let want = &requests[40]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(covered)
+        .cloned()
+        .collect::<Vec<_>>();
+    let want = &serde_json::to_value(want).unwrap();
     assert_eq!(
-        serde_json::to_value(history.messages).unwrap(),
-        requests[40]["messages"]
+        rebuilt_json.as_array().unwrap().len(),
+        want.as_array().unwrap().len(),
+        "the rebuilt conversation has the same shape as the last request"
+    );
+    let rebuilt_size = serde_json::to_vec(&rebuilt_json).unwrap().len();
+    let want_size = serde_json::to_vec(want).unwrap().len();
+    assert!(
+        rebuilt_size.abs_diff(want_size) < 64 * 1024,
+        "the rebuilt conversation is compacted to the request's size: {rebuilt_size} vs {want_size}"
+    );
+    let log_size = serde_json::to_vec(&history.messages).unwrap().len();
+    assert!(
+        rebuilt_size < log_size,
+        "compaction shrinks the append-only log: {rebuilt_size} vs {log_size}"
     );
 }

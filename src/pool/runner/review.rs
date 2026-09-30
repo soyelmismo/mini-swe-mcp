@@ -187,6 +187,7 @@ impl WorkerPool {
                 worker_id: &worker_id,
                 meta,
                 messages: &mut review_messages,
+                unsaved_messages: Vec::new(),
                 step: &mut step,
                 current_max_turns: &mut combined_max_turns,
                 last_assistant_text: &mut last_assistant_text,
