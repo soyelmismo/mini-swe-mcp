@@ -1,4 +1,4 @@
-//! Exercise the global LLM cap in an isolated process without mutating env.
+//! Exercise the global LLM cap in isolated processes without mutating env.
 use mini_swe_mcp::agent::{AgentRunner, ChatMessage, Role};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,8 +6,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// `HUB_LLM_CONCURRENCY` caps the chat-completion requests in flight across the
+/// whole process: the gate is taken around the HTTP request *and* its stream,
+/// so the fake server never sees more requests at once than the cap allows.
+///
+/// The cap is read once per process, so each case runs in a child process
+/// rather than mutating this one's environment.
 #[test]
-fn llm_cap_is_process_wide_and_zero_is_unlimited() {
+fn llm_concurrency_cap_limits_in_flight_requests() {
     for cap in [0, 1, 2] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "llm_cap_child", "--nocapture"])
@@ -48,17 +54,22 @@ async fn llm_cap_child() {
                 let peak = peak.clone();
                 handlers.push(tokio::spawn(async move {
                     let mut head = Vec::new();
-                    let mut buffer = [0; 4096];
+                    let mut buffer = [0u8; 4096];
                     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
                         let n = socket.read(&mut buffer).await.unwrap();
                         assert!(n > 0);
                         head.extend_from_slice(&buffer[..n]);
                     }
-                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(n, Ordering::SeqCst);
-                    // Send headers now and hold the SSE stream open. The cap
-                    // must cover the body, not just receipt of HTTP headers.
-                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Answer the headers, then hold the SSE body open: the cap
+                    // must cover the stream, not just receipt of the headers.
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     active.fetch_sub(1, Ordering::SeqCst);
                     socket.write_all(b"data: [DONE]\n\n").await.unwrap();
@@ -70,8 +81,8 @@ async fn llm_cap_child() {
             }
         }
     });
-    let mut requests = Vec::new();
     // Independently constructed runners must all draw from the same cap.
+    let mut requests = Vec::new();
     for _ in 0..6 {
         let runner = AgentRunner::new(base.clone(), "k".into(), "m".into(), None);
         requests.push(tokio::spawn(async move {
