@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod hub;
 pub mod manifest;
 pub mod mcp;
 pub mod monitor;
