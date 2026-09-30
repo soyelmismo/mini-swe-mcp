@@ -3,7 +3,8 @@
 //! The orchestrator reviews a finished worker's branch and then steers it with
 //! corrections. The model must continue on its own branch with its full
 //! context rather than restart from the task, so [`WorkerPool::run_worker`]
-//! serializes the live conversation (system prompt, task, every assistant turn
+//! and its auto-checkpoints serialize the live conversation (system prompt,
+//! task, every assistant turn
 //! with its reasoning, every tool result -- exactly what the next request
 //! replays) plus the metadata the launch took apart again, into
 //! `swe_base_dir()/swe-wt-<id>.history.json`. [`WorkerPool::steer`] reloads the

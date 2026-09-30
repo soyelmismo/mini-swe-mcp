@@ -33,6 +33,50 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 
+/// Compact statusLine summary: live workers plus terminal rows from the last
+/// five minutes. Reviewing workers count as running; failures remain visible.
+pub fn format_status_line(entries: &[WorkerRegistryEntry], now: u64) -> String {
+    let mut counts = [0usize; 5];
+    for entry in entries {
+        if entry.status.is_terminal()
+            && now.saturating_sub(entry.updated_at) > crate::pool::DEFAULT_TERMINAL_TTL_SECS
+        {
+            continue;
+        }
+        let index = match entry.status {
+            RegistryStatus::Running | RegistryStatus::Reviewing => 0,
+            RegistryStatus::Paused => 1,
+            RegistryStatus::Completed => 2,
+            RegistryStatus::Failed => 3,
+            RegistryStatus::Stopped => 4,
+        };
+        counts[index] += 1;
+    }
+    let parts: Vec<_> = counts
+        .into_iter()
+        .zip(["running", "needs input", "done", "failed", "stopped"])
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("⚙ {}", parts.join(" · "))
+    }
+}
+
+/// Print the registry-only status line, ignoring unavailable rows and broken
+/// output pipes so a statusLine command never disrupts the host UI.
+pub fn print_status_line() {
+    let output = format_status_line(
+        &crate::pool::load_registry_entries_read_only(),
+        unix_timestamp(),
+    );
+    if !output.is_empty() {
+        let _ = writeln!(std::io::stdout().lock(), "{output}");
+    }
+}
+
 /// Human-readable elapsed time: `05s`, `01m 05s`, `01h 01m`.
 fn format_duration(secs: u64) -> String {
     if secs < 60 {
@@ -1047,6 +1091,76 @@ mod tests {
                 metrics: self.metrics,
             }
         }
+    }
+
+    fn line_entry(id: &str, status: RegistryStatus, updated_at: u64) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
+            id: id.into(),
+            pid: 1234,
+            task: "task".into(),
+            model: "ninja".into(),
+            status,
+            step: 1,
+            max_turns: 100,
+            last_command: String::new(),
+            question: None,
+            started_at: 1000,
+            updated_at,
+            group: None,
+            repo_path: None,
+            owner: None,
+            metrics: WorkerMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn test_status_line_omits_zero_parts_and_empty_state() {
+        let now = 10_000;
+        assert_eq!(format_status_line(&[], now), "");
+        let entries = vec![
+            line_entry("a", RegistryStatus::Running, now),
+            line_entry("b", RegistryStatus::Reviewing, now),
+            line_entry("c", RegistryStatus::Running, now),
+            line_entry("d", RegistryStatus::Paused, now),
+            line_entry("e", RegistryStatus::Completed, now),
+            line_entry("f", RegistryStatus::Completed, now),
+        ];
+        assert_eq!(
+            format_status_line(&entries, now),
+            "⚙ 3 running · 1 needs input · 2 done"
+        );
+    }
+
+    #[test]
+    fn test_status_line_covers_failed_and_expires_terminal_rows() {
+        use crate::pool::DEFAULT_TERMINAL_TTL_SECS;
+        let now = 10_000;
+        let fresh_failed = line_entry("a", RegistryStatus::Failed, now - 10);
+        let stale_failed = line_entry(
+            "b",
+            RegistryStatus::Failed,
+            now - DEFAULT_TERMINAL_TTL_SECS - 1,
+        );
+        let live = line_entry("c", RegistryStatus::Running, now);
+        assert_eq!(
+            format_status_line(&[fresh_failed, stale_failed.clone(), live], now),
+            "⚙ 1 running · 1 failed"
+        );
+        // Terminal rows age out exactly at the shared TTL boundary.
+        assert_eq!(
+            format_status_line(&[stale_failed], now),
+            "",
+            "old terminal rows must not wake a statusLine"
+        );
+        let entries = vec![
+            line_entry("d", RegistryStatus::Paused, now),
+            line_entry("e", RegistryStatus::Completed, now),
+            line_entry("f", RegistryStatus::Stopped, now),
+        ];
+        assert_eq!(
+            format_status_line(&entries, now),
+            "⚙ 1 needs input · 1 done · 1 stopped"
+        );
     }
 
     #[test]

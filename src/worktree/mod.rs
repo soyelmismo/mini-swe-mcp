@@ -12,7 +12,7 @@
 //! The public surface stays flat: everything callers need is re-exported here.
 
 mod guard;
-mod prune;
+pub(crate) mod prune;
 
 pub use guard::{FileFingerprint, WorktreeGuard};
 pub use prune::{
@@ -81,11 +81,45 @@ pub(crate) fn force_remove_dir(path: &Path) {
     }
 }
 
-/// Delete a worktree's scratch/target directories from every known base dir.
+/// Private scratch root for one worker, independent of its shared build slot.
+pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
+    let name = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    swe_base_dir().join(format!("swe-tmp-{name}"))
+}
+
+/// Delete private scratch and legacy targets, never shared slot targets.
 pub(crate) fn remove_target_dirs(wt_path: &Path) {
     if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
         for base in swe_base_dirs() {
             force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
+            force_remove_dir(&base.join(format!("swe-tmp-{wt_name}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn teardown_only_removes_private_and_legacy_directories() {
+        let base = swe_base_dir();
+        let name = format!("swe-wt-cleanup-{}", uuid::Uuid::new_v4());
+        let worktree = base.join(&name);
+        let legacy = base.join(format!("swe-target-{name}"));
+        let scratch = scratch_dir(&worktree);
+        let shared = crate::cache::slot_target_dir(&base, 999999).unwrap();
+        let lease = crate::cache::TargetLease::acquire(&shared).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        remove_target_dirs(&worktree);
+        assert!(!legacy.exists());
+        assert!(!scratch.exists());
+        assert!(shared.exists());
+        drop(lease);
+        force_remove_dir(&shared);
     }
 }

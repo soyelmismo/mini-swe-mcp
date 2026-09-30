@@ -36,9 +36,8 @@ fn scratch_dir() -> PathBuf {
 
 /// A server backed by a pool that can answer handshake verbs without an LLM.
 fn server() -> Arc<McpServer> {
-    let pool =
-        WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-            .with_manifest(Arc::new(ModelManifest::default()));
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
     Arc::new(McpServer::new(pool, "test-model".to_string()))
 }
 
@@ -74,9 +73,7 @@ impl Client {
 
     /// Send one request and return its decoded `result`.
     async fn call(&mut self, method: &str) -> serde_json::Value {
-        self.request(method, serde_json::json!({}))
-            .await["result"]
-            .clone()
+        self.request(method, serde_json::json!({})).await["result"].clone()
     }
 
     /// Send one request and return the whole reply envelope, error included.
@@ -131,10 +128,7 @@ impl Client {
     }
 
     /// One `worker` tool call: the decoded payload, or the error message.
-    async fn worker(
-        &mut self,
-        arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    async fn worker(&mut self, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
         let reply = self
             .request(
                 "tools/call",
@@ -156,20 +150,14 @@ impl Client {
 #[tokio::test]
 async fn two_clients_share_one_daemon() {
     let dir = scratch_dir();
-    let config = HubConfig::new(
-        hub_paths_for_test(&dir),
-        60,
-    );
+    let config = HubConfig::new(hub_paths_for_test(&dir), 60);
     let daemon = HubServer::new(server(), config);
     let task = tokio::spawn(async move { daemon.run().await });
 
     let socket = dir.join("hub.sock");
     wait_for_socket(&socket).await;
     let (mut a, mut b) = tokio::join!(Client::connect(&socket), Client::connect(&socket));
-    let (init_a, init_b) = tokio::join!(
-        a.call("initialize"),
-        b.call("initialize"),
-    );
+    let (init_a, init_b) = tokio::join!(a.call("initialize"), b.call("initialize"),);
     assert_eq!(init_a["protocolVersion"], "2024-11-05");
     assert_eq!(init_b["protocolVersion"], "2024-11-05");
     let (tools, ping) = tokio::join!(a.call("tools/list"), b.call("ping"));
@@ -189,10 +177,7 @@ async fn two_clients_share_one_daemon() {
 #[tokio::test]
 async fn second_daemon_defers_to_the_lock_holder() {
     let dir = scratch_dir();
-    let first = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 60),
-    );
+    let first = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
     let running = Arc::new(tokio::sync::Mutex::new(false));
     let flag = running.clone();
     let task = tokio::spawn(async move {
@@ -200,10 +185,7 @@ async fn second_daemon_defers_to_the_lock_holder() {
         *flag.lock().await = held;
     });
     wait_for_socket(&dir.join("hub.sock")).await;
-    let second = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 60),
-    );
+    let second = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
     assert!(!second.run().await.expect("lock query runs"));
 
     task.abort();
@@ -215,10 +197,7 @@ async fn second_daemon_defers_to_the_lock_holder() {
 #[tokio::test]
 async fn idle_daemon_removes_its_socket() {
     let dir = scratch_dir();
-    let daemon = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 1),
-    );
+    let daemon = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 1));
     let socket = dir.join("hub.sock");
     let probe = socket.clone();
     let task = tokio::spawn(async move { daemon.run().await });
@@ -230,7 +209,10 @@ async fn idle_daemon_removes_its_socket() {
         .expect("daemon runs");
     assert!(held);
     assert!(!socket.exists(), "idle shutdown removes hub.sock");
-    assert!(dir.join("hub.log").is_file(), "daemon records its lifecycle in hub.log");
+    assert!(
+        dir.join("hub.log").is_file(),
+        "daemon records its lifecycle in hub.log"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -284,8 +266,14 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         cmd.env("SWE_HUB_DIR", &hub_dir)
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-list")
-            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+            .env(
+                "ENV_FILE",
+                format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+            )
+            .env(
+                "MODELS_FILE",
+                format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+            );
     };
 
     // First CLI call auto-starts the daemon and answers through it.
@@ -295,10 +283,21 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("first CLI call runs");
-    assert!(out.status.success(), "first CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(hub_dir.join("hub.sock").exists(), "first call auto-starts the daemon");
-    let first_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon writes hub.log");
-    assert!(first_log.contains("listening"), "daemon records startup: {first_log}");
+    assert!(
+        out.status.success(),
+        "first CLI call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        hub_dir.join("hub.sock").exists(),
+        "first call auto-starts the daemon"
+    );
+    let first_log =
+        std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon writes hub.log");
+    assert!(
+        first_log.contains("listening"),
+        "daemon records startup: {first_log}"
+    );
 
     // Second CLI call reuses the same daemon: no second listener starts.
     let mut second = Command::new(&exe);
@@ -307,7 +306,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("second CLI call runs");
-    assert!(out.status.success(), "second CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "second CLI call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let second_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon log persists");
     // Both CLI connections reached the daemon; the socket path stayed put and
     // no second listener line was appended (stderr lines also say "listening").
@@ -330,8 +333,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     let stdout = child.stdout.take().expect("proxy stdout");
     let mut lines = StdBufReader::new(stdout).lines();
     for (id, method) in [(1, "initialize"), (2, "tools/list")] {
-        writeln!(stdin, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}")
-            .expect("write a proxy frame");
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}"
+        )
+        .expect("write a proxy frame");
     }
     stdin.flush().expect("flush proxy frames");
     // Requests are served concurrently, so the replies may arrive in either
@@ -351,7 +357,10 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         }
     }
     for expected in ["\"protocolVersion\":\"2024-11-05\"", "\"tools\""] {
-        assert!(seen.contains(expected), "proxy must answer with {expected}: {seen}");
+        assert!(
+            seen.contains(expected),
+            "proxy must answer with {expected}: {seen}"
+        );
     }
     drop(stdin);
     let _ = child.wait();
@@ -365,11 +374,18 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .env("OPENAI_API_BASE", "http://127.0.0.1:1")
         .output()
         .expect("dispatch runs");
-    assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "dispatch must be accepted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let payload: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("dispatch prints JSON");
-    let wid = payload["worker_id"].as_str().expect("dispatch names the worker").to_string();
+    let wid = payload["worker_id"]
+        .as_str()
+        .expect("dispatch names the worker")
+        .to_string();
     assert_eq!(
         payload["owner"], "cli",
         "a CLI dispatch is owned by the stable `cli` identity: {payload}"
@@ -394,7 +410,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("second CLI list runs");
-    assert!(out.status.success(), "list must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "list must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let listed: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("list prints JSON");
@@ -403,7 +423,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .expect("workers array")
         .iter()
         .find(|row| row["id"] == wid.as_str())
-        .unwrap_or_else(|| panic!("the `cli` identity must keep its workers across invocations: {listed}"));
+        .unwrap_or_else(|| {
+            panic!("the `cli` identity must keep its workers across invocations: {listed}")
+        });
     assert_eq!(row["owner"], "cli");
 
     // The escape hatch never creates a socket.
@@ -413,14 +435,27 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .env("SWE_HUB_DIR", bare.path())
         .env("MINI_SWE_NO_DAEMON", "1")
         .env("OPENAI_API_KEY", "test-key-not-used-by-list")
-        .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+        .env(
+            "ENV_FILE",
+            format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+        )
+        .env(
+            "MODELS_FILE",
+            format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+        );
     let out = local
         .args(["list", "--json"])
         .output()
         .expect("local CLI call runs");
-    assert!(out.status.success(), "escape-hatch call must succeed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(!bare.path().join("hub.sock").exists(), "MINI_SWE_NO_DAEMON=1 creates no socket");
+    assert!(
+        out.status.success(),
+        "escape-hatch call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !bare.path().join("hub.sock").exists(),
+        "MINI_SWE_NO_DAEMON=1 creates no socket"
+    );
 }
 
 /// Terminates every daemon that logged into `hub_dir` when dropped.
@@ -471,12 +506,17 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
             .expect("restrict the scratch dir to 0700");
     }
     for repo in [&repo_a, &repo_b] {
-        let _ = Command::new("git").args(["init", "-q"]).current_dir(repo).output();
+        let _ = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .output();
         let _ = Command::new("git")
             .args(["commit", "-q", "--allow-empty", "-m", "seed"])
             .current_dir(repo)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
             .output();
     }
 
@@ -490,14 +530,28 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-dispatch")
             .env("OPENAI_API_BASE", "http://127.0.0.1:1")
-            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .env(
+                "ENV_FILE",
+                format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+            )
+            .env(
+                "MODELS_FILE",
+                format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+            )
             .output()
             .expect("dispatch runs");
-        assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "dispatch must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let payload: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("dispatch prints JSON");
-        payload["worker_id"].as_str().expect("dispatch names the worker").to_string()
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+                .expect("dispatch prints JSON");
+        payload["worker_id"]
+            .as_str()
+            .expect("dispatch names the worker")
+            .to_string()
     };
 
     let (a, b) = (dispatch(&repo_a), dispatch(&repo_b));
@@ -564,7 +618,8 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     // Agent B: an ordinary orchestrator, identified by its hello.
     let mut b = Client::connect(&socket).await;
     b.initialize("other-host").await;
-    b.notify("hub/hello", serde_json::json!({"agent_id": "agent-b"})).await;
+    b.notify("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
+        .await;
     for arguments in [
         serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "stop"}),
         serde_json::json!({"action": "kill", "worker_id": "h3-hub-worker"}),
@@ -575,11 +630,9 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         let error = b
             .worker(arguments)
             .await
-            .expect_err("another agent's worker must be refused")
-            ;
+            .expect_err("another agent's worker must be refused");
         assert_eq!(
-            error,
-            "worker h3-hub-worker belongs to agent agent-a",
+            error, "worker h3-hub-worker belongs to agent agent-a",
             "'{action}' must name the owning agent: {error}"
         );
     }
@@ -595,9 +648,12 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     // its connection id (H-3), so it never sees another agent's worker either.
     let mut a = Client::connect(&socket).await;
     a.initialize("other-host").await;
-    a.notify("hub/hello", serde_json::json!({"agent_id": "agent-a"})).await;
+    a.notify("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
     let steered = a
-        .worker(serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "go"}))
+        .worker(
+            serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "go"}),
+        )
         .await
         .expect("the owner may steer its own worker");
     assert_eq!(steered["status"], "steered");
@@ -614,7 +670,10 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    assert!(!ids.contains(&"h3-hub-worker"), "the CLI must not list it: {listed}");
+    assert!(
+        !ids.contains(&"h3-hub-worker"),
+        "the CLI must not list it: {listed}"
+    );
     let all = cli
         .worker(serde_json::json!({"action": "list", "scope": "all"}))
         .await
@@ -629,7 +688,9 @@ async fn a_hub_connection_only_controls_its_own_workers() {
 
     // The operator's `--admin`: the same connection, with the override in hello.
     let mut operator = Client::connect(&socket).await;
-    operator.initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME).await;
+    operator
+        .initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME)
+        .await;
     operator
         .notify(
             "hub/hello",
@@ -654,4 +715,681 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     task.abort();
     let _ = task.await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Crash recovery: a dead row and its dirty checkout become a failed row with
+/// the salvage message, the uncommitted file lands on `worker-<id>`, and the
+/// saved history survives for a later revision.
+#[test]
+fn daemon_recovers_an_orphaned_worker_on_startup() {
+    use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry};
+    use std::process::{Command, Stdio};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("git {args:?} failed to run"));
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let root = scratch_dir();
+    let hub = root.join("hub");
+    let swe = root.join("swe");
+    let repo = root.join("repo");
+    for dir in [&hub, &swe, &repo] {
+        std::fs::create_dir_all(dir).expect("create scratch dir");
+    }
+    let mut dead = Command::new("true").spawn().expect("spawn short-lived owner");
+    let dead_pid = dead.id();
+    dead.wait().expect("reap owner");
+    assert!(!mini_swe_mcp::worktree::is_process_alive(dead_pid));
+    let _reaper = DaemonReaper(hub.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict hub dir");
+        std::fs::set_permissions(&swe, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict swe dir");
+    }
+    // A repo with one commit, plus a registered worktree carrying an
+    // uncommitted file on `worker-<orphan>`.
+    let wid = "orphan1";
+    git(&repo, &["init", "-b", "master"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("seed the repo");
+    git(&repo, &["add", "base.txt"]);
+    git(&repo, &["commit", "-m", "seed"]);
+    let branch = format!("worker-{wid}");
+    let checkout = swe.join(format!("swe-wt-{wid}"));
+    git(&repo, &[
+        "worktree", "add", "-b", &branch, &checkout.to_string_lossy(), "HEAD",
+    ]);
+    std::fs::write(checkout.join("dirty.txt"), "unsaved\n").expect("dirty the checkout");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let row = serde_json::json!({
+        "id": wid, "pid": dead_pid, "task": "t", "model": "ninja", "status": "running",
+        "step": 3, "max_turns": 10, "last_command": "cargo test",
+        "started_at": now - 60, "updated_at": now - 60,
+        // Real rows name their repository; without it the daemon's own
+        // registry readers look for the branch in the wrong repo.
+        "repo_path": repo,
+    });
+    std::fs::create_dir_all(swe.join("swe-registry")).expect("create the registry");
+    std::fs::write(swe.join("swe-registry").join(format!("{wid}.json")), row.to_string())
+        .expect("write the orphan row");
+    let history = serde_json::json!({"worker": wid});
+    std::fs::write(swe.join(format!("swe-wt-{wid}.history.json")), history.to_string())
+        .expect("write the history file");
+
+    let mut daemon = Command::new(common::binary_path())
+        .arg("daemon")
+        .env("SWE_HUB_DIR", &hub)
+        .env("SWE_TEMP_DIR", &swe)
+        .env("TMPDIR", &swe)
+        .env("HUB_IDLE_SECS", "1")
+        .env("ENV_FILE", root.join("absent.env"))
+        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn recovery daemon");
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(hub.join("hub.sock")).is_ok() {
+            break;
+        }
+        assert!(daemon.try_wait().expect("probe daemon").is_none(), "daemon exited early");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(hub.join("hub.sock").exists(), "daemon must listen after recovery");
+    let entry: WorkerRegistryEntry = serde_json::from_slice(
+        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json")))
+            .expect("the orphan row survives recovery"),
+    ).expect("registry JSON");
+    assert_eq!(entry.status, RegistryStatus::Failed, "the orphan row must be failed");
+    let expected = format!("hub restarted; work salvaged on branch worker-{wid}");
+    assert_eq!(entry.last_command, expected, "the owner must see the salvage branch");
+    let log = Command::new("git")
+        .current_dir(&repo)
+        .args(["log", &branch, "--oneline"])
+        .output()
+        .expect("read the worker branch");
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("salvaged uncommitted work"),
+        "the uncommitted file must be committed on {branch}"
+    );
+    let show = Command::new("git")
+        .current_dir(&repo)
+        .args(["show", &format!("{branch}:dirty.txt")])
+        .output()
+        .expect("read the salvaged file");
+    assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "unsaved");
+    assert!(
+        swe.join(format!("swe-wt-{wid}.history.json")).is_file(),
+        "recovery must keep the history file for revision"
+    );
+    let registered = Command::new("git")
+        .current_dir(&repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("list worktrees");
+    assert!(
+        !String::from_utf8_lossy(&registered.stdout).contains(checkout.to_string_lossy().as_ref()),
+        "the orphan checkout must be released so steer can reopen the branch"
+    );
+
+    for _ in 0..100 {
+        if daemon.try_wait().expect("probe idle shutdown").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(daemon.try_wait().expect("probe exit").is_some(), "daemon must idle out");
+    let log = std::fs::read_to_string(hub.join("hub.log")).expect("read recovery log");
+    assert!(log.contains("recovered 1 orphaned workers"), "{log}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SIGKILL bypasses the worker's exit path: only checkpoint history makes the
+/// salvaged worker revisable when the next daemon starts.
+#[tokio::test]
+async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let root = common::TempDir::new_in_tmp("hub-checkpoint-revision");
+    // Unix socket paths are bounded by sockaddr_un, unlike scratch paths.
+    let hub = std::env::temp_dir().join(format!("h5-{}", std::process::id()));
+    std::fs::create_dir_all(&hub).unwrap();
+    let swe = root.subdir("swe");
+    let repo = root.subdir("repo");
+    for dir in [&hub, &swe] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    common::git(&repo, &["init", "-b", "master"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    common::git(&repo, &["config", "user.email", "test@localhost"]);
+    common::git(&repo, &["commit", "--allow-empty", "-m", "seed"]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let llm = tokio::spawn(async move {
+        for turn in 1..=21 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+                if bytes.ends_with(b"\r\n\r\n") { break bytes.len(); }
+            };
+            let headers = String::from_utf8_lossy(&bytes).to_lowercase();
+            let length: usize = headers.lines().find_map(|line| {
+                line.strip_prefix("content-length:")?.trim().parse().ok()
+            }).unwrap();
+            bytes.resize(header_end + length, 0);
+            socket.read_exact(&mut bytes[header_end..]).await.unwrap();
+            if turn == 20 {
+                // Leave the post-checkpoint LLM call unfinished until SIGKILL.
+                continue;
+            }
+            let command = match turn {
+                19 => "echo checkpoint > kept.txt".to_string(),
+                21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
+                _ => format!("echo turn {turn}"),
+            };
+            let chunk = serde_json::json!({"choices":[{"delta":{
+                "content": format!("```bash\n{command}\n```"),
+            }}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let command = || {
+        let mut cmd = tokio::process::Command::new(common::binary_path());
+        cmd.env("SWE_HUB_DIR", &hub).env("SWE_TEMP_DIR", &swe).env("TMPDIR", &swe)
+            .env_remove("MINI_SWE_NO_DAEMON")
+            .env("OPENAI_API_BASE", &api_base).env("OPENAI_API_KEY", "test-key")
+            .env("ENV_FILE", root.path().join("absent.env"))
+            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .env("HUB_IDLE_SECS", "60");
+        cmd
+    };
+    let mut first = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+        .kill_on_drop(true).spawn().unwrap();
+    wait_for_socket(&hub.join("hub.sock")).await;
+    let out = command().args(["dispatch", "checkpoint recovery", "--repo", repo.to_str().unwrap(),
+        "--model", "test-model", "--max-turns", "30", "--verify", "", "--json"])
+        .output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let dispatched: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let wid = dispatched["worker_id"].as_str().unwrap();
+    let history_path = swe.join(format!("swe-wt-{wid}.history.json"));
+    for _ in 0..400 {
+        if history_path.is_file() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let checkpoint: mini_swe_mcp::pool::WorkerHistory = serde_json::from_slice(
+        &std::fs::read(&history_path).expect("checkpoint must save history before exit")
+    ).unwrap();
+    assert!(mini_swe_mcp::pool::is_replayable(&checkpoint.messages));
+    assert!(checkpoint.messages.len() >= 40, "must retain exchanges before turn 20");
+    assert_eq!(checkpoint.owner.as_deref(), Some("cli"));
+    assert_eq!(checkpoint.verify, None);
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+
+    let mut second = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+        .kill_on_drop(true).spawn().unwrap();
+    wait_for_socket(&hub.join("hub.sock")).await;
+    let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
+        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap()
+    ).unwrap();
+    assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Failed);
+    assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15),
+        command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--wait", "--json"])
+            .output()).await.expect("revision must finish").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&checkpoint.branch));
+    assert_eq!(common::git(&repo, &["show", &format!("{}:kept.txt", checkpoint.branch)]).trim(), "checkpoint");
+    second.kill().await.unwrap();
+    second.wait().await.unwrap();
+    llm.await.unwrap();
+    std::fs::remove_dir_all(&hub).unwrap();
+}
+
+fn event_worker(id: &str, owner: &str) -> mini_swe_mcp::pool::WorkerRecord {
+    use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
+    WorkerRecord {
+        id: id.to_string(),
+        task: "event probe".to_string(),
+        model: "test".to_string(),
+        owner: owner.to_string(),
+        state: WorkerState::Running {
+            step: 1,
+            last_command: "test".to_string(),
+            started_at: 0,
+        },
+        metrics: WorkerMetrics::default(),
+        logs: LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    }
+}
+
+async fn next_event(client: &mut Client) -> serde_json::Value {
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.reader.read_line(&mut line),
+    )
+    .await
+    .expect("event arrives")
+    .expect("read event");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("event JSON");
+    assert_eq!(event["method"], "notifications/claude/channel");
+    event
+}
+
+#[tokio::test]
+async fn events_are_owner_scoped_and_replayed_after_hello() {
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-live", "h4-a"))
+        .await;
+    pool.__test_insert_worker(event_worker("h4-late", "h4-late-owner"))
+        .await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut a = Client::connect(&socket).await;
+    let mut b = Client::connect(&socket).await;
+    a.request("hub/hello", serde_json::json!({"agent_id": "h4-a"}))
+        .await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "h4-b"}))
+        .await;
+    pool.__test_set_worker_state(
+        "h4-live",
+        WorkerState::Paused {
+            question: "continue?".to_string(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
+    let event = next_event(&mut a).await;
+    assert_eq!(event["params"]["meta"]["worker_id"], "h4-live");
+    let mut line = String::new();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            b.reader.read_line(&mut line)
+        )
+        .await
+        .is_err()
+    );
+    pool.__test_set_worker_state(
+        "h4-late",
+        WorkerState::Failed {
+            error: "late failure".to_string(),
+            step: 2,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    // Observe a later transition to establish that the watcher ran while the
+    // late owner still had no connection.
+    pool.__test_set_worker_state(
+        "h4-live",
+        WorkerState::Failed {
+            error: "failure".to_string(),
+            step: 2,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    next_event(&mut a).await;
+    let mut late = Client::connect(&socket).await;
+    late.request(
+        "hub/hello",
+        serde_json::json!({"agent_id": "h4-late-owner"}),
+    )
+    .await;
+    let queued = next_event(&mut late).await;
+    assert_eq!(queued["params"]["meta"]["worker_id"], "h4-late");
+    assert_eq!(queued["params"]["meta"]["event"], "failed");
+    let mut admin = Client::connect(&socket).await;
+    admin
+        .request("hub/hello", serde_json::json!({"admin": true}))
+        .await;
+    assert_eq!(
+        next_event(&mut admin).await["params"]["meta"]["worker_id"],
+        "h4-late"
+    );
+    drop(a);
+    drop(b);
+    drop(late);
+    drop(admin);
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-busy", "h4-owner"))
+        .await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut client = Client::connect(&socket).await;
+    let hello = client
+        .request("hub/hello", serde_json::json!({"version": "99.0.0"}))
+        .await;
+    assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["result"]["busy"], true);
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"],
+        "Hub is busy"
+    );
+    pool.__test_set_worker_state(
+        "h4-busy",
+        WorkerState::Paused {
+            question: "wait".to_string(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"],
+        "Hub is busy"
+    );
+    pool.__test_set_worker_state(
+        "h4-busy",
+        WorkerState::Failed {
+            error: "done".to_string(),
+            step: 1,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["result"]["busy"],
+        false
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert!(!socket.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn newer_cli_replaces_an_idle_daemon() {
+    use std::process::Command;
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-version");
+    let _reaper = DaemonReaper(hub.path().to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let invoke = |fake: bool| {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["list", "--json"])
+            .env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", hub.subdir("swe"))
+            .env("ENV_FILE", "/nonexistent-mini-swe-env");
+        if fake {
+            cmd.env("MINI_SWE_FAKE_VERSION", "99.0.0");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    invoke(false);
+    invoke(true);
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with(" listening"))
+            .count(),
+        2,
+        "{log}"
+    );
+    assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}
+
+#[tokio::test]
+async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
+    let dir = scratch_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-version-busy", "owner"))
+        .await;
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool, "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&dir.join("hub.sock")).await;
+    let mut command = tokio::process::Command::new(common::binary_path());
+    command
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", &dir)
+        .env("MINI_SWE_FAKE_VERSION", "99.0.0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env");
+    let output = command.output().await.unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("is newer than hub"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(dir.join("hub.sock").exists());
+
+    let mut proxy = tokio::process::Command::new(common::binary_path());
+    proxy
+        .arg("--stdio")
+        .env("SWE_HUB_DIR", &dir)
+        .env("MINI_SWE_FAKE_VERSION", "99.0.0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = proxy.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stdout.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"],
+        serde_json::json!({})
+    );
+    drop(stdin);
+    let output = child.wait_with_output().await.unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("is newer than hub"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
+    use mini_swe_mcp::pool::WorkerState;
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-blocked", "h4-owner"))
+        .await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut waiter = Client::connect(&socket).await;
+    waiter
+        .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
+        .await;
+    // `steer --wait` on a live worker blocks until the worker moves; hold it.
+    let waiting = tokio::spawn(async move {
+        waiter.worker(serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go", "wait": true})).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut closer = Client::connect(&socket).await;
+    closer
+        .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
+        .await;
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        closer.request("hub/shutdown", serde_json::json!({})),
+    )
+    .await
+    .expect("shutdown answers promptly");
+    assert_eq!(reply["error"]["message"], "Hub is busy");
+    pool.__test_set_worker_state(
+        "h4-blocked",
+        WorkerState::Failed {
+            error: "done".to_string(),
+            step: 1,
+            failed_at: 1,
+            metrics: mini_swe_mcp::pool::WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    let steered = tokio::time::timeout(std::time::Duration::from_secs(3), waiting)
+        .await
+        .expect("steer wait resolves")
+        .expect("steer task joins");
+    assert!(steered.is_ok());
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A client newer than the running hub still works when that hub predates the
+/// version handshake: `hub/hello` as a request is answered "Method not found",
+/// and the client falls back to the notification form instead of failing.
+#[test]
+fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    let hub = common::TempDir::new_in_tmp("hub-legacy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the hub dir to 0700");
+    }
+    let listener = UnixListener::bind(hub.path().join("hub.sock")).expect("bind the fake hub");
+    let fake = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept the client");
+        let mut writer = stream.try_clone().expect("clone the stream");
+        let mut methods = Vec::new();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("client sends JSON");
+            let method = frame["method"].as_str().unwrap_or_default().to_string();
+            let reply = match (&method[..], frame.get("id")) {
+                (_, None) => None,
+                ("hub/hello", Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "Method not found: hub/hello"}})),
+                ("tools/call", Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": "{\"workers\":[]}"}]}})),
+                (_, Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            };
+            methods.push((method.clone(), frame.get("id").is_some()));
+            if let Some(reply) = reply {
+                writeln!(writer, "{reply}").expect("reply to the client");
+            }
+            if method == "tools/call" {
+                break;
+            }
+        }
+        methods
+    });
+
+    let out = Command::new(common::binary_path())
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env("ENV_FILE", hub.path().join("absent.env"))
+        .output()
+        .expect("run the CLI");
+    assert!(
+        out.status.success(),
+        "the CLI must work against an old hub: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("predates the version handshake"));
+    let methods = fake.join().expect("fake hub thread");
+    assert!(
+        methods.contains(&("hub/hello".to_string(), false)),
+        "the identity must still be announced as a notification: {methods:?}"
+    );
 }

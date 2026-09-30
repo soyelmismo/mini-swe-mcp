@@ -18,7 +18,6 @@
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -229,6 +228,15 @@ pub(super) struct TurnConfig<'a> {
     pub model: &'a str,
     /// Combined turn budget reported in the registry.
     pub max_turns: usize,
+    /// Dispatch task: the history file carries it so a revision resumes the
+    /// same work.
+    pub task: &'a str,
+    /// Sampling temperature of the dispatch, replayed by a revision.
+    pub temperature: Option<f32>,
+    /// Reviewer model of the dispatch, replayed by a revision.
+    pub review_after: Option<&'a str>,
+    /// Declared network policy of the dispatch, replayed by a revision.
+    pub network_offline: bool,
 }
 
 /// Outcome of one turn.
@@ -315,6 +323,7 @@ impl<'a> TurnEngine<'a> {
         // --- Automatic checkpoint (both phases) ---
         if *self.step > 0 && (*self.step).is_multiple_of(AUTO_CHECKPOINT_TURNS) {
             self.checkpoint().await;
+            self.persist_checkpoint_history(config).await;
         }
 
         // --- Stagnation detector (implementer only, like the sentinels) ---
@@ -772,6 +781,53 @@ impl<'a> TurnEngine<'a> {
         }
     }
 
+    /// Persist the conversation at an auto-checkpoint, so a killed hub
+    /// leaves a revisable history file behind instead of only the branch.
+    ///
+    /// The exit path's history format is serialized off the runtime thread.
+    /// A failed snapshot warns without interrupting the worker.
+    async fn persist_checkpoint_history(&self, config: &TurnConfig<'_>) {
+        use super::super::revision::{WorkerHistory, save_worker_history};
+        let revision = self.pool.workers.read().await.get(self.worker_id)
+            .map(|worker| worker.revision).unwrap_or(0);
+        let history = WorkerHistory {
+            task: config.task.to_string(),
+            group: self.meta.group.clone(),
+            model: config.model.to_string(),
+            temperature: config.temperature,
+            repo_path: self
+                .meta
+                .repo_path
+                .clone()
+                .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
+            base_commit: self.worktree.base_commit.clone(),
+            branch: self.worktree.branch.clone(),
+            network_offline: config.network_offline,
+            verify: self.verify.map(str::to_string),
+            max_turns: config.max_turns,
+            review_after: config.review_after.map(str::to_string),
+            revision,
+            owner: Some(self.meta.owner.clone()),
+            messages: self.messages.clone(),
+        };
+        let worker_id = self.worker_id.to_string();
+        let step = *self.step;
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            save_worker_history(&worker_id, &history)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(anyhow::anyhow!("history snapshot task failed: {e}"))
+        }) {
+            warn!(
+                worker = %self.worker_id,
+                step,
+                error = %e,
+                "Checkpoint history snapshot failed; the worker continues without it"
+            );
+        }
+    }
+
     /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
     /// worker that stopped changing anything to make the edit or escalate.
     async fn check_stagnation(&mut self) {
@@ -805,7 +861,7 @@ impl<'a> TurnEngine<'a> {
     /// A granted heavy command also carries the job count the controller
     /// divided over the builds already running, which rides on a runner clone
     /// for this one command; a light command keeps the default parallelism.
-    async fn run_gated(&self, command: &str) -> Result<(String, Option<i32>)> {
+    async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {
             Some(self.pool.admission.acquire().await)
@@ -818,10 +874,14 @@ impl<'a> TurnEngine<'a> {
             .acquire()
             .await
             .context("Bash semaphore closed")?;
-        let runner = match &build_permit {
-            Some(permit) => Cow::Owned(self.runner.clone().with_build_jobs(permit.jobs())),
-            None => Cow::Borrowed(self.runner),
-        };
+        let mut runner = self.runner.clone();
+        if let Some(permit) = &build_permit {
+            self.worktree.last_build_slot = Some(permit.slot());
+            runner = runner.with_build_jobs(permit.jobs());
+        }
+        runner.build_target_dir = self.worktree.last_build_slot
+            .map(|slot| crate::cache::slot_target_dir(&self.worktree.repo_root, slot))
+            .transpose()?;
         runner.execute_bash(&self.worktree.path, command).await
     }
 

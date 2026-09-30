@@ -201,9 +201,425 @@ pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Stable key of the canonical repository root, including linked worktrees.
+pub(crate) fn repo_key(repo: &Path) -> anyhow::Result<String> {
+    let root = crate::agent::sandbox::find_git_common_dir(repo)
+        .and_then(|git| git.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| repo.to_path_buf())
+        .canonicalize()?;
+    // FNV-1a is fixed across processes and Rust versions, unlike DefaultHasher.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in root.as_os_str().as_encoded_bytes() {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+/// Warm dependencies are shared by repo and exclusive admission slot. Workspace
+/// incremental artifacts may rebuild when the worktree path changes; kache still
+/// reuses compiler outputs. The admission permit spans the entire heavy command.
+pub(crate) fn slot_target_dir(repo: &Path, slot: usize) -> anyhow::Result<PathBuf> {
+    Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-slot{slot}", repo_key(repo)?)))
+}
+
+fn slot_repo(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?.strip_prefix("swe-target-")?;
+    let (repo, slot) = name.split_once("-slot")?;
+    (repo.len() == 16
+        && repo.bytes().all(|b| b.is_ascii_hexdigit())
+        && !slot.is_empty()
+        && slot.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(repo)
+}
+
+#[derive(Debug, Clone)]
+struct TargetEntry {
+    dir: PathBuf,
+    last_used: std::time::SystemTime,
+    size: u64,
+    idle: bool,
+}
+
+/// TTL is repository-wide; the size cap evicts idle slots in deterministic LRU
+/// order. Active bytes count toward the cap but can never be evicted.
+fn target_evictions(
+    entries: &[TargetEntry],
+    now: std::time::SystemTime,
+    ttl: std::time::Duration,
+    max_bytes: u64,
+) -> Vec<PathBuf> {
+    let mut latest = std::collections::BTreeMap::new();
+    let mut active_repos = std::collections::BTreeSet::new();
+    for entry in entries {
+        if let Some(repo) = slot_repo(&entry.dir) {
+            let at = latest.entry(repo).or_insert(entry.last_used);
+            *at = (*at).max(entry.last_used);
+            if !entry.idle {
+                active_repos.insert(repo);
+            }
+        }
+    }
+    let mut ordered: Vec<_> = entries.iter().filter(|e| e.idle).collect();
+    ordered.sort_by(|a, b| {
+        a.last_used
+            .cmp(&b.last_used)
+            .then_with(|| a.dir.cmp(&b.dir))
+    });
+    let mut total = entries
+        .iter()
+        .fold(0u64, |sum, e| sum.saturating_add(e.size));
+    let mut removed = Vec::new();
+    for entry in &ordered {
+        let expired = slot_repo(&entry.dir)
+            .and_then(|repo| latest.get(repo))
+            .is_some_and(|at| {
+                !active_repos.contains(slot_repo(&entry.dir).expect("slot repo"))
+                    && now.duration_since(*at).unwrap_or_default() >= ttl
+            });
+        if expired {
+            removed.push(entry.dir.clone());
+            total = total.saturating_sub(entry.size);
+        }
+    }
+    for entry in ordered {
+        if total <= max_bytes {
+            break;
+        }
+        if !removed.contains(&entry.dir) {
+            removed.push(entry.dir.clone());
+            total = total.saturating_sub(entry.size);
+        }
+    }
+    removed
+}
+
+fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn flock(file: &std::fs::File, exclusive: bool, nonblocking: bool) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    } | if nonblocking { libc::LOCK_NB } else { 0 };
+    // SAFETY: flock only reads the live descriptor and integer flags.
+    if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn flock(_file: &std::fs::File, _exclusive: bool, _nonblocking: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Target leases require Unix",
+    ))
+}
+
+fn target_lease_path(target: &Path) -> PathBuf {
+    target.with_file_name(format!(
+        ".{}.lease",
+        target.file_name().expect("named target").to_string_lossy()
+    ))
+}
+
+/// A shared lease prevents idle eviction, without serializing light commands.
+/// Heavy-command exclusivity belongs to the admission controller.
+pub(crate) struct TargetLease(std::fs::File);
+
+impl TargetLease {
+    pub(crate) fn acquire(target: &Path) -> std::io::Result<Self> {
+        let base = target
+            .parent()
+            .ok_or_else(|| std::io::Error::other("Target has no parent"))?;
+        std::fs::create_dir_all(base)?;
+        let global = lock_file(&base.join(".swe-target-sweep.lock"))?;
+        flock(&global, true, false)?;
+        std::fs::create_dir_all(target)?;
+        let lease = lock_file(&target_lease_path(target))?;
+        flock(&lease, false, false)?;
+        lease.set_modified(std::time::SystemTime::now())?;
+        start_target_sweep();
+        Ok(Self(lease))
+    }
+}
+
+impl Drop for TargetLease {
+    fn drop(&mut self) {
+        let _ = self.0.set_modified(std::time::SystemTime::now());
+    }
+}
+
+fn target_size(dir: &Path) -> std::io::Result<u64> {
+    // Stream each level and never follow symlinks into another worker's data.
+    let mut stack = vec![std::fs::read_dir(dir)?];
+    let mut size = 0u64;
+    while let Some(level) = stack.last_mut() {
+        match level.next() {
+            Some(entry) => {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    if stack.len() >= 128 {
+                        return Err(std::io::Error::other(
+                            "Build target directory nesting exceeds scan limit",
+                        ));
+                    }
+                    stack.push(std::fs::read_dir(entry.path())?);
+                } else {
+                    size = size.saturating_add(entry.metadata()?.len());
+                }
+            }
+            None => {
+                stack.pop();
+            }
+        }
+    }
+    Ok(size)
+}
+
+fn sweep_targets(base: &Path, ttl: std::time::Duration, max_bytes: u64) -> std::io::Result<()> {
+    let global = lock_file(&base.join(".swe-target-sweep.lock"))?;
+    flock(&global, true, false)?;
+    let mut entries = Vec::new();
+    let mut idle_leases = Vec::new();
+    for dir in std::fs::read_dir(base)?.flatten() {
+        if !dir.file_type()?.is_dir() || slot_repo(&dir.path()).is_none() {
+            continue;
+        }
+        let path = dir.path();
+        let lease = lock_file(&target_lease_path(&path))?;
+        let idle = flock(&lease, true, true).is_ok();
+        let last_used = lease.metadata()?.modified()?;
+        // A failed scan cannot safely participate in size eviction.
+        let Ok(size) = target_size(&path) else {
+            continue;
+        };
+        entries.push(TargetEntry {
+            dir: path,
+            last_used,
+            size,
+            idle,
+        });
+        idle_leases.push(lease);
+    }
+    let now = std::time::SystemTime::now();
+    for path in target_evictions(&entries, now, ttl, max_bytes) {
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(%error, path = %path.display(), "Failed to evict idle build target");
+        } else {
+            // The global lock excludes acquisitions until both names are gone.
+            let _ = std::fs::remove_file(target_lease_path(&path));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn start_target_sweep() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                let ttl = crate::config::env_parse::<u64>("HUB_TARGET_TTL_HOURS").unwrap_or(24);
+                let cap = crate::config::env_parse::<u64>("HUB_TARGET_MAX_GB").unwrap_or(40);
+                // Shared slots are created only in the configured base; legacy
+                // per-worktree targets in other temp roots belong to worktree prune.
+                for base in [crate::worktree::swe_base_dir()] {
+                    if let Err(error) = sweep_targets(
+                        &base,
+                        std::time::Duration::from_secs(ttl.saturating_mul(3600)),
+                        cap.saturating_mul(1024 * 1024 * 1024),
+                    ) {
+                        tracing::debug!(%error, "Build target sweep unavailable");
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(300));
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_slot_target_naming_is_stable_and_bounded() {
+        let _lock = crate::agent::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = crate::worktree::swe_base_dir();
+        let first = super::repo_key(&repo).expect("Repository root must be usable");
+        let second = super::repo_key(&repo).expect("Repository root must be usable");
+        assert_eq!(first, second, "The same repository must keep one key");
+        assert_eq!(first.len(), 16, "got: {first:?}");
+        let base = crate::worktree::swe_base_dir();
+        let slot0 = super::slot_target_dir(&repo, 0).expect("Slot dir must resolve");
+        let slot1 = super::slot_target_dir(&repo, 1).expect("Slot dir must resolve");
+        assert_eq!(
+            slot0.parent(),
+            Some(base.as_path()),
+            "{slot0:?} must live in the base"
+        );
+        assert_eq!(
+            slot1.parent(),
+            Some(base.as_path()),
+            "{slot1:?} must live in the base"
+        );
+        assert_ne!(slot0, slot1, "Distinct slots must never share a target");
+        let name0 = slot0
+            .file_name()
+            .expect("Named target")
+            .to_str()
+            .expect("UTF-8 target");
+        assert!(
+            name0.starts_with("swe-target-") && name0.contains(&first) && name0.ends_with("-slot0"),
+            "got: {name0:?}"
+        );
+    }
+
+    #[test]
+    fn test_target_eviction_prefers_idle_lru_under_the_cap() {
+        use std::time::{Duration, SystemTime};
+        fn entry(dir: &str, age_secs: u64, size: u64, idle: bool) -> super::TargetEntry {
+            super::TargetEntry {
+                dir: PathBuf::from(dir),
+                last_used: SystemTime::now() - Duration::from_secs(age_secs),
+                size,
+                idle,
+            }
+        }
+        let now = SystemTime::now();
+        let ttl = Duration::from_secs(24 * 3600);
+        let shared = entry(
+            "/base/swe-target-0123456789abcdef-slot0",
+            25 * 3600 + 60,
+            10,
+            false,
+        );
+        let busy = entry(
+            "/base/swe-target-aaaaaaaaaaaaaaaa-slot0",
+            25 * 3600 + 60,
+            10,
+            false,
+        );
+        let old_idle = entry(
+            "/base/swe-target-bbbbbbbbbbbbbbbb-slot0",
+            25 * 3600 + 60,
+            10,
+            true,
+        );
+        let trimmed = super::target_evictions(
+            &[shared.clone(), busy.clone(), old_idle.clone()],
+            now,
+            ttl,
+            u64::MAX,
+        );
+        assert_eq!(
+            trimmed,
+            vec![old_idle.dir.clone()],
+            "Only an idle slot in a repository unused past the TTL is evicted"
+        );
+        // A warm cap keeps the newest idle slots and evicts least-recently-used first.
+        let mut entries = Vec::new();
+        for (slot, age_secs) in [(0, 400), (1, 300), (2, 200), (3, 100)] {
+            entries.push(entry(
+                &format!("/base/swe-target-cccccccccccccccc-slot{slot}"),
+                age_secs,
+                10,
+                true,
+            ));
+        }
+        let trimmed = super::target_evictions(&entries, now, ttl, 25);
+        assert_eq!(
+            trimmed,
+            vec![entries[0].dir.clone(), entries[1].dir.clone()],
+            "The cap must remove the oldest idle slots first, deterministically"
+        );
+        assert!(!trimmed.contains(&entries[2].dir) && !trimmed.contains(&entries[3].dir));
+    }
+
+    #[test]
+    fn canonical_repo_aliases_share_a_key() {
+        let root = std::env::current_dir().unwrap();
+        assert_eq!(repo_key(&root).unwrap(), repo_key(&root.join(".")).unwrap());
+        if let Some(common) = crate::agent::sandbox::find_git_common_dir(&root) {
+            assert_eq!(
+                repo_key(&root).unwrap(),
+                repo_key(common.parent().unwrap()).unwrap()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let base = crate::worktree::swe_base_dir()
+                .join(format!("swe-key-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&base).unwrap();
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(repo_key(&root).unwrap(), repo_key(&alias).unwrap());
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn ttl_is_repo_wide_and_cap_never_evicts_busy_slots() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let entries = vec![
+            TargetEntry {
+                dir: "/base/swe-target-0123456789abcdef-slot0".into(),
+                last_used: UNIX_EPOCH,
+                size: 10,
+                idle: true,
+            },
+            TargetEntry {
+                dir: "/base/swe-target-0123456789abcdef-slot1".into(),
+                last_used: UNIX_EPOCH + Duration::from_secs(90),
+                size: 10,
+                idle: true,
+            },
+        ];
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert!(target_evictions(&entries, now, Duration::from_secs(20), 30).is_empty());
+        let mut busy = entries.clone();
+        busy[1].idle = false;
+        assert!(target_evictions(&busy, now, Duration::ZERO, 30).is_empty());
+        assert_eq!(
+            target_evictions(&busy, now, Duration::ZERO, 0),
+            vec![busy[0].dir.clone()]
+        );
+        let mut tied = entries.clone();
+        tied[1].last_used = UNIX_EPOCH;
+        tied.reverse();
+        assert_eq!(
+            target_evictions(&tied, now, Duration::from_secs(200), 10),
+            vec![entries[0].dir.clone()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_preserves_leased_targets_and_removes_idle_targets() {
+        let base = crate::worktree::swe_base_dir()
+            .join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
+        let target = base.join("swe-target-0123456789abcdef-slot0");
+        let lease = TargetLease::acquire(&target).unwrap();
+        std::fs::write(target.join("artifact"), b"build").unwrap();
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        assert!(target.join("artifact").exists());
+        drop(lease);
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        assert!(!target.exists());
+        assert!(!target_lease_path(&target).exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn test_shared_cache_root_default() {
@@ -225,8 +641,14 @@ mod tests {
     fn test_parse_custom_cache_binds() {
         let binds = parse_custom_cache_binds("/host/a:/guest/a, /host/b");
         assert_eq!(binds.len(), 2);
-        assert_eq!(binds[0], (PathBuf::from("/host/a"), PathBuf::from("/guest/a")));
-        assert_eq!(binds[1], (PathBuf::from("/host/b"), PathBuf::from("/host/b")));
+        assert_eq!(
+            binds[0],
+            (PathBuf::from("/host/a"), PathBuf::from("/guest/a"))
+        );
+        assert_eq!(
+            binds[1],
+            (PathBuf::from("/host/b"), PathBuf::from("/host/b"))
+        );
 
         let empty = parse_custom_cache_binds("  , , ");
         assert!(empty.is_empty());

@@ -17,6 +17,11 @@ use std::env;
 use std::sync::Arc;
 
 fn main() -> Result<()> {
+    let args = strip_admin_flag(strip_json_flag(env::args().collect()));
+    if action_of(&args) == Some("status") && args.iter().any(|arg| arg == "--line") {
+        mini_swe_mcp::monitor::print_status_line();
+        return Ok(());
+    }
     bootstrap::runtime()?.block_on(async_main())
 }
 
@@ -222,7 +227,7 @@ fn print_help() {
     println!("Usage: mini-swe-mcp [--stdio | [--json] <action> [args...]]");
     println!("\nActions:");
     println!("  {DISPATCH_USAGE}");
-    println!("  status <worker_id>");
+    println!("  status <worker_id> | status --line");
     println!("  collect <worker_id>");
     println!("  logs <worker_id>");
     println!("  reap");

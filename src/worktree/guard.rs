@@ -150,6 +150,8 @@ pub struct WorktreeGuard {
     pub path: PathBuf,
     pub branch: String,
     pub repo_root: PathBuf,
+    /// Slot affinity survives the implementer/reviewer phase boundary.
+    pub(crate) last_build_slot: Option<usize>,
     pub base_commit: String,
     pub preserve_branch: bool,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
@@ -287,6 +289,7 @@ impl WorktreeGuard {
             path,
             branch: branch.to_string(),
             repo_root: repo_root.to_path_buf(),
+            last_build_slot: None,
             base_commit: base_commit.to_string(),
             preserve_branch: false,
             seeded,

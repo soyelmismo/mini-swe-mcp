@@ -92,7 +92,12 @@ DISCIPLINE:
 10. You are already at the repository root ($PWD); do not cd elsewhere.
 11. Scripted edits (python/sed) can silently match nothing: assert the old text is present before replacing and confirm with `git diff --stat` that the change landed.
 12. Keep each command small: never paste a whole large file into one command (tool arguments over 64 KiB are dropped); edit in targeted chunks.
-13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work; use git only to inspect."#;
+13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work; use git only to inspect.
+14. Reuse before writing: search for an existing function that already does the job and call it, or extract a shared core that both callers use. Never copy a block of logic into a second place.
+15. Concurrency: never hold a lock, guard or permit across a wait that can be long (network, child process, another worker). Anything that joins a queue or takes a slot must give it back when the operation fails or is cancelled (release it in a guard/Drop/finally, not only on the success path).
+16. Tests must be hermetic and deterministic: give every file, directory, daemon or registry they touch a temporary location passed to the code under test; do not mutate process-global state (environment variables) in tests that run in parallel; do not depend on the order of concurrent replies; poll for a condition instead of sleeping. Never write an assertion that cannot fail: a new test must fail without your change.
+17. Do not call a failure "environmental" or "pre-existing" without proof: show the same failure on the unmodified code (e.g. `git show HEAD:<path>`) and explain the mechanism; otherwise it is yours to fix.
+18. Other workers change the same repository in parallel: keep the diff to what the task needs, and put new tests in a module or file dedicated to your change rather than appending to the end of a large shared test file."#;
 
 /// Chat roles accepted by the OpenAI chat-completions API.
 ///
