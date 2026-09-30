@@ -1178,6 +1178,7 @@ fn sample_history(repo_path: &std::path::Path, base_commit: &str, branch: &str) 
         temperature: None,
         repo_path: repo_path.to_string_lossy().to_string(),
         base_commit: base_commit.to_string(),
+        base_branch: Some("master".to_string()),
         branch: branch.to_string(),
         network_offline: false,
         verify: None,
@@ -1242,6 +1243,12 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     let repo = scratch_repo("history-roundtrip");
     let history = sample_history(&repo, "abc123", "worker-rev1");
     mini_swe_mcp::pool::save_worker_history("rev1", &history).expect("save history");
+
+    let mut legacy = serde_json::to_value(&history).unwrap();
+    assert_eq!(legacy["base_branch"], "master");
+    legacy.as_object_mut().unwrap().remove("base_branch");
+    let restored: mini_swe_mcp::pool::WorkerHistory = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.base_branch, None, "old history files remain readable");
 
     // Atomic write, owner-only permissions, beside the mailbox.
     let path = mini_swe_mcp::pool::history_path("rev1");

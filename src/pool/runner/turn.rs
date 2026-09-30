@@ -25,18 +25,29 @@ use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
 use crate::manifest::MAX_TURNS_LIMIT;
-use crate::worktree::{WorktreeGuard, git};
+use crate::worktree::{BaseSync, WorktreeGuard, git};
 
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::super::WorkerPool;
+use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
     summarize_command,
 };
+
+/// Prefix used by both tool results and code-block command output messages.
+pub(super) const COMMAND_OUTPUT_PREFIX: &str = "COMMAND OUTPUT (exit code: ";
+
+/// Prefix of verification feedback; user-role feedback remains an instruction.
+pub(super) const VERIFICATION_OUTPUT_PREFIX: &str = "VERIFICATION FAILED (exit ";
+
+/// Follow-up when the model produced no executable bash command.
+pub(super) const NO_COMMAND_NUDGE: &str =
+    "ERROR: No bash command found. You MUST call the `bash` tool with your command.";
 
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
@@ -126,14 +137,16 @@ pub(super) fn parse_shortstat(line: &str) -> Option<(usize, usize, usize)> {
 /// commits along the way and the still-uncommitted tail are counted together.
 /// `git` is a blocking subprocess, so the sample runs off the runtime thread,
 /// and `None` means "not measured", never "measured as empty".
-pub(super) async fn shortstat_of(path: &Path, base: &str) -> Option<(usize, usize, usize)> {
+pub(super) async fn shortstat_of(path: &Path, base: &str, base_branch: Option<&str>) -> Option<(usize, usize, usize)> {
     let path = path.to_path_buf();
     let base = if base.is_empty() {
         "HEAD".to_string()
     } else {
         base.to_string()
     };
+    let base_branch = base_branch.map(str::to_string);
     let output = tokio::task::spawn_blocking(move || {
+        let base = WorktreeGuard::diff_base_at(&path, &base, base_branch.as_deref())?;
         git(&path, "diff --shortstat", &["diff", "--shortstat", &base])
     })
     .await
@@ -143,6 +156,18 @@ pub(super) async fn shortstat_of(path: &Path, base: &str) -> Option<(usize, usiz
         return None;
     }
     parse_shortstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Run harness git off the runtime thread before a completion can reach verification.
+async fn sync_base_for_completion(worktree: &WorktreeGuard) -> Result<BaseSync> {
+    let path = worktree.path.clone();
+    let repo_root = worktree.repo_root.clone();
+    let branch = worktree.branch.clone();
+    let base_commit = worktree.base_commit.clone();
+    let base_branch = worktree.base_branch.clone();
+    tokio::task::spawn_blocking(move || {
+        WorktreeGuard::sync_base_at(&path, &repo_root, &branch, &base_commit, base_branch.as_deref())
+    }).await.context("Base integration task failed")?
 }
 
 /// Cross-turn state of the two loop detectors.
@@ -321,6 +346,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         // --- LLM call with error handling ---
+        compact_history(self.messages);
         let llm_resp = match self.runner.run_step_llm(self.messages).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -393,6 +419,7 @@ impl<'a> TurnEngine<'a> {
                                     ));
                                 }
                                 // Re-run the LLM step now that network/connectivity is restored
+                                compact_history(self.messages);
                                 self.runner.run_step_llm(self.messages).await?
                             }
                             None => return Err(e),
@@ -592,7 +619,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         let output_text = format!(
-            "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
+            "{COMMAND_OUTPUT_PREFIX}{}):\n```\n{}\n```",
             code.unwrap_or(-1),
             output
         );
@@ -631,6 +658,36 @@ impl<'a> TurnEngine<'a> {
             *self.last_assistant_text = llm_resp.content.clone();
         }
 
+        let merged = match sync_base_for_completion(self.worktree).await? {
+            BaseSync::Unchanged => None,
+            BaseSync::Merged { branch } => {
+                self.worktree.preserve_branch = true;
+                Some(branch)
+            }
+            BaseSync::Conflicts { branch, files } => {
+                self.worktree.preserve_branch = true;
+                let refusal = if files.is_empty() {
+                    format!(
+                        "COMPLETION REFUSED: base {branch} was merged, but the merge is still in progress. Resolve any hidden conflicts (for example with `git status` and `git diff`), make every file compile and pass tests, then request completion again. Do not run git commit; the harness concludes the merge it started."
+                    )
+                } else {
+                    format!(
+                        "COMPLETION REFUSED: base {branch} was merged, but the merge is still in progress. Resolve the conflict markers (<<<<<<<) in: {}. Keep both sides' intent, remove every marker, then request completion again. Do not run git commit; the harness stages your resolutions and creates the merge commit.",
+                        files.join(", ")
+                    )
+                };
+                // One exchange, like a verify failure: the completion turn is
+                // replayed, so the next request carries no dangling tool_call.
+                self.push_exchange(
+                    llm_resp.content.clone(),
+                    llm_resp.reasoning_content.clone(),
+                    llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+                    refusal,
+                );
+                return Ok(TurnOutcome::Continue);
+            }
+        };
+
         let Some(verify) = self.verify.filter(|v| !v.is_empty()) else {
             return Ok(TurnOutcome::Completed { verified: None });
         };
@@ -659,8 +716,11 @@ impl<'a> TurnEngine<'a> {
                 w.logs.push(step_log);
             }
         }
+        let integration = merged.map(|branch| format!(
+            " Base {branch} was merged before this check; verification ran on the integrated tree."
+        )).unwrap_or_default();
         let output_text = format!(
-            "VERIFICATION FAILED (exit {exit}) - fix these problems before completing:\n{output}"
+            "{VERIFICATION_OUTPUT_PREFIX}{exit}) - fix these problems before completing:{integration}\n{output}"
         );
         // The completion turn is replayed with the same rules as a command
         // turn, so the next request never carries a dangling tool_call.
@@ -788,6 +848,7 @@ impl<'a> TurnEngine<'a> {
                 .clone()
                 .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
             base_commit: self.worktree.base_commit.clone(),
+            base_branch: self.worktree.base_branch.clone(),
             branch: self.worktree.branch.clone(),
             network_offline: config.network_offline,
             verify: self.verify.map(str::to_string),
@@ -948,7 +1009,7 @@ impl<'a> TurnEngine<'a> {
             self.messages.push(msg);
             self.messages.push(ChatMessage::text(
                 Role::User,
-                "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
+                NO_COMMAND_NUDGE,
             ));
         }
     }

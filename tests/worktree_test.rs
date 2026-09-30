@@ -733,3 +733,121 @@ fn reopen_on_a_missing_branch_is_a_clear_error() {
         "the error must name the missing branch, got: {err}"
     );
 }
+
+fn sync_base(guard: &WorktreeGuard) -> mini_swe_mcp::worktree::BaseSync {
+    WorktreeGuard::sync_base_at(
+        &guard.path,
+        &guard.repo_root,
+        &guard.branch,
+        &guard.base_commit,
+        guard.base_branch.as_deref(),
+    )
+    .expect("base integration failed")
+}
+
+#[test]
+fn moving_base_is_merged_and_excluded_from_worker_diff() {
+    use mini_swe_mcp::worktree::BaseSync;
+    let repo = TestRepo::new("sync-clean");
+    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-clean")).unwrap();
+    assert_eq!(guard.base_branch.as_deref(), Some("master"));
+    assert_eq!(sync_base(&guard), BaseSync::Unchanged);
+    std::fs::write(guard.path.join("worker.txt"), "worker change\n").unwrap();
+    std::fs::write(repo.path().join("base.txt"), "base change\n").unwrap();
+    run(repo.path(), &["add", "."]);
+    run(repo.path(), &["commit", "-m", "move base"]);
+    assert_eq!(sync_base(&guard), BaseSync::Merged { branch: "master".into() });
+    assert_eq!(std::fs::read_to_string(guard.path.join("base.txt")).unwrap(), "base change\n");
+    assert_eq!(run(&guard.path, &["status", "--porcelain"]), "");
+    let diff = guard.get_diff().unwrap();
+    assert!(diff.contains("worker.txt"));
+    assert!(!diff.contains("base.txt"), "base-only work leaked into diff: {diff}");
+    assert_eq!(run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"]).split_whitespace().count(), 3);
+    assert_eq!(sync_base(&guard), BaseSync::Unchanged);
+
+    // A second base advance is integrated without forgetting the worker's first commit.
+    std::fs::write(repo.path().join("later.txt"), "later base change\n").unwrap();
+    run(repo.path(), &["add", "."]);
+    run(repo.path(), &["commit", "-m", "move base again"]);
+    assert!(matches!(sync_base(&guard), BaseSync::Merged { .. }));
+    let diff = guard.get_diff().unwrap();
+    assert!(diff.contains("worker.txt"));
+    assert!(!diff.contains("base.txt") && !diff.contains("later.txt"));
+}
+
+#[test]
+fn conflicting_base_refuses_completion_until_markers_are_resolved() {
+    use mini_swe_mcp::worktree::BaseSync;
+    let repo = TestRepo::new("sync-conflict");
+    let mut guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-conflict")).unwrap();
+    std::fs::write(guard.path.join("README.md"), "worker intent\n").unwrap();
+    std::fs::write(repo.path().join("README.md"), "base intent\n").unwrap();
+    run(repo.path(), &["add", "."]);
+    run(repo.path(), &["commit", "-m", "conflicting base"]);
+    let conflicts = BaseSync::Conflicts { branch: "master".into(), files: vec!["README.md".into()] };
+    assert_eq!(sync_base(&guard), conflicts);
+    assert!(WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
+    let markers = std::fs::read_to_string(guard.path.join("README.md")).unwrap();
+    assert!(markers.contains("<<<<<<<"));
+    assert!(markers.contains("base intent") && markers.contains("worker intent"));
+    let head = run(&guard.path, &["rev-parse", "HEAD"]);
+    assert!(guard.commit_changes("checkpoint during conflict").is_err());
+    assert_eq!(sync_base(&guard), conflicts, "markers must refuse a second completion too");
+    assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]), head);
+
+    // Even if the model stages the file, the harness checks working-tree markers.
+    run(&guard.path, &["add", "README.md"]);
+    assert_eq!(sync_base(&guard), conflicts);
+    std::fs::write(guard.path.join("README.md"), "base intent\nworker intent\n").unwrap();
+    std::fs::write(guard.path.join("renamed.txt"), "<<<<<<< unresolved\n").unwrap();
+    assert_eq!(sync_base(&guard), BaseSync::Conflicts {
+        branch: "master".into(), files: vec!["renamed.txt".into()],
+    });
+    std::fs::remove_file(guard.path.join("renamed.txt")).unwrap();
+    assert_eq!(sync_base(&guard), BaseSync::Merged { branch: "master".into() });
+    assert!(!WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
+    assert_eq!(run(&guard.path, &["status", "--porcelain"]), "");
+    assert_eq!(run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"]).split_whitespace().count(), 3);
+    let diff = guard.get_diff().unwrap();
+    assert!(diff.contains("+worker intent"));
+    assert!(!diff.contains("+base intent"));
+}
+
+#[test]
+fn detached_dispatch_has_no_base_to_sync() {
+    let repo = TestRepo::new("sync-detached");
+    run(repo.path(), &["switch", "--detach"]);
+    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-detached")).unwrap();
+    assert_eq!(guard.base_branch, None);
+    std::fs::write(guard.path.join("worker.txt"), "pending\n").unwrap();
+    assert_eq!(sync_base(&guard), mini_swe_mcp::worktree::BaseSync::Unchanged);
+    assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]).trim(), guard.base_commit);
+    assert!(guard.get_diff().unwrap().contains("worker.txt"));
+}
+
+#[test]
+fn sync_base_env_zero_leaves_worker_untouched() {
+    // Isolate the env override in a child so concurrent tests cannot observe it.
+    const CHILD: &str = "SWE_SYNC_BASE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_base_env_zero_leaves_worker_untouched", "--nocapture"])
+            .env(CHILD, "1")
+            .env("WORKER_SYNC_BASE", "0")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let repo = TestRepo::new("sync-disabled");
+    let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-disabled")).unwrap();
+    std::fs::write(guard.path.join("worker.txt"), "pending\n").unwrap();
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    run(repo.path(), &["add", "."]);
+    run(repo.path(), &["commit", "-m", "move base"]);
+    assert_eq!(sync_base(&guard), mini_swe_mcp::worktree::BaseSync::Unchanged);
+    assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]).trim(), guard.base_commit);
+    assert_eq!(run(&guard.path, &["status", "--porcelain"]), "?? worker.txt\n");
+    assert!(!guard.path.join("base.txt").exists());
+    assert!(!WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
+}
