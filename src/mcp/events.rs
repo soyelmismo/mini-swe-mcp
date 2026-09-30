@@ -118,6 +118,12 @@ pub struct WorkerView {
     pub question: Option<String>,
     /// Terminal payload, read only for a worker that is about to be reported.
     pub outcome: Outcome,
+    /// Branch the finished worker committed to (`worker-<id>`), when known.
+    /// Carried so the completion guidance can name the branch the revision
+    /// resumes on.
+    pub branch: Option<String>,
+    /// Times the worker was revised after finishing.
+    pub revision: usize,
 }
 
 /// One tick's view of every known worker, keyed by worker id.
@@ -199,10 +205,17 @@ pub fn channel_frame(event: &ChannelEvent) -> Option<String> {
 /// with. The verb is repeated in every notification because a `wait: false`
 /// dispatch may be the only trace of the worker left in the session.
 fn render(view: &WorkerView, kind: EventKind) -> String {
-    let header = format!(
-        "Worker {} is {} (model {}, group {}).",
-        view.worker_id, view.status, view.model, view.group
-    );
+    let header = if view.revision > 0 {
+        format!(
+            "Worker {} is {} (model {}, group {}, revision {}).",
+            view.worker_id, view.status, view.model, view.group, view.revision
+        )
+    } else {
+        format!(
+            "Worker {} is {} (model {}, group {}).",
+            view.worker_id, view.status, view.model, view.group
+        )
+    };
     let (body, verb) = match kind {
         EventKind::NeedsInput => (
             format!(
@@ -226,30 +239,34 @@ fn render(view: &WorkerView, kind: EventKind) -> String {
                 ));
             }
             if let Some(diff) = &view.outcome.diff_stat {
-                body.push_str(&format!("Diff: {diff}"));
+                body.push_str(&format!("Diff: {diff}\n"));
             }
+            if body.trim().is_empty() {
+                body.push_str("Completed with no recorded summary.\n");
+            }
+            body.push_str(&crate::pool::next_step_for(view.branch.as_deref()));
             (
-                if body.is_empty() {
-                    "Completed with no recorded summary.".to_string()
-                } else {
-                    body.trim_end().to_string()
-                },
+                body.trim_end().to_string(),
                 format!(
                     "Review it with the worker tool: action \"collect\", worker_id \"{}\".",
                     view.worker_id
                 ),
             )
         }
-        EventKind::Failed => (
-            format!(
-                "Error: {}",
-                quote(view.outcome.error.as_deref().unwrap_or("(none recorded)"))
-            ),
+        EventKind::Failed => {
+            let body = format!(
+                "Error: {}\n{}",
+                quote(view.outcome.error.as_deref().unwrap_or("(none recorded)")),
+                crate::pool::next_step_for(view.branch.as_deref()),
+            );
+            (
+            body,
             format!(
                 "Inspect it with the worker tool: action \"status\" (then \"logs\"), worker_id \"{}\".",
                 view.worker_id
             ),
-        ),
+        )
+        }
     };
     format!("{header}\n{body}\n{verb}")
 }
@@ -327,6 +344,14 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             && let Some(state) = pool.get_worker_state(&id).await
         {
             view.outcome = outcome_of(&state);
+            // The in-memory state names the branch the registry row cannot, so
+            // the completion guidance points at the branch a revision resumes.
+            view.branch = crate::pool::terminal_branch(&state);
+            view.revision = match &state {
+                WorkerState::Completed { revision, .. }
+                | WorkerState::Failed { revision, .. } => *revision,
+                WorkerState::Running { .. } | WorkerState::Paused { .. } => 0,
+            };
         }
     }
     current
@@ -354,6 +379,11 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             diff_stat: diff_stat(&entry.metrics),
             ..Outcome::default()
         },
+        // A registry row names no branch, so the guidance falls back to the
+        // branch-less wording; the in-memory enrichment below fills in the
+        // real branch when this process owns the worker.
+        branch: None,
+        revision: 0,
     }
 }
 

@@ -261,8 +261,8 @@ impl WorkerPool {
         worker_id: &str,
         config: &RunConfig<'_>,
         meta: &mut WorkerMeta,
-        mut worktree: &mut WorktreeGuard,
-        mut messages: &mut Vec<ChatMessage>,
+        worktree: &mut WorktreeGuard,
+        messages: &mut Vec<ChatMessage>,
     ) -> Result<()> {
         let task = config.task.to_string();
         let model = config.model.to_string();
@@ -302,11 +302,11 @@ impl WorkerPool {
             };
             let mut engine = TurnEngine {
                 pool: self,
-                worktree: &mut worktree,
+                worktree,
                 runner: &runner,
-                worker_id: &worker_id,
+                worker_id,
                 meta,
-                messages: &mut messages,
+                messages,
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
@@ -331,7 +331,7 @@ impl WorkerPool {
         if let Some(reviewer_model) = review_after {
             step = self
                 .run_review_phase(
-                    &mut worktree,
+                    worktree,
                     ReviewPhase {
                         worker_id: worker_id.to_string(),
                         reviewer_model,
@@ -462,7 +462,7 @@ impl WorkerPool {
             None,
         );
 
-        self.unregister_worktree(&worker_id).await;
+        self.unregister_worktree(worker_id).await;
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())
     }

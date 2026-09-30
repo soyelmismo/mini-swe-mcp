@@ -190,6 +190,13 @@ pub fn format_status(val: &serde_json::Value) -> String {
         out.push_str(&health);
         out.push('\n');
     }
+    // A finished worker's status tells the orchestrator the loop exists: the
+    // branch is still there, and steering this worker resumes it in place.
+    if let Some(next) = val.get("next_step").and_then(|v| v.as_str())
+        && !next.trim().is_empty()
+    {
+        out.push_str(&format!("Next step: {next}\n"));
+    }
     out.trim_end().to_string()
 }
 
@@ -219,10 +226,16 @@ pub fn format_collect(val: &serde_json::Value) -> String {
 
     let counters = log_counters_line(val);
     let health = health_line(val).map(|h| format!("\n{h}")).unwrap_or_default();
+    let next = val
+        .get("next_step")
+        .and_then(|v| v.as_str())
+        .filter(|next| !next.trim().is_empty())
+        .map(|next| format!("\nNext step: {next}"))
+        .unwrap_or_default();
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.\n{counters}{health}")
+        format!("Worker {wid}: No git diff produced.\n{counters}{health}{next}")
     } else {
-        format!("{diff}\n{counters}{health}")
+        format!("{diff}\n{counters}{health}{next}")
     }
 }
 
@@ -323,6 +336,11 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                     && !diff.trim().is_empty()
                 {
                     out.push_str(&format!("\nDiff:\n{diff}\n"));
+                }
+                if let Some(next) = val.get("next_step").and_then(|v| v.as_str())
+                    && !next.trim().is_empty()
+                {
+                    out.push_str(&format!("\nNext step: {next}\n"));
                 }
             } else if state_name == "Failed" || state.get("Failed").is_some() {
                 out.push_str("State: Failed\n");

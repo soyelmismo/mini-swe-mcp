@@ -99,7 +99,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Steering guidance or follow-up instruction. Required for 'steer'.",
+            "Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget."
         ),
     ),
     (
@@ -119,7 +119,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "max_turns",
         "integer",
-        DescriptionSource::Static("Maximum bash exploration turns (overrides manifest default)."),
+        DescriptionSource::Static("Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget of a revision started by steering a finished worker (default 60), and is ignored for running or paused workers."),
     ),
     (
         "temperature",
