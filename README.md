@@ -208,4 +208,4 @@ In the full run the admission controller logged 108 heavy-command admission wait
 
 ## License
 
-MIT
+GNU General Public License v3.0 (GPL-3.0-or-later)
