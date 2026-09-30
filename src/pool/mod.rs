@@ -19,7 +19,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -180,6 +180,7 @@ impl WorkerPool {
         group: Option<String>,
         review_after: Option<String>,
         network_offline: bool,
+        verify: Option<String>,
     ) -> Result<String> {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
@@ -231,6 +232,15 @@ impl WorkerPool {
         let wid = worker_id.clone();
         let meta_for_fail = meta;
         let model_for_fail = model.clone();
+        // Resolve the verify gate: an explicit empty string disables it, an
+        // explicit command is used verbatim, and an absent argument auto-detects
+        // from the repository layout.
+        let verify = match verify {
+            Some(cmd) if cmd.is_empty() => None,
+            Some(cmd) => Some(cmd),
+            None => detect_verify_command(&repo_path),
+        };
+
         let config = WorkerLaunchConfig {
             task,
             model,
@@ -240,6 +250,7 @@ impl WorkerPool {
             group: resolved_group,
             review_after,
             network_offline,
+            verify,
         };
 
         let join_handle = tokio::spawn(async move {
@@ -518,4 +529,87 @@ pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
             pool.reap().await;
         }
     })
+}
+
+/// Auto-detect a sensible verify gate from the repository layout.
+///
+/// Returns `None` when no recognised build/test manifest is present, so a
+/// worker on a plain repository is not forced through a gate that cannot run.
+pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
+    if repo_path.join("Cargo.toml").is_file() {
+        return Some("cargo build --all-targets && cargo test".to_string());
+    }
+    if repo_path.join("package.json").is_file() {
+        // Only gate on `npm test` when the manifest actually declares a test
+        // script; otherwise the gate would fail on a repo with no tests.
+        if let Ok(raw) = std::fs::read_to_string(repo_path.join("package.json"))
+            && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&raw)
+            && pkg.get("scripts").and_then(|s| s.get("test")).is_some()
+        {
+            return Some("npm test".to_string());
+        }
+    }
+    if repo_path.join("pyproject.toml").is_file() || repo_path.join("pytest.ini").is_file() {
+        return Some("pytest -q".to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod verify_detection_tests {
+    use super::detect_verify_command;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("verify-detect-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_cargo_manifest_selects_the_cargo_gate() {
+        let dir = scratch("cargo");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            detect_verify_command(&dir).as_deref(),
+            Some("cargo build --all-targets && cargo test")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_json_without_a_test_script_is_not_gated() {
+        let dir = scratch("npm-no-test");
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(detect_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_json_with_a_test_script_selects_npm_test() {
+        let dir = scratch("npm-test");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("npm test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_python_manifest_selects_pytest() {
+        let dir = scratch("py");
+        std::fs::write(dir.join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("pytest -q"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_repository_is_not_gated() {
+        let dir = scratch("bare");
+        assert_eq!(detect_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

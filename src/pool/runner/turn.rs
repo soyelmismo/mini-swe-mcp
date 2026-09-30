@@ -54,8 +54,10 @@ pub(super) struct TurnConfig<'a> {
 
 /// Outcome of one turn.
 pub(super) enum TurnOutcome {
-    /// The completion sentinel was found; stop the loop.
-    Completed,
+    /// The completion sentinel was found; stop the loop. `verified` is
+    /// `Some(true)` when the verify gate passed, `Some(false)` when it was
+    /// exhausted after repeated failures, and `None` when no gate was set.
+    Completed { verified: Option<bool> },
     /// A command was executed; continue the loop.
     Continue,
     /// No command was found; history was updated; continue the loop.
@@ -80,6 +82,11 @@ pub(super) struct TurnEngine<'a> {
     pub current_max_turns: &'a mut usize,
     pub last_assistant_text: &'a mut String,
     pub consecutive_no_cmd: &'a mut usize,
+    /// Optional shell command run through the same bash path before a
+    /// completion sentinel is honoured. `None` disables the gate.
+    pub verify: Option<&'a str>,
+    /// Number of consecutive failed verification runs for this phase.
+    pub verify_failures: &'a mut usize,
 }
 
 impl<'a> TurnEngine<'a> {
@@ -209,15 +216,7 @@ impl<'a> TurnEngine<'a> {
         // --- Command extraction ---
         let cmd_str = match llm_resp.command {
             Some(ref cmd) if is_completion_request(cmd) => {
-                info!(
-                    worker = %self.worker_id,
-                    step = *self.step,
-                    "Worker requested completion"
-                );
-                if !llm_resp.content.trim().is_empty() {
-                    *self.last_assistant_text = llm_resp.content.clone();
-                }
-                return Ok(TurnOutcome::Completed);
+                return self.handle_completion(&llm_resp).await;
             }
             Some(ref cmd) => {
                 *self.consecutive_no_cmd = 0;
@@ -398,6 +397,99 @@ impl<'a> TurnEngine<'a> {
             self.messages.push(ChatMessage::text(Role::User, output_text));
         }
 
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Handle a completion sentinel: run the verify gate (if any) and either
+    /// complete or push the failure back to the model for another turn.
+    async fn handle_completion(&mut self, llm_resp: &LlmResponse) -> Result<TurnOutcome> {
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            "Worker requested completion"
+        );
+        if !llm_resp.content.trim().is_empty() {
+            *self.last_assistant_text = llm_resp.content.clone();
+        }
+
+        let Some(verify) = self.verify.filter(|v| !v.is_empty()) else {
+            return Ok(TurnOutcome::Completed { verified: None });
+        };
+
+        let (output, code) = {
+            let is_heavy = crate::agent::is_heavy_command(verify);
+            let _build_permit = if is_heavy {
+                Some(
+                    self.pool
+                        .build_semaphore
+                        .acquire()
+                        .await
+                        .context("Build semaphore closed")?,
+                )
+            } else {
+                None
+            };
+            let _bash_permit = self
+                .pool
+                .bash_semaphore
+                .acquire()
+                .await
+                .context("Bash semaphore closed")?;
+            self.runner.execute_bash(&self.worktree.path, verify).await?
+        };
+
+        let exit = code.unwrap_or(-1);
+        if exit == 0 {
+            return Ok(TurnOutcome::Completed { verified: Some(true) });
+        }
+
+        // Verification failed. Record a step log and push the output back to
+        // the model so it can fix the problems before completing again. After
+        // three failed verifications the worker completes anyway, flagged
+        // unverified.
+        *self.verify_failures += 1;
+        if *self.verify_failures >= 3 {
+            return Ok(TurnOutcome::Completed { verified: Some(false) });
+        }
+        let label = format!("[verify] {}", summarize_command(verify));
+        let step_log = build_step_log(*self.step, &label, output.clone(), code);
+        {
+            let mut lock = self.pool.workers.write().await;
+            if let Some(w) = lock.get_mut(self.worker_id) {
+                w.logs.push(step_log);
+            }
+        }
+        let output_text = format!(
+            "VERIFICATION FAILED (exit {exit}) - fix these problems before completing:\n{output}"
+        );
+        // The completion turn is replayed with the same rules as a command
+        // turn: a `tool_calls` response keeps its assistant turn and gets a
+        // tool_result per call id, so the next request never carries a
+        // dangling tool_call the provider would reject.
+        if let (Some(tool_calls), Some(tc_id)) =
+            (llm_resp.tool_calls.clone(), llm_resp.tool_call_id.clone())
+        {
+            let assistant_content = if llm_resp.content.trim().is_empty() {
+                None
+            } else {
+                Some(llm_resp.content.clone())
+            };
+            let msg = ChatMessage::assistant_with_tool_calls(assistant_content, tool_calls)
+                .with_reasoning_content(llm_resp.reasoning_content.clone());
+            self.messages.push(msg);
+            self.messages
+                .push(ChatMessage::tool_result(tc_id, &output_text));
+        } else {
+            let assistant_content = if llm_resp.content.trim().is_empty() {
+                "The verification gate failed.".to_string()
+            } else {
+                llm_resp.content.clone()
+            };
+            let msg = ChatMessage::text(Role::Assistant, assistant_content)
+                .with_reasoning_content(llm_resp.reasoning_content.clone());
+            self.messages.push(msg);
+            self.messages.push(ChatMessage::text(Role::User, output_text));
+        }
         Ok(TurnOutcome::Continue)
     }
 

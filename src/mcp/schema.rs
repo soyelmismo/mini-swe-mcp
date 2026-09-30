@@ -126,6 +126,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         ),
     ),
     (
+        "verify",
+        "string",
+        DescriptionSource::Static(
+            "Optional shell command run through the same sandboxed bash path before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). When absent, the harness auto-detects from the repository layout (Cargo.toml, package.json with a test script, or pyproject.toml/pytest.ini). Pass an empty string to disable the gate. Optional for 'dispatch'.",
+        ),
+    ),
+    (
         "network",
         "string",
         DescriptionSource::Static(

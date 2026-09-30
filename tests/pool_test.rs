@@ -683,6 +683,7 @@ async fn steer_rejects_unsteerable_workers() {
         completed_at: 0,
         artifacts: vec![],
         branch: None,
+        verified: None,
     };
     pool.__test_insert_worker(done).await;
     let err = pool.steer("w4", "x".into()).await.unwrap_err();
@@ -719,6 +720,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
         completed_at: 0,
         artifacts: vec!["a".repeat(4096)],
         branch: Some("feature".into()),
+        verified: None,
     };
     pool.__test_insert_worker(w).await;
 

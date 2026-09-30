@@ -673,6 +673,42 @@ fn test_tools_list_advertises_the_optional_network_policy() {
     assert_eq!(schema["required"], json!(["action"]));
 }
 
+/// The `verify` property is part of the advertised contract: an optional
+/// string that stays out of `required` so pre-existing clients are unaffected.
+#[test]
+fn test_tools_list_advertises_the_optional_verify_gate() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({ "jsonrpc": "2.0", "id": "verify-schema", "method": "tools/list" }));
+    let response = server
+        .expect_response("tools/list")
+        .expect("tools/list must be answered");
+    let result = expect_result(&response);
+
+    let worker = result["tools"]
+        .as_array()
+        .expect("result.tools must be an array")
+        .iter()
+        .find(|tool| tool["name"] == "worker")
+        .expect("tools/list must expose the 'worker' tool");
+    let schema = &worker["inputSchema"];
+    let verify = schema["properties"]
+        .get("verify")
+        .unwrap_or_else(|| panic!("the worker tool must advertise a 'verify' property, got: {schema}"));
+
+    assert_eq!(verify["type"], json!("string"));
+    assert!(
+        verify["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("auto-detect") && text.contains("empty string")),
+        "the description must document auto-detection and how to disable, got: {verify}"
+    );
+
+    // Optional by construction: `action` is still the only required argument.
+    assert_eq!(schema["required"], json!(["action"]));
+}
+
 /// An unknown `network` value is a hard tool error, not a silent fallback: a
 /// caller that asked for isolation must never quietly get connectivity back.
 #[test]
