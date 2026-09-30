@@ -326,8 +326,9 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
         String::from_utf8_lossy(&output.stdout)
     );
     let completed = format!(
-        r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"cli"}}"#,
-        std::process::id()
+        r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"{}"}}"#,
+        std::process::id(),
+        common::host_of_this_process()
     );
     std::fs::write(
         swe.path().join("swe-registry").join("w-cli.json"),
@@ -356,7 +357,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     // The same worker, now gone: still nothing to watch.
     std::fs::create_dir_all(swe.path().join("swe-registry")).unwrap();
     let now = mini_swe_mcp::pool::unix_timestamp();
-    let running = serde_json::json!({"id":"w-cli","pid":std::process::id(),"task":"t","model":"m","status":"running","step":1,"max_turns":10,"last_command":"test","started_at":now,"updated_at":now,"owner":"cli"});
+    let running = serde_json::json!({"id":"w-cli","pid":std::process::id(),"task":"t","model":"m","status":"running","step":1,"max_turns":10,"last_command":"test","started_at":now,"updated_at":now,"owner":common::host_of_this_process()});
     std::fs::write(
         swe.path().join("swe-registry/w-cli.json"),
         running.to_string(),
@@ -410,7 +411,7 @@ async fn the_binary_watches_through_the_hub() {
     let server = pool_with(vec![
         record(
             "w-hub",
-            "cli",
+            &common::host_of_this_process(),
             WorkerState::Completed {
                 turns: 3,
                 diff: String::new(),

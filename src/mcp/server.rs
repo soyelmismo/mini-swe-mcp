@@ -48,8 +48,9 @@ pub struct McpServer {
 /// `clientInfo.name` the CLI sends in its `initialize` handshake.
 pub const CLI_CLIENT_NAME: &str = "mini-swe-cli";
 
-/// Owner identity shared by every CLI invocation, so a worker dispatched by one
-/// `mini-swe-mcp list` is still steerable from the next one.
+/// Owner identity of a CLI invocation whose host process could not be named
+/// (no readable `/proc` ancestry), so every such invocation still shares one
+/// identity and a worker stays steerable from the next call.
 pub const CLI_AGENT: &str = "cli";
 
 /// Owner identity of the in-process stdio server (`MINI_SWE_NO_DAEMON=1`), which
@@ -74,6 +75,11 @@ pub struct ConnectionContext {
     pub id: u64,
     /// `MINI_SWE_AGENT_ID` from `hub/hello`, when the client sent one.
     pub agent_id: Option<String>,
+    /// The agent's host process from `hub/hello`, when the client sent one:
+    /// `host:<comm>:<pid>:<starttime>` (see [`crate::hub::identity`]). One
+    /// host process is one agent session, so the MCP connection and the shell
+    /// commands it spawned share their workers.
+    pub host_id: Option<String>,
     /// `clientInfo.name` from `initialize`, when the client sent one.
     pub client_name: Option<String>,
     /// `admin: true` from `hub/hello`: the operator may act on any worker.
@@ -91,6 +97,7 @@ impl ConnectionContext {
         Self {
             id: 0,
             agent_id: None,
+            host_id: None,
             client_name: None,
             admin: false,
             local: true,
@@ -105,6 +112,7 @@ impl ConnectionContext {
         Self {
             id,
             agent_id: None,
+            host_id: None,
             client_name: None,
             admin: false,
             local: false,
@@ -119,14 +127,22 @@ impl ConnectionContext {
     ///
     /// 1. the `MINI_SWE_AGENT_ID` the client sent in `hub/hello`, so several
     ///    connections of one orchestrator share their workers;
-    /// 2. `cli` for the CLI, whose identity is stable across invocations;
-    /// 3. `<clientInfo.name>#<connection id>`, which keeps two clients of the
+    /// 2. the agent's host process, which the client walked up to and sent in
+    ///    `hub/hello`: one host is one session, so the MCP connection and the
+    ///    shell commands it spawned share their workers while two hosts never
+    ///    do, and the identity survives a reconnect or a hub restart;
+    /// 3. `cli` for a CLI whose host could not be named, whose identity is
+    ///    therefore stable across invocations;
+    /// 4. `<clientInfo.name>#<connection id>`, which keeps two clients of the
     ///    same host separate;
-    /// 4. `local` for the in-process stdio server, and `connection#<id>` for a
+    /// 5. `local` for the in-process stdio server, and `connection#<id>` for a
     ///    hub client that announced nothing at all.
     pub fn agent(&self) -> String {
         if let Some(agent_id) = self.agent_id.as_deref().filter(|id| !id.is_empty()) {
             return agent_id.to_string();
+        }
+        if let Some(host_id) = self.host_id.as_deref().filter(|id| !id.is_empty()) {
+            return host_id.to_string();
         }
         match self.client_name.as_deref().filter(|name| !name.is_empty()) {
             Some(CLI_CLIENT_NAME) => CLI_AGENT.to_string(),
@@ -267,6 +283,7 @@ impl McpServer {
                 if req.method == "hub/hello" {
                     let params = req.params.as_ref().cloned().unwrap_or_default();
                     ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                    ctx.host_id = params["host_id"].as_str().map(str::to_owned);
                     ctx.admin = params["admin"].as_bool().unwrap_or(false);
                     ctx.pid = params["pid"]
                         .as_u64()
@@ -300,7 +317,10 @@ impl McpServer {
                         let _ = out_tx.send(response.to_frame()?).await;
                     }
                     if hub
-                        && (ctx.agent_id.is_some() || ctx.client_name.is_some() || ctx.is_admin())
+                        && (ctx.agent_id.is_some()
+                            || ctx.host_id.is_some()
+                            || ctx.client_name.is_some()
+                            || ctx.is_admin())
                     {
                         self.hub_events.lock().await.register(&ctx, out_tx.clone());
                     }
@@ -916,8 +936,39 @@ mod tests {
         assert_eq!(ctx.agent(), "orchestrator-7");
     }
 
-    /// The CLI identity is stable across invocations, which is what lets
-    /// `mini-swe-mcp list` see the worker an earlier `dispatch` started.
+    /// A host identity outranks the client name, so the MCP connection an agent
+    /// dispatches over and the `mini-swe-mcp` calls its shell makes are one
+    /// agent — while a second host is a second agent.
+    #[test]
+    fn one_host_identity_is_shared_by_a_connection_and_its_shell() {
+        let host = "host:claude:4242:9182734";
+        let mut connection = ConnectionContext::hub_connection(7);
+        connection.client_name = Some("claude-code".to_string());
+        connection.host_id = Some(host.to_string());
+        let mut shell = ConnectionContext::hub_connection(8);
+        shell.client_name = Some(CLI_CLIENT_NAME.to_string());
+        shell.host_id = Some(host.to_string());
+        assert_eq!(connection.agent(), host);
+        assert_eq!(shell.agent(), host);
+
+        let mut other_host = ConnectionContext::hub_connection(9);
+        other_host.client_name = Some("claude-code".to_string());
+        other_host.host_id = Some("host:opencode:5253:9182735".to_string());
+        assert_ne!(other_host.agent(), connection.agent());
+    }
+
+    /// The explicit override still outranks the host identity.
+    #[test]
+    fn an_explicit_agent_id_outranks_the_host_identity() {
+        let mut ctx = ConnectionContext::hub_connection(3);
+        ctx.host_id = Some("host:claude:4242:9182734".to_string());
+        ctx.agent_id = Some("orchestrator-7".to_string());
+        assert_eq!(ctx.agent(), "orchestrator-7");
+    }
+
+    /// A CLI whose host process could not be named keeps the `cli` identity,
+    /// which is what lets `mini-swe-mcp list` see the worker an earlier
+    /// `dispatch` started.
     #[test]
     fn every_cli_connection_shares_the_cli_identity() {
         let mut first = ConnectionContext::hub_connection(1);

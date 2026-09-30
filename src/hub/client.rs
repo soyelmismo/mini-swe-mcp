@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::UnixStream;
 
 use super::daemon::hub_lock_held;
+use super::identity;
 use super::{HubPaths, hub_dir};
 
 /// Dial the hub, starting a detached daemon if none is listening.
@@ -66,9 +67,12 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
 /// Announce this process to the daemon.
 ///
 /// `agent_id` is the operator's `MINI_SWE_AGENT_ID`, the one way a client can
-/// name the agent its workers belong to; without it the daemon derives the
-/// identity from the `initialize` `clientInfo` (see [`crate::mcp::ConnectionContext::agent`]).
-/// `admin` is the operator override that lifts the per-agent ownership check.
+/// name the agent its workers belong to; without it the daemon uses the
+/// `host_id` this client walked up to — the agent's host process, shared by its
+/// MCP connection and its shell commands (see [`crate::hub::identity`]) — and
+/// only then the `initialize` `clientInfo` (see
+/// [`crate::mcp::ConnectionContext::agent`]). `admin` is the operator override
+/// that lifts the per-agent ownership check.
 fn client_version() -> String {
     #[cfg(debug_assertions)]
     if let Ok(version) = std::env::var("MINI_SWE_FAKE_VERSION") {
@@ -105,8 +109,15 @@ fn build_ts() -> u64 {
     env!("MINI_SWE_BUILD_TS").parse().unwrap_or_default()
 }
 
+/// The `hub/hello` parameters: who this client is, and which agent it speaks
+/// for.
+///
+/// `host_id` is computed here, on the client, because only the client can see
+/// its own ancestry: the daemon would otherwise have to trust a pid it cannot
+/// walk. It is a coordination identity, never an authenticated one.
 fn hello_params(admin: bool, version: &str, build: &Value) -> Value {
     json!({"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
+           "host_id": identity::host_identity().map(|host| host.to_string()),
            "pid": std::process::id(), "version": version, "build": build,
            "cwd": std::env::current_dir().ok(), "admin": admin})
 }
@@ -173,12 +184,11 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
             notifications: Vec::new(),
             watch_line: Vec::new(),
         };
-        // Announce the final CLI identity before any replay. The proxy's
-        // identity comes from hello or the host's later initialize.
-        let mut params = hello_params(admin, &version, &build);
-        if cli && params["agent_id"].as_str().is_none_or(str::is_empty) {
-            params["agent_id"] = json!(crate::mcp::CLI_AGENT);
-        }
+        // Announce the identity before any replay. Both transports send the
+        // host process they walked up to; the CLI additionally answers the
+        // `initialize` the daemon expects from it below, and a client that
+        // names no host at all keeps the `cli`/`clientInfo` fallback.
+        let params = hello_params(admin, &version, &build);
         let reply = match client.request("hub/hello", params.clone()).await {
             Ok(reply) => reply,
             // A daemon from before the version handshake only knows hello as
@@ -294,15 +304,17 @@ pub struct HubClient {
 }
 
 impl HubClient {
-    /// Connect as the CLI: identity `cli`, shared by every invocation.
+    /// Connect as the CLI: the agent its host process names, or `cli` when
+    /// that host cannot be walked.
     pub async fn connect() -> Result<Self> {
         Self::connect_as_admin(false).await
     }
 
     /// Connect as the CLI, optionally with the operator's admin override.
     ///
-    /// The `clientInfo.name` sent in `initialize` is what gives the CLI its
-    /// stable `cli` identity (H-3), and `admin` is the human operator's
+    /// The identity is the host process this CLI runs under (H-3), so a worker
+    /// dispatched by one invocation stays steerable from the next one and from
+    /// the agent's MCP connection; `admin` is the human operator's
     /// `mini-swe-mcp --admin` bypass of the per-agent ownership check.
     pub async fn connect_as_admin(admin: bool) -> Result<Self> {
         negotiated(admin, true).await
