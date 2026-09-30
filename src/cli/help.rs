@@ -3,11 +3,11 @@
 /// The `Flags:` block of `--help`, one flag per line.
 ///
 /// `--admin` is the human operator's escape hatch: every other caller may only
-/// steer, kill, collect and wait on the workers it dispatched itself, while the
+/// read, steer, kill, collect and watch the workers it dispatched itself, while the
 /// operator can act on any of them (H-3).
 pub const HELP_FLAGS: &str = concat!(
     "      --json     Output in JSON format (default is formatted plain text)\n",
-    "      --all      List every agent's workers, not just this one's\n",
+    "      --all      List every agent's workers (requires --admin)\n",
     "      --admin    Operator override: act on workers owned by any agent\n",
     "  -h, --help     Print help\n",
     "  -V, --version  Print version",

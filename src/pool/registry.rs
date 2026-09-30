@@ -404,18 +404,23 @@ pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
 }
 
 pub(crate) fn recover_orphaned_workers() -> usize {
+    recover_entries(raw_registry_entries())
+}
+
+fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEntry)>) -> usize {
     let mut recovered = 0;
-    for (path, mut entry) in raw_registry_entries() {
+    for (path, mut entry) in entries {
         if !entry.status.is_live()
             || entry.pid == std::process::id()
             || crate::worktree::is_process_alive(entry.pid)
         {
             continue;
         }
-        let base = path
-            .parent()
-            .and_then(|dir| dir.parent())
-            .expect("registry base");
+        // The base dir the worker was created under, not the registry row's own
+        // grandparent: the registry may live anywhere, and the target/scratch
+        // cleanup below resolves through `swe_base_dir()` the same way teardown
+        // does, so the two must agree on where the worktree was.
+        let base = crate::worktree::swe_base_dir();
         let checkout = base.join(format!("swe-wt-{}", entry.id));
         let salvaged =
             !checkout.is_dir() || crate::worktree::prune::salvage_dirty_worktree(&checkout);
@@ -430,6 +435,13 @@ pub(crate) fn recover_orphaned_workers() -> usize {
             if !removed.is_ok_and(|out| out.status.success()) {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
             }
+        }
+        // The orphan's private build dirs and its lease outlive the worktree
+        // directory itself, so they need their own cleanup: without it every
+        // hub restart leaks one `swe-target-<id>` tree and one stale `.pid`.
+        if !checkout.is_dir() {
+            crate::worktree::remove_target_dirs(&checkout);
+            let _ = std::fs::remove_file(crate::worktree::pid_file_for(&checkout));
         }
         // Interrupted, not failed: the worker stopped because the hub did, not
         // because it cannot continue. Its branch and conversation survive, so
@@ -500,4 +512,82 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod recovery_cleanup_tests {
+    use super::*;
+    use crate::worktree::{pid_file_for, swe_base_dir};
+
+    /// A pid that is certainly dead: a child that has already exited, so
+    /// `is_process_alive` reports it dead and the sweep treats the row as an
+    /// orphan rather than a live worker it must not touch.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    /// A registry row whose `pid` is dead: the shape of a worker orphaned by a
+    /// hub crash.
+    fn orphan_row(id: &str) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
+            id: id.to_string(),
+            pid: dead_pid(),
+            task: "orphan".to_string(),
+            model: "test".to_string(),
+            status: RegistryStatus::Running,
+            step: 1,
+            max_turns: 10,
+            last_command: "orphaned".to_string(),
+            question: None,
+            started_at: 0,
+            updated_at: 0,
+            group: None,
+            repo_path: None,
+            owner: Some("agent-a".to_string()),
+            metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            revision: 0,
+            auto_continues: 0,
+        }
+    }
+
+    /// The sweep releases the worktree registration so `steer` can reattach to
+    /// the branch. That alone leaves the worker's private build dirs and its
+    /// lease behind, and every hub restart would leak another pair.
+    #[test]
+    fn recovery_removes_the_orphans_target_dir_and_pid_file() {
+        // The real base dir, because the sweep's cleanup resolves the target
+        // and scratch paths through `swe_base_dir()` exactly as teardown does.
+        let base = swe_base_dir();
+        let id = format!("recovery-{}", uuid::Uuid::new_v4().simple());
+        let worktree = base.join(format!("swe-wt-{id}"));
+        let target = base.join(format!("swe-target-swe-wt-{id}"));
+        let scratch = base.join(format!("swe-tmp-swe-wt-{id}"));
+        let pid = pid_file_for(&worktree);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(&pid, serde_json::json!({"pid": 1}).to_string()).unwrap();
+        // A private registry file: the sweep is driven directly, so no other
+        // process's rows can be recovered by accident.
+        let registry = base.join("swe-registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let path = registry.join(format!("{id}.json"));
+        let row = orphan_row(&id);
+        std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
+
+        let recovered = recover_entries([(path.clone(), row)]);
+        assert_eq!(recovered, 1, "the orphan row must be recovered");
+        let row: WorkerRegistryEntry = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(row.status, RegistryStatus::Interrupted);
+
+        assert!(!target.exists(), "the orphan's target dir must be removed");
+        assert!(!scratch.exists(), "the orphan's scratch dir must be removed");
+        assert!(!pid.exists(), "the orphan's lease must be removed");
+    }
 }

@@ -624,7 +624,9 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "stop"}),
         serde_json::json!({"action": "kill", "worker_id": "h3-hub-worker"}),
         serde_json::json!({"action": "collect", "worker_id": "h3-hub-worker"}),
-        serde_json::json!({"action": "wait", "worker_id": "h3-hub-worker", "timeout_secs": 0}),
+        serde_json::json!({"action": "status", "worker_id": "h3-hub-worker"}),
+        serde_json::json!({"action": "logs", "worker_id": "h3-hub-worker"}),
+        serde_json::json!({"action": "watch", "worker_id": "h3-hub-worker", "timeout_secs": 0}),
     ] {
         let action = arguments["action"].as_str().expect("action").to_string();
         let error = b
@@ -636,14 +638,6 @@ async fn a_hub_connection_only_controls_its_own_workers() {
             "'{action}' must name the owning agent: {error}"
         );
     }
-    // The refusals left the worker alone, and reading it stays open.
-    let status = b
-        .worker(serde_json::json!({"action": "status", "worker_id": "h3-hub-worker"}))
-        .await
-        .expect("status is readable by every agent");
-    assert_eq!(status["owner"], "agent-a");
-    assert_eq!(status["state"]["state"], "Running");
-
     // The owner may act on it, and the CLI's stable identity is `cli` whatever
     // its connection id (H-3), so it never sees another agent's worker either.
     let mut a = Client::connect(&socket).await;
@@ -674,17 +668,11 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         !ids.contains(&"h3-hub-worker"),
         "the CLI must not list it: {listed}"
     );
-    let all = cli
+    let error = cli
         .worker(serde_json::json!({"action": "list", "scope": "all"}))
         .await
-        .expect("scope=all answers");
-    let row = all["workers"]
-        .as_array()
-        .expect("workers array")
-        .iter()
-        .find(|row| row["id"] == "h3-hub-worker")
-        .unwrap_or_else(|| panic!("scope=all must list it: {all}"));
-    assert_eq!(row["owner"], "agent-a");
+        .expect_err("scope=all requires admin");
+    assert!(error.contains("admin"), "{error}");
 
     // The operator's `--admin`: the same connection, with the override in hello.
     let mut operator = Client::connect(&socket).await;
@@ -984,14 +972,18 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Interrupted);
     assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
     let out = tokio::time::timeout(std::time::Duration::from_secs(15),
-        command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--wait", "--json"])
-            .output()).await.expect("revision must finish").unwrap();
+        command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--json"])
+            .output()).await.expect("steer must return").unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).contains(&checkpoint.branch));
+    let watched = tokio::time::timeout(std::time::Duration::from_secs(15),
+        command().args(["watch", wid, "--timeout", "10", "--json"]).output())
+        .await.expect("revision watch must finish").unwrap();
+    assert!(watched.status.success(), "{}", String::from_utf8_lossy(&watched.stderr));
+    assert!(String::from_utf8_lossy(&watched.stdout).contains(&checkpoint.branch));
     assert_eq!(common::git(&repo, &["show", &format!("{}:kept.txt", checkpoint.branch)]).trim(), "checkpoint");
     second.kill().await.unwrap();
     second.wait().await.unwrap();
-    llm.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), llm).await.expect("LLM completed all turns").unwrap();
     std::fs::remove_dir_all(&hub).unwrap();
 }
 
@@ -1408,11 +1400,11 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
     waiter
         .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
         .await;
-    // `steer --wait` on a live worker blocks until the worker moves; hold it.
-    let waiting = tokio::spawn(async move {
-        waiter.worker(serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go", "wait": true})).await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let steered = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        waiter.worker(serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go"})),
+    ).await.expect("steer returns immediately").expect("steer succeeds");
+    assert_eq!(steered["status"], "steered");
     let mut closer = Client::connect(&socket).await;
     closer
         .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
@@ -1435,11 +1427,6 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
         },
     )
     .await;
-    let steered = tokio::time::timeout(std::time::Duration::from_secs(3), waiting)
-        .await
-        .expect("steer wait resolves")
-        .expect("steer task joins");
-    assert!(steered.is_ok());
     task.abort();
     let _ = task.await;
     let _ = std::fs::remove_dir_all(dir);

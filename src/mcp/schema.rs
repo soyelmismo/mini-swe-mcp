@@ -15,7 +15,7 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "wait", "collect", "logs", "list", "kill", "reap", "manifest",
+    "dispatch", "status", "steer", "watch", "collect", "logs", "list", "kill", "reap", "manifest",
     "prune",
 ];
 
@@ -30,7 +30,8 @@ pub const NETWORK_MODES: &[&str] = crate::manifest::NETWORK_POLICIES;
 
 /// Accepted values of the `list` `scope` property: the caller's own workers,
 /// or every agent's. [`LIST_SCOPE_ALL`] is the only way to look at another
-/// agent's rows; the mutating verbs refuse regardless (H-3).
+/// agent's rows and it requires the admin override; every other verb refuses
+/// a foreign worker regardless (H-3).
 pub const LIST_SCOPES: &[&str] = &["mine", "all"];
 
 /// `scope` value that lists every agent's workers.
@@ -65,7 +66,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction, or continue any stopped worker -- completed, failed, interrupted, killed -- on its own id and branch; never dispatch a replacement for a stopped worker), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). Use mini-swe-mcp watch for unattended events instead of polling status. A worker belongs to the agent that dispatched it: 'steer', 'kill', 'collect' and 'wait' only act on your own workers, while 'status' and 'logs' read any worker's.",
+            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction, or continue any stopped worker -- completed, failed, interrupted, killed -- on its own id and branch; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; pair with 'timeout_secs' for a bounded long-poll), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). Use 'watch' (or mini-swe-mcp watch) for unattended events instead of polling status. A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
         ),
     ),
     (
@@ -95,7 +96,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'wait', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -111,17 +112,24 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         ),
     ),
     (
-        "wait",
-        "boolean",
+        "worker_ids",
+        "array",
         DescriptionSource::Static(
-            "If true, blocks until worker completes and returns final diff immediately. Optional for 'dispatch' (default: false) and for 'steer' (default: false), where it makes steer-and-wait one call that reports the worker's next event. Recommended for unattended single-worker runs to avoid manual polling loops, and pair it with 'timeout_secs' when the host enforces its own tool deadline.",
+            "Worker IDs to watch. Optional for 'watch': omitted watches every one of your own running or paused workers.",
+        ),
+    ),
+    (
+        "group",
+        "string",
+        DescriptionSource::Static(
+            "Only watch workers of this group. Optional for 'watch'.",
         ),
     ),
     (
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Client-side deadline in seconds for a blocking call ('dispatch'/'steer' with wait:true, and 'wait'). When it expires before the worker completes, fails or pauses, the call returns {status:'still_running', step, last_command} instead of blocking, so the agent can simply call 'wait' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
+            "Client-side deadline in seconds for a blocking call ('watch'). When it expires before an event arrives, the call returns {status:'no_event'} instead of blocking, so the agent can simply call 'watch' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
         ),
     ),
     (
@@ -152,7 +160,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': omitted or 'mine' returns only the calling agent's workers, 'all' returns every agent's, each row naming its 'owner'. Optional for 'list' (default: 'mine').",
+            "Listing scope for 'list': omitted or 'mine' returns only the calling agent's workers, 'all' returns every agent's and requires the admin override. Optional for 'list' (default: 'mine').",
         ),
     ),
     (
@@ -216,6 +224,9 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     }
     if name == "timeout_secs" {
         schema.insert("minimum".to_string(), Value::from(0));
+    }
+    if name == "worker_ids" {
+        schema.insert("items".to_string(), json!({ "type": "string" }));
     }
     if name == "temperature" {
         schema.insert(

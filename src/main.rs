@@ -124,7 +124,7 @@ async fn run_local_stdio() -> Result<()> {
 /// `tools/call` whose payload and plain-text rendering match the local path.
 ///
 /// `admin` is the operator's `--admin`: the handshake then lifts the per-agent
-/// ownership check, so the CLI can steer, kill, collect and wait on a worker
+/// ownership check, so the CLI can steer, kill, collect and watch a worker
 /// another agent dispatched.
 async fn run_remote_action(
     action: &str,
@@ -141,36 +141,12 @@ async fn run_remote_action(
     print_result(action, &result, json_output)
 }
 
-/// Issue one `worker` tool call and, while the worker is paused for input,
-/// run the operator dialogue as `steer` + `wait` calls.
-///
-/// `call` is the only transport difference between the in-process pool and
-/// the hub daemon, so both CLI paths share this one algorithm.
+/// Issue one worker call through either transport. Dispatch and steer detach.
 async fn drive_worker_call(
     tool_args: serde_json::Map<String, serde_json::Value>,
     mut call: impl AsyncFnMut(serde_json::Value) -> Result<serde_json::Value>,
 ) -> Result<serde_json::Value> {
-    let mut result = call(serde_json::Value::Object(tool_args)).await?;
-    while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
-        let wid = result["worker_id"].as_str().unwrap_or("").to_string();
-        let q = result["question"].as_str().unwrap_or("");
-        eprintln!("\n[mini-swe] Worker {} is PAUSED: {}", wid, q);
-        eprint!("Reply with guidance (or press Enter to abort): ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            eprintln!("[mini-swe] No input provided; terminating worker.");
-            call(serde_json::json!({"action": "kill", "worker_id": wid})).await?;
-            break;
-        }
-
-        call(serde_json::json!({"action": "steer", "worker_id": wid, "message": input})).await?;
-        eprintln!("[mini-swe] Guidance sent. Resuming execution...");
-        // `wait` blocks until the worker finishes, fails or pauses again.
-        result = call(serde_json::json!({"action": "wait", "worker_id": wid})).await?;
-    }
-    Ok(result)
+    call(serde_json::Value::Object(tool_args)).await
 }
 
 /// Run the hub daemon: the single process owning the only worker pool.
@@ -236,9 +212,8 @@ fn print_help() {
     println!("  collect <worker_id>");
     println!("  logs <worker_id>");
     println!("  reap");
-    println!("  steer <worker_id> <message> [--wait] [--timeout <secs>] [--max-turns <n>] (finished workers: revision)");
+    println!("  steer <worker_id> <message> [--max-turns <n>] (finished workers: revision)");
     println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
-    println!("  wait <worker_id> [--timeout <secs>]");
     println!("  list [--all]");
     println!("  monitor [--once]");
     println!("  supervisor [--once]");

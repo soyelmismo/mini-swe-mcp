@@ -738,6 +738,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         view["owner"] = row["owner"].clone();
         if let Some(progress) = pool.worker_progress(id).await {
             view["step"] = json!(progress.step);
+            view["turns"] = json!(progress.step);
             view["status"] = json!(phase_status(progress.phase));
             view["question"] = json!(progress.question);
             // list_workers supplies a summary without cloning the multi-megabyte diff.
@@ -817,7 +818,11 @@ impl EventRouter {
         let initial = params["initial"].as_bool().unwrap_or(false);
         let group = params["group"].as_str();
         let owner = ctx.agent();
-        let allowed = |v: &serde_json::Value| ctx.is_admin() || v["owner"] == owner;
+        // Unattributed legacy rows are the admin's alone: an agent that happens
+        // to be named "unattributed" must not inherit them by accident.
+        let allowed = |v: &serde_json::Value| {
+            ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed")
+        };
         for id in &ids {
             let known = self.watch_current.get(id).or_else(|| self.watch_history.values().flat_map(|h| &h.pending).find(|v| v["worker_id"] == *id));
             if let Some(v) = known {
@@ -832,6 +837,19 @@ impl EventRouter {
             for v in &history.pending {
                 if !crate::cli::watch::matches(v, &ids, group) { continue; }
                 let mut event = v.clone();
+                if v["event"] == "stalled"
+                    && let Some(current) = v["worker_id"].as_str().and_then(|id| self.watch_current.get(id))
+                {
+                    if !matches!(current["status"].as_str(), Some("running" | "reviewing")) {
+                        continue;
+                    }
+                    let now = crate::pool::unix_timestamp();
+                    for (key, value) in current.as_object().into_iter().flatten() {
+                        event[key] = value.clone();
+                    }
+                    event["time_since_last_step"] = json!(now.saturating_sub(current["last_step_at"].as_u64().unwrap_or(now)));
+                    event["commands"] = json!(crate::cli::watch::commands(&event));
+                }
                 event["missed"] = json!(initial);
                 event["dropped_events"] = json!(history.dropped);
                 events.push(event);
@@ -843,7 +861,7 @@ impl EventRouter {
         if initial {
             for id in &ids {
                 if !events.iter().any(|v| v["worker_id"] == *id)
-                    && let Some(v) = self.watch_reported.get(id).filter(|v| allowed(v) && crate::cli::watch::matches(v, &ids, group)) { events.push(v.clone()); }
+                    && let Some(v) = self.watch_reported.get(id).filter(|v| matches!(v["event"].as_str(), Some("completed" | "failed")) && allowed(v) && crate::cli::watch::matches(v, &ids, group)) { events.push(v.clone()); }
             }
         }
         // A caller that resumes with no live ids must not start watching new
@@ -870,7 +888,46 @@ pub(super) async fn watch_request(pool: &WorkerPool, router: &Arc<Mutex<EventRou
         router.lock().await.acknowledge_watch(ctx, params["sequence"].as_u64().unwrap_or(0));
         return Ok(json!({}));
     }
+    let snapshot = watch_snapshot(pool).await;
     let mut guard = router.lock().await;
-    guard.observe_watch(watch_snapshot(pool).await);
+    guard.observe_watch(snapshot);
     guard.watch_reply(ctx, &params)
+}
+
+#[cfg(test)]
+mod watch_stall_regression_tests {
+    use super::*;
+
+    fn view(step: usize) -> serde_json::Value {
+        json!({"worker_id":"stall-probe", "owner":"owner", "status":"running",
+            "step":step, "revision":0, "last_step_at":crate::pool::unix_timestamp().saturating_sub(601),
+            "metrics":crate::pool::WorkerMetrics::default()})
+    }
+
+    #[test]
+    fn acknowledged_stall_is_not_replayed_by_an_explicit_initial_watch() {
+        let mut router = EventRouter::default();
+        router.observe_watch([("stall-probe".into(), view(160))].into());
+        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let params = json!({"worker_ids":["stall-probe"], "initial":true});
+        let first = router.watch_reply(&ctx, &params).unwrap();
+        assert_eq!(first["events"][0]["event"], "stalled");
+        let sequence = first["events"][0]["sequence"].as_u64().unwrap();
+        router.acknowledge_watch(&ctx, sequence);
+        assert_eq!(router.watch_history["owner"].cursor, sequence);
+        let second = router.watch_reply(&ctx, &params).unwrap();
+        assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
+    }
+
+    #[test]
+    fn pending_stall_renders_the_current_step_instead_of_its_queued_snapshot() {
+        let mut router = EventRouter::default();
+        router.observe_watch([("stall-probe".into(), view(160))].into());
+        router.watch_current.insert("stall-probe".into(), view(162));
+        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let reply = router.watch_reply(&ctx, &json!({"worker_ids":["stall-probe"], "initial":true})).unwrap();
+        assert_eq!(reply["events"][0]["step"], 162);
+    }
 }
