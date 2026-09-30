@@ -262,6 +262,14 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     }
     // Worktrees and registry rows of the probe dispatch stay in the scratch dir.
     let swe = hub.subdir("swe");
+    // The probe dispatch passes `--repo`: without it `repo_path` resolves to
+    // the cwd (the crate directory) and the worker's `worker-*` branch is
+    // created in the crate's own repository.
+    let repo = hub.subdir("repo");
+    common::git(&repo, &["init", "-b", "master"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    common::git(&repo, &["config", "user.email", "test@localhost"]);
+    common::git(&repo, &["commit", "--allow-empty", "-m", "seed"]);
     let envs = |cmd: &mut Command| {
         cmd.env("SWE_HUB_DIR", &hub_dir)
             .env("SWE_TEMP_DIR", &swe)
@@ -370,7 +378,8 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     let mut dispatch = Command::new(&exe);
     envs(&mut dispatch);
     let out = dispatch
-        .args(["dispatch", "thin-client lifecycle probe", "--json"])
+        .args(["dispatch", "thin-client lifecycle probe", "--json", "--repo"])
+        .arg(&repo)
         .env("OPENAI_API_BASE", "http://127.0.0.1:1")
         .output()
         .expect("dispatch runs");
