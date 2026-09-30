@@ -1365,6 +1365,40 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
 }
 
 #[tokio::test]
+async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
+    // Collection evicts the record but the worker becomes registry-only, not
+    // unrevisable: the history file must survive it (only prune/reap retire
+    // it), so a later steer can still revise the same id and branch.
+    let dir = scratch_dir("collect-keeps-history");
+    let _scope = ScopedTempDir::set(&dir);
+    let repo = scratch_repo("collect-keeps-history");
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let mut done = running_worker("keep1");
+    done.state = WorkerState::Completed {
+        turns: 1,
+        diff: String::new(),
+        summary: "done".to_string(),
+        completed_at: 0,
+        artifacts: Vec::new(),
+        branch: Some("worker-keep1".to_string()),
+        verified: None,
+        metrics: WorkerMetrics::default(),
+        revision: 0,
+    };
+    pool.__test_insert_worker(done).await;
+    let history = sample_history(&repo, "abc123", "worker-keep1");
+    mini_swe_mcp::pool::save_worker_history("keep1", &history).expect("save history");
+    pool.collect("keep1").await.expect("collect the worker");
+    assert!(
+        mini_swe_mcp::pool::history_path("keep1").is_file(),
+        "collect must not delete the history file; only prune/reap retire it"
+    );
+    mini_swe_mcp::pool::remove_worker_history("keep1");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[tokio::test]
 async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     // The branch the orchestrator reviewed is gone: the error names the
     // branch, not just the worker.

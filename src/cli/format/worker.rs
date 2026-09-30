@@ -616,9 +616,12 @@ mod tests {
     #[test]
     fn test_finished_views_render_the_next_step_guidance() {
         let next = "Review the diff (collect) and run the project's checks.";
-        let payload = format!(
-            "{{"worker_id":"w","state":{{"state":"Completed","details":{{"turns":3,"summary":"done"}}}},"next_step":"{next}"}}"
-        );
+        let payload = serde_json::json!({
+            "worker_id": "w",
+            "state": {"state": "Completed", "details": {"turns": 3, "summary": "done"}},
+            "next_step": next,
+        })
+        .to_string();
         assert!(
             format_status(&v(&payload)).ends_with(&format!("Next step: {next}")),
             "status must end with the guidance: {}",

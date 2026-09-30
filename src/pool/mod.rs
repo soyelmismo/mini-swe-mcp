@@ -690,9 +690,9 @@ impl WorkerPool {
             record
         };
         self.worktrees.write().await.remove(id);
-        // Collection ends the worker's reviewable life: the terminal payload
-        // travels with the response, so the saved conversation is retired too.
-        remove_worker_history(id);
+        // The saved conversation stays: a collected worker is registry-only
+        // from here on, and steering it must still revise it (same id, same
+        // branch, full context). Only prune/reap retire the history file.
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         let dropped = record.logs.dropped();
         let view = emit_view(&record.logs, self.log_policy.max_emitted);

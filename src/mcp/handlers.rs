@@ -293,6 +293,12 @@ impl McpServer {
             Ok(json!({ "worker_id": wid, "state": state, "next_step": next_step }))
         } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
             let state_name = entry.status.display_name();
+            // A registry-only terminal row (collected worker, restarted hub)
+            // carries the same review guidance as the live path.
+            let next_step = entry
+                .status
+                .is_terminal()
+                .then(|| crate::pool::next_step_for(None));
             Ok(json!({
                 "worker_id": wid,
                 "task": entry.task,
@@ -310,7 +316,8 @@ impl McpServer {
                         "started_at": entry.started_at,
                         "metrics": entry.metrics,
                     }
-                }
+                },
+                "next_step": next_step,
             }))
         } else {
             anyhow::bail!("Worker not found: {wid}")

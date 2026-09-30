@@ -273,7 +273,7 @@ impl super::WorkerPool {
 
         let pool = self.clone();
         let wid = id.to_string();
-        let history_for_run = history.clone();
+        let base_commit = history.base_commit.clone();
         let model_for_fail = history.model.clone();
         let meta = super::WorkerMeta {
             id: wid.clone(),
@@ -295,7 +295,7 @@ impl super::WorkerPool {
             network_offline: history.network_offline,
             verify: history.verify.clone(),
             resume_messages: Some(history.messages),
-            resume_base_commit: Some(history_for_run.base_commit.clone()),
+            resume_base_commit: Some(base_commit.clone()),
         };
         let handle = tokio::spawn(async move {
             if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
@@ -321,8 +321,24 @@ impl super::WorkerPool {
             }
         }
         // The revision's launch is what a re-attached `status` reports until
-        // the first turn writes its own row.
-        history_for_run.save_revision_status(id, revision, max_turns);
+        // the first turn writes its own row (`history.messages` moved into the
+        // launch above, so the row is rebuilt from the surviving fields).
+        WorkerHistory {
+            task: history.task.clone(),
+            group: history.group.clone(),
+            model: history.model.clone(),
+            temperature: history.temperature,
+            repo_path: history.repo_path.clone(),
+            base_commit: base_commit.clone(),
+            branch: history.branch.clone(),
+            network_offline: history.network_offline,
+            verify: history.verify.clone(),
+            max_turns,
+            review_after: history.review_after.clone(),
+            revision,
+            messages: Vec::new(),
+        }
+        .save_revision_status(id, revision, max_turns);
         tracing::info!(worker = %id, revision, max_turns, "Worker revision started");
         Ok(())
     }
