@@ -203,6 +203,12 @@ impl RegistryWriter {
         self.rows.remove(worker_id);
         self.last_write.remove(worker_id);
     }
+
+    /// Forget the last-write timestamp of one row (test support).
+    #[doc(hidden)]
+    pub fn reset_throttle(&mut self, worker_id: &str) {
+        self.last_write.remove(worker_id);
+    }
 }
 
 pub fn extract_group(task: &str) -> Option<String> {

@@ -1057,6 +1057,50 @@ fn can_create_network_namespace() -> bool {
 // `wait`: re-attaching to a worker, and the wait heartbeat
 // ----------
 
+/// A waiter blocked in `await_worker_result_until` returns within ~100 ms of a
+/// synthetic state change, proving the wait sleeps on the pool's change
+/// subscription rather than on a fixed tick.
+#[tokio::test]
+async fn a_blocked_wait_returns_promptly_on_a_state_change() {
+    use std::time::{Duration, Instant};
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("wait-test-wakes")).await;
+    let server = McpServer::new(pool.clone(), "ninja".to_string());
+
+    let waiter = tokio::spawn(async move {
+        server
+            .await_worker_result_until("wait-test-wakes", 10, None, None, None)
+            .await
+    });
+    // Let the waiter reach its sleep; then pause the worker behind it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let changed_at = Instant::now();
+    pool.__test_set_worker_state(
+        "wait-test-wakes",
+        WorkerState::Paused {
+            question: "which branch?".to_string(),
+            step: 2,
+            paused_at: 0,
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the waiter must answer")
+        .expect("the waiter task stays alive")
+        .expect("a paused worker answers needs_input");
+    assert_eq!(result["worker_id"], "wait-test-wakes");
+    assert_eq!(result["status"], "needs_input");
+    assert_eq!(result["question"], "which branch?");
+    // ~100 ms is the bar; 500 ms of scheduling slack keeps the assertion
+    // honest on a loaded host without weakening it into the old 500 ms tick.
+    assert!(
+        changed_at.elapsed() < Duration::from_millis(500),
+        "the waiter took {:?} to observe the change; it must wake on the notification",
+        changed_at.elapsed()
+    );
+}
+
 /// A synthetic pool record: the `worker` verb table is exercised here without
 /// dispatching an LLM-backed worker, exactly like the pool's own tests do.
 fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {

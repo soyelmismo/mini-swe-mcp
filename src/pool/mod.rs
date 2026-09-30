@@ -386,6 +386,33 @@ impl WorkerPool {
         self.update_worker(id, |worker| worker.state = state).await;
     }
 
+    /// Route one registry write through the coalescing writer (test support).
+    #[doc(hidden)]
+    pub fn __test_save_status(
+        &self,
+        meta: &WorkerMeta,
+        model: &str,
+        status: RegistryStatus,
+        step: usize,
+        max_turns: usize,
+        last_command: &str,
+        question: Option<String>,
+    ) {
+        self.save_status(meta, model, status, step, max_turns, last_command, question);
+    }
+
+    /// Forget the last-write timestamp of `id`'s row (test support).
+    ///
+    /// Lets a test drive the coalescing writer past its throttle window
+    /// without sleeping for it.
+    #[doc(hidden)]
+    pub fn __test_reset_registry_throttle(&self, id: &str) {
+        self.registry
+            .lock()
+            .expect("registry lock poisoned")
+            .reset_throttle(id);
+    }
+
     /// Lightweight snapshot for progress waiters.
     ///
     /// Clones only the small strings needed to render progress and never the
