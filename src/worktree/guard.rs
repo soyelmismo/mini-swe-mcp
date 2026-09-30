@@ -749,9 +749,7 @@ impl WorktreeGuard {
         })
         .unwrap_or(false)
     }
-}
 
-impl WorktreeGuard {
     /// The worker id this guard belongs to, recovered from the worktree
     /// directory name (`swe-wt-<id>`): the sweep logs it, and the id is not
     /// stored on the guard.

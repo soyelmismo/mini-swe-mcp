@@ -45,6 +45,10 @@ const MAX_ANCESTORS: usize = 64;
 ///
 /// One log line is emitted per sweep that killed something, so a leak stays
 /// visible in the worker's log instead of silently burning CPU somewhere else.
+///
+/// The whole call is bounded by [`TERM_GRACE`] plus [`KILL_GRACE`], which is
+/// what makes it safe to run from a `Drop`: a worker's teardown already blocks
+/// on `git`, and half a second more is the price of not leaving a build behind.
 pub(crate) fn sweep_worker_processes(worker_id: &str, dirs: &[PathBuf]) -> usize {
     let targets = processes_in_dirs(dirs);
     if targets.is_empty() {
@@ -109,6 +113,10 @@ pub fn processes_in_dirs(dirs: &[PathBuf]) -> Vec<u32> {
 /// group leader has already been reaped, so nothing pins the group id any more
 /// and a recycled id must never be mistaken for this one.
 pub(crate) fn process_group_members(pgid: u32) -> Vec<u32> {
+    // A pgid of 0 is "no group known", never a group to look for.
+    if pgid == 0 {
+        return Vec::new();
+    }
     process_pids()
         .into_iter()
         .filter(|pid| process_group_of(*pid) == Some(pgid))
