@@ -162,6 +162,10 @@ fn a_worker_step_is_confined_without_bubblewrap() {
         .arg("--nocapture")
         .env(EXEC_PROBE_ENV, "1")
         .env("PATH", &sanitized)
+        // An inherited override (this suite running inside a worker step)
+        // would replace the probe's own target with one that encloses the
+        // file outside its domain.
+        .env_remove("CARGO_TARGET_DIR")
         .env("LL_WORKTREE", &roots.worktree)
         .env("LL_TARGET", &roots.target)
         .env("LL_OUTSIDE", &secret)

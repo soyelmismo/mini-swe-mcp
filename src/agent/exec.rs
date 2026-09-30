@@ -590,6 +590,10 @@ fn apply_build_env(cmd: &mut Command, target_dir: &Path, tmp_dir: &Path, paralle
         .env("TMPDIR", tmp_dir)
         .env("TMP", tmp_dir)
         .env("TEMP", tmp_dir)
+        // A mini-swe run nested inside the step (this crate's own test suite,
+        // or a worker driving the CLI) keeps its scratch data there too:
+        // the default `/var/tmp` is outside every sandbox's writable set.
+        .env("SWE_TEMP_DIR", tmp_dir)
         .env("CARGO_BUILD_JOBS", parallelism)
         .env("RUST_TEST_THREADS", parallelism)
         .env("NEXTEST_TEST_THREADS", parallelism)
@@ -1870,6 +1874,24 @@ mod tests {
         assert_eq!(choose_backend(false, false, no, no), Unconfined);
     }
 
+    /// A step's temp and nested-scratch variables point at one private dir the
+    /// sandbox lets it write, whichever backend confines it.
+    #[tokio::test]
+    async fn a_step_gets_a_writable_private_scratch_dir() {
+        let tmp = crate::worktree::swe_base_dir().join("exec-scratch-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let (out, code) = runner()
+            .execute_bash(
+                &tmp,
+                r#"[ "$TMPDIR" = "$SWE_TEMP_DIR" ] && mkdir -p "$SWE_TEMP_DIR/nested" && touch "$TMPDIR/probe" && echo scratch-ok"#,
+            )
+            .await
+            .expect("the probe must spawn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(code, Some(0), "{out:?}");
+        assert!(out.contains("scratch-ok"), "{out:?}");
+    }
+
     /// Run a python snippet under the kernel backend and return its stdout.
     ///
     /// Python's `ctypes` issues raw syscalls, which is the only way to check
@@ -1969,11 +1991,15 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             "unix sockets stay usable:\n{offline}"
         );
 
-        let online = run_confined_python(false, "seccomp-online", script).await;
-        assert!(
-            online.lines().any(|l| l == "tcp4 ok"),
-            "online workers keep inet sockets:\n{online}"
-        );
+        // The online half only means something where this process may open
+        // INET sockets itself (not, say, inside an offline worker step).
+        if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
+            let online = run_confined_python(false, "seccomp-online", script).await;
+            assert!(
+                online.lines().any(|l| l == "tcp4 ok"),
+                "online workers keep inet sockets:\n{online}"
+            );
+        }
     }
 
     /// A confined command still runs, and it still gets its own process group
