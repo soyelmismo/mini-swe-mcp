@@ -943,6 +943,18 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     ).unwrap();
     // Interrupted, not failed: the worker stopped because the hub did, and its
     // conversation survived, so the steer below continues it.
+    if recovered.status != mini_swe_mcp::pool::RegistryStatus::Interrupted {
+        let state = std::fs::read_to_string(format!("/proc/{}/status", recovered.pid))
+            .ok()
+            .and_then(|raw| raw.lines().find(|l| l.starts_with("State:")).map(str::to_string));
+        eprintln!(
+            "DBG first_pid={:?} entry_pid={} alive={} state={:?}",
+            first.id(),
+            recovered.pid,
+            mini_swe_mcp::worktree::is_process_alive(recovered.pid),
+            state
+        );
+    }
     assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Interrupted);
     assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
     let out = tokio::time::timeout(std::time::Duration::from_secs(15),
