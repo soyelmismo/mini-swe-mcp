@@ -84,12 +84,11 @@ Configuration resolution follows a 4-tier cascading precedence:
 3. `.env` alongside the executable
 4. Custom path specified via `ENV_FILE=/path/to/.env`
 
-Required environment variables:
+Environment variables (only `OPENAI_API_KEY` is required):
 ```bash
 OPENAI_API_KEY=sk-...
 OPENAI_API_BASE=https://api.openai.com/v1   # Optional, default: https://api.openai.com/v1
 DEFAULT_MODEL=ninja                         # Optional, default: ninja
-OPENAI_API_KEY=sk-...
 MAX_CONCURRENT_WORKERS=64                   # Optional, default: 64
 BASH_CONCURRENT_LIMIT=4                     # Optional, default: one slot per worker
 BASH_BUILD_LIMIT=2                          # Optional, default: cores / 2
