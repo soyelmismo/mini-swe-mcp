@@ -4,7 +4,9 @@
 //! and `reap` — the actions that answer about one worker (or, for `reap`, about
 //! a set of terminal workers) rather than about the system catalog.
 //! [`log_counters_line`] is the shared counter/notice line that `collect` and
-//! `logs` both append so step-log truncation is never silent (audit 07, R7).
+//! `logs` both append so step-log truncation is never silent (audit 07, R7), and
+//! [`health_line`] is the per-worker health line `status`, `collect` and
+//! `dispatch --wait` append so a run can be graded, not just read.
 //!
 //! Every function here is a pure function over [`serde_json::Value`]: no I/O,
 //! no state, no formatting knobs. That is what keeps them unit-testable and
@@ -46,6 +48,87 @@ pub fn log_counters_line(val: &serde_json::Value) -> String {
         return "no step logs".to_string();
     }
     parts.join(" | ")
+}
+
+/// The `metrics` object a payload carries, wherever it sits in the shape.
+///
+/// `status`, `collect` and `dispatch --wait` all report the worker's
+/// `WorkerState`, whose metrics live inside the enum's `details`; the keyed
+/// form (`{"Completed": {...}}`) used by a few payloads nests them one level
+/// deeper, and a flattened payload carries them at the top.
+fn metrics_of(val: &serde_json::Value) -> Option<&serde_json::Value> {
+    let state = val.get("state");
+    if let Some(metrics) = state.and_then(|s| s.get("metrics")) {
+        return Some(metrics);
+    }
+    if let Some(metrics) = state
+        .and_then(|s| s.get("details"))
+        .and_then(|d| d.get("metrics"))
+    {
+        return Some(metrics);
+    }
+    if let Some(metrics) = ["Completed", "Failed", "Running", "Paused"]
+        .iter()
+        .find_map(|tag| state.and_then(|s| s.get(tag)).and_then(|d| d.get("metrics")))
+    {
+        return Some(metrics);
+    }
+    val.get("metrics")
+}
+
+/// One compact line of per-worker health, or `None` when there is nothing to
+/// report.
+///
+/// Omitted for a payload with no metrics and for an all-zero set, which is what
+/// a registry row written before the counters existed carries: a view must not
+/// dress an unmeasured run up as a healthy one.
+pub fn health_line(val: &serde_json::Value) -> Option<String> {
+    let metrics = metrics_of(val)?;
+    let count = |key: &str| metrics.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let (turns, granted, refused) = (count("turns_used"), count("extensions_granted"), count("extensions_refused"));
+    let (repeats, nudges, pauses) = (count("repeat_blocks"), count("stagnation_nudges"), count("loop_pauses"));
+    let (verify_runs, verify_failures) = (count("verify_runs"), count("verify_failures"));
+    let (files, insertions, deletions) = (
+        count("diff_files"),
+        count("diff_insertions"),
+        count("diff_deletions"),
+    );
+    if turns == 0
+        && granted == 0
+        && refused == 0
+        && repeats == 0
+        && nudges == 0
+        && pauses == 0
+        && verify_runs == 0
+        && files == 0
+        && insertions == 0
+        && deletions == 0
+    {
+        return None;
+    }
+
+    let plural = |n: u64, word: &str| {
+        format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+    };
+    let mut parts = vec![
+        plural(turns, "turn"),
+        format!("+{granted}/-{refused} ext"),
+        plural(repeats, "repeat"),
+        plural(nudges, "nudge"),
+    ];
+    if pauses > 0 {
+        parts.push(plural(pauses, "loop pause"));
+    }
+    if verify_runs > 0 {
+        parts.push(format!("verify {verify_failures}/{verify_runs} failed"));
+    }
+    if files > 0 {
+        parts.push(format!(
+            "diff {} +{insertions}/-{deletions}",
+            plural(files, "file")
+        ));
+    }
+    Some(format!("Health: {}", parts.join(", ")))
 }
 
 pub fn format_status(val: &serde_json::Value) -> String {
@@ -101,6 +184,10 @@ pub fn format_status(val: &serde_json::Value) -> String {
             }
         }
     }
+    if let Some(health) = health_line(val) {
+        out.push_str(&health);
+        out.push('\n');
+    }
     out.trim_end().to_string()
 }
 
@@ -129,10 +216,11 @@ pub fn format_collect(val: &serde_json::Value) -> String {
         .unwrap_or("");
 
     let counters = log_counters_line(val);
+    let health = health_line(val).map(|h| format!("\n{h}")).unwrap_or_default();
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.\n{counters}")
+        format!("Worker {wid}: No git diff produced.\n{counters}{health}")
     } else {
-        format!("{diff}\n{counters}")
+        format!("{diff}\n{counters}{health}")
     }
 }
 
@@ -180,6 +268,7 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
         format!("✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress.")
     } else {
+        let health = health_line(val);
         let mut out = format!("✓ Worker {wid} finished.\n");
         if let Some(state) = val.get("state") {
             let state_name = state.get("state").and_then(|v| v.as_str()).unwrap_or("");
@@ -207,6 +296,9 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                     let list: Vec<&str> = artifacts.iter().filter_map(|a| a.as_str()).collect();
                     out.push_str(&format!("Preserved Artifacts: {}\n", list.join(", ")));
                 }
+                if let Some(health) = &health {
+                    out.push_str(&format!("{health}\n"));
+                }
                 if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(|v| v.as_str())
                     && !diff.trim().is_empty()
                 {
@@ -216,6 +308,9 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                 out.push_str("State: Failed\n");
                 if let Some(err) = details.and_then(|d| d.get("error")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Error: {err}\n"));
+                }
+                if let Some(health) = &health {
+                    out.push_str(&format!("{health}\n"));
                 }
             }
         }
@@ -363,6 +458,90 @@ mod tests {
             r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3}}}"#,
         ));
         assert!(!unflagged.contains("Verified"), "{unflagged}");
+    }
+
+    #[test]
+    fn test_health_line_renders_every_measured_counter() {
+        let line = health_line(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"metrics":{
+                 "turns_used":142,"extensions_granted":0,"extensions_refused":0,
+                 "repeat_blocks":3,"stagnation_nudges":1,"loop_pauses":0,
+                 "verify_runs":2,"verify_failures":1,
+                 "diff_files":5,"diff_insertions":120,"diff_deletions":340}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            line,
+            "Health: 142 turns, +0/-0 ext, 3 repeats, 1 nudge, verify 1/2 failed, diff 5 files +120/-340"
+        );
+    }
+
+    #[test]
+    fn test_health_line_reports_the_rare_counters_only_when_they_happened() {
+        let clean = health_line(&v(
+            r#"{"state":{"details":{"metrics":{"turns_used":7,"diff_files":1,
+                 "diff_insertions":4,"diff_deletions":0}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            clean,
+            "Health: 7 turns, +0/-0 ext, 0 repeats, 0 nudges, diff 1 file +4/-0"
+        );
+
+        let looping = health_line(&v(
+            r#"{"state":{"Failed":{"metrics":{"turns_used":9,"extensions_granted":3,
+                 "extensions_refused":1,"repeat_blocks":3,"loop_pauses":1,
+                 "verify_runs":3,"verify_failures":3}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            looping,
+            "Health: 9 turns, +3/-1 ext, 3 repeats, 0 nudges, 1 loop pause, verify 3/3 failed"
+        );
+    }
+
+    #[test]
+    fn test_health_line_is_omitted_when_nothing_was_measured() {
+        // No metrics at all: a payload from a build that did not record them.
+        assert_eq!(health_line(&v(r#"{"worker_id":"w","state":"Running"}"#)), None);
+        // Metrics present but untouched: a worker killed before its first turn.
+        assert_eq!(health_line(&v(r#"{"state":{"details":{"metrics":{}}}}"#)), None);
+        assert_eq!(
+            health_line(&v(
+                r#"{"state":{"state":"Failed","details":{"metrics":{"turns_used":0,"repeat_blocks":0}}}}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_the_worker_views_append_the_health_line() {
+        let payload = r#"{"worker_id":"w","state":{"state":"Completed","details":{
+                       "turns":3,"summary":"done","diff":"--- a","total_steps":3,
+                       "metrics":{"turns_used":3,"repeat_blocks":1}}}}"#;
+        assert!(
+            format_status(&v(payload)).ends_with("Health: 3 turns, +0/-0 ext, 1 repeat, 0 nudges"),
+            "status must end with the health line: {}",
+            format_status(&v(payload))
+        );
+        assert!(
+            format_collect(&v(payload)).ends_with("Health: 3 turns, +0/-0 ext, 1 repeat, 0 nudges"),
+            "collect must end with the health line: {}",
+            format_collect(&v(payload))
+        );
+        let dispatched = format_dispatch(&v(payload));
+        assert!(
+            dispatched.contains("\nHealth: 3 turns, +0/-0 ext, 1 repeat, 0 nudges\n\nDiff:\n"),
+            "dispatch --wait must report health before the diff: {dispatched}"
+        );
+        // A failed worker reports what it measured too.
+        let failed = format_dispatch(&v(
+            r#"{"worker_id":"w","state":{"Failed":{"error":"boom","metrics":{"turns_used":4}}}}"#,
+        ));
+        assert!(
+            failed.ends_with("Health: 4 turns, +0/-0 ext, 0 repeats, 0 nudges"),
+            "{failed}"
+        );
     }
 
     #[test]

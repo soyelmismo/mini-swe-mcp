@@ -262,6 +262,7 @@ impl McpServer {
                         "question": entry.question,
                         "pid": entry.pid,
                         "started_at": entry.started_at,
+                        "metrics": entry.metrics,
                     }
                 }
             }))

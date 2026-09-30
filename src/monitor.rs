@@ -477,12 +477,19 @@ fn stack_row(
         pad_visible(&format!("{:<width$}", w.pid, width = layout.pid), layout.pid),
         turns_cell(w.step, w.max_turns, layout),
     );
-    let second = format!(
+    let mut second = format!(
         "{}  {}  {}",
         pad_visible(status, layout.status),
         pad_visible(&w.model, layout.model),
         pad_visible(&format_duration(duration_secs), layout.uptime),
     );
+    // Health counters ride the label line, which has room the inline row does
+    // not — but only whole: a cell that would overflow the terminal is
+    // dropped rather than clipped, so the row stays readable.
+    let health = w.metrics.repeat_nudge_cell();
+    if visible_width(&second) + 2 + visible_width(&health) <= layout.total {
+        second = format!("{}  {health}", second.trim_end());
+    }
     let mut out = String::new();
     out.push_str(&first);
     out.push('\n');
@@ -946,6 +953,7 @@ pub async fn run_monitor(once: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::WorkerMetrics;
 
     /// Builder for registry rows: the tests below touch every field, so a
     /// positional 8-argument helper would be unreadable.
@@ -958,6 +966,7 @@ mod tests {
         task: String,
         group: Option<&'static str>,
         repo: Option<&'static str>,
+        metrics: WorkerMetrics,
         updated_at: u64,
     }
 
@@ -972,6 +981,7 @@ mod tests {
                 task: String::new(),
                 group: None,
                 repo: None,
+                metrics: WorkerMetrics::default(),
                 updated_at: 1050,
             }
         }
@@ -1012,6 +1022,12 @@ mod tests {
             self
         }
 
+        fn metrics(mut self, repeat_blocks: usize, stagnation_nudges: usize) -> Self {
+            self.metrics.repeat_blocks = repeat_blocks;
+            self.metrics.stagnation_nudges = stagnation_nudges;
+            self
+        }
+
         fn build(self) -> WorkerRegistryEntry {
             WorkerRegistryEntry {
                 id: self.id.into(),
@@ -1027,6 +1043,7 @@ mod tests {
                 updated_at: self.updated_at,
                 group: self.group.map(str::to_string),
                 repo_path: self.repo.map(str::to_string),
+                metrics: self.metrics,
             }
         }
     }
@@ -1415,6 +1432,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The stacked row has room the inline row does not, so the repeat/nudge
+    /// counts ride its label line — and never overflow it.
+    #[test]
+    fn test_stacked_row_carries_the_repeat_and_nudge_counts() {
+        let entries = vec![Row::new("health01")
+            .task("Refactor the authentication middleware into smaller pieces")
+            .command("cargo test --all")
+            .metrics(3, 1)
+            .repo("local")
+            .build()];
+
+        let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
+        assert!(
+            text.contains("3 repeats, 1 nudge"),
+            "the stacked row must show the health counters:\n{text}"
+        );
+        for line in text.lines() {
+            assert!(
+                visible_width(line) <= MIN_TERMINAL_WIDTH,
+                "line overflows the terminal width: {line:?}"
+            );
+        }
+
+        // The inline row has no room for a new column, so it shows none.
+        let inline = render_dashboard_with_width(&entries, 1060, false, 200);
+        assert!(!inline.contains("repeats"), "{inline}");
     }
 
     #[test]

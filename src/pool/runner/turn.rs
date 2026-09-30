@@ -89,6 +89,62 @@ fn repository_sample(path: &Path) -> Option<String> {
     ))
 }
 
+/// Read a `git diff --shortstat` line as `(files, insertions, deletions)`.
+///
+/// Git pluralises by count (`1 file changed`) and omits a section entirely when
+/// it is zero (`2 files changed, 3 insertions(+)`), so each count is taken from
+/// the part naming it and a missing part is zero. `None` when the line carries
+/// no count at all, so an empty or unreadable diff is never reported as a
+/// measured one.
+pub(super) fn parse_shortstat(line: &str) -> Option<(usize, usize, usize)> {
+    let (mut files, mut insertions, mut deletions) = (None, None, None);
+    for part in line.split(',') {
+        let part = part.trim();
+        let (digits, rest) = match part.find(|c: char| !c.is_ascii_digit()) {
+            Some(end) => part.split_at(end),
+            None => (part, ""),
+        };
+        let Ok(count) = digits.parse::<usize>() else {
+            continue;
+        };
+        if rest.contains("file") {
+            files = Some(count);
+        } else if rest.contains("insertion") {
+            insertions = Some(count);
+        } else if rest.contains("deletion") {
+            deletions = Some(count);
+        }
+    }
+    let files = files.or(insertions).or(deletions)?;
+    Some((files, insertions.unwrap_or(0), deletions.unwrap_or(0)))
+}
+
+/// Size of the worker's final diff, taken with the same git helper the
+/// detectors sample the repository with.
+///
+/// The base commit is the one the worktree was created from, so checkpoint
+/// commits along the way and the still-uncommitted tail are counted together.
+/// `git` is a blocking subprocess, so the sample runs off the runtime thread,
+/// and `None` means "not measured", never "measured as empty".
+pub(super) async fn shortstat_of(path: &Path, base: &str) -> Option<(usize, usize, usize)> {
+    let path = path.to_path_buf();
+    let base = if base.is_empty() {
+        "HEAD".to_string()
+    } else {
+        base.to_string()
+    };
+    let output = tokio::task::spawn_blocking(move || {
+        git(&path, "diff --shortstat", &["diff", "--shortstat", &base])
+    })
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_shortstat(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Cross-turn state of the two loop detectors.
 ///
 /// Owned by the phase loop and lent to every turn, because `TurnEngine` is
@@ -183,11 +239,10 @@ pub(super) struct TurnEngine<'a> {
     pub worktree: &'a mut WorktreeGuard,
     pub runner: &'a AgentRunner,
     pub worker_id: &'a str,
-    pub task: &'a str,
-    pub group: &'a str,
-    pub repo_path_str: &'a str,
-    pub started_at_ts: u64,
-    pub meta: &'a WorkerMeta,
+    /// The worker's registry row: it carries the worker's identity *and* the
+    /// run's health counters, so every guard below moves its counter here, at
+    /// the point it fires, and the row is written from the same struct.
+    pub meta: &'a mut WorkerMeta,
     pub messages: &'a mut Vec<ChatMessage>,
     pub step: &'a mut usize,
     pub current_max_turns: &'a mut usize,
@@ -196,8 +251,6 @@ pub(super) struct TurnEngine<'a> {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<&'a str>,
-    /// Number of consecutive failed verification runs for this phase.
-    pub verify_failures: &'a mut usize,
     /// The budget the dispatch was given, the base the self-grant cap is
     /// measured from (`current_max_turns` moves as the worker extends it).
     pub dispatch_max_turns: usize,
@@ -298,11 +351,8 @@ impl<'a> TurnEngine<'a> {
                                 step: *self.step,
                                 max_turns: *self.current_max_turns,
                                 last_command: &format!("paused_on_error: {e}"),
-                                task: self.task,
                                 model: config.model,
-                                group: self.group,
-                                repo_path_str: self.repo_path_str,
-                                started_at_ts: self.started_at_ts,
+                                meta: self.meta,
                             })
                             .await?;
 
@@ -376,15 +426,19 @@ impl<'a> TurnEngine<'a> {
         // --- In-memory state update ---
         {
             let mut lock = self.pool.workers.write().await;
-            if let Some(w) = lock.get_mut(self.worker_id)
-                && let WorkerState::Running {
+            if let Some(w) = lock.get_mut(self.worker_id) {
+                // Same critical section refreshes the cached metrics, so a kill
+                // racing this turn still reports the counters up to it.
+                w.metrics = self.meta.metrics;
+                if let WorkerState::Running {
                     step: ref mut s,
                     ref mut last_command,
                     ..
                 } = w.state
-            {
-                *s = *self.step;
-                *last_command = label.clone();
+                {
+                    *s = *self.step;
+                    *last_command = label.clone();
+                }
             }
         }
 
@@ -410,6 +464,7 @@ impl<'a> TurnEngine<'a> {
         // burns a turn and returns the output the history already carries, so
         // the command is answered without being executed.
         if let Some(blocks) = self.watch.register_command(&cmd_str) {
+            self.meta.metrics.repeat_blocks += 1;
             warn!(
                 worker = %self.worker_id,
                 step = *self.step,
@@ -448,6 +503,7 @@ impl<'a> TurnEngine<'a> {
                 if requested_max <= self.dispatch_max_turns + budget {
                     let old_max = *self.current_max_turns;
                     *self.current_max_turns = requested_max;
+                    self.meta.metrics.extensions_granted += additional;
                     info!(
                         worker = %self.worker_id,
                         requested = additional,
@@ -458,6 +514,7 @@ impl<'a> TurnEngine<'a> {
                         "Subagent requested turn extension; granted"
                     );
                 } else {
+                    self.meta.metrics.extensions_refused += 1;
                     warn!(
                         worker = %self.worker_id,
                         requested = additional,
@@ -485,11 +542,8 @@ impl<'a> TurnEngine<'a> {
                         step: *self.step,
                         max_turns: *self.current_max_turns,
                         last_command: &cmd_summary,
-                        task: self.task,
                         model: config.model,
-                        group: self.group,
-                        repo_path_str: self.repo_path_str,
-                        started_at_ts: self.started_at_ts,
+                        meta: self.meta,
                     })
                     .await?;
 
@@ -555,6 +609,7 @@ impl<'a> TurnEngine<'a> {
             return Ok(TurnOutcome::Completed { verified: None });
         };
 
+        self.meta.metrics.verify_runs += 1;
         let (output, code) = self.run_gated(verify).await?;
 
         let exit = code.unwrap_or(-1);
@@ -566,8 +621,8 @@ impl<'a> TurnEngine<'a> {
         // the model so it can fix the problems before completing again. After
         // three failed verifications the worker completes anyway, flagged
         // unverified.
-        *self.verify_failures += 1;
-        if *self.verify_failures >= 3 {
+        self.meta.metrics.verify_failures += 1;
+        if self.meta.metrics.verify_failures >= 3 {
             return Ok(TurnOutcome::Completed { verified: Some(false) });
         }
         let label = format!("[verify] {}", summarize_command(verify));
@@ -612,6 +667,7 @@ impl<'a> TurnEngine<'a> {
             return Ok(TurnOutcome::EndReview);
         }
 
+        self.meta.metrics.loop_pauses += 1;
         let question = format!(
             "Repetition loop: `{cmd_summary}` was blocked {blocks} turns in a row (byte-identical to the previous turn's command, output unchanged). The worker is not making progress; guide it to a different action."
         );
@@ -623,11 +679,8 @@ impl<'a> TurnEngine<'a> {
                 step: *self.step,
                 max_turns: *self.current_max_turns,
                 last_command: cmd_summary,
-                task: self.task,
                 model: config.model,
-                group: self.group,
-                repo_path_str: self.repo_path_str,
-                started_at_ts: self.started_at_ts,
+                meta: self.meta,
             })
             .await?;
 
@@ -690,6 +743,7 @@ impl<'a> TurnEngine<'a> {
         if self.watch.record_sample(sample) < STAGNATION_TURNS_LIMIT {
             return;
         }
+        self.meta.metrics.stagnation_nudges += 1;
         warn!(
             worker = %self.worker_id,
             step = *self.step,
@@ -809,7 +863,7 @@ impl<'a> TurnEngine<'a> {
 mod tests {
     use super::{
         MAX_TURNS_LIMIT, ProgressWatch, REPEAT_BLOCK_LIMIT, STAGNATION_SAMPLE_TURNS,
-        extension_budget,
+        extension_budget, parse_shortstat,
     };
 
     #[test]
@@ -882,6 +936,21 @@ mod tests {
             0,
             "any change, including a commit, resets the streak"
         );
+    }
+
+    #[test]
+    fn a_shortstat_line_yields_files_insertions_and_deletions() {
+        assert_eq!(
+            parse_shortstat(" 5 files changed, 120 insertions(+), 340 deletions(-)"),
+            Some((5, 120, 340))
+        );
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 2 insertions(+)"),
+            Some((1, 2, 0)),
+            "git omits a zero section and singularises the rest"
+        );
+        assert_eq!(parse_shortstat(""), None);
+        assert_eq!(parse_shortstat(" no diff "), None);
     }
 
     #[test]

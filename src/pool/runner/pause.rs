@@ -19,18 +19,17 @@ use super::super::unix_timestamp;
 /// Everything needed to park a worker on an orchestrator question and wait.
 ///
 /// `last_command` is the command that carried the sentinel, so the registry
-/// keeps showing what the worker was doing while it waits.
+/// keeps showing what the worker was doing while it waits. `meta` is the
+/// worker's registry row, so a pause is written with the same identity — and
+/// the same health counters — as every other status update of the run.
 pub struct PauseRequest<'a> {
     pub worker_id: &'a str,
     pub question: &'a str,
     pub step: usize,
     pub max_turns: usize,
     pub last_command: &'a str,
-    pub task: &'a str,
     pub model: &'a str,
-    pub group: &'a str,
-    pub repo_path_str: &'a str,
-    pub started_at_ts: u64,
+    pub meta: &'a WorkerMeta,
 }
 
 impl WorkerPool {
@@ -49,11 +48,8 @@ impl WorkerPool {
             step,
             max_turns,
             last_command,
-            task,
             model,
-            group,
-            repo_path_str,
-            started_at_ts,
+            meta,
         } = req;
 
         let worker_id = worker_id.to_string();
@@ -76,14 +72,6 @@ impl WorkerPool {
             }
         }
 
-        let meta = WorkerMeta {
-            id: worker_id.clone(),
-            task: task.to_string(),
-            group: Some(group.to_string()),
-            repo_path: Some(repo_path_str.to_string()),
-            started_at: started_at_ts,
-            pid: std::process::id(),
-        };
         meta.save_status(
             model,
             RegistryStatus::Paused,
