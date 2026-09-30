@@ -398,6 +398,109 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
     drop(guard);
 }
 
+/// A seeded artifact is the worker's starting point, not its output. When the
+/// repo root's copy moves on while the worker runs (another worker's result
+/// merged, the user edited it), re-publishing the worker's untouched copy would
+/// silently revert that newer content.
+#[test]
+fn test_sync_never_reverts_a_newer_repo_file_the_worker_never_touched() {
+    let test_repo = TestRepo::new("no-revert");
+    let repo = test_repo.path();
+    std::fs::create_dir_all(repo.join("audits")).expect("failed to create audits dir in repo");
+    let repo_file = repo.join("audits/memory.md");
+    std::fs::write(&repo_file, "seeded v1\n").expect("failed to write seeded artifact");
+
+    let id = unique_worker_id("no-revert");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    assert!(
+        guard.path.join("audits/memory.md").exists(),
+        "the artifact was not seeded into the worktree"
+    );
+
+    // Another writer advances the repo root while the worker runs. The worker
+    // never reads or writes its seeded copy.
+    std::fs::write(&repo_file, "newer content from another worker\n")
+        .expect("failed to edit the repo artifact after seeding");
+
+    let synced = guard.sync_artifacts();
+    assert_eq!(
+        std::fs::read_to_string(&repo_file).expect("failed to read repo artifact"),
+        "newer content from another worker\n",
+        "the sync reverted a repo file that moved on after seeding"
+    );
+    // Skipping the copy is not the same as hiding the artifact: callers still
+    // get it in the reported list.
+    assert!(
+        synced.contains(&"audits/memory.md".to_string()),
+        "an inherited artifact must still be reported, got: {synced:?}"
+    );
+
+    drop(guard);
+    assert_eq!(
+        std::fs::read_to_string(&repo_file).expect("failed to read repo artifact"),
+        "newer content from another worker\n",
+        "the teardown sync reverted a repo file that moved on after seeding"
+    );
+}
+
+/// The other half of the rule: a seeded file the worker *did* edit is its
+/// output, and must reach the repo root even though the path was seeded.
+#[test]
+fn test_sync_publishes_a_seeded_file_the_worker_modified() {
+    let test_repo = TestRepo::new("edited-seed");
+    let repo = test_repo.path();
+    std::fs::create_dir_all(repo.join("reports")).expect("failed to create reports dir in repo");
+    let repo_file = repo.join("reports/status.md");
+    std::fs::write(&repo_file, "seeded v1\n").expect("failed to write seeded report");
+
+    let id = unique_worker_id("edited-seed");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+    std::fs::write(guard.path.join("reports/status.md"), "worker revision\n")
+        .expect("failed to edit the seeded report in the worktree");
+
+    let synced = guard.sync_artifacts();
+    assert!(
+        synced.contains(&"reports/status.md".to_string()),
+        "expected the edited artifact to be reported, got: {synced:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&repo_file).expect("failed to read synced report"),
+        "worker revision\n",
+        "the worker's edit to a seeded file was not synced"
+    );
+
+    drop(guard);
+}
+
+/// A path the worker invented was never seeded, so it has no fingerprint to
+/// match and always travels back to the repo root.
+#[test]
+fn test_sync_publishes_a_new_file_the_worker_created() {
+    let test_repo = TestRepo::new("new-artifact");
+    let repo = test_repo.path();
+    let id = unique_worker_id("new-artifact");
+    let guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    let audit_dir = guard.path.join("audits");
+    std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
+    std::fs::write(audit_dir.join("audit_new.md"), "# New audit\n")
+        .expect("failed to write the new artifact");
+
+    let synced = guard.sync_artifacts();
+    assert!(
+        synced.contains(&"audits/audit_new.md".to_string()),
+        "expected the new artifact to be reported, got: {synced:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("audits/audit_new.md"))
+            .expect("failed to read the new artifact"),
+        "# New audit\n",
+        "a file the worker created was not synced"
+    );
+
+    drop(guard);
+}
+
 #[test]
 fn test_sync_artifacts_never_mirrors_git_build_or_node_modules() {
     let test_repo = TestRepo::new("guards");
