@@ -1556,3 +1556,119 @@ fn agent_runners_share_one_http_client() {
         "runners must reuse one client so connections and TLS sessions are shared"
     );
 }
+
+// ----------
+// Heavy-command admission controller
+// ----------
+
+/// A slot is granted while the host is idle, and the job count divides the
+/// cores over the builds running after the grant.
+#[tokio::test]
+async fn admission_grants_with_job_count() {
+    use mini_swe_mcp::pool::{AdmissionController, HostSample};
+    let gate = AdmissionController::new(4, 4, 2048, 1536);
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(12_000),
+        load1: Some(1.0),
+    }));
+    let first = gate.acquire().await;
+    assert_eq!(first.jobs(), 4, "the first build owns the machine");
+    assert_eq!(gate.running_heavy(), 1);
+    let second = gate.acquire().await;
+    assert_eq!(second.jobs(), 2, "two builds split the cores");
+    drop(first);
+    drop(second);
+    assert_eq!(gate.running_heavy(), 0);
+}
+
+/// Two queued waiters are granted in the order they arrived: when one slot
+/// frees, the waiter queued first is the one admitted.
+#[tokio::test]
+async fn admission_waiters_are_granted_fifo() {
+    use mini_swe_mcp::pool::{AdmissionController, HostSample};
+    use std::sync::{Arc, Mutex};
+    let gate = AdmissionController::new(1, 4, 2048, 1536);
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(12_000),
+        load1: Some(0.5),
+    }));
+    let held = gate.acquire().await;
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let spawn_waiter = |tag: &'static str| {
+        let gate = gate.clone();
+        let order = order.clone();
+        tokio::spawn(async move {
+            let _permit = gate.acquire().await;
+            order.lock().expect("order lock poisoned").push(tag);
+        })
+    };
+    let first = spawn_waiter("first");
+    // The first waiter must be queued before the second arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let second = spawn_waiter("second");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(gate.waiting(), 2, "both waiters must be queued");
+
+    drop(held);
+    first.await.expect("first waiter completes");
+    // The first waiter drains before the second is even eligible.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    second.await.expect("second waiter completes");
+
+    assert_eq!(
+        *order.lock().expect("order lock poisoned"),
+        vec!["first", "second"],
+        "the waiter queued first must be granted first"
+    );
+}
+
+/// Admitting the first build never waits, even when the host is saturated:
+/// the progress guarantee keeps a busy machine from deadlocking.
+#[tokio::test]
+async fn admission_first_build_never_blocks() {
+    use mini_swe_mcp::pool::{AdmissionController, HostSample};
+    let gate = AdmissionController::new(2, 4, 2048, 1536);
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(64),
+        load1: Some(99.0),
+    }));
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire())
+        .await
+        .expect("the first build must be admitted without waiting");
+    assert_eq!(gate.running_heavy(), 1);
+    drop(permit);
+}
+
+/// A second build waits while memory is short, then is admitted once memory
+/// frees up.
+#[tokio::test]
+async fn admission_memory_shortage_waits_then_admits() {
+    use mini_swe_mcp::pool::{AdmissionController, HostSample};
+    let gate = AdmissionController::new(2, 4, 2048, 1536);
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(12_000),
+        load1: Some(0.5),
+    }));
+    let _held = gate.acquire().await;
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(100),
+        load1: Some(0.5),
+    }));
+    let waiter = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.acquire().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(gate.waiting(), 1, "the second build must wait on memory");
+    gate.__test_set_host_sample(Some(HostSample {
+        mem_available_mb: Some(12_000),
+        load1: Some(0.5),
+    }));
+    // The waiter re-evaluates every 2 s at the latest.
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter must be admitted once memory frees")
+        .expect("waiter task completes");
+    drop(permit);
+}

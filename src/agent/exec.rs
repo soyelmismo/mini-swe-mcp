@@ -1139,6 +1139,22 @@ mod tests {
     }
 
     #[test]
+    fn build_parallelism_uses_the_granted_job_count() {
+        if std::env::var_os("BUILD_PARALLELISM").is_some() {
+            return; // An env override makes the granted count unobservable.
+        }
+        // The admission controller's grant wins over the default, and zero or
+        // any granted count still yields at least one job.
+        assert_eq!(build_parallelism(Some(3)), "3");
+        assert_eq!(build_parallelism(Some(1)), "1");
+        // Without a grant the default is half the cores, never below one.
+        assert_eq!(
+            build_parallelism(None),
+            crate::config::half_the_cores().to_string()
+        );
+    }
+
+    #[test]
     fn guardrail_rejection_is_reported_not_errored() {
         let out = blocked_by_guardrail("outside the worktree");
         assert!(out.contains("COMMAND BLOCKED BY WORKTREE GUARDRAIL"));

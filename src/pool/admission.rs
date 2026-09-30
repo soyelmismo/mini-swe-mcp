@@ -301,10 +301,13 @@ impl AdmissionController {
             // woken by the same notification cannot both take the last slot.
             let outcome = {
                 let mut gate = self.lock_gate();
-                // A newcomer never jumps the queue: while anybody waits, only
-                // the oldest request is a candidate, so requests are granted
-                // in the order they arrived.
-                let is_head = gate.queue.front().map(|head| *head == id).unwrap_or(true);
+                // Every waiter takes a queue ticket on arrival, and only the
+                // oldest ticket is ever a candidate, so a newcomer can never
+                // jump ahead of a request that arrived first.
+                if !gate.queue.contains(&id) {
+                    gate.queue.push_back(id);
+                }
+                let is_head = gate.queue.front().is_some_and(|head| *head == id);
                 if !is_head {
                     None
                 } else {
@@ -322,12 +325,7 @@ impl AdmissionController {
                             gate.running += 1;
                             Some(Ok(jobs))
                         }
-                        Decision::Waiting(blocked) => {
-                            if !gate.queue.contains(&id) {
-                                gate.queue.push_back(id);
-                            }
-                            Some(Err(blocked))
-                        }
+                        Decision::Waiting(blocked) => Some(Err(blocked)),
                     }
                 }
             };
@@ -431,5 +429,141 @@ impl Drop for HeavyPermit {
             gate.running = gate.running.saturating_sub(1);
         }
         self.controller.inner.wake.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open() -> AdmissionInputs {
+        AdmissionInputs {
+            running: 0,
+            max: 4,
+            mem_available_mb: Some(12_000),
+            reserve_mb: 2048,
+            estimate_mb: 1536,
+            load1: Some(1.0),
+            cores: 4,
+        }
+    }
+
+    #[test]
+    fn first_build_is_always_admitted() {
+        // The progress guarantee: with nothing heavy running the slot is
+        // granted even when memory is tight and the load is high.
+        let inputs = AdmissionInputs {
+            running: 0,
+            mem_available_mb: Some(100),
+            load1: Some(99.0),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn slot_limit_blocks() {
+        let inputs = AdmissionInputs {
+            running: 4,
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::SlotLimit));
+    }
+
+    #[test]
+    fn short_memory_blocks() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            mem_available_mb: Some(2048 + 1535),
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::Memory));
+    }
+
+    #[test]
+    fn enough_memory_admits() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            mem_available_mb: Some(2048 + 1536),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn high_load_blocks() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            load1: Some(5.0),
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::Load));
+    }
+
+    #[test]
+    fn load_just_below_ceiling_admits() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            load1: Some(4.99),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn unreadable_readings_are_skipped() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            mem_available_mb: None,
+            load1: None,
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn slot_limit_beats_progress_guarantee() {
+        // `max == 0` can never admit, whatever the progress guarantee says.
+        let inputs = AdmissionInputs {
+            running: 0,
+            max: 0,
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::SlotLimit));
+    }
+
+    #[test]
+    fn job_count_divides_cores_over_running() {
+        assert_eq!(jobs_for(4, 1), 4);
+        assert_eq!(jobs_for(4, 2), 2);
+        assert_eq!(jobs_for(4, 3), 1);
+        assert_eq!(jobs_for(4, 4), 1);
+        assert_eq!(jobs_for(4, 99), 1);
+        assert_eq!(jobs_for(4, 0), 4);
+        assert_eq!(jobs_for(0, 1), 1);
+    }
+
+    #[test]
+    fn granted_job_count_matches_running_after_grant() {
+        let first = admit(&open());
+        assert!(matches!(first, Decision::Granted { jobs: 4 }));
+        let second = admit(&AdmissionInputs {
+            running: 1,
+            ..open()
+        });
+        assert!(matches!(second, Decision::Granted { jobs: 2 }));
+    }
+
+    #[test]
+    fn meminfo_reader_parses_available() {
+        let body = "MemTotal:       16384000 kB\nMemAvailable:    8192000 kB\n";
+        assert_eq!(mem_available_mb_from(body), Some(8000));
+        assert_eq!(mem_available_mb_from("MemTotal: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn loadavg_reader_parses_first_field() {
+        assert_eq!(loadavg_1m_from("2.50 1.75 1.25 4/512 12345\n"), Some(2.5));
+        assert_eq!(loadavg_1m_from(""), None);
     }
 }
