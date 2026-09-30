@@ -14,8 +14,8 @@
 //! missing response fails fast instead of hanging the suite.
 
 use mini_swe_mcp::mcp::{
-    ChannelEvent, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome, WorkerSnapshot,
-    WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
+    ChannelEvent, EventKind, LOCAL_AGENT, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
+    WorkerSnapshot, WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
 };
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
 use mini_swe_mcp::agent::wrap_network_command;
@@ -1113,6 +1113,7 @@ fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
         id: id.to_string(),
         task: "t".to_string(),
         model: "m".to_string(),
+        owner: LOCAL_AGENT.to_string(),
         state,
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
@@ -1548,6 +1549,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         updated_at: 0,
         group: Some(String::from("backend")),
         repo_path: None,
+        owner: Some(String::from("registry-owner")),
         metrics: WorkerMetrics::default(),
     }
 }

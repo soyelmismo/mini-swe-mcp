@@ -534,6 +534,7 @@ fn running_worker(id: &str) -> WorkerRecord {
         id: id.to_string(),
         task: "t".into(),
         model: "m".into(),
+        owner: TEST_OWNER.into(),
         state: WorkerState::Running {
             step: 1,
             last_command: "ls".into(),
@@ -1047,6 +1048,7 @@ fn measured_entry() -> WorkerRegistryEntry {
         updated_at: 1_700_000_100,
         group: Some("g".into()),
         repo_path: Some("/tmp/repo".into()),
+        owner: Some(TEST_OWNER.into()),
         metrics: WorkerMetrics {
             turns_used: 142,
             extensions_granted: 4,
@@ -1183,6 +1185,7 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         task: "t".into(),
         group: None,
         repo_path: None,
+        owner: TEST_OWNER.into(),
         started_at: 0,
         pid: std::process::id(),
         metrics: WorkerMetrics::default(),
