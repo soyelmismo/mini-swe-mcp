@@ -119,16 +119,10 @@ impl AgentRunner {
         }
 
         let parallelism = build_parallelism(self.build_jobs);
-        let target_dir = resolve_target_dir(self.build_target_dir.as_deref());
-        // The lease protects even light steps using their previous slot from eviction.
-        let _target_lease = match &target_dir {
-            Some(target) => {
-                let target = target.clone();
-                Some(tokio::task::spawn_blocking(move || crate::cache::TargetLease::acquire(&target))
-                    .await.context("Target lease task failed")??)
-            }
-            None => None,
-        };
+        // The worker already holds its build directory for its whole lifetime
+        // (see `WorktreeGuard::ensure_build_dir`), so a step only reads the
+        // grant: no second lock is taken per command.
+        let target_dir = self.build_target_dir.clone();
         let sandbox_target = target_dir.as_deref().unwrap_or(dir);
         let tmp_dir = crate::worktree::scratch_dir(dir);
         std::fs::create_dir_all(&tmp_dir).context("Failed to create worker scratch directory")?;
@@ -267,10 +261,6 @@ fn build_parallelism(granted: Option<usize>) -> String {
 }
 
 /// A light step without slot affinity leaves Cargo's normal target selection intact.
-fn resolve_target_dir(granted: Option<&Path>) -> Option<PathBuf> {
-    granted.map(Path::to_path_buf)
-}
-
 /// Which confinement a worker step runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SandboxBackend {
@@ -1109,13 +1099,20 @@ mod tests {
     }
 
     #[test]
-    fn target_override_requires_slot_affinity() {
-        assert_eq!(resolve_target_dir(None), None);
-        let target = Path::new("/tmp/swe-target-0123456789abcdef-slot0");
-        assert_eq!(resolve_target_dir(Some(target)), Some(target.to_path_buf()));
+    fn the_leased_build_dir_is_exported_to_cargo() {
+        let target = Path::new("/tmp/swe-target-0123456789abcdef-0");
         let mut cmd = Command::new("true");
-        apply_build_env(&mut cmd, None, Path::new("/tmp/private"), "1");
-        assert!(!cmd.as_std().get_envs().any(|(key, _)| key == "CARGO_TARGET_DIR"));
+        apply_build_env(&mut cmd, Some(target), Path::new("/tmp/private"), "1");
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| key == "CARGO_TARGET_DIR" && value == Some(target.as_os_str()))
+        );
+        // A worker without a lease builds in its own worktree, never in a
+        // directory another live worker could be building in.
+        let mut plain = Command::new("true");
+        apply_build_env(&mut plain, None, Path::new("/tmp/private"), "1");
+        assert!(!plain.as_std().get_envs().any(|(key, _)| key == "CARGO_TARGET_DIR"));
     }
 
     #[test]
