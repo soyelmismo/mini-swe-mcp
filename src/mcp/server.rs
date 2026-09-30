@@ -38,23 +38,26 @@ pub struct McpServer {
 
 /// Identity of one client connection serving MCP requests.
 ///
-/// Carried into request handling so later tasks can attach per-connection
-/// state (such as the owning agent); for now it is only an id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Hello metadata is descriptive only; it does not grant ownership or authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConnectionContext {
     /// Connection id, unique per process for log correlation.
     pub id: u64,
+    pub agent_id: Option<String>,
+    pub pid: Option<u32>,
+    pub version: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl ConnectionContext {
     /// Context for the stdio transport, which serves exactly one connection.
     pub fn stdio() -> Self {
-        Self { id: 0 }
+        Self::hub_connection(0)
     }
 
     /// Context for the `id`-th accepted hub connection (1-based).
     pub fn hub_connection(id: u64) -> Self {
-        Self { id }
+        Self { id, agent_id: None, pid: None, version: None, cwd: None }
     }
 }
 
@@ -103,7 +106,7 @@ impl McpServer {
         &self,
         reader: R,
         writer: W,
-        ctx: ConnectionContext,
+        mut ctx: ConnectionContext,
     ) -> Result<()>
     where
         R: AsyncBufRead + Unpin,
@@ -149,27 +152,31 @@ impl McpServer {
                 continue;
             }
 
+            let req = match parse_frame(line) {
+                Ok(req) => req,
+                Err(rejection) => {
+                    error!("Rejected JSON-RPC frame: {rejection:?}");
+                    let _ = out_tx.send(rejection.into_frame()).await;
+                    continue;
+                }
+            };
+            // Process hello in wire order before snapshotting the next request's context.
+            if req.id.is_none() {
+                if req.method == "hub/hello" {
+                    let params = req.params.unwrap_or_default();
+                    ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                    ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
+                    ctx.version = params["version"].as_str().map(str::to_owned);
+                    ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
+                        .filter(|cwd| cwd.is_absolute());
+                }
+                trace!(method = %req.method, "Received notification");
+                continue;
+            }
             let server = self.clone();
             let tx = out_tx.clone();
-            let owned_line = line.to_string();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                let line = owned_line.as_str();
-                let req = match parse_frame(line) {
-                    Ok(req) => req,
-                    Err(rejection) => {
-                        error!("Rejected JSON-RPC frame: {rejection:?}");
-                        let _ = tx.send(rejection.into_frame()).await;
-                        return;
-                    }
-                };
-
-                // JSON-RPC 2.0 §4.1: a Notification is a Request object without
-                // an `id` (absent or `null`); the server MUST NOT reply to it.
-                if req.id.is_none() {
-                    trace!(method = %req.method, "Received notification");
-                    return;
-                }
-
                 let response = server.handle_request(req, ctx, Some(tx.clone())).await;
                 let frame = response
                     .to_frame()
@@ -224,7 +231,7 @@ impl McpServer {
                     .cloned();
 
                 match self
-                    .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
+                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, &ctx)
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
@@ -270,13 +277,20 @@ impl McpServer {
         progress_token: Option<Value>,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> Result<Value> {
+        self.execute_tool_in_context(name, args, progress_token, progress_tx, &ConnectionContext::stdio()).await
+    }
+
+    async fn execute_tool_in_context(
+        &self, name: &str, args: Value, progress_token: Option<Value>,
+        progress_tx: Option<mpsc::Sender<String>>, ctx: &ConnectionContext,
+    ) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{name}'. Only 'worker' is supported.");
         }
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref())
+        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref(), ctx)
             .await
     }
 

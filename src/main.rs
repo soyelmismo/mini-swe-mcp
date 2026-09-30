@@ -9,7 +9,7 @@ use mini_swe_mcp::cli::format::format_output;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
-use mini_swe_mcp::{bootstrap, config, telemetry, worktree};
+use mini_swe_mcp::{bootstrap, config, telemetry};
 use std::env;
 use std::sync::Arc;
 
@@ -49,6 +49,20 @@ async fn async_main() -> Result<()> {
     telemetry::init(stdio_requested(&cli_args));
     bootstrap::load_dotenv_files();
 
+    if stdio_requested(&cli_args) || action_of(&cli_args).is_none() {
+        if env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
+            return run_local_stdio().await;
+        }
+        return mini_swe_mcp::hub::proxy_stdio().await;
+    }
+
+    if let Some(action) = action_of(&cli_args)
+        && action != "daemon"
+        && env::var("MINI_SWE_NO_DAEMON").ok().as_deref() != Some("1")
+    {
+        return run_remote_action(action, &cli_args, json_output).await;
+    }
+
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
     let manifest = ModelManifest::load();
     let default_model = default_model(&manifest);
@@ -60,13 +74,23 @@ async fn async_main() -> Result<()> {
         if action == "daemon" {
             return run_daemon_cmd(&server).await;
         }
-        return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
+        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
 
+    run_local_stdio().await
+}
+
+/// Serve MCP over stdio in this process (escape hatch for `MINI_SWE_NO_DAEMON=1`).
+async fn run_local_stdio() -> Result<()> {
+    let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
     }
-
+    let manifest = ModelManifest::load();
+    let default_model = default_model(&manifest);
+    let pool = WorkerPool::new(max_concurrent_workers(), api_base(), api_key)
+        .with_manifest(Arc::new(manifest));
+    let server = McpServer::new(pool.clone(), default_model);
     tokio::select! {
         res = server.run_stdio() => res,
         _ = tokio::signal::ctrl_c() => {
@@ -78,6 +102,50 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Route one CLI action through the hub daemon: initialize, hello and one
+/// `tools/call` whose payload and plain-text rendering match the local path.
+async fn run_remote_action(action: &str, cli_args: &[String], json_output: bool) -> Result<()> {
+    let api_key_present = !env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
+    let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
+        return Ok(());
+    };
+    let mut client = mini_swe_mcp::hub::HubClient::connect().await?;
+    let result = drive_worker_call(tool_args, async |args| client.worker(args).await).await?;
+    print_result(action, &result, json_output)
+}
+
+/// Issue one `worker` tool call and, while the worker is paused for input,
+/// run the operator dialogue as `steer` + `wait` calls.
+///
+/// `call` is the only transport difference between the in-process pool and
+/// the hub daemon, so both CLI paths share this one algorithm.
+async fn drive_worker_call(
+    tool_args: serde_json::Map<String, serde_json::Value>,
+    mut call: impl AsyncFnMut(serde_json::Value) -> Result<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut result = call(serde_json::Value::Object(tool_args)).await?;
+    while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
+        let wid = result["worker_id"].as_str().unwrap_or("").to_string();
+        let q = result["question"].as_str().unwrap_or("");
+        eprintln!("\n[mini-swe] Worker {} is PAUSED: {}", wid, q);
+        eprint!("Reply with guidance (or press Enter to abort): ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            eprintln!("[mini-swe] No input provided; terminating worker.");
+            call(serde_json::json!({"action": "kill", "worker_id": wid})).await?;
+            break;
+        }
+
+        call(serde_json::json!({"action": "steer", "worker_id": wid, "message": input})).await?;
+        eprintln!("[mini-swe] Guidance sent. Resuming execution...");
+        // `wait` blocks until the worker finishes, fails or pauses again.
+        result = call(serde_json::json!({"action": "wait", "worker_id": wid})).await?;
+    }
+    Ok(result)
 }
 
 /// Run the hub daemon: the single process owning the only worker pool.
@@ -94,64 +162,20 @@ async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
     Ok(())
 }
 
-/// Execute one CLI-selected action and print the result.
+/// Execute one CLI-selected action in this process and print the result.
 async fn run_action(
     server: &McpServer,
-    pool: &WorkerPool,
     action: &str,
     cli_args: &[String],
     json_output: bool,
     api_key_present: bool,
 ) -> Result<()> {
-    // `prune` is a direct worktree call, not a `worker` tool verb.
-    if action == "prune" {
-        worktree::prune_stale_worktrees(&std::path::PathBuf::from("."));
-        let res = serde_json::json!({
-            "status": "ok",
-            "message": "Stale worktrees and orphaned worker branches pruned"
-        });
-        return print_result(action, &res, json_output);
-    }
-
     // `None` means the verb was already answered (or exited) by `tool_args`.
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
         return Ok(());
     };
-
-    let mut result = server
-        .execute_tool("worker", serde_json::Value::Object(tool_args.clone()))
-        .await?;
-
-    // Interactive steering: whenever the shared wait loop reports the worker
-    // paused for input, prompt the operator and resume. Re-waiting goes through
-    // the same helper the MCP stdio dispatch path uses, so both callers share
-    // one polling/termination algorithm.
-    let wait_max_turns = tool_args
-        .get("max_turns")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-    while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
-        let wid = result["worker_id"].as_str().unwrap_or("").to_string();
-        let q = result["question"].as_str().unwrap_or("");
-        eprintln!("\n[mini-swe] Worker {} is PAUSED: {}", wid, q);
-        eprint!("Reply with guidance (or press Enter to abort): ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            eprintln!("[mini-swe] No input provided; terminating worker.");
-            pool.kill(&wid).await;
-            break;
-        }
-
-        pool.steer(&wid, input).await?;
-        eprintln!("[mini-swe] Guidance sent. Resuming execution...");
-
-        result = server
-            .await_worker_result(&wid, wait_max_turns, None, None)
-            .await?;
-    }
-
+    let result =
+        drive_worker_call(tool_args, async |args| server.execute_tool("worker", args).await).await?;
     print_result(action, &result, json_output)
 }
 

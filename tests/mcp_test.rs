@@ -76,6 +76,9 @@ impl McpProcess {
             // this dummy also keeps the suite independent of (and unable to
             // read) whatever key the developer happens to have exported.
             .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
+            // Protocol tests exercise the in-process server; the hub transport
+            // has its own end-to-end tests (tests/hub_test.rs).
+            .env("MINI_SWE_NO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
