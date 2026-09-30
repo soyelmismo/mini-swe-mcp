@@ -459,11 +459,13 @@ mod replay_batch_tests {
     }
 
     #[test]
-    fn a_live_event_carries_no_missed_heading() {
+    fn a_mixed_batch_still_prints_the_heading_once() {
         let live = json!({"worker_id": "w-live", "event": "needs_input", "question": "go on?",
-            "owner": "cli", "missing_marker": false});
+            "owner": "cli"});
         let mut out = Vec::new();
-        print_events_to(&mut out, &[live], false, false).expect("print");
-        assert!(!String::from_utf8(out).expect("utf8").contains(MISSED_HEADING));
+        print_events_to(&mut out, &[missed("w-old", "Late."), live], false, false).expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
+        assert!(text.contains("Late.") && text.contains("go on?"), "{text}");
     }
 }

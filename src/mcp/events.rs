@@ -1030,8 +1030,11 @@ mod verify_tail_tests {
     }
 
     #[test]
-    fn a_verbose_marker_line_cannot_grow_the_tail_past_four_kib() {
-        let output = format!("error: {}", "x".repeat(9000));
-        assert!(verify_tail(&output).len() <= 4096, "{} bytes", verify_tail(&output).len());
+    fn a_giant_marker_line_keeps_its_tail_within_four_kib() {
+        let output = format!("error: {}\n{}", "x".repeat(9000), passing(50));
+        let tail = verify_tail(&output);
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("xxxx"), "the marked line survives: {} bytes", tail.len());
+        assert!(!tail.contains("case_0"), "passing noise gives up the budget first");
     }
 }
