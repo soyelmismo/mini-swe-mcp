@@ -302,7 +302,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     let swe = common::TempDir::new_in_tmp("watch-cli-swe");
     std::fs::create_dir_all(swe.path().join("swe-registry")).expect("registry dir");
     let run = |args: &[&str]| {
-        std::process::Command::new(&exe)
+        common::binary_command(&exe)
             .args(args)
             .env("SWE_HUB_DIR", hub.path())
             .env("SWE_TEMP_DIR", swe.path())
@@ -440,7 +440,7 @@ async fn the_binary_watches_through_the_hub() {
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&hub.path().join("hub.sock")).await;
     let run = |args: &[&str]| {
-        std::process::Command::new(common::binary_path())
+        common::binary_command(&common::binary_path())
             .args(args)
             .env("SWE_HUB_DIR", hub.path())
             .env("SWE_TEMP_DIR", swe.path())
@@ -520,7 +520,7 @@ fn one_watch_call_replays_every_missed_event() {
     }
 
     let exe = common::binary_path();
-    let output = std::process::Command::new(&exe)
+    let output = common::binary_command(&exe)
         .args(["--json", "watch", "w-first", "w-second"])
         .current_dir(dir.path())
         .env("MINI_SWE_NO_DAEMON", "1")

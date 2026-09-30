@@ -373,6 +373,7 @@ fn spawn_daemon(hub: &Path, swe: &Path, api_base: &str, shape: &LoadShape) -> Da
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(file))
         .kill_on_drop(true);
+    common::scrub_identity_env(command.as_std_mut());
     let child = command.spawn().expect("spawn the hub daemon");
     let pid = child.id().expect("daemon pid");
     Daemon { child, pid }

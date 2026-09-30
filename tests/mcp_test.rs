@@ -13,6 +13,8 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
+mod common;
+
 use mini_swe_mcp::agent::wrap_network_command;
 use mini_swe_mcp::mcp::{
     ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
@@ -127,6 +129,7 @@ impl McpProcess {
             // Protocol tests exercise the in-process server; the hub transport
             // has its own end-to-end tests (tests/hub_test.rs).
             .env("MINI_SWE_NO_DAEMON", "1");
+        common::scrub_identity_env(&mut command);
         for (name, value) in envs {
             command.env(name, value);
         }

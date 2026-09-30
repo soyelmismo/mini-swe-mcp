@@ -363,7 +363,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     };
 
     // First CLI call auto-starts the daemon and answers through it.
-    let mut first = Command::new(&exe);
+    let mut first = common::binary_command(&exe);
     envs(&mut first);
     let out = first
         .args(["list", "--json"])
@@ -386,7 +386,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     );
 
     // Second CLI call reuses the same daemon: no second listener starts.
-    let mut second = Command::new(&exe);
+    let mut second = common::binary_command(&exe);
     envs(&mut second);
     let out = second
         .args(["list", "--json"])
@@ -406,7 +406,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     );
 
     // The `--stdio` proxy answers the handshake verbs through the same daemon.
-    let mut proxy = Command::new(&exe);
+    let mut proxy = common::binary_command(&exe);
     envs(&mut proxy);
     let mut child = proxy
         .arg("--stdio")
@@ -453,7 +453,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
 
     // A dispatch against an unreachable API base records the worker in the hub
     // and survives the CLI process exiting (no LLM call is awaited).
-    let mut dispatch = Command::new(&exe);
+    let mut dispatch = common::binary_command(&exe);
     envs(&mut dispatch);
     let out = dispatch
         .args([
@@ -483,7 +483,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         common::host_of_this_process(),
         "a CLI dispatch is owned by the host process it ran under: {payload}"
     );
-    let mut status = Command::new(&exe);
+    let mut status = common::binary_command(&exe);
     envs(&mut status);
     let out = status
         .args(["status", &wid, "--json"])
@@ -497,7 +497,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
 
     // That identity is stable across invocations, so a *second* CLI process
     // still sees (and could steer) the worker the first one dispatched.
-    let mut listing = Command::new(&exe);
+    let mut listing = common::binary_command(&exe);
     envs(&mut listing);
     let out = listing
         .args(["list", "--json"])
@@ -523,7 +523,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
 
     // The escape hatch never creates a socket.
     let bare = common::TempDir::new_in_tmp("hub-no-daemon");
-    let mut local = Command::new(&exe);
+    let mut local = common::binary_command(&exe);
     local
         .env("SWE_HUB_DIR", bare.path())
         .env("MINI_SWE_NO_DAEMON", "1")
@@ -616,7 +616,7 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
     // A dead API base keeps the dispatch from an LLM call: the worker record
     // still names the repository the daemon resolved for this caller.
     let dispatch = |repo: &std::path::Path| -> String {
-        let out = Command::new(&exe)
+        let out = common::binary_command(&exe)
             .current_dir(repo)
             .args(["dispatch", "cwd probe", "--json"])
             .env("SWE_HUB_DIR", hub.path())
@@ -889,7 +889,7 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
     )
     .expect("write the history file");
 
-    let mut daemon = Command::new(common::binary_path())
+    let mut daemon = common::binary_command(&common::binary_path())
         .arg("daemon")
         .env("SWE_HUB_DIR", &hub)
         .env("SWE_TEMP_DIR", &swe)
@@ -1019,6 +1019,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
                 format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
             )
             .env("HUB_IDLE_SECS", "60");
+        common::scrub_identity_env(cmd.as_std_mut());
         cmd
     };
     let mut first = command()
@@ -1455,14 +1456,13 @@ async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
 
 #[test]
 fn newer_cli_replaces_an_idle_daemon() {
-    use std::process::Command;
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("hub-version");
     let _reaper = DaemonReaper(hub.path().to_path_buf());
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let invoke = |fake: bool| {
-        let mut cmd = Command::new(&exe);
+        let mut cmd = common::binary_command(&exe);
         cmd.args(["list", "--json"])
             .env("SWE_HUB_DIR", hub.path())
             .env("SWE_TEMP_DIR", hub.subdir("swe"))
@@ -1498,7 +1498,6 @@ fn newer_cli_replaces_an_idle_daemon() {
 fn a_replacing_client_waits_for_the_predecessor_to_release_the_lock() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::process::Command;
 
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("hub-lockwait");
@@ -1539,7 +1538,7 @@ fn a_replacing_client_waits_for_the_predecessor_to_release_the_lock() {
         drop(lock);
     });
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = common::binary_command(&exe);
     cmd.args(["list", "--json"])
         .env("SWE_HUB_DIR", hub.path())
         .env("SWE_TEMP_DIR", hub.subdir("swe"))
@@ -1580,6 +1579,7 @@ async fn run_list_twice_with_client_build_skew(build_skew_nanos: i128) -> String
         if let Some(ts) = fake_build_ts {
             cmd.env("MINI_SWE_FAKE_BUILD_TS", ts);
         }
+        common::scrub_identity_env(cmd.as_std_mut());
         let output = cmd.output().await.unwrap();
         assert!(
             output.status.success(),
@@ -1661,6 +1661,7 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
         .env("SWE_HUB_DIR", &dir)
         .env("MINI_SWE_FAKE_VERSION", "99.0.0")
         .env("ENV_FILE", "/nonexistent-mini-swe-env");
+    common::scrub_identity_env(command.as_std_mut());
     let output = command.output().await.unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1684,6 +1685,7 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    common::scrub_identity_env(proxy.as_std_mut());
     let mut child = proxy.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -1781,7 +1783,6 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
 fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::process::Command;
 
     let hub = common::TempDir::new_in_tmp("hub-legacy");
     #[cfg(unix)]
@@ -1820,7 +1821,7 @@ fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
         methods
     });
 
-    let out = Command::new(common::binary_path())
+    let out = common::binary_command(&common::binary_path())
         .args(["list", "--json"])
         .env("SWE_HUB_DIR", hub.path())
         .env("OPENAI_API_KEY", "test-key-not-used")
@@ -1851,7 +1852,6 @@ fn a_hub_without_a_build_field_falls_back_to_the_release() {
     fn list_against_fake_hub(version: &str) -> (Vec<(String, bool)>, serde_json::Value) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
-        use std::process::Command;
 
         let hub = common::TempDir::new_in_tmp("hub-nobuild");
         #[cfg(unix)]
@@ -1897,7 +1897,7 @@ fn a_hub_without_a_build_field_falls_back_to_the_release() {
             (methods, hello_params)
         });
 
-        let out = Command::new(common::binary_path())
+        let out = common::binary_command(&common::binary_path())
             .args(["list", "--json"])
             .env("SWE_HUB_DIR", hub.path())
             .env("OPENAI_API_KEY", "test-key-not-used")

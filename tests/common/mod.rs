@@ -132,10 +132,33 @@ impl Drop for TempDir {
 // itself, and must never auto-start or reach the developer's real hub daemon.
 // The hub transport is tested end to end in tests/hub_test.rs.
 
+/// Remove every environment variable that names an agent identity from `cmd`.
+///
+/// A child a test spawns would otherwise inherit the session the suite was
+/// launched from — a `CLAUDE_CODE_SESSION_ID` in an agent's shell qualifies the
+/// owner the child reports — so every spawn of the crate's binary scrubs the
+/// session variables, the operator override and the watch token first. A test
+/// that deliberately exercises one of them sets it *after* scrubbing.
+pub fn scrub_identity_env(cmd: &mut Command) {
+    for var in mini_swe_mcp::hub::identity::SESSION_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.env_remove("MINI_SWE_AGENT_ID");
+    cmd.env_remove(mini_swe_mcp::hub::identity::WATCH_TOKEN_ENV);
+}
+
+/// A `Command` for `exe` with every inherited agent identity scrubbed; see
+/// [`scrub_identity_env`].
+pub fn binary_command(exe: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    scrub_identity_env(&mut cmd);
+    cmd
+}
+
 /// Run the binary in the current working directory.
 pub fn run_exe(args: &[&str]) -> Output {
     let exe = binary_path();
-    Command::new(&exe)
+    binary_command(&exe)
         .args(args)
         .env("MINI_SWE_NO_DAEMON", "1")
         .output()
@@ -147,7 +170,7 @@ pub fn run_exe(args: &[&str]) -> Output {
 /// `OPENAI_API_KEY` is removed, so a child can never read or mutate the
 /// developer's real environment, config or repository.
 pub fn run_exe_in_dir(exe: &Path, dir: &Path, args: &[&str]) -> Output {
-    Command::new(exe)
+    binary_command(exe)
         .args(args)
         .current_dir(dir)
         .env("MINI_SWE_NO_DAEMON", "1")
@@ -169,7 +192,7 @@ pub fn run_exe_in_dir(exe: &Path, dir: &Path, args: &[&str]) -> Output {
 /// that the manifest/list code paths never actually use.
 pub fn run_exe_on_manifest(args: &[&str]) -> Output {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    Command::new(binary_path())
+    binary_command(&binary_path())
         .args(args)
         .current_dir(manifest_dir)
         .env("MINI_SWE_NO_DAEMON", "1")
