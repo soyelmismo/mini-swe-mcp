@@ -8,7 +8,8 @@
 //! that spawned it. That is the leak this module closes: at worker end -- and
 //! again when a crashed hub's worktrees are recovered -- every process of this
 //! uid whose working directory is inside one of the worker's directories is
-//! taken down.
+//! taken down if its ancestry leads to the hub or an orphan adopter, not a
+//! terminal/login session.
 //!
 //! The sweep is deliberately narrow:
 //!
@@ -20,6 +21,7 @@
 //!   it could resolve -- an unreadable `/proc` entry is left alone rather than
 //!   guessed at.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -41,7 +43,8 @@ const MAX_ANCESTORS: usize = 64;
 ///
 /// `dirs` is the whole definition of "belongs to this worker": the worktree, its
 /// private scratch dir, its target dirs and its leased build dir. Nothing
-/// outside them is ever signalled, so a live sibling worker is never touched.
+/// outside them is ever signalled. Processes from unrelated terminal/login
+/// sessions are excluded even when their cwd is inside these directories.
 ///
 /// One log line is emitted per sweep that killed something, so a leak stays
 /// visible in the worker's log instead of silently burning CPU somewhere else.
@@ -50,7 +53,11 @@ const MAX_ANCESTORS: usize = 64;
 /// what makes it safe to run from a `Drop`: a worker's teardown already blocks
 /// on `git`, and half a second more is the price of not leaving a build behind.
 pub(crate) fn sweep_worker_processes(worker_id: &str, dirs: &[PathBuf]) -> usize {
-    let targets = processes_in_dirs(dirs);
+    sweep_owned_processes(worker_id, dirs, std::process::id())
+}
+
+fn sweep_owned_processes(worker_id: &str, dirs: &[PathBuf], hub_pid: u32) -> usize {
+    let targets = owned_processes_in_dirs(dirs, hub_pid);
     if targets.is_empty() {
         return 0;
     }
@@ -92,19 +99,84 @@ pub(crate) fn worker_dirs(worktree: &Path) -> Vec<PathBuf> {
 }
 
 /// Pids of this uid's processes whose working directory is inside one of
-/// `dirs`, excluding this process and every ancestor of it.
+/// `dirs`, with worker/orphan ancestry and excluding this process and its
+/// ancestors. Unrelated terminal/login sessions are never targets.
 ///
 /// The sweep's targeting rule, exposed so tests can assert on it directly
 /// instead of on the side effect of a kill.
 #[doc(hidden)]
 pub fn processes_in_dirs(dirs: &[PathBuf]) -> Vec<u32> {
+    owned_processes_in_dirs(dirs, std::process::id())
+}
+
+fn owned_processes_in_dirs(dirs: &[PathBuf], hub_pid: u32) -> Vec<u32> {
     let protected = protected_pids();
     let dirs: Vec<PathBuf> = dirs.iter().map(|dir| resolve_dir(dir)).collect();
-    process_pids()
+    let ancestry: BTreeMap<u32, (u32, String)> = process_pids()
         .into_iter()
+        .filter_map(|pid| {
+            let parent = parent_pid(pid)?;
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            Some((pid, (parent, comm.trim().to_string())))
+        })
+        .collect();
+    ancestry
+        .keys()
+        .copied()
         .filter(|pid| !protected.contains(pid))
         .filter(|pid| cwd_is_inside(*pid, &dirs))
+        .filter(|pid| worker_ancestry(*pid, hub_pid, &ancestry, &protected))
         .collect()
+}
+
+/// A live hub descendant or an orphan adopted by init/systemd belongs to the
+/// worker only if the ancestry has no terminal/login boundary. Merely reaching
+/// init through a user's terminal does not make that terminal's children orphans.
+/// Linux does not expose another process's PR_SET_CHILD_SUBREAPER flag in /proc;
+/// unknown adopters are left alone rather than treated as service managers.
+fn worker_ancestry(
+    mut pid: u32,
+    hub_pid: u32,
+    ancestry: &BTreeMap<u32, (u32, String)>,
+    protected: &[u32],
+) -> bool {
+    for _ in 0..MAX_ANCESTORS {
+        if pid == hub_pid {
+            return true;
+        }
+        if protected.contains(&pid) {
+            return false;
+        }
+        let Some((parent, comm)) = ancestry.get(&pid) else {
+            return false;
+        };
+        if login_boundary(comm) {
+            return false;
+        }
+        if *parent == 1 {
+            return true;
+        }
+        if let Some((_, parent_comm)) = ancestry.get(parent)
+            && matches!(parent_comm.as_str(), "systemd" | "init")
+        {
+            return true;
+        }
+        if *parent == pid || *parent == 0 {
+            return false;
+        }
+        pid = *parent;
+    }
+    false
+}
+
+fn login_boundary(comm: &str) -> bool {
+    matches!(
+        comm,
+        "sshd" | "sshd-session" | "login" | "agetty" | "getty" | "su" | "sudo"
+            | "xterm" | "uxterm" | "konsole" | "gnome-terminal-" | "gnome-terminal"
+            | "kgx" | "xfce4-terminal" | "mate-terminal" | "alacritty" | "kitty"
+            | "wezterm-gui" | "foot" | "urxvt" | "rxvt" | "tmux: server" | "screen"
+    )
 }
 
 /// Pids of the live processes in the process group `pgid`.
@@ -306,6 +378,37 @@ mod tests {
             .expect("setsid must spawn")
     }
 
+    /// A `setsid` session leader forked by a helper that exits at once, so the
+    /// leader's parent is init rather than this test: the shape of a terminal
+    /// the operator opened by hand.
+    fn spawn_unrelated_shell(dir: &Path, pid_file: &Path) -> std::process::Child {
+        // `setsid` detaches the leader into its own session, which is what a
+        // terminal the operator opened by hand looks like from the outside.
+        Command::new("setsid")
+            .args(["bash", "-c", "sleep 300 & echo $! > $1; wait", "bash"])
+            .arg(pid_file)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("setsid must spawn")
+    }
+
+    /// Wait until `file` holds a pid, so a test never races the fork that
+    /// writes it.
+    fn wait_for_pid(file: &Path) -> u32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("no pid ever appeared in {}", file.display());
+    }
+
     /// Wait until `dir` holds at least one process, so a test never asserts on
     /// a sweep that ran before the sleeper existed.
     fn await_process_in(dir: &Path) {
@@ -326,7 +429,7 @@ mod tests {
         await_process_in(&dir);
 
         let dirs = [dir.clone()];
-        let killed = sweep_worker_processes("worker-test", &dirs);
+        let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
 
         assert_eq!(killed, 1, "the detached sleeper must be signalled");
         // Reaped through `try_wait`, because a killed child of this test stays
@@ -362,7 +465,7 @@ mod tests {
         await_process_in(&outside);
 
         let dirs = [inside.clone()];
-        let killed = sweep_worker_processes("worker-test", &dirs);
+        let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
 
         assert_eq!(
             killed, 0,
@@ -396,6 +499,39 @@ mod tests {
             protected.iter().all(|pid| *pid != 0),
             "pid 0 addresses a group, never a process: {protected:?}"
         );
+    }
+
+    /// A process whose parent is an unrelated long-lived process survives the
+    /// sweep: it belongs to a terminal/login session, not to this worker.
+    ///
+    /// The "user shell" is a `setsid` session leader, which is exactly how a
+    /// terminal the operator opened by hand appears from the outside: its child
+    /// is adopted by the user's service manager, never by this worker's hub.
+    #[test]
+    fn a_process_from_an_unrelated_parent_survives_the_sweep() {
+        let dir = worker_dir("unrelated");
+        let pid_file = dir.join("child.pid");
+        let mut shell = spawn_unrelated_shell(&dir, &pid_file);
+        let shell_pid = shell.id();
+        let child_pid = wait_for_pid(&pid_file);
+        await_process_in(&dir);
+
+        let dirs = [dir.clone()];
+        let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
+
+        assert_eq!(
+            killed, 0,
+            "a process whose ancestry is an unrelated session must survive \
+             (shell {shell_pid}, child {child_pid})"
+        );
+        assert!(
+            pid_is_alive(shell_pid) && pid_is_alive(child_pid),
+            "neither the unrelated shell nor its child may be signalled"
+        );
+        signal_pid(shell_pid, libc::SIGKILL);
+        signal_pid(child_pid, libc::SIGKILL);
+        let _ = shell.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A group member is found by its process group, which is what the step-end
