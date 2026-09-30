@@ -36,8 +36,10 @@ const HOST: &str = "host:opencode:730:12";
 const TAB_A: &str = "host:opencode:730:12/session:tab-a";
 const TAB_B: &str = "host:opencode:730:12/session:tab-b";
 
-/// Every session variable, so a test can pin the environment it means.
-const SESSION_VARS: &[&str] = &[
+/// Every variable identity resolution reads, so a test can pin the environment
+/// it means: the operator override, the session variables, and the token.
+const IDENTITY_ENV_VARS: &[&str] = &[
+    "MINI_SWE_AGENT_ID",
     "CLAUDE_CODE_SESSION_ID",
     "OPENCODE_SESSION_ID",
     "MINI_SWE_SESSION_ID",
@@ -659,13 +661,13 @@ async fn a_host_with_no_session_keeps_its_host_identity() {
     }
 }
 
-/// Run `mini-swe-mcp whoami` with `vars` set and every other session variable
+/// Run `mini-swe-mcp whoami` with `vars` set and every other identity variable
 /// cleared, so the environment a test means is the environment the child sees.
 fn whoami_with(vars: &[(&str, &str)], hub_dir: Option<&Path>) -> String {
     let exe = common::binary_path();
     let mut command = Command::new(&exe);
     command.arg("whoami").env("MINI_SWE_NO_DAEMON", "1");
-    for var in SESSION_VARS {
+    for var in IDENTITY_ENV_VARS {
         command.env_remove(var);
     }
     for (var, value) in vars {
