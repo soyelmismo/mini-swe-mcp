@@ -52,6 +52,29 @@ async fn wait_for_socket(path: &Path) {
     panic!("hub socket {} never came up", path.display());
 }
 
+/// Wait until the worker's registry row reports `status`, or return the last
+/// row read at the deadline.
+///
+/// The hub recovers orphans before it binds its socket, but a child of the
+/// killed hub can keep the previous listener alive, so [`wait_for_socket`] may
+/// return while the row still carries its pre-crash status: poll for the write.
+async fn wait_for_registry_status(
+    registry: &Path,
+    wid: &str,
+    status: mini_swe_mcp::pool::RegistryStatus,
+) -> mini_swe_mcp::pool::WorkerRegistryEntry {
+    let path = registry.join(format!("{wid}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let row: mini_swe_mcp::pool::WorkerRegistryEntry =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if row.status == status || std::time::Instant::now() >= deadline {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 struct Client {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
@@ -938,23 +961,13 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         .env("HUB_AUTO_RESUME", "0")
         .kill_on_drop(true).spawn().unwrap();
     wait_for_socket(&hub.join("hub.sock")).await;
-    let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
-        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap()
-    ).unwrap();
+    let recovered = wait_for_registry_status(
+        &swe.join("swe-registry"),
+        wid,
+        mini_swe_mcp::pool::RegistryStatus::Interrupted,
+    ).await;
     // Interrupted, not failed: the worker stopped because the hub did, and its
     // conversation survived, so the steer below continues it.
-    if recovered.status != mini_swe_mcp::pool::RegistryStatus::Interrupted {
-        let state = std::fs::read_to_string(format!("/proc/{}/status", recovered.pid))
-            .ok()
-            .and_then(|raw| raw.lines().find(|l| l.starts_with("State:")).map(str::to_string));
-        eprintln!(
-            "DBG first_pid={:?} entry_pid={} alive={} state={:?}",
-            first.id(),
-            recovered.pid,
-            mini_swe_mcp::worktree::is_process_alive(recovered.pid),
-            state
-        );
-    }
     assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Interrupted);
     assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
     let out = tokio::time::timeout(std::time::Duration::from_secs(15),
