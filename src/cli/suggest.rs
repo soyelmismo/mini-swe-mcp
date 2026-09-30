@@ -10,7 +10,7 @@ use crate::mcp::WORKER_ACTIONS;
 
 /// CLI-only verbs: actions the binary handles directly instead of dispatching
 /// through the `worker` tool.
-const CLI_ONLY_ACTIONS: &[&str] = &["monitor", "supervisor"];
+const CLI_ONLY_ACTIONS: &[&str] = &["monitor", "supervisor", "whoami"];
 
 /// Everything the CLI accepts: the tool's own actions (single-sourced from the
 /// MCP server) plus the CLI-only verbs.
@@ -74,6 +74,7 @@ mod tests {
         }
         assert!(actions.contains(&"monitor"));
         assert!(actions.contains(&"supervisor"));
+        assert!(actions.contains(&"whoami"));
         // No duplicates: a CLI-only verb must not shadow a tool verb.
         let mut seen = actions.clone();
         seen.sort_unstable();

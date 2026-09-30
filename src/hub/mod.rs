@@ -8,13 +8,15 @@
 //!
 //! Because the pool is shared, each connection carries an agent identity (see
 //! [`crate::mcp::ConnectionContext::agent`]): the `MINI_SWE_AGENT_ID` of its
-//! `hub/hello`, else its `initialize` `clientInfo` — the CLI's stable `cli`
-//! identity among them. Workers belong to the agent that dispatched them, and
-//! the mutating verbs refuse anyone else. [`client`]'s `admin` hello is the
-//! operator's override.
+//! `hub/hello`, else the host process [`identity`] walks up to — the `claude`
+//! or `opencode` process that spawned both the connection and the agent's
+//! shell commands — and only then its `initialize` `clientInfo`. Workers
+//! belong to the agent that dispatched them, and the mutating verbs refuse
+//! anyone else. [`client`]'s `admin` hello is the operator's override.
 
 pub mod client;
 mod daemon;
+pub mod identity;
 
 pub use client::{HubClient, connect_or_spawn, proxy_stdio};
 pub use daemon::{HubConfig, HubPaths, HubServer, hub_dir, run_daemon};

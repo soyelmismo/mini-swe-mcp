@@ -474,10 +474,9 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
 }
 
 async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
-    let owner = std::env::var("MINI_SWE_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| crate::mcp::CLI_AGENT.to_string());
+    // The same resolution the hub applies to this process: the operator's
+    // override, then the host process, then the CLI's own identity.
+    let owner = crate::hub::identity::identity(crate::mcp::CLI_AGENT).id;
     let started = tokio::time::Instant::now();
     let mut previous = Snapshot::new();
     let mut reported = Snapshot::new();

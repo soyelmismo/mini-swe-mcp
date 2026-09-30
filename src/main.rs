@@ -57,6 +57,15 @@ async fn async_main() -> Result<()> {
         return mini_swe_mcp::monitor::run_monitor(once).await;
     }
 
+    // `whoami` answers from `/proc` alone: no hub, no API key, no
+    // configuration, so it works wherever the agent itself can run.
+    if action_of(&cli_args) == Some("whoami") {
+        let identity = mini_swe_mcp::hub::identity::identity(mini_swe_mcp::mcp::CLI_AGENT);
+        println!("agent {}", identity.id);
+        println!("derived from {}", identity.explain());
+        return Ok(());
+    }
+
     telemetry::init(stdio_requested(&cli_args));
     bootstrap::load_dotenv_files();
 
@@ -249,6 +258,8 @@ fn print_help() {
     println!("           Health view of workers and the hub.");
     println!("  daemon");
     println!("           Run the shared hub in the foreground.");
+    println!("  whoami");
+    println!("           Print this session's agent identity and how it was derived.");
     println!("\nWorkflow:\n{}", mini_swe_mcp::cli::watch::WORKFLOW);
     println!("\nFlags:");
     println!("{}", mini_swe_mcp::cli::HELP_FLAGS);
