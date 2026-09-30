@@ -153,6 +153,7 @@ fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) 
     }
 }
 
+
 /// How one side of the handshake names itself when they have to be told apart.
 fn label(version: &str, build: &Value) -> String {
     match build["id"].as_str() {
