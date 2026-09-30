@@ -1,536 +1,181 @@
 # mini-swe-mcp
 
-High-throughput autonomous software engineering subagent orchestrator speaking the Model Context Protocol (MCP) over `stdio`. Designed to execute concurrent coding subagents in fully isolated Git worktrees with fine-grained concurrency governance.
+Autonomous software-engineering subagent orchestrator speaking the Model Context Protocol (MCP). One long-lived **hub daemon** owns a single worker pool and serves every orchestrator agent that connects to it; each subagent runs in its own Git worktree on a `worker-<id>` branch. The CLI and `--stdio` are both thin front ends to that daemon, and both start it automatically on first use.
 
----
-
-## Key Features
-
-- **MCP Stdio Protocol**: Seamlessly interfaces with Antigravity, Claude Desktop, Cursor, and any JSON-RPC 2.0 MCP client.
-- **Three-Tier Semaphore Concurrency Governance**:
-  - **Worker Pool Semaphore** (default 64): High-concurrency async dispatch for LLM inference.
-  - **Bash Command Semaphore** (default one slot per worker, tunable via `BASH_CONCURRENT_LIMIT`): caps simultaneous bash steps; heavy commands (`cargo`, `make`, `pytest`, compilers, …) also take a slot from the **Build Semaphore** (default `cores / 2`, `BASH_BUILD_LIMIT`).
-  - Child shells run with `nice -n 10` and a per-command thread cap (`BUILD_PARALLELISM`, default `cores / 2`).
-- **Strict Git Worktree Isolation**:
-  - Each subagent operates on its own dedicated worktree branch (`worker-<id>`).
-  - No lock collisions or git state corruption across concurrent workers.
-  - Sibling PID tracking prevents accidental pruning while subagents are running; a stale worktree has its uncommitted work salvaged onto the worker branch before it is removed.
-  - Automated RAII worktree cleanup on worker completion or failure, keeping the branch whenever it carries commits.
-- **Native Tool Calls & SSE Streaming**:
-  - Native OpenAI `tool_calls` with a fenced-code-block fallback for models that do not use them.
-  - Server-Sent Events (`stream: true`) with instant TCP socket termination on cancellation.
-- **Verification Gate**:
-  - A dispatch can name a `verify` command (`--verify "cargo test"`); when it is absent one is auto-detected from the repository layout.
-  - The gate runs through the same sandboxed bash path before a completion sentinel is honoured, and its failure output is fed back to the model.
-- **Interactive Orchestrator Steering**:
-  - Workers can pause execution and ask the orchestrator questions (`ASK_ORCHESTRATOR: <question>`).
-  - Request dynamic turn extensions (`REQUEST_TURNS: <n>`), bounded to half the dispatch's own budget.
-  - Repetition and stagnation detectors nudge or park a worker that stops making progress.
-- **Persistent Role Memory**:
-  - `.agents/memory/<alias>.md` is read into the system prompt on every dispatch, per role; the runtime never writes it.
-
----
-
-## Installation & Setup
-
-### Prerequisites
-
-- Rust 1.85+ (Rust 2024 edition)
-- Git 2.30+
-- Linux or POSIX environment
-
-### Building and Installing
+## Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/soyelmismo/mini-swe-mcp.git
-cd mini-swe-mcp
-
-# Build optimized release binary
-cargo build --release
-
-# Install to ~/.local/bin
-install -m 755 target/release/mini-swe-mcp ~/.local/bin/mini-swe-mcp
+cargo build --release      # target/release/mini-swe-mcp
+cargo install --path .     # or put it on PATH
 ```
 
-Ensure `~/.local/bin` is in your `PATH`.
+Requirements: `git`, an OpenAI-compatible endpoint, and `OPENAI_API_KEY`. A `.env` in the working directory is loaded automatically (`ENV_FILE` points elsewhere); `OPENAI_API_BASE` defaults to `https://api.openai.com/v1`.
 
-The release profile is tuned for this I/O-bound stdio daemon
-(see `audits/opt_10_cargo_codegen.md`):
+Model aliases resolve from the first `models.yaml` found: `MODELS_FILE`, then `./models.yaml`, then `$XDG_CONFIG_HOME/mini-swe/models.yaml`, then next to the executable, then the built-in catalog. `mini-swe-mcp manifest` prints the resolved catalog; `DEFAULT_MODEL` names the alias used when a dispatch omits `--model`.
 
-```toml
-[profile.release]
-opt-level = 2        # smaller and faster to build than 3 for a stdio/JSON daemon
-lto = "thin"         # 34% faster release link than fat LTO for a ~5% size cost
-codegen-units = 1    # deterministic single-core thin-LTO link
-panic = "abort"      # no unwinding tables (~473 KB smaller)
-strip = true         # drops ~9.9 MB of debug symbols
-```
+## Connect an agent
 
-Measured result: ~34% faster release compilation and a smaller binary than the
-previous `opt-level = 3` / fat-LTO configuration.
+The server speaks MCP over stdio. `mini-swe-mcp --stdio` starts (or joins) the shared hub and proxies the connection to it, so many orchestrators share one pool.
 
-### Configuration (`.env`)
-
-Copy `.env.example` to `.env` and set your credentials:
-
-```bash
-cp .env.example .env
-```
-
-Configuration resolution follows a 4-tier cascading precedence:
-1. `./.env` (current working directory or parent directory)
-2. `$XDG_CONFIG_HOME/mini-swe/.env` (or `~/.config/mini-swe/.env`)
-3. `.env` alongside the executable
-4. Custom path specified via `ENV_FILE=/path/to/.env`
-
-Environment variables (only `OPENAI_API_KEY` is required):
-```bash
-OPENAI_API_KEY=sk-...
-OPENAI_API_BASE=https://api.openai.com/v1   # Optional, default: https://api.openai.com/v1
-DEFAULT_MODEL=ninja                         # Optional, default: ninja
-MAX_CONCURRENT_WORKERS=64                   # Optional, default: 64
-BASH_CONCURRENT_LIMIT=4                     # Optional, default: one slot per worker
-BASH_BUILD_LIMIT=2                          # Optional, default: cores / 2
-BUILD_PARALLELISM=2                         # Optional, default: cores / 2
-COMMAND_TIMEOUT_SECS=600                    # Optional, default: 600 heavy / 120 light
-WORKER_MAX_RETAINED_LOGS=200                # Optional, default: 200 (ceiling 1000)
-WORKER_MAX_EMITTED_LOGS=40                  # Optional, default: 40 (ceiling 500)
-WORKER_TERMINAL_TTL_SECS=300                # Optional, default: 300
-```
-
-The three `WORKER_*` variables bound the per-worker step-log memory and the
-lifetime of finished worker records; see `.env.example` for the full contract
-and [Step-Log Retention](#step-log-retention) below. Every optional number is
-parsed by one helper: unset, blank and non-numeric values all fall back to the
-documented default, and a value above a ceiling is clamped rather than rejected.
-
----
-
-## MCP Server Integration
-
-### Antigravity / Claude Desktop / Cursor
-
-Add `mini-swe-mcp` to your MCP configuration file (e.g. `~/.config/Claude/claude_desktop_config.json`):
+Claude Code (`claude mcp add` writes the same block):
 
 ```json
 {
   "mcpServers": {
     "mini-swe": {
       "command": "mini-swe-mcp",
-      "args": ["--stdio"],
-      "env": {
-        "OPENAI_API_KEY": "sk-your-openai-api-key",
-        "OPENAI_API_BASE": "https://api.openai.com/v1",
-        "DEFAULT_MODEL": "ninja"
-      }
+      "args": ["--stdio"]
     }
   }
 }
 ```
 
----
+Any other stdio MCP client is configured the same way (`command` plus `args`). The CLI verbs below are the same calls the `worker` MCP tool exposes, for shells and scripts.
 
-## CLI Direct Usage
+## Workflow
 
-`mini-swe-mcp` can be driven directly from the terminal without an MCP client:
+Dispatch, watch, review, steer, merge — one worker per focused concern.
 
-### Flags
-- `mini-swe-mcp --version` / `-V`: Print binary version.
-- `mini-swe-mcp --help` / `-h`: Print command line help.
+### 1. dispatch
 
-### Actions
-
-#### 1. Dispatch a Subagent
-```bash
-# Async dispatch (returns worker_id immediately)
-mini-swe-mcp dispatch "Implement unit tests for src/config.rs" --model ninja --repo .
-
-# Detached dispatch; watch for events and steer when input is needed
-mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo .
-mini-swe-mcp watch
-
-# Offline dispatch: every bash step runs with no network egress
-mini-swe-mcp dispatch "Rename the internal helper" --model ninja --repo . --offline
-
-# Pin the verify gate; --verify "" disables it for this dispatch
-mini-swe-mcp dispatch "Fix the flaky parser test" --model ninja --repo . \
-  --verify "cargo test --all-targets" --max-turns 80
-```
-
-Full usage:
-
-```
-dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>]
-          [--max-turns <n>] [--group <group>] [--offline]
-          [--verify <cmd>]
-```
-
-The `--offline` flag is the CLI spelling of the tool's optional `network`
-property — see [Network Policy](#network-policy). `--verify` is the spelling of
-the `verify` property; see [Verification Gate](#verification-gate).
-
-#### 2. Monitor and List Workers
-```bash
-# List all active and past workers
-mini-swe-mcp list
-
-# Check status of a specific worker
-mini-swe-mcp status <worker_id>
-
-# Registry-only summary (never starts or connects to the hub)
-mini-swe-mcp status --line
-```
-
-For Claude Code, add this to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "mini-swe-mcp status --line"
-  }
-}
-```
-
-The line looks like `⚙ 3 running · 1 needs input · 2 done`. Zero counts are
-omitted; reviewing workers count as running, and failed and stopped workers
-are shown separately. Terminal rows are recent for five minutes after their
-last update. With no active or recent workers, it prints nothing. This command
-reads the registry directly, needs no API key, and always exits successfully.
-
-`mini-swe-mcp monitor` keeps its one-second registry refresh; `--once` prints a
-single dashboard without connecting to or starting the hub.
-
-#### 3. Watch for the Next Actionable Event
-```bash
-# Block until the next actionable event of your workers, then exit
-mini-swe-mcp watch --timeout 300
-mini-swe-mcp watch <worker_id> --follow --json
-```
-
-`watch` is the orchestrator's single blocking command: it prints one
-self-contained event (completed, failed, needs_input or stalled) with everything
-needed to decide — review+merge, steer, answer or kill — and the exact next
-command to run. Without `--follow` it prints that one event and exits; with
-`--follow` it streams one event per line until no watched worker remains.
-`--timeout <secs>` exits 2 with a short "no event" line, and an empty watch set
-exits 3. Events that happened while you were not watching are replayed once,
-under a `While you were not watching:` heading, and only for your own workers.
-
-Full usage:
-```bash
-mini-swe-mcp watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]
-```
-
-#### 4. Steer a Running or Paused Subagent
-```bash
-
-mini-swe-mcp steer <worker_id> "Focus on unit tests first, skip integration tests for now."
-```
-
-A steer on a finished (completed/failed) worker starts a revision: it resumes on
-its preserved `worker-<id>` branch with its full conversation plus your message,
-on a fresh turn budget (`--max-turns <n>`, default 60). Send every correction
-and any merge conflict back to the same worker instead of editing its branch
-yourself; merge only when it is right.
-
-`steer` works from **any terminal, including one that did not dispatch the
-worker**. A worker running in another `mini-swe-mcp` process is steered through
-a per-worker mailbox file at `<base>/swe-wt-<worker_id>.steer`, where `<base>` is
-`/var/tmp` by default or `$SWE_TEMP_DIR` when set. The message is appended
-atomically and picked up by the worker on its next step, so guidance sent to a
-worker dispatched in a different shell is never lost.
-
-The mailbox is a JSON-lines file (one `{message, sent_at, pid}` record per line),
-so multi-line messages — a pasted stack trace, a diff hunk — survive intact. The
-worker drains it once per turn in both the implementation loop and the review
-loop, and deletes it on exit.
+`dispatch` **always detaches**: it returns a `worker_id` immediately and never blocks. The worker starts on its own `worker-<id>` branch in an isolated worktree.
 
 ```bash
-# Terminal A: dispatch and block
-mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo .
-mini-swe-mcp watch
-
-# Terminal B: steer that worker mid-flight
-mini-swe-mcp steer <worker_id> "Skip the integration tests for now."
+mini-swe-mcp dispatch "fix the flaky retry test in src/retry.rs; gate: cargo test retry"
 ```
 
-#### 5. Collect Diff & Logs
-```bash
-# Collect diff and execution summary (automatically removes the worker record)
-mini-swe-mcp collect <worker_id>
-```
+`dispatch <task>` takes:
 
-#### 6. Inspect a Worker's Step Logs
-```bash
-# Read a live worker's retained (bounded) step history without collecting it
-mini-swe-mcp logs <worker_id>
-```
+- `--model <alias>` — otherwise `DEFAULT_MODEL` or the manifest default.
+- `--review-after <alias>` — run a reviewer phase over the produced diff before completing.
+- `--repo <path>` — operate on a different repository.
+- `--max-turns <n>` — turn budget.
+- `--group <g>` — tag workers for `watch --group` and `list`.
+- `--offline` — no outbound network during the run.
+- `--verify <cmd>` — command the worker must pass before completing (auto-detected otherwise).
 
-The response always carries `total_steps`, `logs_retained`, `logs_omitted` and
-`logs_dropped`, plus a `logs_truncation_notice` whenever part of the history is
-missing — see [Step-Log Retention](#step-log-retention).
+Write the task as ONE focused concern with the files in scope and an acceptance gate. Avoid parallel workers whose scopes share files.
 
-#### 7. Kill a Worker
-```bash
-mini-swe-mcp kill <worker_id>
-```
+### 2. watch
 
-Uncommitted work is committed onto the worker's branch before the task is
-aborted, so a kill costs at most the work since the last checkpoint.
-
-#### 8. Reap Expired Worker Records
-```bash
-# Evict terminal worker records whose TTL expired (also runs in the background)
-mini-swe-mcp reap
-```
-
-#### 9. Prune Stale Worktrees
-```bash
-# Clean up orphaned branches and stale temporary worktrees whose processes died
-mini-swe-mcp prune
-```
-
-Uncommitted changes in a dead worker's checkout are salvaged onto its
-`worker-<id>` branch before the checkout is removed, and a branch with commits
-missing from `HEAD` is preserved.
-
-#### 10. Inspect Model Manifest
-```bash
-mini-swe-mcp manifest
-```
-
----
-
-## Network Policy
-
-Every `dispatch` may declare a network policy for its worker:
-
-```json
-{ "action": "dispatch", "task": "Refactor the parser", "network": "offline" }
-```
-
-| Value | Effect |
-|---|---|
-| `allow` | Steps run with the host's normal connectivity (the fallback when no policy is declared) |
-| `offline` | Each bash step runs inside its own network namespace with no egress |
-
-`network` is optional. When it is absent the dispatch default for the resolved
-model applies: its `policy.network` from `models.yaml` if the model declares one,
-otherwise `allow`. An explicit argument always wins. Any other value — or a
-non-string — is rejected as a tool error instead of being silently downgraded: a
-request that asked for isolation must never quietly get connectivity back.
-
-`offline` is enforced at the kernel level with `unshare -n`, with no containers
-and no external firewall. Inside the namespace there is no interface and no
-route, so `curl`, `git fetch` or `cargo add` fail immediately with
-`Network is unreachable` rather than blocking out a connect timeout — the step
-returns fast and the model can adapt on its next turn. The worktree, the build
-environment, the command timeout and the output plumbing are all unchanged; the
-policy also covers the reviewer phase of a `review_after` dispatch.
-
-Use it for pure refactors, analysis, renames or formatting passes, where an
-outbound request would be a defect rather than a feature. Note that `cargo
-build` / `cargo test` still work offline as long as their dependencies are
-already vendored or present in the local registry cache.
-
-If the host forbids creating network namespaces (an unprivileged container
-without `CAP_SYS_ADMIN`), the wrapper is still applied and the step fails
-loudly — a policy that quietly did not apply would be worse than one that is
-visibly unavailable.
-
----
-
-## Verification Gate
-
-A dispatch may declare the command that decides whether a finished worker is
-actually finished:
+`watch` is the only way to wait. It reports an event when a watched worker **completes, fails, needs input or stalls**, and **replays events a late watcher missed**, so there is no `wait` action and no `--wait` flag.
 
 ```bash
-mini-swe-mcp dispatch "Fix the parser" --model ninja --repo . --verify "cargo clippy --all-targets -- -D warnings && cargo test"
+mini-swe-mcp watch --follow             # every worker this agent owns
+mini-swe-mcp watch <id> [...] --follow  # named workers
+mini-swe-mcp watch --group build        # first event in the group, then return
 ```
 
-The gate is resolved once, at dispatch:
+Without `--follow` it prints the next event and returns; with `--follow` it streams until every watched worker is terminal. `--timeout <secs>` bounds the wait; `--json` emits the raw event stream.
 
-| `verify` argument | Gate |
-|---|---|
-| a command | used verbatim |
-| an empty string (`--verify ""`) | disabled for this dispatch |
-| absent | auto-detected: `Cargo.toml` -> `cargo build --all-targets && cargo test`; a `package.json` with a `test` script -> `npm test`; `pyproject.toml` / `pytest.ini` -> `pytest -q`; otherwise none |
+### 3. review
 
-The gate runs through the same sandboxed, semaphore-gated bash path as any other
-step, and only runs when the worker tries to finish (`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`).
-A non-zero exit is pushed back to the model as `VERIFICATION FAILED` with the
-output, so the worker gets another turn to fix it; after three failed
-verifications the run completes anyway and is reported as *not verified* rather
-than looping forever. `verify_runs` and `verify_failures` are reported in the
-worker's health metrics.
-
----
-
-## Step-Log Retention
-
-Every bash step a worker runs appends an `AgentStepLog` to its in-memory history.
-That history is bounded on three independent axes so a long-running server's
-residency tracks *concurrent* workers, not historical ones:
-
-| Axis | Variable | Default | What it bounds |
-|---|---|---|---|
-| Entries per worker | `WORKER_MAX_RETAINED_LOGS` | 200 (max 1000) | Sliding window; the oldest entries are evicted |
-| Bytes per worker | derived from the window | ~430 KiB | Each entry stores a `<= 64 B` command summary and a `<= 2048 B` output excerpt |
-| Entries per response | `WORKER_MAX_EMITTED_LOGS` | 40 (max 500) | A single `collect` / `logs` reply |
-| Terminal record TTL | `WORKER_TERMINAL_TTL_SECS` | 300 | How long a finished worker is kept before eviction |
-
-The truncation marker (`... [N bytes truncated]`) is charged *against* the
-2048-byte budget, so the stored `output` is at most 2048 bytes rather than
-2048-plus-marker.
-
-Nothing degrades silently: every log-bearing response reports
-`total_steps`, `logs_retained`, `logs_omitted` and `logs_dropped`, and adds a
-`logs_truncation_notice` when part of the history is not shown. Use
-`logs <worker_id>` to page through the retained window of a live worker, and
-`reap` (or the background reaper) to reclaim finished workers.
-
----
-
-## Model Manifest (`models.yaml`)
-
-Define custom subagent roles and aliases in `models.yaml`:
-
-```yaml
-default: ninja
-models:
-  ninja:
-    id: combo:ninja
-    role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
-    temperature: 0.2
-    max_turns: 150
-    policy:
-      network: "allow"
-  nerd:
-    id: combo:nerd
-    role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
-    temperature: 0.6
-    max_turns: 200
-    policy:
-      network: "allow"
+```bash
+mini-swe-mcp status <id> --json   # status, branch and diff stat
+mini-swe-mcp collect <id>         # full transcript and final message
+mini-swe-mcp logs <id>            # last commands and their output
 ```
 
-### Execution policy
+Review the diff on `worker-<id>` before merging. `dispatch --review-after` adds an independent reviewer turn over the same worktree.
 
-A model entry may declare the execution policy its workers run under. The
-`policy:` block and its field are both optional, and an entry without one keeps
-the runtime defaults, so a manifest written before this block existed is still
-valid:
+### 4. steer
 
-| Field | Accepted values | Meaning |
-|-------|-----------------|---------|
-| `network` | `"offline"` \| `"allow"` | The dispatch default for the worker: `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool, and an explicit argument on the dispatch wins over the manifest. |
-
-Values are trimmed and matched case-insensitively, so `Offline` and
-`" offLINE "` are accepted. An **unknown value never fails the load**: it is
-reported as a warning naming the exact text you wrote and is repaired to the
-*restrictive* default (`offline`), so a typo can never quietly widen a sandbox.
-Warnings are emitted on startup, alongside the other manifest checks (temperature
-bounds, turn budgets, duplicate ids).
-
-`fs:` is **not supported**: it is ignored with a startup warning, because
-filesystem confinement is not negotiated per model. A worker always writes inside
-its own worktree and build directory, confined by the sandbox rather than by the
-manifest.
-
----
-
-## Persistent Role Memory
-
-A subagent conversation is volatile: every dispatch starts from the same static
-system prompt. Role memory gives each *role* a durable notes file at the repo
-root that is loaded into the system prompt when the worker starts:
-
-```
-.agents/
-└── memory/
-    ├── ninja.md    # fast-execution lessons (compile/test loop, minimal diffs)
-    └── nerd.md     # architecture & review lessons (root cause, invariants)
-```
-
-The file is keyed by the **alias** from `models.yaml`, so `ninja` and `nerd` have
-separate memories and neither leaks into the other's prompt. Memory is read fresh
-on every dispatch and never memoized, so an edit is picked up by the very next
-run:
-
-- **Absent, blank or unreadable** -> no memory section at all; the system prompt
-  is byte-identical to the pre-memory behaviour. Nothing to configure, nothing to
-  break.
-- **Bounded** -> at most 8 KiB of memory is injected (the newest entries), so a
-  memory file that grows forever can never squeeze out the instructions.
-- **Traversal-safe** -> the alias is reduced to an `[a-z0-9_-]` slug before it
-  touches the filesystem, so a `model` argument can never read outside
-  `.agents/memory/`.
-
-Memory is **read-only** from the server's side: it loads a role's notes and never
-writes them, so the files stay a reviewable artefact of the repository rather
-than something a run can silently rewrite. Edit `.agents/memory/<alias>.md` (or
-ask a subagent to) and the next dispatch picks it up.
-
----
-
-## Continuing a worker
-
-A worker that stopped for **any** reason -- `completed`, `failed`, `killed`, or
-`interrupted` by a hub crash -- is continued with `steer`, never replaced:
+`steer` corrects a **completed** worker and continues any **stopped** one (`failed`, `killed`, or `interrupted` by a crash). Either way it resumes on the preserved `worker-<id>` branch with the full conversation plus your message, on a fresh turn budget (`--max-turns <n>`, default 60).
 
 ```bash
 mini-swe-mcp steer <id> "the retry logic still drops the last page"
 ```
 
-The worker keeps its id and its branch `worker-<id>`, so the orchestrator never
-dispatches a replacement. What `steer` does depends on what stopped it:
+Send corrections here instead of dispatching a second worker on the same files, and hand a worker a merge conflict the same way. A worker continued without a saved conversation (legacy) restarts cold on the same branch; only a missing branch is an error.
 
-| What stopped it | What `steer` does |
-| --- | --- |
-| `completed` | Revises the saved conversation with `REVISION REQUEST …` |
-| `failed` / `killed` / `interrupted` | Continues the saved conversation with `CONTINUE: your previous run stopped (…)` |
-| No saved conversation (legacy worker) | Cold continuation: same id and branch, a fresh conversation that names the work the branch already holds |
+### 5. merge
 
-Only a missing branch is an error (`branch worker-<id> no longer exists`).
+Merge `worker-<id>` yourself once the diff is reviewed and the base branch is green. Before reporting completion the worker syncs the base branch into its worktree (`WORKER_SYNC_BASE=0` disables that).
 
-The conversation is durable: every message is appended as one line to
-`swe-wt-<id>.history.jsonl` as it is pushed, so a crash loses at most the
-in-flight turn and a torn last line is dropped on load. Compaction is applied
-when the conversation is rebuilt for a request; the on-disk log stays
-append-only.
+## The hub
 
-A hub crash is not a worker failure: at startup the daemon marks orphans
-`interrupted` (terminal for listing, continuable) and automatically continues
-every interrupted worker that has a history, at most 3 times per worker. Set
-`HUB_AUTO_RESUME=0` to leave them for the orchestrator.
+One daemon, many orchestrators.
 
-Transient failures -- an LLM outage, a network error, a stream stall, a 5xx
-during a revision -- never end a worker in `failed`: it pauses with a question
-instead, and `steer` resumes it.
+- **One daemon.** The CLI and `--stdio` auto-start the hub when none is running. Its socket lives in `SWE_HUB_DIR` (default `<SWE_TEMP_DIR>/mini-swe-hub-<uid>`, private to your uid). `mini-swe-mcp daemon` runs it in the foreground; it exits after `HUB_IDLE_SECS` without clients.
+- **Ownership & privacy.** A client may only read, steer, kill, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, or the MCP `initialize` client info when that is unset.
+- **`--admin`.** The human operator's override on the CLI: act on workers owned by any agent. `list --all` requires it.
+- **Crash recovery.** If the hub dies, its workers become `interrupted`; on restart it auto-resumes them from their durable conversation (`HUB_AUTO_RESUME=0` disables this).
+- **`MINI_SWE_NO_DAEMON=1`.** No daemon: each process serves MCP and owns its own pool. Useful for tests and single-shot use, but its state is invisible to other clients.
 
-## Verification & Testing
+## Sandbox
 
-Run the full automated test suite:
+Every tool command is confined by the kernel by default:
 
-```bash
-# Unit tests + CLI tests + MCP JSON-RPC integration + WorktreeGuard tests
-cargo test
+- **Landlock** (filesystem) plus **seccomp** (syscalls). `MINI_SWE_LANDLOCK_ENFORCE=1` makes an unavailable Landlock fatal instead of best-effort; `SWE_DISABLE_LANDLOCK=1` turns Landlock off.
+- **bubblewrap is opt-in** with `SWE_SANDBOX=bwrap`; it is no longer the default. On a kernel with neither Landlock nor seccomp the sandbox falls back to bwrap when installed and otherwise runs unconfined.
+- `SWE_DISABLE_SANDBOX=1` disables all confinement.
 
-# Strict clippy linting over every target
-cargo clippy --all-targets -- -D warnings
-```
+## Resource management
 
----
+- **Admission.** Heavy commands are classified and dosed: at most `BASH_BUILD_LIMIT` (default the core count) heavy builds at once, gated by free memory (`HUB_MEM_RESERVE_MB`, `HUB_BUILD_MEM_MB`). Light commands use `BASH_CONCURRENT_LIMIT` slots (default one per worker).
+- **Fair scheduling.** `MAX_CONCURRENT_WORKERS` bounds the pool and `MAX_WORKERS_PER_AGENT` caps each agent so one orchestrator cannot starve the others; runnable workers are scheduled across agents.
+- **Shared warm build dirs.** Workers share compiler/package caches under `SWE_CACHE_DIR`, so the second build is warm. `SWE_SHARED_CACHES` adds custom cache binds; `SWE_DISABLE_KACHE=1` (or `KACHE_DISABLED=1`) turns the kache layer off. Shared build slots are pruned by `HUB_TARGET_TTL_HOURS` / `HUB_TARGET_MAX_GB`.
+- **History compaction.** Long conversations are compacted to stay inside `HISTORY_BUDGET_BYTES` while keeping the prompt, task and recent turns intact; `HISTORY_FULL_TURNS` restores a fixed-turn window and `HISTORY_KEEP_ALL_REASONING=1` retains all reasoning.
+- **Log retention.** `WORKER_MAX_RETAINED_LOGS` and `WORKER_MAX_EMITTED_LOGS` bound per-worker logs.
+
+## statusLine
+
+`mini-swe-mcp status --line` prints one line summarising the pool, e.g. `⚙ 3 running · 1 needs input · 2 done`, for a Claude Code `statusLine` command; it prints nothing when the pool is idle. `MONITOR_WIDTH` overrides the width used by the full `monitor`.
+
+## Environment variables
+
+Defaults are what the code uses when the variable is unset.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | — | API key; required by `dispatch`. |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible base URL. |
+| `DEFAULT_MODEL` | manifest default | Alias when a dispatch omits `--model`. |
+| `MODELS_FILE` | — | Path to `models.yaml` (else `./models.yaml`, XDG, exe). |
+| `ENV_FILE` | `.env` | Dotenv file loaded at startup. |
+| `MAX_CONCURRENT_WORKERS` | `128` | Workers the pool can run at once. |
+| `MAX_WORKERS_PER_AGENT` | `0` (unlimited) | Running workers one agent may hold. |
+| `BASH_CONCURRENT_LIMIT` | `MAX_CONCURRENT_WORKERS` | Slots for light commands. |
+| `BASH_BUILD_LIMIT` | core count | Concurrent heavy builds. |
+| `HUB_MEM_RESERVE_MB` | `2048` | Free memory held back from admission. |
+| `HUB_BUILD_MEM_MB` | `1536` | Memory one heavy build is assumed to need. |
+| `BUILD_PARALLELISM` | granted jobs, else half the cores | Parallelism exported to a build. |
+| `HUB_LLM_CONCURRENCY` | `0` (unlimited) | In-flight LLM requests hub-wide. |
+| `LLM_MAX_RETRIES` | `6` | Attempts per completion. |
+| `LLM_OUTAGE_PATIENCE_SECS` | `600` | How long a turn waits out an outage. |
+| `COMMAND_HEAVY_TIMEOUT_SECS` | `600` | Timeout for a heavy command. |
+| `COMMAND_LIGHT_TIMEOUT_SECS` | `120` | Timeout for a light command. |
+| `COMMAND_TIMEOUT_SECS` | — | Overrides both timeout tiers. |
+| `HISTORY_BUDGET_BYTES` | `160000` | Compaction budget for a conversation. |
+| `HISTORY_FULL_TURNS` | — | Fixed-turn history window instead of a budget. |
+| `HISTORY_KEEP_ALL_REASONING` | unset | `1` keeps every reasoning block. |
+| `WORKER_SYNC_BASE` | `1` | Sync the base branch before completing; `0` disables. |
+| `WORKER_TERMINAL_TTL_SECS` | `300` | How long a terminal worker stays listed. |
+| `WORKER_MAX_RETAINED_LOGS` | `200` | Command logs retained (ceiling `1000`). |
+| `WORKER_MAX_EMITTED_LOGS` | `40` | Log lines shown per worker (ceiling `500`). |
+| `SWE_TEMP_DIR` | `/var/tmp`, else `$TMPDIR` | Root for worktrees, hub and caches. |
+| `SWE_HUB_DIR` | `<SWE_TEMP_DIR>/mini-swe-hub-<uid>` | Hub socket and lock directory. |
+| `HUB_IDLE_SECS` | `600` | Idle seconds before the hub exits. |
+| `HUB_AUTO_RESUME` | `1` | Auto-resume interrupted workers; `0` disables. |
+| `MINI_SWE_AGENT_ID` | — | Agent identity used for ownership. |
+| `MINI_SWE_NO_DAEMON` | `0` | `1` runs the in-process server with no hub. |
+| `MINI_SWE_WORKER_THREADS` | `4` | Tokio runtime worker threads. |
+| `SWE_SANDBOX` | Landlock + seccomp | `bwrap` selects the bubblewrap backend. |
+| `SWE_DISABLE_LANDLOCK` | `0` | `1` disables Landlock. |
+| `MINI_SWE_LANDLOCK_ENFORCE` | `0` | `1` makes a missing Landlock fatal. |
+| `SWE_DISABLE_SANDBOX` | `0` | `1` disables all confinement. |
+| `SWE_CACHE_DIR` | `<SWE_TEMP_DIR>/swe-cache` | Shared compiler/package cache root. |
+| `SWE_SHARED_CACHES` | — | Extra cache binds for the sandbox. |
+| `SWE_DISABLE_KACHE` / `KACHE_DISABLED` | unset | `1` disables the kache layer. |
+| `HUB_TARGET_TTL_HOURS` | `24` | Prune shared build slots older than this. |
+| `HUB_TARGET_MAX_GB` | `40` | Size cap on shared build slots. |
+| `MONITOR_WIDTH` | terminal size | Width used by `monitor` / `status`. |
+| `COLUMNS` | terminal size | Fallback width when `MONITOR_WIDTH` is unset. |
+| `XDG_CONFIG_HOME` | `$HOME/.config` | Base for `mini-swe/models.yaml`. |
 
 ## Load testing
 
-`tests/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub
-daemon out to many agents of many workers and asserts the hub keeps the machine
-busy without memory pressure. It is excluded from `cargo test` so the normal
-suite stays fast — run it explicitly:
+`tests/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub daemon out to many agents of many workers and asserts the hub keeps the machine busy without memory pressure. It is excluded from `cargo test` so the normal suite stays fast — run it explicitly:
 
 ```bash
 # Quick smoke: 2 agents x 3 workers (the defaults), ~5 s.
@@ -541,37 +186,23 @@ LOAD_AGENTS=5 LOAD_WORKERS_PER_AGENT=20 \
     cargo test --test load_test -- --ignored --nocapture
 ```
 
-Every worker is driven by a fake OpenAI-compatible SSE server
-(`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a
-heavy command (`cargo build` plus a bounded CPU burn, classified heavy by
-`is_heavy_command` so the pool's admission controller has to dose it), then the
-completion sentinel. The test dispatches each worker over the hub socket with a
-distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the
-daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy
-commands in flight by watching the daemon's children, and records the order
-workers finish in. It then asserts — and prints a one-screen report of:
+Every worker is driven by a fake OpenAI-compatible SSE server (`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a heavy command (`cargo build` plus a bounded CPU burn, classified heavy by `is_heavy_command` so the pool's admission controller has to dose it), then the completion sentinel. The test dispatches each worker over the hub socket with a distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy commands in flight by watching the daemon's children, and records the order workers finish in. It then asserts — and prints a one-screen report of:
 
 - **all workers complete** — every dispatched worker reaches `completed`;
 - **bounded daemon RSS** — peak `VmHWM` stays under a generous 300 MB;
-- **dosed heavy commands** — the number in flight never exceeds
-  `BASH_BUILD_LIMIT`;
-- **fairness** — no agent finishes all of its workers before another agent has
-  completed any of its own.
+- **dosed heavy commands** — the number in flight never exceeds `BASH_BUILD_LIMIT`;
+- **fairness** — no agent finishes all of its workers before another agent has completed any of its own.
 
-The shape is configurable through the environment: `LOAD_AGENTS`,
-`LOAD_WORKERS_PER_AGENT`, `LOAD_MAX_WORKERS` (`MAX_CONCURRENT_WORKERS`),
-`LOAD_MAX_HEAVY` (`BASH_BUILD_LIMIT`), `LOAD_HEAVY_SECS`, and `LOAD_TIMEOUT_SECS`.
+The shape is configurable through the environment: `LOAD_AGENTS`, `LOAD_WORKERS_PER_AGENT`, `LOAD_MAX_WORKERS` (`MAX_CONCURRENT_WORKERS`), `LOAD_MAX_HEAVY` (`BASH_BUILD_LIMIT`), `LOAD_HEAVY_SECS`, and `LOAD_TIMEOUT_SECS`.
 
 Measured on a 4-core host (all other settings at their defaults):
 
 | run         | wall  | peak daemon RSS (VmHWM) | peak heavy in flight | completed |
-| ----------- | ----- | ----------------------- | -------------------- | --------- |
+| ----------- | ----- | ---------- | ---------- | --------- |
 | smoke 2 x 3 | 4.7 s | 20.1 MB                 | 4 / 4                | 6 / 6     |
 | full 5 x 20 | 72 s  | 24.6 MB                 | 4 / 4                | 100 / 100 |
 
-In the full run the admission controller logged 108 heavy-command admission
-waits for the four build slots and the completion order interleaved all five
-agents, so the daemon stayed busy and bounded under 100 concurrent workers.
+In the full run the admission controller logged 108 heavy-command admission waits for the four build slots and the completion order interleaved all five agents, so the daemon stayed busy and bounded under 100 concurrent workers.
 
 ---
 
