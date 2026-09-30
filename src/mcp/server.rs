@@ -13,6 +13,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace};
@@ -309,7 +310,8 @@ impl McpServer {
             .await
     }
 
-    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
+    /// Wait on a worker until it finishes, fails, or pauses for orchestrator
+    /// input.
     ///
     /// Returns the terminal payload:
     /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
@@ -324,10 +326,19 @@ impl McpServer {
     ///
     /// Progress notifications are emitted only when a `progress_token`/`tx`
     /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
-    /// and the polling algorithm stays identical for both callers. While the
+    /// and the waiting algorithm stays identical for both callers. While the
     /// worker runs, the current step is re-sent as a heartbeat every
     /// [`PROGRESS_HEARTBEAT_INTERVAL`](Self::PROGRESS_HEARTBEAT_INTERVAL) so a
     /// step that never ends cannot be mistaken for an idle call.
+    ///
+    /// The wait itself is event-driven: the pool bumps a generation counter on
+    /// every worker state change and this loop sleeps on that subscription, so
+    /// a step, a pause, a resume or a terminal state is observed as it happens
+    /// instead of on a fixed tick. The only coarse tick left is
+    /// [`CROSS_PROCESS_TICK`](Self::CROSS_PROCESS_TICK), for a worker this
+    /// process does not own (another `mini-swe-mcp` process, or
+    /// `MINI_SWE_NO_DAEMON` mode): its state changes are invisible to the
+    /// subscription, so the registry has to be re-read.
     pub async fn await_worker_result_until(
         &self,
         wid: &str,
@@ -342,15 +353,25 @@ impl McpServer {
         let mut last_reported_step = 0;
         let mut last_reported_at = std::time::Instant::now();
         let mut last_progress: Option<crate::pool::WorkerProgress> = None;
+        // Subscribed before the first read, so a change landing between the
+        // read and the sleep is still seen by `changed()`.
+        let mut changes = self.pool.subscribe_changes();
+        // A worker owned by another process never bumps this pool's counter, so
+        // its wait falls back to re-reading the registry on a coarse tick.
+        let tick = if self.pool.worker_progress(wid).await.is_some() {
+            Self::HEARTBEAT_TICK
+        } else {
+            Self::CROSS_PROCESS_TICK
+        };
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            // H-5: poll the lightweight progress snapshot. It never clones the
+            // H-5: read the lightweight progress snapshot. It never clones the
             // (potentially multi-megabyte) `diff`/`summary`/`artifacts` that a
-            // `get_worker_state` clone would copy on every 500 ms tick.
+            // `get_worker_state` clone would copy on every tick.
             if let Some(progress) = self.pool.worker_progress(wid).await {
                 last_progress = Some(progress);
             }
             let Some(progress) = last_progress.as_ref() else {
+                Self::wait_for_change(&mut changes, tick).await;
                 continue;
             };
             match progress.phase {
@@ -440,6 +461,22 @@ impl McpServer {
                     "last_command": progress.last_command,
                 }));
             }
+            Self::wait_for_change(&mut changes, tick).await;
+        }
+    }
+
+    /// Sleep until the pool reports a worker state change, or `tick` elapses.
+    ///
+    /// The tick is a safety net rather than the primary wake-up: it bounds how
+    /// long a missed notification can stall the wait, and it is clamped to the
+    /// heartbeat interval so a step that never ends still reports in.
+    async fn wait_for_change(changes: &mut tokio::sync::watch::Receiver<u64>, tick: Duration) {
+        let wait = tick.min(Self::PROGRESS_HEARTBEAT_INTERVAL);
+        tokio::select! {
+            // A new generation means some worker moved; the caller re-reads the
+            // snapshot it cares about and decides whether it was the one.
+            _ = changes.changed() => {}
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }

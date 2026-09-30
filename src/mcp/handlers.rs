@@ -155,6 +155,20 @@ impl McpServer {
     pub const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(60);
 
+    /// Coarse fallback tick for a worker this process does not own.
+    ///
+    /// Its state changes happen in another process, so no in-process
+    /// notification can arrive and the registry has to be re-read. Thirty
+    /// seconds is far coarser than the 500 ms poll this replaced, because the
+    /// only thing it can still discover is a transition that already happened.
+    pub(super) const CROSS_PROCESS_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Tick used while waiting on a worker this process owns.
+    ///
+    /// Such a worker wakes the wait through the change subscription, so this
+    /// only has to be short enough to carry the heartbeat deadline.
+    pub(super) const HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
     /// Map a `tools/call` request to its handler.
     ///
     /// Verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`,

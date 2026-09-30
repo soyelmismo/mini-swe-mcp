@@ -316,14 +316,11 @@ impl WorkerPool {
             verified,
             metrics: meta.metrics,
         };
-        {
-            let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
-                w.state = completed_state;
-            }
-        }
+        self.update_worker(&worker_id, |w| w.state = completed_state)
+            .await;
 
-        meta.save_status(
+        self.save_status(
+            meta,
             &model,
             RegistryStatus::Completed,
             step,

@@ -11,10 +11,12 @@
 //! server:mini-swe`) drops such a notification silently, so emitting one is
 //! always safe.
 //!
-//! [`spawn_event_stream`] is the producer: every [`POLL_INTERVAL`] it diffs the
-//! worker state — this process's pool plus the shared on-disk registry, so a
-//! worker owned by another `mini-swe-mcp` process (a CLI dispatch) is reported
-//! too — and emits one notification per transition into a state the
+//! [`spawn_event_stream`] is the producer: it sleeps on the pool's change
+//! subscription and diffs the worker state on every wake-up, plus a coarse
+//! fallback tick for workers owned by another process. It reads this
+//! process's pool plus the shared on-disk registry, so a worker owned by
+//! another `mini-swe-mcp` process (a CLI dispatch) is reported too — and emits
+//! one notification per transition into a state the
 //! orchestrator has to act on: paused (`needs_input`), `completed` and
 //! `failed`. A worker that was already terminal when the task started is
 //! seeded into the first snapshot instead of being diffed against an empty one,
@@ -38,12 +40,15 @@ use crate::pool::{
     clamp_string,
 };
 
-/// How often the event task re-reads the worker state.
+/// How often the event task re-reads the registry for workers it does not own.
 ///
-/// Two seconds is coarse enough that a fleet of workers costs a handful of
-/// small registry reads per minute, and fine enough that a paused worker is
-/// reported long before the orchestrator gives up on it.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// This tick only exists for a worker owned by another `mini-swe-mcp` process
+/// (a CLI dispatch) or `MINI_SWE_NO_DAEMON` mode: a worker of this process
+/// wakes the task through the pool's change subscription. Thirty seconds is
+/// coarse enough that a fleet of workers costs a handful of small registry
+/// reads per minute, and fine enough that a paused worker is still reported
+/// long before the orchestrator gives up on it.
+const FALLBACK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// JSON-RPC method of a channel notification (research preview).
 const CHANNEL_METHOD: &str = "notifications/claude/channel";
@@ -268,8 +273,14 @@ pub(super) fn spawn_event_stream(pool: WorkerPool, tx: mpsc::Sender<String>) -> 
         // announces it.
         let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
         previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
+        // Subscribed before serving, so a transition landing while the first
+        // snapshot is being read still wakes the loop after it.
+        let mut changes = pool.subscribe_changes();
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_INTERVAL) => {}
+            }
             let current = snapshot(&pool, &previous).await;
             for event in diff_events(&previous, &current) {
                 let Some(frame) = channel_frame(&event) else {

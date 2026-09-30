@@ -1143,3 +1143,97 @@ async fn test_a_killed_worker_reports_what_the_run_had_measured() {
     assert_eq!(metrics.repeat_blocks, 2);
     assert_eq!(metrics.turns_used, 9);
 }
+
+// ----------
+// Hub H-5a: event-driven waits, coalesced registry writes, one HTTP client
+// ----------
+
+/// A synthetic state change wakes a subscribed waiter without any tick.
+#[tokio::test]
+async fn change_subscription_fires_on_every_state_change() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("h5a-sub")).await;
+    let mut changes = pool.subscribe_changes();
+    // The subscription starts at the current generation, so only the state
+    // change below may resolve it.
+    let changed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        changes.changed(),
+    );
+    pool.__test_set_worker_state(
+        "h5a-sub",
+        WorkerState::Paused {
+            question: "q?".into(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
+    changed.await.expect("the waiter must observe the change").expect("watch open");
+}
+
+/// Step-only registry updates coalesce; a status transition writes at once.
+#[tokio::test]
+async fn step_only_registry_updates_coalesce_to_one_write() {
+    let dir = scratch_dir("h5a-reg");
+    let _scope = ScopedTempDir::set(&dir);
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let meta = mini_swe_mcp::pool::WorkerMeta {
+        id: "h5a-reg".into(),
+        task: "t".into(),
+        group: None,
+        repo_path: None,
+        started_at: 0,
+        pid: std::process::id(),
+        metrics: WorkerMetrics::default(),
+    };
+    let row_path =
+        std::path::PathBuf::from(&dir).join("swe-registry").join("h5a-reg.json");
+    let mtime = || std::fs::metadata(&row_path).ok().and_then(|m| m.modified().ok());
+
+    // First write always lands (there is no row yet to coalesce with)...
+    pool.__test_save_status(&meta, "m", RegistryStatus::Running, 1, 10, "ls", None);
+    assert!(row_path.exists(), "the first registry row must be written");
+    let first = mtime();
+    // ...but N rapid step-only updates behind the throttle window do not.
+    for step in 2..=10usize {
+        pool.__test_save_status(&meta, "m", RegistryStatus::Running, step, 10, "ls", None);
+    }
+    assert_eq!(mtime(), first, "rapid step updates must coalesce to one file write");
+
+    // Past the throttle window a step update lands again, so the final state
+    // can never be stuck behind the throttle.
+    pool.__test_reset_registry_throttle("h5a-reg");
+    pool.__test_save_status(&meta, "m", RegistryStatus::Running, 11, 10, "ls", None);
+    assert!(mtime() >= first, "a step update past the window must be written");
+    let stepped = mtime();
+
+    // A status transition is never throttled.
+    pool.__test_save_status(&meta, "m", RegistryStatus::Paused, 11, 10, "ls", Some("q?".into()));
+    let entry: WorkerRegistryEntry =
+        serde_json::from_str(&std::fs::read_to_string(&row_path).expect("row readable"))
+            .expect("row parses");
+    assert_eq!(entry.status, RegistryStatus::Paused);
+    assert_eq!(entry.question.as_deref(), Some("q?"));
+    assert!(mtime() >= stepped, "a status transition must write immediately");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every runner reuses the single process-wide HTTP client.
+#[test]
+fn agent_runners_share_one_http_client() {
+    use mini_swe_mcp::agent::AgentRunner;
+    let _first = AgentRunner::new("http://x".into(), "k".into(), "m".into(), None);
+    let builds = AgentRunner::__test_shared_client_builds();
+    assert_eq!(builds, 1, "the first runner builds the one shared client");
+    // Further runners — even against another base URL — must not build again:
+    // they clone the shared client, so connections and TLS sessions are reused.
+    let _second = AgentRunner::new("http://y".into(), "k".into(), "m".into(), None);
+    let _third = AgentRunner::new("http://z".into(), "k".into(), "m".into(), None);
+    assert_eq!(
+        AgentRunner::__test_shared_client_builds(),
+        builds,
+        "runners must reuse one client so connections and TLS sessions are shared"
+    );
+}
