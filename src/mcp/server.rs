@@ -523,13 +523,7 @@ impl McpServer {
                 };
 
                 match self
-                    .execute_tool_in_context(
-                        tool_name,
-                        arguments,
-                        progress_token,
-                        progress_tx,
-                        ctx,
-                    )
+                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, ctx)
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),

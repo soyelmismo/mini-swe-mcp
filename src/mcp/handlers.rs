@@ -255,9 +255,7 @@ impl McpServer {
     /// `watch` runs in the same process.
     fn watch_command(ctx: &super::server::ConnectionContext) -> Option<String> {
         let token = ctx.token_store()?.token_for(&ctx.agent())?;
-        Some(format!(
-            "MINI_SWE_WATCH_TOKEN={token} mini-swe-mcp watch"
-        ))
+        Some(format!("MINI_SWE_WATCH_TOKEN={token} mini-swe-mcp watch"))
     }
 
     /// Add `watch_command` to a dispatch or steer payload, when this caller has

@@ -58,8 +58,17 @@ const MAX_DEPTH: usize = 32;
 /// rule answers instead. The list is explicit: guessing at "looks like a
 /// daemon" would either miss the per-user manager or refuse a real host.
 const SERVICE_MANAGERS: &[&str] = &[
-    "systemd", "init", "launchd", "openrc", "openrc-init", "runit", "runsvdir", "s6-svscan",
-    "supervisord", "tini", "docker-init",
+    "systemd",
+    "init",
+    "launchd",
+    "openrc",
+    "openrc-init",
+    "runit",
+    "runsvdir",
+    "s6-svscan",
+    "supervisord",
+    "tini",
+    "docker-init",
 ];
 
 /// Environment variables that name the session inside the host process, in
@@ -165,7 +174,11 @@ impl Identity {
                 host.pid,
                 skipped.join(", ")
             ),
-            Source::Session { host, skipped, session } => format!(
+            Source::Session {
+                host,
+                skipped,
+                session,
+            } => format!(
                 "host process {} (pid {}){} in session {}",
                 host.comm,
                 host.pid,
@@ -325,12 +338,7 @@ pub fn identity(fallback: &str) -> Identity {
 /// The identity of `pid`, reading the session and the watch token from this
 /// process's environment.
 pub fn identity_of(pid: u32, override_id: Option<&str>, fallback: &str) -> Identity {
-    identity_with_session(
-        pid,
-        override_id,
-        session_from_env().as_deref(),
-        fallback,
-    )
+    identity_with_session(pid, override_id, session_from_env().as_deref(), fallback)
 }
 
 /// The identity of `pid` with the session supplied by the caller.
@@ -609,7 +617,12 @@ mod tests {
     /// one: neither splits nor invents an identity.
     #[test]
     fn the_override_outranks_the_session() {
-        let resolved = identity_with_session(std::process::id(), Some("orchestrator-7"), Some("tab-7"), "cli");
+        let resolved = identity_with_session(
+            std::process::id(),
+            Some("orchestrator-7"),
+            Some("tab-7"),
+            "cli",
+        );
         assert_eq!(resolved.id, "orchestrator-7");
         assert_eq!(resolved.source, Source::Override);
 
@@ -619,7 +632,10 @@ mod tests {
             "{:?}",
             host_only.source
         );
-        assert_eq!(host_only.id, host_of(std::process::id()).unwrap().to_string());
+        assert_eq!(
+            host_only.id,
+            host_of(std::process::id()).unwrap().to_string()
+        );
     }
 
     /// The session variables are read in one fixed order, and the first one

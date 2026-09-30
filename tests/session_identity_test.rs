@@ -238,8 +238,11 @@ impl Client {
 struct Daemon {
     socket: PathBuf,
     server: Arc<McpServer>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     dir: PathBuf,
+    /// Set by [`Daemon::stop`]: the directory outlives this daemon, so the
+    /// caller (a restart) owns it and its cleanup.
+    detached: bool,
 }
 
 impl Daemon {
@@ -264,16 +267,32 @@ impl Daemon {
         Self {
             socket,
             server,
-            task,
+            task: Some(task),
             dir,
+            detached: false,
+        }
+    }
+
+    /// Stop the daemon and wait for it to let go of the hub lock, leaving the
+    /// directory in place: the seam a restart is tested through, since the
+    /// tokens have to survive it.
+    async fn stop(&mut self) {
+        self.detached = true;
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.task.abort();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if !self.detached {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -300,8 +319,10 @@ async fn watch_token_of(reply: &Value) -> String {
 async fn two_sessions_of_one_connection_own_different_workers() {
     let daemon = Daemon::start().await;
     let pool = daemon.server.pool();
-    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
-    pool.__test_insert_worker(owned_worker("tab-b-1", TAB_B)).await;
+    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+        .await;
+    pool.__test_insert_worker(owned_worker("tab-b-1", TAB_B))
+        .await;
 
     // One connection, one host, two sessions: opencode v2's tabs.
     let mut connection = Client::connect(&daemon.socket).await;
@@ -325,9 +346,9 @@ async fn two_sessions_of_one_connection_own_different_workers() {
         "a call that names no session is the bare host, which owns neither"
     );
 
-    for (session, mine, theirs) in [
-        ("tab-a", "tab-a-1", "tab-b-1"),
-        ("tab-b", "tab-b-1", "tab-a-1"),
+    for (session, mine, theirs, theirs_owner) in [
+        ("tab-a", "tab-a-1", "tab-b-1", TAB_B),
+        ("tab-b", "tab-b-1", "tab-a-1", TAB_A),
     ] {
         connection
             .worker(
@@ -344,7 +365,7 @@ async fn two_sessions_of_one_connection_own_different_workers() {
             .await
             .expect_err("the other session's worker must be refused");
         assert!(
-            error.contains(&format!("belongs to agent {theirs}")),
+            error.contains(&format!("belongs to agent {theirs_owner}")),
             "'{session}' must be told who owns the worker: {error}"
         );
     }
@@ -356,7 +377,8 @@ async fn two_sessions_of_one_connection_own_different_workers() {
 async fn a_session_is_read_per_call_and_never_cached() {
     let daemon = Daemon::start().await;
     let pool = daemon.server.pool();
-    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
+    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+        .await;
 
     let mut connection = Client::connect(&daemon.socket).await;
     connection
@@ -366,7 +388,10 @@ async fn a_session_is_read_per_call_and_never_cached() {
     // The connection announced tab-a, so a call with no `_meta` is tab-a ...
     assert_eq!(connection.listed_ids(None).await, ["tab-a-1"]);
     // ... and a call that names tab-b is tab-b, without relearning anything.
-    assert_eq!(connection.listed_ids(Some("tab-b")).await, Vec::<String>::new());
+    assert_eq!(
+        connection.listed_ids(Some("tab-b")).await,
+        Vec::<String>::new()
+    );
     // ... and the connection is still tab-a afterwards.
     assert_eq!(connection.listed_ids(None).await, ["tab-a-1"]);
 }
@@ -377,7 +402,8 @@ async fn a_session_is_read_per_call_and_never_cached() {
 async fn a_watch_token_acts_as_the_dispatching_session() {
     let daemon = Daemon::start().await;
     let pool = daemon.server.pool();
-    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
+    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+        .await;
 
     // The session that dispatched: it steers its worker and is handed the
     // command that waits on it.
@@ -392,7 +418,7 @@ async fn a_watch_token_acts_as_the_dispatching_session() {
         )
         .await
         .expect("the session may steer its own worker");
-    assert_eq!(steered["owner"], TAB_A);
+    assert_eq!(steered["worker_id"], "tab-a-1");
     let token = watch_token_of(&steered).await;
 
     // The shell: no session variable reaches it, only the token.
@@ -424,7 +450,13 @@ async fn a_watch_token_acts_as_the_dispatching_session() {
     // A wrong token is not an identity: the caller falls back to its own host.
     let mut wrong = Client::connect(&daemon.socket).await;
     wrong
-        .handshake(CLI_CLIENT_NAME, None, Some(HOST), None, Some(&"0".repeat(32)))
+        .handshake(
+            CLI_CLIENT_NAME,
+            None,
+            Some(HOST),
+            None,
+            Some(&"0".repeat(32)),
+        )
         .await;
     assert_eq!(
         wrong.listed_ids(None).await,
@@ -445,9 +477,10 @@ async fn a_watch_token_acts_as_the_dispatching_session() {
 async fn watch_tokens_survive_a_daemon_restart() {
     let dir = scratch_dir();
     let token = {
-        let daemon = Daemon::start_in(dir.clone()).await;
+        let mut daemon = Daemon::start_in(dir.clone()).await;
         let pool = daemon.server.pool();
-        pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
+        pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+            .await;
         let mut session = Client::connect(&daemon.socket).await;
         session
             .handshake("opencode", None, Some(HOST), None, None)
@@ -461,7 +494,7 @@ async fn watch_tokens_survive_a_daemon_restart() {
             .expect("the session may steer its own worker");
         let token = watch_token_of(&steered).await;
 
-        let path = dir.join("watch-tokens.json");
+        let path = HubPaths::new(dir.clone()).watch_tokens();
         let mode = std::fs::metadata(&path)
             .expect("the token store is a file in the hub directory")
             .permissions()
@@ -474,13 +507,15 @@ async fn watch_tokens_survive_a_daemon_restart() {
             !stored.contains(TAB_B),
             "only the identities that asked are stored: {stored}"
         );
+        daemon.stop().await;
         token
     };
 
     // A fresh daemon on the same directory: the token still names the session.
     let restarted = Daemon::start_in(dir.clone()).await;
     let pool = restarted.server.pool();
-    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
+    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+        .await;
     let mut shell = Client::connect(&restarted.socket).await;
     shell
         .handshake(CLI_CLIENT_NAME, None, None, None, Some(&token))
@@ -521,7 +556,10 @@ async fn an_explicit_agent_id_outranks_the_session_and_the_token() {
         )
         .await
         .expect_err("the session does not own the pinned worker");
-    assert!(steered.contains("belongs to agent orchestrator-7"), "{steered}");
+    assert!(
+        steered.contains("belongs to agent orchestrator-7"),
+        "{steered}"
+    );
     let token = {
         // The pinned agent dispatches, so the token it is handed is its own.
         let mut pinned = Client::connect(&daemon.socket).await;
@@ -548,7 +586,13 @@ async fn an_explicit_agent_id_outranks_the_session_and_the_token() {
     // The token names the pinned agent, and the override outranks the token.
     let mut shell = Client::connect(&daemon.socket).await;
     shell
-        .handshake(CLI_CLIENT_NAME, Some("orchestrator-7"), None, None, Some(&token))
+        .handshake(
+            CLI_CLIENT_NAME,
+            Some("orchestrator-7"),
+            None,
+            None,
+            Some(&token),
+        )
         .await;
     shell
         .worker(
@@ -574,8 +618,10 @@ async fn an_explicit_agent_id_outranks_the_session_and_the_token() {
 async fn a_host_with_no_session_keeps_its_host_identity() {
     let daemon = Daemon::start().await;
     let pool = daemon.server.pool();
-    pool.__test_insert_worker(owned_worker("host-1", HOST)).await;
-    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A)).await;
+    pool.__test_insert_worker(owned_worker("host-1", HOST))
+        .await;
+    pool.__test_insert_worker(owned_worker("tab-a-1", TAB_A))
+        .await;
 
     let mut connection = Client::connect(&daemon.socket).await;
     connection
@@ -606,7 +652,10 @@ async fn a_host_with_no_session_keeps_its_host_identity() {
             )
             .await
             .expect_err("a session of that host is a different agent");
-        assert!(error.contains(&format!("belongs to agent {TAB_A}")), "{error}");
+        assert!(
+            error.contains(&format!("belongs to agent {TAB_A}")),
+            "{error}"
+        );
     }
 }
 
@@ -684,8 +733,8 @@ fn a_shell_with_no_session_variable_keeps_its_host_identity() {
         "no session, so the host alone: {stdout}"
     );
     assert!(
-        stdout.contains("host process") && !stdout.contains("session"),
-        "whoami must say the host answered: {stdout}"
+        stdout.contains("derived from host process"),
+        "whoami must say the host answered, with no session in it: {stdout}"
     );
 }
 

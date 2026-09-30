@@ -599,10 +599,14 @@ struct TokenStore {
 }
 
 impl TokenStore {
-    /// Drop rows that can never be presented again, then the oldest rows until
-    /// the file is back inside [`MAX_TOKEN_ROWS`].
-    fn prune(&mut self) {
+    /// Drop the rows that can never be presented again: a `host:` identity
+    /// whose process is gone.
+    fn retain_live(&mut self) {
         self.rows.retain(|identity, _| identity_alive(identity));
+    }
+
+    /// Drop the oldest rows until the file is back inside [`MAX_TOKEN_ROWS`].
+    fn cap_rows(&mut self) {
         if self.rows.len() <= MAX_TOKEN_ROWS {
             return;
         }
@@ -631,8 +635,7 @@ fn identity_alive(identity: &str) -> bool {
     };
     let host = rest.split("/session:").next().unwrap_or(rest);
     let mut fields = host.split(':');
-    let (Some(_comm), Some(pid), Some(starttime)) =
-        (fields.next(), fields.next(), fields.next())
+    let (Some(_comm), Some(pid), Some(starttime)) = (fields.next(), fields.next(), fields.next())
     else {
         return true;
     };
@@ -674,6 +677,10 @@ impl WatchTokens {
             return Some(row.token.clone());
         }
         let token = mint_token()?;
+        // Dead rows go first, so a long-lived hub cannot grow the file without
+        // limit; the caller's own row is live by definition — it is the
+        // identity asking right now.
+        store.retain_live();
         store.rows.insert(
             identity.to_string(),
             TokenRow {
@@ -681,7 +688,7 @@ impl WatchTokens {
                 created: now_secs(),
             },
         );
-        store.prune();
+        store.cap_rows();
         self.write(&store)?;
         Some(token)
     }
