@@ -57,6 +57,9 @@ async fn async_main() -> Result<()> {
     let server = McpServer::new(pool.clone(), default_model);
 
     if let Some(action) = action_of(&cli_args) {
+        if action == "daemon" {
+            return run_daemon_cmd(&server, &pool).await;
+        }
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
 
@@ -75,6 +78,20 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Run the hub daemon: the single process owning the only worker pool.
+///
+/// Foreground only; clients dial `hub.sock` and speak the same JSON-RPC the
+/// stdio server speaks. No API key is required to start: the pool is built
+/// exactly like the stdio path, and keyless dispatches fail lazily per call.
+async fn run_daemon_cmd(server: &McpServer, _pool: &WorkerPool) -> Result<()> {
+    let dir = mini_swe_mcp::hub::hub_dir()?;
+    let running = mini_swe_mcp::hub::run_daemon(std::sync::Arc::new(server.clone()), dir, None).await?;
+    if !running {
+        println!("hub already running");
+    }
+    Ok(())
 }
 
 /// Execute one CLI-selected action and print the result.
@@ -167,6 +184,7 @@ fn print_help() {
     println!("  kill <worker_id>");
     println!("  manifest");
     println!("  prune");
+    println!("  daemon");
     println!("\nFlags:");
     println!("      --json     Output in JSON format (default is formatted plain text)");
     println!("  -h, --help     Print help");

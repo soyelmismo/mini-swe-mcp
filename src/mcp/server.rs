@@ -146,7 +146,6 @@ impl McpServer {
 
             let server = self.clone();
             let tx = out_tx.clone();
-            let ctx = ctx;
             let owned_line = line.to_string();
             tokio::spawn(async move {
                 let line = owned_line.as_str();

@@ -202,11 +202,11 @@ impl HubServer {
                     break;
                 }
                 _ = async {
-                    async {
-                        match term.as_mut() {
-                            Some(sig) => sig.recv().await,
-                            None => std::future::pending::<Option<()>>().await,
+                    match term.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
                         }
+                        None => std::future::pending::<()>().await,
                     }
                 } => {
                     info!("Received SIGTERM, shutting down hub daemon");
