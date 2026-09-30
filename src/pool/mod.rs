@@ -54,6 +54,7 @@ pub use self::registry::{
     remove_registry_entry, save_registry_entry,
 };
 pub(crate) use self::registry::recover_orphaned_workers;
+pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
     parse_request_turns, summarize_command,

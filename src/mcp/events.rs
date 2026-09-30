@@ -500,6 +500,54 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
     current
 }
 
+/// Lines a failed `[verify]` run is worth reading: failure markers and the
+/// newest context, bounded to 40 lines and 4 KiB.
+///
+/// A verify run prints thousands of passing-test lines, so the raw tail is both
+/// huge and uninformative. Marked lines (`FAILED`, `panicked`, `error`,
+/// `warning:`, `assertion`) win the budget: when none of the last 40 lines
+/// carries one, the most recent marked lines are shown instead of the oldest
+/// tail lines, and the byte cap drops unmarked lines first.
+fn verify_tail(output: &str) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 4096;
+    const MARKERS: [&str; 5] = ["FAILED", "panicked", "error", "warning:", "assertion"];
+    fn marked(line: &str) -> bool {
+        MARKERS.iter().any(|marker| line.contains(marker))
+    }
+    let lines: Vec<&str> = output.lines().collect();
+    let mut window: Vec<&str> = lines.iter().rev().take(MAX_LINES).rev().copied().collect();
+    if !window.iter().any(|line| marked(line)) {
+        let mut failures: Vec<&str> = lines.iter().filter(|line| marked(line)).copied().collect();
+        failures.reverse();
+        failures.truncate(MAX_LINES);
+        let kept = failures.len();
+        if kept > 0 {
+            let context = window.len().saturating_sub(MAX_LINES - kept);
+            let mut chosen = failures;
+            chosen.extend_from_slice(&window[window.len() - context..]);
+            window = chosen;
+        }
+    }
+    let mut total: usize = window.iter().map(|line| line.len() + 1).sum();
+    let mut index = 0;
+    while total > MAX_BYTES && index < window.len() {
+        if marked(window[index]) {
+            index += 1;
+        } else {
+            total -= window[index].len() + 1;
+            window.remove(index);
+        }
+    }
+    let mut text = window.join("\n");
+    if text.len() > MAX_BYTES {
+        let cut = text.len() - MAX_BYTES;
+        let start = text.char_indices().find(|(at, _)| *at >= cut).map(|(at, _)| at).unwrap_or(text.len());
+        text = text[start..].to_string();
+    }
+    text
+}
+
 /// A worker as the on-disk registry describes it.
 fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
     WorkerView {
@@ -762,10 +810,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         if let Some(logs) = pool.get_worker_logs(id).await {
             view["last_ops"] = json!(logs.tail(5).iter().map(|log| clamp_string(&log.command,256)).collect::<Vec<_>>());
             if view["verified"] == false || view["metrics"]["verify_failures"].as_u64().unwrap_or(0) > 0 {
-                view["verify_output_tail"] = json!(logs.tail(1000).iter().rev().find(|log| log.command.starts_with("[verify]")).map(|log| {
-                    let tail: String = log.output.chars().rev().take(1500).collect::<String>().chars().rev().collect();
-                    tail
-                }));
+                view["verify_output_tail"] = json!(logs.tail(1000).iter().rev().find(|log| log.command.starts_with("[verify]")).map(|log| verify_tail(&log.output)));
             }
         }
     }
