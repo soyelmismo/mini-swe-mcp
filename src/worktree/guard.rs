@@ -93,6 +93,20 @@ fn sanitize_worker_id(worker_id: &str) -> String {
     trimmed.to_string()
 }
 
+/// The commit a branch points at, or `None` when the branch is absent.
+///
+/// `show-ref --verify` answers without listing every ref, so a revision probe
+/// stays O(1) however many worker branches the repository holds.
+fn branch_ref(repo_root: &Path, branch: &str) -> Option<String> {
+    let output = git(
+        repo_root,
+        "show-ref",
+        &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+    )
+    .ok()?;
+    output.status.success().then(|| branch.to_string())
+}
+
 /// Create the checkout directory private *before* git writes into it.
 /// Git accepts an existing empty directory for `worktree add` and preserves
 /// its mode; chmodding only after checkout exposes contents under umask 022.
@@ -146,6 +160,26 @@ pub struct WorktreeGuard {
 }
 
 impl WorktreeGuard {
+    /// Re-attach to the branch a finished worker left behind (`worker-<id>`).
+    ///
+    /// Used by a revision: the branch carries the previous run's checkpoints
+    /// and final commit, so the worktree is checked out from the branch tip
+    /// instead of `HEAD` (reusing [`WorktreeGuard::new`]'s checkout path, not
+    /// a second copy of it). The diff base stays the original `base_commit`,
+    /// so uncommitted work plus every checkpoint still reports as one diff.
+    /// Errors when the branch is gone -- the orchestrator must know the branch
+    /// it reviewed no longer exists instead of silently restarting elsewhere.
+    pub fn reopen(repo_root: &Path, worker_id: &str, base_commit: &str) -> Result<Self> {
+        let worker_id = sanitize_worker_id(worker_id);
+        let branch = format!("worker-{worker_id}");
+        if branch_ref(repo_root, &branch).is_none() {
+            anyhow::bail!(
+                "Worker branch {branch} no longer exists; the finished worker cannot be revised"
+            );
+        }
+        Self::checkout(repo_root, &worker_id, &branch, branch.as_str(), base_commit, false)
+    }
+
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
         // Branch and directory names derive from the *sanitized* id, so they
         // can never describe different worktrees nor escape `swe_base_dir()`.
@@ -160,6 +194,44 @@ impl WorktreeGuard {
         force_remove_dir(&path);
         let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
 
+        let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
+        if !base_commit_out.status.success() {
+            let stderr = String::from_utf8_lossy(&base_commit_out.stderr);
+            anyhow::bail!("git rev-parse HEAD failed: {}", stderr.trim());
+        }
+        let base_commit = String::from_utf8_lossy(&base_commit_out.stdout)
+            .trim()
+            .to_string();
+
+        let mut guard = Self::checkout(repo_root, &worker_id, &branch, "HEAD", &base_commit, true)?;
+        guard.base_commit = base_commit;
+        Ok(guard)
+    }
+
+    /// Check out `start_point` at `path` on `branch`: the one checkout path
+    /// [`WorktreeGuard::new`] and [`WorktreeGuard::reopen`] share, so neither
+    /// duplicates the private-dir creation, the `worktree add`, the mode
+    /// hardening, the lease marker or the artifact seeding.
+    ///
+    /// `fresh_branch` selects `-b` (create, for a dispatch) versus `--detach`-
+    /// free re-attach (for a revision, where the branch already exists).
+    /// `base_commit` is recorded as the diff base without re-reading `HEAD` of
+    /// the repo root, which may have moved on since the original run.
+    fn checkout(
+        repo_root: &Path,
+        worker_id: &str,
+        branch: &str,
+        start_point: &str,
+        base_commit: &str,
+        fresh_branch: bool,
+    ) -> Result<Self> {
+        let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
+
+        // A revision never leaves a stale checkout behind: the finished run's
+        // `Drop` removed it, but a crashed run may not have, and `worktree add`
+        // fails loudly on a registered path (audit §06).
+        force_remove_dir(&path);
+
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
 
         let path_str = path
@@ -169,11 +241,19 @@ impl WorktreeGuard {
         // a permissive umask.
         create_private_worktree_dir(&path)?;
 
-        let output = git(
-            repo_root,
-            "worktree add",
-            &["worktree", "add", "-b", &branch, path_str, "HEAD"],
-        )?;
+        let output = if fresh_branch {
+            git(
+                repo_root,
+                "worktree add",
+                &["worktree", "add", "-b", branch, path_str, start_point],
+            )?
+        } else {
+            git(
+                repo_root,
+                "worktree add",
+                &["worktree", "add", path_str, start_point],
+            )?
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -203,20 +283,11 @@ impl WorktreeGuard {
             }
         }
 
-        let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
-        if !base_commit_out.status.success() {
-            let stderr = String::from_utf8_lossy(&base_commit_out.stderr);
-            anyhow::bail!("git rev-parse HEAD failed: {}", stderr.trim());
-        }
-        let base_commit = String::from_utf8_lossy(&base_commit_out.stdout)
-            .trim()
-            .to_string();
-
         Ok(Self {
             path,
-            branch,
+            branch: branch.to_string(),
             repo_root: repo_root.to_path_buf(),
-            base_commit,
+            base_commit: base_commit.to_string(),
             preserve_branch: false,
             seeded,
         })

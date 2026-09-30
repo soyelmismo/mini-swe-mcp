@@ -98,6 +98,11 @@ pub enum WorkerState {
         verified: Option<bool>,
         #[serde(default)]
         metrics: WorkerMetrics,
+        /// Times this worker was revised after finishing. A fresh dispatch
+        /// completes at zero; every revision bumps it, so the orchestrator can
+        /// tell the first answer from a corrected one.
+        #[serde(default)]
+        revision: usize,
     },
     Failed {
         error: String,
@@ -107,6 +112,10 @@ pub enum WorkerState {
         /// its first turn reports the all-zero default.
         #[serde(default)]
         metrics: WorkerMetrics,
+        /// Same counter as on [`WorkerState::Completed`]: a failed worker that
+        /// was itself a revision reports which attempt died.
+        #[serde(default)]
+        revision: usize,
     },
 }
 
@@ -134,7 +143,7 @@ impl WorkerState {
                 "question": question,
                 "paused_at": paused_at,
             }),
-            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, metrics, .. } => serde_json::json!({
+            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, metrics, revision, .. } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
@@ -143,13 +152,15 @@ impl WorkerState {
                 "branch": branch,
                 "verified": verified,
                 "metrics": metrics,
+                "revision": revision,
             }),
-            WorkerState::Failed { error, step, failed_at, metrics } => serde_json::json!({
+            WorkerState::Failed { error, step, failed_at, metrics, revision } => serde_json::json!({
                 "status": "Failed",
                 "step": step,
                 "error": error,
                 "failed_at": failed_at,
                 "metrics": metrics,
+                "revision": revision,
             }),
         }
     }
@@ -169,15 +180,29 @@ pub struct WorkerRecord {
     pub pending_steer: Vec<String>,
     pub resume_tx: Option<tokio::sync::mpsc::Sender<String>>,
     pub handle: Option<JoinHandle<()>>,
+    /// Times this worker was steered after reaching a terminal state. A fresh
+    /// dispatch starts at zero; every revision bumps it, so the orchestrator
+    /// can tell the first answer from a corrected one in the payloads and the
+    /// channel events.
+    pub revision: usize,
 }
 
 impl WorkerRecord {
     pub(super) fn fail(&mut self, error: impl Into<String>) {
+        // A revision that dies keeps its number: the failure payload says
+        // which attempt died, not just that something did.
+        let revision = match &self.state {
+            WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
+                *revision
+            }
+            WorkerState::Running { .. } | WorkerState::Paused { .. } => self.revision,
+        };
         self.state = WorkerState::Failed {
             error: error.into(),
             step: self.state.step(),
             failed_at: unix_timestamp(),
             metrics: self.metrics,
+            revision,
         };
     }
 
@@ -316,6 +341,7 @@ mod tests {
                 branch: None,
                 verified: None,
                 metrics: WorkerMetrics::default(),
+                revision: 0,
             }
             .step(),
             12
@@ -326,6 +352,7 @@ mod tests {
                 step: 3,
                 failed_at: 0,
                 metrics: WorkerMetrics::default(),
+                revision: 0,
             }
             .step(),
             3
@@ -349,12 +376,14 @@ mod tests {
             branch: None,
             verified: None,
             metrics: WorkerMetrics::default(),
+            revision: 0,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
             step: 1,
             failed_at: 1_700_000_001,
             metrics: WorkerMetrics::default(),
+            revision: 0,
         };
         assert!(!matches!(running, WorkerState::Completed { .. }));
         assert!(matches!(completed, WorkerState::Completed { .. }));
@@ -372,6 +401,7 @@ mod tests {
             pending_steer: Vec::new(),
             resume_tx: None,
             handle: None,
+            revision: 0,
         }
     }
 
@@ -385,6 +415,7 @@ mod tests {
             branch: None,
             verified: None,
             metrics: WorkerMetrics::default(),
+            revision: 0,
         }
     }
 
@@ -394,6 +425,7 @@ mod tests {
             step: 1,
             failed_at: when,
             metrics: WorkerMetrics::default(),
+            revision: 0,
         }
     }
 
