@@ -192,7 +192,7 @@ fn test_cli_prune_action() {
     assert!(output.status.success(), "prune plain text failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("✓ Stale worktrees and"),
+        stdout.contains("✓ Stale worktrees and orphaned worker branches pruned"),
         "expected formatted plain text, got: {stdout}"
     );
 
@@ -305,23 +305,14 @@ fn test_cli_status_renders_the_health_line() {
     std::fs::write(registry.join(format!("{legacy}.json")), legacy_row)
         .expect("write the legacy registry row");
 
-    // The registry lives under `SWE_TEMP_DIR`, so every CLI call must see the
-    // same one: the hub daemon it talks to inherits the environment of the
-    // client that started it. The hub dir is created private (mktemp-style
-    // scratch dirs are 0755, which the daemon refuses).
-    let hub = swe.join("hub");
-    std::fs::create_dir_all(&hub).expect("create the hub dir");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hub, std::fs::Permissions::from_mode(0o700))
-            .expect("restrict the hub dir to 0700");
-    }
+    // The registry lives under `SWE_TEMP_DIR` and the hub must not share it:
+    // orphaned registry rows with no worktree or branch are reaped on `list`,
+    // so the hub gets its own scratch dir and `status` reads rows in-process.
     let status = |wid: &str| {
         let output = Command::new(&exe)
             .args(["status", wid])
             .env("SWE_TEMP_DIR", &swe)
-            .env("SWE_HUB_DIR", &hub)
+            .env("MINI_SWE_NO_DAEMON", "1")
             .env("OPENAI_API_KEY", "test-key-not-used-by-status")
             .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
             .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
