@@ -189,9 +189,10 @@ impl McpServer {
     async fn handle_request(
         &self,
         req: JsonRpcRequest,
-        _ctx: ConnectionContext,
+        ctx: ConnectionContext,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> JsonRpcResponse {
+        trace!(connection = ctx.id, method = %req.method, "Dispatching JSON-RPC request");
         let id = req.id_or_null().map(|v| v.to_owned());
         match req.method.as_str() {
             "ping" => JsonRpcResponse::ok(id, json!({})),

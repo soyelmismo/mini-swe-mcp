@@ -58,7 +58,7 @@ async fn async_main() -> Result<()> {
 
     if let Some(action) = action_of(&cli_args) {
         if action == "daemon" {
-            return run_daemon_cmd(&server, &pool).await;
+            return run_daemon_cmd(&server).await;
         }
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
@@ -85,7 +85,7 @@ async fn async_main() -> Result<()> {
 /// Foreground only; clients dial `hub.sock` and speak the same JSON-RPC the
 /// stdio server speaks. No API key is required to start: the pool is built
 /// exactly like the stdio path, and keyless dispatches fail lazily per call.
-async fn run_daemon_cmd(server: &McpServer, _pool: &WorkerPool) -> Result<()> {
+async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
     let dir = mini_swe_mcp::hub::hub_dir()?;
     let running = mini_swe_mcp::hub::run_daemon(std::sync::Arc::new(server.clone()), dir, None).await?;
     if !running {
