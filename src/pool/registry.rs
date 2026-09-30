@@ -26,12 +26,19 @@ pub enum RegistryStatus {
     Completed,
     Failed,
     Stopped,
+    /// A hub crash interrupted a live worker. Terminal for listing -- its
+    /// uptime is frozen -- but continuable: its branch and its conversation
+    /// are intact, so `steer <id> "..."` resumes it on the same id.
+    Interrupted,
 }
 
 impl RegistryStatus {
     /// Whether the worker has finished and its uptime is frozen.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Stopped | Self::Interrupted
+        )
     }
 
     /// Whether the worker is still live (its uptime keeps counting).
@@ -48,6 +55,7 @@ impl RegistryStatus {
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
+            Self::Interrupted => "Interrupted",
         }
     }
 }
@@ -352,11 +360,11 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
         })
 }
 
-/// Rewrite the dead rows of a crashed hub into failed ones before serving.
+/// Rewrite the dead rows of a crashed hub into interrupted ones before serving.
 ///
 /// Recovery treats any `running`/`paused`/`reviewing` row with a dead pid as
 /// an orphan of the previous hub: salvage the checkout onto `worker-<id>` and
-/// mark it failed with the branch name, keeping branch and history for revision.
+/// mark it interrupted with the branch name, keeping branch and history for revision.
 /// The checkout is released only after a successful salvage. Rows of this daemon are live work, so they are never orphans.
 pub(crate) fn recover_orphaned_workers() -> usize {
     let mut recovered = 0;
@@ -386,7 +394,10 @@ pub(crate) fn recover_orphaned_workers() -> usize {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
             }
         }
-        entry.status = RegistryStatus::Failed;
+        // Interrupted, not failed: the worker stopped because the hub did, not
+        // because it cannot continue. Its branch and conversation survive, so
+        // the daemon continues it and the orchestrator can steer it.
+        entry.status = RegistryStatus::Interrupted;
         entry.question = None;
         entry.last_command = if salvaged {
             format!("hub restarted; work salvaged on branch worker-{}", entry.id)
