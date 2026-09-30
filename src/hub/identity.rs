@@ -41,6 +41,8 @@ const MAX_DEPTH: usize = 32;
 /// One process in an ancestry, as `/proc/<pid>/stat` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
+    /// Field 1: the pid.
+    pub pid: u32,
     /// Field 2: the executable name, truncated by the kernel to 15 bytes.
     pub comm: String,
     /// Field 4: the parent pid.
@@ -167,6 +169,7 @@ pub fn process(pid: u32) -> Option<Process> {
     let ppid = fields.get(4 - 3)?.parse().ok()?;
     let starttime = fields.get(22 - 3)?.parse().ok()?;
     Some(Process {
+        pid,
         comm,
         ppid,
         starttime,
@@ -238,8 +241,9 @@ pub fn identity_of(pid: u32, override_id: Option<&str>, fallback: &str) -> Ident
 mod tests {
     use super::*;
 
-    fn row(comm: &str, ppid: u32, starttime: u64) -> Process {
+    fn row(pid: u32, comm: &str, ppid: u32, starttime: u64) -> Process {
         Process {
+            pid,
             comm: comm.to_string(),
             ppid,
             starttime,
@@ -251,9 +255,9 @@ mod tests {
     #[test]
     fn the_walk_skips_shells_and_names_the_host() {
         let mut table = Ancestry::new();
-        table.insert(900, row("mini-swe-mcp", 800, 10));
-        table.insert(800, row("bash", 700, 5));
-        table.insert(700, row("claude", 1, 2));
+        table.insert(900, row(900, "mini-swe-mcp", 800, 10));
+        table.insert(800, row(800, "bash", 700, 5));
+        table.insert(700, row(700, "claude", 1, 2));
         let resolution = resolve(&table, 900).expect("claude is the host");
         assert_eq!(
             resolution.host,
@@ -272,10 +276,10 @@ mod tests {
     fn every_listed_wrapper_is_skipped() {
         for wrapper in WRAPPERS {
             let mut table = Ancestry::new();
-            table.insert(20, row("mini-swe-mcp", 19, 1));
-            table.insert(19, row(wrapper, 18, 1));
-            table.insert(18, row(wrapper, 17, 1));
-            table.insert(17, row("agy", 1, 1));
+            table.insert(20, row(20, "mini-swe-mcp", 19, 1));
+            table.insert(19, row(19, wrapper, 18, 1));
+            table.insert(18, row(18, wrapper, 17, 1));
+            table.insert(17, row(17, "agy", 1, 1));
             let resolution = resolve(&table, 20).unwrap_or_else(|| panic!("{wrapper} skipped"));
             assert_eq!(resolution.host.comm, "agy", "{wrapper} must be stepped over");
             assert_eq!(resolution.skipped, [*wrapper, *wrapper]);
@@ -287,10 +291,10 @@ mod tests {
     #[test]
     fn a_chain_of_only_wrappers_names_no_host() {
         let mut table = Ancestry::new();
-        table.insert(30, row("mini-swe-mcp", 29, 1));
-        table.insert(29, row("sh", 28, 1));
-        table.insert(28, row("bash", 27, 1));
-        table.insert(27, row("env", 1, 1));
+        table.insert(30, row(30, "mini-swe-mcp", 29, 1));
+        table.insert(29, row(29, "sh", 28, 1));
+        table.insert(28, row(28, "bash", 27, 1));
+        table.insert(27, row(27, "env", 1, 1));
         assert_eq!(resolve(&table, 30), None);
     }
 
@@ -299,9 +303,9 @@ mod tests {
     #[test]
     fn init_is_not_a_host() {
         let mut table = Ancestry::new();
-        table.insert(40, row("mini-swe-mcp", 39, 1));
-        table.insert(39, row("sh", 1, 1));
-        table.insert(1, row("systemd", 0, 1));
+        table.insert(40, row(40, "mini-swe-mcp", 39, 1));
+        table.insert(39, row(39, "sh", 1, 1));
+        table.insert(1, row(1, "systemd", 0, 1));
         assert_eq!(resolve(&table, 40), None);
     }
 
@@ -310,8 +314,8 @@ mod tests {
     fn an_unreadable_or_cyclic_ancestry_names_no_host() {
         assert_eq!(resolve(&Ancestry::new(), 404), None);
         let mut table = Ancestry::new();
-        table.insert(50, row("mini-swe-mcp", 51, 1));
-        table.insert(51, row("bash", 50, 1));
+        table.insert(50, row(50, "mini-swe-mcp", 51, 1));
+        table.insert(51, row(51, "bash", 50, 1));
         assert_eq!(resolve(&table, 50), None);
     }
 
