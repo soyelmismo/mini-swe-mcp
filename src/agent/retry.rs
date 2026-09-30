@@ -6,6 +6,7 @@
 //! transient failures — so the transport code in [`super::runner`] stays about
 //! *what* is being sent rather than *how often to resend it*.
 
+use crate::config::env_parse;
 use std::time::Duration;
 
 /// Attempts made before a request is reported as a failure.
@@ -27,10 +28,7 @@ const MAX_DELAY_SHIFT: u32 = 6;
 /// Attempt budget, overridable with `LLM_MAX_RETRIES` so an operator can
 /// trade latency against resilience without a rebuild.
 pub fn max_llm_retries() -> usize {
-    std::env::var("LLM_MAX_RETRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_RETRIES)
+    env_parse("LLM_MAX_RETRIES").unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
 /// Whether an HTTP status is worth retrying rather than surfacing to the model.

@@ -24,6 +24,27 @@ fn xdg_config_dir_from(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf>
     }
 }
 
+/// Parse the environment variable `name` into `T`.
+///
+/// The value is trimmed first, and an unset, blank or unparsable value all
+/// yield `None` so every caller can express its own default with a single
+/// `unwrap_or` / `filter` chain.
+pub fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let raw = env::var(name).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+/// Half the available CPU cores, never below one (falls back to 2).
+pub fn half_the_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +104,42 @@ mod tests {
         assert_eq!(xdg_config_dir_from(None, Some("   ")), None);
         assert_eq!(xdg_config_dir_from(Some(""), Some("")), None);
         assert_eq!(xdg_config_dir_from(Some("  "), Some("\t\n ")), None);
+    }
+
+    /// `env_parse` returns `None` when the variable is unset.
+    #[test]
+    fn test_env_parse_unset() {
+        let name = "MINI_SWE_ENV_PARSE_UNSET_TEST";
+        unsafe { env::remove_var(name) };
+        assert_eq!(env_parse::<usize>(name), None);
+    }
+
+    /// `env_parse` returns `None` for blank/whitespace-only values.
+    #[test]
+    fn test_env_parse_blank() {
+        let name = "MINI_SWE_ENV_PARSE_BLANK_TEST";
+        for blank in ["", " ", "   ", "\t", "\n", " \t\n "] {
+            unsafe { env::set_var(name, blank) };
+            assert_eq!(env_parse::<usize>(name), None, "blank {blank:?} should be None");
+        }
+        unsafe { env::remove_var(name) };
+    }
+
+    /// `env_parse` returns `None` for unparsable values.
+    #[test]
+    fn test_env_parse_unparsable() {
+        let name = "MINI_SWE_ENV_PARSE_UNPARSABLE_TEST";
+        unsafe { env::set_var(name, "not-a-number") };
+        assert_eq!(env_parse::<usize>(name), None);
+        unsafe { env::remove_var(name) };
+    }
+
+    /// `env_parse` parses a valid value, trimming surrounding whitespace.
+    #[test]
+    fn test_env_parse_valid() {
+        let name = "MINI_SWE_ENV_PARSE_VALID_TEST";
+        unsafe { env::set_var(name, "  42  ") };
+        assert_eq!(env_parse::<usize>(name), Some(42));
+        unsafe { env::remove_var(name) };
     }
 }

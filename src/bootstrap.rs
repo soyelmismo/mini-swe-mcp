@@ -3,7 +3,7 @@
 //! One-shot, side-effecting steps that must run before any CLI action is
 //! dispatched; none is interesting to the dispatch logic itself.
 
-use crate::config::xdg_config_dir;
+use crate::config::{env_parse, xdg_config_dir};
 use anyhow::Result;
 use std::env;
 
@@ -26,9 +26,7 @@ pub fn runtime() -> Result<tokio::runtime::Runtime> {
 
 /// Resolve the Tokio worker thread count from the environment.
 pub fn resolve_worker_threads() -> usize {
-    env::var("MINI_SWE_WORKER_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    env_parse("MINI_SWE_WORKER_THREADS")
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_WORKER_THREADS)
 }
