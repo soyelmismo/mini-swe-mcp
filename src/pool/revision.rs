@@ -179,7 +179,11 @@ pub fn append_history_message(
     restrict_to_owner(&path)?;
     let mut payload = String::new();
     if fresh {
-        payload.push_str(&serde_json::to_string(meta).context("Could not serialize history metadata")?);
+        // The metadata line carries the relaunch facts only: the conversation
+        // is the lines that follow it, one per message.
+        let mut meta = meta.clone();
+        meta.messages.clear();
+        payload.push_str(&serde_json::to_string(&meta).context("Could not serialize history metadata")?);
         payload.push('\n');
     }
     payload.push_str(&serde_json::to_string(message).context("Could not serialize history message")?);
@@ -216,6 +220,9 @@ pub fn load_worker_history_log(worker_id: &str) -> Result<WorkerHistory> {
             path.display()
         )
     })?;
+    // The metadata line is the relaunch facts; the conversation is the lines
+    // after it, so anything it carried is discarded here.
+    history.messages.clear();
     for line in lines {
         // A torn final line is the one failure a crash can leave: skip it and
         // every later line (there is none in practice) rather than losing the
@@ -590,8 +597,7 @@ impl super::WorkerPool {
             .unwrap_or_default();
         let task = entry.task.clone();
         let conversation = format!(
-            "{system}\n\n\
-             The task you were dispatched with:\n{task}\n\n\
+            "The task you were dispatched with:\n{task}\n\n\
              CONTINUATION: your previous run stopped ({reason}) without finishing, and its \
              conversation was not saved. The branch `{branch}` still holds the work that run \
              left behind -- start by reading it:\n  \
@@ -616,7 +622,10 @@ impl super::WorkerPool {
             revision: entry.revision,
             auto_continues: entry.auto_continues,
             owner: entry.owner.clone(),
-            messages: vec![ChatMessage::text(crate::agent::Role::User, conversation)],
+            messages: vec![
+                ChatMessage::text(crate::agent::Role::System, system),
+                ChatMessage::text(crate::agent::Role::User, conversation),
+            ],
         };
         let outcome = self
             .revise_with_prefix(id, history, String::new(), String::new(), Some(max_turns))
@@ -728,6 +737,23 @@ impl super::WorkerPool {
         history.max_turns = max_turns;
         history.revision += 1;
         let revision = history.revision;
+        // Append the messages the log does not have yet, so a worker relaunched
+        // from it replays the same conversation. A warm continuation adds one
+        // line; a cold one writes its whole fresh conversation. This happens
+        // before the relaunch is visible anywhere, so the conversation is never
+        // behind the record that points at it.
+        let already = super::load_worker_history_log(id)
+            .map(|logged| logged.messages.len())
+            .unwrap_or(0);
+        for message in history.messages.iter().skip(already) {
+            if let Err(e) = super::append_history_message(id, &history, message) {
+                tracing::warn!(
+                    worker = %id,
+                    error = %e,
+                    "Could not append the continuation message to the history log"
+                );
+            }
+        }
 
         // A registry-only worker has no record here yet: register it so the
         // relaunch below -- and every poll on it -- sees one process's worker,
@@ -831,7 +857,7 @@ impl super::WorkerPool {
             review_after: history.review_after.clone(),
             network_offline: history.network_offline,
             verify: history.verify.clone(),
-            resume_messages: Some(history.messages),
+            resume_messages: Some(std::mem::take(&mut history.messages)),
             resume_base_commit: Some(base_commit.clone()),
             resume_base_branch: history.base_branch.clone(),
         };

@@ -242,6 +242,9 @@ fn auto_resume_enabled() -> bool {
             let message = "the hub restarted".to_string();
             match pool.continue_worker(&id, message, None).await {
                 Ok(_) => {
+                    // Count it before anything else can, so a worker the hub
+                    // keeps losing stops being restarted after the cap.
+                    pool.count_auto_continue(&id).await;
                     resumed += 1;
                     info!(worker = %id, "Auto-continued interrupted worker");
                 }

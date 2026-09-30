@@ -60,9 +60,9 @@ pub use self::runner::{
 };
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
-    WorkerHistory, append_history_message, history_log_path, history_path, is_replayable,
-    load_worker_history, load_worker_history_log, prune_orphan_histories, remove_worker_history,
-    save_worker_history,
+    WorkerHistory, append_history_message, ensure_base_branch, history_log_path, history_path,
+    is_replayable, load_worker_history, load_worker_history_log, prune_orphan_histories,
+    remove_worker_history, save_worker_history,
 };
 pub use self::runner::RunConfig;
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
@@ -825,14 +825,38 @@ impl WorkerPool {
     /// The counter lives in the history metadata (and the registry row), so it
     /// survives both a restart and a re-registration.
     pub async fn auto_continue_budget(&self, id: &str) -> usize {
-        let spent = crate::pool::load_worker_history(id)
+        MAX_AUTO_CONTINUES.saturating_sub(self.auto_continues_spent(id).await)
+    }
+
+    /// Automatic continuations `id` has already spent.
+    async fn auto_continues_spent(&self, id: &str) -> usize {
+        crate::pool::load_worker_history(id)
             .map(|h| h.auto_continues)
             .unwrap_or_else(|_| {
                 crate::pool::load_registry_entry(id)
                     .map(|e| e.auto_continues)
                     .unwrap_or(0)
-            });
-        crate::pool::MAX_AUTO_CONTINUES.saturating_sub(spent)
+            })
+    }
+
+    /// Count one automatic continuation against `id`'s cap.
+    ///
+    /// The counter is written to the history metadata (the durable store) and
+    /// the registry row, so the daemon's next start sees the same count.
+    pub async fn count_auto_continue(&self, id: &str) {
+        let spent = self.auto_continues_spent(id).await + 1;
+        let id_owned = id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(mut history) = crate::pool::load_worker_history(&id_owned) {
+                history.auto_continues = spent;
+                let _ = crate::pool::save_worker_history(&id_owned, &history);
+            }
+            if let Some(mut entry) = crate::pool::load_registry_entry(&id_owned) {
+                entry.auto_continues = spent;
+                crate::pool::save_registry_entry(&entry);
+            }
+        })
+        .await;
     }
 
     /// Record where a running worker's worktree lives.
