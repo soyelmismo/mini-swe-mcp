@@ -87,11 +87,23 @@ impl WorkerPool {
             "Implementation finished; starting multi-phase review pipeline"
         );
 
-        // Checkpoint phase 1 implementation changes in git
-        let _ = worktree.commit_changes(&format!(
-            "worker({}): implementation phase completed (checkpoint)",
-            worker_id
-        ));
+        // Checkpoint phase 1 implementation changes in git. `commit_changes`
+        // shells out to git, so it runs off the runtime thread.
+        {
+            let path = worktree.path.clone();
+            let message = format!(
+                "worker({}): implementation phase completed (checkpoint)",
+                worker_id
+            );
+            let committed = tokio::task::spawn_blocking(move || {
+                crate::worktree::WorktreeGuard::commit_all(&path, &message)
+            })
+            .await
+            .unwrap_or(Ok(false));
+            if committed.unwrap_or(false) {
+                worktree.preserve_branch = true;
+            }
+        }
 
         let review_prompt = format!(
             "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\

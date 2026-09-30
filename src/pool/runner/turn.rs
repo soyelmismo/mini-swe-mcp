@@ -75,7 +75,7 @@ fn extension_budget(dispatch_max_turns: usize) -> usize {
 /// Commit `path` like [`WorktreeGuard::commit_changes`], off the runtime
 /// thread: stage everything, commit when dirty, and still report the branch
 /// when it already carries commits beyond `base_commit`.
-fn commit_all_preserving(
+pub(super) fn commit_all_preserving(
     path: &Path,
     repo_root: &Path,
     branch: &str,

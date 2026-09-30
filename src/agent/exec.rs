@@ -247,7 +247,7 @@ fn blocked_by_guardrail(reason: &str) -> String {
 /// admission controller's granted job count, else half the available cores
 /// (never below one).
 fn build_parallelism(granted: Option<usize>) -> String {
-    if let Some(parallelism) = crate::config::env_parse("BUILD_PARALLELISM") {
+    if let Some(parallelism) = crate::config::env_parse::<usize>("BUILD_PARALLELISM") {
         return parallelism.to_string();
     }
     granted
