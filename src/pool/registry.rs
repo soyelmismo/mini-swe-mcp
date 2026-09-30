@@ -514,13 +514,24 @@ mod recovery_cleanup_tests {
     use super::*;
     use crate::worktree::{pid_file_for, swe_base_dir};
 
+    /// A pid that is certainly dead: a child that has already exited, so
+    /// `is_process_alive` reports it dead and the sweep treats the row as an
+    /// orphan rather than a live worker it must not touch.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
     /// A registry row whose `pid` is dead: the shape of a worker orphaned by a
-    /// hub crash. PID 1 is never this process, and `is_process_alive` reports
-    /// it dead, so the sweep treats the row as recoverable.
+    /// hub crash.
     fn orphan_row(id: &str) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
             id: id.to_string(),
-            pid: 1,
+            pid: dead_pid(),
             task: "orphan".to_string(),
             model: "test".to_string(),
             status: RegistryStatus::Running,

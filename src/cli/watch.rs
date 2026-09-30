@@ -77,17 +77,32 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
 pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<Value> {
     let status = view["status"].as_str()?;
     let metrics: WorkerMetrics = serde_json::from_value(view["metrics"].clone()).unwrap_or_default();
-    let old: WorkerMetrics = previous.and_then(|v| serde_json::from_value(v["metrics"].clone()).ok()).unwrap_or_default();
+    let baseline: WorkerMetrics = previous.and_then(|v| serde_json::from_value(v["metrics"].clone()).ok()).unwrap_or_default();
     let idle = now.saturating_sub(view["last_step_at"].as_u64().unwrap_or(now));
     let event = match status {
         "completed" | "failed" => status,
         "paused" => "needs_input",
-        "running" | "reviewing" if idle >= 600 || metrics.repeat_blocks.saturating_sub(old.repeat_blocks) >= 3 || metrics.stagnation_nudges.saturating_sub(old.stagnation_nudges) >= 3 => "stalled",
+        "running" | "reviewing" if idle >= 600 || metrics.repeat_blocks.saturating_sub(baseline.repeat_blocks) >= 3 || metrics.stagnation_nudges.saturating_sub(baseline.stagnation_nudges) >= 3 => "stalled",
         _ => return None,
     };
     if let Some(old) = previous {
-        if event != "stalled" && old["event"] == event && old["revision"] == view["revision"] && old["step"] == view["step"] && old["question"] == view["question"] { return None; }
-        if event == "stalled" && old["event"] == event && old["step"] == view["step"] && metrics.repeat_blocks.saturating_sub(old["metrics"]["repeat_blocks"].as_u64().unwrap_or(0) as usize) < 3 && metrics.stagnation_nudges.saturating_sub(old["metrics"]["stagnation_nudges"].as_u64().unwrap_or(0) as usize) < 3 { return None; }
+        let old_event = old["event"].as_str().unwrap_or("");
+        if event != "stalled" && old_event == event && old["revision"] == view["revision"] && old["step"] == view["step"] && old["question"] == view["question"] { return None; }
+        // A stall is one episode, not one poll: repeat it only when the worker
+        // has since blocked again or been nudged again. Keying the suppression
+        // on the step would re-fire it on every step the worker takes while
+        // still idle, which is exactly the "Step 160/162, no step for 600s"
+        // spam a stalled worker produced.
+        if event == "stalled" && old_event == event
+            && metrics
+                .repeat_blocks
+                .saturating_sub(baseline.repeat_blocks)
+                < 3
+            && metrics
+                .stagnation_nudges
+                .saturating_sub(baseline.stagnation_nudges)
+                < 3
+        { return None; }
     }
     let mut payload = view.clone();
     payload["event"] = json!(event);
@@ -302,6 +317,36 @@ mod tests {
         assert!(out.contains("mini-swe-mcp steer") && out.contains("git diff"), "{out}");
         let text = render(&select_event(&state("running", 2, repeated, 100, 10), Some(&state("running", 2, metrics, 100, 10)), 110).unwrap());
         assert!(text.contains("mini-swe-mcp kill"), "{text}");
+    }
+
+    /// A stall is one episode: the worker taking another step while still idle
+    /// must not re-deliver it with the step it has already passed.
+    #[test]
+    fn a_stall_is_reported_once_per_episode() {
+        let metrics = WorkerMetrics::default();
+        let first = select_event(&state("running", 160, metrics, 100, 162), None, 700)
+            .expect("an idle running worker stalls");
+        assert_eq!(first["event"], "stalled");
+        assert_eq!(first["step"], 160);
+
+        // The worker advanced but is still idle: same episode, no repeat.
+        assert!(
+            select_event(&state("running", 162, metrics, 100, 162), Some(&first), 700).is_none(),
+            "a step change alone must not re-report the stall"
+        );
+        // The worker stepped again and is still idle: still the same episode.
+        assert!(
+            select_event(&state("running", 163, metrics, 100, 162), Some(&first), 700).is_none(),
+            "the stall must not follow the worker step by step"
+        );
+
+        // A fresh episode -- the worker blocked three more times -- reports again.
+        let mut blocked = metrics;
+        blocked.repeat_blocks = 3;
+        let again = select_event(&state("running", 164, blocked, 100, 162), Some(&first), 700)
+            .expect("a new blocking episode reports again");
+        assert_eq!(again["event"], "stalled");
+        assert_eq!(again["step"], 164, "the payload carries the current step");
     }
 
     #[test]

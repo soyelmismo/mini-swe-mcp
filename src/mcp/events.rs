@@ -736,6 +736,13 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
         }));
         view["owner"] = row["owner"].clone();
+        // The registry row the view was seeded from lags the live worker by
+        // however long ago its last transition was written, so the pool's own
+        // state is what a stall is judged against: rendering the registry's
+        // step reports a step the worker has already passed.
+        if let Some(step) = row["state"]["details"]["step"].as_u64() {
+            view["step"] = json!(step);
+        }
         if let Some(progress) = pool.worker_progress(id).await {
             view["step"] = json!(progress.step);
             view["status"] = json!(phase_status(progress.phase));
