@@ -214,7 +214,14 @@ impl McpProcess {
     /// Wait for the next worker-event notification, stepping over any other
     /// frame the server volunteers in the meantime.
     fn expect_channel_event(&mut self, context: &str) -> Value {
-        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        self.expect_channel_event_within(context, RESPONSE_TIMEOUT)
+    }
+
+    /// [`McpProcess::expect_channel_event`] with an explicit budget, for a
+    /// cross-process row change the server only discovers on its coarse
+    /// fallback tick.
+    fn expect_channel_event_within(&mut self, context: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
@@ -236,7 +243,7 @@ impl McpProcess {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    panic!("timed out after {RESPONSE_TIMEOUT:?} waiting for {context}")
+                    panic!("timed out after {timeout:?} waiting for {context}")
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     panic!("stdout reader thread vanished while waiting for {context}")
@@ -1563,7 +1570,9 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
     paused.question = Some(String::from("Ship the migration or roll it back?"));
     save_registry_entry(&paused);
-    let event = server.expect_channel_event("the paused worker");
+    // The row belongs to another process, so the server only discovers it on
+    // its coarse cross-process fallback tick.
+    let event = server.expect_channel_event_within("the paused worker", Duration::from_secs(45));
     remove_registry_entry(&worker_id);
 
     let meta = &event["params"]["meta"];
