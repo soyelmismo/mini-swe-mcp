@@ -142,6 +142,7 @@ async fn a_detached_job_survives_the_step_and_dies_at_worker_end() {
             .expect("the step must run");
         assert_eq!(code, Some(0), "{out:?}");
         assert!(out.contains("started"), "{out:?}");
+        await_process_in(&guard.path);
         assert!(
             !processes_in_dirs(&[guard.path.clone()]).is_empty(),
             "a detached job must survive the step that started it"

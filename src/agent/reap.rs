@@ -310,23 +310,30 @@ mod tests {
     fn a_detached_process_inside_the_directories_is_killed() {
         let dir = worker_dir("inside");
         let mut sleeper = detached_sleeper(&dir);
-        let pid = sleeper.id();
         await_process_in(&dir);
 
         let killed = sweep_worker_processes("worker-test", &[dir.clone()]);
 
         assert_eq!(killed, 1, "the detached sleeper must be signalled");
+        // Reaped through `try_wait`, because a killed child of this test stays
+        // a zombie until it is waited on and a zombie still answers `kill -0`.
+        let mut gone = false;
         for _ in 0..100 {
-            if !pid_is_alive(pid) {
+            if sleeper
+                .try_wait()
+                .expect("try_wait must not fail")
+                .is_some()
+            {
+                gone = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            !pid_is_alive(pid),
+            gone,
             "the sweep must leave no process behind in the worker's directories"
         );
-        let _ = sleeper.wait();
+        assert!(processes_in_dirs(&[dir.clone()]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
