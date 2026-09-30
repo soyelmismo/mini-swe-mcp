@@ -48,6 +48,87 @@ pub fn log_counters_line(val: &serde_json::Value) -> String {
     parts.join(" | ")
 }
 
+/// The `metrics` object a payload carries, wherever it sits in the shape.
+///
+/// `status`, `collect` and `dispatch --wait` all report the worker's
+/// `WorkerState`, whose metrics live inside the enum's `details`; the keyed
+/// form (`{"Completed": {...}}`) used by a few payloads nests them one level
+/// deeper, and a flattened payload carries them at the top.
+fn metrics_of(val: &serde_json::Value) -> Option<&serde_json::Value> {
+    let state = val.get("state");
+    if let Some(metrics) = state.and_then(|s| s.get("metrics")) {
+        return Some(metrics);
+    }
+    if let Some(metrics) = state
+        .and_then(|s| s.get("details"))
+        .and_then(|d| d.get("metrics"))
+    {
+        return Some(metrics);
+    }
+    if let Some(metrics) = ["Completed", "Failed", "Running", "Paused"]
+        .iter()
+        .find_map(|tag| state.and_then(|s| s.get(tag)).and_then(|d| d.get("metrics")))
+    {
+        return Some(metrics);
+    }
+    val.get("metrics")
+}
+
+/// One compact line of per-worker health, or `None` when there is nothing to
+/// report.
+///
+/// Omitted for a payload with no metrics and for an all-zero set, which is what
+/// a registry row written before the counters existed carries: a view must not
+/// dress an unmeasured run up as a healthy one.
+pub fn health_line(val: &serde_json::Value) -> Option<String> {
+    let metrics = metrics_of(val)?;
+    let count = |key: &str| metrics.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let (turns, granted, refused) = (count("turns_used"), count("extensions_granted"), count("extensions_refused"));
+    let (repeats, nudges, pauses) = (count("repeat_blocks"), count("stagnation_nudges"), count("loop_pauses"));
+    let (verify_runs, verify_failures) = (count("verify_runs"), count("verify_failures"));
+    let (files, insertions, deletions) = (
+        count("diff_files"),
+        count("diff_insertions"),
+        count("diff_deletions"),
+    );
+    if turns == 0
+        && granted == 0
+        && refused == 0
+        && repeats == 0
+        && nudges == 0
+        && pauses == 0
+        && verify_runs == 0
+        && files == 0
+        && insertions == 0
+        && deletions == 0
+    {
+        return None;
+    }
+
+    let plural = |n: u64, word: &str| {
+        format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+    };
+    let mut parts = vec![
+        plural(turns, "turn"),
+        format!("+{granted}/-{refused} ext"),
+        plural(repeats, "repeat"),
+        plural(nudges, "nudge"),
+    ];
+    if pauses > 0 {
+        parts.push(plural(pauses, "loop pause"));
+    }
+    if verify_runs > 0 {
+        parts.push(format!("verify {verify_failures}/{verify_runs} failed"));
+    }
+    if files > 0 {
+        parts.push(format!(
+            "diff {} +{insertions}/-{deletions}",
+            plural(files, "file")
+        ));
+    }
+    Some(format!("Health: {}", parts.join(", ")))
+}
+
 pub fn format_status(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let mut out = format!("Worker: {wid}\n");
@@ -101,6 +182,10 @@ pub fn format_status(val: &serde_json::Value) -> String {
             }
         }
     }
+    if let Some(health) = health_line(val) {
+        out.push_str(&health);
+        out.push('\n');
+    }
     out.trim_end().to_string()
 }
 
@@ -129,10 +214,11 @@ pub fn format_collect(val: &serde_json::Value) -> String {
         .unwrap_or("");
 
     let counters = log_counters_line(val);
+    let health = health_line(val).map(|h| format!("\n{h}")).unwrap_or_default();
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.\n{counters}")
+        format!("Worker {wid}: No git diff produced.\n{counters}{health}")
     } else {
-        format!("{diff}\n{counters}")
+        format!("{diff}\n{counters}{health}")
     }
 }
 
@@ -180,6 +266,7 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
         format!("✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress.")
     } else {
+        let health = health_line(val);
         let mut out = format!("✓ Worker {wid} finished.\n");
         if let Some(state) = val.get("state") {
             let state_name = state.get("state").and_then(|v| v.as_str()).unwrap_or("");
@@ -207,6 +294,9 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                     let list: Vec<&str> = artifacts.iter().filter_map(|a| a.as_str()).collect();
                     out.push_str(&format!("Preserved Artifacts: {}\n", list.join(", ")));
                 }
+                if let Some(health) = &health {
+                    out.push_str(&format!("{health}\n"));
+                }
                 if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(|v| v.as_str())
                     && !diff.trim().is_empty()
                 {
@@ -216,6 +306,9 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                 out.push_str("State: Failed\n");
                 if let Some(err) = details.and_then(|d| d.get("error")).and_then(|v| v.as_str()) {
                     out.push_str(&format!("Error: {err}\n"));
+                }
+                if let Some(health) = &health {
+                    out.push_str(&format!("{health}\n"));
                 }
             }
         }

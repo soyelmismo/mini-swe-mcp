@@ -477,12 +477,19 @@ fn stack_row(
         pad_visible(&format!("{:<width$}", w.pid, width = layout.pid), layout.pid),
         turns_cell(w.step, w.max_turns, layout),
     );
-    let second = format!(
+    let mut second = format!(
         "{}  {}  {}",
         pad_visible(status, layout.status),
         pad_visible(&w.model, layout.model),
         pad_visible(&format_duration(duration_secs), layout.uptime),
     );
+    // Health counters ride the label line, which has room the inline row does
+    // not -- but only whole: a cell that would overflow the terminal is
+    // dropped rather than clipped, so the row stays readable.
+    let health = w.metrics.repeat_nudge_cell();
+    if visible_width(&second) + 2 + visible_width(&health) <= layout.total {
+        second = format!("{}  {health}", second.trim_end());
+    }
     let mut out = String::new();
     out.push_str(&first);
     out.push('\n');
@@ -958,6 +965,7 @@ mod tests {
         task: String,
         group: Option<&'static str>,
         repo: Option<&'static str>,
+        metrics: WorkerMetrics,
         updated_at: u64,
     }
 
@@ -972,6 +980,7 @@ mod tests {
                 task: String::new(),
                 group: None,
                 repo: None,
+                metrics: WorkerMetrics::default(),
                 updated_at: 1050,
             }
         }
@@ -1012,6 +1021,12 @@ mod tests {
             self
         }
 
+        fn metrics(mut self, repeat_blocks: usize, stagnation_nudges: usize) -> Self {
+            self.metrics.repeat_blocks = repeat_blocks;
+            self.metrics.stagnation_nudges = stagnation_nudges;
+            self
+        }
+
         fn build(self) -> WorkerRegistryEntry {
             WorkerRegistryEntry {
                 id: self.id.into(),
@@ -1027,6 +1042,7 @@ mod tests {
                 updated_at: self.updated_at,
                 group: self.group.map(str::to_string),
                 repo_path: self.repo.map(str::to_string),
+                metrics: self.metrics,
             }
         }
     }

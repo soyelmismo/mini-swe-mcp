@@ -260,7 +260,7 @@ impl WorkerPool {
 
         let pool = self.clone();
         let wid = worker_id.clone();
-        let meta_for_fail = meta;
+        let mut meta_for_fail = meta;
         let model_for_fail = model.clone();
         // Resolve the verify gate: an explicit empty string disables it, an
         // explicit command is used verbatim, and an absent argument auto-detects
@@ -277,7 +277,6 @@ impl WorkerPool {
             temperature,
             repo_path,
             max_turns,
-            group: resolved_group,
             review_after,
             network_offline,
             verify,

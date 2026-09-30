@@ -32,7 +32,9 @@ use super::state::WorkerState;
 use super::steer::remove_steer_file;
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
-use self::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
+use self::turn::{
+    LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
+};
 
 mod pause;
 mod review;
@@ -51,7 +53,6 @@ pub struct WorkerLaunchConfig {
     pub temperature: Option<f32>,
     pub repo_path: std::path::PathBuf,
     pub max_turns: usize,
-    pub group: String,
     pub review_after: Option<String>,
     /// Declared network policy: `true` confines every bash step to an
     /// isolated network namespace (`network: "offline"` on the dispatch).
@@ -120,7 +121,6 @@ impl WorkerPool {
             temperature,
             repo_path,
             max_turns,
-            group,
             review_after,
             network_offline,
             verify,
@@ -167,7 +167,6 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
-        let started_at_ts = unix_timestamp();
 
         while step < current_max_turns {
             step += 1;
@@ -186,10 +185,6 @@ impl WorkerPool {
                 worktree: &mut worktree,
                 runner: &runner,
                 worker_id: &worker_id,
-                task: &task,
-                group: &group,
-                repo_path_str: &repo_path_str,
-                started_at_ts,
                 meta,
                 messages: &mut messages,
                 step: &mut step,
@@ -224,9 +219,7 @@ impl WorkerPool {
                         task: task.clone(),
                         max_turns,
                         current_max_turns,
-                        group: group.clone(),
                         repo_path_str: repo_path_str.clone(),
-                        started_at_ts,
                         step,
                         network_offline,
                         meta,
@@ -246,6 +239,18 @@ impl WorkerPool {
 
         let diff = worktree.get_diff()?;
         let now = unix_timestamp();
+
+        // Health counters measured once, at the end: the turn total the record
+        // reports and the size of the diff it produced. `git` is a blocking
+        // subprocess, so the shortstat sample is taken off the runtime.
+        meta.metrics.turns_used = step;
+        if let Some((files, insertions, deletions)) =
+            shortstat_of(&worktree.path, &worktree.base_commit).await
+        {
+            meta.metrics.diff_files = files;
+            meta.metrics.diff_insertions = insertions;
+            meta.metrics.diff_deletions = deletions;
+        }
 
         let task_headline = task
             .lines()
@@ -309,6 +314,7 @@ impl WorkerPool {
             artifacts,
             branch,
             verified,
+            metrics: meta.metrics,
         };
         {
             let mut lock = self.workers.write().await;

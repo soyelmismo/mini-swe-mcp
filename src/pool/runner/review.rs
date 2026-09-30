@@ -29,7 +29,7 @@ use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOut
 /// The counter flows out through [`ReviewPhaseOutcome::step`] because the
 /// reviewer's turns are interleaved with the implementer's in a single
 /// monotonic sequence that the registry and the completion record both report.
-pub struct ReviewPhase {
+pub struct ReviewPhase<'a> {
     pub worker_id: String,
     pub reviewer_model: String,
     pub temperature: Option<f32>,
@@ -40,15 +40,17 @@ pub struct ReviewPhase {
     /// The implementation loop's running turn budget, needed to report the
     /// combined `max_turns` while the worker is marked `reviewing`.
     pub current_max_turns: usize,
-    pub group: String,
     pub repo_path_str: String,
-    pub started_at_ts: u64,
     /// The implementer's turn counter entering the review phase.
     pub step: usize,
     /// The dispatch's declared network policy, applied to the reviewer's own
     /// bash steps too: a worker declared `offline` must not regain egress just
     /// because a second agent takes over the worktree.
     pub network_offline: bool,
+    /// The same registry row the implementer wrote to, so the reviewer's turns
+    /// land in one continuous set of health counters instead of a second run's
+    /// worth.
+    pub meta: &'a mut WorkerMeta,
 }
 
 /// The step counter after the review phase, for the caller to fold back into
@@ -64,7 +66,7 @@ impl WorkerPool {
     pub(super) async fn run_review_phase(
         &self,
         worktree: &mut WorktreeGuard,
-        review: ReviewPhase,
+        review: ReviewPhase<'_>,
     ) -> Result<ReviewPhaseOutcome> {
         let ReviewPhase {
             worker_id,
@@ -73,11 +75,10 @@ impl WorkerPool {
             task,
             max_turns,
             current_max_turns,
-            group,
             repo_path_str,
-            started_at_ts,
             mut step,
             network_offline,
+            meta,
         } = review;
 
         info!(
@@ -134,15 +135,6 @@ impl WorkerPool {
             reviewer_manifest_turns.unwrap_or(current_max_turns)
         };
 
-        let meta = WorkerMeta {
-            id: worker_id.clone(),
-            task: task.clone(),
-            group: Some(group.clone()),
-            repo_path: Some(repo_path_str.clone()),
-            started_at: started_at_ts,
-            pid: std::process::id(),
-        };
-
         meta.save_status(
             &reviewer_model,
             RegistryStatus::Reviewing,
@@ -155,7 +147,6 @@ impl WorkerPool {
         let mut review_step = 0;
         let mut last_assistant_text = String::new();
         let mut consecutive_no_cmd = 0;
-        let mut verify_failures = 0;
         let mut watch = ProgressWatch::default();
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
@@ -177,18 +168,13 @@ impl WorkerPool {
                 worktree,
                 runner: &reviewer_runner,
                 worker_id: &worker_id,
-                task: &task,
-                group: &group,
-                repo_path_str: &repo_path_str,
-                started_at_ts,
-                meta: &meta,
+                meta,
                 messages: &mut review_messages,
                 step: &mut step,
                 current_max_turns: &mut combined_max_turns,
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: None,
-                verify_failures: &mut verify_failures,
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
             };
