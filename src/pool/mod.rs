@@ -40,8 +40,8 @@ pub use self::buffer::{
 };
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
-    RegistryStatus, WorkerMeta, WorkerRegistryEntry, extract_group, load_all_registry_entries, load_registry_entry,
-    registry_dir,
+    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
+    load_all_registry_entries, load_registry_entry, registry_dir, registry_owner_label,
     remove_registry_entry, save_registry_entry,
 };
 pub use self::runner::{
@@ -50,8 +50,8 @@ pub use self::runner::{
 };
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerPhase, WorkerProgress,
-    WorkerRecord, WorkerState,
+    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
+    WorkerProgress, WorkerRecord, WorkerState,
 };
 
 use self::state::expired_terminal_ids;
@@ -234,9 +234,15 @@ impl WorkerPool {
         expired
     }
 
+    /// Spawn one worker owned by `owner`.
+    ///
+    /// The owner is the agent identity of the connection that dispatched it
+    /// and is recorded on both the in-memory record and the registry row, so
+    /// ownership survives a process restart (H-3).
     #[allow(clippy::too_many_arguments)]
     pub async fn dispatch(
         &self,
+        owner: String,
         task: String,
         model: String,
         temperature: Option<f32>,
@@ -261,6 +267,7 @@ impl WorkerPool {
             task: task.clone(),
             group: Some(resolved_group.clone()),
             repo_path: Some(repo_path_str.clone()),
+            owner: owner.clone(),
             started_at: now,
             pid: std::process::id(),
             // Filled in by the phase loop; the dispatch itself measures nothing.
@@ -271,6 +278,7 @@ impl WorkerPool {
             id: worker_id.clone(),
             task: task.clone(),
             model: model.clone(),
+            owner,
             state: WorkerState::Running {
                 step: 0,
                 last_command: String::from("initializing"),
@@ -471,16 +479,33 @@ impl WorkerPool {
             .count()
     }
 
+    /// Every worker the registry knows about, each with the agent that owns it.
     pub async fn list_workers(&self) -> Vec<serde_json::Value> {
+        self.list_workers_matching(None).await
+    }
+
+    /// Only the workers owned by `owner` (H-3).
+    ///
+    /// The default view of `list`: an orchestrator sees its own workers and
+    /// nobody else's, while [`WorkerPool::list_workers`] (behind
+    /// `scope: "all"`) still reports every row together with its owner.
+    pub async fn list_workers_of(&self, owner: &str) -> Vec<serde_json::Value> {
+        self.list_workers_matching(Some(owner)).await
+    }
+
+    /// The list payload, optionally narrowed to one owner.
+    async fn list_workers_matching(&self, owner: Option<&str>) -> Vec<serde_json::Value> {
         let registry = load_all_registry_entries();
         if !registry.is_empty() {
             registry
                 .into_iter()
+                .filter(|e| owner.is_none_or(|owner| e.owner.as_deref() == Some(owner)))
                 .map(|e| {
                     serde_json::json!({
                         "id": e.id,
                         "task": e.task,
                         "model": e.model,
+                        "owner": registry_owner_label(&e),
                         "group": e.group.as_deref().unwrap_or("default"),
                         "state": {
                             "status": e.status.display_name(),
@@ -502,12 +527,14 @@ impl WorkerPool {
         } else {
             let lock = self.workers.read().await;
             lock.values()
+                .filter(|w| owner.is_none_or(|owner| w.owner == owner))
                 .map(|w| {
                     let stats = w.log_stats();
                     serde_json::json!({
                         "id": w.id,
                         "task": w.task,
                         "model": w.model,
+                        "owner": w.owner,
                         "state": w.state.to_summary(),
                         "total_steps": stats.total_steps,
                         "logs_retained": stats.logs_retained,
@@ -516,6 +543,41 @@ impl WorkerPool {
                 })
                 .collect()
         }
+    }
+
+    /// Who owns `id`, from the in-memory record or, for a worker that lives in
+    /// another process, from its registry row.
+    ///
+    /// `None` means the pool and the registry both have no row for `id`: the
+    /// caller keeps its own "not found" answer.
+    pub async fn worker_owner(&self, id: &str) -> Option<WorkerOwner> {
+        if let Some(owner) = self.workers.read().await.get(id).map(|w| w.owner.clone()) {
+            return Some(WorkerOwner::Agent(owner));
+        }
+        let entry = load_registry_entry(id)?;
+        Some(match entry.owner {
+            Some(owner) => WorkerOwner::Agent(owner),
+            None => WorkerOwner::Unattributed,
+        })
+    }
+
+    /// Ids of `owner`'s still-running workers, used to report a per-agent cap.
+    pub async fn active_workers_of(&self, owner: &str) -> Vec<String> {
+        let lock = self.workers.read().await;
+        let mut ids: Vec<String> = lock
+            .values()
+            .filter(|w| {
+                w.owner == owner
+                    && matches!(
+                        w.state,
+                        WorkerState::Running { .. } | WorkerState::Paused { .. }
+                    )
+            })
+            .map(|w| w.id.clone())
+            .collect();
+        drop(lock);
+        ids.sort();
+        ids
     }
 
     /// Deliver an orchestrator message to a worker.
@@ -744,6 +806,7 @@ impl WorkerPool {
             id: record.id,
             task: record.task,
             model: record.model,
+            owner: record.owner,
             state: record.state,
             logs: view.logs,
             logs_omitted: view.logs_omitted,
