@@ -251,13 +251,27 @@ async fn llm_concurrency_cap_limits_in_flight_requests() {
                 .with_llm_concurrency(cap)
             })
             .collect();
-        let mut requests = Vec::new();
-        for runner in &runners {
-            requests.push(runner.run_step_llm(&messages));
-        }
+        eprintln!(
+            "DEBUG cap={cap} gates={:?}",
+            runners.iter().map(|r| r.llm_gate.as_ref().map(|g| g.available_permits())).collect::<Vec<_>>()
+        );
+        let requests: Vec<_> = runners
+            .iter()
+            .map(|runner| {
+                let runner = runner.clone();
+                let messages = messages.clone();
+                tokio::spawn(async move { runner.run_step_llm(&messages).await })
+            })
+            .collect();
+        let started = std::time::Instant::now();
         for request in requests {
-            request.await.expect("fake SSE step");
+            request
+                .await
+                .expect("request task")
+                .expect("fake SSE step");
         }
+        eprintln!("DEBUG cap={cap} elapsed={:?}", started.elapsed());
+        eprintln!("DEBUG cap={cap} peak={} inflight={}", server.peak.load(Ordering::SeqCst), server.in_flight.load(Ordering::SeqCst));
         assert_eq!(
             server.peak.load(Ordering::SeqCst),
             cap,
@@ -270,3 +284,4 @@ async fn llm_concurrency_cap_limits_in_flight_requests() {
         );
     }
 }
+
