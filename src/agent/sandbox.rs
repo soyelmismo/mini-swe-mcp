@@ -1912,10 +1912,12 @@ impl SeccompFilter {
         // another, where the same `nr` names a different syscall. Anything
         // that is not the native architecture gets nothing at all.
         program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFF));
-        program.push(bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 0, 1));
-        // Not this architecture: allow and stop. The alternative - denying -
-        // would break a legitimate 32-bit helper binary for no gain, since
-        // the denied syscalls below are named by the native numbering.
+        // On a match, skip the allow-and-stop below and continue with the
+        // rules; on a mismatch, fall through to it. The alternative -
+        // denying - would break a legitimate 32-bit helper binary for no
+        // gain, since the denied syscalls below are named by the native
+        // numbering.
+        program.push(bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 1, 0));
         program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW as u32));
 
         // Load the syscall number once; every rule below compares against it.
@@ -2220,7 +2222,7 @@ impl KernelConfinement {
     /// Only sound between `fork(2)` and `exec(2)`, where the calling process
     /// is single-threaded by construction. Every step is async-signal-safe,
     /// but the Landlock half is irreversible.
-    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+    pub unsafe fn apply(&self) -> std::io::Result<()> {
         if self.landlock.is_none() {
             // The Landlock half sets `no_new_privs` itself before restricting;
             // without it the seccomp half needs the flag set explicitly, as
