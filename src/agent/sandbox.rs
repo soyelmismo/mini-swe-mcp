@@ -589,7 +589,10 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     // deny-check and the rule name the same real directory.
     push(canonical_root(worktree), WRITE_RIGHTS);
     push(canonical_root(target_dir), WRITE_RIGHTS);
-    push(canonical_root(&crate::worktree::scratch_dir(worktree)), WRITE_RIGHTS);
+    push(
+        canonical_root(&crate::worktree::scratch_dir(worktree)),
+        WRITE_RIGHTS,
+    );
 
     // Toolchain caches, readable and executable but never writable: the child
     // environment forwards `CARGO_HOME`/`RUSTUP_HOME` at these locations so an
@@ -1631,7 +1634,8 @@ mod tests {
         }
         let cache_root = crate::cache::shared_cache_root();
         for path in &writable {
-            let is_root = *path == worktree || *path == target
+            let is_root = *path == worktree
+                || *path == target
                 || *path == crate::worktree::scratch_dir(worktree);
             let is_sink = WRITABLE_SINKS.contains(&path.to_str().unwrap_or_default());
             let is_cache = path.starts_with(&cache_root)

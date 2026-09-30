@@ -12,8 +12,7 @@
 //! (missing, unreadable, malformed or foreign lease) must be preserved.
 
 use mini_swe_mcp::worktree::{
-    claim_lease_for_test, is_process_alive, prune_stale_worktrees_in,
-    worktree_is_stale_for_test,
+    claim_lease_for_test, is_process_alive, prune_stale_worktrees_in, worktree_is_stale_for_test,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -141,7 +140,10 @@ impl Drop for Fixture {
         // Remove any worktree registrations first so git does not leave
         // dangling metadata behind in the throwaway repo.
         for (branch, dir, _) in self.pending.drain(..) {
-            let _ = try_run(&self.repo, &["worktree", "remove", "--force", dir.to_str().unwrap_or("")]);
+            let _ = try_run(
+                &self.repo,
+                &["worktree", "remove", "--force", dir.to_str().unwrap_or("")],
+            );
             let _ = try_run(&self.repo, &["branch", "-D", &branch]);
         }
         if let Some(root) = self.base.parent() {
@@ -205,7 +207,10 @@ fn dead_worktree_is_pruned_completely() {
 
     f.sweep();
 
-    assert!(!dir.exists(), "zombie worktree directory survived the sweep");
+    assert!(
+        !dir.exists(),
+        "zombie worktree directory survived the sweep"
+    );
     assert!(!pid_file.exists(), "zombie lease file survived the sweep");
     assert!(
         !branch_exists(&f.repo, &branch),
@@ -228,7 +233,10 @@ fn unleased_worktree_is_preserved() {
     f.sweep();
 
     assert!(dir.is_dir(), "worktree without a lease was pruned");
-    assert!(branch_exists(&f.repo, &branch), "branch of unleased worktree was pruned");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "branch of unleased worktree was pruned"
+    );
 }
 
 /// Test 4 — a corrupt lease is handled identically by the registered-worktree
@@ -246,7 +254,10 @@ fn corrupt_lease_is_handled_consistently() {
         dir.is_dir(),
         "registered worktree with a corrupt lease was pruned (fail-open expected)"
     );
-    assert!(branch_exists(&f.repo, &branch), "corrupt-lease branch was pruned");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "corrupt-lease branch was pruned"
+    );
 
     // Same corrupt data seen by the orphan-directory path: also fail open.
     let orphan = f.base.join(format!("swe-wt-{}", unique("corrupt-orphan")));
@@ -310,9 +321,11 @@ fn dangling_lease_without_directory_is_reclaimed() {
         s
     });
     f.write_dead_lease(&pid_name);
-    assert!(!f.base.join(
-        pid_name.file_stem().map(PathBuf::from).unwrap()
-    ).exists());
+    assert!(
+        !f.base
+            .join(pid_name.file_stem().map(PathBuf::from).unwrap())
+            .exists()
+    );
 
     f.sweep();
 
@@ -372,7 +385,17 @@ fn dirty_worktree_is_salvaged_before_prune() {
         s.push(".pid");
         PathBuf::from(s)
     };
-    run(&f.repo, &["worktree", "add", "-b", &branch, dir.to_str().unwrap(), "HEAD"]);
+    run(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
     f.write_dead_lease(&pid_file);
     std::fs::write(dir.join("precious.txt"), "uncommitted worker output\n").unwrap();
 
@@ -430,7 +453,10 @@ fn live_worktree_whose_directory_vanished_keeps_its_unmerged_branch() {
     run(&dir, &["checkout", &branch]);
     std::fs::write(dir.join("precious.txt"), "unmerged worker output\n").unwrap();
     run(&dir, &["add", "precious.txt"]);
-    run(&dir, &["commit", "-m", "unmerged work that must not be destroyed"]);
+    run(
+        &dir,
+        &["commit", "-m", "unmerged work that must not be destroyed"],
+    );
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(!dir.exists(), "precondition: worktree directory is gone");
 
@@ -446,7 +472,6 @@ fn live_worktree_whose_directory_vanished_keeps_its_unmerged_branch() {
         "unmerged commit was lost: {log}"
     );
 }
-
 
 /// Direct coverage of the §1 staleness decision, which the end-to-end sweep
 /// cannot reach: `git worktree prune` at the top of the sweep unregisters a
@@ -582,7 +607,10 @@ fn zombie_leased_orphan_is_reclaimed() {
     };
     std::fs::create_dir_all(&orphan).unwrap();
     std::fs::write(&pid_file, zpid.to_string()).unwrap();
-    let target_dir = f.base.join(format!("swe-target-{}", orphan.file_name().unwrap().to_str().unwrap()));
+    let target_dir = f.base.join(format!(
+        "swe-target-{}",
+        orphan.file_name().unwrap().to_str().unwrap()
+    ));
     std::fs::create_dir_all(&target_dir).unwrap();
 
     f.sweep();

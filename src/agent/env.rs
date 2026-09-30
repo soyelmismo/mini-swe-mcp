@@ -314,13 +314,36 @@ mod tests {
     #[test]
     fn allow_list_and_toolchain_names_are_not_credentials() {
         let markers = [
-            "API_KEY", "APIKEY", "API_TOKEN", "AUTH_TOKEN", "ACCESS_TOKEN", "SECRET",
-            "PASSWORD", "PASSWD", "PASSPHRASE", "TOKEN", "AUTHORIZATION", "CREDENTIAL",
-            "PRIVATE_KEY", "SESSION_KEY", "SESSION_TOKEN", "REFRESH_TOKEN",
-            "ENCRYPTION_KEY", "SIGNING_KEY", "CLIENT_SECRET", "CONNECTION_STRING",
-            "AWS_", "SSH_", "GPG_", "BEARER",
+            "API_KEY",
+            "APIKEY",
+            "API_TOKEN",
+            "AUTH_TOKEN",
+            "ACCESS_TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "PASSPHRASE",
+            "TOKEN",
+            "AUTHORIZATION",
+            "CREDENTIAL",
+            "PRIVATE_KEY",
+            "SESSION_KEY",
+            "SESSION_TOKEN",
+            "REFRESH_TOKEN",
+            "ENCRYPTION_KEY",
+            "SIGNING_KEY",
+            "CLIENT_SECRET",
+            "CONNECTION_STRING",
+            "AWS_",
+            "SSH_",
+            "GPG_",
+            "BEARER",
         ];
-        for name in ALLOWED_VARS.iter().chain(TOOLCHAIN_VARS.iter()).chain([HOME_VAR].iter()) {
+        for name in ALLOWED_VARS
+            .iter()
+            .chain(TOOLCHAIN_VARS.iter())
+            .chain([HOME_VAR].iter())
+        {
             let upper = name.to_ascii_uppercase();
             for marker in markers {
                 assert!(
@@ -467,9 +490,7 @@ mod tests {
                 continue;
             }
             assert!(
-                ALLOWED_VARS.contains(&k)
-                    || TOOLCHAIN_VARS.contains(&k)
-                    || k == HOME_VAR,
+                ALLOWED_VARS.contains(&k) || TOOLCHAIN_VARS.contains(&k) || k == HOME_VAR,
                 "{k} escaped the allow-list"
             );
         }

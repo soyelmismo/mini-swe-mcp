@@ -162,7 +162,10 @@ impl HubLink {
             .expect("write frame");
         self.writer.flush().await.expect("flush frame");
         loop {
-            let Some(line) = self.line_until(Instant::now() + Duration::from_secs(30)).await else {
+            let Some(line) = self
+                .line_until(Instant::now() + Duration::from_secs(30))
+                .await
+            else {
                 panic!("the hub closed the connection while answering {method}");
             };
             let reply: serde_json::Value =
@@ -356,7 +359,10 @@ fn spawn_daemon(hub: &Path, swe: &Path, api_base: &str, shape: &LoadShape) -> Da
         .env("OPENAI_API_BASE", api_base)
         .env("OPENAI_API_KEY", "test-key-not-used-by-the-fake-llm")
         .env("ENV_FILE", hub.join("absent.env"))
-        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+        .env(
+            "MODELS_FILE",
+            format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+        )
         .env("HUB_IDLE_SECS", "600")
         .env("MAX_CONCURRENT_WORKERS", shape.worker_slots.to_string())
         .env("BASH_BUILD_LIMIT", shape.max_heavy.to_string())
@@ -401,7 +407,9 @@ fn private_dir(dir: &Path) {
 /// long enough to observe whatever the admission controller does with it, even
 /// where the sandbox denies cargo a writable cache.
 fn heavy_command(token: &str, secs: u64) -> String {
-    format!("LOAD_PROBE={token} cargo build --offline -q; timeout {secs} sh -c 'while :; do :; done'")
+    format!(
+        "LOAD_PROBE={token} cargo build --offline -q; timeout {secs} sh -c 'while :; do :; done'"
+    )
 }
 
 /// The load test itself: 5 agents x 20 workers through one hub daemon.
@@ -612,7 +620,10 @@ fn report(
     );
     println!(
         "fake LLM requests {requests} | completed {done}/{total} | failed {failed}",
-        done = statuses.values().filter(|status| *status == "completed").count(),
+        done = statuses
+            .values()
+            .filter(|status| *status == "completed")
+            .count(),
         total = shape.total(),
         failed = statuses
             .values()

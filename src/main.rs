@@ -5,8 +5,8 @@
 
 use anyhow::Result;
 use mini_swe_mcp::cli::args::{
-    action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag,
-    strip_json_flag, tool_args,
+    action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag, strip_json_flag,
+    tool_args,
 };
 use mini_swe_mcp::cli::format::format_output;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
@@ -90,7 +90,15 @@ async fn async_main() -> Result<()> {
         if action == "daemon" {
             return run_daemon_cmd(&server).await;
         }
-        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty(), admin).await;
+        return run_action(
+            &server,
+            action,
+            &cli_args,
+            json_output,
+            !api_key.is_empty(),
+            admin,
+        )
+        .await;
     }
 
     run_local_stdio().await
@@ -100,7 +108,9 @@ async fn async_main() -> Result<()> {
 async fn run_local_stdio() -> Result<()> {
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
-        anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
+        anyhow::bail!(
+            "Missing OPENAI_API_KEY. Please provide it via environment variable or .env file."
+        );
     }
     let manifest = ModelManifest::load();
     let default_model = default_model(&manifest);
@@ -156,7 +166,8 @@ async fn drive_worker_call(
 /// exactly like the stdio path, and keyless dispatches fail lazily per call.
 async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
     let dir = mini_swe_mcp::hub::hub_dir()?;
-    let running = mini_swe_mcp::hub::run_daemon(std::sync::Arc::new(server.clone()), dir, None).await?;
+    let running =
+        mini_swe_mcp::hub::run_daemon(std::sync::Arc::new(server.clone()), dir, None).await?;
     if !running {
         println!("hub already running");
     }

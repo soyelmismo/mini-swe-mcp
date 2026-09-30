@@ -582,7 +582,12 @@ fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
 
 /// Universal build/test parallelism caps so a command cannot oversubscribe the
 /// machine no matter which build tool it drives.
-fn apply_build_env(cmd: &mut Command, target_dir: Option<&Path>, tmp_dir: &Path, parallelism: &str) {
+fn apply_build_env(
+    cmd: &mut Command,
+    target_dir: Option<&Path>,
+    tmp_dir: &Path,
+    parallelism: &str,
+) {
     if let Some(target) = target_dir {
         cmd.env("CARGO_TARGET_DIR", target);
     }
@@ -1112,7 +1117,12 @@ mod tests {
         // directory another live worker could be building in.
         let mut plain = Command::new("true");
         apply_build_env(&mut plain, None, Path::new("/tmp/private"), "1");
-        assert!(!plain.as_std().get_envs().any(|(key, _)| key == "CARGO_TARGET_DIR"));
+        assert!(
+            !plain
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key == "CARGO_TARGET_DIR")
+        );
     }
 
     #[test]

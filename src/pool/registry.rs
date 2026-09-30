@@ -322,7 +322,11 @@ fn branch_exists(
         if let Ok(output) = crate::worktree::git(
             &repo_dir,
             "for-each-ref",
-            &["for-each-ref", "--format=%(refname:short)", "refs/heads/worker-*"],
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/worker-*",
+            ],
         ) && output.status.success()
         {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -472,8 +476,10 @@ fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEnt
 
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     let mut entries = Vec::new();
-    let mut branches_by_repo: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    let mut branches_by_repo: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
 
     // The directory scan, parsing and id dedupe live in [`raw_registry_entries`];
     // this loader only adds liveness normalisation and terminal-row pruning.
@@ -583,11 +589,15 @@ mod recovery_cleanup_tests {
 
         let recovered = recover_entries([(path.clone(), row)]);
         assert_eq!(recovered, 1, "the orphan row must be recovered");
-        let row: WorkerRegistryEntry = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let row: WorkerRegistryEntry =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(row.status, RegistryStatus::Interrupted);
 
         assert!(!target.exists(), "the orphan's target dir must be removed");
-        assert!(!scratch.exists(), "the orphan's scratch dir must be removed");
+        assert!(
+            !scratch.exists(),
+            "the orphan's scratch dir must be removed"
+        );
         assert!(!pid.exists(), "the orphan's lease must be removed");
     }
 }

@@ -10,10 +10,10 @@ use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde::Deserializer as _;
-use serde::de::IgnoredAny;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde::de::IgnoredAny;
 use serde_json::value::RawValue;
+use serde_json::{Value, json};
 
 /// The `jsonrpc` member of every frame, per JSON-RPC 2.0 §6.
 pub(super) const JSONRPC_VERSION: &str = "2.0";
@@ -54,8 +54,7 @@ pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Frame emitted when an outgoing frame fails to serialize; `id` is `null`,
 /// which JSON-RPC 2.0 §5 permits when the id cannot be determined.
-pub(super) const INTERNAL_ERROR_FRAME: &str =
-    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}\n";
+pub(super) const INTERNAL_ERROR_FRAME: &str = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}\n";
 
 /// Diagnosis for a frame that carries no usable `method`.
 const NO_METHOD: &str = "Invalid Request: missing or non-string \"method\" member";
@@ -222,8 +221,7 @@ impl JsonRpcResponse {
     /// The payload is pretty-printed into the `text` of a single content block,
     /// exactly the shape MCP clients expect.
     pub(super) fn tool_call(id: Option<Box<RawValue>>, payload: Value) -> Self {
-        let text = serde_json::to_string_pretty(&payload)
-            .unwrap_or_else(|_| String::from("null"));
+        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| String::from("null"));
         Self {
             id,
             body: Body::Result(json!({
@@ -377,7 +375,10 @@ mod tests {
     #[test]
     fn rejections_use_the_codes_the_spec_reserves() {
         for (line, expected) in [
-            (r#"{"jsonrpc": "2.0", "id": 7, "method": "#, code::PARSE_ERROR),
+            (
+                r#"{"jsonrpc": "2.0", "id": 7, "method": "#,
+                code::PARSE_ERROR,
+            ),
             (r#"{"id":1"#, code::PARSE_ERROR),
             (r#"{"method":"ping"} trailing"#, code::PARSE_ERROR),
             (r#"{bad}"#, code::PARSE_ERROR),
@@ -386,7 +387,9 @@ mod tests {
             ("42", code::INVALID_REQUEST),
             ("[1,2]", code::INVALID_REQUEST),
         ] {
-            let frame = parse_frame(line).expect_err("must be rejected").into_frame();
+            let frame = parse_frame(line)
+                .expect_err("must be rejected")
+                .into_frame();
             let value: Value = serde_json::from_str(&frame).expect("frame is JSON");
             assert_eq!(value["jsonrpc"], json!(JSONRPC_VERSION));
             assert!(
@@ -396,7 +399,10 @@ mod tests {
             assert_eq!(value["error"]["code"], json!(expected), "for {line}");
             assert!(value.get("result").is_none(), "errors carry no result");
             assert!(
-                !value["error"]["message"].as_str().unwrap_or_default().is_empty(),
+                !value["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
                 "the message must stay diagnosable"
             );
         }
@@ -408,7 +414,9 @@ mod tests {
             NO_METHOD.replace('"', "\\\"")
         );
         assert_eq!(
-            parse_frame(r#"{"id":1}"#).expect_err("no method").into_frame(),
+            parse_frame(r#"{"id":1}"#)
+                .expect_err("no method")
+                .into_frame(),
             expected
         );
     }
@@ -447,7 +455,11 @@ mod tests {
         let tail = r#""}"#;
         let pad = MAX_FRAME_BYTES - envelope.len() - tail.len();
         let line = format!("{envelope}{}{tail}", "x".repeat(pad));
-        assert_eq!(line.len(), MAX_FRAME_BYTES, "the fixture must sit on the bound");
+        assert_eq!(
+            line.len(),
+            MAX_FRAME_BYTES,
+            "the fixture must sit on the bound"
+        );
 
         let req = parse_frame(&line).expect("a frame at the bound is served");
         assert_eq!(req.method, "ping");
@@ -475,7 +487,10 @@ mod tests {
     #[test]
     fn json_rpc_constructors_are_spec_shaped() {
         let ok = JsonRpcResponse::ok(None, json!({ "a": 1 })).to_frame();
-        assert_eq!(ok.expect("frame"), "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"a\":1}}\n");
+        assert_eq!(
+            ok.expect("frame"),
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"a\":1}}\n"
+        );
 
         // A value the server built itself, serialized as raw JSON text.
         let req = parse_frame(r#"{"id":"server-1","method":"ping"}"#).expect("parse");
@@ -484,15 +499,12 @@ mod tests {
             code::METHOD_NOT_FOUND,
             Cow::Borrowed("nope"),
         )
-            .to_frame()
-            .expect("frame");
+        .to_frame()
+        .expect("frame");
         let value: Value = serde_json::from_str(&err).expect("frame is JSON");
         assert_eq!(value["jsonrpc"], json!(JSONRPC_VERSION));
         assert_eq!(value["id"], json!("server-1"));
-        assert_eq!(
-            value["error"],
-            json!({ "code": -32601, "message": "nope" })
-        );
+        assert_eq!(value["error"], json!({ "code": -32601, "message": "nope" }));
         assert!(value.get("result").is_none());
     }
 
@@ -501,7 +513,10 @@ mod tests {
     fn method_not_found_quotes_the_requested_method() {
         let line = r#"{"id":3,"method":"does/not/exist"}"#;
         let req = parse_frame(line).expect("parse");
-        let response = JsonRpcResponse::method_not_found(req.id_or_null().map(|v| v.to_owned()), Cow::Owned(req.method));
+        let response = JsonRpcResponse::method_not_found(
+            req.id_or_null().map(|v| v.to_owned()),
+            Cow::Owned(req.method),
+        );
         assert_eq!(
             response.to_frame().expect("frame"),
             concat!(
@@ -531,9 +546,15 @@ mod tests {
     #[test]
     fn frames_are_newline_terminated_documents() {
         let response = JsonRpcResponse::ok(None, json!({}));
-        let frame = response.to_frame().expect("a `Value` payload always serializes");
+        let frame = response
+            .to_frame()
+            .expect("a `Value` payload always serializes");
         assert!(frame.ends_with('\n'));
-        assert_eq!(frame.matches('\n').count(), 1, "one line per frame: {frame:?}");
+        assert_eq!(
+            frame.matches('\n').count(),
+            1,
+            "one line per frame: {frame:?}"
+        );
         let parsed: Value = serde_json::from_str(&frame).expect("the frame is one JSON document");
         assert_eq!(parsed["result"], json!({}));
     }
@@ -542,9 +563,12 @@ mod tests {
     #[test]
     fn tool_call_embeds_the_payload_as_pretty_text() {
         let req = parse_frame(r#"{"id":7,"method":"ping"}"#).expect("parse");
-        let envelope = JsonRpcResponse::tool_call(req.id_or_null().map(|v| v.to_owned()), json!({ "worker_id": "w-1" }))
-            .to_frame()
-            .expect("frame");
+        let envelope = JsonRpcResponse::tool_call(
+            req.id_or_null().map(|v| v.to_owned()),
+            json!({ "worker_id": "w-1" }),
+        )
+        .to_frame()
+        .expect("frame");
         let wire: Value = serde_json::from_str(&envelope).expect("frame");
         assert_eq!(wire["id"], json!(7));
         let text = wire["result"]["content"][0]["text"]
@@ -555,7 +579,10 @@ mod tests {
             serde_json::from_str::<Value>(text).expect("the text is the payload"),
             json!({ "worker_id": "w-1" })
         );
-        assert!(text.contains('\n') && text.contains("  "), "still pretty-printed: {text}");
+        assert!(
+            text.contains('\n') && text.contains("  "),
+            "still pretty-printed: {text}"
+        );
     }
 
     /// A `tools/call` response keeps the pretty-printed payload *and* its
@@ -577,7 +604,10 @@ mod tests {
             serde_json::from_str::<Value>(text).expect("the text is the payload"),
             json!({ "status": "reaped", "worker_ids": [] })
         );
-        assert!(text.contains('\n') && text.contains("  "), "still pretty-printed: {text}");
+        assert!(
+            text.contains('\n') && text.contains("  "),
+            "still pretty-printed: {text}"
+        );
     }
 
     /// The handshake document is process-constant and spec-shaped.
@@ -591,7 +621,10 @@ mod tests {
             json!(env!("CARGO_PKG_VERSION")),
             "the advertised version is the package version"
         );
-        assert_eq!(initialize["capabilities"]["tools"]["listChanged"], json!(false));
+        assert_eq!(
+            initialize["capabilities"]["tools"]["listChanged"],
+            json!(false)
+        );
     }
 
     /// The handshake also opts into the `claude/channel` extension and tells the

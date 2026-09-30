@@ -16,8 +16,8 @@
 //!   shape of each message kind is the only observable behaviour left to pin.
 
 use mini_swe_mcp::agent::{
-    extract_command, truncate_output, ChatMessage, Role, ToolCall, ToolCallFn,
-    TRUNCATE_HEAD as HEAD, TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
+    ChatMessage, Role, TRUNCATE_HEAD as HEAD, TRUNCATE_LIMIT as LIMIT, TRUNCATE_TAIL as TAIL,
+    ToolCall, ToolCallFn, extract_command, truncate_output,
 };
 
 // The byte budget above which output is truncated, and the sizes of the
@@ -43,7 +43,9 @@ fn split_truncated(out: &str) -> (&str, &str, &str) {
     // The marker is introduced by a leading '\n' that is *not* part of the head.
     let head = &out[..idx - 1];
     let rest = &out[idx..];
-    let end = rest.find('\n').expect("marker line must be newline-terminated");
+    let end = rest
+        .find('\n')
+        .expect("marker line must be newline-terminated");
     (head, &rest[..end], &rest[end + 1..])
 }
 
@@ -78,10 +80,15 @@ fn test_truncate_output_keeps_head_and_tail_with_16k_split() {
     let (head, marker, tail) = split_truncated(&out);
 
     // The head is the first HEAD bytes verbatim...
-    assert_eq!(head, "a".repeat(HEAD), "head must be the first {HEAD} bytes");
+    assert_eq!(
+        head,
+        "a".repeat(HEAD),
+        "head must be the first {HEAD} bytes"
+    );
     // ...and the tail is the last TAIL bytes verbatim.
     assert_eq!(
-        tail, "b".repeat(0) + &"a".repeat(TAIL),
+        tail,
+        "b".repeat(0) + &"a".repeat(TAIL),
         "tail must be the last {TAIL} bytes"
     );
     // Exactly one byte fell into the gap, and the marker says so.
@@ -89,7 +96,10 @@ fn test_truncate_output_keeps_head_and_tail_with_16k_split() {
 
     // For large inputs, head + gap + tail is strictly smaller than the original.
     let large_input = "a".repeat(20_000);
-    assert!(truncate_output(&large_input).len() < large_input.len(), "truncation must shrink large outputs");
+    assert!(
+        truncate_output(&large_input).len() < large_input.len(),
+        "truncation must shrink large outputs"
+    );
     assert_eq!(out.chars().count(), out.len(), "output must be pure ASCII");
 }
 
@@ -235,7 +245,10 @@ fn test_truncate_output_handles_pathological_multibyte_input() {
     // An all-emoji string: every cut is deep inside multi-byte chars.
     let input = emoji.repeat(10_000);
     let out = truncate_output(&input);
-    assert!(!out.contains('\u{FFFD}'), "all-emoji input must not be split");
+    assert!(
+        !out.contains('\u{FFFD}'),
+        "all-emoji input must not be split"
+    );
     let (head, _, tail) = split_truncated(&out);
     assert!(
         head.chars().all(|c| c == EMOJI),
@@ -583,7 +596,15 @@ fn test_truncate_output_matches_reference_implementation() {
         let input = "a".repeat(n);
         assert_eq!(truncate_output(&input), truncate_output_reference(&input));
     }
-    for n in [LIMIT - 1, LIMIT, LIMIT + 1, LIMIT + 2, LIMIT + 6, 2 * LIMIT, 100_000] {
+    for n in [
+        LIMIT - 1,
+        LIMIT,
+        LIMIT + 1,
+        LIMIT + 2,
+        LIMIT + 6,
+        2 * LIMIT,
+        100_000,
+    ] {
         let input = "a".repeat(n);
         assert_eq!(
             truncate_output(&input),
@@ -598,7 +619,12 @@ fn test_truncate_output_matches_reference_implementation() {
 
     // 14c. 2-, 3- and 4-byte characters straddling the head cut, at every
     //      offset that can put the cut inside the character.
-    for ch in ['\u{20ac}', EMOJI.chars().next().unwrap(), '\u{65e5}', '\u{800}'] {
+    for ch in [
+        '\u{20ac}',
+        EMOJI.chars().next().unwrap(),
+        '\u{65e5}',
+        '\u{800}',
+    ] {
         for leading in (HEAD - 10)..=(HEAD + 10) {
             let input = format!("{}c{}", "a".repeat(leading), ch) + &"b".repeat(9_000);
             assert_eq!(
@@ -623,12 +649,25 @@ fn test_truncate_output_matches_reference_implementation() {
 
     // 14e. All-emoji and all-CJK documents: every cut is deep inside
     //      multi-byte characters.
-    for input in [EMOJI.repeat(10_000), "\u{65e5}\u{672c}\u{8a9e}".repeat(5_000)] {
+    for input in [
+        EMOJI.repeat(10_000),
+        "\u{65e5}\u{672c}\u{8a9e}".repeat(5_000),
+    ] {
         assert_eq!(truncate_output(&input), truncate_output_reference(&input));
     }
 
     // 14f. Pseudo-random mixed-width documents.
-    let alphabet = ['a', 'b', ' ', '\n', '\u{e9}', '\u{20ac}', '\u{65e5}', EMOJI.chars().next().unwrap(), '\u{800}'];
+    let alphabet = [
+        'a',
+        'b',
+        ' ',
+        '\n',
+        '\u{e9}',
+        '\u{20ac}',
+        '\u{65e5}',
+        EMOJI.chars().next().unwrap(),
+        '\u{800}',
+    ];
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for _ in 0..400 {
         let target = rng.below(40_000);
@@ -698,8 +737,24 @@ fn test_extract_command_matches_reference_on_edge_cases() {
 #[test]
 fn test_extract_command_matches_reference_on_token_soup() {
     const TOKENS: &[&str] = &[
-        "```bash", "```sh", "```rust", "```", "\n", " ", "echo hi", "ls", "\t", "\r\n", "a",
-        "```bash\nx", "x\n```", "```bashx", "``` bash", "```sh ", "    ", "```BASH",
+        "```bash",
+        "```sh",
+        "```rust",
+        "```",
+        "\n",
+        " ",
+        "echo hi",
+        "ls",
+        "\t",
+        "\r\n",
+        "a",
+        "```bash\nx",
+        "x\n```",
+        "```bashx",
+        "``` bash",
+        "```sh ",
+        "    ",
+        "```BASH",
     ];
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..2_000 {

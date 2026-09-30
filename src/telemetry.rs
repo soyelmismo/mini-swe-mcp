@@ -36,7 +36,11 @@ where
             tracing::Level::TRACE => "\x1b[35mTRCE\x1b[0m",
         };
 
-        write!(writer, "{:02}:{:02}:{:02} {} [{}] ", hours, mins, secs, lvl, short_target)?;
+        write!(
+            writer,
+            "{:02}:{:02}:{:02} {} [{}] ",
+            hours, mins, secs, lvl, short_target
+        )?;
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }

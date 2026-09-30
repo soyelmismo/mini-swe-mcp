@@ -121,7 +121,9 @@ impl McpServer {
             return ctx.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
         }
         let path = PathBuf::from(repo_path_str);
-        if path.is_relative() && let Some(cwd) = &ctx.cwd {
+        if path.is_relative()
+            && let Some(cwd) = &ctx.cwd
+        {
             cwd.join(path)
         } else {
             path
@@ -161,8 +163,7 @@ impl McpServer {
     /// that sends no notification at all as idle. The wait loop therefore
     /// re-emits the current step on this interval, well under the 30-minute
     /// idle timeout.
-    pub const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration =
-        std::time::Duration::from_secs(60);
+    pub const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Coarse fallback tick for a worker this process does not own.
     ///
@@ -229,11 +230,7 @@ impl McpServer {
     /// an authentication one: any process of this user may name itself another
     /// agent, or ask for `admin`. What keeps a worker private to its user is
     /// still the hub daemon's `SO_PEERCRED` check.
-    async fn require_owner(
-        &self,
-        wid: &str,
-        ctx: &super::server::ConnectionContext,
-    ) -> Result<()> {
+    async fn require_owner(&self, wid: &str, ctx: &super::server::ConnectionContext) -> Result<()> {
         if ctx.is_admin() {
             return Ok(());
         }
@@ -289,7 +286,8 @@ impl McpServer {
         let agent = ctx.agent();
         // Fairness gate: one agent may not fill the pool, so its dispatches
         // stop at `MAX_WORKERS_PER_AGENT` running workers (0 = unlimited).
-        self.check_agent_cap(&agent, Self::max_workers_per_agent()).await?;
+        self.check_agent_cap(&agent, Self::max_workers_per_agent())
+            .await?;
         let repo_path = Self::get_repo_path(args, ctx);
         let requested_model = args
             .get("model")
@@ -317,13 +315,10 @@ impl McpServer {
             .get("group")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let review_after = args
-            .get("review_after")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                let (resolved, _, _) = self.manifest.resolve_model(s);
-                resolved
-            });
+        let review_after = args.get("review_after").and_then(|v| v.as_str()).map(|s| {
+            let (resolved, _, _) = self.manifest.resolve_model(s);
+            resolved
+        });
 
         let network_offline =
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
@@ -437,8 +432,7 @@ impl McpServer {
     /// Render the bounded tail of a live worker's step history plus the
     /// counters that make the degradation explicit.
     pub(super) async fn render_logs(&self, wid: &str) -> LogView {
-        let Some(buffer) = self.pool.get_worker_logs(wid).await
-        else {
+        let Some(buffer) = self.pool.get_worker_logs(wid).await else {
             return LogView::default();
         };
         let view = emit_view(&buffer, self.pool.log_policy().max_emitted);
@@ -552,18 +546,13 @@ impl McpServer {
     /// look like a pool with nobody else's runs in it. `scope: "all"` is the
     /// admin override, so a non-admin caller gets a refusal rather than a
     /// truncated list it would read as "nobody else is running".
-    fn lists_every_agent(
-        args: &Value,
-        ctx: &super::server::ConnectionContext,
-    ) -> Result<bool> {
+    fn lists_every_agent(args: &Value, ctx: &super::server::ConnectionContext) -> Result<bool> {
         match args.get("scope") {
             None => Ok(false),
             Some(scope) => match scope.as_str() {
                 Some(scope) if super::schema::LIST_SCOPES.contains(&scope) => {
                     if scope == super::schema::LIST_SCOPE_ALL && !ctx.is_admin() {
-                        anyhow::bail!(
-                            "'scope' \"all\" requires the admin override (--admin)"
-                        );
+                        anyhow::bail!("'scope' \"all\" requires the admin override (--admin)");
                     }
                     Ok(scope == super::schema::LIST_SCOPE_ALL)
                 }
@@ -643,7 +632,8 @@ impl McpServer {
                 // backlog is bounded, and a caller that never acks would
                 // eventually see `dropped_events` instead of its own history.
                 for event in &events {
-                    self.watch_ack(ctx, event["sequence"].as_u64().unwrap_or(0)).await?;
+                    self.watch_ack(ctx, event["sequence"].as_u64().unwrap_or(0))
+                        .await?;
                 }
                 return Ok(json!({
                     "status": "event",
@@ -661,8 +651,12 @@ impl McpServer {
                 }));
             }
             if initial {
-                ids = reply["watching"].as_array().into_iter().flatten()
-                    .filter_map(|id| id.as_str().map(str::to_string)).collect();
+                ids = reply["watching"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect();
             }
             initial = false;
             if !watching {
@@ -743,17 +737,24 @@ impl McpServer {
         // dispatch, so a typo cannot silently become the default budget.
         let revision_turns = match args.get("max_turns") {
             None => None,
-            Some(v) => Some(v.as_u64().ok_or_else(|| {
-                anyhow::anyhow!("'max_turns' must be a non-negative integer for action 'steer'")
-            }).map(|v| v as usize).and_then(|v| {
-                if v == 0 {
-                    Err(anyhow::anyhow!(
-                        "'max_turns' must be at least 1 for action 'steer'"
-                    ))
-                } else {
-                    Ok(v.min(crate::manifest::MAX_TURNS_LIMIT))
-                }
-            })?),
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "'max_turns' must be a non-negative integer for action 'steer'"
+                        )
+                    })
+                    .map(|v| v as usize)
+                    .and_then(|v| {
+                        if v == 0 {
+                            Err(anyhow::anyhow!(
+                                "'max_turns' must be at least 1 for action 'steer'"
+                            ))
+                        } else {
+                            Ok(v.min(crate::manifest::MAX_TURNS_LIMIT))
+                        }
+                    })?,
+            ),
         };
         let admission = self.admit_worker().await?;
         let outcome = self
@@ -858,7 +859,10 @@ impl LogView {
     /// The four log keys as a JSON map, for embedding into a `json!` response.
     pub(super) fn as_map(&self) -> Map<String, Value> {
         let mut map = Map::new();
-        map.insert("logs".to_string(), serde_json::to_value(&self.logs).unwrap_or_default());
+        map.insert(
+            "logs".to_string(),
+            serde_json::to_value(&self.logs).unwrap_or_default(),
+        );
         map.insert("logs_omitted".to_string(), json!(self.logs_omitted));
         map.insert("logs_dropped".to_string(), json!(self.logs_dropped));
         map.insert(
@@ -932,7 +936,10 @@ mod tests {
     fn an_unknown_network_policy_is_a_hard_error() {
         let err = McpServer::get_network_offline(&json!({ "network": "offine" }), "dispatch")
             .expect_err("a typo must not be accepted");
-        assert!(err.to_string().contains("not a valid 'network' policy"), "{err}");
+        assert!(
+            err.to_string().contains("not a valid 'network' policy"),
+            "{err}"
+        );
 
         let err = McpServer::get_network_offline(&json!({ "network": true }), "dispatch")
             .expect_err("a non-string network must not be accepted");
@@ -973,13 +980,8 @@ mod tests {
         let manifest = ModelManifest::default();
         // ninja declares `allow` in the built-in manifest.
         assert!(
-            !McpServer::resolve_network_policy(
-                &json!({}),
-                "dispatch",
-                &manifest,
-                "combo:ninja",
-            )
-            .expect("manifest policy must apply"),
+            !McpServer::resolve_network_policy(&json!({}), "dispatch", &manifest, "combo:ninja",)
+                .expect("manifest policy must apply"),
             "ninja's manifest policy is allow"
         );
     }
@@ -1002,13 +1004,8 @@ mod tests {
             },
         );
         assert!(
-            McpServer::resolve_network_policy(
-                &json!({}),
-                "dispatch",
-                &manifest,
-                "vendor:sealed",
-            )
-            .expect("manifest offline must apply"),
+            McpServer::resolve_network_policy(&json!({}), "dispatch", &manifest, "vendor:sealed",)
+                .expect("manifest offline must apply"),
             "a model declaring offline must isolate the worker"
         );
     }

@@ -30,15 +30,15 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
-use super::registry::{RegistryStatus, WorkerMeta};
-use super::state::WorkerState;
-use super::steer::remove_steer_file;
-use super::revision::{WorkerHistory, append_history_message};
-use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
+use super::registry::{RegistryStatus, WorkerMeta};
+use super::revision::{WorkerHistory, append_history_message};
+use super::state::WorkerState;
+use super::steer::remove_steer_file;
+use super::{WorkerPool, unix_timestamp};
 
 pub(crate) mod history;
 mod pause;
@@ -180,7 +180,7 @@ impl WorkerPool {
                 let mut guard = WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base)?;
                 guard.base_branch = resume_base_branch;
                 Ok(guard)
-            },
+            }
             None => WorktreeGuard::new(&repo_path_owned, &worker_id_owned),
         })
         .await
@@ -188,7 +188,8 @@ impl WorkerPool {
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
-        self.register_worktree(&worker_id, worktree.path.clone()).await;
+        self.register_worktree(&worker_id, worktree.path.clone())
+            .await;
 
         // The system prompt carries this role's persistent memory
         // (`.agents/memory/<alias>.md`) when the repository provides any, so a
@@ -439,7 +440,6 @@ impl WorkerPool {
             meta.metrics.diff_deletions = deletions;
         }
 
-
         // A worker that exhausted its verification budget completes anyway but
         // is flagged: both the completion summary and the registry last_command
         // must say so, so the harness never mistakes it for a clean pass.
@@ -542,7 +542,11 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
     };
     let committed = {
         let commit_subject: &str = if !agent_summary.is_empty() {
-            let first_line = agent_summary.lines().next().unwrap_or(&task_headline).trim();
+            let first_line = agent_summary
+                .lines()
+                .next()
+                .unwrap_or(&task_headline)
+                .trim();
             let stripped = first_line.trim_start_matches('#').trim();
             if stripped.is_empty() {
                 &task_headline

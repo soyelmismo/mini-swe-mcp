@@ -148,7 +148,10 @@ pub fn check_command(command: &str) -> Result<(), String> {
     // `rm -rf /`, `rm -fr /`, `rm -rf /*`, `rm --no-preserve-root`. Token-aware:
     // `rm` with recursive+force flags and a root-level target (`/`, `/*`, `~`,
     // `/home`, `/etc`, ...); a plain `rm -rf target/` stays allowed.
-    if commands.iter().any(|(word, args)| command_name(word) == "rm" && is_destructive_rm(args)) {
+    if commands
+        .iter()
+        .any(|(word, args)| command_name(word) == "rm" && is_destructive_rm(args))
+    {
         return Err(block_reason("rm -rf /"));
     }
     // Filesystem creation / raw disk writes.
@@ -236,7 +239,10 @@ fn heredoc_delimiter(line: &str) -> Option<String> {
 /// Commands that run another command, each with its flags that take a
 /// separate argument (skipped together with that argument).
 const WRAPPERS: &[(&str, &[&str])] = &[
-    ("sudo", &["-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t"]),
+    (
+        "sudo",
+        &["-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t"],
+    ),
     ("doas", &["-u", "-C"]),
     ("env", &["-u", "-C", "-S"]),
     ("nice", &["-n"]),
@@ -292,8 +298,12 @@ fn invocations(scan_trimmed: &str) -> Vec<(&str, Vec<&str>)> {
         .map(|segment| segment.split_whitespace().collect())
         .collect();
     let piped_into_shell = segments.iter().any(|tokens| {
-        tokens.first().is_some_and(|first| SHELLS.contains(&command_name(first)))
-            && tokens[1..].iter().all(|t| t.starts_with('-') && !t.contains('c'))
+        tokens
+            .first()
+            .is_some_and(|first| SHELLS.contains(&command_name(first)))
+            && tokens[1..]
+                .iter()
+                .all(|t| t.starts_with('-') && !t.contains('c'))
     });
 
     let mut found = Vec::new();
@@ -329,7 +339,9 @@ fn invocations(scan_trimmed: &str) -> Vec<(&str, Vec<&str>)> {
             }
             // `sh -c "<cmd>"`: the quoted program is the command.
             if SHELLS.contains(&name)
-                && tokens[at + 1..].first().is_some_and(|t| t.starts_with('-') && t.contains('c'))
+                && tokens[at + 1..]
+                    .first()
+                    .is_some_and(|t| t.starts_with('-') && t.contains('c'))
             {
                 wrapper_flags = Some(&[]);
                 at += 1;
@@ -372,7 +384,6 @@ fn is_destructive_rm(args: &[&str]) -> bool {
         !arg.starts_with('-') && targets_root_level(arg.trim_end_matches([')', '}']))
     })
 }
-
 
 /// The root operand carried by a flag-shaped token, e.g. `/` in `-rf/`
 /// or in `-/`, which `rm` reads as an option ending in `/` rather than as
@@ -472,7 +483,9 @@ mod tests {
         let rm_root = ["rm", "-rf", "/"].join(" ");
         let mkfs = ["mk", "fs"].concat();
         for cmd in [
-            format!("cat > src/x.rs <<'EOF'\nassert!(blocks(\"{rm_root}\"));\nlet s = \"{mkfs}.ext4\";\nEOF"),
+            format!(
+                "cat > src/x.rs <<'EOF'\nassert!(blocks(\"{rm_root}\"));\nlet s = \"{mkfs}.ext4\";\nEOF"
+            ),
             format!("python3 - <<'PY'\nfixture = '{rm_root}'\nPY"),
             format!("cat > t.sh <<-EOF\n\t{mkfs} /dev/sda1\n\tEOF\ncargo test"),
             format!("grep -rn {mkfs} src/"),
@@ -489,7 +502,10 @@ mod tests {
         let search = ["find", "/home", "-name", "x"].join(" ");
         let cmd = format!("cat > notes.md <<'EOF'\nnever run: {search}\nEOF");
         let view = strip_data_heredocs(&cmd);
-        assert!(crate::agent::validate_bash_command(&view).is_ok(), "{view:?}");
+        assert!(
+            crate::agent::validate_bash_command(&view).is_ok(),
+            "{view:?}"
+        );
         assert!(crate::agent::validate_bash_command(&search).is_err());
     }
 

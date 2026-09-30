@@ -67,7 +67,10 @@ pub fn is_completion_request(cmd: &str) -> bool {
     else {
         return false;
     };
-    arg.trim().trim_matches(|c| c == '"' || c == '\'' ).trim_end_matches("\\n") == COMPLETION_SENTINEL
+    arg.trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_end_matches("\\n")
+        == COMPLETION_SENTINEL
 }
 
 /// `echo "REQUEST_TURNS: N"` → the extra turns the subagent is asking for.
@@ -128,7 +131,8 @@ mod tests {
 
     #[test]
     fn test_summarize_command_utf8() {
-        let cmd = "echo 'esta_es_una_palabra_extremadamente_larga_con_ñ_y_acentos_para_superar_limite'";
+        let cmd =
+            "echo 'esta_es_una_palabra_extremadamente_larga_con_ñ_y_acentos_para_superar_limite'";
         let summary = summarize_command(cmd);
         assert!(summary.ends_with("..."));
 

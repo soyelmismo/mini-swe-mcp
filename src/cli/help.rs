@@ -21,7 +21,15 @@ mod tests {
     /// accepted without being discoverable.
     #[test]
     fn every_selector_is_documented() {
-        for flag in ["--json", "--all", "--admin", "-h", "--help", "-V", "--version"] {
+        for flag in [
+            "--json",
+            "--all",
+            "--admin",
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+        ] {
             assert!(
                 HELP_FLAGS.contains(flag),
                 "'{flag}' is accepted by the parser but missing from --help: {HELP_FLAGS}"

@@ -88,10 +88,7 @@ pub fn write_steer_message(worker_id: &str, message: &str) -> std::io::Result<Pa
     let mut payload = serde_json::to_string(&record).unwrap_or_default();
     payload.push('\n');
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     // Single write of a `\n`-terminated payload: atomic under O_APPEND.
     file.write_all(payload.as_bytes())?;
     file.flush()?;
@@ -124,7 +121,9 @@ pub fn drain_steer_messages(worker_id: &str) -> Vec<String> {
 
     let drained = read_records(&claim);
     // The claim file is ours alone; removing it is the drain's commit.
-    if let Err(e) = std::fs::remove_file(&claim) && e.kind() != std::io::ErrorKind::NotFound {
+    if let Err(e) = std::fs::remove_file(&claim)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         warn!(worker = %worker_id, error = %e, "Failed to remove claimed steering mailbox");
     }
     drained
@@ -156,9 +155,13 @@ fn read_records(claim: &Path) -> Vec<String> {
 pub fn remove_steer_file(worker_id: &str) {
     for path in [steer_path(worker_id), claim_path(worker_id)] {
         match std::fs::remove_file(&path) {
-            Ok(()) => debug!(worker = %worker_id, path = %path.display(), "Removed steering mailbox"),
+            Ok(()) => {
+                debug!(worker = %worker_id, path = %path.display(), "Removed steering mailbox")
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to remove steering mailbox"),
+            Err(e) => {
+                warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to remove steering mailbox")
+            }
         }
     }
 }

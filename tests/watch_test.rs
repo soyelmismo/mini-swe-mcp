@@ -2,11 +2,11 @@
 
 mod common;
 
+use mini_swe_mcp::cli::watch;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
-use mini_swe_mcp::cli::watch;
 use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,8 +77,15 @@ struct Raw {
 
 impl Raw {
     async fn connect(socket: &Path) -> Self {
-        let (reader, writer) = UnixStream::connect(socket).await.expect("connect").into_split();
-        Self { reader: BufReader::new(reader), writer, next_id: 1 }
+        let (reader, writer) = UnixStream::connect(socket)
+            .await
+            .expect("connect")
+            .into_split();
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+            next_id: 1,
+        }
     }
 
     async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -98,8 +105,6 @@ impl Raw {
             }
         }
     }
-
-
 }
 
 async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
@@ -115,44 +120,84 @@ async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
 async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner() {
     isolate_registry();
     let dir = common::TempDir::new_in_tmp("wg");
-    let server = pool_with(vec![record("w-watch", "agent-a", WorkerState::Running {
-        step: 1,
-        last_command: "test".to_string(),
-        started_at: 0,
-    })]).await;
+    let server = pool_with(vec![record(
+        "w-watch",
+        "agent-a",
+        WorkerState::Running {
+            step: 1,
+            last_command: "test".to_string(),
+            started_at: 0,
+        },
+    )])
+    .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.path().join("hub.sock")).await;
 
     let mut a = Raw::connect(&dir.path().join("hub.sock")).await;
     let reply = a
-        .request("hub/watch", serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}))
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}),
+        )
         .await;
-    assert_eq!(reply["error"]["message"], "worker w-watch belongs to agent agent-a");
+    assert_eq!(
+        reply["error"]["message"],
+        "worker w-watch belongs to agent agent-a"
+    );
     drop(a);
 
     let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
-    owner.request("hub/hello", serde_json::json!({"agent_id": "agent-a"})).await;
-    let reply = owner
-        .request("hub/watch", serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}))
+    owner
+        .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
         .await;
-    assert!(reply["result"]["watching"].as_array().unwrap().contains(&serde_json::json!("w-watch")), "{reply:?}");
+    let reply = owner
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}),
+        )
+        .await;
+    assert!(
+        reply["result"]["watching"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("w-watch")),
+        "{reply:?}"
+    );
 
     let mut b = Raw::connect(&dir.path().join("hub.sock")).await;
-    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"})).await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
+        .await;
     let reply = b
-        .request("hub/watch", serde_json::json!({"worker_ids": [], "group": null, "initial": true}))
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
         .await;
     assert_eq!(reply["result"]["watching"], serde_json::json!([]));
     assert_eq!(reply["result"]["events"], serde_json::json!([]));
 
     let mut admin = Raw::connect(&dir.path().join("hub.sock")).await;
-    admin.request("hub/hello", serde_json::json!({"agent_id": "agent-b", "admin": true})).await;
+    admin
+        .request(
+            "hub/hello",
+            serde_json::json!({"agent_id": "agent-b", "admin": true}),
+        )
+        .await;
     let reply = admin
-        .request("hub/watch", serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}))
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": ["w-watch"], "group": null, "initial": true}),
+        )
         .await;
     assert!(reply.get("error").is_none(), "{reply:?}");
-    assert!(reply["result"]["watching"].as_array().unwrap().contains(&serde_json::json!("w-watch")), "{reply:?}");
+    assert!(
+        reply["result"]["watching"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("w-watch")),
+        "{reply:?}"
+    );
 
     task.abort();
     let _ = task.await;
@@ -162,49 +207,89 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
 async fn completed_worker_is_reported_immediately_with_missed_marker() {
     isolate_registry();
     let dir = common::TempDir::new_in_tmp("wm");
-    let server = pool_with(vec![record("w-done", "agent-a", WorkerState::Completed {
-        turns: 2,
-        diff: String::new(),
-        summary: "Fixed.".to_string(),
-        completed_at: 0,
-        artifacts: Vec::new(),
-        branch: Some("worker-w-done".to_string()),
-        verified: Some(true),
-        metrics: WorkerMetrics::default(),
-        revision: 0,
-    })]).await;
+    let server = pool_with(vec![record(
+        "w-done",
+        "agent-a",
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "Fixed.".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-done".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )])
+    .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.path().join("hub.sock")).await;
 
     let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
-    owner.request("hub/hello", serde_json::json!({"agent_id": "agent-a"})).await;
+    owner
+        .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
     // Let the daemon's 1 s watch loop observe the terminal worker first.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     let reply = owner
-        .request("hub/watch", serde_json::json!({"worker_ids": [], "group": null, "initial": true}))
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
         .await;
     let event = &reply["result"]["events"][0];
     assert_eq!(event["worker_id"], "w-done");
     assert_eq!(event["event"], "completed");
     assert_eq!(event["missed"], true);
     assert_eq!(event["branch"], "worker-w-done");
-    assert!(event["commands"].as_array().map(|actions| actions.iter().any(|action| action.as_str().unwrap_or("").contains("mini-swe-mcp steer"))).unwrap_or(false), "{event:?}");
-    assert!(event["next_step"].as_str().unwrap_or("").contains("worker-w-done"), "{event:?}");
+    assert!(
+        event["commands"]
+            .as_array()
+            .map(|actions| actions
+                .iter()
+                .any(|action| action.as_str().unwrap_or("").contains("mini-swe-mcp steer")))
+            .unwrap_or(false),
+        "{event:?}"
+    );
+    assert!(
+        event["next_step"]
+            .as_str()
+            .unwrap_or("")
+            .contains("worker-w-done"),
+        "{event:?}"
+    );
 
     // Acknowledging removes the backlog; the next watch has nothing to replay.
-    owner.request("hub/watch/ack", serde_json::json!({"sequence": event["sequence"]})).await;
+    owner
+        .request(
+            "hub/watch/ack",
+            serde_json::json!({"sequence": event["sequence"]}),
+        )
+        .await;
     let reply = owner
-        .request("hub/watch", serde_json::json!({"worker_ids": ["w-done"], "group": null, "initial": false}))
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": ["w-done"], "group": null, "initial": false}),
+        )
         .await;
     assert_eq!(reply["result"]["events"], serde_json::json!([]));
 
     let mut b = Raw::connect(&dir.path().join("hub.sock")).await;
-    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"})).await;
-    let reply = b
-        .request("hub/watch", serde_json::json!({"worker_ids": [], "group": null, "initial": true}))
+    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
         .await;
-    assert_eq!(reply["result"]["events"], serde_json::json!([]), "A must never replay to B");
+    let reply = b
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
+        .await;
+    assert_eq!(
+        reply["result"]["events"],
+        serde_json::json!([]),
+        "A must never replay to B"
+    );
 
     task.abort();
     let _ = task.await;
@@ -225,20 +310,45 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
             .env("MINI_SWE_NO_DAEMON", "1")
             .env("ENV_FILE", "/nonexistent-mini-swe-env")
             .env("OPENAI_API_KEY", "test-key-not-used")
-        .env("MODELS_FILE", concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"))
+            .env(
+                "MODELS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+            )
             .output()
             .unwrap_or_else(|e| panic!("run {args:?}: {e}"))
     };
     // Nothing to watch: no Running/Paused worker of this identity.
     let output = run(&["watch", "--timeout", "1"]);
-    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stdout));
-    let completed = format!(r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"cli"}}"#, std::process::id());
-    std::fs::write(swe.path().join("swe-registry").join("w-cli.json"), completed).expect("row");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let completed = format!(
+        r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"cli"}}"#,
+        std::process::id()
+    );
+    std::fs::write(
+        swe.path().join("swe-registry").join("w-cli.json"),
+        completed,
+    )
+    .expect("row");
     std::fs::create_dir_all(swe.path().join("swe-wt-w-cli")).expect("preserved worktree");
     let output = run(&["watch", "w-cli"]);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(stdout.contains("w-cli") && stdout.contains("completed") && stdout.contains("mini-swe-mcp steer"), "{stdout}");
+    assert!(
+        stdout.contains("w-cli")
+            && stdout.contains("completed")
+            && stdout.contains("mini-swe-mcp steer"),
+        "{stdout}"
+    );
     let _ = std::fs::remove_dir_all(swe.path().join("swe-registry"));
     // The registry-only row carries no branch, so the guidance falls back to
     // the branch-less wording instead of naming a branch that is not there.
@@ -247,9 +357,18 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     std::fs::create_dir_all(swe.path().join("swe-registry")).unwrap();
     let now = mini_swe_mcp::pool::unix_timestamp();
     let running = serde_json::json!({"id":"w-cli","pid":std::process::id(),"task":"t","model":"m","status":"running","step":1,"max_turns":10,"last_command":"test","started_at":now,"updated_at":now,"owner":"cli"});
-    std::fs::write(swe.path().join("swe-registry/w-cli.json"), running.to_string()).unwrap();
+    std::fs::write(
+        swe.path().join("swe-registry/w-cli.json"),
+        running.to_string(),
+    )
+    .unwrap();
     let output = run(&["watch", "w-cli", "--timeout", "1"]);
-    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("no event"));
 }
 
@@ -257,15 +376,23 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
 fn tool_description_carries_the_orchestrator_guidelines() {
     let manifest = ModelManifest::default();
     let server = McpServer::new(
-        WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()).with_manifest(Arc::new(manifest)),
+        WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string())
+            .with_manifest(Arc::new(manifest)),
         "m".to_string(),
     );
     let text = serde_json::to_string(&server.tools_list()).expect("list");
-    for needle in ["ONE focused concern", "mini-swe-mcp watch", "steer", "merge only when it is right"] {
-        assert!(text.contains(needle), "tool schema must carry the guidelines ({needle} missing)");
+    for needle in [
+        "ONE focused concern",
+        "mini-swe-mcp watch",
+        "steer",
+        "merge only when it is right",
+    ] {
+        assert!(
+            text.contains(needle),
+            "tool schema must carry the guidelines ({needle} missing)"
+        );
     }
 }
-
 
 /// The real binary against an in-process daemon: the immediate event, the
 /// timeout and the ownership refusal all go through the hub transport.
@@ -278,23 +405,31 @@ async fn the_binary_watches_through_the_hub() {
     let hub = common::TempDir::new_in_tmp("watch-hub-cli");
     let swe = common::TempDir::new_in_tmp("watch-hub-swe");
     let server = pool_with(vec![
-        record("w-hub", "cli", WorkerState::Completed {
-            turns: 3,
-            diff: String::new(),
-            summary: "Fixed the parser.".to_string(),
-            completed_at: 0,
-            artifacts: Vec::new(),
-            branch: Some("worker-w-hub".to_string()),
-            verified: Some(true),
-            metrics: WorkerMetrics::default(),
-            revision: 0,
-        }),
+        record(
+            "w-hub",
+            "cli",
+            WorkerState::Completed {
+                turns: 3,
+                diff: String::new(),
+                summary: "Fixed the parser.".to_string(),
+                completed_at: 0,
+                artifacts: Vec::new(),
+                branch: Some("worker-w-hub".to_string()),
+                verified: Some(true),
+                metrics: WorkerMetrics::default(),
+                revision: 0,
+            },
+        ),
         // Another agent's live worker: never watchable, never leaked.
-        record("w-foreign", "other", WorkerState::Running {
-            step: 1,
-            last_command: "cargo test".to_string(),
-            started_at: 0,
-        }),
+        record(
+            "w-foreign",
+            "other",
+            WorkerState::Running {
+                step: 1,
+                last_command: "cargo test".to_string(),
+                started_at: 0,
+            },
+        ),
     ])
     .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
@@ -308,22 +443,43 @@ async fn the_binary_watches_through_the_hub() {
             .env("TMPDIR", swe.path())
             .env("OPENAI_API_KEY", "test-key-not-used")
             .env("ENV_FILE", "/nonexistent-mini-swe-env")
-            .env("MODELS_FILE", concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"))
+            .env(
+                "MODELS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+            )
             .output()
             .unwrap_or_else(|e| panic!("run {args:?}: {e}"))
     };
     let output = run(&["watch", "w-hub", "--timeout", "10"]);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(stdout.contains("w-hub") && stdout.contains("completed"), "{stdout}");
+    assert!(
+        stdout.contains("w-hub") && stdout.contains("completed"),
+        "{stdout}"
+    );
     assert!(stdout.contains("While you were not watching:"), "{stdout}");
     assert!(stdout.contains("worker-w-hub"), "{stdout}");
     // The other agent's worker is refused, and never leaks into the output.
     let output = run(&["watch", "w-foreign", "--timeout", "5"]);
-    assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("belongs to agent other"));
     let output = run(&["watch", "--timeout", "3"]);
-    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     task.abort();
     let _ = task.await;
 }

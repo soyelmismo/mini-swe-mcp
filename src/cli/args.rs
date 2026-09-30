@@ -18,14 +18,20 @@ pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-af
 /// goes through the `worker` tool. An
 /// unrecognised action is a hard error, so the caller can exit non-zero after
 /// printing the "did you mean" hint.
-pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Result<Option<Map<String, Value>>> {
+pub fn tool_args(
+    action: &str,
+    cli_args: &[String],
+    api_key_present: bool,
+) -> Result<Option<Map<String, Value>>> {
     let mut tool_args = Map::new();
     tool_args.insert("action".into(), Value::String(action.to_string()));
 
     match action {
         "dispatch" => {
             if !api_key_present {
-                anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
+                anyhow::bail!(
+                    "Missing OPENAI_API_KEY. Please provide it via environment variable or .env file."
+                );
             }
             if cli_args.len() < 3 {
                 eprintln!("Usage: mini-swe-mcp {DISPATCH_USAGE}");
@@ -161,7 +167,10 @@ pub fn admin_requested(raw_args: &[String]) -> bool {
 /// argv with the `--admin` selector removed, for the same reason as
 /// [`strip_json_flag`]: it is a flag, never a positional argument.
 pub fn strip_admin_flag(raw_args: Vec<String>) -> Vec<String> {
-    raw_args.into_iter().filter(|arg| arg != "--admin").collect()
+    raw_args
+        .into_iter()
+        .filter(|arg| arg != "--admin")
+        .collect()
 }
 
 /// True when the binary should serve MCP over stdio rather than run an action.
@@ -338,7 +347,14 @@ mod tests {
         );
 
         for flag in ["--max-turns", "-t"] {
-            let flagged = args(&["mini-swe-mcp", "steer", "w1", "fix the edge case", flag, "25"]);
+            let flagged = args(&[
+                "mini-swe-mcp",
+                "steer",
+                "w1",
+                "fix the edge case",
+                flag,
+                "25",
+            ]);
             let with = tool_args("steer", &flagged, true).unwrap().unwrap();
             assert_eq!(with["max_turns"], 25, "flag {flag}");
             assert_eq!(with["message"], "fix the edge case", "flag {flag}");
@@ -354,10 +370,27 @@ mod tests {
     #[test]
     fn test_dispatch_args_maps_every_flag_including_short_forms() {
         let cli_args = args(&[
-            "mini-swe-mcp", "dispatch", "fix it",
-            "--model", "m1", "--review-after", "m2", "--repo", "/tmp/r",
-            "--max-turns", "12", "--group", "g1",
-            "-m", "m3", "-r", "/tmp/r2", "-g", "g2", "-t", "3",
+            "mini-swe-mcp",
+            "dispatch",
+            "fix it",
+            "--model",
+            "m1",
+            "--review-after",
+            "m2",
+            "--repo",
+            "/tmp/r",
+            "--max-turns",
+            "12",
+            "--group",
+            "g1",
+            "-m",
+            "m3",
+            "-r",
+            "/tmp/r2",
+            "-g",
+            "g2",
+            "-t",
+            "3",
         ]);
         let mut tool_args = Map::new();
         dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
@@ -366,7 +399,10 @@ mod tests {
         assert_eq!(tool_args["model"], "m3"); // the last flag wins
         assert_eq!(tool_args["review_after"], "m2");
         assert_eq!(tool_args["repo_path"], "/tmp/r2");
-        assert!(!tool_args.contains_key("wait"), "dispatch never waits: {tool_args:?}");
+        assert!(
+            !tool_args.contains_key("wait"),
+            "dispatch never waits: {tool_args:?}"
+        );
         assert_eq!(tool_args["max_turns"], 3);
         assert_eq!(tool_args["group"], "g2");
     }
@@ -378,7 +414,11 @@ mod tests {
         dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
 
         assert_eq!(tool_args["task"], "t");
-        assert_eq!(tool_args.len(), 1, "unknown flags add nothing: {tool_args:?}");
+        assert_eq!(
+            tool_args.len(),
+            1,
+            "unknown flags add nothing: {tool_args:?}"
+        );
     }
 
     #[test]

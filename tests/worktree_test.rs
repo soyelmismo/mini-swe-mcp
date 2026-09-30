@@ -140,7 +140,10 @@ fn concurrent_guards_use_distinct_branches_and_paths() {
     // Guards were dropped at the end of the scope: everything is cleaned up.
     for (branch, path) in [(&branch_a, &path_a), (&branch_b, &path_b)] {
         assert!(!branch_exists(repo, branch), "branch {branch} still exists");
-        assert!(!worktree_is_registered(repo, path), "worktree {path:?} still registered");
+        assert!(
+            !worktree_is_registered(repo, path),
+            "worktree {path:?} still registered"
+        );
         assert!(!path.exists(), "directory {path:?} still exists");
     }
 }
@@ -161,8 +164,14 @@ fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
     std::fs::write(guard.path.join("after_checkpoint.txt"), "second\n").unwrap();
 
     let diff = guard.get_diff().expect("get_diff failed");
-    assert!(diff.contains("before_checkpoint.txt"), "checkpointed work missing:\n{diff}");
-    assert!(diff.contains("after_checkpoint.txt"), "uncommitted work missing:\n{diff}");
+    assert!(
+        diff.contains("before_checkpoint.txt"),
+        "checkpointed work missing:\n{diff}"
+    );
+    assert!(
+        diff.contains("after_checkpoint.txt"),
+        "uncommitted work missing:\n{diff}"
+    );
 }
 
 #[test]
@@ -250,7 +259,10 @@ fn test_worktree_cleanup_on_drop_with_uncommitted_files() {
 
         // 2. A modification of a file that is tracked in the worktree.
         let tracked = path.join("README.md");
-        assert!(tracked.exists(), "expected a tracked README.md in the worktree");
+        assert!(
+            tracked.exists(),
+            "expected a tracked README.md in the worktree"
+        );
         let original = std::fs::read_to_string(&tracked).expect("failed to read tracked file");
         std::fs::write(&tracked, format!("{original}\nmodified by the worker\n"))
             .expect("failed to modify tracked file");
@@ -307,7 +319,8 @@ fn test_sync_artifacts_preserves_reports_to_repo_root() {
     let audit_dir = guard.path.join("audits");
     std::fs::create_dir_all(&audit_dir).expect("failed to create audits dir in worktree");
     let audit_file = audit_dir.join(format!("audit_{id}.md"));
-    std::fs::write(&audit_file, "# Subagent Audit Report\nAll clear.").expect("failed to write audit file");
+    std::fs::write(&audit_file, "# Subagent Audit Report\nAll clear.")
+        .expect("failed to write audit file");
 
     let synced = guard.sync_artifacts();
     let expected_rel = format!("audits/audit_{id}.md");
@@ -317,7 +330,10 @@ fn test_sync_artifacts_preserves_reports_to_repo_root() {
     );
 
     let destination = repo.join(&expected_rel);
-    assert!(destination.exists(), "artifact was not copied to repo root: {destination:?}");
+    assert!(
+        destination.exists(),
+        "artifact was not copied to repo root: {destination:?}"
+    );
     let content = std::fs::read_to_string(&destination).expect("failed to read copied artifact");
     assert!(content.contains("# Subagent Audit Report"));
 
@@ -352,7 +368,10 @@ fn test_commit_changes_preserves_branch_on_drop() {
     assert!(!worktree_is_registered(repo, &path));
 
     // But the git branch is PRESERVED in the test repository
-    assert!(branch_exists(repo, &branch), "worker branch should be preserved");
+    assert!(
+        branch_exists(repo, &branch),
+        "worker branch should be preserved"
+    );
 
     let log = run(repo, &["log", "-1", "--pretty=%s", &branch]);
     assert!(
@@ -654,8 +673,14 @@ fn hostile_worker_id_cannot_escape_the_scratch_base_or_become_a_git_flag() {
         // The worktree must still be a real, registered git worktree: hardening
         // the id may not break the checkout itself.
         assert!(guard.path.is_dir(), "{label}: worktree directory missing");
-        assert!(worktree_is_registered(repo, &guard.path), "{label}: git does not know this worktree");
-        assert!(branch_exists(repo, &guard.branch), "{label}: branch was not created");
+        assert!(
+            worktree_is_registered(repo, &guard.path),
+            "{label}: git does not know this worktree"
+        );
+        assert!(
+            branch_exists(repo, &guard.branch),
+            "{label}: branch was not created"
+        );
 
         drop(guard);
     }
@@ -701,16 +726,30 @@ fn reopen_reattaches_to_the_preserved_branch() {
     let first_path = {
         let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
         std::fs::write(guard.path.join("fix.txt"), "fix\n").expect("worker change");
-        guard.commit_changes("worker: fix").expect("checkpoint commit");
+        guard
+            .commit_changes("worker: fix")
+            .expect("checkpoint commit");
         guard.path.clone()
     };
-    assert!(branch_exists(repo, &branch), "the finished run must preserve its branch");
-    assert!(!first_path.exists(), "the finished run must remove its checkout");
+    assert!(
+        branch_exists(repo, &branch),
+        "the finished run must preserve its branch"
+    );
+    assert!(
+        !first_path.exists(),
+        "the finished run must remove its checkout"
+    );
 
     let guard = WorktreeGuard::reopen(repo, &id, &base).expect("reopen must re-attach");
     assert_eq!(guard.branch, branch, "the revision keeps the same branch");
-    assert_eq!(guard.base_commit, base, "the diff base stays the original commit");
-    assert!(guard.path.join("fix.txt").is_file(), "checkpoints survive the re-attach");
+    assert_eq!(
+        guard.base_commit, base,
+        "the diff base stays the original commit"
+    );
+    assert!(
+        guard.path.join("fix.txt").is_file(),
+        "checkpoints survive the re-attach"
+    );
     assert!(
         worktree_is_registered(repo, &guard.path),
         "the re-attached checkout is a registered worktree"
@@ -756,13 +795,29 @@ fn moving_base_is_merged_and_excluded_from_worker_diff() {
     std::fs::write(repo.path().join("base.txt"), "base change\n").unwrap();
     run(repo.path(), &["add", "."]);
     run(repo.path(), &["commit", "-m", "move base"]);
-    assert_eq!(sync_base(&guard), BaseSync::Merged { branch: "master".into() });
-    assert_eq!(std::fs::read_to_string(guard.path.join("base.txt")).unwrap(), "base change\n");
+    assert_eq!(
+        sync_base(&guard),
+        BaseSync::Merged {
+            branch: "master".into()
+        }
+    );
+    assert_eq!(
+        std::fs::read_to_string(guard.path.join("base.txt")).unwrap(),
+        "base change\n"
+    );
     assert_eq!(run(&guard.path, &["status", "--porcelain"]), "");
     let diff = guard.get_diff().unwrap();
     assert!(diff.contains("worker.txt"));
-    assert!(!diff.contains("base.txt"), "base-only work leaked into diff: {diff}");
-    assert_eq!(run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"]).split_whitespace().count(), 3);
+    assert!(
+        !diff.contains("base.txt"),
+        "base-only work leaked into diff: {diff}"
+    );
+    assert_eq!(
+        run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
     assert_eq!(sync_base(&guard), BaseSync::Unchanged);
 
     // A second base advance is integrated without forgetting the worker's first commit.
@@ -784,7 +839,10 @@ fn conflicting_base_refuses_completion_until_markers_are_resolved() {
     std::fs::write(repo.path().join("README.md"), "base intent\n").unwrap();
     run(repo.path(), &["add", "."]);
     run(repo.path(), &["commit", "-m", "conflicting base"]);
-    let conflicts = BaseSync::Conflicts { branch: "master".into(), files: vec!["README.md".into()] };
+    let conflicts = BaseSync::Conflicts {
+        branch: "master".into(),
+        files: vec!["README.md".into()],
+    };
     assert_eq!(sync_base(&guard), conflicts);
     assert!(WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
     let markers = std::fs::read_to_string(guard.path.join("README.md")).unwrap();
@@ -792,7 +850,11 @@ fn conflicting_base_refuses_completion_until_markers_are_resolved() {
     assert!(markers.contains("base intent") && markers.contains("worker intent"));
     let head = run(&guard.path, &["rev-parse", "HEAD"]);
     assert!(guard.commit_changes("checkpoint during conflict").is_err());
-    assert_eq!(sync_base(&guard), conflicts, "markers must refuse a second completion too");
+    assert_eq!(
+        sync_base(&guard),
+        conflicts,
+        "markers must refuse a second completion too"
+    );
     assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]), head);
 
     // Even if the model stages the file, the harness checks working-tree markers.
@@ -800,14 +862,28 @@ fn conflicting_base_refuses_completion_until_markers_are_resolved() {
     assert_eq!(sync_base(&guard), conflicts);
     std::fs::write(guard.path.join("README.md"), "base intent\nworker intent\n").unwrap();
     std::fs::write(guard.path.join("renamed.txt"), "<<<<<<< unresolved\n").unwrap();
-    assert_eq!(sync_base(&guard), BaseSync::Conflicts {
-        branch: "master".into(), files: vec!["renamed.txt".into()],
-    });
+    assert_eq!(
+        sync_base(&guard),
+        BaseSync::Conflicts {
+            branch: "master".into(),
+            files: vec!["renamed.txt".into()],
+        }
+    );
     std::fs::remove_file(guard.path.join("renamed.txt")).unwrap();
-    assert_eq!(sync_base(&guard), BaseSync::Merged { branch: "master".into() });
+    assert_eq!(
+        sync_base(&guard),
+        BaseSync::Merged {
+            branch: "master".into()
+        }
+    );
     assert!(!WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
     assert_eq!(run(&guard.path, &["status", "--porcelain"]), "");
-    assert_eq!(run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"]).split_whitespace().count(), 3);
+    assert_eq!(
+        run(&guard.path, &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
     let diff = guard.get_diff().unwrap();
     assert!(diff.contains("+worker intent"));
     assert!(!diff.contains("+base intent"));
@@ -820,8 +896,14 @@ fn detached_dispatch_has_no_base_to_sync() {
     let guard = WorktreeGuard::new(repo.path(), &unique_worker_id("sync-detached")).unwrap();
     assert_eq!(guard.base_branch, None);
     std::fs::write(guard.path.join("worker.txt"), "pending\n").unwrap();
-    assert_eq!(sync_base(&guard), mini_swe_mcp::worktree::BaseSync::Unchanged);
-    assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]).trim(), guard.base_commit);
+    assert_eq!(
+        sync_base(&guard),
+        mini_swe_mcp::worktree::BaseSync::Unchanged
+    );
+    assert_eq!(
+        run(&guard.path, &["rev-parse", "HEAD"]).trim(),
+        guard.base_commit
+    );
     assert!(guard.get_diff().unwrap().contains("worker.txt"));
 }
 
@@ -831,12 +913,21 @@ fn sync_base_env_zero_leaves_worker_untouched() {
     const CHILD: &str = "SWE_SYNC_BASE_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "sync_base_env_zero_leaves_worker_untouched", "--nocapture"])
+            .args([
+                "--exact",
+                "sync_base_env_zero_leaves_worker_untouched",
+                "--nocapture",
+            ])
             .env(CHILD, "1")
             .env("WORKER_SYNC_BASE", "0")
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     let repo = TestRepo::new("sync-disabled");
@@ -845,9 +936,18 @@ fn sync_base_env_zero_leaves_worker_untouched() {
     std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
     run(repo.path(), &["add", "."]);
     run(repo.path(), &["commit", "-m", "move base"]);
-    assert_eq!(sync_base(&guard), mini_swe_mcp::worktree::BaseSync::Unchanged);
-    assert_eq!(run(&guard.path, &["rev-parse", "HEAD"]).trim(), guard.base_commit);
-    assert_eq!(run(&guard.path, &["status", "--porcelain"]), "?? worker.txt\n");
+    assert_eq!(
+        sync_base(&guard),
+        mini_swe_mcp::worktree::BaseSync::Unchanged
+    );
+    assert_eq!(
+        run(&guard.path, &["rev-parse", "HEAD"]).trim(),
+        guard.base_commit
+    );
+    assert_eq!(
+        run(&guard.path, &["status", "--porcelain"]),
+        "?? worker.txt\n"
+    );
     assert!(!guard.path.join("base.txt").exists());
     assert!(!WorktreeGuard::merge_in_progress_at(&guard.path).unwrap());
 }

@@ -72,7 +72,9 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "task",
         "string",
-        DescriptionSource::Static("ONE focused concern, naming the files in scope and the acceptance gate. Avoid parallel workers with overlapping files. Required for 'dispatch'."),
+        DescriptionSource::Static(
+            "ONE focused concern, naming the files in scope and the acceptance gate. Avoid parallel workers with overlapping files. Required for 'dispatch'.",
+        ),
     ),
     (
         "repo_path",
@@ -108,7 +110,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget."
+            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget.",
         ),
     ),
     (
@@ -121,9 +123,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "group",
         "string",
-        DescriptionSource::Static(
-            "Only watch workers of this group. Optional for 'watch'.",
-        ),
+        DescriptionSource::Static("Only watch workers of this group. Optional for 'watch'."),
     ),
     (
         "timeout_secs",
@@ -135,7 +135,9 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "max_turns",
         "integer",
-        DescriptionSource::Static("Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget of a revision started by steering a finished worker (default 60), and is ignored for running or paused workers."),
+        DescriptionSource::Static(
+            "Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget of a revision started by steering a finished worker (default 60), and is ignored for running or paused workers.",
+        ),
     ),
     (
         "temperature",
@@ -201,7 +203,10 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     .collect(),
             ),
         );
-        schema.insert("default".to_string(), Value::String(NETWORK_DEFAULT.to_string()));
+        schema.insert(
+            "default".to_string(),
+            Value::String(NETWORK_DEFAULT.to_string()),
+        );
     }
     if name == "scope" {
         schema.insert(
@@ -213,7 +218,10 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     .collect(),
             ),
         );
-        schema.insert("default".to_string(), Value::String(LIST_SCOPES[0].to_string()));
+        schema.insert(
+            "default".to_string(),
+            Value::String(LIST_SCOPES[0].to_string()),
+        );
     }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));

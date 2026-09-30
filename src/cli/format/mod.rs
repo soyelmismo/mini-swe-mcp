@@ -64,12 +64,24 @@ mod tests {
             ("list", "Workers (1):", r#"{"workers":[{"id":"w"}]}"#),
             ("prune", "✓", r#"{"message":"done"}"#),
             ("status", "Worker: w", r#"{"worker_id":"w"}"#),
-            ("collect", "Worker w: No git diff produced.", r#"{"worker_id":"w"}"#),
+            (
+                "collect",
+                "Worker w: No git diff produced.",
+                r#"{"worker_id":"w"}"#,
+            ),
             ("logs", "Worker w step logs", r#"{"worker_id":"w"}"#),
             ("reap", "✓ No expired", r#"{"reaped":0}"#),
             ("dispatch", "✓ Worker w finished.", r#"{"worker_id":"w"}"#),
-            ("steer", "✓ Worker w:", r#"{"worker_id":"w","message":"go"}"#),
-            ("kill", "Worker w was not running.", r#"{"worker_id":"w","killed":false}"#),
+            (
+                "steer",
+                "✓ Worker w:",
+                r#"{"worker_id":"w","message":"go"}"#,
+            ),
+            (
+                "kill",
+                "Worker w was not running.",
+                r#"{"worker_id":"w","killed":false}"#,
+            ),
         ];
         for (action, needle, json) in cases {
             let out = format_output(action, &v(json));
@@ -85,5 +97,4 @@ mod tests {
         let out = format_output("not-an-action", &v(r#"{"a":1}"#));
         assert_eq!(out, "{\n  \"a\": 1\n}");
     }
-
 }

@@ -6,7 +6,7 @@
 //! reported separately from omitted ones, and the truncation notice is present
 //! exactly when something is missing (audit 07, R4/R7).
 
-use super::super::{build_step_log, LogRetentionPolicy};
+use super::super::{LogRetentionPolicy, build_step_log};
 use super::*;
 
 use crate::agent::AgentStepLog;

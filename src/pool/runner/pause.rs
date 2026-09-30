@@ -10,11 +10,11 @@
 use anyhow::Result;
 use tracing::info;
 
-use super::sentinels::summarize_command;
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::unix_timestamp;
+use super::sentinels::summarize_command;
 
 /// Everything needed to park a worker on an orchestrator question and wait.
 ///

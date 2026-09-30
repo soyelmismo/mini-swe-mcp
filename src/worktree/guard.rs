@@ -101,7 +101,12 @@ fn branch_ref(repo_root: &Path, branch: &str) -> Option<String> {
     let output = git(
         repo_root,
         "show-ref",
-        &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )
     .ok()?;
     output.status.success().then(|| branch.to_string())
@@ -190,7 +195,14 @@ impl WorktreeGuard {
                 "Worker branch {branch} no longer exists; the finished worker cannot be revised"
             );
         }
-        Self::checkout(repo_root, &worker_id, &branch, branch.as_str(), base_commit, false)
+        Self::checkout(
+            repo_root,
+            &worker_id,
+            &branch,
+            branch.as_str(),
+            base_commit,
+            false,
+        )
     }
 
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
@@ -207,9 +219,15 @@ impl WorktreeGuard {
         force_remove_dir(&path);
         let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
 
-        let branch_out = git(repo_root, "symbolic-ref", &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let branch_out = git(
+            repo_root,
+            "symbolic-ref",
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )?;
         let base_branch = branch_out.status.success().then(|| {
-            String::from_utf8_lossy(&branch_out.stdout).trim().to_string()
+            String::from_utf8_lossy(&branch_out.stdout)
+                .trim()
+                .to_string()
         });
         let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
         if !base_commit_out.status.success() {
@@ -220,7 +238,14 @@ impl WorktreeGuard {
             .trim()
             .to_string();
 
-        let mut guard = Self::checkout(repo_root, &worker_id, &branch, &base_commit, &base_commit, true)?;
+        let mut guard = Self::checkout(
+            repo_root,
+            &worker_id,
+            &branch,
+            &base_commit,
+            &base_commit,
+            true,
+        )?;
         guard.base_branch = base_branch;
         guard.base_commit = base_commit;
         Ok(guard)
@@ -318,20 +343,36 @@ impl WorktreeGuard {
     }
 
     /// Resolve the shared ancestor with the current base tip, excluding base-only work.
-    pub fn diff_base_at(path: &Path, base_commit: &str, base_branch: Option<&str>) -> Result<String> {
+    pub fn diff_base_at(
+        path: &Path,
+        base_commit: &str,
+        base_branch: Option<&str>,
+    ) -> Result<String> {
         if let Some(branch) = base_branch {
             let reference = format!("refs/heads/{branch}");
             let output = git(path, "merge-base", &["merge-base", "HEAD", &reference])?;
             if !output.status.success() {
-                anyhow::bail!("git merge-base failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+                anyhow::bail!(
+                    "git merge-base failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
             }
             return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
         }
-        Ok(if base_commit.is_empty() { "HEAD" } else { base_commit }.to_string())
+        Ok(if base_commit.is_empty() {
+            "HEAD"
+        } else {
+            base_commit
+        }
+        .to_string())
     }
 
     /// Take the worker diff against its shared ancestor with the moving base.
-    pub fn diff_with_base_at(path: &Path, base_commit: &str, base_branch: Option<&str>) -> Result<String> {
+    pub fn diff_with_base_at(
+        path: &Path,
+        base_commit: &str,
+        base_branch: Option<&str>,
+    ) -> Result<String> {
         let base = Self::diff_base_at(path, base_commit, base_branch)?;
         Self::diff_at(path, &base)
     }
@@ -363,8 +404,13 @@ impl WorktreeGuard {
 
     /// Whether this checkout has an unfinished merge.
     pub fn merge_in_progress_at(path: &Path) -> Result<bool> {
-        Ok(git(path, "rev-parse MERGE_HEAD", &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])?
-            .status.success())
+        Ok(git(
+            path,
+            "rev-parse MERGE_HEAD",
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        )?
+        .status
+        .success())
     }
 
     /// Integrate the dispatch's base branch before verification, on the harness.
@@ -376,50 +422,117 @@ impl WorktreeGuard {
         base_commit: &str,
         base_branch: Option<&str>,
     ) -> Result<BaseSync> {
-        let Some(base_branch) = base_branch.filter(|_| std::env::var_os("WORKER_SYNC_BASE").as_deref() != Some(std::ffi::OsStr::new("0"))) else {
+        let Some(base_branch) = base_branch.filter(|_| {
+            std::env::var_os("WORKER_SYNC_BASE").as_deref() != Some(std::ffi::OsStr::new("0"))
+        }) else {
             return Ok(BaseSync::Unchanged);
         };
         let mut merged = false;
         if Self::merge_in_progress_at(path)? {
             // Git searches working-tree content even when the index is unmerged.
-            let markers = git(path, "grep conflict markers", &["grep", "--no-textconv", "--untracked", "--exclude-standard", "-a", "-l", "-z", "-e", "^<<<<<<<", "--"])?;
+            let markers = git(
+                path,
+                "grep conflict markers",
+                &[
+                    "grep",
+                    "--no-textconv",
+                    "--untracked",
+                    "--exclude-standard",
+                    "-a",
+                    "-l",
+                    "-z",
+                    "-e",
+                    "^<<<<<<<",
+                    "--",
+                ],
+            )?;
             match markers.status.code() {
-                Some(0) => return Ok(BaseSync::Conflicts {
-                    branch: base_branch.to_string(),
-                    files: nul_paths(&markers.stdout),
-                }),
+                Some(0) => {
+                    return Ok(BaseSync::Conflicts {
+                        branch: base_branch.to_string(),
+                        files: nul_paths(&markers.stdout),
+                    });
+                }
                 Some(1) => {}
-                _ => anyhow::bail!("Could not check conflict markers: {}", String::from_utf8_lossy(&markers.stderr).trim()),
+                _ => anyhow::bail!(
+                    "Could not check conflict markers: {}",
+                    String::from_utf8_lossy(&markers.stderr).trim()
+                ),
             }
             checked_git(path, "add resolved merge", &["add", "-A"])?;
-            checked_git(path, "commit resolved merge", &[
-                "-c", "user.name=mini-swe", "-c", "user.email=mini-swe@localhost",
-                "commit", "--no-edit",
-            ])?;
+            checked_git(
+                path,
+                "commit resolved merge",
+                &[
+                    "-c",
+                    "user.name=mini-swe",
+                    "-c",
+                    "user.email=mini-swe@localhost",
+                    "commit",
+                    "--no-edit",
+                ],
+            )?;
             merged = true;
         }
 
         let reference = format!("refs/heads/{base_branch}");
         let base = Self::diff_base_at(path, base_commit, Some(base_branch))?;
-        let tip = checked_git(path, "resolve base tip", &["rev-parse", "--verify", &reference])?;
+        let tip = checked_git(
+            path,
+            "resolve base tip",
+            &["rev-parse", "--verify", &reference],
+        )?;
         if base == String::from_utf8_lossy(&tip.stdout).trim() {
-            return Ok(if merged { BaseSync::Merged { branch: base_branch.to_string() } } else { BaseSync::Unchanged });
+            return Ok(if merged {
+                BaseSync::Merged {
+                    branch: base_branch.to_string(),
+                }
+            } else {
+                BaseSync::Unchanged
+            });
         }
 
-        Self::commit_changes_at(path, repo_root, branch, base_commit, "worker: checkpoint before base integration")?;
-        let output = git(path, "merge base", &[
-            "-c", "user.name=mini-swe", "-c", "user.email=mini-swe@localhost",
-            "merge", "--no-edit", &reference,
-        ])?;
+        Self::commit_changes_at(
+            path,
+            repo_root,
+            branch,
+            base_commit,
+            "worker: checkpoint before base integration",
+        )?;
+        let output = git(
+            path,
+            "merge base",
+            &[
+                "-c",
+                "user.name=mini-swe",
+                "-c",
+                "user.email=mini-swe@localhost",
+                "merge",
+                "--no-edit",
+                &reference,
+            ],
+        )?;
         if !output.status.success() {
-            let conflicts = checked_git(path, "list merge conflicts", &["diff", "--name-only", "--diff-filter=U", "-z"])?;
+            let conflicts = checked_git(
+                path,
+                "list merge conflicts",
+                &["diff", "--name-only", "--diff-filter=U", "-z"],
+            )?;
             let files = nul_paths(&conflicts.stdout);
             if Self::merge_in_progress_at(path)? && !files.is_empty() {
-                return Ok(BaseSync::Conflicts { branch: base_branch.to_string(), files });
+                return Ok(BaseSync::Conflicts {
+                    branch: base_branch.to_string(),
+                    files,
+                });
             }
-            anyhow::bail!("git merge base {base_branch} failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            anyhow::bail!(
+                "git merge base {base_branch} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
-        Ok(BaseSync::Merged { branch: base_branch.to_string() })
+        Ok(BaseSync::Merged {
+            branch: base_branch.to_string(),
+        })
     }
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
@@ -496,7 +609,9 @@ impl WorktreeGuard {
         {
             self.build_dir = Some(lease);
         }
-        self.build_dir.as_ref().map(|lease| lease.dir().to_path_buf())
+        self.build_dir
+            .as_ref()
+            .map(|lease| lease.dir().to_path_buf())
     }
 
     /// The build directory this worker already leased, without leasing one.
@@ -511,8 +626,8 @@ impl WorktreeGuard {
     /// Acquire the lease off the runtime: it waits on the sweep lock.
     async fn lease_build_dir(&mut self) -> Option<crate::cache::BuildDirLease> {
         let repo = self.repo_root.clone();
-        let acquired = tokio::task::spawn_blocking(move || crate::cache::BuildDirLease::acquire(&repo))
-            .await;
+        let acquired =
+            tokio::task::spawn_blocking(move || crate::cache::BuildDirLease::acquire(&repo)).await;
         match acquired {
             Ok(Ok(lease)) => Some(lease),
             Ok(Err(error)) => {
@@ -681,14 +796,20 @@ impl Drop for WorktreeGuard {
 fn checked_git(path: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
     let output = git(path, operation, args)?;
     if !output.status.success() {
-        anyhow::bail!("git {operation} failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        anyhow::bail!(
+            "git {operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(output)
 }
 
 fn nul_paths(bytes: &[u8]) -> Vec<String> {
-    let mut paths: Vec<_> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    let mut paths: Vec<_> = bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
     paths.sort();
     paths.dedup();
     paths
@@ -767,7 +888,6 @@ fn is_up_to_date(src: &Path, dst: &Path) -> bool {
         _ => false,
     }
 }
-
 
 /// Copy `src` onto `dst` atomically.
 ///
@@ -921,9 +1041,10 @@ mod tests {
         for raw in ["", "///", "   "] {
             let id = sanitize_worker_id(raw);
             assert!(!id.is_empty(), "id {raw:?} must be replaced, not emptied");
-            assert!(id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            );
         }
         assert_ne!(sanitize_worker_id(""), sanitize_worker_id(""));
 
@@ -960,8 +1081,12 @@ mod tests {
             Err(_) => return false,
         };
         // SAFETY: `file` owns a live descriptor for the duration of the call.
-        let locked =
-            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+        let locked = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
         if locked == 0 {
             // SAFETY: releasing a lock this call just took.
             unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN) };
@@ -972,7 +1097,8 @@ mod tests {
     }
 
     fn repo_dir(tag: &str) -> PathBuf {
-        let path = crate::worktree::swe_base_dir().join(format!("swe-lease-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        let path = crate::worktree::swe_base_dir()
+            .join(format!("swe-lease-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&path).expect("repository root must be creatable");
         path
     }
@@ -989,7 +1115,10 @@ mod tests {
             None,
             "a worker that ran no heavy command must hold no dir"
         );
-        let first = worker.build_dir().await.expect("a heavy step must lease a dir");
+        let first = worker
+            .build_dir()
+            .await
+            .expect("a heavy step must lease a dir");
         assert_eq!(
             worker.leased_build_dir(),
             Some(first.as_path()),
@@ -1004,11 +1133,17 @@ mod tests {
 
         // A second live worker of the same repository gets a dir of its own.
         let mut other = guard_for(&repo);
-        let second = other.build_dir().await.expect("a second worker must lease a dir");
+        let second = other
+            .build_dir()
+            .await
+            .expect("a second worker must lease a dir");
         assert_ne!(second, first, "two live workers shared {}", first.display());
 
         drop(worker);
-        assert!(dir_is_free(&first), "ending the worker must release its dir");
+        assert!(
+            dir_is_free(&first),
+            "ending the worker must release its dir"
+        );
         assert!(!dir_is_free(&second), "the other worker must keep its dir");
 
         drop(other);

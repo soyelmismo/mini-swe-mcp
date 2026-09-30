@@ -35,12 +35,10 @@ mod validate;
 mod tests;
 
 pub use self::catalog::build_system_prompt;
-pub use self::memory::{
-    MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory,
-};
+pub use self::memory::{MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory};
 pub use self::types::{
-    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT,
-    ModelDefinition, ModelManifest, NETWORK_POLICIES, NetworkPolicy, TEMPERATURE_RANGE,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT, ModelDefinition,
+    ModelManifest, NETWORK_POLICIES, NetworkPolicy, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.

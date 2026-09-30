@@ -104,7 +104,11 @@ fn repo_with_branch(tag: &str, id: &str) -> std::path::PathBuf {
             .args(args)
             .output()
             .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "--initial-branch=master"]);
     git(&["config", "user.email", "t@t"]);
@@ -164,7 +168,11 @@ fn the_append_only_log_survives_a_torn_last_line() {
     let lines: Vec<&str> = raw.lines().collect();
     assert_eq!(lines.len(), 5, "metadata plus four messages");
     eprintln!("LINES={} PATH={}", lines.len(), path.display());
-    let torn = format!("{}\n{}", lines[..4].join("\n"), &lines[4][..lines[4].len() / 2]);
+    let torn = format!(
+        "{}\n{}",
+        lines[..4].join("\n"),
+        &lines[4][..lines[4].len() / 2]
+    );
     std::fs::write(&path, torn).unwrap();
 
     // The reload keeps everything before the torn line and never fails.
@@ -218,7 +226,10 @@ fn a_legacy_whole_file_history_is_still_read() {
 
     let loaded = load_worker_history("leg1").expect("the legacy whole-file form is still read");
     assert_eq!(loaded.messages.len(), 4);
-    assert!(!history_log_path("leg1").exists(), "no log is created by a read");
+    assert!(
+        !history_log_path("leg1").exists(),
+        "no log is created by a read"
+    );
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);
 }
@@ -294,12 +305,18 @@ async fn steer_on_a_worker_without_history_continues_cold_on_the_same_branch() {
     assert_eq!(reloaded.branch, "worker-cold1");
     let content = serde_json::to_value(&reloaded.messages[1]).unwrap();
     let content = content["content"].as_str().unwrap();
-    assert!(content.contains("fix the parser"), "the original task is replayed");
+    assert!(
+        content.contains("fix the parser"),
+        "the original task is replayed"
+    );
     assert!(content.contains("git log --oneline <base>..HEAD"));
     assert!(content.contains("git diff <base>...HEAD --stat"));
     assert!(content.contains("keep going"));
     // The base is resolved from the branch, so the diff is measured honestly.
-    assert!(!reloaded.base_commit.is_empty(), "a base commit is resolved");
+    assert!(
+        !reloaded.base_commit.is_empty(),
+        "a base commit is resolved"
+    );
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);
 }
@@ -320,7 +337,8 @@ async fn a_missing_branch_is_the_only_cold_continuation_error() {
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     let err = pool.steer("gone1", "keep going".into()).await.unwrap_err();
     assert!(
-        err.to_string().contains("branch worker-gone1 no longer exists"),
+        err.to_string()
+            .contains("branch worker-gone1 no longer exists"),
         "the error must name the missing branch, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&repo);
@@ -342,10 +360,7 @@ fn a_history_without_a_base_branch_gets_one_detected_on_continuation() {
         .enable_all()
         .build()
         .unwrap();
-    let detected = runtime.block_on(mini_swe_mcp::pool::ensure_base_branch(
-        &mut meta,
-        &repo,
-    ));
+    let detected = runtime.block_on(mini_swe_mcp::pool::ensure_base_branch(&mut meta, &repo));
     assert_eq!(
         detected.as_deref(),
         Some("master"),
@@ -404,7 +419,9 @@ fn the_auto_continue_budget_counts_down_from_the_cap() {
     );
 
     // An interrupted worker with a history is still continuable by hand.
-    let outcome = runtime.block_on(pool.steer("bud1", "resume".into())).unwrap();
+    let outcome = runtime
+        .block_on(pool.steer("bud1", "resume".into()))
+        .unwrap();
     assert!(matches!(
         outcome,
         mini_swe_mcp::pool::SteerOutcome::Continuing { cold: false, .. }
@@ -440,9 +457,7 @@ fn a_transient_llm_error_never_marks_the_worker_failed() {
         "a provider outage is waited out before the orchestrator is asked"
     );
     // And no transient path reaches the failure transition from an LLM error.
-    let failures = source
-        .matches("w.fail(")
-        .count();
+    let failures = source.matches("w.fail(").count();
     assert!(
         failures <= 1,
         "the turn engine must not fail a worker on a transient LLM error"

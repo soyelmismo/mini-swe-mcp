@@ -289,7 +289,11 @@ impl SseAccumulator {
 
     /// Append streamed reasoning content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
     pub(crate) fn push_reasoning_content(&mut self, text: &str) {
-        Self::push_bounded(&mut self.reasoning_content, &mut self.reasoning_capped, text);
+        Self::push_bounded(
+            &mut self.reasoning_content,
+            &mut self.reasoning_capped,
+            text,
+        );
     }
 
     /// Append streamed content, respecting [`MAX_STREAMED_CONTENT_BYTES`].
@@ -740,12 +744,20 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(acc.tools.len(), 1, "one call, not one per fragment: {:?}", acc.tools);
+        assert_eq!(
+            acc.tools.len(),
+            1,
+            "one call, not one per fragment: {:?}",
+            acc.tools
+        );
         let (tcs, _) = SseAccumulator::finalize_from(&acc.tools);
         assert_eq!(tcs.len(), 1, "exactly one tool call: {tcs:?}");
         assert_eq!(tcs[0].id, "chatcmpl-tool-9d6a7c55214c5666");
         assert_eq!(tcs[0].function.arguments, r#"{"command": "ls"}"#);
-        assert_eq!(acc.reasoning_content, "thought A", "reasoning captured once");
+        assert_eq!(
+            acc.reasoning_content, "thought A",
+            "reasoning captured once"
+        );
         let resp = acc.finish();
         assert_eq!(resp.command.as_deref(), Some("ls"));
         assert_eq!(resp.reasoning_content.as_deref(), Some("thought A"));
@@ -758,7 +770,12 @@ mod tests {
         let mut acc = SseAccumulator::default();
         acc.accumulate_tool_call(&tc(0, Some("a"), Some("bash"), Some("{}")));
         acc.accumulate_tool_call(&tc(0, Some("b"), None, None));
-        assert_eq!(acc.tools.len(), 2, "a real new id must open a slot: {:?}", acc.tools);
+        assert_eq!(
+            acc.tools.len(),
+            2,
+            "a real new id must open a slot: {:?}",
+            acc.tools
+        );
     }
 
     /// Explicit `null` fields must not drop the chunk: `tool_calls: null`,
@@ -779,7 +796,11 @@ mod tests {
             }
         }
         let resp = acc.finish();
-        assert_eq!(resp.command.as_deref(), Some("ls"), "nulls must not drop the chunk");
+        assert_eq!(
+            resp.command.as_deref(),
+            Some("ls"),
+            "nulls must not drop the chunk"
+        );
     }
 
     /// A data frame that fails to parse is warned about (once per stream) rather
@@ -788,7 +809,11 @@ mod tests {
     fn unparsable_frame_is_warned_once() {
         let mut acc = SseAccumulator::default();
         let mut buffer = Vec::new();
-        let body = sse_body(&["{not json", "{also bad", r#"{"choices":[{"delta":{"content":"ok"}}]}"#]);
+        let body = sse_body(&[
+            "{not json",
+            "{also bad",
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        ]);
         for b in &body {
             if acc.push(&[*b], &mut buffer) == Some(FrameOutcome::Done) {
                 break;
@@ -804,11 +829,20 @@ mod tests {
     fn finish_keeps_only_the_executed_tool_call_in_history() {
         let mut acc = SseAccumulator::default();
         acc.accumulate_tool_call(&tc(0, Some("a"), Some("bash"), Some(r#"{"command":"ls"}"#)));
-        acc.accumulate_tool_call(&tc(1, Some("b"), Some("bash"), Some(r#"{"command":"pwd"}"#)));
+        acc.accumulate_tool_call(&tc(
+            1,
+            Some("b"),
+            Some("bash"),
+            Some(r#"{"command":"pwd"}"#),
+        ));
         let resp = acc.finish();
         assert_eq!(resp.command.as_deref(), Some("ls"));
         let calls = resp.tool_calls.expect("tool_calls present");
-        assert_eq!(calls.len(), 1, "only the executed call may be replayed: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the executed call may be replayed: {calls:?}"
+        );
         assert_eq!(calls[0].id, "a");
         assert_eq!(resp.tool_call_id.as_deref(), Some("a"));
     }
@@ -850,10 +884,7 @@ mod tests {
         }
         let (tcs, ids) = SseAccumulator::finalize_from(&acc.tools);
         assert_eq!(tcs.len(), 3, "no call may be dropped: {tcs:?}");
-        let commands: Vec<&str> = tcs
-            .iter()
-            .map(|c| c.function.arguments.as_str())
-            .collect();
+        let commands: Vec<&str> = tcs.iter().map(|c| c.function.arguments.as_str()).collect();
         assert_eq!(
             commands,
             vec![
