@@ -36,16 +36,6 @@ const HOST: &str = "host:opencode:730:12";
 const TAB_A: &str = "host:opencode:730:12/session:tab-a";
 const TAB_B: &str = "host:opencode:730:12/session:tab-b";
 
-/// Every variable identity resolution reads, so a test can pin the environment
-/// it means: the operator override, the session variables, and the token.
-const IDENTITY_ENV_VARS: &[&str] = &[
-    "MINI_SWE_AGENT_ID",
-    "CLAUDE_CODE_SESSION_ID",
-    "OPENCODE_SESSION_ID",
-    "MINI_SWE_SESSION_ID",
-    "MINI_SWE_WATCH_TOKEN",
-];
-
 /// A scratch hub directory, removed when the test ends.
 ///
 /// Mode 0700: the client side resolves a watch token through `hub_dir()`, which
@@ -667,9 +657,7 @@ fn whoami_with(vars: &[(&str, &str)], hub_dir: Option<&Path>) -> String {
     let exe = common::binary_path();
     let mut command = Command::new(&exe);
     command.arg("whoami").env("MINI_SWE_NO_DAEMON", "1");
-    for var in IDENTITY_ENV_VARS {
-        command.env_remove(var);
-    }
+    common::scrub_identity_env(&mut command);
     for (var, value) in vars {
         command.env(var, value);
     }

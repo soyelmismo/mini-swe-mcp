@@ -21,16 +21,6 @@ use tokio::net::UnixStream;
 
 static TAG: AtomicU64 = AtomicU64::new(0);
 
-/// Every variable identity resolution reads, so a spawned `whoami` sees the
-/// environment the test means and not the one the suite inherited.
-const IDENTITY_ENV_VARS: &[&str] = &[
-    "MINI_SWE_AGENT_ID",
-    "CLAUDE_CODE_SESSION_ID",
-    "OPENCODE_SESSION_ID",
-    "MINI_SWE_SESSION_ID",
-    "MINI_SWE_WATCH_TOKEN",
-];
-
 /// A scratch hub directory, removed when the test ends.
 fn scratch_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -238,9 +228,7 @@ fn a_shell_command_names_the_test_process_as_its_host() {
         // execs a lone command, and then there would be no shell to skip.
         .arg(format!("{} whoami; true", exe.display()))
         .env("MINI_SWE_NO_DAEMON", "1");
-    for var in IDENTITY_ENV_VARS {
-        command.env_remove(var);
-    }
+    common::scrub_identity_env(&mut command);
     let output = command
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} whoami: {e}", exe.display()));
@@ -269,11 +257,14 @@ fn a_shell_command_names_the_test_process_as_its_host() {
 #[test]
 fn an_explicit_agent_id_outranks_the_host_of_a_shell_command() {
     let exe = common::binary_path();
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(format!("{} whoami", exe.display()))
-        .env("MINI_SWE_NO_DAEMON", "1")
-        .env("MINI_SWE_AGENT_ID", "orchestrator-7")
+        .env("MINI_SWE_NO_DAEMON", "1");
+    common::scrub_identity_env(&mut command);
+    command.env("MINI_SWE_AGENT_ID", "orchestrator-7");
+    let output = command
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} whoami: {e}", exe.display()));
     let stdout = common::stdout_of(&output);

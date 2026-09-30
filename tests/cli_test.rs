@@ -1,5 +1,7 @@
 //! Integration tests for the `mini-swe-mcp` CLI executable.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -19,7 +21,7 @@ fn binary_path() -> PathBuf {
 fn test_cli_version_flag() {
     let exe = binary_path();
     for flag in ["--version", "-V"] {
-        let output = Command::new(&exe)
+        let output = common::binary_command(&exe)
             .env("MINI_SWE_NO_DAEMON", "1")
             .arg(flag)
             .output()
@@ -39,7 +41,7 @@ fn test_cli_version_flag() {
 fn test_cli_help_flag() {
     let exe = binary_path();
     for flag in ["--help", "-h"] {
-        let output = Command::new(&exe)
+        let output = common::binary_command(&exe)
             .env("MINI_SWE_NO_DAEMON", "1")
             .arg(flag)
             .output()
@@ -94,7 +96,7 @@ fn test_cli_flags_without_api_key() {
 
     let mut outputs = Vec::new();
     for flag in ["--version", "-V", "--help", "-h"] {
-        let output = Command::new(&exe)
+        let output = common::binary_command(&exe)
             .env("MINI_SWE_NO_DAEMON", "1")
             .current_dir(&temp)
             .arg(flag)
@@ -145,7 +147,7 @@ fn test_cli_flags_without_api_key() {
 #[test]
 fn test_cli_unknown_action() {
     let exe = binary_path();
-    let output = Command::new(&exe)
+    let output = common::binary_command(&exe)
         .env("MINI_SWE_NO_DAEMON", "1")
         .arg("nonexistent_action_xyz")
         .output()
@@ -173,7 +175,7 @@ fn test_cli_unknown_action() {
 #[test]
 fn test_cli_typo_suggestion() {
     let exe = binary_path();
-    let output = Command::new(&exe)
+    let output = common::binary_command(&exe)
         .env("MINI_SWE_NO_DAEMON", "1")
         .arg("statsu")
         .output()
@@ -190,7 +192,7 @@ fn test_cli_typo_suggestion() {
 #[test]
 fn test_cli_prefix_suggestion() {
     let exe = binary_path();
-    let output = Command::new(&exe)
+    let output = common::binary_command(&exe)
         .env("MINI_SWE_NO_DAEMON", "1")
         .arg("disp")
         .output()
@@ -215,7 +217,7 @@ fn test_cli_prune_action() {
         .output();
 
     // 1. Plain text format (default)
-    let output = Command::new(&exe)
+    let output = common::binary_command(&exe)
         .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .arg("prune")
@@ -230,7 +232,7 @@ fn test_cli_prune_action() {
     );
 
     // 2. JSON format with --json flag
-    let output_json = Command::new(&exe)
+    let output_json = common::binary_command(&exe)
         .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .args(["prune", "--json"])
@@ -247,7 +249,7 @@ fn test_cli_prune_action() {
 }
 
 fn run_action(exe: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(exe)
+    common::binary_command(exe)
         .args(args)
         .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -359,7 +361,7 @@ fn test_cli_status_renders_the_health_line() {
     // orphaned registry rows with no worktree or branch are reaped on `list`,
     // so the hub gets its own scratch dir and `status` reads rows in-process.
     let status = |wid: &str| {
-        let output = Command::new(&exe)
+        let output = common::binary_command(&exe)
             .env("MINI_SWE_NO_DAEMON", "1")
             .args(["status", wid, "--admin"])
             .env("SWE_TEMP_DIR", &swe)
@@ -481,7 +483,7 @@ fn test_cli_status_line_never_autostarts_the_hub() {
     .expect("write the done row");
 
     let run = |args: &[&str]| {
-        Command::new(&exe)
+        common::binary_command(&exe)
             .args(args)
             .env("SWE_HUB_DIR", &hub)
             .env("SWE_TEMP_DIR", &swe)
