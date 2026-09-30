@@ -206,3 +206,135 @@ async fn world_writable_hub_dir_is_refused() {
 fn hub_paths_for_test(dir: &Path) -> HubPaths {
     HubPaths::for_test(dir.to_path_buf())
 }
+
+/// Thin-client lifecycle over the real binary: the first CLI call auto-starts
+/// the daemon, the second reuses it, the `--stdio` proxy answers the handshake
+/// verbs, and the escape hatch never creates a socket.
+#[test]
+fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-thin");
+    let hub_dir = hub.path().to_path_buf();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the hub dir to 0700");
+    }
+    let envs = |cmd: &mut Command| {
+        cmd.env("SWE_HUB_DIR", &hub_dir)
+            .env("OPENAI_API_KEY", "test-key-not-used-by-list")
+            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
+            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+    };
+
+    // First CLI call auto-starts the daemon and answers through it.
+    let mut first = Command::new(&exe);
+    envs(&mut first);
+    let out = first
+        .args(["list", "--json"])
+        .output()
+        .expect("first CLI call runs");
+    assert!(out.status.success(), "first CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(hub_dir.join("hub.sock").exists(), "first call auto-starts the daemon");
+    let first_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon writes hub.log");
+    assert!(first_log.contains("listening"), "daemon records startup: {first_log}");
+
+    // Second CLI call reuses the same daemon: no second listener starts.
+    let mut second = Command::new(&exe);
+    envs(&mut second);
+    let out = second
+        .args(["list", "--json"])
+        .output()
+        .expect("second CLI call runs");
+    assert!(out.status.success(), "second CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    let second_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon log persists");
+    // Both CLI connections reached the daemon; the socket path stayed put and
+    // no second listener line was appended (stderr lines also say "listening").
+    assert!(
+        second_log.matches("Hub daemon listening").count() <= 1,
+        "the second call must reuse the daemon: {second_log}"
+    );
+
+    // The `--stdio` proxy answers the handshake verbs through the same daemon.
+    let mut proxy = Command::new(&exe);
+    envs(&mut proxy);
+    let mut child = proxy
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the stdio proxy");
+    let mut stdin = child.stdin.take().expect("proxy stdin");
+    let stdout = child.stdout.take().expect("proxy stdout");
+    let mut lines = StdBufReader::new(stdout).lines();
+    for (id, method) in [(1, "initialize"), (2, "tools/list")] {
+        writeln!(stdin, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}")
+            .expect("write a proxy frame");
+    }
+    stdin.flush().expect("flush proxy frames");
+    for expected in ["\"protocolVersion\":\"2024-11-05\"", "\"tools\""] {
+        let mut seen = String::new();
+        for _ in 0..50 {
+            match lines.next() {
+                Some(Ok(line)) => {
+                    seen.push_str(&line);
+                    if line.contains(expected) {
+                        break;
+                    }
+                }
+                Some(Err(e)) => panic!("reading the proxy reply: {e}"),
+                None => break,
+            }
+        }
+        assert!(seen.contains(expected), "proxy must answer with {expected}: {seen}");
+    }
+    drop(stdin);
+    let _ = child.wait();
+
+    // A dispatch against an unreachable API base records the worker in the hub
+    // and survives the CLI process exiting (no LLM call is awaited).
+    let mut dispatch = Command::new(&exe);
+    envs(&mut dispatch);
+    let out = dispatch
+        .args(["dispatch", "thin-client lifecycle probe", "--json"])
+        .env("OPENAI_API_BASE", "http://127.0.0.1:1")
+        .output()
+        .expect("dispatch runs");
+    assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+    let payload: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("dispatch prints JSON");
+    let wid = payload["worker_id"].as_str().expect("dispatch names the worker").to_string();
+    let mut status = Command::new(&exe);
+    envs(&mut status);
+    let out = status
+        .args(["status", &wid, "--json"])
+        .output()
+        .expect("status runs");
+    assert!(
+        out.status.success(),
+        "the worker record must survive the dispatching CLI exiting: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The escape hatch never creates a socket.
+    let bare = common::TempDir::new_in_tmp("hub-no-daemon");
+    let mut local = Command::new(&exe);
+    local
+        .env("SWE_HUB_DIR", bare.path())
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("OPENAI_API_KEY", "test-key-not-used-by-list")
+        .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
+        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+    let out = local
+        .args(["list", "--json"])
+        .output()
+        .expect("local CLI call runs");
+    assert!(out.status.success(), "escape-hatch call must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!bare.path().join("hub.sock").exists(), "MINI_SWE_NO_DAEMON=1 creates no socket");
+}
