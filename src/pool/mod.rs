@@ -91,12 +91,13 @@ fn registry_row_live_elsewhere(id: &str) -> bool {
 /// Tells the orchestrator the review loop exists: the finished worker's branch
 /// is still there, and `steer` with corrections resumes it in place.
 pub fn next_step_for(branch: Option<&str>) -> String {
-    match branch {
-        Some(branch) => format!(
-            "Review the diff (collect) and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes on branch {branch} with its full context. Merge only when it is right."
-        ),
-        None => "Review the result and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes with its full context. Merge only when it is right.".to_string(),
-    }
+    let on_branch = match branch {
+        Some(branch) => format!(" on branch {branch}"),
+        None => String::new(),
+    };
+    format!(
+        "Review the diff (collect) and run the project's checks. To correct this worker -- or to continue any worker that stopped (failed, interrupted, killed) -- call steer <id> \"...\" with the concrete corrections; it continues{on_branch} with its full context. Never dispatch a replacement for a stopped worker. Merge only when it is right."
+    )
 }
 
 /// The branch a terminal [`WorkerState`] finished on, if it kept one.
@@ -790,6 +791,34 @@ impl WorkerPool {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
+    }
+
+    /// Id of every registry row left `interrupted` by a hub crash.
+    ///
+    /// The daemon asks this at startup to decide what to continue: a row is
+    /// only a candidate when its conversation survived, because a cold
+    /// continuation is the orchestrator's call, not an automatic one.
+    pub async fn interrupted_workers(&self) -> Vec<String> {
+        crate::pool::registry::interrupted_registry_entries()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Automatic continuations still available for `id`, after counting the
+    /// ones already spent.
+    ///
+    /// The counter lives in the history metadata (and the registry row), so it
+    /// survives both a restart and a re-registration.
+    pub async fn auto_continue_budget(&self, id: &str) -> usize {
+        let spent = crate::pool::load_worker_history(id)
+            .map(|h| h.auto_continues)
+            .unwrap_or_else(|_| {
+                crate::pool::load_registry_entry(id)
+                    .map(|e| e.auto_continues)
+                    .unwrap_or(0)
+            });
+        crate::pool::MAX_AUTO_CONTINUES.saturating_sub(spent)
     }
 
     /// Record where a running worker's worktree lives.

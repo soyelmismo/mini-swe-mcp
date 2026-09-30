@@ -392,6 +392,18 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
 /// an orphan of the previous hub: salvage the checkout onto `worker-<id>` and
 /// mark it interrupted with the branch name, keeping branch and history for revision.
 /// The checkout is released only after a successful salvage. Rows of this daemon are live work, so they are never orphans.
+/// Ids of every registry row the last hub left `interrupted`.
+///
+/// Read at daemon startup to decide which workers to continue: the row is
+/// terminal for listing but its branch and conversation are intact.
+pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
+    raw_registry_entries()
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .filter(|e| e.status == RegistryStatus::Interrupted)
+        .collect()
+}
+
 pub(crate) fn recover_orphaned_workers() -> usize {
     let mut recovered = 0;
     for (path, mut entry) in raw_registry_entries() {

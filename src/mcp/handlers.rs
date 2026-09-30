@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
-use crate::pool::{UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
+use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
 
 /// Owner label used when neither the pool nor the registry has a row.
 const UNKNOWN_OWNER: &str = "unknown";
@@ -670,7 +670,8 @@ impl McpServer {
         // finished worker must report the fresh budget as its denominator.
         let was_terminal = self.pool.is_terminal(wid).await;
         let admission = self.admit_worker().await?;
-        self.pool
+        let outcome = self
+            .pool
             .steer_with_budget(wid, message, revision_turns)
             .await?;
         drop(admission);
@@ -693,14 +694,37 @@ impl McpServer {
                 )
                 .await;
         }
-        if was_terminal {
+        // The reply names exactly what happened: a live worker was steered or
+        // resumed, a stopped one continued -- as a revision of its saved
+        // conversation, or cold when none survived.
+        if let SteerOutcome::Continuing { revision, cold } = outcome {
+            let budget = self.revision_await_budget(revision_turns);
+            let (status, message) = if cold {
+                (
+                    "continuing",
+                    format!(
+                        "Continuing worker {wid} on branch worker-{wid} with a fresh conversation (no saved history) and a fresh budget of {budget} turns"
+                    ),
+                )
+            } else {
+                (
+                    "revising",
+                    format!(
+                        "Revision {revision} started on branch worker-{wid} with a fresh budget of {budget} turns"
+                    ),
+                )
+            };
             return Ok(json!({
                 "worker_id": wid,
-                "status": "revising",
-                "message": format!(
-                    "Revision started on branch worker-{wid} with a fresh budget of {} turns",
-                    self.revision_await_budget(revision_turns)
-                ),
+                "status": status,
+                "message": message,
+            }));
+        }
+        if matches!(outcome, SteerOutcome::Resumed) {
+            return Ok(json!({
+                "worker_id": wid,
+                "status": "resumed",
+                "message": "Worker resumed with your steering instruction"
             }));
         }
         Ok(json!({
