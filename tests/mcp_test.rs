@@ -24,7 +24,7 @@ use mini_swe_mcp::pool::{
 };
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread::JoinHandle;
@@ -101,8 +101,16 @@ struct McpProcess {
 
 impl McpProcess {
     fn spawn() -> Self {
+        Self::spawn_with_env(&[])
+    }
+
+    /// Spawn the server with extra environment overrides, e.g. a scratch
+    /// `SWE_TEMP_DIR`: a test that really dispatches a worker must keep that
+    /// worker's worktree out of the developer's own scratch directory.
+    fn spawn_with_env(envs: &[(&str, &str)]) -> Self {
         let (exe, args) = binary_command();
-        let mut child = Command::new(&exe)
+        let mut command = Command::new(&exe);
+        command
             .args(&args)
             // The stdio server refuses to start without a key, and
             // `dotenvy` never overrides a variable that is already set, so
@@ -111,7 +119,11 @@ impl McpProcess {
             .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
             // Protocol tests exercise the in-process server; the hub transport
             // has its own end-to-end tests (tests/hub_test.rs).
-            .env("MINI_SWE_NO_DAEMON", "1")
+            .env("MINI_SWE_NO_DAEMON", "1");
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -931,7 +943,10 @@ fn test_tools_call_ignores_network_on_non_dispatch_verbs() {
 /// response: the explicit argument wins over the manifest policy.
 #[test]
 fn test_dispatch_reports_explicit_offline_network() {
-    let mut server = McpProcess::spawn();
+    let scratch = DispatchScratch::new("offline");
+    let crate_branches = CrateBranchGuard::new();
+    let swe = scratch.base();
+    let mut server = McpProcess::spawn_with_env(&[("SWE_TEMP_DIR", swe.as_str())]);
     server.initialize();
 
     server.send(&json!({
@@ -943,7 +958,7 @@ fn test_dispatch_reports_explicit_offline_network() {
             "arguments": {
                 "action": "dispatch",
                 "task": "tidy the docs",
-                "repo_path": ".",
+                "repo_path": scratch.repo(),
                 "network": "offline"
             }
         }
@@ -957,13 +972,22 @@ fn test_dispatch_reports_explicit_offline_network() {
         .expect("tool text must be JSON");
     assert_eq!(payload["network"], json!("offline"));
     assert_eq!(payload["status"], json!("dispatched"));
+
+    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    kill_worker(&mut server, 610, &wid);
+    drop(server);
+    crate_branches.assert_untouched();
 }
+
 
 /// A dispatch that omits `network` inherits the resolved model's manifest
 /// policy. The shipped `ninja` declares `allow`, so the response reports it.
 #[test]
 fn test_dispatch_reports_manifest_network_policy_when_argument_omitted() {
-    let mut server = McpProcess::spawn();
+    let scratch = DispatchScratch::new("manifest-policy");
+    let crate_branches = CrateBranchGuard::new();
+    let swe = scratch.base();
+    let mut server = McpProcess::spawn_with_env(&[("SWE_TEMP_DIR", swe.as_str())]);
     server.initialize();
 
     server.send(&json!({
@@ -975,7 +999,7 @@ fn test_dispatch_reports_manifest_network_policy_when_argument_omitted() {
             "arguments": {
                 "action": "dispatch",
                 "task": "tidy the docs",
-                "repo_path": ".",
+                "repo_path": scratch.repo(),
                 "model": "ninja"
             }
         }
@@ -989,13 +1013,22 @@ fn test_dispatch_reports_manifest_network_policy_when_argument_omitted() {
         .expect("tool text must be JSON");
     assert_eq!(payload["network"], json!("allow"));
     assert_eq!(payload["status"], json!("dispatched"));
+
+    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    kill_worker(&mut server, 611, &wid);
+    drop(server);
+    crate_branches.assert_untouched();
 }
+
 
 /// A dispatch with no `network` argument and a model that declares no policy
 /// falls back to the runtime default (`allow`).
 #[test]
 fn test_dispatch_reports_default_network_when_nothing_declared() {
-    let mut server = McpProcess::spawn();
+    let scratch = DispatchScratch::new("default-network");
+    let crate_branches = CrateBranchGuard::new();
+    let swe = scratch.base();
+    let mut server = McpProcess::spawn_with_env(&[("SWE_TEMP_DIR", swe.as_str())]);
     server.initialize();
 
     server.send(&json!({
@@ -1007,7 +1040,7 @@ fn test_dispatch_reports_default_network_when_nothing_declared() {
             "arguments": {
                 "action": "dispatch",
                 "task": "tidy the docs",
-                "repo_path": ".",
+                "repo_path": scratch.repo(),
                 "model": "some/unknown-model"
             }
         }
@@ -1021,7 +1054,13 @@ fn test_dispatch_reports_default_network_when_nothing_declared() {
         .expect("tool text must be JSON");
     assert_eq!(payload["network"], json!("allow"));
     assert_eq!(payload["status"], json!("dispatched"));
+
+    let wid = payload["worker_id"].as_str().expect("worker id").to_string();
+    kill_worker(&mut server, 612, &wid);
+    drop(server);
+    crate_branches.assert_untouched();
 }
+
 
 /// The wrapper itself: connected stays byte-identical, `offline` enters a
 /// network namespace and keeps the command verbatim inside it.
@@ -1954,6 +1993,139 @@ fn completed_channel_event_carries_the_review_guidance() {
 }
 
 // ----------
+// Dispatch scratch
+// ----------
+
+/// Run `git` in `dir`, panicking on failure: only test scaffolding calls this.
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run git {args:?} in {}: {e}", dir.display()));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `worker-*` branches of `repo`, or an empty list when it is not a repository.
+fn worker_branches(repo: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["branch", "--list", "worker-*"])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim().trim_start_matches('*').trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A throwaway repository plus the scratch root a dispatched worker builds its
+/// worktree in. Both vanish on drop: a protocol test that really dispatches a
+/// worker must leave the crate's own repository untouched.
+struct DispatchScratch {
+    root: PathBuf,
+    repo: PathBuf,
+    base: PathBuf,
+}
+
+impl DispatchScratch {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("swe-mcp-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        let base = root.join("swe");
+        std::fs::create_dir_all(&repo).expect("create the scratch repository");
+        std::fs::create_dir_all(&base).expect("create the scratch base dir");
+        git_in(&repo, &["init", "-b", "master"]);
+        git_in(&repo, &["config", "user.name", "mini-swe-test"]);
+        git_in(&repo, &["config", "user.email", "test@localhost"]);
+        std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed the repository");
+        git_in(&repo, &["add", "README.md"]);
+        git_in(&repo, &["commit", "-m", "baseline"]);
+        Self { root, repo, base }
+    }
+
+    /// The repository the worker must treat as its `repo_path`.
+    fn repo(&self) -> String {
+        self.repo.to_string_lossy().into_owned()
+    }
+
+    /// The scratch root the server under test must see as `SWE_TEMP_DIR`.
+    fn base(&self) -> String {
+        self.base.to_string_lossy().into_owned()
+    }
+
+    fn worker_branches(&self) -> Vec<String> {
+        worker_branches(&self.repo)
+    }
+}
+
+impl Drop for DispatchScratch {
+    fn drop(&mut self) {
+        // Best effort: a leftover scratch tree must never fail a good test.
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Snapshot of the crate repository's `worker-*` branches, so a test can prove
+/// its dispatch created none of them: the worker's branch belongs in the test's
+/// own scratch repository, never in the crate.
+struct CrateBranchGuard {
+    before: Vec<String>,
+}
+
+impl CrateBranchGuard {
+    fn new() -> Self {
+        Self {
+            before: worker_branches(&std::env::current_dir().expect("current dir")),
+        }
+    }
+
+    fn assert_untouched(&self) {
+        let cwd = std::env::current_dir().expect("current dir");
+        let leaked: Vec<String> = worker_branches(&cwd)
+            .into_iter()
+            .filter(|branch| !self.before.contains(branch))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a dispatch leaked worker branches into the crate repository: {leaked:?}"
+        );
+    }
+}
+
+/// Ask the server to kill `worker_id` and wait for the reply, so the worker's
+/// `WorktreeGuard` drops before the server process is hard-killed.
+fn kill_worker(server: &mut McpProcess, id: u64, worker_id: &str) {
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": { "action": "kill", "worker_id": worker_id }
+        }
+    }));
+    let response = server
+        .expect_response("tools/call kill")
+        .expect("the kill call must be answered");
+    let result = expect_result(&response);
+    let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().expect("text"))
+        .expect("tool text must be JSON");
+    assert_eq!(payload["worker_id"], json!(worker_id), "kill must echo the worker id");
+}
+
+// ----------
 // H-11: dispatch never waits, and every verb is private to its owner
 // ----------
 
@@ -1961,10 +2133,11 @@ fn completed_channel_event_carries_the_review_guidance() {
 /// answers *now*: no `wait`, no `timeout_secs`, no blocking.
 #[tokio::test]
 async fn dispatch_returns_immediately_with_a_watch_hint() {
-    let server = McpServer::new(
-        WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
-        "ninja".to_string(),
-    );
+    let scratch = DispatchScratch::new("dispatch-watch");
+    let _swe = ScopedEnv::set("SWE_TEMP_DIR", &scratch.base());
+    let crate_branches = CrateBranchGuard::new();
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    let server = McpServer::new(pool.clone(), "ninja".to_string());
 
     let result = tokio::time::timeout(
         Duration::from_secs(3),
@@ -1973,6 +2146,7 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
             json!({
                 "action": "dispatch",
                 "task": "probe",
+                "repo_path": scratch.repo(),
                 "wait": true,
                 "timeout_secs": 0,
             }),
@@ -1994,7 +2168,23 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
         result.get("state").is_none() && result.get("logs").is_none(),
         "an immediate dispatch carries no terminal payload: {result}"
     );
+
+    // The worktree is built asynchronously; wait until it appears in the
+    // scratch repository before proving the crate's own repository is intact.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !scratch.worker_branches().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dispatched worker must create its worktree");
+
+    pool.kill(&wid).await;
     remove_registry_entry(&wid);
+    crate_branches.assert_untouched();
 }
 
 /// The `watch` action is the only way to wait, and it is bounded by
