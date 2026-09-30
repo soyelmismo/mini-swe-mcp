@@ -27,6 +27,10 @@ use mini_swe_mcp::pool::{
     parse_request_turns, summarize_command,
 };
 
+/// Owner recorded for the synthetic workers these tests insert: the pool's
+/// lock discipline and registry coalescing are under test, not ownership.
+const TEST_OWNER: &str = "test-agent";
+
 // ---------------------------------------------------------------------------
 // parse_request_turns
 // ---------------------------------------------------------------------------

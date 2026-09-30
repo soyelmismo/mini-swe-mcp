@@ -704,6 +704,59 @@ mod tests {
         }
     }
 
+    /// A `hub/hello` agent id wins: it is how several connections of one
+    /// orchestrator end up sharing their workers.
+    #[test]
+    fn a_hello_agent_id_is_the_connection_identity() {
+        let mut ctx = ConnectionContext::hub_connection(3);
+        ctx.client_name = Some(CLI_CLIENT_NAME.to_string());
+        ctx.agent_id = Some("orchestrator-7".to_string());
+        assert_eq!(ctx.agent(), "orchestrator-7");
+    }
+
+    /// The CLI identity is stable across invocations, which is what lets
+    /// `mini-swe-mcp list` see the worker an earlier `dispatch` started.
+    #[test]
+    fn every_cli_connection_shares_the_cli_identity() {
+        let mut first = ConnectionContext::hub_connection(1);
+        first.client_name = Some(CLI_CLIENT_NAME.to_string());
+        let mut second = ConnectionContext::hub_connection(99);
+        second.client_name = Some(CLI_CLIENT_NAME.to_string());
+        assert_eq!(first.agent(), CLI_AGENT);
+        assert_eq!(second.agent(), CLI_AGENT);
+    }
+
+    /// Any other client is qualified by its connection id, so two orchestrators
+    /// of the same host never share workers by accident.
+    #[test]
+    fn another_client_is_scoped_to_its_connection() {
+        let mut ctx = ConnectionContext::hub_connection(12);
+        ctx.client_name = Some("claude-code".to_string());
+        assert_eq!(ctx.agent(), "claude-code#12");
+    }
+
+    /// The in-process stdio server is its own only client; a hub connection that
+    /// announced nothing falls back to its connection id.
+    #[test]
+    fn an_unannounced_connection_falls_back_to_its_transport() {
+        assert_eq!(ConnectionContext::stdio().agent(), LOCAL_AGENT);
+        assert_eq!(
+            ConnectionContext::hub_connection(4).agent(),
+            format!("{ANONYMOUS_AGENT_PREFIX}#4")
+        );
+    }
+
+    /// Admin is opt-in per connection: only an explicit `admin: true` in the
+    /// hello lifts the ownership check.
+    #[test]
+    fn admin_is_opt_in() {
+        assert!(!ConnectionContext::stdio().is_admin());
+        let mut ctx = ConnectionContext::hub_connection(1);
+        assert!(!ctx.is_admin());
+        ctx.admin = true;
+        assert!(ctx.is_admin());
+    }
+
     /// The payload is immutable, hence built once and only cloned afterwards.
     #[test]
     fn tools_list_is_precomputed_and_stable() {
