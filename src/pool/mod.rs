@@ -381,6 +381,22 @@ impl WorkerPool {
         Some(progress)
     }
 
+    /// Workers this pool still holds as `Running` or `Paused`.
+    ///
+    /// The hub daemon's idle shutdown keys off this: a terminal record is kept
+    /// for `collect`, so it must not hold the daemon open.
+    pub async fn active_worker_count(&self) -> usize {
+        let lock = self.workers.read().await;
+        lock.values()
+            .filter(|w| {
+                matches!(
+                    w.state,
+                    WorkerState::Running { .. } | WorkerState::Paused { .. }
+                )
+            })
+            .count()
+    }
+
     pub async fn list_workers(&self) -> Vec<serde_json::Value> {
         let registry = load_all_registry_entries();
         if !registry.is_empty() {

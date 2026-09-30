@@ -5,12 +5,15 @@
 //! request to the right response. Verb handling lives in [`super::handlers`],
 //! the advertised contract in [`super::schema`], the envelope types in
 //! [`super::protocol`].
+//!
+//! [`McpServer::serve_connection`] is the one frame loop; [`McpServer::run_stdio`]
+//! and the hub daemon's Unix sockets are both just transports feeding it.
 
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace};
 
@@ -33,6 +36,28 @@ pub struct McpServer {
     pub(super) tools_list: Arc<Value>,
 }
 
+/// Identity of one client connection serving MCP requests.
+///
+/// Carried into request handling so later tasks can attach per-connection
+/// state (such as the owning agent); for now it is only an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionContext {
+    /// Connection id, unique per process for log correlation.
+    pub id: u64,
+}
+
+impl ConnectionContext {
+    /// Context for the stdio transport, which serves exactly one connection.
+    pub fn stdio() -> Self {
+        Self { id: 0 }
+    }
+
+    /// Context for the `id`-th accepted hub connection (1-based).
+    pub fn hub_connection(id: u64) -> Self {
+        Self { id }
+    }
+}
+
 impl McpServer {
     pub fn new(pool: WorkerPool, default_model: String) -> Self {
         // The pool owns the manifest (attached in `main.rs`); the server shares
@@ -50,13 +75,37 @@ impl McpServer {
 
     /// Serve MCP over stdin/stdout until the client closes the input.
     pub async fn run_stdio(&self) -> Result<()> {
+        self.serve_connection(
+            BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+            ConnectionContext::stdio(),
+        )
+        .await
+    }
+
+    /// Serve one MCP connection over any byte transport.
+    ///
+    /// Frames are newline-delimited JSON-RPC; each request is handled on its
+    /// own task while a single writer task owns `writer`, so a response can
+    /// never interleave with another frame. Oversized frames are rejected with
+    /// the shared `FrameTooLarge` frame and the reader resynchronizes on the
+    /// next newline. Returns when the peer closes the input.
+    pub async fn serve_connection<R, W>(
+        &self,
+        reader: R,
+        writer: W,
+        ctx: ConnectionContext,
+    ) -> Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         // Background reaper: bounds the memory held by terminal worker records
         // even when the orchestrator never calls `collect`.
         let reaper = crate::pool::spawn_reaper((*self.pool).clone());
 
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        let mut reader = reader;
+        let mut writer = writer;
         let mut input = Vec::new();
 
         info!("Mini-SWE-MCP server listening on stdio");
@@ -68,15 +117,16 @@ impl McpServer {
         // notification can never land inside a response frame.
         let events = super::events::spawn_event_stream((*self.pool).clone(), out_tx.clone());
 
-        // Dedicated background writer draining stdout messages
-        let stdout_task = tokio::spawn(async move {
+        // Dedicated background writer: the single owner of `writer`, so
+        // frames from concurrent request tasks cannot interleave.
+        let writer_task = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = stdout.write_all(msg.as_bytes()).await {
-                    error!(error = %e, "Failed writing to stdout");
+                if let Err(e) = writer.write_all(msg.as_bytes()).await {
+                    error!(error = %e, "Failed writing to client");
                     break;
                 }
-                if let Err(e) = stdout.flush().await {
-                    error!(error = %e, "Failed flushing stdout");
+                if let Err(e) = writer.flush().await {
+                    error!(error = %e, "Failed flushing client stream");
                     break;
                 }
             }
@@ -96,6 +146,7 @@ impl McpServer {
 
             let server = self.clone();
             let tx = out_tx.clone();
+            let ctx = ctx;
             let owned_line = line.to_string();
             tokio::spawn(async move {
                 let line = owned_line.as_str();
@@ -115,7 +166,7 @@ impl McpServer {
                     return;
                 }
 
-                let response = server.handle_request(req, Some(tx.clone())).await;
+                let response = server.handle_request(req, ctx, Some(tx.clone())).await;
                 let frame = response
                     .to_frame()
                     .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME));
@@ -126,7 +177,7 @@ impl McpServer {
         drop(out_tx);
         reaper.abort();
         events.abort();
-        let _ = stdout_task.await;
+        let _ = writer_task.await;
 
         Ok(())
     }
@@ -135,6 +186,7 @@ impl McpServer {
     async fn handle_request(
         &self,
         req: JsonRpcRequest,
+        _ctx: ConnectionContext,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> JsonRpcResponse {
         let id = req.id_or_null().map(|v| v.to_owned());
@@ -182,6 +234,14 @@ impl McpServer {
             // the MCP notifications a host may send us.
             _ => JsonRpcResponse::method_not_found(id, Cow::Owned(req.method.clone())),
         }
+    }
+
+    /// The pool this server dispatches into.
+    ///
+    /// The hub daemon shares one server (hence one pool) across every
+    /// connection and needs the pool for its own lifecycle decisions.
+    pub fn pool(&self) -> &WorkerPool {
+        &self.pool
     }
 
     /// The precomputed `tools/list` result.
