@@ -73,6 +73,13 @@ const DEFAULT_IDLE_SECS: u64 = 600;
 /// How often the idle watchdog re-checks the daemon's liveness.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How long a starting daemon waits for a predecessor to release `hub.lock`
+/// after the predecessor removed its socket.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// How often that wait re-probes the lock and the socket.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The three files a hub directory holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPaths {
@@ -258,13 +265,45 @@ impl HubServer {
         resumed
     }
 
+    /// Wait out a predecessor that removed `hub.sock` but still holds
+    /// `hub.lock`.
+    ///
+    /// Teardown removes the socket before it drops the lock, so a starter that
+    /// arrives in that window sees a busy lock and no listener. Retry for a
+    /// bounded time; `Ok(None)` means a hub is genuinely running or a
+    /// predecessor outlasted [`LOCK_WAIT`].
+    async fn wait_for_lock(&self) -> Result<Option<HubLock>> {
+        let path = self.config.paths().lock();
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        loop {
+            if let Some(lock) = acquire_lock(&path)? {
+                return Ok(Some(lock));
+            }
+            if UnixStream::connect(self.config.paths().socket())
+                .await
+                .is_ok()
+            {
+                return Ok(None);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(LOCK_POLL_INTERVAL).await;
+        }
+    }
+
     pub async fn run(&self) -> Result<bool> {
         raise_nofile_limit();
         let paths = self.config.paths();
-        let lock = acquire_lock(&paths.lock())?;
-        let Some(lock) = lock else {
-            info!("hub already running");
-            return Ok(false);
+        let lock = match acquire_lock(&paths.lock())? {
+            Some(lock) => lock,
+            None => match self.wait_for_lock().await? {
+                Some(lock) => lock,
+                None => {
+                    info!("hub already running");
+                    return Ok(false);
+                }
+            },
         };
 
         // A socket left behind by a killed daemon would make `bind` fail with
@@ -457,6 +496,21 @@ fn acquire_lock(path: &Path) -> Result<Option<HubLock>> {
         return Ok(None);
     }
     Err(err).with_context(|| format!("Could not lock {}", path.display()))
+}
+
+/// Whether some process currently holds the exclusive lock on `path`.
+///
+/// The probe takes the same non-blocking `flock` as [`acquire_lock`] and
+/// releases it at once, so a client can observe the holder without keeping the
+/// hub locked.
+pub fn hub_lock_held(path: &Path) -> Result<bool> {
+    match acquire_lock(path)? {
+        Some(lock) => {
+            drop(lock);
+            Ok(false)
+        }
+        None => Ok(true),
+    }
 }
 
 /// The held `flock`, released on drop.
