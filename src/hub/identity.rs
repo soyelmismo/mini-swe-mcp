@@ -226,7 +226,7 @@ pub fn session_from_env() -> Option<String> {
 }
 
 /// Whether `comm` names a service manager rather than an agent host.
-pub fn is_service_manager(comm: &str) -> bool {
+fn is_service_manager(comm: &str) -> bool {
     SERVICE_MANAGERS.contains(&comm)
 }
 
@@ -346,7 +346,7 @@ pub fn identity_of(pid: u32, override_id: Option<&str>, fallback: &str) -> Ident
 /// The seam the session split is tested through: the environment is
 /// process-global, so a test cannot set `CLAUDE_CODE_SESSION_ID` for one case
 /// and clear it for the next.
-pub fn identity_with_session(
+fn identity_with_session(
     pid: u32,
     override_id: Option<&str>,
     session: Option<&str>,
