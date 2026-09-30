@@ -44,6 +44,13 @@ pub fn swe_base_dir() -> PathBuf {
 /// Yielded at most once each: `swe_base_dir()` frequently *is* the system temp
 /// dir, and sweeping it twice used to re-scan the same tree (audit §07).
 pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
+    swe_base_dirs_for_cleanup()
+}
+
+/// The same sweep, visible to the pool's history-file cleanup: a worker's
+/// conversation file lives next to its scratch data, so it leaks unless every
+/// base dir is swept when the worker is pruned, reaped or collected.
+pub fn swe_base_dirs_for_cleanup() -> Vec<PathBuf> {
     let mut dirs = vec![swe_base_dir()];
     let tmp = std::env::temp_dir();
     if !dirs.contains(&tmp) {

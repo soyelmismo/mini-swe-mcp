@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 mod buffer;
 mod clock;
 mod registry;
+pub(crate) mod revision;
 mod runner;
 mod state;
 mod steer;
@@ -48,6 +49,11 @@ pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
     parse_request_turns, summarize_command,
 };
+pub use self::revision::{
+    DEFAULT_REVISION_TURNS, REVISION_PREFIX, WorkerHistory, history_path, is_replayable,
+    load_worker_history, remove_worker_history, save_worker_history,
+};
+pub use self::runner::RunConfig;
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerPhase, WorkerProgress,
@@ -243,6 +249,7 @@ impl WorkerPool {
             pending_steer: Vec::new(),
             resume_tx: None,
             handle: None,
+            revision: 0,
         };
 
         meta.save_status(&model, RegistryStatus::Running, 0, max_turns, "initializing", None);
@@ -280,6 +287,8 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            resume_messages: None,
+            resume_base_commit: None,
         };
 
         let join_handle = tokio::spawn(async move {

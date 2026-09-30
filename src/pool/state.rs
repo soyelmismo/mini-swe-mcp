@@ -169,6 +169,11 @@ pub struct WorkerRecord {
     pub pending_steer: Vec<String>,
     pub resume_tx: Option<tokio::sync::mpsc::Sender<String>>,
     pub handle: Option<JoinHandle<()>>,
+    /// Times this worker was steered after reaching a terminal state. A fresh
+    /// dispatch starts at zero; every revision bumps it, so the orchestrator
+    /// can tell the first answer from a corrected one in the payloads and the
+    /// channel events.
+    pub revision: usize,
 }
 
 impl WorkerRecord {

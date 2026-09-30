@@ -30,7 +30,7 @@ use crate::worktree::WorktreeGuard;
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
 use super::steer::remove_steer_file;
-use super::revision::{RunConfig, WorkerHistory, save_worker_history};
+use super::revision::{WorkerHistory, save_worker_history};
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
@@ -47,6 +47,20 @@ pub use self::sentinels::{
     summarize_command,
 };
 
+/// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
+/// the worktree and the conversation, so a failure anywhere still leaves both
+/// available for history persistence.
+pub struct RunConfig<'a> {
+    pub task: &'a str,
+    pub model: &'a str,
+    pub temperature: Option<f32>,
+    pub max_turns: usize,
+    pub review_after: Option<String>,
+    pub network_offline: bool,
+    pub verify: Option<&'a str>,
+    pub repo_path_str: &'a str,
+}
+
 /// Everything the execution loop needs to start one worker.
 pub struct WorkerLaunchConfig {
     pub task: String,
@@ -61,9 +75,6 @@ pub struct WorkerLaunchConfig {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<String>,
-    /// Reviewer model of the original dispatch, replayed by a revision so the
-    /// audit phase runs again over the corrected branch.
-    pub review_after: Option<String>,
     /// Conversation a revision continues: the finished worker's history plus
     /// the orchestrator's revision request. `None` starts a fresh dispatch,
     /// which builds its own system prompt and task message.
@@ -192,14 +203,6 @@ impl WorkerPool {
             ],
         };
 
-        let runner = AgentRunner::new(
-            self.api_base.clone(),
-            self.api_key.clone(),
-            model.clone(),
-            temperature,
-        )
-        .with_network_offline(network_offline);
-
         let result = self
             .run_phases(
                 &worker_id,
@@ -208,7 +211,7 @@ impl WorkerPool {
                     model: &model,
                     temperature,
                     max_turns,
-                    review_after,
+                    review_after: review_after.clone(),
                     network_offline,
                     verify: verify.as_deref(),
                     repo_path_str: &repo_path_str,
@@ -266,28 +269,26 @@ impl WorkerPool {
         worker_id: &str,
         config: &RunConfig<'_>,
         meta: &mut WorkerMeta,
-        worktree: &mut WorktreeGuard,
+        mut worktree: &mut WorktreeGuard,
         runner: &AgentRunner,
-        messages: &mut Vec<ChatMessage>,
+        mut messages: &mut Vec<ChatMessage>,
     ) -> Result<()> {
-        let RunConfig {
-            task,
-            model,
+        let task = config.task.to_string();
+        let model = config.model.to_string();
+        let temperature = config.temperature;
+        let max_turns = config.max_turns;
+        let review_after = config.review_after.clone();
+        let network_offline = config.network_offline;
+        let verify = config.verify.map(|v| v.to_string());
+        let repo_path_str = config.repo_path_str.to_string();
+
+        let runner = AgentRunner::new(
+            self.api_base.clone(),
+            self.api_key.clone(),
+            model.clone(),
             temperature,
-            max_turns,
-            review_after,
-            network_offline,
-            verify,
-            repo_path_str,
-        } = config;
-        let task = task.clone();
-        let model = model.clone();
-        let temperature = *temperature;
-        let max_turns = *max_turns;
-        let review_after = review_after.clone();
-        let network_offline = *network_offline;
-        let verify = verify.map(|v| v.to_string());
-        let repo_path_str = repo_path_str.to_string();
+        )
+        .with_network_offline(network_offline);
 
         let mut step = 0;
         let mut current_max_turns = max_turns;
@@ -341,7 +342,7 @@ impl WorkerPool {
                 .run_review_phase(
                     &mut worktree,
                     ReviewPhase {
-                        worker_id: worker_id.clone(),
+                        worker_id: worker_id.to_string(),
                         reviewer_model,
                         temperature,
                         task: task.clone(),
@@ -446,7 +447,7 @@ impl WorkerPool {
         };
         {
             let mut lock = self.workers.write().await;
-            if let Some(w) = lock.get_mut(&worker_id) {
+            if let Some(w) = lock.get_mut(worker_id) {
                 w.state = completed_state;
             }
         }
