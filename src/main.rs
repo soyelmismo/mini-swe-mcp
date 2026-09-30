@@ -49,6 +49,20 @@ async fn async_main() -> Result<()> {
     telemetry::init(stdio_requested(&cli_args));
     bootstrap::load_dotenv_files();
 
+    if stdio_requested(&cli_args) || action_of(&cli_args).is_none() {
+        if env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
+            return run_local_stdio().await;
+        }
+        return mini_swe_mcp::hub::proxy_stdio().await;
+    }
+
+    if let Some(action) = action_of(&cli_args)
+        && action != "daemon"
+        && env::var("MINI_SWE_NO_DAEMON").ok().as_deref() != Some("1")
+    {
+        return run_remote_action(action, &cli_args, json_output).await;
+    }
+
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
     let manifest = ModelManifest::load();
     let default_model = default_model(&manifest);
@@ -63,10 +77,20 @@ async fn async_main() -> Result<()> {
         return run_action(&server, &pool, action, &cli_args, json_output, !api_key.is_empty()).await;
     }
 
+    run_local_stdio().await
+}
+
+/// Serve MCP over stdio in this process (escape hatch for `MINI_SWE_NO_DAEMON=1`).
+async fn run_local_stdio() -> Result<()> {
+    let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
     if api_key.is_empty() {
         anyhow::bail!("Missing OPENAI_API_KEY. Please provide it via environment variable or .env file.");
     }
-
+    let manifest = ModelManifest::load();
+    let default_model = default_model(&manifest);
+    let pool = WorkerPool::new(max_concurrent_workers(), api_base(), api_key)
+        .with_manifest(Arc::new(manifest));
+    let server = McpServer::new(pool.clone(), default_model);
     tokio::select! {
         res = server.run_stdio() => res,
         _ = tokio::signal::ctrl_c() => {
@@ -78,6 +102,64 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Route one CLI action through the hub daemon: initialize, hello and one
+/// `tools/call` whose payload and plain-text rendering match the local path.
+async fn run_remote_action(action: &str, cli_args: &[String], json_output: bool) -> Result<()> {
+    // `prune` sweeps the worktrees of the repository the operator is standing
+    // in, so the daemon is told that path explicitly: it may well have been
+    // started from a different working directory.
+    if action == "prune" {
+        let mut args = serde_json::Map::new();
+        args.insert("action".into(), serde_json::Value::String("prune".into()));
+        if let Ok(cwd) = std::env::current_dir() {
+            args.insert("repo_path".into(), serde_json::Value::String(cwd.to_string_lossy().into_owned()));
+        }
+        let mut client = mini_swe_mcp::hub::HubClient::connect().await?;
+        let result = client.worker(serde_json::Value::Object(args)).await?;
+        return print_result(action, &result, json_output);
+    }
+
+    let api_key_present = !env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
+    let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
+        return Ok(());
+    };
+    let mut client = mini_swe_mcp::hub::HubClient::connect().await?;
+    let mut result = client
+        .worker(serde_json::Value::Object(tool_args))
+        .await?;
+
+    // Interactive steering: the same operator dialogue the local pool drives,
+    // spoken as `steer` + `wait` tool calls so the daemon owns the worker.
+    while result.get("status").and_then(|v| v.as_str()) == Some("needs_input") {
+        let wid = result["worker_id"].as_str().unwrap_or("").to_string();
+        let q = result["question"].as_str().unwrap_or("");
+        eprintln!("\n[mini-swe] Worker {} is PAUSED: {}", wid, q);
+        eprint!("Reply with guidance (or press Enter to abort): ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            eprintln!("[mini-swe] No input provided; terminating worker.");
+            client
+                .worker(serde_json::json!({"action": "kill", "worker_id": wid}))
+                .await?;
+            break;
+        }
+
+        client
+            .worker(serde_json::json!({"action": "steer", "worker_id": wid, "message": input}))
+            .await?;
+        eprintln!("[mini-swe] Guidance sent. Resuming execution...");
+        // `wait` blocks in the daemon until the worker finishes, fails or
+        // pauses again, mirroring the shared wait loop of the local path.
+        result = client
+            .worker(serde_json::json!({"action": "wait", "worker_id": wid}))
+            .await?;
+    }
+
+    print_result(action, &result, json_output)
 }
 
 /// Run the hub daemon: the single process owning the only worker pool.
