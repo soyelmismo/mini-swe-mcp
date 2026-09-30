@@ -296,15 +296,30 @@ struct PathRule {
     allowed: u64,
 }
 
-/// `struct landlock_ruleset_attr` truncated to the field this module sets.
+/// `struct landlock_ruleset_attr` as this module uses it.
 ///
 /// The UAPI lets the struct grow across ABI versions and validates `size`, so
-/// only `handled_access_fs` is populated and only its size is passed. A
-/// `size == 0` query returns the highest supported ABI.
+/// only the prefix the running kernel understands is passed: `handled_access_fs`
+/// alone below ABI 4, plus `handled_access_net` from ABI 4, plus `scoped` from
+/// ABI 6. A `size == 0` query returns the highest supported ABI.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct RulesetAttr {
     handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+/// Byte size of the ruleset attribute prefix a kernel of the given ABI
+/// understands: 8 below ABI 4, 16 from ABI 4, 24 from ABI 6.
+fn ruleset_attr_size(abi: i64) -> usize {
+    if abi >= ABI_SCOPE {
+        std::mem::size_of::<RulesetAttr>()
+    } else if abi >= ABI_NET {
+        2 * std::mem::size_of::<u64>()
+    } else {
+        std::mem::size_of::<u64>()
+    }
 }
 
 /// `struct landlock_path_beneath_attr` as the kernel defines it.
@@ -570,7 +585,113 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     push(canonical_root(worktree), WRITE_RIGHTS);
     push(canonical_root(target_dir), WRITE_RIGHTS);
 
+    // Toolchain caches, readable and executable but never writable: the child
+    // environment forwards `CARGO_HOME`/`RUSTUP_HOME` at these locations so an
+    // offline `cargo build` resolves against the host's registry instead of
+    // the network. Missing paths are skipped when the plan is applied.
+    for cache in toolchain_cache_paths() {
+        push(cache, READ_ONLY_RIGHTS);
+    }
+
+    // Shared compiler/package caches, writable like the bubblewrap backend
+    // binds them: `GOCACHE`, the JS/Python caches and friends live here and
+    // must accept writes for builds to succeed.
+    for cache in writable_cache_paths() {
+        push(cache, WRITE_RIGHTS);
+    }
+
+    // Git metadata: the common `.git` dir read-only so `git status` resolves
+    // refs and objects, the worktree's own gitdir writable so the index can
+    // refresh. Workers must not commit, so read-only is the right grant for
+    // the shared half. Relative `gitdir:` pointers resolve against the
+    // worktree before canonicalisation.
+    for (common, worktree_gitdir) in git_rule_paths(worktree) {
+        push(common, READ_ONLY_RIGHTS);
+        if let Some(gitdir) = worktree_gitdir {
+            push(gitdir, WRITE_RIGHTS);
+        }
+    }
+
     rules
+}
+
+/// Read-only toolchain locations a sandboxed build resolves binaries and the
+/// registry from.
+///
+/// Mirrors the mounts the bubblewrap backend binds: the host's `CARGO_HOME`
+/// (or `~/.cargo` when it exists), `RUSTUP_HOME` when set, and `~/.local/bin`
+/// for tool discovery through `PATH`. Everything here is resolved in the
+/// parent, where reading the environment and probing the filesystem is safe.
+fn toolchain_cache_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(4);
+    if let Some(cargo_home) = crate::agent::env::host_cargo_home() {
+        paths.push(cargo_home);
+    } else if let Some(home) = home_dir() {
+        // `host_cargo_home` only reports `~/.cargo` when it exists; without a
+        // Cargo home there is no registry to grant, so nothing is added.
+        let _ = home;
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        paths.push(rustup_home);
+    }
+    if let Some(home) = home_dir() {
+        for dir in [".cargo", ".rustup", ".local/bin"] {
+            paths.push(home.join(dir));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Writable cache locations shared across workers.
+///
+/// The same directories the bubblewrap backend binds read-write and the child
+/// environment points `GOCACHE`, `UV_CACHE_DIR` and friends at: the shared
+/// cache root, the user's `kache` directory, and any `SWE_SHARED_CACHES`
+/// host-side binds. Missing paths are skipped when the plan is applied.
+fn writable_cache_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(4);
+    paths.push(crate::cache::shared_cache_root());
+    if let Some(home) = home_dir() {
+        paths.push(home.join(".cache").join("kache"));
+    }
+    if let Ok(custom) = std::env::var("SWE_SHARED_CACHES") {
+        for (host, _guest) in crate::cache::parse_custom_cache_binds(&custom) {
+            paths.push(host);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Git directories covering `worktree`, resolved to absolute canonical paths.
+///
+/// The worktree's `.git` is a `gitdir:` pointer file, not a directory, so the
+/// common `.git` and the worktree's own gitdir come from [`find_git_dirs`].
+/// A relative pointer resolves against the worktree; anything
+/// un-canonicalisable is dropped rather than granted blind.
+fn git_rule_paths(worktree: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let Some((common, worktree_gitdir)) = find_git_dirs(worktree) else {
+        return Vec::new();
+    };
+    let resolve = |p: PathBuf| {
+        let absolute = if p.is_absolute() {
+            p
+        } else {
+            worktree.join(p)
+        };
+        std::fs::canonicalize(&absolute).ok()
+    };
+    let Some(common) = resolve(common) else {
+        return Vec::new();
+    };
+    let worktree_gitdir = worktree_gitdir.and_then(resolve);
+    vec![(common, worktree_gitdir)]
 }
 
 /// Union of every right any rule asks for, narrowed to what the kernel
@@ -613,6 +734,15 @@ fn handled_access_fs(rules: &[PathRule], access: u64) -> u64 {
 pub struct LandlockPlan {
     /// Bitmask of `ACCESS_FS_*` rights the ruleset handles.
     handled: u64,
+    /// Bitmask of `ACCESS_NET_*` rights the ruleset handles.
+    ///
+    /// Non-zero only for an offline worker on ABI >= 4: with no network rule
+    /// ever added, handling TCP bind/connect denies every port.
+    handled_net: u64,
+    /// Bitmask of `LANDLOCK_SCOPE_*` restrictions, set on ABI >= 6.
+    scoped: u64,
+    /// Byte size of the `RulesetAttr` prefix the running kernel understands.
+    attr_size: usize,
     /// One pre-resolved, NUL-terminated rule path per rule.
     ///
     /// Allocated in the parent and inherited across the fork, so the child
@@ -661,6 +791,16 @@ impl LandlockPlan {
         self.handled
     }
 
+    /// Bitmask of `ACCESS_NET_*` rights the ruleset will handle.
+    pub fn handled_net_access(&self) -> u64 {
+        self.handled_net
+    }
+
+    /// Bitmask of `LANDLOCK_SCOPE_*` restrictions the ruleset will install.
+    pub fn scoped(&self) -> u64 {
+        self.scoped
+    }
+
     /// Apply the domain to the calling process.
     ///
     /// # Safety
@@ -670,20 +810,23 @@ impl LandlockPlan {
     /// async-signal-safe, but **irreversible**: `landlock_restrict_self`
     /// confines the calling process for good, along with everything it forks.
     pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
-        // Handled mask was already narrowed to the running ABI by
-        // `build_landlock_plan`, so the kernel cannot reject it.
+        // Masks were already narrowed to the running ABI by
+        // `build_landlock_plan`, so the kernel cannot reject them.
         let attr = RulesetAttr {
             handled_access_fs: self.handled,
+            handled_access_net: self.handled_net,
+            scoped: self.scoped,
         };
         // SAFETY: `attr` is a live, correctly laid out `landlock_ruleset_attr`
-        // prefix and `size` is its exact size, which is what the kernel
-        // validates. Both are stack locals that outlive the call.
+        // prefix and `size` is the exact prefix length the running kernel
+        // understands, which is what the kernel validates. Both are stack
+        // locals that outlive the call.
         let ruleset_fd = {
             landlock_syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
                 [
                     &attr as *const RulesetAttr as libc::c_long,
-                    std::mem::size_of::<RulesetAttr>() as libc::c_long,
+                    self.attr_size as libc::c_long,
                     0,
                     0,
                 ],
@@ -797,8 +940,17 @@ impl LandlockPlan {
 /// construction, the syscall-backed existence checks - runs in the parent
 /// process, where allocating is safe. The returned plan holds no file
 /// descriptor, so nothing leaks into the child through an inherited one.
-pub fn build_landlock_plan(worktree: &Path, target_dir: &Path) -> Result<Option<LandlockPlan>> {
-    build_plan_with_abi(worktree, target_dir, query_abi_version())
+///
+/// `offline` adds the network deny policy: on ABI >= 4 the ruleset handles
+/// TCP bind/connect with no allowed port, so every TCP socket stays
+/// unusable; below ABI 4 there is no network support and the seccomp filter
+/// alone carries the offline policy.
+pub fn build_landlock_plan(
+    worktree: &Path,
+    target_dir: &Path,
+    offline: bool,
+) -> Result<Option<LandlockPlan>> {
+    build_plan_with_abi(worktree, target_dir, query_abi_version(), offline)
 }
 
 /// The body of [`build_landlock_plan`], with the ABI probe as a parameter.
@@ -814,6 +966,7 @@ fn build_plan_with_abi(
     worktree: &Path,
     target_dir: &Path,
     abi: Option<i64>,
+    offline: bool,
 ) -> Result<Option<LandlockPlan>> {
     if landlock_disabled() {
         tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
@@ -843,6 +996,23 @@ fn build_plan_with_abi(
     let rules = build_path_rules(worktree, target_dir);
     let handled = handled_access_fs(&rules, supported_access_fs(abi));
 
+    // Offline network policy: handle TCP bind/connect with no rule granting
+    // any port, which denies them all. Online workers leave the network
+    // unhandled and therefore unrestricted.
+    let handled_net = if offline && abi >= ABI_NET {
+        ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
+    } else {
+        0
+    };
+
+    // A worker's signals and abstract sockets stay inside its own domain, so
+    // one agent cannot kill or impersonate the daemon or another worker.
+    let scoped = if abi >= ABI_SCOPE {
+        LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+    } else {
+        0
+    };
+
     // Counts are fixed by the policy, so size both vectors up front.
     let mut paths = Vec::with_capacity(rules.len());
     let mut allowed = Vec::with_capacity(rules.len());
@@ -871,6 +1041,9 @@ fn build_plan_with_abi(
     );
     Ok(Some(LandlockPlan {
         handled,
+        handled_net,
+        scoped,
+        attr_size: ruleset_attr_size(abi),
         paths,
         allowed,
     }))
@@ -1924,6 +2097,150 @@ fn seccomp_supported() -> bool {
 /// rules, which arrived together in ABI 6.
 fn landlock_scope_supported(abi: i64) -> bool {
     abi >= 6
+}
+
+/// Harden the calling process after confinement is installed.
+///
+/// * `PR_SET_PDEATHSIG(SIGKILL)` dies with the parent, replacing bubblewrap's
+///   `--die-with-parent`. The `getppid` re-check closes the fork race: when
+///   the parent died before the `prctl`, the child was already reparented and
+///   the death signal would never fire, so the spawn is aborted instead.
+/// * `PR_SET_DUMPABLE(0)` keeps the worker's memory out of other users'
+///   debuggers and core dumps.
+/// * `RLIMIT_CORE=0` stops the worker from writing core files into the
+///   worktree, where the model could read them back.
+///
+/// # Safety
+///
+/// Only sound between `fork(2)` and `exec(2)`: `prctl`, `getppid` and
+/// `setrlimit` are async-signal-safe raw syscalls that allocate nothing.
+unsafe fn apply_process_hardening(parent_pid: u32) -> std::io::Result<()> {
+    // SAFETY: `prctl(PR_SET_PDEATHSIG)` takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The parent may have died between the fork and the `prctl above`, in
+    // which case this process was reparented and the death signal is armed
+    // against the wrong pid. Aborting the spawn is the only safe answer: the
+    // daemon is going away anyway.
+    //
+    // SAFETY: `getppid` takes no argument and reads nothing.
+    if unsafe { libc::getppid() } as u32 != parent_pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "worker parent died before the death signal was armed",
+        ));
+    }
+    // SAFETY: `prctl(PR_SET_DUMPABLE)` takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `no_core` is a live struct the kernel only reads.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The whole kernel backend for one worker step, prepared in the parent.
+///
+/// Landlock owns the filesystem, seccomp owns the syscalls, and the hardening
+/// owns the process itself; all three install from the same `pre_exec` hook.
+/// Either half may be absent - no Landlock on this kernel, no seccomp without
+/// `CONFIG_SECCOMP` - and the hook installs whatever is present. `None` for
+/// both means the caller registers no hook at all.
+#[derive(Debug)]
+pub struct KernelConfinement {
+    landlock: Option<LandlockPlan>,
+    seccomp: Option<SeccompFilter>,
+    parent_pid: u32,
+}
+
+impl KernelConfinement {
+    /// Prepare confinement for `worktree`/`target_dir` under `offline`.
+    ///
+    /// Returns `Ok(None)` when this kernel offers neither Landlock nor
+    /// seccomp, so the caller can fall back to bubblewrap or run unconfined.
+    /// A malformed policy (a missing root) stays an `Err`.
+    pub fn prepare(worktree: &Path, target_dir: &Path, offline: bool) -> Result<Option<Self>> {
+        if landlock_disabled() {
+            tracing::debug!("kernel confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
+            return Ok(None);
+        }
+        let landlock = build_landlock_plan(worktree, target_dir, offline)?;
+        let seccomp = seccomp_supported().then(|| SeccompFilter::build(offline));
+        if landlock.is_none() && seccomp.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            landlock,
+            seccomp,
+            // The pid the `pre_exec` child checks its parent against, so a
+            // parent that died in between aborts the spawn instead of running
+            // with no death signal armed.
+            parent_pid: std::process::id(),
+        }))
+    }
+
+    /// Whether this kernel can confine a worker at all: Landlock, seccomp,
+    /// or both. Neither `lsm=` without `landlock` nor a kernel built without
+    /// `CONFIG_SECCOMP` confines anything, and the caller must know that
+    /// before choosing the backend.
+    pub fn probe_available() -> bool {
+        if landlock_disabled() {
+            return false;
+        }
+        query_abi_version().is_some() || seccomp_supported()
+    }
+
+    /// Whether a Landlock domain is part of this confinement.
+    pub fn has_landlock(&self) -> bool {
+        self.landlock.is_some()
+    }
+
+    /// Whether a seccomp filter is part of this confinement.
+    pub fn has_seccomp(&self) -> bool {
+        self.seccomp.is_some()
+    }
+
+    /// Install every prepared layer on the calling process: the filesystem
+    /// domain, then the syscall filter, then hardening.
+    ///
+    /// # Safety
+    ///
+    /// Only sound between `fork(2)` and `exec(2)`, where the calling process
+    /// is single-threaded by construction. Every step is async-signal-safe,
+    /// but the Landlock half is irreversible.
+    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+        if self.landlock.is_none() {
+            // The Landlock half sets `no_new_privs` itself before restricting;
+            // without it the seccomp half needs the flag set explicitly, as
+            // the kernel refuses `SECCOMP_SET_MODE_FILTER` without it.
+            //
+            // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS)` takes plain integers and
+            // is async-signal-safe.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if let Some(plan) = &self.landlock {
+            // SAFETY: forwarded from this function's contract; the plan holds
+            // only pre-resolved paths and raw-syscall installation.
+            unsafe { plan.apply()? };
+        }
+        if let Some(filter) = &self.seccomp {
+            // SAFETY: forwarded from this function's contract; the filter is
+            // a pre-built instruction vector installed with one syscall.
+            unsafe { filter.apply()? };
+        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { apply_process_hardening(self.parent_pid) }
+    }
 }
 
 /// `LANDLOCK_SCOPE_SIGNAL`: restrict signalling to the caller's own domain.
