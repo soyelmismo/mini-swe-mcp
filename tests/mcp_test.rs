@@ -14,8 +14,8 @@
 //! missing response fails fast instead of hanging the suite.
 
 use mini_swe_mcp::mcp::{
-    ChannelEvent, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome, WorkerSnapshot,
-    WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
+    ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
+    WorkerSnapshot, WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
 };
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
 use mini_swe_mcp::agent::wrap_network_command;
@@ -56,6 +56,39 @@ impl ServerOutput {
 
 // ---------------------------------------------------------------------------
 // Subprocess harness
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One test's override of a process-wide environment variable, restored on drop.
+///
+/// Edition 2024 makes `set_var` unsafe, which is exactly the hazard this
+/// serializes: no other test in this binary may observe the overridden value.
+struct ScopedEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    name: &'static str,
+    previous: Option<String>,
+}
+
+impl ScopedEnv {
+    fn set(name: &'static str, value: &str) -> Self {
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var(name).ok();
+        // SAFETY: the lock above excludes every other test in this binary.
+        unsafe { std::env::set_var(name, value) };
+        Self { _guard: guard, name, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            None => unsafe { std::env::remove_var(self.name) },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// A running `mini-swe-mcp --stdio` server connected through pipes.
@@ -1113,6 +1146,7 @@ fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
         id: id.to_string(),
         task: "t".to_string(),
         model: "m".to_string(),
+        owner: LOCAL_AGENT.to_string(),
         state,
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
@@ -1550,6 +1584,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         updated_at: 0,
         group: Some(String::from("backend")),
         repo_path: None,
+        owner: Some(String::from("registry-owner")),
         metrics: WorkerMetrics::default(),
     }
 }
@@ -1596,6 +1631,235 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
 }
 
 // ----------
+// Per-agent ownership (H-3)
+// ----------
+
+/// Owner of the synthetic workers the ownership tests share: the same identity
+/// the in-process stdio connection resolves to.
+const LOCAL_AGENT: &str = mini_swe_mcp::mcp::LOCAL_AGENT;
+
+/// A connection of `agent`, as a hub client that announced `MINI_SWE_AGENT_ID`.
+fn agent_context(agent: &str) -> ConnectionContext {
+    ConnectionContext {
+        agent_id: Some(agent.to_string()),
+        ..ConnectionContext::hub_connection(3)
+    }
+}
+
+/// The operator's `--admin` connection: the same agent, plus the override.
+fn admin_context(agent: &str) -> ConnectionContext {
+    ConnectionContext {
+        admin: true,
+        ..agent_context(agent)
+    }
+}
+
+/// A synthetic worker owned by `owner`, running.
+fn owned_worker(id: &str, owner: &str) -> WorkerRecord {
+    WorkerRecord {
+        owner: owner.to_string(),
+        ..running_worker(id)
+    }
+}
+
+/// A pool plus server over it, with no LLM anywhere in sight.
+fn owned_server() -> (WorkerPool, McpServer) {
+    let pool = WorkerPool::new(8, "http://localhost:1".to_string(), "test-key".to_string());
+    let server = McpServer::new(pool.clone(), "ninja".to_string());
+    (pool, server)
+}
+
+/// One agent controls its own workers and nobody else's: `steer`, `kill`,
+/// `collect` and `wait` are refused for a foreign worker, while `status` and
+/// `logs` stay readable by anyone.
+#[tokio::test]
+async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
+    let (pool, server) = owned_server();
+    pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a")).await;
+    let agent_b = agent_context("agent-b");
+
+    for arguments in [
+        json!({ "action": "steer", "worker_id": "h3-foreign", "message": "stop" }),
+        json!({ "action": "kill", "worker_id": "h3-foreign" }),
+        json!({ "action": "collect", "worker_id": "h3-foreign" }),
+        json!({ "action": "wait", "worker_id": "h3-foreign", "timeout_secs": 0 }),
+    ] {
+        let action = arguments["action"].as_str().expect("action");
+        let error = server
+            .execute_tool_for("worker", arguments.clone(), &agent_b)
+            .await
+            .expect_err("another agent's worker must be refused");
+        assert_eq!(
+            error.to_string(),
+            "worker h3-foreign belongs to agent agent-a",
+            "'{action}' must name the owning agent: {error}"
+        );
+    }
+
+    // The refusals changed nothing: the worker is still running and still owned
+    // by agent A, and A can steer it.
+    assert!(
+        pool.worker_progress("h3-foreign").await.is_some(),
+        "a refused verb must not evict the worker"
+    );
+    let steered = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "steer", "worker_id": "h3-foreign", "message": "carry on" }),
+            &agent_context("agent-a"),
+        )
+        .await
+        .expect("the owner may steer its own worker");
+    assert_eq!(steered["status"], "steered");
+
+    // Reading another agent's run is what tells an orchestrator the worker
+    // exists at all, so `status` and `logs` stay open and name the owner.
+    let status = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "status", "worker_id": "h3-foreign" }),
+            &agent_b,
+        )
+        .await
+        .expect("status is readable by every agent");
+    assert_eq!(status["owner"], "agent-a");
+    assert_eq!(status["state"]["state"], "Running");
+}
+
+/// The operator's `--admin` connection is the one caller allowed past the check.
+#[tokio::test]
+async fn an_admin_connection_bypasses_the_ownership_check() {
+    let (pool, server) = owned_server();
+    pool.__test_insert_worker(owned_worker("h3-admin", "agent-a")).await;
+
+    let steered = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "steer", "worker_id": "h3-admin", "message": "wrap up" }),
+            &admin_context("operator"),
+        )
+        .await
+        .expect("the admin override must reach the worker");
+    assert_eq!(steered["status"], "steered");
+    assert_eq!(steered["worker_id"], "h3-admin");
+
+    // The override is a bypass of ownership only: the admin still sees the
+    // worker it acted on under its real owner.
+    let status = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "status", "worker_id": "h3-admin" }),
+            &admin_context("operator"),
+        )
+        .await
+        .expect("status stays readable");
+    assert_eq!(status["owner"], "agent-a");
+}
+
+/// A running registry row owned by `owner`: the cross-process view of a worker
+/// another connection dispatched, which is what the hub really holds.
+fn owned_registry_row(worker_id: &str, owner: &str) -> WorkerRegistryEntry {
+    let mut row = synthetic_registry_row(worker_id, RegistryStatus::Running);
+    row.owner = Some(owner.to_string());
+    row
+}
+
+/// `list` shows the caller's own workers; `scope: "all"` shows everyone's, each
+/// row naming its owner. The rows live in the registry because that is where a
+/// worker of another *connection* is: the pool itself only knows its own.
+#[tokio::test]
+async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
+    let (_pool, server) = owned_server();
+    save_registry_entry(&owned_registry_row("h3-mine", "agent-a"));
+    save_registry_entry(&owned_registry_row("h3-theirs", "agent-b"));
+    let agent_a = agent_context("agent-a");
+
+    let mine = server
+        .execute_tool_for("worker", json!({ "action": "list" }), &agent_a)
+        .await
+        .expect("list answers");
+    remove_registry_entry("h3-mine");
+    remove_registry_entry("h3-theirs");
+    let ids = |payload: &serde_json::Value| -> Vec<String> {
+        payload["workers"]
+            .as_array()
+            .expect("workers array")
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let owners: Vec<String> = mine["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .map(|row| row["owner"].as_str().expect("owner").to_string())
+        .collect();
+
+    assert!(ids(&mine).contains(&"h3-mine".to_string()), "{mine}");
+    assert!(!ids(&mine).contains(&"h3-theirs".to_string()), "{mine}");
+    assert!(owners.iter().all(|owner| owner == "agent-a"), "{mine}");
+
+    save_registry_entry(&owned_registry_row("h3-mine", "agent-a"));
+    save_registry_entry(&owned_registry_row("h3-theirs", "agent-b"));
+    let all = server
+        .execute_tool_for("worker", json!({ "action": "list", "scope": "all" }), &agent_a)
+        .await
+        .expect("scope=all answers");
+    remove_registry_entry("h3-mine");
+    remove_registry_entry("h3-theirs");
+    assert!(ids(&all).contains(&"h3-mine".to_string()), "{all}");
+    assert!(ids(&all).contains(&"h3-theirs".to_string()), "{all}");
+    let owner_of = |worker_id: &str| -> String {
+        all["workers"]
+            .as_array()
+            .expect("workers array")
+            .iter()
+            .find(|row| row["id"] == worker_id)
+            .and_then(|row| row["owner"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(owner_of("h3-mine"), "agent-a");
+    assert_eq!(owner_of("h3-theirs"), "agent-b");
+
+    // A typo is a hard error, not a silent fallback to the caller's own rows.
+    let error = server
+        .execute_tool_for("worker", json!({ "action": "list", "scope": "everything" }), &agent_a)
+        .await
+        .expect_err("an unknown scope must not be accepted");
+    assert!(error.to_string().contains("'scope' must be one of"), "{error}");
+}
+
+/// One agent may not fill the pool: past `MAX_WORKERS_PER_AGENT` a dispatch is
+/// refused, and the error names the workers already running.
+#[tokio::test]
+async fn a_dispatch_past_the_per_agent_cap_is_refused() {
+    let (pool, server) = owned_server();
+    pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent")).await;
+    let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
+    let capped = agent_context("cap-agent");
+
+    let error = server
+        .execute_tool_for(
+            "worker",
+            json!({
+                "action": "dispatch",
+                "task": "one worker too many",
+                "repo_path": std::env::temp_dir(),
+            }),
+            &capped,
+        )
+        .await
+        .expect_err("the per-agent cap must refuse the dispatch");
+    let message = error.to_string();
+    assert!(message.contains("cap-agent"), "{message}");
+    assert!(message.contains("MAX_WORKERS_PER_AGENT=1"), "{message}");
+    assert!(message.contains("h3-cap"), "{message}");
+    // The refusal happened before the dispatch, so no second worker was started.
+    assert_eq!(pool.active_worker_count().await, 1);
+}
+
+// ----------
 // Revision loop (hub-H8): next_step guidance and steer-after-finish
 // ----------
 
@@ -1607,11 +1871,8 @@ async fn completed_payloads_carry_the_review_guidance() {
     pool.__test_insert_worker(completed_worker("guide-done")).await;
     let server = McpServer::new(pool, "ninja".to_string());
 
-    for action in ["wait", "collect", "status"] {
-        // `collect` evicts the record, so re-insert it for the next verb.
-        if action != "wait" {
-            // Rebuild: only `collect` consumes; `status` leaves it in place.
-        }
+    // `collect` evicts the record, so it goes last.
+    for action in ["wait", "status", "collect"] {
         let result = server
             .execute_tool("worker", json!({ "action": action, "worker_id": "guide-done" }))
             .await
@@ -1625,9 +1886,6 @@ async fn completed_payloads_carry_the_review_guidance() {
             next.contains("swe-wt-done"),
             "{action} must name the branch the revision resumes on: {result}"
         );
-        if action == "collect" {
-            break;
-        }
     }
 }
 

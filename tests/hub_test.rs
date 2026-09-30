@@ -74,9 +74,17 @@ impl Client {
 
     /// Send one request and return its decoded `result`.
     async fn call(&mut self, method: &str) -> serde_json::Value {
+        self.request(method, serde_json::json!({}))
+            .await["result"]
+            .clone()
+    }
+
+    /// Send one request and return the whole reply envelope, error included.
+    async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let id = self.next_id;
         self.next_id += 1;
-        let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method});
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         self.writer
             .write_all(format!("{}\n", frame).as_bytes())
             .await
@@ -93,9 +101,54 @@ impl Client {
                 serde_json::from_str(line.trim()).expect("response is JSON");
             // Event notifications carry no `id`; the answer carries ours.
             if reply.get("id") == Some(&serde_json::json!(id)) {
-                return reply["result"].clone();
+                return reply;
             }
         }
+    }
+
+    /// Send a notification, e.g. the `hub/hello` handshake.
+    async fn notify(&mut self, method: &str, params: serde_json::Value) {
+        let frame = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
+        self.writer
+            .write_all(format!("{}\n", frame).as_bytes())
+            .await
+            .expect("write notification");
+        self.writer.flush().await.expect("flush notification");
+    }
+
+    /// The handshake: the client name becomes part of the connection identity.
+    async fn initialize(&mut self, client: &str) {
+        let reply = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": client, "version": "test"}
+                }),
+            )
+            .await;
+        assert_eq!(reply["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    /// One `worker` tool call: the decoded payload, or the error message.
+    async fn worker(
+        &mut self,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let reply = self
+            .request(
+                "tools/call",
+                serde_json::json!({"name": "worker", "arguments": arguments}),
+            )
+            .await;
+        if let Some(message) = reply.get("error").and_then(|e| e["message"].as_str()) {
+            return Err(message.to_string());
+        }
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("worker tool result text")
+            .to_string();
+        Ok(serde_json::from_str(&text).expect("worker payload is JSON"))
     }
 }
 
@@ -317,6 +370,10 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("dispatch prints JSON");
     let wid = payload["worker_id"].as_str().expect("dispatch names the worker").to_string();
+    assert_eq!(
+        payload["owner"], "cli",
+        "a CLI dispatch is owned by the stable `cli` identity: {payload}"
+    );
     let mut status = Command::new(&exe);
     envs(&mut status);
     let out = status
@@ -328,6 +385,26 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         "the worker record must survive the dispatching CLI exiting: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // That identity is stable across invocations, so a *second* CLI process
+    // still sees (and could steer) the worker the first one dispatched.
+    let mut listing = Command::new(&exe);
+    envs(&mut listing);
+    let out = listing
+        .args(["list", "--json"])
+        .output()
+        .expect("second CLI list runs");
+    assert!(out.status.success(), "list must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    let listed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("list prints JSON");
+    let row = listed["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .find(|row| row["id"] == wid.as_str())
+        .unwrap_or_else(|| panic!("the `cli` identity must keep its workers across invocations: {listed}"));
+    assert_eq!(row["owner"], "cli");
 
     // The escape hatch never creates a socket.
     let bare = common::TempDir::new_in_tmp("hub-no-daemon");
@@ -444,4 +521,137 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
         Some(repo_b.to_string_lossy().as_ref()),
         "the second caller's cwd must win: {seen_b}"
     );
+}
+
+/// Ownership over the wire (H-3): the daemon refuses to let one agent steer,
+/// kill or collect another agent's worker, keeps `status` readable by everyone,
+/// and honours the operator's `admin` hello.
+#[tokio::test]
+async fn a_hub_connection_only_controls_its_own_workers() {
+    use mini_swe_mcp::mcp::ConnectionContext;
+    use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
+
+    // The daemon serves the very pool this test fills, so ownership is decided
+    // against a record that is definitely there (no LLM, no registry row).
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(std::sync::Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(WorkerRecord {
+        id: "h3-hub-worker".to_string(),
+        task: "owned by agent-a".to_string(),
+        model: "test-model".to_string(),
+        owner: "agent-a".to_string(),
+        state: WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+        metrics: WorkerMetrics::default(),
+        logs: LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    })
+    .await;
+    let server = Arc::new(McpServer::new(pool, "test-model".to_string()));
+
+    let dir = scratch_dir();
+    let daemon = HubServer::new(server, HubConfig::new(hub_paths_for_test(&dir), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+
+    // Agent B: an ordinary orchestrator, identified by its hello.
+    let mut b = Client::connect(&socket).await;
+    b.initialize("other-host").await;
+    b.notify("hub/hello", serde_json::json!({"agent_id": "agent-b"})).await;
+    for arguments in [
+        serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "stop"}),
+        serde_json::json!({"action": "kill", "worker_id": "h3-hub-worker"}),
+        serde_json::json!({"action": "collect", "worker_id": "h3-hub-worker"}),
+        serde_json::json!({"action": "wait", "worker_id": "h3-hub-worker", "timeout_secs": 0}),
+    ] {
+        let action = arguments["action"].as_str().expect("action").to_string();
+        let error = b
+            .worker(arguments)
+            .await
+            .expect_err("another agent's worker must be refused")
+            ;
+        assert_eq!(
+            error,
+            "worker h3-hub-worker belongs to agent agent-a",
+            "'{action}' must name the owning agent: {error}"
+        );
+    }
+    // The refusals left the worker alone, and reading it stays open.
+    let status = b
+        .worker(serde_json::json!({"action": "status", "worker_id": "h3-hub-worker"}))
+        .await
+        .expect("status is readable by every agent");
+    assert_eq!(status["owner"], "agent-a");
+    assert_eq!(status["state"]["state"], "Running");
+
+    // The owner may act on it, and the CLI's stable identity is `cli` whatever
+    // its connection id (H-3), so it never sees another agent's worker either.
+    let mut a = Client::connect(&socket).await;
+    a.initialize("other-host").await;
+    a.notify("hub/hello", serde_json::json!({"agent_id": "agent-a"})).await;
+    let steered = a
+        .worker(serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "go"}))
+        .await
+        .expect("the owner may steer its own worker");
+    assert_eq!(steered["status"], "steered");
+
+    let mut cli = Client::connect(&socket).await;
+    cli.initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME).await;
+    let listed = cli
+        .worker(serde_json::json!({"action": "list"}))
+        .await
+        .expect("list answers");
+    let ids: Vec<&str> = listed["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&"h3-hub-worker"), "the CLI must not list it: {listed}");
+    let all = cli
+        .worker(serde_json::json!({"action": "list", "scope": "all"}))
+        .await
+        .expect("scope=all answers");
+    let row = all["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .find(|row| row["id"] == "h3-hub-worker")
+        .unwrap_or_else(|| panic!("scope=all must list it: {all}"));
+    assert_eq!(row["owner"], "agent-a");
+
+    // The operator's `--admin`: the same connection, with the override in hello.
+    let mut operator = Client::connect(&socket).await;
+    operator.initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME).await;
+    operator
+        .notify(
+            "hub/hello",
+            serde_json::json!({"agent_id": "agent-b", "admin": true}),
+        )
+        .await;
+    let killed = operator
+        .worker(serde_json::json!({"action": "kill", "worker_id": "h3-hub-worker"}))
+        .await
+        .expect("the admin override must bypass the ownership check");
+    assert_eq!(killed["killed"], true);
+    assert_eq!(
+        ConnectionContext::hub_connection(1).agent(),
+        "connection#1",
+        "an unannounced connection is scoped to itself"
+    );
+
+    drop(a);
+    drop(b);
+    drop(cli);
+    drop(operator);
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

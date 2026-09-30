@@ -34,6 +34,10 @@ use tokio::sync::Mutex;
 
 use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerMetrics, WorkerPool, WorkerState};
 
+/// Owner recorded for the workers these tests dispatch: the loop is what is
+/// under test here, not the per-agent ownership check.
+const TEST_OWNER: &str = "test-agent";
+
 /// A tool call the engine cannot turn into a command: valid JSON, but no
 /// `command` key, so `BashArgs` fails to deserialize and `command` is `None`.
 const UNPARSEABLE_ARGS: &str = r#"{"not_command":"ls -la"}"#;
@@ -376,6 +380,7 @@ async fn dispatch_and_wait(
     let pool = WorkerPool::new(1, base_url.to_string(), "test-key".to_string());
     let worker_id = pool
         .dispatch(
+            TEST_OWNER.to_string(),
             "exercise the agent loop".to_string(),
             "test-model".to_string(),
             None,
@@ -840,6 +845,7 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
     let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
     let worker_id = pool
         .dispatch(
+            TEST_OWNER.to_string(),
             "loop forever".to_string(),
             "test-model".to_string(),
             None,
@@ -1031,6 +1037,7 @@ async fn killing_a_worker_checkpoints_its_uncommitted_work() {
     let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
     let worker_id = pool
         .dispatch(
+            TEST_OWNER.to_string(),
             "leave work behind".to_string(),
             "test-model".to_string(),
             None,

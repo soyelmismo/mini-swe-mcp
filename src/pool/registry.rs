@@ -52,6 +52,16 @@ impl RegistryStatus {
     }
 }
 
+/// Owner label of a row that carries none, i.e. one written before ownership
+/// was tracked. Rendered in `list` payloads so the gap is visible instead of
+/// showing up as a missing field.
+pub const UNATTRIBUTED_OWNER: &str = "unattributed";
+
+/// The owning agent named by `entry`, or [`UNATTRIBUTED_OWNER`].
+pub fn registry_owner_label(entry: &WorkerRegistryEntry) -> &str {
+    entry.owner.as_deref().unwrap_or(UNATTRIBUTED_OWNER)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
     pub id: String,
@@ -70,6 +80,11 @@ pub struct WorkerRegistryEntry {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Agent identity that dispatched the worker. `None` on a row written
+    /// before ownership was tracked, which is why it deserializes with a
+    /// default instead of failing the read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Per-worker health counters as of this write. `#[serde(default)]` so a
     /// row written by an older build still parses.
     #[serde(default)]
@@ -86,6 +101,9 @@ pub struct WorkerMeta {
     pub task: String,
     pub group: Option<String>,
     pub repo_path: Option<String>,
+    /// Agent identity owning this worker, copied into every row this meta
+    /// writes — including the review phase's, which keeps one worker.
+    pub owner: String,
     pub started_at: u64,
     pub pid: u32,
     /// The phase loop's running counters, written with every status update.
@@ -126,6 +144,7 @@ impl WorkerMeta {
             updated_at: super::unix_timestamp(),
             group: self.group.clone(),
             repo_path: self.repo_path.clone(),
+            owner: Some(self.owner.clone()),
             metrics: self.metrics,
         }
     }

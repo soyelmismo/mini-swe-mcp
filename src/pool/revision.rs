@@ -54,6 +54,10 @@ pub struct WorkerHistory {
     pub review_after: Option<String>,
     /// Revision counter as of the run that wrote the file.
     pub revision: usize,
+    /// Agent that owns the worker; a revision keeps it. `None` in a file
+    /// written before ownership was tracked.
+    #[serde(default)]
+    pub owner: Option<String>,
     /// The live conversation: system prompt, task, every assistant turn with
     /// its reasoning, every tool result.
     pub messages: Vec<ChatMessage>,
@@ -291,40 +295,73 @@ impl super::WorkerPool {
         // relaunch below -- and every poll on it -- sees one process's worker,
         // with the same id and branch the orchestrator reviewed.
         let now = super::unix_timestamp();
+        let owner = history
+            .owner
+            .clone()
+            .unwrap_or_else(|| super::UNATTRIBUTED_OWNER.to_string());
+        let running = super::WorkerState::Running {
+            step: 0,
+            last_command: format!("revision {revision} starting"),
+            started_at: now,
+        };
         {
             let mut lock = self.workers.write().await;
             match lock.get_mut(id) {
+                // Two steers racing on one finished worker must not launch
+                // two revisions on the same branch.
+                Some(w) if matches!(
+                    w.state,
+                    super::WorkerState::Running { .. } | super::WorkerState::Paused { .. }
+                ) =>
+                {
+                    anyhow::bail!("Worker {id} is already running (revision {} in progress)", w.revision);
+                }
                 Some(w) => {
-                    w.state = super::WorkerState::Running {
-                        step: 0,
-                        last_command: format!("revision {revision} starting"),
-                        started_at: now,
-                    };
+                    w.state = running;
                     w.model = history.model.clone();
                     w.task = history.task.clone();
                     w.revision = revision;
                 }
                 None => {
-                    let record = super::WorkerRecord {
-                        id: id.to_string(),
-                        task: history.task.clone(),
-                        model: history.model.clone(),
-                        state: super::WorkerState::Running {
-                            step: 0,
-                            last_command: format!("revision {revision} starting"),
-                            started_at: now,
+                    lock.insert(
+                        id.to_string(),
+                        super::WorkerRecord {
+                            id: id.to_string(),
+                            task: history.task.clone(),
+                            model: history.model.clone(),
+                            owner: owner.clone(),
+                            state: running,
+                            metrics: super::WorkerMetrics::default(),
+                            logs: super::LogBuffer::with_policy(self.log_policy),
+                            pending_steer: Vec::new(),
+                            resume_tx: None,
+                            handle: None,
+                            revision,
                         },
-                        metrics: super::WorkerMetrics::default(),
-                        logs: super::LogBuffer::with_policy(self.log_policy),
-                        pending_steer: Vec::new(),
-                        resume_tx: None,
-                        handle: None,
-                        revision,
-                    };
-                    lock.insert(id.to_string(), record);
+                    );
                 }
             }
+            self.notify_change();
         }
+        // The row that makes the revision visible to registry readers before
+        // its first turn writes one; built before the conversation moves out.
+        let row = super::WorkerRegistryEntry {
+            id: id.to_string(),
+            pid: std::process::id(),
+            task: history.task.clone(),
+            model: history.model.clone(),
+            status: super::RegistryStatus::Running,
+            step: 0,
+            max_turns,
+            last_command: format!("revision {revision} starting"),
+            question: None,
+            started_at: now,
+            updated_at: now,
+            group: history.group.clone(),
+            repo_path: Some(history.repo_path.clone()),
+            metrics: super::WorkerMetrics::default(),
+            owner: Some(owner.clone()),
+        };
 
         let pool = self.clone();
         let wid = id.to_string();
@@ -338,6 +375,7 @@ impl super::WorkerPool {
             started_at: now,
             pid: std::process::id(),
             metrics: super::WorkerMetrics::default(),
+            owner,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {
@@ -355,11 +393,9 @@ impl super::WorkerPool {
         let handle = tokio::spawn(async move {
             if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
                 tracing::error!(worker = %wid, error = %e, "Revision failed with error");
-                let mut lock = pool.workers.write().await;
-                if let Some(w) = lock.get_mut(&wid) {
-                    w.fail(e.to_string());
-                }
-                meta_for_fail.save_status(
+                pool.update_worker(&wid, |w| w.fail(e.to_string())).await;
+                pool.save_status(
+                    &meta_for_fail,
                     &model_for_fail,
                     super::RegistryStatus::Failed,
                     0,
@@ -375,51 +411,9 @@ impl super::WorkerPool {
                 w.handle = Some(handle);
             }
         }
-        // The revision's launch is what a re-attached `status` reports until
-        // the first turn writes its own row (`history.messages` moved into the
-        // launch above, so the row is rebuilt from the surviving fields).
-        WorkerHistory {
-            task: history.task.clone(),
-            group: history.group.clone(),
-            model: history.model.clone(),
-            temperature: history.temperature,
-            repo_path: history.repo_path.clone(),
-            base_commit: base_commit.clone(),
-            branch: history.branch.clone(),
-            network_offline: history.network_offline,
-            verify: history.verify.clone(),
-            max_turns,
-            review_after: history.review_after.clone(),
-            revision,
-            messages: Vec::new(),
-        }
-        .save_revision_status(id, revision, max_turns);
+        super::save_registry_entry(&row);
         tracing::info!(worker = %id, revision, max_turns, "Worker revision started");
         Ok(())
     }
 }
 
-impl WorkerHistory {
-    /// The registry row that makes a just-started revision visible to
-    /// cross-process readers before its first turn writes its own.
-    fn save_revision_status(&self, worker_id: &str, revision: usize, max_turns: usize) {
-        // Reuse the canonical row writer with the history's identity: the row
-        // for the worker id carries the fresh budget and the revision marker.
-        super::save_registry_entry(&super::WorkerRegistryEntry {
-            id: worker_id.to_string(),
-            pid: std::process::id(),
-            task: self.task.clone(),
-            model: self.model.clone(),
-            status: super::RegistryStatus::Running,
-            step: 0,
-            max_turns,
-            last_command: format!("revision {revision} starting"),
-            question: None,
-            started_at: super::unix_timestamp(),
-            updated_at: super::unix_timestamp(),
-            group: self.group.clone(),
-            repo_path: Some(self.repo_path.clone()),
-            metrics: super::WorkerMetrics::default(),
-        });
-    }
-}

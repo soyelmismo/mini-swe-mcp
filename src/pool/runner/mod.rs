@@ -238,6 +238,7 @@ impl WorkerPool {
                 .get(&worker_id)
                 .map(|w| w.revision)
                 .unwrap_or(0),
+            owner: Some(meta.owner.clone()),
             messages,
         };
         if let Err(e) = save_worker_history(&worker_id, &history) {

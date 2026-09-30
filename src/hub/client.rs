@@ -62,12 +62,19 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     }
 }
 
-async fn hello<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+/// Announce this process to the daemon.
+///
+/// `agent_id` is the operator's `MINI_SWE_AGENT_ID`, the one way a client can
+/// name the agent its workers belong to; without it the daemon derives the
+/// identity from the `initialize` `clientInfo` (see [`crate::mcp::ConnectionContext::agent`]).
+/// `admin` is the operator override that lifts the per-agent ownership check.
+async fn hello<W: AsyncWrite + Unpin>(writer: &mut W, admin: bool) -> Result<()> {
     let frame = json!({
         "jsonrpc": "2.0", "method": "hub/hello",
         "params": {"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
                    "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
-                   "cwd": std::env::current_dir().ok()}
+                   "cwd": std::env::current_dir().ok(),
+                   "admin": admin}
     });
     writer.write_all(format!("{frame}\n").as_bytes()).await?;
     writer.flush().await?;
@@ -93,7 +100,7 @@ async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Proxy stdio until either input closes. The daemon owns all MCP semantics.
 pub async fn proxy_stdio() -> Result<()> {
     let mut stream = connect_or_spawn().await?;
-    hello(&mut stream).await?;
+    hello(&mut stream, false).await?;
     let (reader, writer) = stream.into_split();
     tokio::select! {
         result = forward(tokio::io::stdin(), writer) => result,
@@ -108,7 +115,17 @@ pub struct HubClient {
 }
 
 impl HubClient {
+    /// Connect as the CLI: identity `cli`, shared by every invocation.
     pub async fn connect() -> Result<Self> {
+        Self::connect_as_admin(false).await
+    }
+
+    /// Connect as the CLI, optionally with the operator's admin override.
+    ///
+    /// The `clientInfo.name` sent in `initialize` is what gives the CLI its
+    /// stable `cli` identity (H-3), and `admin` is the human operator's
+    /// `mini-swe-mcp --admin` bypass of the per-agent ownership check.
+    pub async fn connect_as_admin(admin: bool) -> Result<Self> {
         let mut client = Self {
             stream: BufReader::new(connect_or_spawn().await?),
             next_id: 1,
@@ -118,11 +135,11 @@ impl HubClient {
                 "initialize",
                 json!({
                     "protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": {"name": "mini-swe-cli", "version": env!("CARGO_PKG_VERSION")}
+                    "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}
                 }),
             )
             .await?;
-        hello(client.stream.get_mut()).await?;
+        hello(client.stream.get_mut(), admin).await?;
         Ok(client)
     }
 
