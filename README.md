@@ -7,20 +7,27 @@ High-throughput autonomous software engineering subagent orchestrator speaking t
 ## Key Features
 
 - **MCP Stdio Protocol**: Seamlessly interfaces with Antigravity, Claude Desktop, Cursor, and any JSON-RPC 2.0 MCP client.
-- **Two-Tier Semaphore Concurrency Governance**:
-  - **Outer LLM Semaphore** (default 64): High-concurrency async dispatch for LLM inference.
-  - **Inner Bash Semaphore** (default `cores / 2`, configurable via `BASH_CONCURRENT_LIMIT`): Guards machine resources by capping simultaneous build and test subprocesses, executing child shells with `nice -n 10` and capping Cargo/Make build threads.
+- **Three-Tier Semaphore Concurrency Governance**:
+  - **Worker Pool Semaphore** (default 64): High-concurrency async dispatch for LLM inference.
+  - **Bash Command Semaphore** (default one slot per worker, tunable via `BASH_CONCURRENT_LIMIT`): caps simultaneous bash steps; heavy commands (`cargo`, `make`, `pytest`, compilers, …) also take a slot from the **Build Semaphore** (default `cores / 2`, `BASH_BUILD_LIMIT`).
+  - Child shells run with `nice -n 10` and a per-command thread cap (`BUILD_PARALLELISM`, default `cores / 2`).
 - **Strict Git Worktree Isolation**:
   - Each subagent operates on its own dedicated worktree branch (`worker-<id>`).
   - No lock collisions or git state corruption across concurrent workers.
-  - Sibling PID tracking prevents accidental pruning while subagents are running.
-  - Automated RAII worktree cleanup on worker completion or failure.
-- **Dual Tool Call Support & SSE Streaming**:
-  - Full native OpenAI `tool_calls` priority with regex extraction fallback.
+  - Sibling PID tracking prevents accidental pruning while subagents are running; a stale worktree has its uncommitted work salvaged onto the worker branch before it is removed.
+  - Automated RAII worktree cleanup on worker completion or failure, keeping the branch whenever it carries commits.
+- **Native Tool Calls & SSE Streaming**:
+  - Native OpenAI `tool_calls` with a fenced-code-block fallback for models that do not use them.
   - Server-Sent Events (`stream: true`) with instant TCP socket termination on cancellation.
+- **Verification Gate**:
+  - A dispatch can name a `verify` command (`--verify "cargo test"`); when it is absent one is auto-detected from the repository layout.
+  - The gate runs through the same sandboxed bash path before a completion sentinel is honoured, and its failure output is fed back to the model.
 - **Interactive Orchestrator Steering**:
   - Workers can pause execution and ask the orchestrator questions (`ASK_ORCHESTRATOR: <question>`).
-  - Request dynamic turn extensions (`REQUEST_TURNS: <n>`).
+  - Request dynamic turn extensions (`REQUEST_TURNS: <n>`), bounded to half the dispatch's own budget.
+  - Repetition and stagnation detectors nudge or park a worker that stops making progress.
+- **Persistent Role Memory**:
+  - `.agents/memory/<alias>.md` is read into the system prompt on every dispatch, per role; the runtime never writes it.
 
 ---
 
@@ -77,13 +84,16 @@ Configuration resolution follows a 4-tier cascading precedence:
 3. `.env` alongside the executable
 4. Custom path specified via `ENV_FILE=/path/to/.env`
 
-Required environment variables:
+Environment variables (only `OPENAI_API_KEY` is required):
 ```bash
 OPENAI_API_KEY=sk-...
 OPENAI_API_BASE=https://api.openai.com/v1   # Optional, default: https://api.openai.com/v1
 DEFAULT_MODEL=ninja                         # Optional, default: ninja
 MAX_CONCURRENT_WORKERS=64                   # Optional, default: 64
-BASH_CONCURRENT_LIMIT=2                     # Optional, default: cores / 2
+BASH_CONCURRENT_LIMIT=4                     # Optional, default: one slot per worker
+BASH_BUILD_LIMIT=2                          # Optional, default: cores / 2
+BUILD_PARALLELISM=2                         # Optional, default: cores / 2
+COMMAND_TIMEOUT_SECS=600                    # Optional, default: 600 heavy / 120 light
 WORKER_MAX_RETAINED_LOGS=200                # Optional, default: 200 (ceiling 1000)
 WORKER_MAX_EMITTED_LOGS=40                  # Optional, default: 40 (ceiling 500)
 WORKER_TERMINAL_TTL_SECS=300                # Optional, default: 300
@@ -91,7 +101,9 @@ WORKER_TERMINAL_TTL_SECS=300                # Optional, default: 300
 
 The three `WORKER_*` variables bound the per-worker step-log memory and the
 lifetime of finished worker records; see `.env.example` for the full contract
-and [Step-Log Retention](#step-log-retention) below.
+and [Step-Log Retention](#step-log-retention) below. Every optional number is
+parsed by one helper: unset, blank and non-numeric values all fall back to the
+documented default, and a value above a ceiling is clamped rather than rejected.
 
 ---
 
@@ -139,10 +151,23 @@ mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
 
 # Offline dispatch: every bash step runs with no network egress
 mini-swe-mcp dispatch "Rename the internal helper" --model ninja --repo . --offline
+
+# Pin the verify gate; --verify "" disables it for this dispatch
+mini-swe-mcp dispatch "Fix the flaky parser test" --model ninja --repo . \
+  --verify "cargo test --all-targets" --max-turns 80
+```
+
+Full usage:
+
+```
+dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>]
+          [--wait] [--max-turns <n>] [--group <group>] [--offline]
+          [--verify <cmd>]
 ```
 
 The `--offline` flag is the CLI spelling of the tool's optional `network`
-property — see [Network Policy](#network-policy).
+property — see [Network Policy](#network-policy). `--verify` is the spelling of
+the `verify` property; see [Verification Gate](#verification-gate).
 
 #### 2. Monitor and List Workers
 ```bash
@@ -199,6 +224,9 @@ missing — see [Step-Log Retention](#step-log-retention).
 mini-swe-mcp kill <worker_id>
 ```
 
+Uncommitted work is committed onto the worker's branch before the task is
+aborted, so a kill costs at most the work since the last checkpoint.
+
 #### 7. Reap Expired Worker Records
 ```bash
 # Evict terminal worker records whose TTL expired (also runs in the background)
@@ -210,6 +238,10 @@ mini-swe-mcp reap
 # Clean up orphaned branches and stale temporary worktrees whose processes died
 mini-swe-mcp prune
 ```
+
+Uncommitted changes in a dead worker's checkout are salvaged onto its
+`worker-<id>` branch before the checkout is removed, and a branch with commits
+missing from `HEAD` is preserved.
 
 #### 9. Inspect Model Manifest
 ```bash
@@ -228,13 +260,14 @@ Every `dispatch` may declare a network policy for its worker:
 
 | Value | Effect |
 |---|---|
-| `allow` (default) | Steps run with the host's normal connectivity |
+| `allow` | Steps run with the host's normal connectivity (the fallback when no policy is declared) |
 | `offline` | Each bash step runs inside its own network namespace with no egress |
 
-`network` is optional and defaults to `allow`, so a client that never sends it
-behaves exactly as before. Any other value — or a non-string — is rejected as a
-tool error instead of being silently downgraded: a request that asked for
-isolation must never quietly get connectivity back.
+`network` is optional. When it is absent the dispatch default for the resolved
+model applies: its `policy.network` from `models.yaml` if the model declares one,
+otherwise `allow`. An explicit argument always wins. Any other value — or a
+non-string — is rejected as a tool error instead of being silently downgraded: a
+request that asked for isolation must never quietly get connectivity back.
 
 `offline` is enforced at the kernel level with `unshare -n`, with no containers
 and no external firewall. Inside the namespace there is no interface and no
@@ -253,6 +286,33 @@ If the host forbids creating network namespaces (an unprivileged container
 without `CAP_SYS_ADMIN`), the wrapper is still applied and the step fails
 loudly — a policy that quietly did not apply would be worse than one that is
 visibly unavailable.
+
+---
+
+## Verification Gate
+
+A dispatch may declare the command that decides whether a finished worker is
+actually finished:
+
+```bash
+mini-swe-mcp dispatch "Fix the parser" --model ninja --repo . --verify "cargo clippy --all-targets -- -D warnings && cargo test"
+```
+
+The gate is resolved once, at dispatch:
+
+| `verify` argument | Gate |
+|---|---|
+| a command | used verbatim |
+| an empty string (`--verify ""`) | disabled for this dispatch |
+| absent | auto-detected: `Cargo.toml` -> `cargo build --all-targets && cargo test`; a `package.json` with a `test` script -> `npm test`; `pyproject.toml` / `pytest.ini` -> `pytest -q`; otherwise none |
+
+The gate runs through the same sandboxed, semaphore-gated bash path as any other
+step, and only runs when the worker tries to finish (`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`).
+A non-zero exit is pushed back to the model as `VERIFICATION FAILED` with the
+output, so the worker gets another turn to fix it; after three failed
+verifications the run completes anyway and is reported as *not verified* rather
+than looping forever. `verify_runs` and `verify_failures` are reported in the
+worker's health metrics.
 
 ---
 
@@ -290,39 +350,42 @@ default: ninja
 models:
   ninja:
     id: combo:ninja
-    role: "Fast, precise, low-token autonomous execution for targeted fixes and audits."
+    role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
     temperature: 0.2
-    max_turns: 50
+    max_turns: 150
     policy:
       network: "allow"
-      fs: "full"
   nerd:
     id: combo:nerd
-    role: "Deep architectural reasoning, extensive documentation, and heavy refactors."
+    role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
     temperature: 0.6
-    max_turns: 100
+    max_turns: 200
     policy:
       network: "allow"
-      fs: "full"
 ```
 
 ### Execution policy
 
-A model entry may declare the execution policy its workers run under. Both
-fields are optional, and an entry without a `policy:` block keeps the runtime
-defaults, so a manifest written before this block existed is still valid:
+A model entry may declare the execution policy its workers run under. The
+`policy:` block and its field are both optional, and an entry without one keeps
+the runtime defaults, so a manifest written before this block existed is still
+valid:
 
 | Field | Accepted values | Meaning |
 |-------|-----------------|---------|
-| `network` | `"offline"` \| `"allow"` | `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool. |
-| `fs` | `"read-only"` \| `"worktree-only"` \| `"full"` | How much of the filesystem a worker may write, from least to most capable. |
+| `network` | `"offline"` \| `"allow"` | The dispatch default for the worker: `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool, and an explicit argument on the dispatch wins over the manifest. |
 
 Values are trimmed and matched case-insensitively, so `Offline` and
-`" worktree_only "` are accepted. An **unknown value never fails the load**: it is
+`" offLINE "` are accepted. An **unknown value never fails the load**: it is
 reported as a warning naming the exact text you wrote and is repaired to the
-*restrictive* default (`offline` / `read-only`), so a typo can never quietly widen
-a sandbox. Warnings are emitted on startup, alongside the existing manifest
-checks (temperature bounds, turn budgets, duplicate ids).
+*restrictive* default (`offline`), so a typo can never quietly widen a sandbox.
+Warnings are emitted on startup, alongside the other manifest checks (temperature
+bounds, turn budgets, duplicate ids).
+
+`fs:` is **not supported**: it is ignored with a startup warning, because
+filesystem confinement is not negotiated per model. A worker always writes inside
+its own worktree and build directory, confined by the sandbox rather than by the
+manifest.
 
 ---
 
@@ -341,8 +404,8 @@ root that is loaded into the system prompt when the worker starts:
 
 The file is keyed by the **alias** from `models.yaml`, so `ninja` and `nerd` have
 separate memories and neither leaks into the other's prompt. Memory is read fresh
-on every dispatch (never memoized), so a note written by one run is visible to the
-next:
+on every dispatch and never memoized, so an edit is picked up by the very next
+run:
 
 - **Absent, blank or unreadable** -> no memory section at all; the system prompt
   is byte-identical to the pre-memory behaviour. Nothing to configure, nothing to
@@ -350,14 +413,13 @@ next:
 - **Bounded** -> at most 8 KiB of memory is injected (the newest entries), so a
   memory file that grows forever can never squeeze out the instructions.
 - **Traversal-safe** -> the alias is reduced to an `[a-z0-9_-]` slug before it
-  touches the filesystem, so a `model` argument can never read or write outside
+  touches the filesystem, so a `model` argument can never read outside
   `.agents/memory/`.
 
-Notes are appended as atomic, single-line markdown entries
-(`append_agent_memory`): the new file is staged next to the target and moved into
-place with `rename`, and the read-modify-write is serialized, so a reader (or a
-`worktree` artifact sync) never sees a half-written note and two agents finishing
-at once cannot lose each other's takeaway.
+Memory is **read-only** from the server's side: it loads a role's notes and never
+writes them, so the files stay a reviewable artefact of the repository rather
+than something a run can silently rewrite. Edit `.agents/memory/<alias>.md` (or
+ask a subagent to) and the next dispatch picks it up.
 
 ---
 
@@ -369,8 +431,8 @@ Run the full automated test suite:
 # Unit tests + CLI tests + MCP JSON-RPC integration + WorktreeGuard tests
 cargo test
 
-# Strict clippy linting
-cargo clippy -- -D warnings
+# Strict clippy linting over every target
+cargo clippy --all-targets -- -D warnings
 ```
 
 ---
