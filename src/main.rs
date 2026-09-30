@@ -210,7 +210,7 @@ fn print_help() {
     println!("  {DISPATCH_USAGE}");
     println!("           Start a worker on its own branch; always detaches.");
     println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
-    println!("           Wait for workers; replays events missed before connecting.");
+    println!("           Next worker event, replaying events missed before connecting.");
     println!("  status <worker_id> | status --line");
     println!("           Final status/diff, or a one-line pool summary for statusLine.");
     println!("  collect <worker_id>");

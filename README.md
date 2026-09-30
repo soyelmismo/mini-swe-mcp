@@ -34,7 +34,7 @@ Any other stdio MCP client is configured the same way (`command` plus `args`). T
 
 ## Workflow
 
-Dispatch, wait, review, steer, merge — one worker per focused concern.
+Dispatch, watch, review, steer, merge — one worker per focused concern.
 
 ### 1. dispatch
 
