@@ -290,7 +290,8 @@ impl WorkerPool {
             model.clone(),
             temperature,
         )
-        .with_network_offline(network_offline);
+        .with_network_offline(network_offline)
+        .with_llm_gate(self.llm_gate.clone());
 
         let mut step = 0;
         let mut current_max_turns = max_turns;

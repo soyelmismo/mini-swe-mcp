@@ -49,14 +49,20 @@ fn shared_http_client() -> &'static reqwest::Client {
     })
 }
 
-/// Initialized once for the process, just like the shared HTTP client.
-fn shared_llm_gate() -> &'static Option<Arc<Semaphore>> {
-    static GATE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-    GATE.get_or_init(|| llm_gate(crate::config::llm_concurrency()))
+/// Build the process-wide in-flight LLM request cap from `HUB_LLM_CONCURRENCY`.
+/// `None` (unset or 0) is unlimited: every request goes straight through.
+pub fn llm_gate_from_env() -> Option<Arc<Semaphore>> {
+    llm_gate(crate::config::llm_concurrency())
 }
 
 fn llm_gate(limit: usize) -> Option<Arc<Semaphore>> {
     (limit > 0).then(|| Arc::new(Semaphore::new(limit)))
+}
+
+/// Initialized once for the process, just like the shared HTTP client.
+fn shared_llm_gate() -> &'static Option<Arc<Semaphore>> {
+    static GATE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+    GATE.get_or_init(llm_gate_from_env)
 }
 
 async fn acquire_llm(gate: &Option<Arc<Semaphore>>) -> Result<Option<OwnedSemaphorePermit>> {
@@ -94,12 +100,13 @@ pub struct AgentRunner {
     pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
-    /// Process-wide in-flight LLM request cap. `None` (the default) is
-    /// unlimited; `Some` gates every `run_step_llm` request and stream.
-    pub llm_gate: Option<Arc<Semaphore>>,
     /// Fixed per-step command budget in seconds, replacing the light/heavy
     /// classification (tests use it to avoid mutating the process env).
     pub command_timeout_override: Option<u64>,
+    /// Handle of the process-wide in-flight LLM request cap. Shared by every
+    /// runner cloned from a common ancestor so all requests draw from one
+    /// limit; `None` removes this runner from the cap (test seam).
+    pub llm_slot: Option<Arc<Semaphore>>,
     pub max_retries: usize,
     pub initial_retry_delay: Duration,
     /// Jobs granted by the heavy-command admission controller for the next
@@ -122,7 +129,7 @@ impl AgentRunner {
             temperature,
             network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-            llm_gate: shared_llm_gate().clone(),
+            llm_slot: None,
             command_timeout_override: None,
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
@@ -144,21 +151,16 @@ impl AgentRunner {
         self
     }
 
-    /// Route the LLM request through one process-wide in-flight cap (test seam).
-    #[doc(hidden)]
-    pub fn __test_with_llm_permits(&mut self, limit: usize) {
-        self.llm_gate = llm_gate(limit);
-    }
-
     /// Give every bash step the same `secs` budget, whatever the command.
     pub fn with_command_timeout(mut self, secs: u64) -> Self {
         self.command_timeout_override = Some(secs);
         self
     }
 
-    /// Cap this runner's concurrent LLM requests at `limit` (0 is unlimited).
-    pub fn with_llm_concurrency(mut self, limit: usize) -> Self {
-        self.llm_gate = llm_gate(limit);
+    /// Share one process-wide in-flight LLM cap across runners cloned from
+    /// different ancestors (test seam: clones of this runner draw from `gate`).
+    pub fn with_llm_gate(mut self, gate: Option<std::sync::Arc<tokio::sync::Semaphore>>) -> Self {
+        self.llm_slot = gate;
         self
     }
 
@@ -195,7 +197,11 @@ impl AgentRunner {
         let accumulator = loop {
             attempts += 1;
 
-            let mut permit = acquire_llm(&self.llm_gate).await?;
+            let gate = self
+                .llm_slot
+                .clone()
+                .or_else(|| shared_llm_gate().clone());
+            let mut permit = acquire_llm(&gate).await?;
             let Some(mut resp) = self
                 .send_with_retry(&payload, attempts, &mut permit)
                 .await?

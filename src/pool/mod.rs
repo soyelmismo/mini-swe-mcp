@@ -107,6 +107,8 @@ pub struct WorkerPool {
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
     /// Checkout directory of every live worker. The `WorktreeGuard` stays the
+    /// Process-wide in-flight LLM request cap shared by every worker's runner.
+    llm_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// owner of the worktree itself; the pool only needs to know *where* a
     /// worker works so `kill` can commit what it leaves behind before the
     /// aborted task tears the checkout down.
@@ -156,6 +158,7 @@ impl WorkerPool {
         );
         Self {
             worker_slots: fair::FairScheduler::new(max_concurrent),
+            llm_gate: crate::agent::llm_gate_from_env(),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
