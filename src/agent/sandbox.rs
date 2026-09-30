@@ -1601,3 +1601,328 @@ fn run_landlock_enforcement_mode() -> ! {
     std::process::exit(1);
 }
 }
+
+// ----------
+// Seccomp syscall confinement
+// ----------
+
+/// `AUDIT_ARCH_X86_64`: the `arch` value the kernel reports for a 64-bit
+/// x86-64 task, as understood by `seccomp_data`.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E;
+/// `AUDIT_ARCH_AARCH64`: the same for a 64-bit ARM task.
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7;
+
+/// `SECCOMP_SET_MODE_FILTER`: install a BPF filter on the calling thread.
+const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+
+/// `SECCOMP_RET_ERRNO` ORed with an `errno` value: the syscall fails with that
+/// error instead of being killed. Chosen over `SECCOMP_RET_KILL_PROCESS`
+/// because a worker that trips a denied syscall must report a diagnosable
+/// error to the model, not vanish with no output.
+fn seccomp_ret_errno(errno: libc::c_int) -> u32 {
+    (libc::SECCOMP_RET_ERRNO | (errno as u32 & libc::SECCOMP_RET_DATA)) as u32
+}
+
+/// Byte offset of `nr` inside `struct seccomp_data`.
+const SECCOMP_DATA_NR_OFF: u32 = 0;
+/// Byte offset of `arch` inside `struct seccomp_data`.
+const SECCOMP_DATA_ARCH_OFF: u32 = 4;
+/// Byte offset of `args[0]` inside `struct seccomp_data`.
+const SECCOMP_DATA_ARG0_OFF: u32 = 16;
+
+/// `AF_INET`: IPv4, the address family whose sockets an offline worker must
+/// not create.
+const AF_INET: u32 = libc::AF_INET as u32;
+/// `AF_INET6`: IPv6, denied alongside IPv4 so a dual-stack host offers no
+/// fallback path.
+const AF_INET6: u32 = libc::AF_INET6 as u32;
+
+/// Namespace-creating flags shared by `clone(2)` and `unshare(2)`.
+///
+/// `CLONE_NEWTIME` is included because it grants control of the clock, which
+/// is a host-wide resource and not a per-process one.
+const CLONE_NS_FLAGS: u64 = (libc::CLONE_NEWNS as u64)
+    | (libc::CLONE_NEWUTS as u64)
+    | (libc::CLONE_NEWIPC as u64)
+    | (libc::CLONE_NEWUSER as u64)
+    | (libc::CLONE_NEWPID as u64)
+    | (libc::CLONE_NEWNET as u64)
+    | (libc::CLONE_NEWCGROUP as u64)
+    | (libc::CLONE_NEWTIME as u64);
+
+/// One classic-BPF instruction of a seccomp filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BpfInsn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+/// Emit an unconditional instruction.
+fn bpf_stmt(code: u16, k: u32) -> BpfInsn {
+    BpfInsn {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// Emit a conditional jump: `jt` instructions ahead when `A == k`, else `jf`.
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
+    BpfInsn { code, jt, jf, k }
+}
+
+/// `BPF_LD | BPF_W | BPF_ABS`: load a 32-bit word from the seccomp metadata.
+const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+/// `BPF_JMP | BPF_JEQ | BPF_K`: compare the accumulator against a constant.
+const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+/// `BPF_JMP | BPF_JSET | BPF_K`: test the accumulator against a bitmask.
+const BPF_JMP_JSET_K: u16 = (libc::BPF_JMP | 0x20 | libc::BPF_K) as u16;
+/// `BPF_ALU | BPF_AND | BPF_K`: mask the accumulator with a constant.
+const BPF_ALU_AND_K: u16 = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
+/// `BPF_RET | BPF_K`: return a constant to the kernel.
+const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+
+/// A compiled seccomp filter, ready to install in a `pre_exec` hook.
+///
+/// # Why the BPF is built in the parent
+///
+/// A `pre_exec` closure runs between `fork(2)` and `exec(2)` in a child of a
+/// multi-threaded server, where only async-signal-safe operations are allowed.
+/// Building the instruction vector allocates, so the whole program is
+/// assembled here and the child is left with a pointer to a live `Vec` plus
+/// one `seccomp(2)` call - see [`SeccompFilter::apply`].
+#[derive(Debug, Clone)]
+pub struct SeccompFilter {
+    /// Classic-BPF instructions, in execution order.
+    program: Vec<BpfInsn>,
+    /// Whether the filter denies `socket(AF_INET/AF_INET6, ...)`.
+    ///
+    /// Recorded so the caller (and a test) can see the offline policy without
+    /// re-deriving it from the instruction stream.
+    denies_inet_sockets: bool,
+}
+
+impl SeccompFilter {
+    /// Build the filter for a worker's policy.
+    ///
+    /// `offline` adds the `socket(2)` rule that blocks IPv4/IPv6 socket
+    /// creation, which is what makes an offline worker unable to reach the
+    /// network without a network namespace.
+    pub fn build(offline: bool) -> Self {
+        Self::build_with(offline, default_denied_syscalls())
+    }
+
+    /// The body of [`build`](Self::build), with the deny list as a parameter.
+    ///
+    /// Split out so a test can drive the *assembly* (jump offsets, the
+    /// architecture gate, the default-allow tail) against a synthetic list
+    /// instead of only against whatever the host kernel happens to number.
+    fn build_with(offline: bool, denied: &[(libc::c_long, u32)]) -> Self {
+        let mut program: Vec<BpfInsn> = Vec::with_capacity(denied.len() + 8);
+
+        // Architecture gate: a filter written for one ABI is meaningless on
+        // another, where the same `nr` names a different syscall. Anything
+        // that is not the native architecture gets nothing at all.
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFF));
+        program.push(bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 0, 1));
+        // Not this architecture: allow and stop. The alternative - denying -
+        // would break a legitimate 32-bit helper binary for no gain, since
+        // the denied syscalls below are named by the native numbering.
+        program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW as u32));
+
+        // Load the syscall number once; every rule below compares against it.
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFF));
+
+        for (nr, action) in denied {
+            // `jt = 0` falls through to the next rule when the number does not
+            // match; `jf = 1` skips the single return that follows.
+            program.push(bpf_jump(BPF_JMP_JEQ_K, *nr as u32, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, *action));
+        }
+
+        // Offline policy: no IPv4 or IPv6 socket may be created at all. Both
+        // address families are checked, so a dual-stack host offers no
+        // fallback, and the check is on `socket(2)` rather than on
+        // `connect(2)` so UDP and raw sockets are covered too.
+        if offline {
+            program.push(bpf_jump(BPF_JMP_JEQ_K, libc::SYS_socket as u32, 0, 5));
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFF));
+            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET, 0, 2));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EACCES)));
+            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET6, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EACCES)));
+            // Not an INET family: fall through to the next rule.
+        }
+
+        // Default: everything not explicitly denied is allowed. A worker still
+        // has to compile, test and write files, so a default-deny filter would
+        // be an outage rather than a sandbox.
+        program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW as u32));
+
+        Self {
+            program,
+            denies_inet_sockets: offline,
+        }
+    }
+
+    /// Whether this filter blocks INET socket creation.
+    pub fn denies_inet_sockets(&self) -> bool {
+        self.denies_inet_sockets
+    }
+
+    /// Number of BPF instructions in the compiled program.
+    pub fn instruction_count(&self) -> usize {
+        self.program.len()
+    }
+
+    /// Install the filter on the calling thread.
+    ///
+    /// # Safety
+    ///
+    /// Only sound between `fork(2)` and `exec(2)`, where the calling process
+    /// is single-threaded by construction. Performs a single `seccomp(2)`
+    /// syscall against a live, correctly sized `sock_fprog`: it allocates
+    /// nothing, takes no lock and never unwinds, so it is async-signal-safe.
+    ///
+    /// Requires `PR_SET_NO_NEW_PRIVS` to have been set first; the kernel
+    /// refuses `SECCOMP_SET_MODE_FILTER` without it.
+    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+        // Translate the crate's own instruction type into the kernel's
+        // `struct sock_filter` layout. Both are plain data with the same field
+        // order, so the conversion is a field-by-field copy.
+        let mut instructions: Vec<libc::sock_filter> = self
+            .program
+            .iter()
+            .map(|insn| libc::sock_filter {
+                code: insn.code,
+                jt: insn.jt,
+                jf: insn.jf,
+                k: insn.k,
+            })
+            .collect();
+
+        let prog = libc::sock_fprog {
+            len: instructions.len() as libc::c_ushort,
+            filter: instructions.as_mut_ptr(),
+        };
+
+        // SAFETY: `prog` names `len` live instructions owned by this function,
+        // and `seccomp(2)` only reads them. The mode and flags are the
+        // documented filter-installation values.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER as libc::c_long,
+                0,
+                &prog as *const libc::sock_fprog as libc::c_long,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Syscalls a sandboxed worker may not call, each paired with the errno the
+/// kernel should report.
+///
+/// Every entry returns an errno rather than killing the process: a worker that
+/// trips one of these must produce a diagnosable failure for the model, and a
+/// `SIGSYS` would take the whole step down with no output at all.
+///
+/// The list is deliberately about *privilege and cross-process reach*, not
+/// about the filesystem (Landlock owns that) or scheduling (the timeout layer
+/// owns that).
+fn default_denied_syscalls() -> Vec<(libc::c_long, u32)> {
+    /// Deny with `EPERM`: the operation is not permitted for this worker.
+    const EPERM: u32 = libc::EPERM as u32;
+    /// Deny with `ENOSYS`: pretend the syscall does not exist. Used for
+    /// `clone3` so `glibc`'s `clone` fallback runs instead, where the flags
+    /// can actually be inspected.
+    const ENOSYS: u32 = libc::ENOSYS as u32;
+
+    let denied: &[(libc::c_long, u32)] = &[
+        // Inspecting or driving another process's memory and registers.
+        (libc::SYS_ptrace, EPERM),
+        (libc::SYS_process_vm_readv, EPERM),
+        (libc::SYS_process_vm_writev, EPERM),
+        // Mounting: a worker must not reshape the host's mount table.
+        (libc::SYS_mount, EPERM),
+        (libc::SYS_umount2, EPERM),
+        (libc::SYS_pivot_root, EPERM),
+        (libc::SYS_move_mount, EPERM),
+        (libc::SYS_fsopen, EPERM),
+        (libc::SYS_fsmount, EPERM),
+        (libc::SYS_open_tree, EPERM),
+        // Loading kernel code.
+        (libc::SYS_kexec_load, EPERM),
+        (libc::SYS_kexec_file_load, EPERM),
+        (libc::SYS_init_module, EPERM),
+        (libc::SYS_finit_module, EPERM),
+        (libc::SYS_delete_module, EPERM),
+        // Attaching to kernel tracing and key management.
+        (libc::SYS_bpf, EPERM),
+        (libc::SYS_perf_event_open, EPERM),
+        (libc::SYS_keyctl, EPERM),
+        (libc::SYS_add_key, EPERM),
+        (libc::SYS_request_key, EPERM),
+        // Memory-management tricks that can pin or corrupt host pages.
+        (libc::SYS_userfaultfd, EPERM),
+        // Power and swap state are host-wide.
+        (libc::SYS_reboot, EPERM),
+        (libc::SYS_swapon, EPERM),
+        (libc::SYS_swapoff, EPERM),
+        // Raw I/O port access.
+        (libc::SYS_iopl, EPERM),
+        (libc::SYS_ioperm, EPERM),
+        // Entering another namespace, or building a new one.
+        (libc::SYS_setns, EPERM),
+        (libc::SYS_unshare, EPERM),
+    ];
+
+    let mut denied = denied.to_vec();
+    // `clone3` carries its flags in a userspace struct the filter cannot read,
+    // so it is answered with `ENOSYS` and libc falls back to `clone`, whose
+    // flags are a plain argument the namespace rule can inspect.
+    denied.push((libc::SYS_clone3, ENOSYS));
+    denied
+}
+
+/// Whether this host's kernel can install a seccomp filter at all.
+///
+/// `PR_GET_SECCOMP` reports the thread's current mode; `-1` means the
+/// `prctl` itself is unknown, which is how a kernel built without
+/// `CONFIG_SECCOMP` answers. Probing in the parent keeps the child's hook
+/// free of a decision it cannot report.
+fn seccomp_supported() -> bool {
+    // SAFETY: `prctl(PR_GET_SECCOMP)` takes one argument and reads nothing.
+    let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+    mode >= 0
+}
+
+/// Whether the running kernel can scope Landlock's signal and abstract-socket
+/// rules, which arrived together in ABI 6.
+fn landlock_scope_supported(abi: i64) -> bool {
+    abi >= 6
+}
+
+/// `LANDLOCK_SCOPE_SIGNAL`: restrict signalling to the caller's own domain.
+const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 0;
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: restrict abstract-socket reach.
+const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 1;
+
+/// `LANDLOCK_ACCESS_NET_BIND_TCP`: binding a TCP socket.
+const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+/// `LANDLOCK_ACCESS_NET_CONNECT_TCP`: connecting a TCP socket.
+const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+
+/// Landlock ABI that introduced the network access rights.
+const ABI_NET: i64 = 4;
+/// Landlock ABI that introduced the `scoped` ruleset attribute.
+const ABI_SCOPE: i64 = 6;
