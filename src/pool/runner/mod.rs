@@ -33,7 +33,7 @@ use crate::worktree::{FileFingerprint, WorktreeGuard};
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
 use super::steer::remove_steer_file;
-use super::revision::{WorkerHistory, save_worker_history};
+use super::revision::{ChatMessage, WorkerHistory, append_history_message};
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
@@ -270,6 +270,23 @@ impl WorkerPool {
 
     /// The implementer loop, the review phase and the completion payload.
     ///
+    /// Append `messages` to `worker_id`'s history log, creating it with the
+    /// metadata line when it does not exist yet.
+    ///
+    /// The log is append-only, so replaying a conversation that is already in
+    /// it would duplicate every line; the caller passes only the messages it
+    /// has not appended yet.
+    fn append_history_messages(
+        worker_id: &str,
+        meta: &WorkerHistory,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        for msg in messages {
+            append_history_message(worker_id, meta, msg)?;
+        }
+        Ok(())
+    }
+
     /// Split from [`WorkerPool::run_worker`] so the caller owns the worktree and
     /// the conversation: whatever happens in here -- a completion sentinel, a
     /// failed bash step, a cancelled task -- the caller still holds both and can
@@ -322,6 +339,7 @@ impl WorkerPool {
             max_turns,
             review_after: review_after.clone(),
             revision: meta.revision,
+            auto_continues: meta.auto_continues,
             auto_continues: meta.auto_continues,
             owner: Some(meta.owner.clone()),
             messages: Vec::new(),

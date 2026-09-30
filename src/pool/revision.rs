@@ -428,7 +428,6 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
 }
 
 use super::runner::WorkerLaunchConfig;
-use super::resolve_continuation_base;
 
 /// What [`WorkerPool::steer_with_budget`] actually did, so the reply can only
 /// claim what happened.
@@ -506,7 +505,7 @@ impl super::WorkerPool {
                 if let Some(branch) = detected {
                     // Persist the detected base branch on the row so the next
                     // continuation and every reader see it.
-                    self.record_base_branch(id, &branch);
+                    self.record_base_branch(id, &branch).await;
                 }
                 Ok(outcome)
             }
@@ -523,7 +522,7 @@ impl super::WorkerPool {
 
     /// Store the base branch detected during a continuation on the registry
     /// row, so the pre-completion base sync keeps running for that worker.
-    fn record_base_branch(&self, id: &str, base_branch: &str) {
+    async fn record_base_branch(&self, id: &str, base_branch: &str) {
         let base_branch = base_branch.to_string();
         let id = id.to_string();
         let _ = tokio::task::spawn_blocking(move || {
@@ -596,7 +595,8 @@ impl super::WorkerPool {
         let base_branch = detect_base_branch(&repo_path);
         // The base the diff is measured from: the recorded one, else the
         // merge-base of the branch with the base branch.
-        let base_commit = resolve_continuation_base(&repo_path, &branch, base_branch.as_deref())
+        let base_commit = self
+            .resolve_continuation_base(&repo_path, &branch, base_branch.as_deref())
             .await
             .or_else(|| entry.base_commit.clone())
             .unwrap_or_default();
@@ -676,7 +676,7 @@ impl super::WorkerPool {
             )
             .await?;
         if let Some(branch) = detected {
-            self.record_base_branch(id, &branch);
+            self.record_base_branch(id, &branch).await;
         }
         let _ = outcome;
         Ok(())

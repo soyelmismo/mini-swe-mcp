@@ -762,6 +762,7 @@ impl WorkerPool {
     /// the merge-base with the branch the repo has checked out is the honest
     /// answer. `None` when neither can be resolved.
     pub(crate) async fn resolve_continuation_base(
+        &self,
         repo_path: &std::path::Path,
         branch: &str,
         base_branch: Option<&str>,

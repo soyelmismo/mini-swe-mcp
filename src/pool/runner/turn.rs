@@ -33,6 +33,7 @@ use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::history::compact_history;
+use super::revision::{WorkerHistory, append_history_message};
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
@@ -353,7 +354,7 @@ impl<'a> TurnEngine<'a> {
         // --- Automatic checkpoint (both phases) ---
         if *self.step > 0 && (*self.step).is_multiple_of(AUTO_CHECKPOINT_TURNS) {
             self.checkpoint().await;
-            self.persist_checkpoint_history(config).await;
+            self.persist_checkpoint_history().await;
         }
 
         // --- Stagnation detector (implementer only, like the sentinels) ---
@@ -876,56 +877,14 @@ impl<'a> TurnEngine<'a> {
         }
     }
 
-    /// Persist the conversation at an auto-checkpoint, so a killed hub
-    /// leaves a revisable history file behind instead of only the branch.
+    /// Persist the conversation at an auto-checkpoint, so a killed hub leaves a
+    /// revisable history log behind instead of only the branch.
     ///
-    /// The exit path's history format is serialized off the runtime thread.
-    /// A failed snapshot warns without interrupting the worker.
-    async fn persist_checkpoint_history(&self, config: &TurnConfig<'_>) {
-        use super::super::revision::{WorkerHistory, save_worker_history};
-        let revision = self
-            .pool
-            .workers
-            .read()
-            .await
-            .get(self.worker_id)
-            .map(|worker| worker.revision)
-            .unwrap_or(0);
-        let history = WorkerHistory {
-            task: config.task.to_string(),
-            group: self.meta.group.clone(),
-            model: config.model.to_string(),
-            temperature: config.temperature,
-            repo_path: self
-                .meta
-                .repo_path
-                .clone()
-                .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
-            base_commit: self.worktree.base_commit.clone(),
-            base_branch: self.worktree.base_branch.clone(),
-            branch: self.worktree.branch.clone(),
-            network_offline: config.network_offline,
-            verify: self.verify.map(str::to_string),
-            max_turns: config.max_turns,
-            review_after: config.review_after.map(str::to_string),
-            revision,
-            owner: Some(self.meta.owner.clone()),
-            messages: self.messages.clone(),
-        };
-        let worker_id = self.worker_id.to_string();
-        let step = *self.step;
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || save_worker_history(&worker_id, &history))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("history snapshot task failed: {e}")))
-        {
-            warn!(
-                worker = %self.worker_id,
-                step,
-                error = %e,
-                "Checkpoint history snapshot failed; the worker continues without it"
-            );
-        }
+    /// The log is append-only and already holds every message pushed up to the
+    /// previous turn boundary, so a checkpoint is a flush of what this turn
+    /// added: one line per message, never a whole-file rewrite.
+    async fn persist_checkpoint_history(&mut self) {
+        self.flush_history_log().await;
     }
 
     /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
@@ -1033,7 +992,7 @@ impl<'a> TurnEngine<'a> {
     /// The metadata line is written with the first message, so a log always
     /// opens with the facts a continuation needs. A failed append warns and
     /// carries on: the checkpoint snapshot still covers the whole conversation.
-    async fn flush_history_log(&mut self) {
+    pub(super) async fn flush_history_log(&mut self) {
         if self.unsaved_messages.is_empty() {
             return;
         }
