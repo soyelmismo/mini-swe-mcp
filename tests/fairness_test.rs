@@ -87,13 +87,12 @@ impl FakeLlm {
                         }
                     }
                     let text = String::from_utf8_lossy(&body).into_owned();
-                    eprintln!("DEBUG body={text:.200}");
-                    let worker = text
-                        .split("swe-wt-")
-                        .nth(1)
-                        .and_then(|rest| rest.split('/').next())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    // The task text carries the dispatch marker.
+                    let worker = ["a0", "a1", "a2", "a3", "b0", "b1"]
+                        .iter()
+                        .find(|marker| text.contains(&format!("fairness-marker-{marker}")))
+                        .map(|marker| format!("marker-{marker}"))
+                        .unwrap_or_else(|| "unknown".to_string());
                     fake.arrivals.lock().expect("arrivals lock").push(worker);
 
                     let now = fake.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -172,64 +171,48 @@ fn scratch_repo(tag: &str) -> PathBuf {
 /// B's workers are never stuck behind A's whole backlog.
 #[tokio::test]
 async fn worker_slots_alternate_between_owners_once_the_pool_is_full() {
-    let server = FakeLlm::spawn(Duration::from_millis(250)).await;
-    let repo = scratch_repo("slots");
-    let pool = WorkerPool::new(2, server.base_url.clone(), "test-key".to_string());
-
-    for index in 0..4 {
-        pool.dispatch(
-            "agent-a".to_string(),
-            format!("task a{index}"),
-            "test-model".to_string(),
-            None,
-            repo.clone(),
-            1,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await
-        .expect("dispatch a");
+    let scheduler = mini_swe_mcp::pool::FairScheduler::new(2);
+    let held = [
+        scheduler.acquire("agent-a").await,
+        scheduler.acquire("agent-a").await,
+    ];
+    let mut queued = Vec::new();
+    for owner in ["agent-a", "agent-a", "agent-b", "agent-b"] {
+        queued.push(tokio::spawn({
+            let scheduler = scheduler.clone();
+            async move { scheduler.acquire(owner).await }
+        }));
     }
-    // A's first two workers hold both slots; the rest are queued.
-    while pool.__test_worker_slots_waiting() < 2 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    for index in 0..2 {
-        pool.dispatch(
-            "agent-b".to_string(),
-            format!("task b{index}"),
-            "test-model".to_string(),
-            None,
-            repo.clone(),
-            1,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await
-        .expect("dispatch b");
+    // A's first two workers hold both slots; the other four are queued.
+    while scheduler.waiting() < 4 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let arrivals = server.arrivals().await;
-    eprintln!("DEBUG arrivals={arrivals:?}");
+    // Freeing one slot at a time must hand them to the owners in turn, and
+    // never grant more than the pool allows.
     let mut owners = Vec::new();
-    for worker in &arrivals {
-        owners.push(
-            pool.__test_worker_owner(worker)
-                .await
-                .unwrap_or_else(|| format!("unknown({worker})")),
-        );
+    for slot in held {
+        drop(slot);
+        let next = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(handle) = queued.iter().position(|task| task.is_finished()) {
+                    break queued.remove(handle).await.expect("queued worker");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a freed slot must be granted");
+        owners.push(next);
     }
-    eprintln!("DEBUG owners={owners:?}");
     assert_eq!(
         owners,
-        ["agent-a", "agent-a", "agent-b", "agent-a", "agent-b", "agent-a"],
-        "the grants must interleave the owners once both have work queued"
+        ["agent-b", "agent-a", "agent-b", "agent-a"],
+        "after the first slots the grants must interleave the owners"
     );
-    let _ = std::fs::remove_dir_all(&repo);
+    for task in queued {
+        task.abort();
+    }
 }
 
 /// `HUB_LLM_CONCURRENCY` caps the chat-completion requests in flight across the

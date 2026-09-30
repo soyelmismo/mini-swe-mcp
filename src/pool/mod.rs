@@ -485,18 +485,6 @@ impl WorkerPool {
             .reset_throttle(id);
     }
 
-    /// Requests queued for a worker slot (test support).
-    #[doc(hidden)]
-    pub fn __test_worker_slots_waiting(&self) -> usize {
-        self.worker_slots.waiting()
-    }
-
-    /// Owner recorded for `id` (test support).
-    #[doc(hidden)]
-    pub async fn __test_worker_owner(&self, id: &str) -> Option<String> {
-        self.workers.read().await.get(id).map(|w| w.owner.clone())
-    }
-
     /// Lightweight snapshot for progress waiters.
     ///
     /// Clones only the small strings needed to render progress and never the
