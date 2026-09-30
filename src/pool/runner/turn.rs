@@ -107,7 +107,7 @@ fn repository_sample(path: &Path) -> Option<String> {
 /// the part naming it and a missing part is zero. `None` when the line carries
 /// no count at all, so an empty or unreadable diff is never reported as a
 /// measured one.
-pub(super) fn parse_shortstat(line: &str) -> Option<(usize, usize, usize)> {
+pub(crate) fn parse_shortstat(line: &str) -> Option<(usize, usize, usize)> {
     let (mut files, mut insertions, mut deletions) = (None, None, None);
     for part in line.split(',') {
         let part = part.trim();

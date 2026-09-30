@@ -500,6 +500,54 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
     current
 }
 
+/// Lines a failed `[verify]` run is worth reading: failure markers and the
+/// newest context, bounded to 40 lines and 4 KiB.
+///
+/// A verify run prints thousands of passing-test lines, so the raw tail is both
+/// huge and uninformative. Marked lines (`FAILED`, `panicked`, `error`,
+/// `warning:`, `assertion`) win the budget: when none of the last 40 lines
+/// carries one, the most recent marked lines are shown instead of the oldest
+/// tail lines, and the byte cap drops unmarked lines first.
+fn verify_tail(output: &str) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 4096;
+    const MARKERS: [&str; 5] = ["FAILED", "panicked", "error", "warning:", "assertion"];
+    fn marked(line: &str) -> bool {
+        MARKERS.iter().any(|marker| line.contains(marker))
+    }
+    let lines: Vec<&str> = output.lines().collect();
+    let mut window: Vec<&str> = lines.iter().rev().take(MAX_LINES).rev().copied().collect();
+    if !window.iter().any(|line| marked(line)) {
+        let mut failures: Vec<&str> = lines.iter().filter(|line| marked(line)).copied().collect();
+        failures.reverse();
+        failures.truncate(MAX_LINES);
+        let kept = failures.len();
+        if kept > 0 {
+            let context = window.len().saturating_sub(MAX_LINES - kept);
+            let mut chosen = failures;
+            chosen.extend_from_slice(&window[window.len() - context..]);
+            window = chosen;
+        }
+    }
+    let mut total: usize = window.iter().map(|line| line.len() + 1).sum();
+    let mut index = 0;
+    while total > MAX_BYTES && index < window.len() {
+        if marked(window[index]) {
+            index += 1;
+        } else {
+            total -= window[index].len() + 1;
+            window.remove(index);
+        }
+    }
+    let mut text = window.join("\n");
+    if text.len() > MAX_BYTES {
+        let cut = text.len() - MAX_BYTES;
+        let start = text.char_indices().find(|(at, _)| *at >= cut).map(|(at, _)| at).unwrap_or(text.len());
+        text = text[start..].to_string();
+    }
+    text
+}
+
 /// A worker as the on-disk registry describes it.
 fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
     WorkerView {
@@ -522,7 +570,12 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
         question: entry.question.clone(),
         outcome: Outcome {
             error: registry_error(entry),
-            diff_stat: diff_stat(&entry.metrics),
+            diff_stat: diff_stat(&entry.metrics).or_else(|| {
+                // Zero metrics on a terminal row mean the worktree was already
+                // gone when the row was sampled, not that the branch is empty.
+                let (files, insertions, deletions) = crate::cli::watch::branch_diff_stat(entry)?;
+                stat_text(files, insertions, deletions)
+            }),
             ..Outcome::default()
         },
         // A registry row names no branch, so the guidance falls back to the
@@ -571,14 +624,19 @@ fn outcome_of(state: &WorkerState) -> Outcome {
 
 /// `3 files, +40 -12`, or `None` when the run measured no diff at all.
 fn diff_stat(metrics: &WorkerMetrics) -> Option<String> {
-    let touched = metrics.diff_files + metrics.diff_insertions + metrics.diff_deletions;
-    (touched > 0).then(|| {
+    stat_text(
+        metrics.diff_files,
+        metrics.diff_insertions,
+        metrics.diff_deletions,
+    )
+}
+
+/// [`diff_stat`] from raw counts, so a branch-derived diff renders identically.
+fn stat_text(files: usize, insertions: usize, deletions: usize) -> Option<String> {
+    (files + insertions + deletions > 0).then(|| {
         format!(
-            "{} file{}, +{} -{}",
-            metrics.diff_files,
-            if metrics.diff_files == 1 { "" } else { "s" },
-            metrics.diff_insertions,
-            metrics.diff_deletions
+            "{files} file{}, +{insertions} -{deletions}",
+            if files == 1 { "" } else { "s" }
         )
     })
 }
@@ -762,10 +820,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         if let Some(logs) = pool.get_worker_logs(id).await {
             view["last_ops"] = json!(logs.tail(5).iter().map(|log| clamp_string(&log.command,256)).collect::<Vec<_>>());
             if view["verified"] == false || view["metrics"]["verify_failures"].as_u64().unwrap_or(0) > 0 {
-                view["verify_output_tail"] = json!(logs.tail(1000).iter().rev().find(|log| log.command.starts_with("[verify]")).map(|log| {
-                    let tail: String = log.output.chars().rev().take(1500).collect::<String>().chars().rev().collect();
-                    tail
-                }));
+                view["verify_output_tail"] = json!(logs.tail(1000).iter().rev().find(|log| log.command.starts_with("[verify]")).map(|log| verify_tail(&log.output)));
             }
         }
     }
@@ -929,5 +984,57 @@ mod watch_stall_regression_tests {
         ctx.agent_id = Some("owner".into());
         let reply = router.watch_reply(&ctx, &json!({"worker_ids":["stall-probe"], "initial":true})).unwrap();
         assert_eq!(reply["events"][0]["step"], 162);
+    }
+}
+
+#[cfg(test)]
+mod verify_tail_tests {
+    use super::verify_tail;
+
+    /// A verify run's noise: one line per passing test.
+    fn passing(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("test suite::case_{i} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_huge_passing_tail_is_cut_to_forty_lines_and_four_kib() {
+        let output = passing(400);
+        let tail = verify_tail(&output);
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("case_399"), "the newest lines are kept: {tail}");
+    }
+
+    #[test]
+    fn failure_lines_survive_a_wall_of_passing_noise() {
+        let output = format!(
+            "{}\n---- verify stdout ----\nthread 'main' panicked at src/lib.rs:1\nassertion failed\n{}",
+            passing(200),
+            passing(200)
+        );
+        let tail = verify_tail(&output);
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("panicked") && tail.contains("assertion failed"), "{tail}");
+    }
+
+    #[test]
+    fn a_failure_marker_inside_the_window_is_kept() {
+        let output = format!("{}\nFAILED test suite::boom\n{}", passing(20), passing(20));
+        let tail = verify_tail(&output);
+        assert!(tail.contains("FAILED test suite::boom"), "{tail}");
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+    }
+
+    #[test]
+    fn a_giant_marker_line_keeps_its_tail_within_four_kib() {
+        let output = format!("error: {}\n{}", "x".repeat(9000), passing(50));
+        let tail = verify_tail(&output);
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("xxxx"), "the marked line survives: {} bytes", tail.len());
+        assert!(!tail.contains("case_0"), "passing noise gives up the budget first");
     }
 }
