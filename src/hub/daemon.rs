@@ -8,7 +8,8 @@
 //! the stdio server. The daemon exits when it has had no connection and no
 //! live worker for [`HubConfig::idle_secs`], or on `SIGTERM`/`SIGINT`.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::collections::BTreeMap;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -80,6 +82,13 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// How often that wait re-probes the lock and the socket.
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The file the watch tokens are kept in, inside the hub directory.
+const WATCH_TOKENS_FILE: &str = "watch-tokens.json";
+
+/// Rows kept in the token file: a bound, so a long-lived hub cannot grow it
+/// without limit.
+const MAX_TOKEN_ROWS: usize = 512;
+
 /// The three files a hub directory holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPaths {
@@ -110,6 +119,12 @@ impl HubPaths {
     /// The daemon's log file.
     pub fn log(&self) -> PathBuf {
         self.dir.join("hub.log")
+    }
+
+    /// The watch-token store: one token per agent identity (see
+    /// [`WatchTokens`]).
+    pub fn watch_tokens(&self) -> PathBuf {
+        self.dir.join(WATCH_TOKENS_FILE)
     }
 }
 
@@ -436,6 +451,10 @@ impl HubServer {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let server = self.server.clone();
         let open_conns = self.open_conns.clone();
+        // Every connection mints from this daemon's own token store, so the
+        // tokens a dispatch hands out are the ones this daemon resolves and
+        // they survive its restart.
+        let tokens = Arc::new(WatchTokens::new(self.config.paths().dir().to_path_buf()));
         tokio::spawn(async move {
             *open_conns.lock().await += 1;
             let (reader, writer) = stream.into_split();
@@ -443,7 +462,7 @@ impl HubServer {
                 .serve_connection(
                     tokio::io::BufReader::new(reader),
                     writer,
-                    crate::mcp::ConnectionContext::hub_connection(id),
+                    crate::mcp::ConnectionContext::hub_connection(id).with_watch_tokens(tokens),
                 )
                 .await;
             *open_conns.lock().await -= 1;
@@ -543,4 +562,218 @@ pub async fn run_daemon(
     HubServer::new(server, HubConfig::new(paths, idle))
         .run()
         .await
+}
+
+/// Watch tokens: one unguessable token per agent identity, kept in the hub
+/// directory.
+///
+/// A shell cannot know its session: the agent's `bash` tool sees none of
+/// [`SESSION_ENV_VARS`](crate::hub::identity::SESSION_ENV_VARS), so a
+/// `mini-swe-mcp watch` it runs would fall back to the bare host identity and
+/// miss the workers its own session dispatched. Every dispatch and steer answer
+/// therefore carries a `watch_command` naming a token bound to the caller's
+/// identity; presenting that token in `hub/hello` makes the caller exactly that
+/// identity — never `admin`, never another agent's.
+///
+/// The tokens live in the hub directory with mode 0600, so they survive a
+/// daemon restart, and are never listed: a caller only ever learns the token
+/// minted for its own identity, and a lookup goes by token and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WatchTokens {
+    dir: PathBuf,
+}
+
+/// One token row: the token itself, and the clock it was minted at, so a stale
+/// row can be dropped once the file grows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TokenRow {
+    token: String,
+    created: u64,
+}
+
+/// The token file as it is written: identity → row, ordered so the file is
+/// byte-stable for the same contents.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TokenStore {
+    rows: BTreeMap<String, TokenRow>,
+}
+
+impl TokenStore {
+    /// Drop the rows that can never be presented again: a `host:` identity
+    /// whose process is gone.
+    fn retain_live(&mut self) {
+        self.rows.retain(|identity, _| identity_alive(identity));
+    }
+
+    /// Drop the oldest rows until the file is back inside [`MAX_TOKEN_ROWS`].
+    fn cap_rows(&mut self) {
+        if self.rows.len() <= MAX_TOKEN_ROWS {
+            return;
+        }
+        let mut by_age: Vec<(String, u64)> = self
+            .rows
+            .iter()
+            .map(|(identity, row)| (identity.clone(), row.created))
+            .collect();
+        by_age.sort_by_key(|(_, created)| *created);
+        let excess = self.rows.len() - MAX_TOKEN_ROWS;
+        for (identity, _) in by_age.into_iter().take(excess) {
+            self.rows.remove(&identity);
+        }
+    }
+}
+
+/// Whether `identity` can still be presented by a live process.
+///
+/// A `host:<comm>:<pid>:<starttime>` row whose pid is gone — or whose start
+/// time no longer matches, so the kernel recycled the pid — is dead weight in
+/// the token file. Sessions, overrides and fallback identities name no process,
+/// so they are kept.
+fn identity_alive(identity: &str) -> bool {
+    let Some(rest) = identity.strip_prefix("host:") else {
+        return true;
+    };
+    let host = rest.split("/session:").next().unwrap_or(rest);
+    let mut fields = host.split(':');
+    let (Some(_comm), Some(pid), Some(starttime)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return true;
+    };
+    let (Ok(pid), Ok(starttime)) = (pid.parse::<u32>(), starttime.parse::<u64>()) else {
+        return true;
+    };
+    match crate::hub::identity::process(pid) {
+        Some(process) => process.starttime == starttime,
+        None => false,
+    }
+}
+
+/// The held `flock` on the token file, released on drop.
+struct TokenLock {
+    file: std::fs::File,
+}
+
+impl Drop for TokenLock {
+    fn drop(&mut self) {
+        // SAFETY: unlocking the same fd this guard locked.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+impl WatchTokens {
+    /// The store kept in `dir`, the hub directory.
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// The token bound to `identity`, minting one the first time it is asked
+    /// for. `None` when the store cannot be read or written.
+    pub fn token_for(&self, identity: &str) -> Option<String> {
+        let _lock = self.lock(true)?;
+        let mut store = self.read();
+        if let Some(row) = store.rows.get(identity) {
+            return Some(row.token.clone());
+        }
+        let token = mint_token()?;
+        // Dead rows go first, so a long-lived hub cannot grow the file without
+        // limit; the caller's own row is live by definition — it is the
+        // identity asking right now.
+        store.retain_live();
+        store.rows.insert(
+            identity.to_string(),
+            TokenRow {
+                token: token.clone(),
+                created: now_secs(),
+            },
+        );
+        store.cap_rows();
+        self.write(&store)?;
+        Some(token)
+    }
+
+    /// The identity `token` was minted for, or `None` when this store does not
+    /// know it: an unknown token is not an identity, so the caller falls back
+    /// to the next rule instead of being locked out.
+    pub fn identity_of(&self, token: &str) -> Option<String> {
+        let _lock = self.lock(false)?;
+        self.read()
+            .rows
+            .iter()
+            .find(|(_, row)| row.token == token)
+            .map(|(identity, _)| identity.clone())
+    }
+
+    /// The token file, locked exclusively so two connections minting at once
+    /// cannot lose each other's row.
+    fn lock(&self, create: bool) -> Option<TokenLock> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        if create {
+            options.create(true).mode(0o600);
+        }
+        let file = options.open(self.dir.join(WATCH_TOKENS_FILE)).ok()?;
+        // SAFETY: `flock` takes the fd and an operation flag; no pointers.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return None;
+        }
+        Some(TokenLock { file })
+    }
+
+    /// The store on disk; an absent or unreadable file is an empty store.
+    fn read(&self) -> TokenStore {
+        let Ok(text) = std::fs::read_to_string(self.dir.join(WATCH_TOKENS_FILE)) else {
+            return TokenStore::default();
+        };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    /// Write the store back, replacing the file so a reader never sees a
+    /// half-written row.
+    fn write(&self, store: &TokenStore) -> Option<()> {
+        let text = serde_json::to_string(store).ok()?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.dir.join(WATCH_TOKENS_FILE))
+            .ok()?;
+        std::io::Write::write_all(&mut file, text.as_bytes()).ok()
+    }
+}
+
+/// The identity a `MINI_SWE_WATCH_TOKEN` names, read from the hub directory's
+/// token store. `None` when the token is unknown, so `whoami` can say so
+/// instead of inventing an identity.
+pub fn watch_token_identity(token: &str) -> Option<String> {
+    WatchTokens::new(hub_dir().ok()?).identity_of(token)
+}
+
+/// 32 hexadecimal characters of kernel randomness: unguessable, and short
+/// enough to paste into a shell command.
+fn mint_token() -> Option<String> {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut bytes)
+        .ok()?;
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    Some(token)
+}
+
+/// The wall clock in whole seconds, for a token row's age.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }

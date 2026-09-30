@@ -300,9 +300,11 @@ fn is_awaited_result(val: &serde_json::Value) -> bool {
 pub fn format_dispatch(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
-        format!(
+        let mut out = format!(
             "✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress."
-        )
+        );
+        out.push_str(&watch_command_line(val));
+        out
     } else if val.get("status").and_then(|v| v.as_str()) == Some("still_running") {
         // A bounded wait hands the worker back unfinished; say so instead of
         // implying it finished.
@@ -396,7 +398,20 @@ pub fn format_steer(val: &serde_json::Value) -> String {
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("Steering instruction queued");
-    format!("✓ Worker {wid}: {msg}")
+    format!("✓ Worker {wid}: {msg}{}", watch_command_line(val))
+}
+
+/// The `watch_command` a dispatch or steer answer carried, as one line to run.
+///
+/// A shell cannot know its session, so the token in that command is what binds
+/// it to the agent that dispatched: without it a `mini-swe-mcp watch` would
+/// fall back to the bare host and miss the worker. Empty when the hub minted no
+/// token, which is the in-process server's case.
+fn watch_command_line(val: &serde_json::Value) -> String {
+    match val.get("watch_command").and_then(|v| v.as_str()) {
+        Some(command) => format!("\nTo wait for it: {command}"),
+        None => String::new(),
+    }
 }
 
 pub fn format_kill(val: &serde_json::Value) -> String {
@@ -507,6 +522,19 @@ mod tests {
             format_reap(&v(r#"{"reaped":2,"worker_ids":["a","b",7]}"#)),
             "✓ Reaped 2 expired worker record(s): a, b"
         );
+    }
+
+    #[test]
+    fn test_format_dispatch_shows_the_watch_command_when_the_hub_minted_one() {
+        let with_token = format_dispatch(&v(
+            r#"{"worker_id":"w","status":"dispatched","watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert!(
+            with_token.contains("\nTo wait for it: MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"),
+            "{with_token}"
+        );
+        let without = format_dispatch(&v(r#"{"worker_id":"w","status":"dispatched"}"#));
+        assert!(!without.contains("To wait for it"), "{without}");
     }
 
     #[test]

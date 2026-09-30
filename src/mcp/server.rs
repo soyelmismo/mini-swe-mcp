@@ -23,6 +23,7 @@ use super::protocol::{
     MAX_FRAME_BYTES, code, parse_frame,
 };
 use super::schema::build_tools_list;
+use crate::hub::WatchTokens;
 use crate::manifest::ModelManifest;
 use crate::pool::WorkerPool;
 
@@ -80,6 +81,16 @@ pub struct ConnectionContext {
     /// host process is one agent session, so the MCP connection and the shell
     /// commands it spawned share their workers.
     pub host_id: Option<String>,
+    /// The session inside the host process, from `hub/hello` or from the
+    /// `_meta.sessionID` of the call being served (see
+    /// [`crate::hub::identity::qualify`]). A host that runs several sessions —
+    /// opencode v2's tabs, over one shared connection — is not one agent, so
+    /// the session qualifies the host instead of being cached on the
+    /// connection.
+    pub session_id: Option<String>,
+    /// The identity a valid `MINI_SWE_WATCH_TOKEN` named, when the client
+    /// presented one in `hub/hello`: the caller is then exactly that identity.
+    pub token_identity: Option<String>,
     /// `clientInfo.name` from `initialize`, when the client sent one.
     pub client_name: Option<String>,
     /// `admin: true` from `hub/hello`: the operator may act on any worker.
@@ -89,6 +100,10 @@ pub struct ConnectionContext {
     pub pid: Option<u32>,
     pub version: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
+    /// The daemon's watch-token store, so a dispatch answer can carry the
+    /// `watch_command` that binds a shell to this identity. `None` for the
+    /// in-process stdio server, which has no hub directory to keep tokens in.
+    pub watch_tokens: Option<Arc<WatchTokens>>,
 }
 
 impl ConnectionContext {
@@ -98,12 +113,15 @@ impl ConnectionContext {
             id: 0,
             agent_id: None,
             host_id: None,
+            session_id: None,
+            token_identity: None,
             client_name: None,
             admin: false,
             local: true,
             pid: None,
             version: None,
             cwd: None,
+            watch_tokens: None,
         }
     }
 
@@ -113,13 +131,27 @@ impl ConnectionContext {
             id,
             agent_id: None,
             host_id: None,
+            session_id: None,
+            token_identity: None,
             client_name: None,
             admin: false,
             local: false,
             pid: None,
             version: None,
             cwd: None,
+            watch_tokens: None,
         }
+    }
+
+    /// Install the daemon's watch-token store on this connection.
+    pub fn with_watch_tokens(mut self, store: Arc<WatchTokens>) -> Self {
+        self.watch_tokens = Some(store);
+        self
+    }
+
+    /// The watch-token store this connection mints from, when it has one.
+    pub fn token_store(&self) -> Option<&Arc<WatchTokens>> {
+        self.watch_tokens.as_ref()
     }
 
     /// The agent identity that owns the workers this connection dispatches
@@ -127,22 +159,31 @@ impl ConnectionContext {
     ///
     /// 1. the `MINI_SWE_AGENT_ID` the client sent in `hub/hello`, so several
     ///    connections of one orchestrator share their workers;
-    /// 2. the agent's host process, which the client walked up to and sent in
-    ///    `hub/hello`: one host is one session, so the MCP connection and the
-    ///    shell commands it spawned share their workers while two hosts never
-    ///    do, and the identity survives a reconnect or a hub restart;
-    /// 3. `cli` for a CLI whose host could not be named, whose identity is
+    /// 2. the identity a valid `MINI_SWE_WATCH_TOKEN` named, which is how a
+    ///    shell that cannot know its session acts as the session that
+    ///    dispatched a worker;
+    /// 3. the agent's host process qualified by the session running inside it,
+    ///    both of which the client sent in `hub/hello`: one host is one
+    ///    session, so the MCP connection and the shell commands it spawned
+    ///    share their workers while two hosts — and two sessions of one host —
+    ///    never do, and the identity survives a reconnect or a hub restart;
+    /// 4. `cli` for a CLI whose host could not be named, whose identity is
     ///    therefore stable across invocations;
-    /// 4. `<clientInfo.name>#<connection id>`, which keeps two clients of the
+    /// 5. `<clientInfo.name>#<connection id>`, which keeps two clients of the
     ///    same host separate;
-    /// 5. `local` for the in-process stdio server, and `connection#<id>` for a
+    /// 6. `local` for the in-process stdio server, and `connection#<id>` for a
     ///    hub client that announced nothing at all.
     pub fn agent(&self) -> String {
         if let Some(agent_id) = self.agent_id.as_deref().filter(|id| !id.is_empty()) {
             return agent_id.to_string();
         }
-        if let Some(host_id) = self.host_id.as_deref().filter(|id| !id.is_empty()) {
-            return host_id.to_string();
+        if let Some(identity) = self.token_identity.as_deref().filter(|id| !id.is_empty()) {
+            return identity.to_string();
+        }
+        if let Some(identity) =
+            crate::hub::identity::qualify(self.host_id.as_deref(), self.session_id.as_deref())
+        {
+            return identity;
         }
         match self.client_name.as_deref().filter(|name| !name.is_empty()) {
             Some(CLI_CLIENT_NAME) => CLI_AGENT.to_string(),
@@ -284,7 +325,20 @@ impl McpServer {
                     let params = req.params.as_ref().cloned().unwrap_or_default();
                     ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
                     ctx.host_id = params["host_id"].as_str().map(str::to_owned);
-                    ctx.admin = params["admin"].as_bool().unwrap_or(false);
+                    ctx.session_id = params["session_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .filter(|session| !session.is_empty());
+                    // A watch token is the caller's whole identity: it is what
+                    // a shell that cannot know its session presents, so it
+                    // outranks the host and never carries the operator's
+                    // `admin` override with it.
+                    let watch_token = params["watch_token"].as_str();
+                    ctx.token_identity = watch_token
+                        .and_then(|token| ctx.token_store().map(|store| (token, store)))
+                        .and_then(|(token, store)| store.identity_of(token));
+                    let operator_admin = params["admin"].as_bool().unwrap_or(false);
+                    ctx.admin = operator_admin && ctx.token_identity.is_none();
                     ctx.pid = params["pid"]
                         .as_u64()
                         .and_then(|pid| u32::try_from(pid).ok());
@@ -440,14 +494,36 @@ impl McpServer {
                     .or_else(|| arguments.get("progressToken"))
                     .cloned();
 
+                // The session this call belongs to, which is not necessarily
+                // the connection's: opencode v2 sends `_meta.sessionID` on
+                // every call of one shared connection, one per tab. It is read
+                // per call and never cached on the connection, so the next call
+                // of the same connection may name another session.
+                let session = params
+                    .get("_meta")
+                    .and_then(|meta| meta.get("sessionID"))
+                    .or_else(|| {
+                        arguments
+                            .get("_meta")
+                            .and_then(|meta| meta.get("sessionID"))
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .filter(|session| !session.is_empty());
+                let call_ctx;
+                let ctx = match session {
+                    Some(session) => {
+                        call_ctx = ConnectionContext {
+                            session_id: Some(session),
+                            ..ctx.clone()
+                        };
+                        &call_ctx
+                    }
+                    None => &ctx,
+                };
+
                 match self
-                    .execute_tool_in_context(
-                        tool_name,
-                        arguments,
-                        progress_token,
-                        progress_tx,
-                        &ctx,
-                    )
+                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, ctx)
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
