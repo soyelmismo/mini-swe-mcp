@@ -278,6 +278,59 @@ fn test_cli_list_plain_text() {
     );
 }
 
+/// The per-worker health line: one compact summary of the counters a run
+/// recorded, and nothing at all for a row written before they existed.
+#[test]
+fn test_cli_status_renders_the_health_line() {
+    let exe = binary_path();
+    let id = format!("{:08x}", std::process::id());
+    let swe = std::env::temp_dir().join(format!("test-cli-health-{id}"));
+    let registry = swe.join("swe-registry");
+    std::fs::create_dir_all(&registry).expect("create the registry dir");
+    // A completed run, with every counter moved.
+    let measured_row = format!(
+        r#"{{"id":"{id}","pid":1,"task":"t","model":"ninja","status":"completed","step":142,"max_turns":150,"last_command":"completed","started_at":1,"updated_at":2,"metrics":{{"turns_used":142,"extensions_granted":4,"extensions_refused":2,"repeat_blocks":3,"stagnation_nudges":1,"loop_pauses":1,"verify_runs":2,"verify_failures":1,"diff_files":5,"diff_insertions":120,"diff_deletions":340}}}}"#
+    );
+    std::fs::write(registry.join(format!("{id}.json")), measured_row)
+        .expect("write the measured registry row");
+    // A row from a build that recorded no counters at all.
+    let legacy = format!("legacy{id}");
+    let legacy_row = format!(
+        r#"{{"id":"{legacy}","pid":1,"task":"t","model":"ninja","status":"completed","step":9,"max_turns":10,"last_command":"completed","started_at":1,"updated_at":2}}"#
+    );
+    std::fs::write(registry.join(format!("{legacy}.json")), legacy_row)
+        .expect("write the legacy registry row");
+
+    let status = |wid: &str| {
+        let output = Command::new(&exe)
+            .args(["status", wid])
+            .env("SWE_TEMP_DIR", &swe)
+            .env("OPENAI_API_KEY", "test-key-not-used-by-status")
+            .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
+            .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+        assert!(output.status.success(), "`status {wid}` must succeed");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let measured = status(&id);
+    assert!(
+        measured.contains(
+            "Health: 142 turns, +4/-2 ext, 3 repeats, 1 nudge, 1 loop pause, verify 1/2 failed, diff 5 files +120/-340"
+        ),
+        "status must render the health line, got:\n{measured}"
+    );
+
+    let unmeasured = status(&legacy);
+    assert!(
+        !unmeasured.contains("Health"),
+        "a row without metrics must render no health line, got:\n{unmeasured}"
+    );
+
+    let _ = std::fs::remove_dir_all(&swe);
+}
+
 #[test]
 fn test_cli_list_json() {
     let exe = binary_path();
