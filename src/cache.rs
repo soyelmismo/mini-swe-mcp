@@ -240,7 +240,7 @@ struct TargetEntry {
     idle: bool,
 }
 
-/// TTL is repository-wide; the size cap evicts idle slots in deterministic LRU
+/// TTL is repository-wide; the size cap evicts idle dirs in deterministic LRU
 /// order. Active bytes count toward the cap but can never be evicted.
 fn target_evictions(
     entries: &[TargetEntry],
@@ -273,7 +273,7 @@ fn target_evictions(
         let expired = build_dir_repo(&entry.dir)
             .and_then(|repo| latest.get(repo))
             .is_some_and(|at| {
-                !active_repos.contains(build_dir_repo(&entry.dir).expect("slot repo"))
+                !active_repos.contains(build_dir_repo(&entry.dir).expect("build dir repo"))
                     && now.duration_since(*at).unwrap_or_default() >= ttl
             });
         if expired {
@@ -345,7 +345,6 @@ impl BuildDirLease {
     /// Lease the lowest-indexed free directory of `repo`, creating a new one
     /// when every directory the repository already has is live.
     pub(crate) fn acquire(repo: &Path) -> std::io::Result<Self> {
-        let key = repo_key(repo).map_err(std::io::Error::other)?;
         let base = crate::worktree::swe_base_dir();
         std::fs::create_dir_all(&base)?;
         // The sweep lock keeps eviction from removing a directory between the
@@ -354,7 +353,7 @@ impl BuildDirLease {
         flock(&global, true, false)?;
         let mut index = 0usize;
         let lease = loop {
-            let dir = base.join(format!("swe-target-{key}-{index}"));
+            let dir = build_dir(repo, index).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&dir)?;
             let lock = lock_file(&build_dir_lock_path(&dir))?;
             if flock(&lock, true, true).is_ok() {
@@ -455,7 +454,7 @@ pub(crate) fn start_target_sweep() {
             loop {
                 let ttl = crate::config::env_parse::<u64>("HUB_TARGET_TTL_HOURS").unwrap_or(24);
                 let cap = crate::config::env_parse::<u64>("HUB_TARGET_MAX_GB").unwrap_or(40);
-                // Shared slots are created only in the configured base; legacy
+                // Build dirs are created only in the configured base; legacy
                 // per-worktree targets in other temp roots belong to worktree prune.
                 for base in [crate::worktree::swe_base_dir()] {
                     if let Err(error) = sweep_targets(
@@ -477,7 +476,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_slot_target_naming_is_stable_and_bounded() {
+    fn test_build_dir_naming_is_stable_and_bounded() {
         let _lock = crate::agent::env::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -487,26 +486,26 @@ mod tests {
         assert_eq!(first, second, "The same repository must keep one key");
         assert_eq!(first.len(), 16, "got: {first:?}");
         let base = crate::worktree::swe_base_dir();
-        let slot0 = super::slot_target_dir(&repo, 0).expect("Slot dir must resolve");
-        let slot1 = super::slot_target_dir(&repo, 1).expect("Slot dir must resolve");
+        let dir0 = super::build_dir(&repo, 0).expect("Build dir must resolve");
+        let dir1 = super::build_dir(&repo, 1).expect("Build dir must resolve");
         assert_eq!(
-            slot0.parent(),
+            dir0.parent(),
             Some(base.as_path()),
-            "{slot0:?} must live in the base"
+            "{dir0:?} must live in the base"
         );
         assert_eq!(
-            slot1.parent(),
+            dir1.parent(),
             Some(base.as_path()),
-            "{slot1:?} must live in the base"
+            "{dir1:?} must live in the base"
         );
-        assert_ne!(slot0, slot1, "Distinct slots must never share a target");
-        let name0 = slot0
+        assert_ne!(dir0, dir1, "Two workers must never share a build dir");
+        let name0 = dir0
             .file_name()
             .expect("Named target")
             .to_str()
             .expect("UTF-8 target");
         assert!(
-            name0.starts_with("swe-target-") && name0.contains(&first) && name0.ends_with("-slot0"),
+            name0.starts_with("swe-target-") && name0.contains(&first) && name0.ends_with("-0"),
             "got: {name0:?}"
         );
     }
@@ -525,19 +524,19 @@ mod tests {
         let now = SystemTime::now();
         let ttl = Duration::from_secs(24 * 3600);
         let shared = entry(
-            "/base/swe-target-0123456789abcdef-slot0",
+            "/base/swe-target-0123456789abcdef-0",
             25 * 3600 + 60,
             10,
             false,
         );
         let busy = entry(
-            "/base/swe-target-aaaaaaaaaaaaaaaa-slot0",
+            "/base/swe-target-aaaaaaaaaaaaaaaa-0",
             25 * 3600 + 60,
             10,
             false,
         );
         let old_idle = entry(
-            "/base/swe-target-bbbbbbbbbbbbbbbb-slot0",
+            "/base/swe-target-bbbbbbbbbbbbbbbb-0",
             25 * 3600 + 60,
             10,
             true,
@@ -551,13 +550,13 @@ mod tests {
         assert_eq!(
             trimmed,
             vec![old_idle.dir.clone()],
-            "Only an idle slot in a repository unused past the TTL is evicted"
+            "Only an idle dir in a repository unused past the TTL is evicted"
         );
-        // A warm cap keeps the newest idle slots and evicts least-recently-used first.
+        // A warm cap keeps the newest idle dirs and evicts least-recently-used first.
         let mut entries = Vec::new();
-        for (slot, age_secs) in [(0, 400), (1, 300), (2, 200), (3, 100)] {
+        for (index, age_secs) in [(0, 400), (1, 300), (2, 200), (3, 100)] {
             entries.push(entry(
-                &format!("/base/swe-target-cccccccccccccccc-slot{slot}"),
+                &format!("/base/swe-target-cccccccccccccccc-{index}"),
                 age_secs,
                 10,
                 true,
@@ -567,7 +566,7 @@ mod tests {
         assert_eq!(
             trimmed,
             vec![entries[0].dir.clone(), entries[1].dir.clone()],
-            "The cap must remove the oldest idle slots first, deterministically"
+            "The cap must remove the oldest idle dirs first, deterministically"
         );
         assert!(!trimmed.contains(&entries[2].dir) && !trimmed.contains(&entries[3].dir));
     }
@@ -595,17 +594,17 @@ mod tests {
     }
 
     #[test]
-    fn ttl_is_repo_wide_and_cap_never_evicts_busy_slots() {
+    fn ttl_is_repo_wide_and_cap_never_evicts_busy_dirs() {
         use std::time::{Duration, UNIX_EPOCH};
         let entries = vec![
             TargetEntry {
-                dir: "/base/swe-target-0123456789abcdef-slot0".into(),
+                dir: "/base/swe-target-0123456789abcdef-0".into(),
                 last_used: UNIX_EPOCH,
                 size: 10,
                 idle: true,
             },
             TargetEntry {
-                dir: "/base/swe-target-0123456789abcdef-slot1".into(),
+                dir: "/base/swe-target-0123456789abcdef-1".into(),
                 last_used: UNIX_EPOCH + Duration::from_secs(90),
                 size: 10,
                 idle: true,
@@ -634,7 +633,7 @@ mod tests {
     fn sweep_preserves_leased_targets_and_removes_idle_targets() {
         let base = crate::worktree::swe_base_dir()
             .join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
-        let target = base.join("swe-target-0123456789abcdef-slot0");
+        let target = base.join("swe-target-0123456789abcdef-0");
         let lease = TargetLease::acquire(&target).unwrap();
         std::fs::write(target.join("artifact"), b"build").unwrap();
         sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();

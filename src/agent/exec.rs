@@ -120,7 +120,7 @@ impl AgentRunner {
 
         let parallelism = build_parallelism(self.build_jobs);
         // The worker already holds its build directory for its whole lifetime
-        // (see `WorktreeGuard::ensure_build_dir`), so a step only reads the
+        // (see `WorktreeGuard::build_dir`), so a step only reads the
         // grant: no second lock is taken per command.
         let target_dir = self.build_target_dir.clone();
         let sandbox_target = target_dir.as_deref().unwrap_or(dir);

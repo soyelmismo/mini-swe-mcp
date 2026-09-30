@@ -933,14 +933,18 @@ impl<'a> TurnEngine<'a> {
             .context("Bash semaphore closed")?;
         let mut runner = self.runner.clone();
         if let Some(permit) = &build_permit {
-            self.worktree.last_build_slot = Some(permit.slot());
+            // The admission slot still doses CPU, but it no longer picks the
+            // directory: the worker leases one build dir for its whole lifetime.
             runner = runner.with_build_jobs(permit.jobs());
         }
-        runner.build_target_dir = self
-            .worktree
-            .last_build_slot
-            .map(|slot| crate::cache::slot_target_dir(&self.worktree.repo_root, slot))
-            .transpose()?;
+        // The worker's exclusive build dir: a heavy command leases one on
+        // first use, and a light command reuses it when there is one (and
+        // otherwise builds in the worktree, as before).
+        runner.build_target_dir = if heavy {
+            self.worktree.build_dir().await
+        } else {
+            self.worktree.leased_build_dir().map(Path::to_path_buf)
+        };
         runner.execute_bash(&self.worktree.path, command).await
     }
 

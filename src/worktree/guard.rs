@@ -484,6 +484,48 @@ impl WorktreeGuard {
         self.seeded.clone()
     }
 
+    /// The build directory this worker's commands build in, leasing one on the
+    /// first call.
+    ///
+    /// The lease is exclusive for the guard's lifetime and is dropped with it,
+    /// so a completed, failed or killed worker releases its directory for the
+    /// next one while a live worker never shares one with another.
+    pub(crate) async fn build_dir(&mut self) -> Option<PathBuf> {
+        if self.build_dir.is_none()
+            && let Some(lease) = self.lease_build_dir().await
+        {
+            self.build_dir = Some(lease);
+        }
+        self.build_dir.as_ref().map(|lease| lease.dir().to_path_buf())
+    }
+
+    /// The build directory this worker already leased, without leasing one.
+    ///
+    /// A light command reuses the worker's directory when it has one and
+    /// otherwise builds in its worktree, so a worker that never runs a heavy
+    /// command never takes a directory from the pool.
+    pub(crate) fn leased_build_dir(&self) -> Option<&Path> {
+        self.build_dir.as_ref().map(|lease| lease.dir())
+    }
+
+    /// Acquire the lease off the runtime: it waits on the sweep lock.
+    async fn lease_build_dir(&mut self) -> Option<crate::cache::BuildDirLease> {
+        let repo = self.repo_root.clone();
+        let acquired = tokio::task::spawn_blocking(move || crate::cache::BuildDirLease::acquire(&repo))
+            .await;
+        match acquired {
+            Ok(Ok(lease)) => Some(lease),
+            Ok(Err(error)) => {
+                debug!(%error, repo = %self.repo_root.display(), "Build directory lease unavailable");
+                None
+            }
+            Err(error) => {
+                debug!(%error, repo = %self.repo_root.display(), "Build directory lease task failed");
+                None
+            }
+        }
+    }
+
     /// Stage and commit everything in the worktree at `path`, reporting
     /// whether a commit was actually created.
     ///
