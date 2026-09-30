@@ -38,6 +38,9 @@ pub struct AgentRunner {
     pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
+    /// Fixed per-step command budget in seconds, replacing the light/heavy
+    /// classification (tests use it to avoid mutating the process env).
+    pub command_timeout_override: Option<u64>,
     pub max_retries: usize,
     pub initial_retry_delay: Duration,
 }
@@ -58,6 +61,7 @@ impl AgentRunner {
             temperature,
             network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            command_timeout_override: None,
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
         }
@@ -66,6 +70,12 @@ impl AgentRunner {
     /// Confine every bash step to an isolated network namespace (`unshare -n`).
     pub fn with_network_offline(mut self, offline: bool) -> Self {
         self.network_offline = offline;
+        self
+    }
+
+    /// Give every bash step the same `secs` budget, whatever the command.
+    pub fn with_command_timeout(mut self, secs: u64) -> Self {
+        self.command_timeout_override = Some(secs);
         self
     }
 

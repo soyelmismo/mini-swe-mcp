@@ -134,7 +134,9 @@ impl AgentRunner {
         // Classify on the model's own command, before any offline wrapper is
         // applied: a wrapper would otherwise mask the command's heaviness
         // from the timeout classifier.
-        let timeout_secs = command_timeout_secs(command);
+        let timeout_secs = self
+            .command_timeout_override
+            .unwrap_or_else(|| command_timeout_secs(command));
 
         match select_backend() {
             SandboxBackend::Kernel => {
@@ -1517,17 +1519,12 @@ mod tests {
     async fn timed_out_command_still_reports_the_output_it_produced() {
         let tmp = crate::worktree::swe_base_dir().join("exec-drain-test");
         let _ = std::fs::create_dir_all(&tmp);
-        // A one-second budget, so the test stays quick.
-        // SAFETY: this test binary runs its tests single-threaded, and no other
-        // thread in this process reads the command timeout variables.
-        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
 
         let (out, code) = runner()
+            .with_command_timeout(1)
             .execute_bash(&tmp, "echo EARLY-STDOUT; echo EARLY-STDERR >&2; sleep 300")
             .await
             .expect("a timeout is an ordinary result, not an error");
-
-        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
 
         assert_eq!(
             code,
@@ -1555,18 +1552,16 @@ mod tests {
     async fn a_leaked_pipe_does_not_hang_the_timeout_path() {
         let tmp = crate::worktree::swe_base_dir().join("exec-leak-test");
         let _ = std::fs::create_dir_all(&tmp);
-        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
 
         // `setsid` detaches the sleeper from the killed process group, so it
         // keeps the inherited stdout open past the SIGKILL.
         let started = std::time::Instant::now();
         let (out, code) = runner()
+            .with_command_timeout(1)
             .execute_bash(&tmp, "echo BEFORE-LEAK; (setsid sleep 300 &); sleep 300")
             .await
             .expect("a leaked pipe must not turn the timeout into a hang");
         let elapsed = started.elapsed();
-
-        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
 
         assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "{out:?}");
         assert!(
