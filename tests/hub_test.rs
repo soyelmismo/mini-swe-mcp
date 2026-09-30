@@ -218,14 +218,18 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("hub-thin");
     let hub_dir = hub.path().to_path_buf();
+    let _reaper = DaemonReaper(hub_dir.clone());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700))
             .expect("restrict the hub dir to 0700");
     }
+    // Worktrees and registry rows of the probe dispatch stay in the scratch dir.
+    let swe = hub.subdir("swe");
     let envs = |cmd: &mut Command| {
         cmd.env("SWE_HUB_DIR", &hub_dir)
+            .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-list")
             .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
             .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
@@ -277,20 +281,23 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
             .expect("write a proxy frame");
     }
     stdin.flush().expect("flush proxy frames");
-    for expected in ["\"protocolVersion\":\"2024-11-05\"", "\"tools\""] {
-        let mut seen = String::new();
-        for _ in 0..50 {
-            match lines.next() {
-                Some(Ok(line)) => {
-                    seen.push_str(&line);
-                    if line.contains(expected) {
-                        break;
-                    }
-                }
-                Some(Err(e)) => panic!("reading the proxy reply: {e}"),
-                None => break,
+    // Requests are served concurrently, so the replies may arrive in either
+    // order: collect one response per request (skipping notifications, which
+    // carry no id) and check the set.
+    let mut seen = String::new();
+    let mut responses = 0;
+    while responses < 2 {
+        match lines.next() {
+            Some(Ok(line)) if line.contains("\"id\"") => {
+                responses += 1;
+                seen.push_str(&line);
             }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => panic!("reading the proxy reply: {e}"),
+            None => break,
         }
+    }
+    for expected in ["\"protocolVersion\":\"2024-11-05\"", "\"tools\""] {
         assert!(seen.contains(expected), "proxy must answer with {expected}: {seen}");
     }
     drop(stdin);
@@ -339,6 +346,27 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     assert!(!bare.path().join("hub.sock").exists(), "MINI_SWE_NO_DAEMON=1 creates no socket");
 }
 
+/// Terminates every daemon that logged into `hub_dir` when dropped.
+///
+/// Auto-started daemons are detached (`setsid`) and a daemon with running
+/// workers never idles out, so a test must stop the ones it caused or they
+/// outlive the suite (and hold its output pipe open).
+struct DaemonReaper(std::path::PathBuf);
+
+impl Drop for DaemonReaper {
+    fn drop(&mut self) {
+        let log = std::fs::read_to_string(self.0.join("hub.log")).unwrap_or_default();
+        let pids: std::collections::BTreeSet<i32> = log
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix("pid=")?.parse().ok())
+            .collect();
+        for pid in pids {
+            // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+}
+
 /// Two clients with different working directories and no `repo_path` each get
 /// their own repository: the daemon resolves a relative path against the
 /// caller's `cwd` from `hub/hello`, not against its own.
@@ -348,6 +376,7 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
 
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("hub-cwd");
+    let _reaper = DaemonReaper(hub.path().to_path_buf());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -407,7 +436,7 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
     assert_ne!(a, b, "each dispatch is its own worker");
     assert_eq!(
         seen_a["repo_path"].as_str(),
-        Some(repo_a.join(".").to_string_lossy().as_ref()),
+        Some(repo_a.to_string_lossy().as_ref()),
         "the first caller's cwd must win: {seen_a}"
     );
     assert_eq!(

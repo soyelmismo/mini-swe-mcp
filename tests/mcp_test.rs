@@ -75,13 +75,10 @@ impl McpProcess {
             // `dotenvy` never overrides a variable that is already set, so
             // this dummy also keeps the suite independent of (and unable to
             // read) whatever key the developer happens to have exported.
-            // The daemon behind `--stdio` inherits this scratch registry, so
-            // the channel smoke test's synthetic row is visible to it, and
-            // every spawned proxy shares one hub directory (hence one daemon)
-            // instead of racing a private daemon per test.
             .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
-            .env("SWE_TEMP_DIR", swe_temp_dir())
-            .env("SWE_HUB_DIR", swe_temp_dir())
+            // Protocol tests exercise the in-process server; the hub transport
+            // has its own end-to-end tests (tests/hub_test.rs).
+            .env("MINI_SWE_NO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -301,29 +298,6 @@ impl Drop for McpProcess {
 
 /// Locate the freshly built server binary. Cargo exports `CARGO_BIN_EXE_<name>`
 /// for integration tests; fall back to the standard `target/<profile>/` path.
-/// A shared registry scratch dir for spawned servers, so the daemon behind
-/// `--stdio` sees the same rows the test writes.
-fn swe_temp_dir() -> String {
-    use std::sync::OnceLock;
-    static DIR: OnceLock<String> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "swe-mcp-test-swe-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("swe-registry")).expect("create the test registry dir");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .expect("restrict the test hub dir to 0700");
-        }
-        dir.to_string_lossy().into_owned()
-    })
-    .clone()
-}
-
 fn binary_command() -> (PathBuf, Vec<String>) {
     if let Ok(exe) = std::env::var("CARGO_BIN_EXE_mini-swe-mcp") {
         return (PathBuf::from(exe), vec!["--stdio".to_string()]);
@@ -1540,20 +1514,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
 /// a genuine transition rather than history.
 #[test]
 fn a_worker_transition_reaches_the_session_over_stdio() {
-    // The proxy shares one hub daemon per test process, so the worker id must
-    // be unique per test invocation, not just per process.
-    let worker_id = format!(
-        "chan-smoke-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos()
-    );
-    // The daemon behind `--stdio` reads the same scratch registry, so point
-    // this process at it before writing the synthetic rows.
-    let earlier = std::env::var("SWE_TEMP_DIR").ok();
-    unsafe { std::env::set_var("SWE_TEMP_DIR", swe_temp_dir()) };
+    let worker_id = format!("chan-smoke-{}", std::process::id());
     save_registry_entry(&synthetic_registry_row(&worker_id, RegistryStatus::Running));
 
     let mut server = McpProcess::spawn();
@@ -1563,10 +1524,6 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     save_registry_entry(&paused);
     let event = server.expect_channel_event("the paused worker");
     remove_registry_entry(&worker_id);
-    match earlier {
-        Some(v) => unsafe { std::env::set_var("SWE_TEMP_DIR", v) },
-        None => unsafe { std::env::remove_var("SWE_TEMP_DIR") },
-    }
 
     let meta = &event["params"]["meta"];
     assert_eq!(event["jsonrpc"], json!("2.0"));

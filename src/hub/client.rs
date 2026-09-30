@@ -26,7 +26,11 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         .open(paths.log())
         .context("Could not open hub log")?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
-    command.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
     // SAFETY: setsid is async-signal-safe and touches no Rust state after fork.
     unsafe {
         command.pre_exec(|| {
@@ -39,7 +43,9 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     let mut child = tokio::process::Command::from(command)
         .spawn()
         .context("Could not start hub daemon")?;
-    tokio::spawn(async move { let _ = child.wait().await; });
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(20);
@@ -61,7 +67,7 @@ async fn hello<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
         "jsonrpc": "2.0", "method": "hub/hello",
         "params": {"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
                    "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
-                   "cwd": std::env::current_dir()?}
+                   "cwd": std::env::current_dir().ok()}
     });
     writer.write_all(format!("{frame}\n").as_bytes()).await?;
     writer.flush().await?;
@@ -69,11 +75,16 @@ async fn hello<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
 }
 
 /// Forward bytes unchanged with fixed-size buffers and immediate output flushes.
-async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(mut reader: R, mut writer: W) -> Result<()> {
+async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut reader: R,
+    mut writer: W,
+) -> Result<()> {
     let mut buffer = [0; 8192];
     loop {
         let count = reader.read(&mut buffer).await?;
-        if count == 0 { return Ok(()); }
+        if count == 0 {
+            return Ok(());
+        }
         writer.write_all(&buffer[..count]).await?;
         writer.flush().await?;
     }
@@ -98,11 +109,19 @@ pub struct HubClient {
 
 impl HubClient {
     pub async fn connect() -> Result<Self> {
-        let mut client = Self { stream: BufReader::new(connect_or_spawn().await?), next_id: 1 };
-        client.request("initialize", json!({
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "mini-swe-cli", "version": env!("CARGO_PKG_VERSION")}
-        })).await?;
+        let mut client = Self {
+            stream: BufReader::new(connect_or_spawn().await?),
+            next_id: 1,
+        };
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "mini-swe-cli", "version": env!("CARGO_PKG_VERSION")}
+                }),
+            )
+            .await?;
         hello(client.stream.get_mut()).await?;
         Ok(client)
     }
@@ -111,26 +130,47 @@ impl HubClient {
         let id = self.next_id;
         self.next_id += 1;
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.stream.get_mut().write_all(format!("{frame}\n").as_bytes()).await?;
+        self.stream
+            .get_mut()
+            .write_all(format!("{frame}\n").as_bytes())
+            .await?;
         loop {
             // Tool responses include bounded diffs and logs, larger than requests.
             const MAX_REPLY_BYTES: u64 = 32 * 1024 * 1024;
             let mut line = Vec::new();
-            (&mut self.stream).take(MAX_REPLY_BYTES + 1).read_until(b'\n', &mut line).await?;
+            (&mut self.stream)
+                .take(MAX_REPLY_BYTES + 1)
+                .read_until(b'\n', &mut line)
+                .await?;
             anyhow::ensure!(!line.is_empty(), "Hub closed the connection");
-            anyhow::ensure!(line.len() as u64 <= MAX_REPLY_BYTES, "Hub response exceeds 32 MiB");
+            anyhow::ensure!(
+                line.len() as u64 <= MAX_REPLY_BYTES,
+                "Hub response exceeds 32 MiB"
+            );
             let reply: Value = serde_json::from_slice(&line)?;
-            if reply.get("id") != Some(&json!(id)) { continue; }
+            if reply.get("id") != Some(&json!(id)) {
+                continue;
+            }
             if let Some(error) = reply.get("error") {
-                anyhow::bail!("{}", error["message"].as_str().unwrap_or("Hub request failed"));
+                anyhow::bail!(
+                    "{}",
+                    error["message"].as_str().unwrap_or("Hub request failed")
+                );
             }
             return Ok(reply["result"].clone());
         }
     }
 
     pub async fn worker(&mut self, arguments: Value) -> Result<Value> {
-        let result = self.request("tools/call", json!({"name": "worker", "arguments": arguments})).await?;
-        let text = result["content"][0]["text"].as_str().context("Missing worker tool result")?;
+        let result = self
+            .request(
+                "tools/call",
+                json!({"name": "worker", "arguments": arguments}),
+            )
+            .await?;
+        let text = result["content"][0]["text"]
+            .as_str()
+            .context("Missing worker tool result")?;
         Ok(serde_json::from_str(text)?)
     }
 }
