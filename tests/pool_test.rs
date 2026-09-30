@@ -22,8 +22,9 @@ use mini_swe_mcp::agent::AgentStepLog;
 use mini_swe_mcp::pool::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, LogBuffer, LogRetentionPolicy,
     MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES, MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING,
-    WorkerPhase, WorkerPool, WorkerRecord, WorkerState, build_step_log, clamp_string, emit_view,
-    parse_ask_orchestrator, parse_request_turns, summarize_command,
+    RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRecord, WorkerRegistryEntry,
+    WorkerState, build_step_log, clamp_string, emit_view, parse_ask_orchestrator,
+    parse_request_turns, summarize_command,
 };
 
 // ---------------------------------------------------------------------------
@@ -538,6 +539,7 @@ fn running_worker(id: &str) -> WorkerRecord {
             last_command: "ls".into(),
             started_at: 0,
         },
+        metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
         pending_steer: Vec::new(),
         resume_tx: None,
@@ -684,6 +686,7 @@ async fn steer_rejects_unsteerable_workers() {
         artifacts: vec![],
         branch: None,
         verified: None,
+        metrics: WorkerMetrics::default(),
     };
     pool.__test_insert_worker(done).await;
     let err = pool.steer("w4", "x".into()).await.unwrap_err();
@@ -721,6 +724,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
         artifacts: vec!["a".repeat(4096)],
         branch: Some("feature".into()),
         verified: None,
+        metrics: WorkerMetrics::default(),
     };
     pool.__test_insert_worker(w).await;
 
@@ -757,6 +761,7 @@ async fn worker_progress_reports_failed_workers() {
         error: "boom".into(),
         step: 3,
         failed_at: 0,
+        metrics: WorkerMetrics::default(),
     };
     pool.__test_insert_worker(w).await;
 
@@ -1019,4 +1024,122 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
     assert!(leftovers.is_empty(), "worker exit leaked files: {leftovers:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+// ----------
+// Per-worker health metrics (selfimprove-I7)
+// ----------
+
+/// A registry row with every counter moved, as a finished run would write it.
+fn measured_entry() -> WorkerRegistryEntry {
+    WorkerRegistryEntry {
+        id: "m1".into(),
+        pid: 42,
+        task: "t".into(),
+        model: "ninja".into(),
+        status: RegistryStatus::Completed,
+        step: 142,
+        max_turns: 150,
+        last_command: "completed".into(),
+        question: None,
+        started_at: 1_700_000_000,
+        updated_at: 1_700_000_100,
+        group: Some("g".into()),
+        repo_path: Some("/tmp/repo".into()),
+        metrics: WorkerMetrics {
+            turns_used: 142,
+            extensions_granted: 4,
+            extensions_refused: 2,
+            repeat_blocks: 3,
+            stagnation_nudges: 1,
+            loop_pauses: 1,
+            verify_runs: 2,
+            verify_failures: 1,
+            diff_files: 5,
+            diff_insertions: 120,
+            diff_deletions: 340,
+        },
+    }
+}
+
+#[test]
+fn test_worker_metrics_survive_a_registry_row_round_trip() {
+    let entry = measured_entry();
+    let json = serde_json::to_string(&entry).expect("registry entry serializes");
+    let back: WorkerRegistryEntry = serde_json::from_str(&json).expect("registry entry parses");
+    assert_eq!(back.metrics, entry.metrics);
+    assert_eq!(back.metrics.turns_used, 142);
+    assert_eq!(back.metrics.diff_insertions, 120);
+}
+
+#[test]
+fn test_a_registry_row_written_before_the_metrics_still_parses() {
+    // The shape a build without counters wrote: no `metrics`, and none of the
+    // optional fields either.
+    let legacy = r#"{
+        "id": "old1",
+        "pid": 7,
+        "task": "t",
+        "model": "ninja",
+        "status": "completed",
+        "step": 12,
+        "max_turns": 20,
+        "last_command": "completed",
+        "started_at": 1,
+        "updated_at": 2
+    }"#;
+    let entry: WorkerRegistryEntry =
+        serde_json::from_str(legacy).expect("a row without metrics must still parse");
+    assert_eq!(entry.metrics, WorkerMetrics::default());
+    assert!(!entry.metrics.is_recorded());
+    assert!(!WorkerMetrics::default().is_recorded());
+}
+
+#[test]
+fn test_a_partially_recorded_metrics_object_fills_the_rest_with_zero() {
+    let partial: WorkerMetrics =
+        serde_json::from_str(r#"{"repeat_blocks":3,"stagnation_nudges":1}"#).expect("parses");
+    assert_eq!(partial.repeat_blocks, 3);
+    assert_eq!(partial.stagnation_nudges, 1);
+    assert_eq!(partial.turns_used, 0);
+    assert_eq!(partial.verify_runs, 0);
+    assert!(partial.is_recorded());
+}
+
+#[test]
+fn test_a_completed_state_serializes_its_health_counters() {
+    let state = WorkerState::Completed {
+        turns: 3,
+        diff: String::new(),
+        summary: "s".into(),
+        completed_at: 1,
+        artifacts: Vec::new(),
+        branch: None,
+        verified: Some(true),
+        metrics: measured_entry().metrics,
+    };
+    let json = serde_json::to_value(&state).expect("state serializes");
+    assert_eq!(json["state"], "Completed");
+    assert_eq!(json["details"]["metrics"]["turns_used"], 142);
+    assert_eq!(json["details"]["metrics"]["verify_runs"], 2);
+    assert_eq!(json["details"]["metrics"]["loop_pauses"], 1);
+}
+
+#[tokio::test]
+async fn test_a_killed_worker_reports_what_the_run_had_measured() {
+    // The record caches the phase loop's counters, so a kill racing the loop
+    // still reports the measurements the run had made.
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let mut record = running_worker("f1");
+    record.metrics.repeat_blocks = 2;
+    record.metrics.turns_used = 9;
+    pool.__test_insert_worker(record).await;
+
+    assert!(pool.kill("f1").await);
+    let Some(WorkerState::Failed { metrics, .. }) = pool.get_worker_state("f1").await else {
+        panic!("a killed worker must leave a Failed state");
+    };
+    assert_eq!(metrics.repeat_blocks, 2);
+    assert_eq!(metrics.turns_used, 9);
 }

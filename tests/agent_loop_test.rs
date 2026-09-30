@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
-use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerPool, WorkerState};
+use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerMetrics, WorkerPool, WorkerState};
 
 /// A tool call the engine cannot turn into a command: valid JSON, but no
 /// `command` key, so `BashArgs` fails to deserialize and `command` is `None`.
@@ -352,6 +352,17 @@ fn user_messages(request: &Value) -> Vec<String> {
         .filter(|m| m["role"] == json!("user"))
         .map(|m| m["content"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// The health counters a completed run reported.
+///
+/// The counters are what an orchestrator grades a worker on, so the tests that
+/// exercise a guard assert on the number the guard moved.
+fn metrics_of(state: &WorkerState) -> WorkerMetrics {
+    match state {
+        WorkerState::Completed { metrics, .. } => *metrics,
+        other => panic!("expected a completed worker, got {other:?}"),
+    }
 }
 
 /// Dispatch one worker against `base_url` and wait for it to finish.
@@ -681,6 +692,13 @@ async fn verify_gate_fails_then_passes_after_fix_turn() {
         other => panic!("worker must complete, got {other:?}"),
     }
 
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        (metrics.verify_runs, metrics.verify_failures),
+        (2, 1),
+        "both gate runs and the single failure must be counted, got {metrics:?}"
+    );
+
     // The model must have been told the verification failed, and the completion
     // turn must stay answered: a `tool_calls` turn is replayed with a tool
     // result rather than left dangling.
@@ -716,7 +734,7 @@ async fn verify_gate_exhausts_after_three_failures() {
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, Some("exit 1".to_string())).await;
 
     match state {
-        WorkerState::Completed { verified, summary, .. } => {
+        WorkerState::Completed { verified, ref summary, .. } => {
             assert_eq!(verified, Some(false), "three failures must flag the worker unverified");
             assert!(
                 summary.contains("failing verification"),
@@ -725,6 +743,13 @@ async fn verify_gate_exhausts_after_three_failures() {
         }
         other => panic!("worker must complete, got {other:?}"),
     }
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        (metrics.verify_runs, metrics.verify_failures),
+        (3, 3),
+        "the exhausted budget must be visible in the counters, got {metrics:?}"
+    );
 }
 
 // ----------
@@ -756,6 +781,14 @@ async fn a_repeated_command_is_answered_without_being_executed() {
         matches!(state, WorkerState::Completed { .. }),
         "worker must complete after the repetition, got {state:?}"
     );
+
+    let metrics = metrics_of(&state);
+    assert_eq!(metrics.turns_used, 4, "every scripted turn must be counted");
+    assert_eq!(
+        metrics.repeat_blocks, 1,
+        "the one repeated command must be counted, got {metrics:?}"
+    );
+    assert_eq!(metrics.loop_pauses, 0, "one repetition does not park a worker");
 
     let requests = server.requests.all().await;
     assert_eq!(requests.len(), 4, "got {requests:?}");
@@ -829,6 +862,16 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
         matches!(state, WorkerState::Completed { .. }),
         "the worker must finish once the orchestrator guides it, got {state:?}"
     );
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        metrics.repeat_blocks, 3,
+        "all three blocked repetitions must be counted, got {metrics:?}"
+    );
+    assert_eq!(
+        metrics.loop_pauses, 1,
+        "hitting the limit parks the worker exactly once, got {metrics:?}"
+    );
 }
 
 /// A `REQUEST_TURNS` inside the self-grant budget extends the loop.
@@ -867,6 +910,13 @@ async fn a_turn_extension_within_the_budget_extends_the_loop() {
             "a grant within budget must not be refused, request {i}: {request}"
         );
     }
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        metrics.extensions_granted, 2,
+        "the two self-granted turns must be counted, got {metrics:?}"
+    );
+    assert_eq!(metrics.extensions_refused, 0);
 }
 
 /// A `REQUEST_TURNS` past the budget is refused, and the model is told to wrap
@@ -904,6 +954,13 @@ async fn a_turn_extension_beyond_the_budget_is_refused() {
         refusal.contains(COMPLETION_SENTINEL) && refusal.contains("ASK_ORCHESTRATOR"),
         "the refusal must offer both ways out, got {refusal:?}"
     );
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        metrics.extensions_refused, 1,
+        "the refused ask must be counted, got {metrics:?}"
+    );
+    assert_eq!(metrics.extensions_granted, 0);
 }
 
 /// Every twentieth turn a dirty worktree is checkpoint-committed, so the work
@@ -929,6 +986,14 @@ async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
         matches!(state, WorkerState::Completed { .. }),
         "worker must complete, got {state:?}"
     );
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        (metrics.diff_files, metrics.diff_insertions, metrics.diff_deletions),
+        (1, 1, 0),
+        "the final diff must be measured against the worker's base commit, got {metrics:?}"
+    );
+    assert_eq!(metrics.turns_used, 25, "every scripted turn must be counted");
 
     let branch = format!("worker-{worker_id}");
     let subjects = git_capture(repo.path(), &["log", "--format=%s", &branch]);
@@ -1053,4 +1118,11 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
         injected.contains("Stop exploring") && injected.contains("ASK_ORCHESTRATOR"),
         "the nudge must offer both ways out, got {injected:?}"
     );
+
+    let metrics = metrics_of(&state);
+    assert_eq!(
+        metrics.stagnation_nudges, 1,
+        "the single nudge must be counted, got {metrics:?}"
+    );
+    assert_eq!(metrics.turns_used, 41, "implementer and reviewer turns together");
 }

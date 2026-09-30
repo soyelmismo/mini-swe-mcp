@@ -953,6 +953,7 @@ pub async fn run_monitor(once: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::WorkerMetrics;
 
     /// Builder for registry rows: the tests below touch every field, so a
     /// positional 8-argument helper would be unreadable.
@@ -1431,6 +1432,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The stacked row has room the inline row does not, so the repeat/nudge
+    /// counts ride its label line -- and never overflow it.
+    #[test]
+    fn test_stacked_row_carries_the_repeat_and_nudge_counts() {
+        let entries = vec![Row::new("health01")
+            .task("Refactor the authentication middleware into smaller pieces")
+            .command("cargo test --all")
+            .metrics(3, 1)
+            .repo("local")
+            .build()];
+
+        let text = render_dashboard_with_width(&entries, 1060, false, MIN_TERMINAL_WIDTH);
+        assert!(
+            text.contains("3 repeats, 1 nudge"),
+            "the stacked row must show the health counters:\n{text}"
+        );
+        for line in text.lines() {
+            assert!(
+                visible_width(line) <= MIN_TERMINAL_WIDTH,
+                "line overflows the terminal width: {line:?}"
+            );
+        }
+
+        // The inline row has no room for a new column, so it shows none.
+        let inline = render_dashboard_with_width(&entries, 1060, false, 200);
+        assert!(!inline.contains("repeats"), "{inline}");
     }
 
     #[test]

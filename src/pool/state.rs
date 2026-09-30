@@ -324,7 +324,8 @@ mod tests {
             WorkerState::Failed {
                 error: "boom".into(),
                 step: 3,
-                failed_at: 0
+                failed_at: 0,
+                metrics: WorkerMetrics::default(),
             }
             .step(),
             3
