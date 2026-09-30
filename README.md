@@ -193,7 +193,7 @@ For Claude Code, add this to `~/.claude/settings.json`:
 ```
 
 The line looks like `⚙ 3 running · 1 needs input · 2 done`. Zero counts are
-omitted; reviewing workers count as running, and failures and stopped workers
+omitted; reviewing workers count as running, and failed and stopped workers
 are shown separately. Terminal rows are recent for five minutes after their
 last update. With no active or recent workers, it prints nothing. This command
 reads the registry directly, needs no API key, and always exits successfully.

@@ -58,7 +58,11 @@ pub fn format_status_line(entries: &[WorkerRegistryEntry], now: u64) -> String {
         .filter(|(count, _)| *count > 0)
         .map(|(count, label)| format!("{count} {label}"))
         .collect();
-    if parts.is_empty() { String::new() } else { format!("⚙ {}", parts.join(" · ")) }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("⚙ {}", parts.join(" · "))
+    }
 }
 
 /// Print the registry-only status line, ignoring unavailable rows and broken

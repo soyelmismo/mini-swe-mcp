@@ -217,7 +217,10 @@ impl HubServer {
             .await
             .context("Hub recovery task failed")?;
         info!(workers = recovered, "Recovered orphaned hub workers");
-        append_log(&paths.log(), &format!("recovered {recovered} orphaned workers"));
+        append_log(
+            &paths.log(),
+            &format!("recovered {recovered} orphaned workers"),
+        );
 
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("Could not bind hub socket {}", socket.display()))?;

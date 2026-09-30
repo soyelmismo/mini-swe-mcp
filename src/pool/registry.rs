@@ -309,22 +309,27 @@ fn branch_exists(
 /// Dead workers are normalized to stopped, just as in the dashboard loader.
 /// Recovery uses the raw iterator instead to retain their stored status.
 pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
-    raw_registry_entries().map(|(_, mut entry)| {
-        if entry.status.is_live() && !crate::worktree::is_process_alive(entry.pid) {
-            entry.status = RegistryStatus::Stopped;
-        }
-        entry
-    }).collect()
+    raw_registry_entries()
+        .map(|(_, mut entry)| {
+            if entry.status.is_live() && !crate::worktree::is_process_alive(entry.pid) {
+                entry.status = RegistryStatus::Stopped;
+            }
+            entry
+        })
+        .collect()
 }
 
 fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
     let mut seen = std::collections::HashSet::new();
-    crate::worktree::swe_base_dirs().into_iter().flat_map(|base| {
-        std::fs::read_dir(base.join("swe-registry"))
-            .into_iter()
-            .flatten()
-            .flatten()
-    }).filter_map(move |file| {
+    crate::worktree::swe_base_dirs()
+        .into_iter()
+        .flat_map(|base| {
+            std::fs::read_dir(base.join("swe-registry"))
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter_map(move |file| {
         let path = file.path();
         if path.extension()?.to_str()? != "json" {
             return None;
@@ -341,7 +346,6 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
         }
         Some((path, entry))
     })
-}
 
 /// Rewrite the dead rows of a crashed hub into failed ones before serving.
 ///
@@ -358,15 +362,25 @@ pub(crate) fn recover_orphaned_workers() -> usize {
         {
             continue;
         }
-        let base = path.parent().and_then(|dir| dir.parent()).expect("registry base");
+        let base = path
+            .parent()
+            .and_then(|dir| dir.parent())
+            .expect("registry base");
         let checkout = base.join(format!("swe-wt-{}", entry.id));
-        let salvaged = !checkout.is_dir()
-            || crate::worktree::prune::salvage_dirty_worktree(&checkout);
+        let salvaged =
+            !checkout.is_dir() || crate::worktree::prune::salvage_dirty_worktree(&checkout);
         if salvaged && checkout.is_dir() {
             // Release the registration so steer can reattach to the branch.
             // Unlike prune, recovery never retires the branch or history.
             let removed = crate::worktree::git(
-                &checkout, "worktree remove", &["worktree", "remove", "--force", &checkout.to_string_lossy()],
+                &checkout,
+                "worktree remove",
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &checkout.to_string_lossy(),
+                ],
             );
             if !removed.is_ok_and(|out| out.status.success()) {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");

@@ -655,3 +655,139 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     let _ = task.await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Crash recovery: a dead row and its dirty checkout become a failed row with
+/// the salvage message, the uncommitted file lands on `worker-<id>`, and the
+/// saved history survives for a later revision.
+#[test]
+fn daemon_recovers_an_orphaned_worker_on_startup() {
+    use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry};
+    use std::process::{Command, Stdio};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("git {args:?} failed to run"));
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let root = scratch_dir();
+    let hub = root.join("hub");
+    let swe = root.join("swe");
+    let repo = root.join("repo");
+    for dir in [&hub, &swe, &repo] {
+        std::fs::create_dir_all(dir).expect("create scratch dir");
+    }
+    let mut dead = Command::new("true").spawn().expect("spawn short-lived owner");
+    let dead_pid = dead.id();
+    dead.wait().expect("reap owner");
+    assert!(!mini_swe_mcp::worktree::is_process_alive(dead_pid));
+    let _reaper = DaemonReaper(hub.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict hub dir");
+        std::fs::set_permissions(&swe, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict swe dir");
+    }
+    // A repo with one commit, plus a registered worktree carrying an
+    // uncommitted file on `worker-<orphan>`.
+    let wid = "orphan1";
+    git(&repo, &["init", "-b", "master"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("seed the repo");
+    git(&repo, &["add", "base.txt"]);
+    git(&repo, &["commit", "-m", "seed"]);
+    let branch = format!("worker-{wid}");
+    let checkout = swe.join(format!("swe-wt-{wid}"));
+    git(&repo, &[
+        "worktree", "add", "-b", &branch, &checkout.to_string_lossy(), "HEAD",
+    ]);
+    std::fs::write(checkout.join("dirty.txt"), "unsaved\n").expect("dirty the checkout");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let row = serde_json::json!({
+        "id": wid, "pid": dead_pid, "task": "t", "model": "ninja", "status": "running",
+        "step": 3, "max_turns": 10, "last_command": "cargo test",
+        "started_at": now - 60, "updated_at": now - 60,
+    });
+    std::fs::create_dir_all(swe.join("swe-registry")).expect("create the registry");
+    std::fs::write(swe.join("swe-registry").join(format!("{wid}.json")), row.to_string())
+        .expect("write the orphan row");
+    let history = serde_json::json!({"worker": wid});
+    std::fs::write(swe.join(format!("swe-wt-{wid}.history.json")), history.to_string())
+        .expect("write the history file");
+
+    let mut daemon = Command::new(common::binary_path())
+        .arg("daemon")
+        .env("SWE_HUB_DIR", &hub)
+        .env("SWE_TEMP_DIR", &swe)
+        .env("TMPDIR", &swe)
+        .env("HUB_IDLE_SECS", "1")
+        .env("ENV_FILE", root.join("absent.env"))
+        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn recovery daemon");
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(hub.join("hub.sock")).is_ok() {
+            break;
+        }
+        assert!(daemon.try_wait().expect("probe daemon").is_none(), "daemon exited early");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(hub.join("hub.sock").exists(), "daemon must listen after recovery");
+    let entry: WorkerRegistryEntry = serde_json::from_slice(
+        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json")))
+            .expect("the orphan row survives recovery"),
+    ).expect("registry JSON");
+    assert_eq!(entry.status, RegistryStatus::Failed, "the orphan row must be failed");
+    let expected = format!("hub restarted; work salvaged on branch worker-{wid}");
+    assert_eq!(entry.last_command, expected, "the owner must see the salvage branch");
+    let log = Command::new("git")
+        .current_dir(&repo)
+        .args(["log", &branch, "--oneline"])
+        .output()
+        .expect("read the worker branch");
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("salvaged uncommitted work"),
+        "the uncommitted file must be committed on {branch}"
+    );
+    let show = Command::new("git")
+        .current_dir(&repo)
+        .args(["show", &format!("{branch}:dirty.txt")])
+        .output()
+        .expect("read the salvaged file");
+    assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "unsaved");
+    assert!(
+        swe.join(format!("swe-wt-{wid}.history.json")).is_file(),
+        "recovery must keep the history file for revision"
+    );
+    let registered = Command::new("git")
+        .current_dir(&repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("list worktrees");
+    assert!(
+        !String::from_utf8_lossy(&registered.stdout).contains(checkout.to_string_lossy().as_ref()),
+        "the orphan checkout must be released so steer can reopen the branch"
+    );
+
+    for _ in 0..100 {
+        if daemon.try_wait().expect("probe idle shutdown").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(daemon.try_wait().expect("probe exit").is_some(), "daemon must idle out");
+    let log = std::fs::read_to_string(hub.join("hub.log")).expect("read recovery log");
+    assert!(log.contains("recovered 1 orphaned workers"), "{log}");
+    let _ = std::fs::remove_dir_all(&root);
+}
