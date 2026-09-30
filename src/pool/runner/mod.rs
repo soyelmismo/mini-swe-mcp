@@ -33,7 +33,7 @@ use crate::worktree::{FileFingerprint, WorktreeGuard};
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
 use super::steer::remove_steer_file;
-use super::revision::{ChatMessage, WorkerHistory, append_history_message};
+use super::revision::{WorkerHistory, append_history_message};
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
@@ -248,17 +248,12 @@ impl WorkerPool {
             verify: verify.map(|v| v.to_string()),
             max_turns,
             review_after,
-            revision: self
-                .workers
-                .read()
-                .await
-                .get(&worker_id)
-                .map(|w| w.revision)
-                .unwrap_or(0),
+            revision: meta.revision,
+            auto_continues: meta.auto_continues,
             owner: Some(meta.owner.clone()),
             messages,
         };
-        if let Err(e) = save_worker_history(&worker_id, &history) {
+        if let Err(e) = Self::append_history_messages(&worker_id, &history, &history.messages) {
             warn!(
                 worker = %worker_id,
                 error = %e,
@@ -339,7 +334,6 @@ impl WorkerPool {
             max_turns,
             review_after: review_after.clone(),
             revision: meta.revision,
-            auto_continues: meta.auto_continues,
             auto_continues: meta.auto_continues,
             owner: Some(meta.owner.clone()),
             messages: Vec::new(),

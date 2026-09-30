@@ -683,7 +683,7 @@ impl WorkerPool {
     ///
     /// `revision_turns` is the fresh turn budget of a revision (`None` takes
     /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
-    pub async fn steer(&self, id: &str, message: String) -> Result<()> {
+    pub async fn steer(&self, id: &str, message: String) -> Result<SteerOutcome> {
         self.steer_with_budget(id, message, None).await
     }
 

@@ -49,12 +49,13 @@ pub fn format_status_line(entries: &[WorkerRegistryEntry], now: u64) -> String {
             RegistryStatus::Completed => 2,
             RegistryStatus::Failed => 3,
             RegistryStatus::Stopped => 4,
+            RegistryStatus::Interrupted => 5,
         };
         counts[index] += 1;
     }
     let parts: Vec<_> = counts
         .into_iter()
-        .zip(["running", "needs input", "done", "failed", "stopped"])
+        .zip(["running", "needs input", "done", "failed", "stopped", "interrupted"])
         .filter(|(count, _)| *count > 0)
         .map(|(count, label)| format!("{count} {label}"))
         .collect();
@@ -619,6 +620,7 @@ impl<'a> RepoGroup<'a> {
             RegistryStatus::Completed => self.completed += 1,
             RegistryStatus::Failed => self.failed += 1,
             RegistryStatus::Stopped => self.stopped += 1,
+            RegistryStatus::Interrupted => self.stopped += 1,
         }
         self.workers.push(entry);
     }
@@ -684,6 +686,7 @@ pub fn render_dashboard_with_width(
             RegistryStatus::Completed => completed += 1,
             RegistryStatus::Failed => failed += 1,
             RegistryStatus::Stopped => stopped += 1,
+            RegistryStatus::Interrupted => stopped += 1,
         }
         let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
         repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);

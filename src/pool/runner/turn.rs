@@ -33,7 +33,7 @@ use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::history::compact_history;
-use super::revision::{WorkerHistory, append_history_message};
+use super::super::revision::{WorkerHistory, append_history_message};
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
