@@ -12,6 +12,7 @@
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::server::McpServer;
@@ -601,43 +602,110 @@ impl McpServer {
         }
     }
 
-    /// Turn budget used as the progress denominator of an awaited worker.
+    /// `watch` action: block until one of the caller's own workers produces an
+    /// event, replaying the ones it missed while it was away.
     ///
-    /// The registry row written at dispatch time is the only record of the
-    /// budget that outlives the originating call, so a re-attached `wait`
-    /// (and a `steer --wait`) reports the same `N/M` the dispatch did. A
-    /// worker with no row reports `0` rather than a fabricated budget.
-    fn awaited_max_turns(wid: &str) -> usize {
-        crate::pool::load_registry_entry(wid)
-            .map(|entry| entry.max_turns)
-            .unwrap_or(0)
-    }
-
-    /// `wait` action: re-attach to a worker dispatched earlier and block until
-    /// it finishes, fails or pauses for steering.
-    ///
-    /// The payload is exactly what `dispatch` with `wait: true` returns, so an
-    /// orchestrator that lost the handle to a long call can still be notified
-    /// of the next event by a single new call. With `timeout_secs` the wait
-    /// instead ends with `status: "still_running"` and the caller waits again.
-    async fn handle_wait(
+    /// This is the MCP-only orchestrator's equivalent of `mini-swe-mcp watch`:
+    /// dispatch and steer never block, so this is the only way to wait. It is
+    /// the same long-poll the CLI runs -- the router already filters every
+    /// worker to its owner -- and it answers `status: "no_event"` when
+    /// `timeout_secs` expires first, so a caller under a host deadline can
+    /// simply call `watch` again.
+    async fn handle_watch(
         &self,
         args: &Value,
-        token: Option<&Value>,
-        tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "wait")?;
-        self.require_owner(wid, ctx).await?;
-        if self.pool.get_worker_state(wid).await.is_none() {
-            anyhow::bail!("Worker not found: {wid}");
+        let ids: std::collections::BTreeSet<String> = args["worker_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let group = args.get("group").and_then(Value::as_str);
+        let timeout = Self::get_timeout(args, "watch")?;
+        let started = tokio::time::Instant::now();
+        let mut changes = self.pool.subscribe_changes();
+        let mut initial = true;
+        loop {
+            let reply = self.watch_poll(ctx, &ids, group, initial).await?;
+            let events = reply["events"].as_array().cloned().unwrap_or_default();
+            if !events.is_empty() {
+                // Acknowledge what was delivered: the router's per-agent
+                // backlog is bounded, and a caller that never acks would
+                // eventually see `dropped_events` instead of its own history.
+                for event in &events {
+                    self.watch_ack(ctx, event["sequence"].as_u64().unwrap_or(0)).await?;
+                }
+                return Ok(json!({
+                    "status": "event",
+                    "events": events,
+                    "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
+                }));
+            }
+            let watching = reply["watching"].as_array().is_some_and(|w| !w.is_empty());
+            if initial && !watching {
+                return Ok(json!({
+                    "status": "no_event",
+                    "events": [],
+                    "watching": [],
+                    "message": "nothing to watch",
+                }));
+            }
+            initial = false;
+            if !watching {
+                return Ok(json!({"status": "no_event", "events": [], "watching": []}));
+            }
+            let left = match timeout {
+                Some(t) => match t.checked_sub(started.elapsed()) {
+                    Some(left) => left,
+                    None => {
+                        return Ok(json!({
+                            "status": "no_event",
+                            "events": [],
+                            "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
+                        }));
+                    }
+                },
+                None => Duration::from_secs(1),
+            };
+            // The tick bounds how long a missed wake-up can stall the poll;
+            // the pool's change channel is what makes it prompt.
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(left) => {}
+            }
         }
-        self.await_worker_result_until(
-            wid,
-            Self::awaited_max_turns(wid),
-            Self::get_timeout(args, "wait")?,
-            token,
-            tx,
+    }
+
+    /// One `hub/watch` request against this server's own event router.
+    async fn watch_poll(
+        &self,
+        ctx: &super::server::ConnectionContext,
+        ids: &std::collections::BTreeSet<String>,
+        group: Option<&str>,
+        initial: bool,
+    ) -> Result<Value> {
+        let params = json!({
+            "worker_ids": ids.iter().collect::<Vec<_>>(),
+            "group": group,
+            "initial": initial,
+        });
+        super::events::watch_request(&self.pool, &self.hub_events, ctx, params, false).await
+    }
+
+    /// Acknowledge one delivered event so it leaves the caller's backlog.
+    async fn watch_ack(
+        &self,
+        ctx: &super::server::ConnectionContext,
+        sequence: u64,
+    ) -> Result<Value> {
+        super::events::watch_request(
+            &self.pool,
+            &self.hub_events,
+            ctx,
+            json!({ "sequence": sequence }),
+            true,
         )
         .await
     }
@@ -650,8 +718,8 @@ impl McpServer {
     async fn handle_steer(
         &self,
         args: &Value,
-        token: Option<&Value>,
-        tx: Option<&mpsc::Sender<String>>,
+        _token: Option<&Value>,
+        _tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "steer")?;

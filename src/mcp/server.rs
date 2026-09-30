@@ -35,7 +35,7 @@ pub struct McpServer {
     /// mutated after construction, so the payload is byte-identical for the
     /// process lifetime and is cloned (an `Arc` memcpy) instead of rebuilt.
     pub(super) tools_list: Arc<Value>,
-    hub_events: Arc<Mutex<super::events::EventRouter>>,
+    pub(super) hub_events: Arc<Mutex<super::events::EventRouter>>,
     hub_enabled: Arc<std::sync::atomic::AtomicBool>,
     shutdown: watch::Sender<bool>,
     daemon_version: Arc<str>,
