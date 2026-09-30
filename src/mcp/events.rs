@@ -12,10 +12,11 @@
 //! always safe.
 //!
 //! [`spawn_event_stream`] is the producer: it sleeps on the pool's change
-//! subscription and diffs the worker state on every wake-up (plus a coarse
-//! fallback tick for workers owned by another process) — this process's pool plus the shared on-disk registry, so a
-//! worker owned by another `mini-swe-mcp` process (a CLI dispatch) is reported
-//! too — and emits one notification per transition into a state the
+//! subscription and diffs the worker state on every wake-up, plus a coarse
+//! fallback tick for workers owned by another process. It reads this
+//! process's pool plus the shared on-disk registry, so a worker owned by
+//! another `mini-swe-mcp` process (a CLI dispatch) is reported too — and emits
+//! one notification per transition into a state the
 //! orchestrator has to act on: paused (`needs_input`), `completed` and
 //! `failed`. A worker that was already terminal when the task started is
 //! seeded into the first snapshot instead of being diffed against an empty one,
