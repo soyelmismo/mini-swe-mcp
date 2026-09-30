@@ -428,6 +428,7 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
 }
 
 use super::runner::WorkerLaunchConfig;
+use super::resolve_continuation_base;
 
 /// What [`WorkerPool::steer_with_budget`] actually did, so the reply can only
 /// claim what happened.
@@ -595,9 +596,10 @@ impl super::WorkerPool {
         let base_branch = detect_base_branch(&repo_path);
         // The base the diff is measured from: the recorded one, else the
         // merge-base of the branch with the base branch.
-        let base_commit = super::resolve_continuation_base(&repo_path, &branch, base_branch.as_deref())
+        let base_commit = resolve_continuation_base(&repo_path, &branch, base_branch.as_deref())
             .await
-            .unwrap_or_else(|| entry.base_commit.clone().unwrap_or_default());
+            .or_else(|| entry.base_commit.clone())
+            .unwrap_or_default();
         let task = entry.task.clone();
         let conversation = format!(
             "{system}\n\n\
@@ -611,21 +613,21 @@ impl super::WorkerPool {
             reason = entry.status.display_name(),
         );
         let history = WorkerHistory {
-            worker_id: id.to_string(),
             task,
+            group: entry.group.clone(),
             model: entry.model.clone(),
             temperature: None,
             repo_path: repo_path.to_string_lossy().to_string(),
-            branch: branch.clone(),
             base_commit,
             base_branch,
-            review_after: None,
+            branch: branch.clone(),
             network_offline: false,
-            verify: Vec::new(),
+            verify: None,
+            max_turns,
+            review_after: None,
             revision: entry.revision,
-            auto_continues: 0,
+            auto_continues: entry.auto_continues,
             owner: entry.owner.clone(),
-            group: entry.group.clone(),
             messages: vec![ChatMessage::text(crate::agent::Role::User, conversation)],
         };
         let outcome = self
@@ -808,6 +810,10 @@ impl super::WorkerPool {
             group: history.group.clone(),
             repo_path: Some(history.repo_path.clone()),
             metrics: super::WorkerMetrics::default(),
+            base_branch: history.base_branch.clone(),
+            base_commit: Some(history.base_commit.clone()),
+            revision,
+            auto_continues: history.auto_continues,
             owner: Some(owner.clone()),
         };
 
@@ -823,6 +829,8 @@ impl super::WorkerPool {
             started_at: now,
             pid: std::process::id(),
             metrics: super::WorkerMetrics::default(),
+            revision,
+            auto_continues: history.auto_continues,
             owner,
         };
         let mut meta_for_fail = meta;

@@ -325,6 +325,8 @@ impl WorkerPool {
             pid: std::process::id(),
             // Filled in by the phase loop; the dispatch itself measures nothing.
             metrics: WorkerMetrics::default(),
+            revision: 0,
+            auto_continues: 0,
         };
 
         let initial_record = WorkerRecord {

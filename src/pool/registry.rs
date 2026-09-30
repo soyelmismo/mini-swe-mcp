@@ -97,6 +97,22 @@ pub struct WorkerRegistryEntry {
     /// row written by an older build still parses.
     #[serde(default)]
     pub metrics: WorkerMetrics,
+    /// Base branch the worker's diff is measured against, detected at dispatch
+    /// or at the first continuation. `None` on a row written before base-branch
+    /// tracking existed, which is why it deserializes with a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Base commit the worker branched from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// How many revisions this worker has run. `0` on a row written before
+    /// revisions were counted.
+    #[serde(default)]
+    pub revision: usize,
+    /// Automatic "the hub restarted" continuations already spent on this
+    /// worker, capped at [`super::MAX_AUTO_CONTINUES`].
+    #[serde(default)]
+    pub auto_continues: usize,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -114,6 +130,12 @@ pub struct WorkerMeta {
     pub owner: String,
     pub started_at: u64,
     pub pid: u32,
+    /// How many revisions this worker has run; the history log's metadata line
+    /// carries the same counter.
+    pub revision: usize,
+    /// Automatic "the hub restarted" continuations already spent, so the
+    /// daemon's cap survives a restart.
+    pub auto_continues: usize,
     /// The phase loop's running counters, written with every status update.
     ///
     /// The loop owns the counters and lends them to the turn engine, which
@@ -154,6 +176,10 @@ impl WorkerMeta {
             repo_path: self.repo_path.clone(),
             owner: Some(self.owner.clone()),
             metrics: self.metrics,
+            base_branch: None,
+            base_commit: None,
+            revision: self.revision,
+            auto_continues: self.auto_continues,
         }
     }
 

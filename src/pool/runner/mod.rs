@@ -306,6 +306,27 @@ impl WorkerPool {
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
 
+        // Metadata line of the append-only history log: written with the first
+        // message, so the log always opens with the facts a continuation needs.
+        let history_meta = WorkerHistory {
+            task: task.clone(),
+            group: meta.group.clone(),
+            model: model.clone(),
+            temperature,
+            repo_path: repo_path_str.clone(),
+            base_commit: worktree.base_commit.clone(),
+            base_branch: worktree.base_branch.clone(),
+            branch: worktree.branch.clone(),
+            network_offline,
+            verify: verify.clone(),
+            max_turns,
+            review_after: review_after.clone(),
+            revision: meta.revision,
+            auto_continues: meta.auto_continues,
+            owner: Some(meta.owner.clone()),
+            messages: Vec::new(),
+        };
+
         while step < current_max_turns {
             step += 1;
             let max_turns_for_config = current_max_turns;
@@ -329,6 +350,8 @@ impl WorkerPool {
                 worker_id,
                 meta,
                 messages,
+                history_meta: history_meta.clone(),
+                unsaved_messages: Vec::new(),
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
@@ -345,6 +368,9 @@ impl WorkerPool {
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
                 TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
             }
+            // One line per message, flushed at the turn boundary: a crash can
+            // only lose the turn that was in flight.
+            engine.flush_history_log().await;
         }
 
         // --- MULTI-PHASE REVIEW PIPELINE ---

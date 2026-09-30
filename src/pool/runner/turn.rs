@@ -289,6 +289,11 @@ pub(super) struct TurnEngine<'a> {
     /// the point it fires, and the row is written from the same struct.
     pub meta: &'a mut WorkerMeta,
     pub messages: &'a mut Vec<ChatMessage>,
+    /// Metadata line of this run's append-only history log.
+    pub history_meta: WorkerHistory,
+    /// Messages pushed since the last [`Self::flush_history_log`], waiting to
+    /// be appended to the durable log.
+    pub unsaved_messages: Vec<ChatMessage>,
     pub step: &'a mut usize,
     pub current_max_turns: &'a mut usize,
     pub last_assistant_text: &'a mut String,
@@ -319,7 +324,7 @@ impl<'a> TurnEngine<'a> {
         }
         for msg in steer_msgs {
             info!(worker = %self.worker_id, "Injected steering message into subagent turn");
-            self.messages.push(ChatMessage::text(
+            self.push_message(ChatMessage::text(
                 Role::User,
                 format!("{}{}", config.steer_prefix, msg),
             ));
@@ -335,7 +340,7 @@ impl<'a> TurnEngine<'a> {
                     max_turns = *self.current_max_turns,
                     "Injecting proactive turn limit warning"
                 );
-                self.messages.push(ChatMessage::text(
+                self.push_message(ChatMessage::text(
                     Role::User,
                     format!(
                         "TURN LIMIT WARNING: You have used {} of {} turns ({} remaining). If you need more turns to complete testing or refactoring, execute `echo \"REQUEST_TURNS: <number>\"` now. Otherwise, wrap up your changes and execute `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.",
@@ -445,7 +450,7 @@ impl<'a> TurnEngine<'a> {
                         "Worker resumed after error by orchestrator"
                     );
                     if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
-                        self.messages.push(ChatMessage::text(
+                        self.push_message(ChatMessage::text(
                             Role::User,
                             format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
                         ));
@@ -605,7 +610,7 @@ impl<'a> TurnEngine<'a> {
                         budget,
                         "Refused turn extension beyond the self-grant budget"
                     );
-                    self.messages.push(ChatMessage::text(
+                    self.push_message(ChatMessage::text(
                         Role::User,
                         format!(
                             "TURN EXTENSION REFUSED: {additional} more turns would take you to {requested_max}, past the {budget} turns you may self-grant on a {} turn budget. Wrap up your changes and execute `echo {COMPLETION_SENTINEL}`, or execute `echo \"ASK_ORCHESTRATOR: what is blocking you?\"` if you need a decision.",
@@ -631,7 +636,7 @@ impl<'a> TurnEngine<'a> {
                     .await?;
 
                 if let Some(answer) = answer {
-                    self.messages.push(ChatMessage::text(
+                    self.push_message(ChatMessage::text(
                         Role::User,
                         format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{}", answer),
                     ));
@@ -825,7 +830,7 @@ impl<'a> TurnEngine<'a> {
             && !answer.trim().is_empty()
             && answer.trim() != "resume"
         {
-            self.messages.push(ChatMessage::text(
+            self.push_message(ChatMessage::text(
                 Role::User,
                 format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
             ));
@@ -997,9 +1002,8 @@ impl<'a> TurnEngine<'a> {
             let content = (!content.trim().is_empty()).then_some(content);
             let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::tool_result(tc_id, output_text));
+            self.push_message(msg);
+            self.push_message(ChatMessage::tool_result(tc_id, output_text));
         } else {
             let content = if content.trim().is_empty() {
                 "I will execute a bash command.".to_string()
@@ -1007,10 +1011,57 @@ impl<'a> TurnEngine<'a> {
                 content
             };
             let msg = ChatMessage::text(Role::Assistant, content).with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::text(Role::User, output_text));
+            self.push_message(msg);
+            self.push_message(ChatMessage::text(Role::User, output_text));
         }
+    }
+
+    /// Append one message to the live conversation *and* to the durable
+    /// append-only log, so a crash costs at most the in-flight turn.
+    ///
+    /// The append is buffered and flushed by [`Self::flush_history_log`] at the
+    /// end of the turn, keeping the blocking write off the async runtime while
+    /// still writing one line per message.
+    fn push_message(&mut self, msg: ChatMessage) {
+        self.messages.push(msg.clone());
+        self.unsaved_messages.push(msg);
+    }
+
+    /// Write the messages buffered by [`Self::push_message`] to the worker's
+    /// append-only history log.
+    ///
+    /// The metadata line is written with the first message, so a log always
+    /// opens with the facts a continuation needs. A failed append warns and
+    /// carries on: the checkpoint snapshot still covers the whole conversation.
+    async fn flush_history_log(&mut self) {
+        if self.unsaved_messages.is_empty() {
+            return;
+        }
+        let meta = self.history_meta();
+        let pending = std::mem::take(&mut self.unsaved_messages);
+        let worker_id = self.worker_id.to_string();
+        let step = *self.step;
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for msg in &pending {
+                append_history_message(&worker_id, &meta, msg)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("history append task failed: {e}")))
+        {
+            warn!(
+                worker = %self.worker_id,
+                step,
+                error = %e,
+                "Incremental history append failed; the worker continues without it"
+            );
+        }
+    }
+
+    /// The metadata line of this run's history log.
+    fn history_meta(&self) -> WorkerHistory {
+        self.history_meta.clone()
     }
 
     /// Push the protocol-correct history for a response with no usable command.
