@@ -631,18 +631,36 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sweep_preserves_leased_targets_and_removes_idle_targets() {
-        let base = crate::worktree::swe_base_dir()
-            .join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
-        let target = base.join("swe-target-0123456789abcdef-0");
-        let lease = TargetLease::acquire(&target).unwrap();
-        std::fs::write(target.join("artifact"), b"build").unwrap();
-        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
-        assert!(target.join("artifact").exists());
-        drop(lease);
-        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
-        assert!(!target.exists());
-        assert!(!target_lease_path(&target).exists());
-        std::fs::remove_dir_all(base).unwrap();
+        crate::agent::env::with_env_lock(|| {
+            let base = crate::worktree::swe_base_dir()
+                .join(format!("swe-sweep-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&base).unwrap();
+            let previous = std::env::var("SWE_TEMP_DIR").ok();
+            // SAFETY: the environment lock is held for the whole closure.
+            unsafe { std::env::set_var("SWE_TEMP_DIR", &base) };
+            let lease = BuildDirLease::acquire(&base).unwrap();
+            let target = lease.dir().to_path_buf();
+            std::fs::write(target.join("artifact"), b"build").unwrap();
+            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+            assert!(
+                target.join("artifact").exists(),
+                "A leased dir must never be swept"
+            );
+            drop(lease);
+            sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+            assert!(
+                !target.exists(),
+                "A released dir must be swept once it is idle"
+            );
+            // SAFETY: the environment lock is still held.
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("SWE_TEMP_DIR", value),
+                    None => std::env::remove_var("SWE_TEMP_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(base);
+        });
     }
 
     #[test]
