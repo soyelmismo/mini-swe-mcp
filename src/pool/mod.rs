@@ -15,7 +15,7 @@
 //! * [`admission`] — resource-aware admission control for heavy commands,
 //!   replacing the fixed-width build semaphore.
 //!
-//! [`WorkerPool`] itself stays here: it owns the concurrency semaphores and the
+//! [`WorkerPool`] itself stays here: it owns the concurrency gates and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
 //! reap) must stay in one place to keep the lock discipline auditable.
 
@@ -31,6 +31,7 @@ use tracing::{error, info, warn};
 pub mod admission;
 mod buffer;
 mod clock;
+mod fair;
 mod registry;
 pub(crate) mod revision;
 mod runner;
@@ -97,7 +98,7 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
 
 #[derive(Clone)]
 pub struct WorkerPool {
-    semaphore: Arc<Semaphore>,
+    worker_slots: fair::FairScheduler,
     bash_semaphore: Arc<Semaphore>,
     /// Resource-aware gate for heavy commands: the slot count, the memory and
     /// load criteria and the job count all live here.
@@ -151,10 +152,11 @@ impl WorkerPool {
             max_retained_logs = log_policy.max_retained,
             max_emitted_logs = log_policy.max_emitted,
             terminal_ttl_secs = terminal_ttl.as_secs(),
-            "Bash semaphore and heavy-command admission controller initialized"
+            worker_slots = max_concurrent,
+            "Worker slots, bash semaphore and heavy-command admission controller initialized"
         );
         Self {
-            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            worker_slots: fair::FairScheduler::new(max_concurrent),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
