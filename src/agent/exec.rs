@@ -118,7 +118,7 @@ impl AgentRunner {
             return Ok((blocked_by_guardrail(reason), Some(1)));
         }
 
-        let parallelism = build_parallelism();
+        let parallelism = build_parallelism(self.build_jobs);
         let target_dir = resolve_target_dir(dir);
         let _ = std::fs::create_dir_all(&target_dir);
 
@@ -243,13 +243,16 @@ fn blocked_by_guardrail(reason: &str) -> String {
     )
 }
 
-/// Build/test parallelism for the child: `BUILD_PARALLELISM` or half the
-/// available cores (never below one).
-fn build_parallelism() -> String {
-    let default_parallelism = crate::config::half_the_cores();
-    crate::config::env_parse("BUILD_PARALLELISM")
-        .unwrap_or(default_parallelism)
-        .to_string()
+/// Build/test parallelism for the child: `BUILD_PARALLELISM`, else the
+/// admission controller's granted job count, else half the available cores
+/// (never below one).
+fn build_parallelism(granted: Option<usize>) -> String {
+    if let Some(parallelism) = crate::config::env_parse("BUILD_PARALLELISM") {
+        return parallelism.to_string();
+    }
+    granted
+        .map(|jobs| jobs.max(1).to_string())
+        .unwrap_or_else(|| crate::config::half_the_cores().to_string())
 }
 
 /// Directory the child builds into: `CARGO_TARGET_DIR` when set, otherwise a

@@ -12,6 +12,8 @@
 //!   path for orchestrator guidance.
 //! * [`runner`] — the agent execution loop and the orchestrator sentinels.
 //! * [`clock`] — the shared wall-clock helper.
+//! * [`admission`] — resource-aware admission control for heavy commands,
+//!   replacing the fixed-width build semaphore.
 //!
 //! [`WorkerPool`] itself stays here: it owns the concurrency semaphores and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
@@ -26,6 +28,7 @@ use tokio::sync::{RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+pub mod admission;
 mod buffer;
 mod clock;
 mod registry;
@@ -34,6 +37,10 @@ mod runner;
 mod state;
 mod steer;
 
+pub use self::admission::{
+    AdmissionController, AdmissionInputs, Blocked, Decision, HeavyPermit, HostSample, admit,
+    jobs_for,
+};
 pub use self::buffer::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, EmittedLogs, LogBuffer,
     LogRetentionPolicy, LogStats, MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES,
@@ -91,7 +98,9 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
     bash_semaphore: Arc<Semaphore>,
-    build_semaphore: Arc<Semaphore>,
+    /// Resource-aware gate for heavy commands: the slot count, the memory and
+    /// load criteria and the job count all live here.
+    admission: AdmissionController,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -111,17 +120,14 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
-        let default_build_slots = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(1))
-            .unwrap_or(2);
-        let build_slots = std::env::var("BASH_BUILD_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default_build_slots);
+        // Heavy commands are dosed by the admission controller: a slot only
+        // when the host can take another build, and a job count divided over
+        // the builds already running.
+        let admission = AdmissionController::from_env();
 
         // Each worker runs one command at a time, so with one slot per worker
         // this gate is inert; BASH_CONCURRENT_LIMIT opts into a tighter cap.
-        // Heavy commands are throttled separately by the build semaphore.
+        // Heavy commands are throttled separately by the admission controller.
         let bash_slots = std::env::var("BASH_CONCURRENT_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -138,16 +144,18 @@ impl WorkerPool {
 
         info!(
             bash_slots,
-            build_slots,
+            max_heavy = admission.max_heavy(),
+            mem_reserve_mb = admission.reserve_mb(),
+            build_mem_mb = admission.estimate_mb(),
             max_retained_logs = log_policy.max_retained,
             max_emitted_logs = log_policy.max_emitted,
             terminal_ttl_secs = terminal_ttl.as_secs(),
-            "Bash and build execution semaphores initialized"
+            "Bash semaphore and heavy-command admission controller initialized"
         );
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
-            build_semaphore: Arc::new(Semaphore::new(build_slots)),
+            admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry: Arc::new(std::sync::Mutex::new(registry::RegistryWriter::default())),

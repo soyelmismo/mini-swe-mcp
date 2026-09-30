@@ -38,11 +38,19 @@ pub fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     trimmed.parse().ok()
 }
 
+/// The available CPU cores (falls back to 2).
+///
+/// The admission controller divides its job count over these, so the count is
+/// read once here rather than probed per decision.
+pub fn cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+}
+
 /// Half the available CPU cores, never below one (falls back to 2).
 pub fn half_the_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(1))
-        .unwrap_or(2)
+    (cores() / 2).max(1)
 }
 
 #[cfg(test)]

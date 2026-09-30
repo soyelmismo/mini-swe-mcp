@@ -1,0 +1,435 @@
+//! Resource-aware admission control for heavy commands.
+//!
+//! One hub daemon fans out to ~100 workers on a 4-core / 15 GB machine. The
+//! workers themselves are cheap — most of a worker's life is spent waiting on
+//! the LLM — but a *heavy* command (`cargo`, `rustc`, a test suite: see
+//! [`is_heavy_command`](crate::agent::is_heavy_command)) is a real load on the
+//! machine, and a fixed-width semaphore cannot tell a host with 12 GB free
+//! from one that is already swapping.
+//!
+//! This module replaces that semaphore with a controller that grants a heavy
+//! slot only while the host can actually take another build, and sizes the
+//! build's own thread count from how many builds already run:
+//!
+//! * `running_heavy < max_heavy` (`BASH_BUILD_LIMIT`, default the core count),
+//! * `MemAvailable - HUB_MEM_RESERVE_MB >= HUB_BUILD_MEM_MB`,
+//! * the 1-minute load average `< cores * 1.25`.
+//!
+//! The one exception is the progress guarantee: with nothing heavy running a
+//! slot is *always* granted, so a saturated host can never deadlock a worker
+//! that has no other build to wait behind.
+//!
+//! [`admit`] is the pure decision function and carries the unit tests for
+//! every branch; the `/proc` readers beside it return `None` when unreadable,
+//! and an unreadable criterion is skipped rather than read as a failure. The
+//! controller adds only what a pure function cannot express: the running
+//! counter, FIFO queueing and the re-evaluation wakeups.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
+use tracing::debug;
+
+/// Env var overriding how many heavy commands may run at once.
+pub const BUILD_LIMIT_ENV: &str = "BASH_BUILD_LIMIT";
+/// Env var overriding the memory held back from the admission estimate (MB).
+pub const MEM_RESERVE_ENV: &str = "HUB_MEM_RESERVE_MB";
+/// Env var overriding the estimated memory of one heavy command (MB).
+pub const BUILD_MEM_ENV: &str = "HUB_BUILD_MEM_MB";
+
+/// Memory held back from the admission estimate, in MB.
+pub const DEFAULT_MEM_RESERVE_MB: u64 = 2048;
+/// Estimated memory of one heavy command, in MB.
+pub const DEFAULT_BUILD_MEM_MB: u64 = 1536;
+
+/// How far the 1-minute load average may exceed the core count.
+const LOAD_HEADROOM: f64 = 1.25;
+
+/// How often a queued heavy command is re-evaluated when nothing wakes it.
+pub const RE_EVALUATE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long one `/proc` reading stays usable.
+///
+/// Every waiter re-evaluates on the same wakeup, so the readings are shared
+/// for a moment instead of re-read per waiter.
+const SAMPLE_TTL: Duration = Duration::from_millis(500);
+
+/// The host readings one admission decision is made from.
+///
+/// `None` means "could not read it", and that criterion is then skipped: a
+/// container without `/proc/meminfo` must not stop every build.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HostSample {
+    /// `MemAvailable` from `/proc/meminfo`, in MB.
+    pub mem_available_mb: Option<u64>,
+    /// The 1-minute load average from `/proc/loadavg`.
+    pub load1: Option<f64>,
+}
+
+/// Everything [`admit`] decides on. Plain data so the decision stays a pure
+/// function of its inputs, with no `/proc` read and no clock inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdmissionInputs {
+    /// Heavy commands running right now.
+    pub running: usize,
+    /// Heavy commands allowed at once.
+    pub max: usize,
+    /// `MemAvailable` in MB, or `None` when unreadable.
+    pub mem_available_mb: Option<u64>,
+    /// Memory held back from the estimate, in MB.
+    pub reserve_mb: u64,
+    /// Estimated memory of one heavy command, in MB.
+    pub estimate_mb: u64,
+    /// 1-minute load average, or `None` when unreadable.
+    pub load1: Option<f64>,
+    /// Cores the job count is divided over.
+    pub cores: usize,
+}
+
+/// Why a heavy command was not admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    /// `max` heavy commands already run.
+    SlotLimit,
+    /// `MemAvailable` minus the reserve cannot cover one more build.
+    Memory,
+    /// The 1-minute load average reached the ceiling.
+    Load,
+}
+
+impl Blocked {
+    /// Human-readable reason, for the debug line logged while waiting.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Blocked::SlotLimit => "heavy slot limit reached",
+            Blocked::Memory => "available memory below the build reserve",
+            Blocked::Load => "load average at the ceiling",
+        }
+    }
+}
+
+/// The outcome of one admission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// The command may run, with this many jobs.
+    Granted {
+        /// Jobs the command may use: `max(1, cores / running_after_grant)`.
+        jobs: usize,
+    },
+    /// The command must wait; re-evaluated when a slot frees or every 2 s.
+    Waiting(Blocked),
+}
+
+/// Jobs a heavy command may use once `running_after_grant` of them run.
+///
+/// Dividing the cores over the builds already admitted is what keeps the CPU
+/// busy instead of swapping: the first build owns the machine, and each
+/// further one takes a smaller share, never below one.
+pub fn jobs_for(cores: usize, running_after_grant: usize) -> usize {
+    (cores / running_after_grant.max(1)).max(1)
+}
+
+/// Decide whether one more heavy command may start.
+///
+/// The slot limit is checked first and the progress guarantee second: with
+/// nothing heavy running the host is by definition not saturated *by us*, so
+/// the first build always starts even when memory is tight or the load average
+/// is already high. Only a build that would stack on top of another one is
+/// dosed.
+pub fn admit(inputs: &AdmissionInputs) -> Decision {
+    if inputs.running >= inputs.max {
+        return Decision::Waiting(Blocked::SlotLimit);
+    }
+    if inputs.running == 0 {
+        return Decision::Granted {
+            jobs: jobs_for(inputs.cores, inputs.running + 1),
+        };
+    }
+    if let Some(available) = inputs.mem_available_mb
+        && available < inputs.reserve_mb + inputs.estimate_mb
+    {
+        return Decision::Waiting(Blocked::Memory);
+    }
+    if let Some(load) = inputs.load1
+        && load >= inputs.cores as f64 * LOAD_HEADROOM
+    {
+        return Decision::Waiting(Blocked::Load);
+    }
+    Decision::Granted {
+        jobs: jobs_for(inputs.cores, inputs.running + 1),
+    }
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in MB; `None` when unreadable.
+pub fn mem_available_mb() -> Option<u64> {
+    mem_available_mb_from(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Pure core of [`mem_available_mb`]: read the `MemAvailable:` line of a
+/// `/proc/meminfo` body and convert its kB value to MB.
+fn mem_available_mb_from(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+/// The 1-minute load average from `/proc/loadavg`; `None` when unreadable.
+pub fn loadavg_1m() -> Option<f64> {
+    loadavg_1m_from(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+/// Pure core of [`loadavg_1m`]: the first field of a `/proc/loadavg` body.
+fn loadavg_1m_from(loadavg: &str) -> Option<f64> {
+    loadavg.split_whitespace().next()?.parse().ok()
+}
+
+/// The mutable half of the controller: the running count and the FIFO queue.
+struct Gate {
+    /// Heavy commands holding a slot right now.
+    running: usize,
+    /// Ids of the queued requests, oldest first.
+    queue: VecDeque<u64>,
+}
+
+/// The `/proc` readings, cached for [`SAMPLE_TTL`].
+struct HostCache {
+    /// Test seam: when set, returned instead of reading `/proc`.
+    fixed: Option<HostSample>,
+    /// The last real reading and when it was taken.
+    sampled: Option<(Instant, HostSample)>,
+}
+
+struct Inner {
+    cores: usize,
+    max_heavy: usize,
+    reserve_mb: u64,
+    estimate_mb: u64,
+    /// Serializes decide-and-reserve so two waiters waking on the same
+    /// notification cannot both be granted the last slot. Never held across an
+    /// await point.
+    gate: std::sync::Mutex<Gate>,
+    /// Signalled whenever a slot frees or a request is queued.
+    wake: Notify,
+    host: std::sync::Mutex<HostCache>,
+    next_id: AtomicU64,
+}
+
+/// FIFO admission controller for heavy commands.
+///
+/// Cloneable and cheap: every clone shares one counter, one queue and one
+/// wakeup channel, so the pool hands the same controller to every worker.
+#[derive(Clone)]
+pub struct AdmissionController {
+    inner: std::sync::Arc<Inner>,
+}
+
+impl AdmissionController {
+    /// A controller with explicit limits.
+    pub fn new(max_heavy: usize, cores: usize, reserve_mb: u64, estimate_mb: u64) -> Self {
+        Self {
+            inner: std::sync::Arc::new(Inner {
+                cores,
+                max_heavy: max_heavy.max(1),
+                reserve_mb,
+                estimate_mb,
+                gate: std::sync::Mutex::new(Gate {
+                    running: 0,
+                    queue: VecDeque::new(),
+                }),
+                wake: Notify::new(),
+                host: std::sync::Mutex::new(HostCache {
+                    fixed: None,
+                    sampled: None,
+                }),
+                next_id: AtomicU64::new(1),
+            }),
+        }
+    }
+
+    /// Limits from the environment: `BASH_BUILD_LIMIT` (default the core
+    /// count), `HUB_MEM_RESERVE_MB` and `HUB_BUILD_MEM_MB`.
+    pub fn from_env() -> Self {
+        let cores = crate::config::cores();
+        let max_heavy = crate::config::env_parse(BUILD_LIMIT_ENV).unwrap_or(cores);
+        Self::new(
+            max_heavy,
+            cores,
+            crate::config::env_parse(MEM_RESERVE_ENV).unwrap_or(DEFAULT_MEM_RESERVE_MB),
+            crate::config::env_parse(BUILD_MEM_ENV).unwrap_or(DEFAULT_BUILD_MEM_MB),
+        )
+    }
+
+    /// Heavy commands allowed at once.
+    pub fn max_heavy(&self) -> usize {
+        self.inner.max_heavy
+    }
+
+    /// Cores the job count is divided over.
+    pub fn cores(&self) -> usize {
+        self.inner.cores
+    }
+
+    /// Memory held back from the admission estimate, in MB.
+    pub fn reserve_mb(&self) -> u64 {
+        self.inner.reserve_mb
+    }
+
+    /// Estimated memory of one heavy command, in MB.
+    pub fn estimate_mb(&self) -> u64 {
+        self.inner.estimate_mb
+    }
+
+    /// Heavy commands holding a slot right now.
+    pub fn running_heavy(&self) -> usize {
+        self.lock_gate().running
+    }
+
+    /// Requests queued for a heavy slot, oldest first.
+    pub fn waiting(&self) -> usize {
+        self.lock_gate().queue.len()
+    }
+
+    /// Take a heavy slot, waiting FIFO while the host cannot take another
+    /// build. The returned permit holds the slot until it is dropped.
+    pub async fn acquire(&self) -> HeavyPermit {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let sample = self.sample();
+            // One critical section decides *and* reserves, so two waiters
+            // woken by the same notification cannot both take the last slot.
+            let outcome = {
+                let mut gate = self.lock_gate();
+                // A newcomer never jumps the queue: while anybody waits, only
+                // the oldest request is a candidate, so requests are granted
+                // in the order they arrived.
+                let is_head = gate.queue.front().map(|head| *head == id).unwrap_or(true);
+                if !is_head {
+                    None
+                } else {
+                    match admit(&AdmissionInputs {
+                        running: gate.running,
+                        max: self.inner.max_heavy,
+                        mem_available_mb: sample.mem_available_mb,
+                        reserve_mb: self.inner.reserve_mb,
+                        estimate_mb: self.inner.estimate_mb,
+                        load1: sample.load1,
+                        cores: self.inner.cores,
+                    }) {
+                        Decision::Granted { jobs } => {
+                            gate.queue.pop_front();
+                            gate.running += 1;
+                            Some(Ok(jobs))
+                        }
+                        Decision::Waiting(blocked) => {
+                            if !gate.queue.contains(&id) {
+                                gate.queue.push_back(id);
+                            }
+                            Some(Err(blocked))
+                        }
+                    }
+                }
+            };
+            match outcome {
+                Some(Ok(jobs)) => {
+                    // The slot this request took may be the one the next
+                    // queued request was waiting for.
+                    self.inner.wake.notify_waiters();
+                    return HeavyPermit {
+                        controller: self.clone(),
+                        jobs,
+                    };
+                }
+                Some(Err(blocked)) => debug!(
+                    running = self.running_heavy(),
+                    max = self.inner.max_heavy,
+                    cores = self.inner.cores,
+                    mem_available_mb = sample.mem_available_mb,
+                    reserve_mb = self.inner.reserve_mb,
+                    estimate_mb = self.inner.estimate_mb,
+                    load1 = sample.load1,
+                    reason = blocked.reason(),
+                    "Heavy command waiting for admission"
+                ),
+                // Somebody older is ahead of this request; it is re-evaluated
+                // when that one is granted or gives up.
+                None => {}
+            }
+            tokio::select! {
+                _ = self.inner.wake.notified() => {}
+                _ = tokio::time::sleep(RE_EVALUATE_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// Pin the host readings, bypassing `/proc` (test seam).
+    #[doc(hidden)]
+    pub fn __test_set_host_sample(&self, sample: Option<HostSample>) {
+        self.lock_host().fixed = sample;
+    }
+
+    fn lock_gate(&self) -> std::sync::MutexGuard<'_, Gate> {
+        self.inner
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_host(&self) -> std::sync::MutexGuard<'_, HostCache> {
+        self.inner
+            .host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The host readings, from the test seam, the cache or `/proc`.
+    fn sample(&self) -> HostSample {
+        let mut host = self.lock_host();
+        if let Some(fixed) = host.fixed {
+            return fixed;
+        }
+        if let Some((at, sample)) = host.sampled
+            && at.elapsed() < SAMPLE_TTL
+        {
+            return sample;
+        }
+        let fresh = HostSample {
+            mem_available_mb: mem_available_mb(),
+            load1: loadavg_1m(),
+        };
+        host.sampled = Some((Instant::now(), fresh));
+        fresh
+    }
+}
+
+/// A granted heavy slot, held for the whole command.
+///
+/// Dropping it frees the slot and wakes the oldest queued request, so the
+/// count and the queue stay consistent on every exit path.
+pub struct HeavyPermit {
+    controller: AdmissionController,
+    jobs: usize,
+}
+
+impl HeavyPermit {
+    /// Jobs the command may use.
+    pub fn jobs(&self) -> usize {
+        self.jobs
+    }
+
+    /// Heavy commands running, this one included.
+    pub fn running_heavy(&self) -> usize {
+        self.controller.running_heavy()
+    }
+}
+
+impl Drop for HeavyPermit {
+    fn drop(&mut self) {
+        {
+            let mut gate = self.controller.lock_gate();
+            gate.running = gate.running.saturating_sub(1);
+        }
+        self.controller.inner.wake.notify_waiters();
+    }
+}

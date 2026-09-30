@@ -163,11 +163,17 @@ impl WorkerPool {
 
         // A revision re-attaches to the branch the previous run committed to,
         // so the worker keeps its id, its checkpoints and its diff base; a
-        // fresh dispatch creates the branch instead.
-        let mut worktree = match &resume_base_commit {
-            Some(base) => WorktreeGuard::reopen(&repo_path, &worker_id, base)?,
-            None => WorktreeGuard::new(&repo_path, &worker_id)?,
-        };
+        // fresh dispatch creates the branch instead. Checkout shells out to
+        // git and walks the tree, so it runs off the runtime thread.
+        let resume_base_commit = resume_base_commit.clone();
+        let repo_path_owned = repo_path.clone();
+        let worker_id_owned = worker_id.clone();
+        let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
+            Some(base) => WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base),
+            None => WorktreeGuard::new(&repo_path_owned, &worker_id_owned),
+        })
+        .await
+        .context("Worktree checkout task failed")??;
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -348,7 +354,19 @@ impl WorkerPool {
                 .await?;
         }
 
-        let artifacts = worktree.sync_artifacts();
+        // Artifact sync, the final diff and the final commit all shell out
+        // to git and copy files, so they run off the runtime thread.
+        let finish = tokio::task::spawn_blocking({
+            let path = worktree.path.clone();
+            let repo_root = worktree.repo_root.clone();
+            let base_commit = worktree.base_commit.clone();
+            let branch = worktree.branch.clone();
+            move || finalize_worktree(&path, &repo_root, &base_commit, &branch)
+        })
+        .await
+        .context("Worktree finalization task failed")?;
+        let (artifacts, diff, branch_from_commit) = finish?;
+        worktree.preserve_branch = worktree.preserve_branch || branch_from_commit.is_some();
         if !artifacts.is_empty() {
             info!(
                 worker = %worker_id,
@@ -357,7 +375,6 @@ impl WorkerPool {
             );
         }
 
-        let diff = worktree.get_diff()?;
         let now = unix_timestamp();
 
         // Health counters measured once, at the end: the turn total the record
@@ -405,8 +422,7 @@ impl WorkerPool {
             } else {
                 commit_subject.to_string()
             };
-            let commit_msg = format!("worker({worker_id}): {clean_subject}");
-            worktree.commit_changes(&commit_msg).unwrap_or(None)
+            branch_from_commit
         } else {
             None
         };
