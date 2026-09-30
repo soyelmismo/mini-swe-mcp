@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, trace};
 
 use super::protocol::{
@@ -35,6 +35,10 @@ pub struct McpServer {
     /// mutated after construction, so the payload is byte-identical for the
     /// process lifetime and is cloned (an `Arc` memcpy) instead of rebuilt.
     pub(super) tools_list: Arc<Value>,
+    hub_events: Arc<Mutex<super::events::EventRouter>>,
+    hub_enabled: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: watch::Sender<bool>,
+    daemon_version: Arc<str>,
 }
 
 /// `clientInfo.name` the CLI sends in its `initialize` handshake.
@@ -146,6 +150,10 @@ impl McpServer {
             default_model,
             manifest,
             tools_list,
+            hub_events: Arc::new(Mutex::new(super::events::EventRouter::default())),
+            hub_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: watch::channel(false).0,
+            daemon_version: Arc::from(env!("CARGO_PKG_VERSION")),
         }
     }
 
@@ -196,7 +204,12 @@ impl McpServer {
         // Worker events: one `claude/channel` notification per state transition,
         // written through the same outbound channel as the responses so a
         // notification can never land inside a response frame.
-        let events = super::events::spawn_event_stream((*self.pool).clone(), out_tx.clone());
+        let hub = self.hub_enabled.load(std::sync::atomic::Ordering::Acquire);
+        let (context_tx, context_rx) = watch::channel(ctx.clone());
+        let events = (!hub).then(|| super::events::spawn_event_stream(
+            (*self.pool).clone(), out_tx.clone(), context_rx,
+        ));
+
 
         // Dedicated background writer: the single owner of `writer`, so
         // frames from concurrent request tasks cannot interleave.
@@ -210,6 +223,7 @@ impl McpServer {
                     error!(error = %e, "Failed flushing client stream");
                     break;
                 }
+
             }
         });
 
@@ -233,29 +247,62 @@ impl McpServer {
                     continue;
                 }
             };
-            // Process hello in wire order before snapshotting the next request's context.
-            if req.id.is_none() {
-                if req.method == "hub/hello" {
-                    let params = req.params.unwrap_or_default();
-                    ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
-                    ctx.admin = params["admin"].as_bool().unwrap_or(false);
-                    ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                    ctx.version = params["version"].as_str().map(str::to_owned);
-                    ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
-                        .filter(|cwd| cwd.is_absolute());
+            // Identity changes and hub control requests are handled in wire order.
+            let handshake = req.method == "hub/hello" || req.method == "initialize";
+            if req.method == "hub/hello" {
+                let params = req.params.as_ref().cloned().unwrap_or_default();
+                ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                ctx.admin = params["admin"].as_bool().unwrap_or(false);
+                ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
+                ctx.version = params["version"].as_str().map(str::to_owned);
+                ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
+                    .filter(|cwd| cwd.is_absolute());
+            } else if req.method == "initialize" {
+                ctx.client_name = req.params.as_ref()
+                    .and_then(|params| params["clientInfo"]["name"].as_str()).map(str::to_owned);
+            }
+            if handshake {
+                if req.id.is_some() {
+                    let response = if req.method == "hub/hello" {
+                        JsonRpcResponse::ok(req.id_or_null().map(ToOwned::to_owned), json!({
+                            "version": &*self.daemon_version,
+                            "busy": self.pool.active_worker_count().await > 0,
+                        }))
+                    } else {
+                        self.handle_request(req, ctx.clone(), None).await
+                    };
+                    let _ = out_tx.send(response.to_frame()?).await;
                 }
+                if hub && (ctx.agent_id.is_some() || ctx.client_name.is_some() || ctx.is_admin()) {
+                    self.hub_events.lock().await.register(&ctx, out_tx.clone()).await;
+                }
+                context_tx.send_replace(ctx.clone());
+                continue;
+            }
+            if req.id.is_none() {
                 trace!(method = %req.method, "Received notification");
                 continue;
             }
-            // The handshake's `clientInfo.name` is the connection's agent
-            // identity, so it is read in wire order here too: a request sent
-            // after `initialize` must already see the name (H-3).
-            if req.method == "initialize" {
-                ctx.client_name = req
-                    .params
-                    .as_ref()
-                    .and_then(|params| params["clientInfo"]["name"].as_str())
-                    .map(str::to_owned);
+            if hub && req.method == "hub/shutdown" {
+                let busy = self.pool.active_worker_count().await > 0;
+                let id = req.id_or_null().map(ToOwned::to_owned);
+                let response = if busy {
+                    JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Borrowed("Hub is busy"))
+                } else {
+                    JsonRpcResponse::ok(id, json!({"version": &*self.daemon_version, "busy": false}))
+                };
+                if !busy {
+                    // Drain through the shutdown reply before the daemon closes sockets.
+                    events.as_ref().inspect(|task| task.abort());
+                    self.hub_events.lock().await.remove(ctx.id);
+                    let _ = out_tx.send(response.to_frame()?).await;
+                    drop(out_tx);
+                    let _ = writer_task.await;
+                    self.shutdown.send_replace(true);
+                    return Ok(());
+                }
+                let _ = out_tx.send(response.to_frame()?).await;
+                continue;
             }
             let server = self.clone();
             let tx = out_tx.clone();
@@ -270,7 +317,8 @@ impl McpServer {
         }
 
         drop(out_tx);
-        events.abort();
+        if let Some(events) = events { events.abort(); }
+        self.hub_events.lock().await.remove(ctx.id);
         let _ = writer_task.await;
 
         Ok(())
@@ -329,6 +377,17 @@ impl McpServer {
             // the MCP notifications a host may send us.
             _ => JsonRpcResponse::method_not_found(id, Cow::Owned(req.method.clone())),
         }
+    }
+
+    /// Start the daemon's single watcher before accepting any connections.
+    pub fn start_hub_events(&self) -> tokio::task::JoinHandle<()> {
+        self.hub_enabled.store(true, std::sync::atomic::Ordering::Release);
+        super::events::spawn_hub_events((*self.pool).clone(), self.hub_events.clone())
+    }
+
+    /// Subscribe to an idle shutdown requested through the hub transport.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     /// The pool this server dispatches into.

@@ -11,28 +11,22 @@
 //! server:mini-swe`) drops such a notification silently, so emitting one is
 //! always safe.
 //!
-//! [`spawn_event_stream`] is the producer: it sleeps on the pool's change
-//! subscription and diffs the worker state on every wake-up, plus a coarse
-//! fallback tick for workers owned by another process. It reads this
-//! process's pool plus the shared on-disk registry, so a worker owned by
-//! another `mini-swe-mcp` process (a CLI dispatch) is reported too — and emits
-//! one notification per transition into a state the
-//! orchestrator has to act on: paused (`needs_input`), `completed` and
-//! `failed`. A worker that was already terminal when the task started is
-//! seeded into the first snapshot instead of being diffed against an empty one,
-//! so starting a server next to a hundred finished workers stays silent; one
-//! already paused on a question is still announced, since it needs an answer.
+//! The daemon uses one pool watcher and a bounded replay buffer. Connections
+//! receive only their owner's events, unless they explicitly announce admin.
+//! Terminal workers present at daemon startup are seeded silently; new events
+//! remain available in memory even while their owner is disconnected.
 //!
 //! The notification text is rendered for a model, not for a log: the diff
 //! between two snapshots is pure ([`diff_events`]), and only that pure part
 //! decides *what* to say; rendering ([`ChannelEvent`], [`channel_frame`]) and
 //! the polling loop are kept apart so the decision is testable on its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::pool::{
@@ -293,34 +287,107 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
 /// Frames go out on the same outbound channel as the responses, so a
 /// notification can never land inside a response frame. The returned handle is
 /// aborted when the stdio loop ends.
-pub(super) fn spawn_event_stream(pool: WorkerPool, tx: mpsc::Sender<String>) -> JoinHandle<()> {
+pub(super) fn spawn_event_stream(
+    pool: WorkerPool,
+    tx: mpsc::Sender<String>,
+    mut context: watch::Receiver<super::server::ConnectionContext>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Seed the first snapshot with the workers that are already terminal,
-        // so a server starting next to finished workers does not replay their
-        // history. A worker already paused on a question is left out of the
-        // seed on purpose: it still needs an answer, so the first tick
-        // announces it.
+        let mut changes = pool.subscribe_changes();
         let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
         previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
-        // Subscribed before serving, so a transition landing while the first
-        // snapshot is being read still wakes the loop after it.
-        let mut changes = pool.subscribe_changes();
         loop {
             tokio::select! {
                 _ = changes.changed() => {}
+                _ = context.changed() => {}
                 _ = tokio::time::sleep(FALLBACK_INTERVAL) => {}
             }
             let current = snapshot(&pool, &previous).await;
+            let ctx = context.borrow().clone();
             for event in diff_events(&previous, &current) {
-                let Some(frame) = channel_frame(&event) else {
-                    continue;
-                };
-                if tx.send(frame).await.is_err() {
-                    // The client is gone; there is nobody left to notify.
+                if owns(&pool, &ctx, &event.worker_id).await
+                    && let Some(frame) = channel_frame(&event)
+                    && tx.send(frame).await.is_err()
+                {
                     return;
                 }
             }
             previous = current;
+        }
+    })
+}
+
+async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &str) -> bool {
+    ctx.is_admin() || pool.worker_owner(id).await
+        == Some(crate::pool::WorkerOwner::Agent(ctx.agent()))
+}
+
+/// Latest events survive disconnected owners, but never retain more than 100 workers.
+#[derive(Default)]
+pub(super) struct EventRouter {
+    latest: VecDeque<(Option<String>, ChannelEvent)>,
+    connections: BTreeMap<u64, (String, bool, mpsc::Sender<String>)>,
+}
+
+impl EventRouter {
+    pub(super) async fn register(&mut self, ctx: &super::server::ConnectionContext, tx: mpsc::Sender<String>) {
+        let agent = ctx.agent();
+        if self.connections.get(&ctx.id).is_some_and(|(old, admin, _)| old == &agent && *admin == ctx.is_admin()) {
+            return;
+        }
+        for (owner, event) in &self.latest {
+            if (ctx.is_admin() || owner.as_deref() == Some(agent.as_str()))
+                && let Some(frame) = channel_frame(event)
+                && tx.send(frame).await.is_err()
+            {
+                return;
+            }
+        }
+        self.connections.insert(ctx.id, (agent, ctx.is_admin(), tx));
+    }
+
+    pub(super) fn remove(&mut self, id: u64) {
+        self.connections.remove(&id);
+    }
+
+    fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
+        self.latest.retain(|(_, old)| old.worker_id != event.worker_id);
+        if self.latest.len() == 100 {
+            self.latest.pop_front();
+        }
+        if let Some(frame) = channel_frame(&event) {
+            self.connections.retain(|_, (agent, admin, tx)| {
+                if *admin || owner.as_deref() == Some(agent.as_str()) {
+                    // A stalled connection must not block the pool watcher.
+                    tx.try_send(frame.clone()).is_ok()
+                } else {
+                    !tx.is_closed()
+                }
+            });
+        }
+        self.latest.push_back((owner, event));
+    }
+}
+
+pub(super) fn spawn_hub_events(pool: WorkerPool, router: Arc<Mutex<EventRouter>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut changes = pool.subscribe_changes();
+        let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
+        previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
+        loop {
+            let current = snapshot(&pool, &previous).await;
+            for event in diff_events(&previous, &current) {
+                let owner = match pool.worker_owner(&event.worker_id).await {
+                    Some(crate::pool::WorkerOwner::Agent(owner)) => Some(owner),
+                    _ => None,
+                };
+                router.lock().await.publish(owner, event);
+            }
+            previous = current;
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(FALLBACK_INTERVAL) => {}
+            }
         }
     })
 }
@@ -336,6 +403,18 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
     let mut current = WorkerSnapshot::new();
     for entry in crate::pool::load_all_registry_entries() {
         current.insert(entry.id.clone(), registry_view(&entry));
+    }
+
+    // Include in-memory workers even when their registry row was removed.
+    for row in pool.list_workers().await {
+        if let Some(id) = row["id"].as_str() {
+            current.entry(id.to_string()).or_insert_with(|| WorkerView {
+                worker_id: id.to_string(),
+                model: row["model"].as_str().unwrap_or_default().to_string(),
+                group: "default".to_string(),
+                ..WorkerView::default()
+            });
+        }
     }
 
     // A dispatch writes its registry row before the record becomes visible in

@@ -655,3 +655,122 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     let _ = task.await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+fn event_worker(id: &str, owner: &str) -> mini_swe_mcp::pool::WorkerRecord {
+    use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
+    WorkerRecord {
+        id: id.to_string(), task: "event probe".to_string(), model: "test".to_string(),
+        owner: owner.to_string(),
+        state: WorkerState::Running { step: 1, last_command: "test".to_string(), started_at: 0 },
+        metrics: WorkerMetrics::default(), logs: LogBuffer::new(), pending_steer: Vec::new(),
+        resume_tx: None, handle: None, revision: 0,
+    }
+}
+
+async fn next_event(client: &mut Client) -> serde_json::Value {
+    let mut line = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), client.reader.read_line(&mut line))
+        .await.expect("event arrives").expect("read event");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("event JSON");
+    assert_eq!(event["method"], "notifications/claude/channel");
+    event
+}
+
+#[tokio::test]
+async fn events_are_owner_scoped_and_replayed_after_hello() {
+    use mini_swe_mcp::pool::{WorkerState, WorkerMetrics};
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-live", "h4-a")).await;
+    pool.__test_insert_worker(event_worker("h4-late", "h4-late-owner")).await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut a = Client::connect(&socket).await;
+    let mut b = Client::connect(&socket).await;
+    a.request("hub/hello", serde_json::json!({"agent_id": "h4-a"})).await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "h4-b"})).await;
+    pool.__test_set_worker_state("h4-live", WorkerState::Paused {
+        question: "continue?".to_string(), step: 1,
+    }).await;
+    let event = next_event(&mut a).await;
+    assert_eq!(event["params"]["meta"]["worker_id"], "h4-live");
+    let mut line = String::new();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), b.reader.read_line(&mut line)).await.is_err());
+    pool.__test_set_worker_state("h4-late", WorkerState::Failed {
+        error: "late failure".to_string(), step: 2, failed_at: 1,
+        metrics: WorkerMetrics::default(), revision: 0,
+    }).await;
+    // Observe a later transition to establish that the watcher ran while the
+    // late owner still had no connection.
+    pool.__test_set_worker_state("h4-live", WorkerState::Failed {
+        error: "failure".to_string(), step: 2, failed_at: 1,
+        metrics: WorkerMetrics::default(), revision: 0,
+    }).await;
+    next_event(&mut a).await;
+    let mut late = Client::connect(&socket).await;
+    late.request("hub/hello", serde_json::json!({"agent_id": "h4-late-owner"})).await;
+    let queued = next_event(&mut late).await;
+    assert_eq!(queued["params"]["meta"]["worker_id"], "h4-late");
+    assert_eq!(queued["params"]["meta"]["event"], "failed");
+    let mut admin = Client::connect(&socket).await;
+    admin.request("hub/hello", serde_json::json!({"admin": true})).await;
+    assert_eq!(next_event(&mut admin).await["params"]["meta"]["worker_id"], "h4-late");
+    drop(a); drop(b); drop(late); drop(admin);
+    task.abort(); let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
+    use mini_swe_mcp::pool::{WorkerState, WorkerMetrics};
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-busy", "h4-owner")).await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut client = Client::connect(&socket).await;
+    let hello = client.request("hub/hello", serde_json::json!({"version": "99.0.0"})).await;
+    assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["result"]["busy"], true);
+    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
+    pool.__test_set_worker_state("h4-busy", WorkerState::Paused { question: "wait".to_string(), step: 1 }).await;
+    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
+    pool.__test_set_worker_state("h4-busy", WorkerState::Failed {
+        error: "done".to_string(), step: 1, failed_at: 1, metrics: WorkerMetrics::default(), revision: 0,
+    }).await;
+    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["result"]["busy"], false);
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap().unwrap());
+    assert!(!socket.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn newer_cli_replaces_an_idle_daemon() {
+    use std::process::Command;
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-version");
+    let _reaper = DaemonReaper(hub.path().to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let invoke = |fake: bool| {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["list", "--json"]).env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", hub.subdir("swe"))
+            .env("ENV_FILE", "/nonexistent-mini-swe-env");
+        if fake { cmd.env("MINI_SWE_FAKE_VERSION", "99.0.0"); }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    invoke(false);
+    invoke(true);
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap();
+    assert_eq!(log.lines().filter(|line| line.ends_with(" listening")).count(), 2, "{log}");
+    assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}

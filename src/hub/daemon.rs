@@ -221,6 +221,9 @@ impl HubServer {
         info!(socket = %socket.display(), idle_secs = self.config.idle_secs(), "Hub daemon listening");
         append_log(&paths.log(), "listening");
 
+        let events = self.server.start_hub_events();
+        let mut shutdown = self.server.subscribe_shutdown();
+
         let reaper = crate::pool::spawn_reaper((*self.server.pool()).clone());
         let idle_watcher = self.clone();
         let mut idle_task = tokio::spawn(async move { idle_watcher.watch_idle().await });
@@ -255,6 +258,10 @@ impl HubServer {
                     info!("Received SIGTERM, shutting down hub daemon");
                     break;
                 }
+                _ = shutdown.changed() => {
+                    info!("Hub shutdown requested by client");
+                    break;
+                }
                 _ = &mut idle_task => {
                     info!(idle_secs = self.config.idle_secs(), "Hub daemon idle, shutting down");
                     break;
@@ -264,6 +271,7 @@ impl HubServer {
 
         idle_task.abort();
         reaper.abort();
+        events.abort();
         let killed = self.server.pool().kill_all().await;
         if killed > 0 {
             info!(workers = killed, "Terminated workers on hub shutdown");
