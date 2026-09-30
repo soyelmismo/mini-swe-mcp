@@ -281,7 +281,10 @@ mod tests {
             table.insert(18, row(18, wrapper, 17, 1));
             table.insert(17, row(17, "agy", 1, 1));
             let resolution = resolve(&table, 20).unwrap_or_else(|| panic!("{wrapper} skipped"));
-            assert_eq!(resolution.host.comm, "agy", "{wrapper} must be stepped over");
+            assert_eq!(
+                resolution.host.comm, "agy",
+                "{wrapper} must be stepped over"
+            );
             assert_eq!(resolution.skipped, [*wrapper, *wrapper]);
         }
     }

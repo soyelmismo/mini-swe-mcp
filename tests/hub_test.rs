@@ -34,14 +34,6 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
-/// The identity a CLI child of this test process resolves to: this process,
-/// named with its pid and its start time (see [`mini_swe_mcp::hub::identity`]).
-fn host_of_this_process() -> String {
-    let me = mini_swe_mcp::hub::identity::process(std::process::id())
-        .expect("read /proc/self/stat");
-    format!("host:{}:{}:{}", me.comm, me.pid, me.starttime)
-}
-
 /// A server backed by a pool that can answer handshake verbs without an LLM.
 fn server() -> Arc<McpServer> {
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
@@ -488,7 +480,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .to_string();
     assert_eq!(
         payload["owner"],
-        host_of_this_process(),
+        common::host_of_this_process(),
         "a CLI dispatch is owned by the host process it ran under: {payload}"
     );
     let mut status = Command::new(&exe);
@@ -527,7 +519,7 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .unwrap_or_else(|| {
             panic!("the host identity must keep its workers across invocations: {listed}")
         });
-    assert_eq!(row["owner"], host_of_this_process());
+    assert_eq!(row["owner"], common::host_of_this_process());
 
     // The escape hatch never creates a socket.
     let bare = common::TempDir::new_in_tmp("hub-no-daemon");
@@ -1094,7 +1086,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     );
     assert_eq!(
         checkpoint.owner.as_deref(),
-        Some(host_of_this_process().as_str())
+        Some(common::host_of_this_process().as_str())
     );
     assert_eq!(checkpoint.verify, None);
     first.kill().await.unwrap();

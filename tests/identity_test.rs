@@ -8,7 +8,6 @@
 
 mod common;
 
-use mini_swe_mcp::hub::identity;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::{CLI_CLIENT_NAME, McpServer};
@@ -54,13 +53,6 @@ async fn wait_for_socket(path: &Path) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("hub socket {} never came up", path.display());
-}
-
-/// The identity a child of this test process resolves to: this process, named
-/// with its pid and its start time.
-fn host_of_this_process() -> String {
-    let me = identity::process(std::process::id()).expect("read /proc/self/stat");
-    format!("host:{}:{}:{}", me.comm, me.pid, me.starttime)
 }
 
 /// A synthetic running worker owned by `owner`, as if that agent had
@@ -109,7 +101,8 @@ impl Client {
     async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let id = self.next_id;
         self.next_id += 1;
-        let frame = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         self.writer
             .write_all(format!("{frame}\n").as_bytes())
             .await
@@ -142,7 +135,12 @@ impl Client {
 
     /// The handshake a client makes: `initialize` names it, `hub/hello` names
     /// the agent it speaks for.
-    async fn handshake(&mut self, client_name: &str, agent_id: Option<&str>, host_id: Option<&str>) {
+    async fn handshake(
+        &mut self,
+        client_name: &str,
+        agent_id: Option<&str>,
+        host_id: Option<&str>,
+    ) {
         let reply = self
             .request(
                 "initialize",
@@ -214,7 +212,7 @@ fn a_shell_command_names_the_test_process_as_its_host() {
         common::stderr_of(&output)
     );
     let stdout = common::stdout_of(&output);
-    let expected = host_of_this_process();
+    let expected = common::host_of_this_process();
     assert!(
         stdout.contains(&format!("agent {expected}")),
         "the host is this test process, not the shell: {stdout}"
@@ -265,9 +263,7 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
 
     // The agent's MCP connection: it dispatched the worker.
     let mut connection = Client::connect(&socket).await;
-    connection
-        .handshake("claude-code", None, Some(host))
-        .await;
+    connection.handshake("claude-code", None, Some(host)).await;
     // The agent's shell: the same host, announced by the CLI's own hello.
     let mut shell = Client::connect(&socket).await;
     shell.handshake(CLI_CLIENT_NAME, None, Some(host)).await;
@@ -290,7 +286,9 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
         // `watch` is the verb the agent's shell blocks on; the owner may wait
         // on the worker, and `steer` proves it controls it.
         caller
-            .worker(serde_json::json!({"action": "watch", "worker_id": "shared-1", "timeout_secs": 0}))
+            .worker(
+                serde_json::json!({"action": "watch", "worker_id": "shared-1", "timeout_secs": 0}),
+            )
             .await
             .expect("the owner may watch its own worker");
         let steered = caller
@@ -335,7 +333,9 @@ async fn two_host_identities_cannot_see_each_others_workers() {
 
     for action in ["steer", "kill", "collect"] {
         let error = mine
-            .worker(serde_json::json!({"action": action, "worker_id": "theirs-1", "message": "stop"}))
+            .worker(
+                serde_json::json!({"action": action, "worker_id": "theirs-1", "message": "stop"}),
+            )
             .await
             .expect_err("another host's worker must be refused");
         assert!(
@@ -357,7 +357,8 @@ async fn an_explicit_agent_id_outranks_the_host_identity() {
         .await;
 
     let mut pinned = Client::connect(&socket).await;
-    pinned.handshake("claude-code", Some("orchestrator-7"), Some(host))
+    pinned
+        .handshake("claude-code", Some("orchestrator-7"), Some(host))
         .await;
     let mut host_named = Client::connect(&socket).await;
     host_named.handshake("claude-code", None, Some(host)).await;
@@ -370,9 +371,6 @@ async fn an_explicit_agent_id_outranks_the_host_identity() {
         .worker(serde_json::json!({"action": "steer", "worker_id": "pinned-1", "message": "go on"}))
         .await
         .expect_err("the host identity does not own it");
-    assert!(
-        error.contains("belongs to agent orchestrator-7"),
-        "{error}"
-    );
+    assert!(error.contains("belongs to agent orchestrator-7"), "{error}");
     daemon.abort();
 }

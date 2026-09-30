@@ -42,6 +42,21 @@ pub fn binary_path() -> PathBuf {
 }
 
 // ----------
+// Agent identity
+// ----------
+
+/// The identity a child of this test process resolves to: this process, named
+/// with its pid and its start time (see [`mini_swe_mcp::hub::identity`]).
+///
+/// A CLI or MCP child a test spawns is an agent session whose host is the test
+/// process itself, so this is the owner identity its workers carry.
+pub fn host_of_this_process() -> String {
+    let me =
+        mini_swe_mcp::hub::identity::process(std::process::id()).expect("read /proc/self/stat");
+    format!("host:{}:{}:{}", me.comm, me.pid, me.starttime)
+}
+
+// ----------
 // Unique names
 // ----------
 

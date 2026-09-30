@@ -99,7 +99,8 @@ Merge `worker-<id>` yourself once the diff is reviewed and the base branch is gr
 One daemon, many orchestrators.
 
 - **One daemon.** The CLI and `--stdio` auto-start the hub when none is running. Its socket lives in `SWE_HUB_DIR` (default `<SWE_TEMP_DIR>/mini-swe-hub-<uid>`, private to your uid). `mini-swe-mcp daemon` runs it in the foreground; it exits after `HUB_IDLE_SECS` without clients.
-- **Ownership & privacy.** A client may only read, steer, kill, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, or the MCP `initialize` client info when that is unset.
+- **Ownership & privacy.** A client may only read, steer, kill, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, else the agent's **host process**, else the MCP `initialize` client info.
+- **One identity per session.** The identity is the agent's host process — the first ancestor of the client that is not a shell or a wrapper (`mini-swe-mcp <- bash <- claude` resolves to `claude`), named `host:<comm>:<pid>:<starttime>`. The MCP connection and the agent's shell commands share it, so a `mini-swe-mcp watch` in the shell sees the workers its own MCP connection dispatched, and two hosts never share workers. It survives MCP reconnects and hub restarts while the host lives; the start time keeps a recycled pid from colliding. `mini-swe-mcp whoami` prints the identity and how it was derived.
 - **`--admin`.** The human operator's override on the CLI: act on workers owned by any agent. `list --all` requires it.
 - **Crash recovery.** If the hub dies, its workers become `interrupted`; on restart it auto-resumes them from their durable conversation (`HUB_AUTO_RESUME=0` disables this).
 - **`MINI_SWE_NO_DAEMON=1`.** No daemon: each process serves MCP and owns its own pool. Useful for tests and single-shot use, but its state is invisible to other clients.
@@ -159,7 +160,7 @@ Defaults are what the code uses when the variable is unset.
 | `SWE_HUB_DIR` | `<SWE_TEMP_DIR>/mini-swe-hub-<uid>` | Hub socket and lock directory. |
 | `HUB_IDLE_SECS` | `600` | Idle seconds before the hub exits. |
 | `HUB_AUTO_RESUME` | `1` | Auto-resume interrupted workers; `0` disables. |
-| `MINI_SWE_AGENT_ID` | — | Agent identity used for ownership. |
+| `MINI_SWE_AGENT_ID` | — | Agent identity used for ownership; overrides the host process. |
 | `MINI_SWE_NO_DAEMON` | `0` | `1` runs the in-process server with no hub. |
 | `MINI_SWE_WORKER_THREADS` | `4` | Tokio runtime worker threads. |
 | `SWE_SANDBOX` | Landlock + seccomp | `bwrap` selects the bubblewrap backend. |
