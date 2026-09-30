@@ -204,6 +204,10 @@ impl WorktreeGuard {
         force_remove_dir(&path);
         let _ = git(repo_root, "branch -D", &["branch", "-D", &branch]);
 
+        let branch_out = git(repo_root, "symbolic-ref", &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let base_branch = branch_out.status.success().then(|| {
+            String::from_utf8_lossy(&branch_out.stdout).trim().to_string()
+        });
         let base_commit_out = git(repo_root, "rev-parse HEAD", &["rev-parse", "HEAD"])?;
         if !base_commit_out.status.success() {
             let stderr = String::from_utf8_lossy(&base_commit_out.stderr);
@@ -214,10 +218,7 @@ impl WorktreeGuard {
             .to_string();
 
         let mut guard = Self::checkout(repo_root, &worker_id, &branch, &base_commit, &base_commit, true)?;
-        let branch_out = git(repo_root, "symbolic-ref", &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        guard.base_branch = branch_out.status.success().then(|| {
-            String::from_utf8_lossy(&branch_out.stdout).trim().to_string()
-        });
+        guard.base_branch = base_branch;
         guard.base_commit = base_commit;
         Ok(guard)
     }
@@ -377,7 +378,7 @@ impl WorktreeGuard {
         let mut merged = false;
         if Self::merge_in_progress_at(path)? {
             // Git searches working-tree content even when the index is unmerged.
-            let markers = git(path, "grep conflict markers", &["grep", "--no-textconv", "-a", "-l", "-z", "-e", "^<<<<<<<", "--"])?;
+            let markers = git(path, "grep conflict markers", &["grep", "--no-textconv", "--untracked", "--exclude-standard", "-a", "-l", "-z", "-e", "^<<<<<<<", "--"])?;
             match markers.status.code() {
                 Some(0) => return Ok(BaseSync::Conflicts {
                     branch: base_branch.to_string(),

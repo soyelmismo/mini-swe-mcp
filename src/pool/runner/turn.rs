@@ -654,16 +654,24 @@ impl<'a> TurnEngine<'a> {
             }
             BaseSync::Conflicts { branch, files } => {
                 self.worktree.preserve_branch = true;
+                let refusal = if files.is_empty() {
+                    format!(
+                        "COMPLETION REFUSED: base {branch} was merged, but the merge is still in progress. Resolve any hidden conflicts (for example with `git status` and `git diff`), make every file compile and pass tests, then request completion again. Do not run git commit; the harness concludes the merge it started."
+                    )
+                } else {
+                    format!(
+                        "COMPLETION REFUSED: base {branch} was merged, but the merge is still in progress. Resolve the conflict markers (<<<<<<<) in: {}. Keep both sides' intent, remove every marker, then request completion again. Do not run git commit; the harness stages your resolutions and creates the merge commit.",
+                        files.join(", ")
+                    )
+                };
+                // One exchange, like a verify failure: the completion turn is
+                // replayed, so the next request carries no dangling tool_call.
                 self.push_exchange(
                     llm_resp.content.clone(),
                     llm_resp.reasoning_content.clone(),
                     llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
-                    "COMPLETION REFUSED: base integration needs conflict resolution.".to_string(),
+                    refusal,
                 );
-                self.messages.push(ChatMessage::text(Role::User, format!(
-                    "Base {branch} was merged into your branch, but the merge is still in progress. Conflicting files: {}. Resolve all <<<<<<< markers, keeping both sides' intent, then request completion again. Do not run git commit; the harness will stage your resolutions and create the merge commit.",
-                    files.join(", ")
-                )));
                 return Ok(TurnOutcome::Continue);
             }
         };
