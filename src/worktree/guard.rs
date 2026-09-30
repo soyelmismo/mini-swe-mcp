@@ -145,12 +145,22 @@ fn harden_worktree_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Result of the harness's pre-completion integration step.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BaseSync {
+    Unchanged,
+    Merged { branch: String },
+    Conflicts { branch: String, files: Vec<String> },
+}
+
 /// RAII guard around one subagent's `git` worktree.
 pub struct WorktreeGuard {
     pub path: PathBuf,
     pub branch: String,
     pub repo_root: PathBuf,
     pub base_commit: String,
+    /// Branch checked out at dispatch; detached checkouts have no sync target.
+    pub base_branch: Option<String>,
     pub preserve_branch: bool,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
@@ -203,7 +213,11 @@ impl WorktreeGuard {
             .trim()
             .to_string();
 
-        let mut guard = Self::checkout(repo_root, &worker_id, &branch, "HEAD", &base_commit, true)?;
+        let mut guard = Self::checkout(repo_root, &worker_id, &branch, &base_commit, &base_commit, true)?;
+        let branch_out = git(repo_root, "symbolic-ref", &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        guard.base_branch = branch_out.status.success().then(|| {
+            String::from_utf8_lossy(&branch_out.stdout).trim().to_string()
+        });
         guard.base_commit = base_commit;
         Ok(guard)
     }
@@ -288,13 +302,33 @@ impl WorktreeGuard {
             branch: branch.to_string(),
             repo_root: repo_root.to_path_buf(),
             base_commit: base_commit.to_string(),
+            base_branch: None,
             preserve_branch: false,
             seeded,
         })
     }
 
     pub fn get_diff(&self) -> Result<String> {
-        Self::diff_at(&self.path, &self.base_commit)
+        Self::diff_with_base_at(&self.path, &self.base_commit, self.base_branch.as_deref())
+    }
+
+    /// Resolve the shared ancestor with the current base tip, excluding base-only work.
+    pub fn diff_base_at(path: &Path, base_commit: &str, base_branch: Option<&str>) -> Result<String> {
+        if let Some(branch) = base_branch {
+            let reference = format!("refs/heads/{branch}");
+            let output = git(path, "merge-base", &["merge-base", "HEAD", &reference])?;
+            if !output.status.success() {
+                anyhow::bail!("git merge-base failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+            }
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        Ok(if base_commit.is_empty() { "HEAD" } else { base_commit }.to_string())
+    }
+
+    /// Take the worker diff against its shared ancestor with the moving base.
+    pub fn diff_with_base_at(path: &Path, base_commit: &str, base_branch: Option<&str>) -> Result<String> {
+        let base = Self::diff_base_at(path, base_commit, base_branch)?;
+        Self::diff_at(path, &base)
     }
 
     /// The final diff of the checkout at `path` against `base_commit`.
@@ -320,6 +354,67 @@ impl WorktreeGuard {
             anyhow::bail!("git diff {base} failed: {}", stderr.trim());
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Whether this checkout has an unfinished merge.
+    pub fn merge_in_progress_at(path: &Path) -> Result<bool> {
+        Ok(git(path, "rev-parse MERGE_HEAD", &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])?
+            .status.success())
+    }
+
+    /// Integrate the dispatch's base branch before verification, on the harness.
+    /// Conflicts remain in place for the model; only a later completion may commit them.
+    pub fn sync_base_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        base_branch: Option<&str>,
+    ) -> Result<BaseSync> {
+        let Some(base_branch) = base_branch.filter(|_| std::env::var_os("WORKER_SYNC_BASE").as_deref() != Some(std::ffi::OsStr::new("0"))) else {
+            return Ok(BaseSync::Unchanged);
+        };
+        let mut merged = false;
+        if Self::merge_in_progress_at(path)? {
+            // Git searches working-tree content even when the index is unmerged.
+            let markers = git(path, "grep conflict markers", &["grep", "--no-textconv", "-a", "-l", "-z", "-e", "^<<<<<<<", "--"])?;
+            match markers.status.code() {
+                Some(0) => return Ok(BaseSync::Conflicts {
+                    branch: base_branch.to_string(),
+                    files: nul_paths(&markers.stdout),
+                }),
+                Some(1) => {}
+                _ => anyhow::bail!("Could not check conflict markers: {}", String::from_utf8_lossy(&markers.stderr).trim()),
+            }
+            checked_git(path, "add resolved merge", &["add", "-A"])?;
+            checked_git(path, "commit resolved merge", &[
+                "-c", "user.name=mini-swe", "-c", "user.email=mini-swe@localhost",
+                "commit", "--no-edit",
+            ])?;
+            merged = true;
+        }
+
+        let reference = format!("refs/heads/{base_branch}");
+        let base = Self::diff_base_at(path, base_commit, Some(base_branch))?;
+        let tip = checked_git(path, "resolve base tip", &["rev-parse", "--verify", &reference])?;
+        if base == String::from_utf8_lossy(&tip.stdout).trim() {
+            return Ok(if merged { BaseSync::Merged { branch: base_branch.to_string() } } else { BaseSync::Unchanged });
+        }
+
+        Self::commit_changes_at(path, repo_root, branch, base_commit, "worker: checkpoint before base integration")?;
+        let output = git(path, "merge base", &[
+            "-c", "user.name=mini-swe", "-c", "user.email=mini-swe@localhost",
+            "merge", "--no-edit", &reference,
+        ])?;
+        if !output.status.success() {
+            let conflicts = checked_git(path, "list merge conflicts", &["diff", "--name-only", "--diff-filter=U", "-z"])?;
+            let files = nul_paths(&conflicts.stdout);
+            if Self::merge_in_progress_at(path)? && !files.is_empty() {
+                return Ok(BaseSync::Conflicts { branch: base_branch.to_string(), files });
+            }
+            anyhow::bail!("git merge base {base_branch} failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(BaseSync::Merged { branch: base_branch.to_string() })
     }
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
@@ -393,6 +488,10 @@ impl WorktreeGuard {
     /// worktree down on the way out. A clean tree is not an error and simply
     /// reports `false`, so the caller can stay quiet about it.
     pub(crate) fn commit_all(path: &Path, message: &str) -> Result<bool> {
+        // Completion owns merge resolution; checkpoints must not commit markers.
+        if Self::merge_in_progress_at(path)? {
+            anyhow::bail!("Base merge is still in progress; resolve it and request completion");
+        }
         // Stage all changes (both tracked and untracked).
         let _ = git(path, "add", &["add", "-A"]);
 
@@ -530,6 +629,22 @@ impl Drop for WorktreeGuard {
         let _ = std::fs::remove_file(&pid_file);
         remove_target_dirs(&self.path);
     }
+}
+
+fn checked_git(path: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
+    let output = git(path, operation, args)?;
+    if !output.status.success() {
+        anyhow::bail!("git {operation} failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(output)
+}
+
+fn nul_paths(bytes: &[u8]) -> Vec<String> {
+    let mut paths: Vec<_> = bytes.split(|b| *b == 0).filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Process-unique counter backing [`tmp_sibling_name`], so two concurrent

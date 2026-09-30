@@ -1178,6 +1178,7 @@ fn sample_history(repo_path: &std::path::Path, base_commit: &str, branch: &str) 
         temperature: None,
         repo_path: repo_path.to_string_lossy().to_string(),
         base_commit: base_commit.to_string(),
+        base_branch: Some("master".to_string()),
         branch: branch.to_string(),
         network_offline: false,
         verify: None,
