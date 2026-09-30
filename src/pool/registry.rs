@@ -330,22 +330,26 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
                 .flatten()
         })
         .filter_map(move |file| {
-        let path = file.path();
-        if path.extension()?.to_str()? != "json" {
-            return None;
-        }
-        let entry: WorkerRegistryEntry =
-            serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-        // IDs are path components, never paths supplied by registry contents.
-        if entry.id.is_empty()
-            || !entry.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            || path.file_stem()?.to_str()? != entry.id
-            || !seen.insert(entry.id.clone())
-        {
-            return None;
-        }
-        Some((path, entry))
-    })
+            let path = file.path();
+            if path.extension()?.to_str()? != "json" {
+                return None;
+            }
+            let entry: WorkerRegistryEntry =
+                serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            // IDs are path components, never paths supplied by registry contents.
+            if entry.id.is_empty()
+                || !entry
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || path.file_stem()?.to_str()? != entry.id
+                || !seen.insert(entry.id.clone())
+            {
+                return None;
+            }
+            Some((path, entry))
+        })
+}
 
 /// Rewrite the dead rows of a crashed hub into failed ones before serving.
 ///
@@ -375,12 +379,7 @@ pub(crate) fn recover_orphaned_workers() -> usize {
             let removed = crate::worktree::git(
                 &checkout,
                 "worktree remove",
-                &[
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &checkout.to_string_lossy(),
-                ],
+                &["worktree", "remove", "--force", &checkout.to_string_lossy()],
             );
             if !removed.is_ok_and(|out| out.status.success()) {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
@@ -392,15 +391,19 @@ pub(crate) fn recover_orphaned_workers() -> usize {
             format!("hub restarted; work salvaged on branch worker-{}", entry.id)
         } else {
             format!(
-                "hub restarted; salvage failed; work retained in {}", checkout.display()
+                "hub restarted; salvage failed; work retained in {}",
+                checkout.display()
             )
         };
         entry.updated_at = super::unix_timestamp();
-        match serde_json::to_vec(&entry).map_err(std::io::Error::other)
+        match serde_json::to_vec(&entry)
+            .map_err(std::io::Error::other)
             .and_then(|json| std::fs::write(&path, json))
         {
             Ok(()) => recovered += 1,
-            Err(error) => tracing::warn!(%error, worker = %entry.id, "Could not record hub recovery"),
+            Err(error) => {
+                tracing::warn!(%error, worker = %entry.id, "Could not record hub recovery")
+            }
         }
     }
     recovered
