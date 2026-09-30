@@ -22,7 +22,7 @@ use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta};
-use super::turn::{LlmErrorPolicy, TurnConfig, TurnEngine, TurnOutcome};
+use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
 
 /// Everything the review phase needs, and the step counter it hands back.
 ///
@@ -156,6 +156,7 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut consecutive_no_cmd = 0;
         let mut verify_failures = 0;
+        let mut watch = ProgressWatch::default();
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -188,6 +189,8 @@ impl WorkerPool {
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: None,
                 verify_failures: &mut verify_failures,
+                dispatch_max_turns: max_turns,
+                watch: &mut watch,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { .. } => {

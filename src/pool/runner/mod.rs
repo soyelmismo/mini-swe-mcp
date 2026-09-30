@@ -17,8 +17,8 @@
 //! * [`turn`] — the unified turn engine shared by both loops.
 //!
 //! What stays here is only the implementer's turn loop, so that the sequence
-//! "steer → warn → LLM step → bash → sentinel → record → next turn" is
-//! readable end to end in one place.
+//! "steer → warn → checkpoint → stagnation → LLM step → repeat check → bash →
+//! sentinel → record → next turn" is readable end to end in one place.
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -32,7 +32,7 @@ use super::state::WorkerState;
 use super::steer::remove_steer_file;
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
-use self::turn::{LlmErrorPolicy, TurnConfig, TurnEngine, TurnOutcome};
+use self::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
 
 mod pause;
 mod review;
@@ -130,6 +130,10 @@ impl WorkerPool {
         let _steer_cleanup = SteerFileGuard::new(worker_id.clone());
 
         let mut worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
+        // A kill must not lose what this worker leaves uncommitted, and the
+        // guard that owns the checkout dies with the task a kill aborts, so the
+        // pool keeps the path and commits through it (see `WorkerPool::kill`).
+        self.register_worktree(&worker_id, worktree.path.clone()).await;
         let runner = AgentRunner::new(
             self.api_base.clone(),
             self.api_key.clone(),
@@ -156,6 +160,7 @@ impl WorkerPool {
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
         let mut verify_failures = 0;
+        let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
         let started_at_ts = unix_timestamp();
 
@@ -197,6 +202,8 @@ impl WorkerPool {
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: verify.as_deref(),
                 verify_failures: &mut verify_failures,
+                dispatch_max_turns: max_turns,
+                watch: &mut watch,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
@@ -323,6 +330,7 @@ impl WorkerPool {
             None,
         );
 
+        self.unregister_worktree(&worker_id).await;
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())
     }

@@ -226,30 +226,21 @@ impl WorktreeGuard {
         // Stage untracked files intent-to-add so git diff captures new files.
         let _ = git(&self.path, "add", &["add", "-N", "."]);
 
-        let output = git(&self.path, "diff HEAD", &["diff", "HEAD"])?;
-        if output.status.success() {
-            let diff = String::from_utf8_lossy(&output.stdout).to_string();
-            if !diff.trim().is_empty() {
-                return Ok(diff);
-            }
+        // Diff the working tree against the commit the worker started from, so
+        // checkpoint commits made along the way (auto-checkpoints, pause on an
+        // LLM error) and the still-uncommitted tail are reported together.
+        // Diffing against HEAD would hide everything before the last checkpoint.
+        let base = if self.base_commit.is_empty() {
+            "HEAD"
+        } else {
+            self.base_commit.as_str()
+        };
+        let output = git(&self.path, "diff base", &["diff", base])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git diff {base} failed: {}", stderr.trim());
         }
-
-        // If the working tree diff is empty, check for commits on this branch.
-        if !self.base_commit.is_empty() {
-            let output = git(
-                &self.path,
-                "diff base_commit..HEAD",
-                &["diff", &format!("{}..HEAD", self.base_commit)],
-            )?;
-            if output.status.success() {
-                let diff = String::from_utf8_lossy(&output.stdout).to_string();
-                if !diff.trim().is_empty() {
-                    return Ok(diff);
-                }
-            }
-        }
-
-        Ok(String::new())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
@@ -301,31 +292,31 @@ impl WorktreeGuard {
         synced.into_keys().collect()
     }
 
-    /// Commit all dirty changes in the worktree to preserve work in git history,
-    /// marking the branch to be retained upon worktree cleanup.
-    pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
+    /// Stage and commit everything in the worktree at `path`, reporting
+    /// whether a commit was actually created.
+    ///
+    /// Split out of [`WorktreeGuard::commit_changes`] so the pool's `kill`
+    /// path can commit the uncommitted work of a worker whose guard it does
+    /// not own: a `kill` must not lose work, and the aborted task tears its
+    /// worktree down on the way out. A clean tree is not an error and simply
+    /// reports `false`, so the caller can stay quiet about it.
+    pub(crate) fn commit_all(path: &Path, message: &str) -> Result<bool> {
         // Stage all changes (both tracked and untracked).
-        let _ = git(&self.path, "add", &["add", "-A"]);
+        let _ = git(path, "add", &["add", "-A"]);
 
         // Check if there are changes to commit.
-        let status = git(&self.path, "status", &["status", "--porcelain"])?;
+        let status = git(path, "status", &["status", "--porcelain"])?;
         if !status.status.success() {
             let stderr = String::from_utf8_lossy(&status.stderr);
             anyhow::bail!("git status failed: {}", stderr.trim());
         }
         if status.stdout.is_empty() {
-            // Even if the working tree is clean, check if the branch already
-            // has commits beyond base_commit.
-            if self.branch_has_commits() {
-                self.preserve_branch = true;
-                return Ok(Some(self.branch.clone()));
-            }
-            return Ok(None);
+            return Ok(false);
         }
 
         // Commit with fallback credentials so lack of git config never errors.
         let commit_out = git(
-            &self.path,
+            path,
             "commit",
             &[
                 "-c",
@@ -341,9 +332,23 @@ impl WorktreeGuard {
             let stderr = String::from_utf8_lossy(&commit_out.stderr);
             anyhow::bail!("git commit failed: {}", stderr.trim());
         }
+        Ok(true)
+    }
 
-        self.preserve_branch = true;
-        Ok(Some(self.branch.clone()))
+    /// Commit all dirty changes in the worktree to preserve work in git history,
+    /// marking the branch to be retained upon worktree cleanup.
+    pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
+        if Self::commit_all(&self.path, message)? {
+            self.preserve_branch = true;
+            return Ok(Some(self.branch.clone()));
+        }
+        // Even if the working tree is clean, check if the branch already
+        // has commits beyond base_commit.
+        if self.branch_has_commits() {
+            self.preserve_branch = true;
+            return Ok(Some(self.branch.clone()));
+        }
+        Ok(None)
     }
 
     /// True when this worker's branch carries commits beyond `base_commit`.

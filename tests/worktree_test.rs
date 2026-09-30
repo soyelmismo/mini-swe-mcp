@@ -145,6 +145,26 @@ fn concurrent_guards_use_distinct_branches_and_paths() {
     }
 }
 
+/// Checkpoint commits made while the worker runs must not hide earlier work:
+/// the reported diff spans everything since the worker's base commit.
+#[test]
+fn get_diff_spans_checkpoint_commits_and_uncommitted_work() {
+    let test_repo = TestRepo::new("diff-checkpoint");
+    let repo = test_repo.path();
+    let id = unique_worker_id("diff-checkpoint");
+    let mut guard = WorktreeGuard::new(repo, &id).expect("worktree creation failed");
+
+    std::fs::write(guard.path.join("before_checkpoint.txt"), "first\n").unwrap();
+    guard
+        .commit_changes("checkpoint")
+        .expect("checkpoint commit failed");
+    std::fs::write(guard.path.join("after_checkpoint.txt"), "second\n").unwrap();
+
+    let diff = guard.get_diff().expect("get_diff failed");
+    assert!(diff.contains("before_checkpoint.txt"), "checkpointed work missing:\n{diff}");
+    assert!(diff.contains("after_checkpoint.txt"), "uncommitted work missing:\n{diff}");
+}
+
 #[test]
 fn get_diff_reports_untracked_and_modified_files() {
     let test_repo = TestRepo::new("diff");
@@ -179,14 +199,15 @@ fn get_diff_reports_untracked_and_modified_files() {
         "diff is missing the untracked file contents:\n{diff}"
     );
 
-    // Modified tracked file is surfaced with both removed and added lines.
+    // The file committed inside the worktree and then modified is reported as
+    // the worker's net change since its base commit: its current contents.
     assert!(
         diff.contains("tracked_file.txt"),
         "diff is missing the modified file:\n{diff}"
     );
     assert!(
-        diff.contains("-original contents") && diff.contains("+modified contents"),
-        "diff is missing the modification hunks:\n{diff}"
+        diff.contains("+modified contents") && !diff.contains("original contents"),
+        "diff must show the net change since the base commit:\n{diff}"
     );
 
     // Both files live inside the worktree, not in the parent repository.

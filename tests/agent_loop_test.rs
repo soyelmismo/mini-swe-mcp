@@ -111,10 +111,9 @@ impl ScriptedSseServer {
         }
     }
 
-    /// The turn a model issues when it is done: the sentinel as the final
-    /// `echo` of the command, which is what `is_completion_request` accepts.
-    fn completion_turn(call_id: &str) -> ScriptedTurn {
-        let arguments = json!({ "command": format!("echo {COMPLETION_SENTINEL}") }).to_string();
+    /// A turn whose tool call runs `command` in the worker worktree.
+    fn bash_turn(call_id: &str, command: &str) -> ScriptedTurn {
+        let arguments = json!({ "command": command }).to_string();
         vec![frame(&json!({
             "choices": [{
                 "delta": {
@@ -126,6 +125,12 @@ impl ScriptedSseServer {
                 }
             }]
         }))]
+    }
+
+    /// The turn a model issues when it is done: the sentinel as the final
+    /// `echo` of the command, which is what `is_completion_request` accepts.
+    fn completion_turn(call_id: &str) -> ScriptedTurn {
+        Self::bash_turn(call_id, &format!("echo {COMPLETION_SENTINEL}"))
     }
 
     /// A turn whose tool call cannot yield a command, plus reasoning content.
@@ -250,6 +255,21 @@ impl Drop for TestRepo {
     }
 }
 
+/// Trimmed stdout of one `git` invocation, for assertions on branch history.
+fn git_capture(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(dir)
@@ -306,6 +326,32 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("worker {worker_id} did not reach a terminal state");
+}
+
+/// The question a paused worker is parked on, or `None` if it never pauses.
+async fn wait_for_paused(pool: &WorkerPool, worker_id: &str) -> Option<String> {
+    for _ in 0..600 {
+        if let Some(WorkerState::Paused { question, .. }) = pool.get_worker_state(worker_id).await {
+            return Some(question);
+        }
+        if matches!(
+            pool.get_worker_state(worker_id).await,
+            Some(WorkerState::Completed { .. } | WorkerState::Failed { .. })
+        ) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// Every user message of `request`, in order.
+fn user_messages(request: &Value) -> Vec<String> {
+    messages_of(request)
+        .into_iter()
+        .filter(|m| m["role"] == json!("user"))
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
 }
 
 /// Dispatch one worker against `base_url` and wait for it to finish.
@@ -679,4 +725,332 @@ async fn verify_gate_exhausts_after_three_failures() {
         }
         other => panic!("worker must complete, got {other:?}"),
     }
+}
+
+// ----------
+// Loop, turn budget and work preservation (selfimprove-I3)
+// ----------
+
+/// The command a looping worker used to re-issue dozens of times.
+const REPEATED_COMMAND: &str = "sed -n '1,5p' README.md";
+
+/// The exact answer a blocked repetition gets instead of a second run.
+const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
+
+/// A command byte-identical to the one before it is answered, not run: its
+/// output is already in the history, so running it again only burns a turn.
+#[tokio::test]
+async fn a_repeated_command_is_answered_without_being_executed() {
+    let repo = TestRepo::new("repeat");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::bash_turn("call_1", REPEATED_COMMAND),
+        ScriptedSseServer::bash_turn("call_2", REPEATED_COMMAND),
+        ScriptedSseServer::bash_turn("call_3", "ls -la"),
+        ScriptedSseServer::completion_turn("call_done"),
+    ])
+    .await;
+
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete after the repetition, got {state:?}"
+    );
+
+    let requests = server.requests.all().await;
+    assert_eq!(requests.len(), 4, "got {requests:?}");
+
+    // Turn 1 really ran: its tool result is the command output.
+    let first = tool_results(&requests[1]);
+    let first_output = first.get("call_1").expect("a tool result for call_1");
+    assert!(
+        first_output.contains("COMMAND OUTPUT"),
+        "the first turn must have run its command, got {first_output:?}"
+    );
+
+    // Turn 2 repeated it byte for byte: the model is told why, and the answer
+    // is not a command output, which is what "was not executed" looks like.
+    let second = tool_results(&requests[2]);
+    let refusal = second.get("call_2").expect("a tool result for call_2");
+    assert_eq!(
+        refusal, REPEAT_REFUSAL,
+        "a repeated command must be refused with the loop answer, got {refusal:?}"
+    );
+
+    // A different command is progress again: the block is not sticky.
+    let third = tool_results(&requests[3]);
+    let resumed = third.get("call_3").expect("a tool result for call_3");
+    assert!(
+        resumed.contains("COMMAND OUTPUT"),
+        "the next distinct command must run, got {resumed:?}"
+    );
+}
+
+/// Three blocked repetitions in a row park the worker on the orchestrator,
+/// because a model that will not change course needs a human decision.
+#[tokio::test]
+async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
+    let repo = TestRepo::new("repeat-park");
+    let mut script: Vec<ScriptedTurn> = (1..=4)
+        .map(|n| ScriptedSseServer::bash_turn(&format!("call_{n}"), REPEATED_COMMAND))
+        .collect();
+    script.push(ScriptedSseServer::completion_turn("call_done"));
+    let server = ScriptedSseServer::spawn(script).await;
+
+    let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
+    let worker_id = pool
+        .dispatch(
+            "loop forever".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            10,
+            Some("agent-loop".to_string()),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("dispatch the worker");
+
+    let question = wait_for_paused(&pool, &worker_id)
+        .await
+        .expect("a looping worker must park on the orchestrator");
+    assert!(
+        question.contains("Repetition loop") && question.contains("sed"),
+        "the pause must name the loop and the repeated command, got {question:?}"
+    );
+
+    pool.steer(&worker_id, "stop re-reading the file; make the edit".to_string())
+        .await
+        .expect("steer the paused worker");
+    let state = wait_for_terminal(&pool, &worker_id).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "the worker must finish once the orchestrator guides it, got {state:?}"
+    );
+}
+
+/// A `REQUEST_TURNS` inside the self-grant budget extends the loop.
+#[tokio::test]
+async fn a_turn_extension_within_the_budget_extends_the_loop() {
+    let repo = TestRepo::new("turns-grant");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::bash_turn("call_rq", "echo REQUEST_TURNS: 2"),
+        ScriptedSseServer::bash_turn("call_1", "echo one"),
+        ScriptedSseServer::bash_turn("call_2", "echo two"),
+        ScriptedSseServer::bash_turn("call_3", "echo three"),
+        ScriptedSseServer::bash_turn("call_4", "echo four"),
+        ScriptedSseServer::completion_turn("call_done"),
+    ])
+    .await;
+
+    // Budget 4, so half of it (2 turns) may be self-granted: 6 turns in total.
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete, got {state:?}"
+    );
+
+    let requests = server.requests.all().await;
+    assert_eq!(
+        requests.len(),
+        6,
+        "the grant must lift the loop from 4 to 6 turns: {requests:?}"
+    );
+    for (i, request) in requests.iter().enumerate() {
+        assert!(
+            !user_messages(request)
+                .iter()
+                .any(|m| m.contains("TURN EXTENSION REFUSED")),
+            "a grant within budget must not be refused, request {i}: {request}"
+        );
+    }
+}
+
+/// A `REQUEST_TURNS` past the budget is refused, and the model is told to wrap
+/// up or escalate instead of asking again.
+#[tokio::test]
+async fn a_turn_extension_beyond_the_budget_is_refused() {
+    let repo = TestRepo::new("turns-refuse");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::bash_turn("call_rq", "echo \"REQUEST_TURNS: 40\""),
+        ScriptedSseServer::bash_turn("call_1", "echo one"),
+        ScriptedSseServer::completion_turn("call_done"),
+    ])
+    .await;
+
+    // Budget 4, so 40 more turns is far past the 2 turns it may self-grant.
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete on the sentinel turn, got {state:?}"
+    );
+
+    let requests = server.requests.all().await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "a refused extension must not extend the loop: {requests:?}"
+    );
+
+    let refusal = user_messages(&requests[1])
+        .into_iter()
+        .find(|m| m.contains("TURN EXTENSION REFUSED"))
+        .expect("the refusal must be injected as a user message");
+    assert!(
+        refusal.contains(COMPLETION_SENTINEL) && refusal.contains("ASK_ORCHESTRATOR"),
+        "the refusal must offer both ways out, got {refusal:?}"
+    );
+}
+
+/// Every twentieth turn a dirty worktree is checkpoint-committed, so the work
+/// survives a kill or a crash without waiting for the completion sentinel.
+#[tokio::test]
+async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
+    let repo = TestRepo::new("checkpoint");
+    let script: Vec<ScriptedTurn> = (1..=25)
+        .map(|turn| match turn {
+            // Dirty the worktree on turn 19, so turn 20 has something to commit.
+            19 => ScriptedSseServer::bash_turn("call_19", "echo checkpoint > note.txt"),
+            25 => ScriptedSseServer::completion_turn("call_done"),
+            _ => {
+                ScriptedSseServer::bash_turn(&format!("call_{turn}"), &format!("echo turn {turn}"))
+            }
+        })
+        .collect();
+    let server = ScriptedSseServer::spawn(script).await;
+
+    let (_pool, worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 25, None, None).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete, got {state:?}"
+    );
+
+    let branch = format!("worker-{worker_id}");
+    let subjects = git_capture(repo.path(), &["log", "--format=%s", &branch]);
+    assert!(
+        subjects.contains(&format!("worker({worker_id}): auto-checkpoint step 20")),
+        "turn 20 must have checkpointed the worktree, branch log was:\n{subjects}"
+    );
+    assert_eq!(
+        git_capture(repo.path(), &["show", &format!("{branch}:note.txt")]),
+        "checkpoint",
+        "the checkpointed commit must carry the uncommitted file"
+    );
+}
+
+/// A kill commits whatever the worker left uncommitted *before* aborting it:
+/// the aborted task drops its worktree guard, so a later commit would find
+/// nothing to save.
+#[tokio::test]
+async fn killing_a_worker_checkpoints_its_uncommitted_work() {
+    let repo = TestRepo::new("kill-checkpoint");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::bash_turn("call_1", "echo preserved > kept.txt"),
+        ScriptedSseServer::bash_turn("call_2", "sleep 30"),
+        ScriptedSseServer::completion_turn("call_done"),
+    ])
+    .await;
+
+    let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
+    let worker_id = pool
+        .dispatch(
+            "leave work behind".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            5,
+            Some("agent-loop".to_string()),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("dispatch the worker");
+
+    // Turn 1 has written its file and turn 2 is in flight, so the worktree is
+    // dirty and the worker is still alive to be killed.
+    let mut reached_second_turn = false;
+    for _ in 0..600 {
+        if pool
+            .worker_progress(&worker_id)
+            .await
+            .is_some_and(|p| p.step >= 2)
+        {
+            reached_second_turn = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(reached_second_turn, "the worker never reached its second turn");
+
+    assert!(pool.kill(&worker_id).await, "kill must find the worker");
+    let state = wait_for_terminal(&pool, &worker_id).await;
+    assert!(
+        matches!(state, WorkerState::Failed { .. }),
+        "a killed worker must fail, got {state:?}"
+    );
+
+    let branch = format!("worker-{worker_id}");
+    let subject = git_capture(repo.path(), &["log", "-1", "--format=%s", &branch]);
+    assert!(
+        subject.contains("checkpoint before kill"),
+        "the kill must have committed the worktree, branch head was {subject:?}"
+    );
+    assert_eq!(
+        git_capture(repo.path(), &["show", &format!("{branch}:kept.txt")]),
+        "preserved",
+        "the killed worker's uncommitted file must survive on its branch"
+    );
+}
+
+/// A worktree that has not changed for 30 sampled turns gets told to make the
+/// edit or escalate, instead of exploring until the budget runs out.
+#[tokio::test]
+async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
+    let repo = TestRepo::new("stagnation");
+    // 40 read-only turns: the samples at turns 10, 20, 30 and 40 all agree,
+    // so the streak reaches 30 turns on the fourth one.
+    let script: Vec<ScriptedTurn> = (1..=40)
+        .map(|turn| {
+            ScriptedSseServer::bash_turn(&format!("call_{turn}"), &format!("echo turn {turn}"))
+        })
+        .chain(std::iter::once(ScriptedSseServer::completion_turn("call_done")))
+        .collect();
+    let server = ScriptedSseServer::spawn(script).await;
+
+    let (_pool, _worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "worker must complete, got {state:?}"
+    );
+
+    let requests = server.requests.all().await;
+    assert_eq!(requests.len(), 41, "got {} requests", requests.len());
+
+    let nudge = |request: &Value| {
+        user_messages(request)
+            .into_iter()
+            .find(|m| m.contains("No change to the repository in the last 30 turns"))
+    };
+    assert!(
+        nudge(&requests[29]).is_none(),
+        "30 turns had not passed yet on turn 30: {:?}",
+        user_messages(&requests[29])
+    );
+    let injected = nudge(&requests[39]).unwrap_or_else(|| {
+        panic!(
+            "turn 40 must inject the stagnation nudge, got {:?}",
+            user_messages(&requests[39])
+        )
+    });
+    assert!(
+        injected.contains("Stop exploring") && injected.contains("ASK_ORCHESTRATOR"),
+        "the nudge must offer both ways out, got {injected:?}"
+    );
 }
