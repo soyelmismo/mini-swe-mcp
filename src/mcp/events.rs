@@ -411,8 +411,11 @@ pub(super) async fn spawn_hub_events(
     tokio::spawn(async move {
         loop {
             let current = snapshot(&pool, &previous).await;
-            let views = watch_snapshot(&pool).await;
-            router.lock().await.observe_watch(views);
+            {
+                let mut guard = router.lock().await;
+                let views = watch_snapshot(&pool).await;
+                guard.observe_watch(views);
+            }
             for event in diff_events(&previous, &current) {
                 let owner = match pool.worker_owner(&event.worker_id).await {
                     Some(crate::pool::WorkerOwner::Agent(owner)) => Some(owner),
@@ -733,8 +736,23 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             view["step"] = json!(progress.step);
             view["status"] = json!(phase_status(progress.phase));
             view["question"] = json!(progress.question);
-            if progress.phase != WorkerPhase::Running
-                && let Some(state) = pool.get_worker_state(id).await { enrich_state(view, &state); }
+            // list_workers supplies a summary without cloning the multi-megabyte diff.
+            if progress.phase != WorkerPhase::Running {
+                let details = &row["state"];
+                for key in ["summary", "verified", "branch", "revision", "metrics", "error"] {
+                    if let Some(value) = details.get(key) {
+                        view[key] = value.as_str().map_or_else(|| value.clone(), |text| json!(clamp_string(text, 1500)));
+                    }
+                }
+                // The pure state projection remains shared with tests; paused
+                // progress carries exactly the fields the projection needs.
+                if progress.phase == WorkerPhase::Paused {
+                    enrich_state(view, &WorkerState::Paused {
+                        question: view["question"].as_str().unwrap_or("").to_string(),
+                        step: progress.step, paused_at: now,
+                    });
+                }
+            }
         }
         if let Some(logs) = pool.get_worker_logs(id).await {
             view["last_ops"] = json!(logs.tail(5).iter().map(|log| clamp_string(&log.command,256)).collect::<Vec<_>>());

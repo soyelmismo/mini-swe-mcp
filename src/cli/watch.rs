@@ -47,7 +47,7 @@ pub fn registry_snapshot(entry: &WorkerRegistryEntry, now: u64) -> Value {
         "model":entry.model, "group":entry.group.as_deref().unwrap_or("default"),
         "status":match entry.status { crate::pool::RegistryStatus::Running=>"running", crate::pool::RegistryStatus::Paused=>"paused", crate::pool::RegistryStatus::Reviewing=>"reviewing", crate::pool::RegistryStatus::Completed=>"completed", crate::pool::RegistryStatus::Failed=>"failed", crate::pool::RegistryStatus::Stopped=>"stopped" }.to_string(),
         "step":entry.step, "turns":entry.step, "max_turns":entry.max_turns,
-        "elapsed":now.saturating_sub(entry.started_at), "last_step_at":entry.updated_at, "last_op":"", "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
+        "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
         "metrics":entry.metrics, "branch":null, "revision":0, "summary":null,
         "task":clamp_string(entry.task.lines().next().unwrap_or(""), 500),
         "verified":null, "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
@@ -106,7 +106,7 @@ fn commands(v: &Value) -> Vec<String> {
         "stalled" => vec![steer, format!("mini-swe-mcp kill {id}")],
         _ => {
             let branch = v["branch"].as_str().map(shell);
-            let mut out = vec![format!("git diff HEAD...{}", branch.as_deref().unwrap_or("'<worker branch>'")), "<run the acceptance checks>".to_string(), format!("mini-swe-mcp steer {id} \"<corrections or merge conflicts>\" --max-turns 60")];
+            let mut out = vec![format!("git diff HEAD...{}", branch.as_deref().unwrap_or("'<worker branch>'")), v["verify_command"].as_str().filter(|s| !s.is_empty()).unwrap_or("<run the acceptance checks>").to_string(), format!("mini-swe-mcp steer {id} \"<corrections or merge conflicts>\" --max-turns 60")];
             if let Some(branch) = branch { out.push(format!("git merge {branch}")); }
             out
         }
@@ -232,6 +232,9 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
         current.retain(|id, v| ids.contains(id) && (admin || v["owner"] == owner) && matches(v, &ids, opts.group.as_deref()));
         for (id, view) in &mut current {
             progress_clock(view, previous.get(id), now);
+            if previous.get(id).is_some_and(|old| old["status"] != view["status"]) {
+                reported.remove(id);
+            }
             if let Some(event) = select_event(view, reported.get(id), now) {
                 print_event(&event, json_output, opts.follow)?;
                 reported.insert(id.clone(), event);

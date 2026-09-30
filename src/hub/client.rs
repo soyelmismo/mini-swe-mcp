@@ -171,6 +171,7 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
             stream: BufReader::new(connect_or_spawn().await?),
             next_id: 1,
             notifications: Vec::new(),
+            watch_line: Vec::new(),
         };
         // Announce the final CLI identity before any replay. The proxy's
         // identity comes from hello or the host's later initialize.
@@ -283,6 +284,7 @@ pub struct HubClient {
     stream: BufReader<UnixStream>,
     next_id: u64,
     notifications: Vec<Vec<u8>>,
+    watch_line: Vec<u8>,
 }
 
 impl HubClient {
@@ -355,6 +357,9 @@ impl HubClient {
 
     /// Owner-scoped actionable replay and the current watch set.
     pub async fn watch_snapshot(&mut self, ids: &std::collections::BTreeSet<String>, group: Option<&str>, initial: bool) -> Result<Value> {
+        if !self.watch_line.is_empty() {
+            self.next_watch_notification().await?;
+        }
         self.request("hub/watch", json!({"worker_ids":ids,"group":group,"initial":initial})).await
     }
 
@@ -370,11 +375,18 @@ impl HubClient {
             self.notifications.clear();
             return Ok(());
         }
-        let mut line = Vec::new();
-        (&mut self.stream).take(1024 * 1024 + 1).read_until(b'\n', &mut line).await?;
-        anyhow::ensure!(!line.is_empty(), "Hub closed the connection");
-        anyhow::ensure!(line.len() <= 1024 * 1024, "Hub notification exceeds 1 MiB");
-        Ok(())
+        loop {
+            let bytes = self.stream.fill_buf().await?;
+            anyhow::ensure!(!bytes.is_empty(), "Hub closed the connection");
+            let count = bytes.iter().position(|byte| *byte == b'\n').map_or(bytes.len(), |end| end + 1);
+            anyhow::ensure!(self.watch_line.len() + count <= 1024 * 1024, "Hub notification exceeds 1 MiB");
+            self.watch_line.extend_from_slice(&bytes[..count]);
+            self.stream.consume(count);
+            if self.watch_line.last() == Some(&b'\n') {
+                self.watch_line.clear();
+                return Ok(());
+            }
+        }
     }
 
     pub async fn worker(&mut self, arguments: Value) -> Result<Value> {

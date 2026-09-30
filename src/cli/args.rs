@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--timeout <secs>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>]";
+pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--wait] [--timeout <secs>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate)";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).

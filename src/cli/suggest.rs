@@ -76,6 +76,7 @@ mod tests {
         }
         assert!(actions.contains(&"monitor"));
         assert!(actions.contains(&"supervisor"));
+        assert!(actions.contains(&"watch"), "watch is a CLI-only verb");
         // No duplicates: a CLI-only verb must not shadow a tool verb.
         let mut seen = actions.clone();
         seen.sort_unstable();
