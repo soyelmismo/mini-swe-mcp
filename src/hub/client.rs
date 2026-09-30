@@ -86,9 +86,15 @@ fn hello_params(admin: bool, version: &str) -> Value {
 fn newer(client: &str, daemon: &str) -> bool {
     fn parts(version: &str) -> Option<([u64; 3], Option<&str>)> {
         let version = version.split('+').next()?;
-        let (core, pre) = version.split_once('-').map_or((version, None), |(v, p)| (v, Some(p)));
+        let (core, pre) = version
+            .split_once('-')
+            .map_or((version, None), |(v, p)| (v, Some(p)));
         let mut numbers = core.split('.');
-        let tuple = [numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?];
+        let tuple = [
+            numbers.next()?.parse().ok()?,
+            numbers.next()?.parse().ok()?,
+            numbers.next()?.parse().ok()?,
+        ];
         numbers.next().is_none().then_some((tuple, pre))
     }
     match (parts(client), parts(daemon)) {
@@ -121,12 +127,16 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                         // The reply precedes teardown. Wait for EOF, not merely
                         // the reply, so connect_or_spawn cannot dial the old hub.
                         let mut byte = [0u8; 1];
-                        tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut byte)).await??;
+                        tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut byte))
+                            .await??;
                         drop(client);
                         let paths = HubPaths::new(hub_dir()?);
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                         while paths.socket().exists() {
-                            anyhow::ensure!(tokio::time::Instant::now() < deadline, "Old hub did not stop");
+                            anyhow::ensure!(
+                                tokio::time::Instant::now() < deadline,
+                                "Old hub did not stop"
+                            );
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                         continue;
@@ -136,15 +146,20 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                     }
                 }
             }
-            {
-                eprintln!("[mini-swe] Client {version} is newer than hub {daemon}; continuing with the existing daemon (busy or replacement unavailable).");
-            }
+            eprintln!(
+                "[mini-swe] Client {version} is newer than hub {daemon}; continuing with the existing daemon (busy or replacement unavailable)."
+            );
         }
         if cli {
-            client.request("initialize", json!({
-                "protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": version}
-            })).await?;
+            client
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": version}
+                    }),
+                )
+                .await?;
         }
         return Ok(client);
     }
@@ -235,7 +250,8 @@ impl HubClient {
                 // Negotiation can race owner replay. Preserve it for the proxy
                 // with both frame count and byte retention bounded.
                 if self.notifications.len() < 100
-                    && self.notifications.iter().map(Vec::len).sum::<usize>() + line.len() <= 1024 * 1024
+                    && self.notifications.iter().map(Vec::len).sum::<usize>() + line.len()
+                        <= 1024 * 1024
                 {
                     self.notifications.push(line);
                 }

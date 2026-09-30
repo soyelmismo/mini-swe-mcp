@@ -271,12 +271,12 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
                 crate::pool::next_step_for(view.branch.as_deref()),
             );
             (
-            body,
-            format!(
-                "Inspect it with the worker tool: action \"status\" (then \"logs\"), worker_id \"{}\".",
-                view.worker_id
-            ),
-        )
+                body,
+                format!(
+                    "Inspect it with the worker tool: action \"status\" (then \"logs\"), worker_id \"{}\".",
+                    view.worker_id
+                ),
+            )
         }
     };
     format!("{header}\n{body}\n{verb}")
@@ -307,7 +307,7 @@ pub(super) fn spawn_event_stream(
             for event in diff_events(&previous, &current) {
                 if owns(&pool, &ctx, &event.worker_id).await
                     && let Some(frame) = channel_frame(&event)
-                    && tx.send(frame).await.is_err()
+                    && !try_deliver(&tx, frame)
                 {
                     return;
                 }
@@ -318,8 +318,8 @@ pub(super) fn spawn_event_stream(
 }
 
 async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &str) -> bool {
-    ctx.is_admin() || pool.worker_owner(id).await
-        == Some(crate::pool::WorkerOwner::Agent(ctx.agent()))
+    ctx.is_admin()
+        || pool.worker_owner(id).await == Some(crate::pool::WorkerOwner::Agent(ctx.agent()))
 }
 
 /// Latest events survive disconnected owners, but never retain more than 100 workers.
@@ -330,15 +330,23 @@ pub(super) struct EventRouter {
 }
 
 impl EventRouter {
-    pub(super) async fn register(&mut self, ctx: &super::server::ConnectionContext, tx: mpsc::Sender<String>) {
+    pub(super) fn register(
+        &mut self,
+        ctx: &super::server::ConnectionContext,
+        tx: mpsc::Sender<String>,
+    ) {
         let agent = ctx.agent();
-        if self.connections.get(&ctx.id).is_some_and(|(old, admin, _)| old == &agent && *admin == ctx.is_admin()) {
+        if self
+            .connections
+            .get(&ctx.id)
+            .is_some_and(|(old, admin, _)| old == &agent && *admin == ctx.is_admin())
+        {
             return;
         }
         for (owner, event) in &self.latest {
             if (ctx.is_admin() || owner.as_deref() == Some(agent.as_str()))
                 && let Some(frame) = channel_frame(event)
-                && tx.send(frame).await.is_err()
+                && !try_deliver(&tx, frame)
             {
                 return;
             }
@@ -351,7 +359,8 @@ impl EventRouter {
     }
 
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
-        self.latest.retain(|(_, old)| old.worker_id != event.worker_id);
+        self.latest
+            .retain(|(_, old)| old.worker_id != event.worker_id);
         if self.latest.len() == 100 {
             self.latest.pop_front();
         }
@@ -359,7 +368,7 @@ impl EventRouter {
             self.connections.retain(|_, (agent, admin, tx)| {
                 if *admin || owner.as_deref() == Some(agent.as_str()) {
                     // A stalled connection must not block the pool watcher.
-                    tx.try_send(frame.clone()).is_ok()
+                    try_deliver(tx, frame.clone())
                 } else {
                     !tx.is_closed()
                 }
@@ -369,7 +378,21 @@ impl EventRouter {
     }
 }
 
-pub(super) async fn spawn_hub_events(pool: WorkerPool, router: Arc<Mutex<EventRouter>>) -> JoinHandle<()> {
+fn try_deliver(tx: &mpsc::Sender<String>, frame: String) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!("Dropping worker event for a stalled connection");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+pub(super) async fn spawn_hub_events(
+    pool: WorkerPool,
+    router: Arc<Mutex<EventRouter>>,
+) -> JoinHandle<()> {
     let mut changes = pool.subscribe_changes();
     let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
     previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
@@ -450,8 +473,9 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             // the completion guidance points at the branch a revision resumes.
             view.branch = crate::pool::terminal_branch(&state);
             view.revision = match &state {
-                WorkerState::Completed { revision, .. }
-                | WorkerState::Failed { revision, .. } => *revision,
+                WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
+                    *revision
+                }
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => 0,
             };
         }
@@ -573,7 +597,6 @@ fn phase_status(phase: WorkerPhase) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod router_tests {
     use super::*;
@@ -581,27 +604,82 @@ mod router_tests {
 
     fn event(id: &str, kind: EventKind) -> ChannelEvent {
         ChannelEvent {
-            worker_id: id.to_string(), kind, group: "default".to_string(),
-            model: "test".to_string(), status: kind.as_str().to_string(), content: "test".to_string(),
+            worker_id: id.to_string(),
+            kind,
+            group: "default".to_string(),
+            model: "test".to_string(),
+            status: kind.as_str().to_string(),
+            content: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn full_channels_do_not_unregister_live_connections() {
+        let mut router = EventRouter::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut ctx = ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("a".to_string());
+        router.register(&ctx, tx);
+        router.publish(Some("a".to_string()), event("first", EventKind::Completed));
+        router.publish(
+            Some("a".to_string()),
+            event("dropped", EventKind::Completed),
+        );
+        assert_eq!(router.connections.len(), 1);
+        let first = rx.try_recv().unwrap();
+        assert!(first.contains("first"));
+        router.publish(Some("a".to_string()), event("next", EventKind::Failed));
+        assert!(rx.try_recv().unwrap().contains("next"));
+        drop(rx);
+        router.publish(Some("a".to_string()), event("closed", EventKind::Failed));
+        assert!(router.connections.is_empty());
+    }
+
+    #[test]
+    fn replay_to_a_full_channel_never_blocks_registration() {
+        let mut router = EventRouter::default();
+        router.publish(Some("a".to_string()), event("first", EventKind::Completed));
+        router.publish(Some("a".to_string()), event("second", EventKind::Failed));
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send("already full".to_string()).unwrap();
+        let mut ctx = ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("a".to_string());
+        router.register(&ctx, tx);
+        assert_eq!(router.connections.len(), 1);
+        assert_eq!(rx.try_recv().unwrap(), "already full");
+        router.publish(Some("a".to_string()), event("new", EventKind::Failed));
+        assert!(rx.try_recv().unwrap().contains("new"));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        ctx.id = 2;
+        router.register(&ctx, tx);
+        assert!(!router.connections.contains_key(&2));
     }
 
     #[tokio::test]
     async fn replay_is_bounded_latest_per_worker_and_owner_scoped() {
         let mut router = EventRouter::default();
         for id in 0..101 {
-            router.publish(Some("a".to_string()), event(&id.to_string(), EventKind::Completed));
+            router.publish(
+                Some("a".to_string()),
+                event(&id.to_string(), EventKind::Completed),
+            );
         }
         router.publish(Some("a".to_string()), event("1", EventKind::Failed));
         assert_eq!(router.latest.len(), 100);
-        assert!(!router.latest.iter().any(|(_, event)| event.worker_id == "0"));
+        assert!(
+            !router
+                .latest
+                .iter()
+                .any(|(_, event)| event.worker_id == "0")
+        );
         let (tx, mut rx) = mpsc::channel(128);
         let mut ctx = ConnectionContext::hub_connection(1);
         ctx.agent_id = Some("b".to_string());
-        router.register(&ctx, tx.clone()).await;
+        router.register(&ctx, tx.clone());
         assert!(rx.try_recv().is_err());
         ctx.agent_id = Some("a".to_string());
-        router.register(&ctx, tx).await;
+        router.register(&ctx, tx);
         let mut frames = Vec::new();
         while let Ok(frame) = rx.try_recv() {
             frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());

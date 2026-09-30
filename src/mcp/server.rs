@@ -208,10 +208,9 @@ impl McpServer {
         // notification can never land inside a response frame.
         let hub = self.hub_enabled.load(std::sync::atomic::Ordering::Acquire);
         let (context_tx, context_rx) = watch::channel(ctx.clone());
-        let events = (!hub).then(|| super::events::spawn_event_stream(
-            (*self.pool).clone(), out_tx.clone(), context_rx,
-        ));
-
+        let events = (!hub).then(|| {
+            super::events::spawn_event_stream((*self.pool).clone(), out_tx.clone(), context_rx)
+        });
 
         // Dedicated background writer: the single owner of `writer`, so
         // frames from concurrent request tasks cannot interleave.
@@ -225,110 +224,131 @@ impl McpServer {
                     error!(error = %e, "Failed flushing client stream");
                     break;
                 }
-
             }
         });
 
         let mut requested_shutdown = false;
         let served = async {
-        while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
-            if oversized {
-                let _ = out_tx
-                    .send(FrameRejection::FrameTooLarge.into_frame())
-                    .await;
-                continue;
-            }
-            let line = std::str::from_utf8(&input)?.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let req = match parse_frame(line) {
-                Ok(req) => req,
-                Err(rejection) => {
-                    error!("Rejected JSON-RPC frame: {rejection:?}");
-                    let _ = out_tx.send(rejection.into_frame()).await;
+            while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
+                if oversized {
+                    let _ = out_tx
+                        .send(FrameRejection::FrameTooLarge.into_frame())
+                        .await;
                     continue;
                 }
-            };
-            // Identity changes and hub control requests are handled in wire order.
-            let handshake = req.method == "hub/hello" || req.method == "initialize";
-            if req.method == "hub/hello" {
-                let params = req.params.as_ref().cloned().unwrap_or_default();
-                ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
-                ctx.admin = params["admin"].as_bool().unwrap_or(false);
-                ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
-                ctx.version = params["version"].as_str().map(str::to_owned);
-                ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
-                    .filter(|cwd| cwd.is_absolute());
-            } else if req.method == "initialize" {
-                ctx.client_name = req.params.as_ref()
-                    .and_then(|params| params["clientInfo"]["name"].as_str()).map(str::to_owned);
-            }
-            if handshake {
-                if req.id.is_some() {
-                    let response = if req.method == "hub/hello" {
-                        JsonRpcResponse::ok(req.id_or_null().map(ToOwned::to_owned), json!({
-                            "version": &*self.daemon_version,
-                            "busy": self.pool.active_worker_count().await > 0,
-                        }))
-                    } else {
-                        self.handle_request(req, ctx.clone(), None).await
-                    };
-                    let _ = out_tx.send(response.to_frame()?).await;
+                let line = std::str::from_utf8(&input)?.trim();
+                if line.is_empty() {
+                    continue;
                 }
-                if hub && (ctx.agent_id.is_some() || ctx.client_name.is_some() || ctx.is_admin()) {
-                    self.hub_events.lock().await.register(&ctx, out_tx.clone()).await;
-                }
-                context_tx.send_replace(ctx.clone());
-                continue;
-            }
-            if req.id.is_none() {
-                trace!(method = %req.method, "Received notification");
-                continue;
-            }
-            if hub && req.method == "hub/shutdown" {
-                let mut busy = self.pool.active_worker_count().await > 0;
-                if !busy {
-                    // Serialize the idle decision with dispatch/revision admission.
-                    let mut stopping = self.hub_shutdown_gate.write().await;
-                    busy = self.pool.active_worker_count().await > 0;
-                    if !busy { *stopping = true; }
-                }
-                let id = req.id_or_null().map(ToOwned::to_owned);
-                let response = if busy {
-                    JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Borrowed("Hub is busy"))
-                } else {
-                    JsonRpcResponse::ok(id, json!({"version": &*self.daemon_version, "busy": false}))
-                };
-                if !busy {
-                    // Drain through the shutdown reply before the daemon closes sockets.
-                    let _ = out_tx.send(response.to_frame()?).await;
-                    requested_shutdown = true;
-                    break;
-                }
-                let _ = out_tx.send(response.to_frame()?).await;
-                continue;
-            }
-            let server = self.clone();
-            let tx = out_tx.clone();
-            let ctx = ctx.clone();
-            tokio::spawn(async move {
-                let response = server.handle_request(req, ctx, Some(tx.clone())).await;
-                let frame = response
-                    .to_frame()
-                    .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME));
-                let _ = tx.send(frame).await;
-            });
-        }
 
-        Ok::<(), anyhow::Error>(())
-        }.await;
+                let req = match parse_frame(line) {
+                    Ok(req) => req,
+                    Err(rejection) => {
+                        error!("Rejected JSON-RPC frame: {rejection:?}");
+                        let _ = out_tx.send(rejection.into_frame()).await;
+                        continue;
+                    }
+                };
+                // Identity changes and hub control requests are handled in wire order.
+                let handshake = req.method == "hub/hello" || req.method == "initialize";
+                if req.method == "hub/hello" {
+                    let params = req.params.as_ref().cloned().unwrap_or_default();
+                    ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                    ctx.admin = params["admin"].as_bool().unwrap_or(false);
+                    ctx.pid = params["pid"]
+                        .as_u64()
+                        .and_then(|pid| u32::try_from(pid).ok());
+                    ctx.version = params["version"].as_str().map(str::to_owned);
+                    ctx.cwd = params["cwd"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .filter(|cwd| cwd.is_absolute());
+                } else if req.method == "initialize" {
+                    ctx.client_name = req
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["clientInfo"]["name"].as_str())
+                        .map(str::to_owned);
+                }
+                if handshake {
+                    if req.id.is_some() {
+                        let response = if req.method == "hub/hello" {
+                            JsonRpcResponse::ok(
+                                req.id_or_null().map(ToOwned::to_owned),
+                                json!({
+                                    "version": &*self.daemon_version,
+                                    "busy": self.pool.active_worker_count().await > 0,
+                                }),
+                            )
+                        } else {
+                            self.handle_request(req, ctx.clone(), None).await
+                        };
+                        let _ = out_tx.send(response.to_frame()?).await;
+                    }
+                    if hub
+                        && (ctx.agent_id.is_some() || ctx.client_name.is_some() || ctx.is_admin())
+                    {
+                        self.hub_events.lock().await.register(&ctx, out_tx.clone());
+                    }
+                    context_tx.send_replace(ctx.clone());
+                    continue;
+                }
+                if req.id.is_none() {
+                    trace!(method = %req.method, "Received notification");
+                    continue;
+                }
+                if hub && req.method == "hub/shutdown" {
+                    let mut busy = self.pool.active_worker_count().await > 0;
+                    if !busy {
+                        // Serialize the idle decision with dispatch/revision admission.
+                        let mut stopping = self.hub_shutdown_gate.write().await;
+                        busy = self.pool.active_worker_count().await > 0;
+                        if !busy {
+                            *stopping = true;
+                        }
+                    }
+                    let id = req.id_or_null().map(ToOwned::to_owned);
+                    let response = if busy {
+                        JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Borrowed("Hub is busy"))
+                    } else {
+                        JsonRpcResponse::ok(
+                            id,
+                            json!({"version": &*self.daemon_version, "busy": false}),
+                        )
+                    };
+                    if !busy {
+                        // Drain through the shutdown reply before the daemon closes sockets.
+                        let _ = out_tx.send(response.to_frame()?).await;
+                        requested_shutdown = true;
+                        break;
+                    }
+                    let _ = out_tx.send(response.to_frame()?).await;
+                    continue;
+                }
+                let server = self.clone();
+                let tx = out_tx.clone();
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let response = server.handle_request(req, ctx, Some(tx.clone())).await;
+                    let frame = response
+                        .to_frame()
+                        .unwrap_or_else(|_| String::from(INTERNAL_ERROR_FRAME));
+                    let _ = tx.send(frame).await;
+                });
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
         drop(out_tx);
-        if let Some(events) = events { events.abort(); }
+        if let Some(events) = events {
+            events.abort();
+        }
         self.hub_events.lock().await.remove(ctx.id);
         let _ = writer_task.await;
-        if requested_shutdown { self.shutdown.send_replace(true); }
+        if requested_shutdown {
+            self.shutdown.send_replace(true);
+        }
         served
     }
 
@@ -371,7 +391,13 @@ impl McpServer {
                     .cloned();
 
                 match self
-                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, &ctx)
+                    .execute_tool_in_context(
+                        tool_name,
+                        arguments,
+                        progress_token,
+                        progress_tx,
+                        &ctx,
+                    )
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
@@ -389,7 +415,8 @@ impl McpServer {
 
     /// Start the daemon's single watcher before accepting any connections.
     pub async fn start_hub_events(&self) -> tokio::task::JoinHandle<()> {
-        self.hub_enabled.store(true, std::sync::atomic::Ordering::Release);
+        self.hub_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
         super::events::spawn_hub_events((*self.pool).clone(), self.hub_events.clone()).await
     }
 
@@ -431,7 +458,8 @@ impl McpServer {
         args: Value,
         ctx: &ConnectionContext,
     ) -> Result<Value> {
-        self.execute_tool_in_context(name, args, None, None, ctx).await
+        self.execute_tool_in_context(name, args, None, None, ctx)
+            .await
     }
 
     /// Execute a tool call, optionally streaming `notifications/progress`.
@@ -442,12 +470,23 @@ impl McpServer {
         progress_token: Option<Value>,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> Result<Value> {
-        self.execute_tool_in_context(name, args, progress_token, progress_tx, &ConnectionContext::stdio()).await
+        self.execute_tool_in_context(
+            name,
+            args,
+            progress_token,
+            progress_tx,
+            &ConnectionContext::stdio(),
+        )
+        .await
     }
 
     async fn execute_tool_in_context(
-        &self, name: &str, args: Value, progress_token: Option<Value>,
-        progress_tx: Option<mpsc::Sender<String>>, ctx: &ConnectionContext,
+        &self,
+        name: &str,
+        args: Value,
+        progress_token: Option<Value>,
+        progress_tx: Option<mpsc::Sender<String>>,
+        ctx: &ConnectionContext,
     ) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{name}'. Only 'worker' is supported.");
@@ -455,17 +494,22 @@ impl McpServer {
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-        let admission = if matches!(action, "dispatch" | "steer") {
-            Some(self.hub_shutdown_gate.read().await)
-        } else {
-            None
-        };
-        if admission.as_ref().is_some_and(|stopping| **stopping) {
+        self.dispatch(
+            action,
+            &args,
+            progress_token.as_ref(),
+            progress_tx.as_ref(),
+            ctx,
+        )
+        .await
+    }
+
+    pub(super) async fn admit_worker(&self) -> Result<tokio::sync::RwLockReadGuard<'_, bool>> {
+        let admission = self.hub_shutdown_gate.read().await;
+        if *admission {
             anyhow::bail!("Hub is shutting down");
         }
-
-        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref(), ctx)
-            .await
+        Ok(admission)
     }
 
     /// Wait indefinitely for a worker's next event.
@@ -591,9 +635,7 @@ impl McpServer {
                     // next: review the branch, and steer this same worker when
                     // it needs corrections.
                     let next_step = state.as_ref().map(|state| {
-                        crate::pool::next_step_for(
-                            crate::pool::terminal_branch(state).as_deref(),
-                        )
+                        crate::pool::next_step_for(crate::pool::terminal_branch(state).as_deref())
                     });
                     let mut result = json!({
                         "worker_id": wid,
@@ -764,6 +806,64 @@ mod tests {
             WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
             "ninja".to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn waiting_steer_releases_its_admission_guard() {
+        use crate::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
+        let server = server();
+        server
+            .pool
+            .__test_insert_worker(WorkerRecord {
+                id: "h4-wait-gate".to_string(),
+                task: "probe".to_string(),
+                model: "test".to_string(),
+                owner: LOCAL_AGENT.to_string(),
+                state: WorkerState::Running {
+                    step: 1,
+                    last_command: "probe".to_string(),
+                    started_at: 0,
+                },
+                metrics: WorkerMetrics::default(),
+                logs: LogBuffer::new(),
+                pending_steer: Vec::new(),
+                resume_tx: None,
+                handle: None,
+                revision: 0,
+            })
+            .await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let waiter = server.clone();
+        let task = tokio::spawn(async move {
+            waiter.execute_tool_with_progress("worker", json!({
+                "action": "steer", "worker_id": "h4-wait-gate", "message": "go", "wait": true
+            }), Some(json!("waiting")), Some(tx)).await
+        });
+        // The first progress frame is emitted only after steering admission
+        // has completed and the waiter has read the still-running worker.
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!task.is_finished());
+        assert!(
+            server.hub_shutdown_gate.try_write().is_ok(),
+            "wait must not retain admission"
+        );
+        server
+            .pool
+            .__test_set_worker_state(
+                "h4-wait-gate",
+                WorkerState::Failed {
+                    error: "done".to_string(),
+                    step: 1,
+                    failed_at: 1,
+                    metrics: WorkerMetrics::default(),
+                    revision: 0,
+                },
+            )
+            .await;
+        assert!(task.await.unwrap().is_ok());
     }
 
     /// No verb may be advertised without a handler behind it.

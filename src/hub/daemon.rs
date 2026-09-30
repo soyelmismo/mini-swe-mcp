@@ -36,7 +36,11 @@ pub fn raise_nofile_limit() {
         }
         let limits = limits.assume_init();
         if limits.rlim_cur >= limits.rlim_max {
-            debug!(soft = limits.rlim_cur, hard = limits.rlim_max, "RLIMIT_NOFILE already raised");
+            debug!(
+                soft = limits.rlim_cur,
+                hard = limits.rlim_max,
+                "RLIMIT_NOFILE already raised"
+            );
             return;
         }
         let raised = libc::rlimit {
@@ -45,7 +49,11 @@ pub fn raise_nofile_limit() {
         };
         let old = limits.rlim_cur;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
-            debug!(old, new = raised.rlim_cur, "Raised RLIMIT_NOFILE soft limit to the hard limit");
+            debug!(
+                old,
+                new = raised.rlim_cur,
+                "Raised RLIMIT_NOFILE soft limit to the hard limit"
+            );
         } else {
             warn!(
                 old,
@@ -129,7 +137,8 @@ fn harden_hub_dir(dir: PathBuf) -> Result<PathBuf> {
             return Ok(dir);
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("Could not inspect hub directory {}", dir.display()));
+            return Err(e)
+                .with_context(|| format!("Could not inspect hub directory {}", dir.display()));
         }
     };
 
@@ -228,14 +237,14 @@ impl HubServer {
         let idle_watcher = self.clone();
         let mut idle_task = tokio::spawn(async move { idle_watcher.watch_idle().await });
 
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(sig) => Some(sig),
-            Err(e) => {
-                warn!(error = %e, "Could not install SIGTERM handler");
-                None
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(sig) => Some(sig),
+                Err(e) => {
+                    warn!(error = %e, "Could not install SIGTERM handler");
+                    None
+                }
+            };
 
         loop {
             tokio::select! {
@@ -400,10 +409,16 @@ impl Drop for HubLock {
 ///
 /// The caller supplies the shared [`McpServer`] so the daemon never builds a
 /// second pool; `idle_secs` overrides `HUB_IDLE_SECS`.
-pub async fn run_daemon(server: Arc<McpServer>, dir: PathBuf, idle_secs: Option<u64>) -> Result<bool> {
+pub async fn run_daemon(
+    server: Arc<McpServer>,
+    dir: PathBuf,
+    idle_secs: Option<u64>,
+) -> Result<bool> {
     let paths = HubPaths { dir };
     let idle = idle_secs
         .or_else(|| crate::config::env_parse("HUB_IDLE_SECS"))
         .unwrap_or(DEFAULT_IDLE_SECS);
-    HubServer::new(server, HubConfig::new(paths, idle)).run().await
+    HubServer::new(server, HubConfig::new(paths, idle))
+        .run()
+        .await
 }

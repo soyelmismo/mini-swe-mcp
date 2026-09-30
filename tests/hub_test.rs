@@ -36,9 +36,8 @@ fn scratch_dir() -> PathBuf {
 
 /// A server backed by a pool that can answer handshake verbs without an LLM.
 fn server() -> Arc<McpServer> {
-    let pool =
-        WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-            .with_manifest(Arc::new(ModelManifest::default()));
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
     Arc::new(McpServer::new(pool, "test-model".to_string()))
 }
 
@@ -74,9 +73,7 @@ impl Client {
 
     /// Send one request and return its decoded `result`.
     async fn call(&mut self, method: &str) -> serde_json::Value {
-        self.request(method, serde_json::json!({}))
-            .await["result"]
-            .clone()
+        self.request(method, serde_json::json!({})).await["result"].clone()
     }
 
     /// Send one request and return the whole reply envelope, error included.
@@ -131,10 +128,7 @@ impl Client {
     }
 
     /// One `worker` tool call: the decoded payload, or the error message.
-    async fn worker(
-        &mut self,
-        arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    async fn worker(&mut self, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
         let reply = self
             .request(
                 "tools/call",
@@ -156,20 +150,14 @@ impl Client {
 #[tokio::test]
 async fn two_clients_share_one_daemon() {
     let dir = scratch_dir();
-    let config = HubConfig::new(
-        hub_paths_for_test(&dir),
-        60,
-    );
+    let config = HubConfig::new(hub_paths_for_test(&dir), 60);
     let daemon = HubServer::new(server(), config);
     let task = tokio::spawn(async move { daemon.run().await });
 
     let socket = dir.join("hub.sock");
     wait_for_socket(&socket).await;
     let (mut a, mut b) = tokio::join!(Client::connect(&socket), Client::connect(&socket));
-    let (init_a, init_b) = tokio::join!(
-        a.call("initialize"),
-        b.call("initialize"),
-    );
+    let (init_a, init_b) = tokio::join!(a.call("initialize"), b.call("initialize"),);
     assert_eq!(init_a["protocolVersion"], "2024-11-05");
     assert_eq!(init_b["protocolVersion"], "2024-11-05");
     let (tools, ping) = tokio::join!(a.call("tools/list"), b.call("ping"));
@@ -189,10 +177,7 @@ async fn two_clients_share_one_daemon() {
 #[tokio::test]
 async fn second_daemon_defers_to_the_lock_holder() {
     let dir = scratch_dir();
-    let first = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 60),
-    );
+    let first = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
     let running = Arc::new(tokio::sync::Mutex::new(false));
     let flag = running.clone();
     let task = tokio::spawn(async move {
@@ -200,10 +185,7 @@ async fn second_daemon_defers_to_the_lock_holder() {
         *flag.lock().await = held;
     });
     wait_for_socket(&dir.join("hub.sock")).await;
-    let second = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 60),
-    );
+    let second = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
     assert!(!second.run().await.expect("lock query runs"));
 
     task.abort();
@@ -215,10 +197,7 @@ async fn second_daemon_defers_to_the_lock_holder() {
 #[tokio::test]
 async fn idle_daemon_removes_its_socket() {
     let dir = scratch_dir();
-    let daemon = HubServer::new(
-        server(),
-        HubConfig::new(hub_paths_for_test(&dir), 1),
-    );
+    let daemon = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 1));
     let socket = dir.join("hub.sock");
     let probe = socket.clone();
     let task = tokio::spawn(async move { daemon.run().await });
@@ -230,7 +209,10 @@ async fn idle_daemon_removes_its_socket() {
         .expect("daemon runs");
     assert!(held);
     assert!(!socket.exists(), "idle shutdown removes hub.sock");
-    assert!(dir.join("hub.log").is_file(), "daemon records its lifecycle in hub.log");
+    assert!(
+        dir.join("hub.log").is_file(),
+        "daemon records its lifecycle in hub.log"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -284,8 +266,14 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         cmd.env("SWE_HUB_DIR", &hub_dir)
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-list")
-            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+            .env(
+                "ENV_FILE",
+                format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+            )
+            .env(
+                "MODELS_FILE",
+                format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+            );
     };
 
     // First CLI call auto-starts the daemon and answers through it.
@@ -295,10 +283,21 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("first CLI call runs");
-    assert!(out.status.success(), "first CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(hub_dir.join("hub.sock").exists(), "first call auto-starts the daemon");
-    let first_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon writes hub.log");
-    assert!(first_log.contains("listening"), "daemon records startup: {first_log}");
+    assert!(
+        out.status.success(),
+        "first CLI call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        hub_dir.join("hub.sock").exists(),
+        "first call auto-starts the daemon"
+    );
+    let first_log =
+        std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon writes hub.log");
+    assert!(
+        first_log.contains("listening"),
+        "daemon records startup: {first_log}"
+    );
 
     // Second CLI call reuses the same daemon: no second listener starts.
     let mut second = Command::new(&exe);
@@ -307,7 +306,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("second CLI call runs");
-    assert!(out.status.success(), "second CLI call must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "second CLI call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let second_log = std::fs::read_to_string(hub_dir.join("hub.log")).expect("daemon log persists");
     // Both CLI connections reached the daemon; the socket path stayed put and
     // no second listener line was appended (stderr lines also say "listening").
@@ -330,8 +333,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
     let stdout = child.stdout.take().expect("proxy stdout");
     let mut lines = StdBufReader::new(stdout).lines();
     for (id, method) in [(1, "initialize"), (2, "tools/list")] {
-        writeln!(stdin, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}")
-            .expect("write a proxy frame");
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\"}}"
+        )
+        .expect("write a proxy frame");
     }
     stdin.flush().expect("flush proxy frames");
     // Requests are served concurrently, so the replies may arrive in either
@@ -351,7 +357,10 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         }
     }
     for expected in ["\"protocolVersion\":\"2024-11-05\"", "\"tools\""] {
-        assert!(seen.contains(expected), "proxy must answer with {expected}: {seen}");
+        assert!(
+            seen.contains(expected),
+            "proxy must answer with {expected}: {seen}"
+        );
     }
     drop(stdin);
     let _ = child.wait();
@@ -365,11 +374,18 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .env("OPENAI_API_BASE", "http://127.0.0.1:1")
         .output()
         .expect("dispatch runs");
-    assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "dispatch must be accepted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let payload: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("dispatch prints JSON");
-    let wid = payload["worker_id"].as_str().expect("dispatch names the worker").to_string();
+    let wid = payload["worker_id"]
+        .as_str()
+        .expect("dispatch names the worker")
+        .to_string();
     assert_eq!(
         payload["owner"], "cli",
         "a CLI dispatch is owned by the stable `cli` identity: {payload}"
@@ -394,7 +410,11 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .args(["list", "--json"])
         .output()
         .expect("second CLI list runs");
-    assert!(out.status.success(), "list must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "list must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let listed: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("list prints JSON");
@@ -403,7 +423,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .expect("workers array")
         .iter()
         .find(|row| row["id"] == wid.as_str())
-        .unwrap_or_else(|| panic!("the `cli` identity must keep its workers across invocations: {listed}"));
+        .unwrap_or_else(|| {
+            panic!("the `cli` identity must keep its workers across invocations: {listed}")
+        });
     assert_eq!(row["owner"], "cli");
 
     // The escape hatch never creates a socket.
@@ -413,14 +435,27 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .env("SWE_HUB_DIR", bare.path())
         .env("MINI_SWE_NO_DAEMON", "1")
         .env("OPENAI_API_KEY", "test-key-not-used-by-list")
-        .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-        .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")));
+        .env(
+            "ENV_FILE",
+            format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+        )
+        .env(
+            "MODELS_FILE",
+            format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+        );
     let out = local
         .args(["list", "--json"])
         .output()
         .expect("local CLI call runs");
-    assert!(out.status.success(), "escape-hatch call must succeed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(!bare.path().join("hub.sock").exists(), "MINI_SWE_NO_DAEMON=1 creates no socket");
+    assert!(
+        out.status.success(),
+        "escape-hatch call must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !bare.path().join("hub.sock").exists(),
+        "MINI_SWE_NO_DAEMON=1 creates no socket"
+    );
 }
 
 /// Terminates every daemon that logged into `hub_dir` when dropped.
@@ -471,12 +506,17 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
             .expect("restrict the scratch dir to 0700");
     }
     for repo in [&repo_a, &repo_b] {
-        let _ = Command::new("git").args(["init", "-q"]).current_dir(repo).output();
+        let _ = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .output();
         let _ = Command::new("git")
             .args(["commit", "-q", "--allow-empty", "-m", "seed"])
             .current_dir(repo)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
             .output();
     }
 
@@ -490,14 +530,28 @@ fn a_relative_repo_path_resolves_against_the_callers_cwd() {
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-dispatch")
             .env("OPENAI_API_BASE", "http://127.0.0.1:1")
-            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
-            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .env(
+                "ENV_FILE",
+                format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")),
+            )
+            .env(
+                "MODELS_FILE",
+                format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")),
+            )
             .output()
             .expect("dispatch runs");
-        assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "dispatch must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let payload: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("dispatch prints JSON");
-        payload["worker_id"].as_str().expect("dispatch names the worker").to_string()
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+                .expect("dispatch prints JSON");
+        payload["worker_id"]
+            .as_str()
+            .expect("dispatch names the worker")
+            .to_string()
     };
 
     let (a, b) = (dispatch(&repo_a), dispatch(&repo_b));
@@ -564,7 +618,8 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     // Agent B: an ordinary orchestrator, identified by its hello.
     let mut b = Client::connect(&socket).await;
     b.initialize("other-host").await;
-    b.notify("hub/hello", serde_json::json!({"agent_id": "agent-b"})).await;
+    b.notify("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
+        .await;
     for arguments in [
         serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "stop"}),
         serde_json::json!({"action": "kill", "worker_id": "h3-hub-worker"}),
@@ -575,11 +630,9 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         let error = b
             .worker(arguments)
             .await
-            .expect_err("another agent's worker must be refused")
-            ;
+            .expect_err("another agent's worker must be refused");
         assert_eq!(
-            error,
-            "worker h3-hub-worker belongs to agent agent-a",
+            error, "worker h3-hub-worker belongs to agent agent-a",
             "'{action}' must name the owning agent: {error}"
         );
     }
@@ -595,9 +648,12 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     // its connection id (H-3), so it never sees another agent's worker either.
     let mut a = Client::connect(&socket).await;
     a.initialize("other-host").await;
-    a.notify("hub/hello", serde_json::json!({"agent_id": "agent-a"})).await;
+    a.notify("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
     let steered = a
-        .worker(serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "go"}))
+        .worker(
+            serde_json::json!({"action": "steer", "worker_id": "h3-hub-worker", "message": "go"}),
+        )
         .await
         .expect("the owner may steer its own worker");
     assert_eq!(steered["status"], "steered");
@@ -614,7 +670,10 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    assert!(!ids.contains(&"h3-hub-worker"), "the CLI must not list it: {listed}");
+    assert!(
+        !ids.contains(&"h3-hub-worker"),
+        "the CLI must not list it: {listed}"
+    );
     let all = cli
         .worker(serde_json::json!({"action": "list", "scope": "all"}))
         .await
@@ -629,7 +688,9 @@ async fn a_hub_connection_only_controls_its_own_workers() {
 
     // The operator's `--admin`: the same connection, with the override in hello.
     let mut operator = Client::connect(&socket).await;
-    operator.initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME).await;
+    operator
+        .initialize(mini_swe_mcp::mcp::CLI_CLIENT_NAME)
+        .await;
     operator
         .notify(
             "hub/hello",
@@ -656,22 +717,36 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 fn event_worker(id: &str, owner: &str) -> mini_swe_mcp::pool::WorkerRecord {
     use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
     WorkerRecord {
-        id: id.to_string(), task: "event probe".to_string(), model: "test".to_string(),
+        id: id.to_string(),
+        task: "event probe".to_string(),
+        model: "test".to_string(),
         owner: owner.to_string(),
-        state: WorkerState::Running { step: 1, last_command: "test".to_string(), started_at: 0 },
-        metrics: WorkerMetrics::default(), logs: LogBuffer::new(), pending_steer: Vec::new(),
-        resume_tx: None, handle: None, revision: 0,
+        state: WorkerState::Running {
+            step: 1,
+            last_command: "test".to_string(),
+            started_at: 0,
+        },
+        metrics: WorkerMetrics::default(),
+        logs: LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
     }
 }
 
 async fn next_event(client: &mut Client) -> serde_json::Value {
     let mut line = String::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), client.reader.read_line(&mut line))
-        .await.expect("event arrives").expect("read event");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.reader.read_line(&mut line),
+    )
+    .await
+    .expect("event arrives")
+    .expect("read event");
     let event: serde_json::Value = serde_json::from_str(&line).expect("event JSON");
     assert_eq!(event["method"], "notifications/claude/channel");
     event
@@ -679,74 +754,156 @@ async fn next_event(client: &mut Client) -> serde_json::Value {
 
 #[tokio::test]
 async fn events_are_owner_scoped_and_replayed_after_hello() {
-    use mini_swe_mcp::pool::{WorkerState, WorkerMetrics};
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(event_worker("h4-live", "h4-a")).await;
-    pool.__test_insert_worker(event_worker("h4-late", "h4-late-owner")).await;
+    pool.__test_insert_worker(event_worker("h4-live", "h4-a"))
+        .await;
+    pool.__test_insert_worker(event_worker("h4-late", "h4-late-owner"))
+        .await;
     let dir = scratch_dir();
-    let daemon = HubServer::new(Arc::new(McpServer::new(pool.clone(), "test".to_string())),
-        HubConfig::new(hub_paths_for_test(&dir), 60));
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
     let task = tokio::spawn(async move { daemon.run().await });
     let socket = dir.join("hub.sock");
     wait_for_socket(&socket).await;
     let mut a = Client::connect(&socket).await;
     let mut b = Client::connect(&socket).await;
-    a.request("hub/hello", serde_json::json!({"agent_id": "h4-a"})).await;
-    b.request("hub/hello", serde_json::json!({"agent_id": "h4-b"})).await;
-    pool.__test_set_worker_state("h4-live", WorkerState::Paused {
-        question: "continue?".to_string(), step: 1, paused_at: 0,
-    }).await;
+    a.request("hub/hello", serde_json::json!({"agent_id": "h4-a"}))
+        .await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "h4-b"}))
+        .await;
+    pool.__test_set_worker_state(
+        "h4-live",
+        WorkerState::Paused {
+            question: "continue?".to_string(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
     let event = next_event(&mut a).await;
     assert_eq!(event["params"]["meta"]["worker_id"], "h4-live");
     let mut line = String::new();
-    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), b.reader.read_line(&mut line)).await.is_err());
-    pool.__test_set_worker_state("h4-late", WorkerState::Failed {
-        error: "late failure".to_string(), step: 2, failed_at: 1,
-        metrics: WorkerMetrics::default(), revision: 0,
-    }).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            b.reader.read_line(&mut line)
+        )
+        .await
+        .is_err()
+    );
+    pool.__test_set_worker_state(
+        "h4-late",
+        WorkerState::Failed {
+            error: "late failure".to_string(),
+            step: 2,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
     // Observe a later transition to establish that the watcher ran while the
     // late owner still had no connection.
-    pool.__test_set_worker_state("h4-live", WorkerState::Failed {
-        error: "failure".to_string(), step: 2, failed_at: 1,
-        metrics: WorkerMetrics::default(), revision: 0,
-    }).await;
+    pool.__test_set_worker_state(
+        "h4-live",
+        WorkerState::Failed {
+            error: "failure".to_string(),
+            step: 2,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
     next_event(&mut a).await;
     let mut late = Client::connect(&socket).await;
-    late.request("hub/hello", serde_json::json!({"agent_id": "h4-late-owner"})).await;
+    late.request(
+        "hub/hello",
+        serde_json::json!({"agent_id": "h4-late-owner"}),
+    )
+    .await;
     let queued = next_event(&mut late).await;
     assert_eq!(queued["params"]["meta"]["worker_id"], "h4-late");
     assert_eq!(queued["params"]["meta"]["event"], "failed");
     let mut admin = Client::connect(&socket).await;
-    admin.request("hub/hello", serde_json::json!({"admin": true})).await;
-    assert_eq!(next_event(&mut admin).await["params"]["meta"]["worker_id"], "h4-late");
-    drop(a); drop(b); drop(late); drop(admin);
-    task.abort(); let _ = task.await;
+    admin
+        .request("hub/hello", serde_json::json!({"admin": true}))
+        .await;
+    assert_eq!(
+        next_event(&mut admin).await["params"]["meta"]["worker_id"],
+        "h4-late"
+    );
+    drop(a);
+    drop(b);
+    drop(late);
+    drop(admin);
+    task.abort();
+    let _ = task.await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
-    use mini_swe_mcp::pool::{WorkerState, WorkerMetrics};
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(event_worker("h4-busy", "h4-owner")).await;
+    pool.__test_insert_worker(event_worker("h4-busy", "h4-owner"))
+        .await;
     let dir = scratch_dir();
-    let daemon = HubServer::new(Arc::new(McpServer::new(pool.clone(), "test".to_string())),
-        HubConfig::new(hub_paths_for_test(&dir), 60));
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
     let task = tokio::spawn(async move { daemon.run().await });
     let socket = dir.join("hub.sock");
     wait_for_socket(&socket).await;
     let mut client = Client::connect(&socket).await;
-    let hello = client.request("hub/hello", serde_json::json!({"version": "99.0.0"})).await;
+    let hello = client
+        .request("hub/hello", serde_json::json!({"version": "99.0.0"}))
+        .await;
     assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(hello["result"]["busy"], true);
-    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
-    pool.__test_set_worker_state("h4-busy", WorkerState::Paused { question: "wait".to_string(), step: 1, paused_at: 0 }).await;
-    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
-    pool.__test_set_worker_state("h4-busy", WorkerState::Failed {
-        error: "done".to_string(), step: 1, failed_at: 1, metrics: WorkerMetrics::default(), revision: 0,
-    }).await;
-    assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["result"]["busy"], false);
-    assert!(tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap().unwrap());
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"],
+        "Hub is busy"
+    );
+    pool.__test_set_worker_state(
+        "h4-busy",
+        WorkerState::Paused {
+            question: "wait".to_string(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"],
+        "Hub is busy"
+    );
+    pool.__test_set_worker_state(
+        "h4-busy",
+        WorkerState::Failed {
+            error: "done".to_string(),
+            step: 1,
+            failed_at: 1,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        client.request("hub/shutdown", serde_json::json!({})).await["result"]["busy"],
+        false
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
     assert!(!socket.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -761,17 +918,30 @@ fn newer_cli_replaces_an_idle_daemon() {
     std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let invoke = |fake: bool| {
         let mut cmd = Command::new(&exe);
-        cmd.args(["list", "--json"]).env("SWE_HUB_DIR", hub.path())
+        cmd.args(["list", "--json"])
+            .env("SWE_HUB_DIR", hub.path())
             .env("SWE_TEMP_DIR", hub.subdir("swe"))
             .env("ENV_FILE", "/nonexistent-mini-swe-env");
-        if fake { cmd.env("MINI_SWE_FAKE_VERSION", "99.0.0"); }
+        if fake {
+            cmd.env("MINI_SWE_FAKE_VERSION", "99.0.0");
+        }
         let output = cmd.output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     };
     invoke(false);
     invoke(true);
     let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap();
-    assert_eq!(log.lines().filter(|line| line.ends_with(" listening")).count(), 2, "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with(" listening"))
+            .count(),
+        2,
+        "{log}"
+    );
     assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
 }
 
@@ -781,38 +951,129 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(event_worker("h4-version-busy", "owner")).await;
-    let daemon = HubServer::new(Arc::new(McpServer::new(pool, "test".to_string())),
-        HubConfig::new(hub_paths_for_test(&dir), 60));
+    pool.__test_insert_worker(event_worker("h4-version-busy", "owner"))
+        .await;
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool, "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.join("hub.sock")).await;
     let mut command = tokio::process::Command::new(common::binary_path());
-    command.args(["list", "--json"]).env("SWE_HUB_DIR", &dir)
+    command
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", &dir)
         .env("MINI_SWE_FAKE_VERSION", "99.0.0")
         .env("ENV_FILE", "/nonexistent-mini-swe-env");
     let output = command.output().await.unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr.lines().filter(|line| line.contains("is newer than hub")).count(), 1, "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("is newer than hub"))
+            .count(),
+        1,
+        "{stderr}"
+    );
     assert!(dir.join("hub.sock").exists());
 
     let mut proxy = tokio::process::Command::new(common::binary_path());
-    proxy.arg("--stdio").env("SWE_HUB_DIR", &dir)
+    proxy
+        .arg("--stdio")
+        .env("SWE_HUB_DIR", &dir)
         .env("MINI_SWE_FAKE_VERSION", "99.0.0")
         .env("ENV_FILE", "/nonexistent-mini-swe-env")
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let mut child = proxy.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").await.unwrap();
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
     let mut line = String::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), stdout.read_line(&mut line)).await.unwrap().unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"], serde_json::json!({}));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        stdout.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"],
+        serde_json::json!({})
+    );
     drop(stdin);
     let output = child.wait_with_output().await.unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr.lines().filter(|line| line.contains("is newer than hub")).count(), 1, "{stderr}");
-    task.abort(); let _ = task.await;
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("is newer than hub"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
+    use mini_swe_mcp::pool::WorkerState;
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-blocked", "h4-owner"))
+        .await;
+    let dir = scratch_dir();
+    let daemon = HubServer::new(
+        Arc::new(McpServer::new(pool.clone(), "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60),
+    );
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.join("hub.sock");
+    wait_for_socket(&socket).await;
+    let mut waiter = Client::connect(&socket).await;
+    waiter
+        .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
+        .await;
+    // `steer --wait` on a live worker blocks until the worker moves; hold it.
+    let waiting = tokio::spawn(async move {
+        waiter.worker(serde_json::json!({"action": "steer", "worker_id": "h4-blocked", "message": "go", "wait": true})).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut closer = Client::connect(&socket).await;
+    closer
+        .notify("hub/hello", serde_json::json!({"agent_id": "h4-owner"}))
+        .await;
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        closer.request("hub/shutdown", serde_json::json!({})),
+    )
+    .await
+    .expect("shutdown answers promptly");
+    assert_eq!(reply["error"]["message"], "Hub is busy");
+    pool.__test_set_worker_state(
+        "h4-blocked",
+        WorkerState::Failed {
+            error: "done".to_string(),
+            step: 1,
+            failed_at: 1,
+            metrics: mini_swe_mcp::pool::WorkerMetrics::default(),
+            revision: 0,
+        },
+    )
+    .await;
+    let steered = tokio::time::timeout(std::time::Duration::from_secs(3), waiting)
+        .await
+        .expect("steer wait resolves")
+        .expect("steer task joins");
+    assert!(steered.is_ok());
+    task.abort();
+    let _ = task.await;
     let _ = std::fs::remove_dir_all(dir);
 }
