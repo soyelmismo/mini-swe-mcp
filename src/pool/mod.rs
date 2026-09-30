@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod buffer;
 mod clock;
@@ -56,6 +56,7 @@ pub use self::state::{
 
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
+use crate::worktree::WorktreeGuard;
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -63,6 +64,11 @@ pub struct WorkerPool {
     bash_semaphore: Arc<Semaphore>,
     build_semaphore: Arc<Semaphore>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
+    /// Checkout directory of every live worker. The `WorktreeGuard` stays the
+    /// owner of the worktree itself; the pool only needs to know *where* a
+    /// worker works so `kill` can commit what it leaves behind before the
+    /// aborted task tears the checkout down.
+    worktrees: Arc<RwLock<HashMap<String, PathBuf>>>,
     api_base: String,
     api_key: String,
     log_policy: LogRetentionPolicy,
@@ -112,6 +118,7 @@ impl WorkerPool {
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             build_semaphore: Arc::new(Semaphore::new(build_slots)),
             workers: Arc::new(RwLock::new(HashMap::new())),
+            worktrees: Arc::new(RwLock::new(HashMap::new())),
             api_base,
             api_key,
             log_policy,
@@ -147,8 +154,26 @@ impl WorkerPool {
     /// entries. Fresh terminal records are deliberately kept so a subsequent
     /// `collect` / `wait: true` still finds them (audit 07, R3).
     pub async fn reap(&self) -> Vec<String> {
-        let mut lock = self.workers.write().await;
-        self.reap_locked(&mut lock)
+        let expired = {
+            let mut lock = self.workers.write().await;
+            self.reap_locked(&mut lock)
+        };
+        self.forget_worktrees(&expired).await;
+        expired
+    }
+
+    /// Drop the worktree paths of workers whose records are gone.
+    ///
+    /// The worktree map is keyed exactly like the worker map, so a record
+    /// leaving the pool is what retires its checkout path.
+    async fn forget_worktrees(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.worktrees
+            .write()
+            .await
+            .retain(|id, _| !ids.iter().any(|gone| gone == id));
     }
 
     /// Shared eviction helper: removes expired terminal records from `lock`.
@@ -219,14 +244,16 @@ impl WorkerPool {
 
         meta.save_status(&model, RegistryStatus::Running, 0, max_turns, "initializing", None);
 
-        {
-            // Prune stale terminal records *before* inserting, so a long-lived
-            // server bounds residency even without the background reaper
-            // (audit 07, R3).
+        // Prune stale terminal records *before* inserting, so a long-lived
+        // server bounds residency even without the background reaper
+        // (audit 07, R3).
+        let expired = {
             let mut lock = self.workers.write().await;
-            self.reap_locked(&mut lock);
+            let expired = self.reap_locked(&mut lock);
             lock.insert(worker_id.clone(), initial_record);
-        }
+            expired
+        };
+        self.forget_worktrees(&expired).await;
 
         let pool = self.clone();
         let wid = worker_id.clone();
@@ -460,7 +487,61 @@ impl WorkerPool {
         Ok(())
     }
 
+    /// Record where a running worker's worktree lives.
+    ///
+    /// Dropped again by [`WorkerPool::unregister_worktree`]; until then a
+    /// `kill` knows where to commit the worker's uncommitted changes.
+    pub(crate) async fn register_worktree(&self, worker_id: &str, path: PathBuf) {
+        self.worktrees
+            .write()
+            .await
+            .insert(worker_id.to_string(), path);
+    }
+
+    /// Forget a worker's worktree path once the worker is done with it.
+    pub(crate) async fn unregister_worktree(&self, worker_id: &str) {
+        self.worktrees.write().await.remove(worker_id);
+    }
+
+    /// Commit a worker's uncommitted worktree changes.
+    ///
+    /// Runs *before* the task is aborted, because aborting drops the worker's
+    /// `WorktreeGuard`, which removes the checkout: a commit afterwards would
+    /// find nothing left to save. Best effort by design — a kill reports
+    /// whether it stopped the worker, never whether git agreed.
+    async fn checkpoint_before_kill(&self, id: &str) {
+        let Some(path) = self.worktrees.read().await.get(id).cloned() else {
+            return;
+        };
+        if !path.is_dir() {
+            return;
+        }
+        let worker_id = id.to_string();
+        let committed = tokio::task::spawn_blocking(move || {
+            WorktreeGuard::commit_all(
+                &path,
+                &format!("worker({worker_id}): checkpoint before kill"),
+            )
+        })
+        .await;
+        match committed {
+            Ok(Ok(true)) => info!(
+                worker = %id,
+                "Committed the killed worker's uncommitted changes"
+            ),
+            // A clean worktree has nothing to preserve, which is not a problem.
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => warn!(
+                worker = %id,
+                error = %e,
+                "Checkpoint before kill failed; the worktree still holds uncommitted changes"
+            ),
+            Err(e) => warn!(worker = %id, error = %e, "Checkpoint before kill could not run"),
+        }
+    }
+
     pub async fn kill(&self, id: &str) -> bool {
+        self.checkpoint_before_kill(id).await;
         let mut lock = self.workers.write().await;
         if let Some(w) = lock.get_mut(id) {
             if let Some(handle) = w.handle.take() {
@@ -499,8 +580,15 @@ impl WorkerPool {
     /// so one response never serializes the full history (audit 07, R4); the
     /// counters travel with the result so degradation stays visible (audit 07, R7).
     pub async fn collect(&self, id: &str) -> Option<CollectedWorker> {
-        let mut lock = self.workers.write().await;
-        let record = lock.remove(id)?;
+        // The record is moved out and the write-guard released before the
+        // worktree path is retired, so no `.await` runs under the guard.
+        let record = {
+            let mut lock = self.workers.write().await;
+            let record = lock.remove(id)?;
+            drop(lock);
+            record
+        };
+        self.worktrees.write().await.remove(id);
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         let dropped = record.logs.dropped();
         let view = emit_view(&record.logs, self.log_policy.max_emitted);

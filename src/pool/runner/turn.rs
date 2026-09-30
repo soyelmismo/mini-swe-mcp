@@ -8,12 +8,24 @@
 //! whether the orchestrator control sentinels apply, and how an LLM API error
 //! is handled. Those four knobs live in [`TurnConfig`]; everything else is
 //! shared here so the two loops cannot drift.
+//!
+//! The engine also carries the four guards that keep a worker honest, all of
+//! them stateless per turn and driven by [`ProgressWatch`] plus the turn
+//! counter: a command byte-identical to the previous turn's is answered
+//! instead of re-run (and three of those in a row park the worker on the
+//! orchestrator), a worktree that stops changing gets a "make the edit or
+//! escalate" nudge, `REQUEST_TURNS` may only add half the dispatch's budget,
+//! and every 20 turns the worktree is checkpoint-committed so a kill or a
+//! crash cannot lose the work.
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
-use crate::worktree::WorktreeGuard;
+use crate::manifest::MAX_TURNS_LIMIT;
+use crate::worktree::{WorktreeGuard, git};
 
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta};
@@ -22,8 +34,107 @@ use super::super::steer::drain_steer_messages;
 use super::super::WorkerPool;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    is_completion_request, parse_ask_orchestrator, parse_request_turns, summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
+    summarize_command,
 };
+
+/// Turns between automatic checkpoint commits, so work left behind by a kill
+/// or a crash is never more than this old.
+const AUTO_CHECKPOINT_TURNS: usize = 20;
+
+/// Turns between repository samples of the stagnation detector.
+const STAGNATION_SAMPLE_TURNS: usize = 10;
+
+/// Turns without a repository change that force the "stop exploring" nudge.
+const STAGNATION_TURNS_LIMIT: usize = 30;
+
+/// Consecutive blocked repetitions of one command before the worker is parked
+/// on the orchestrator instead of being told to try something else.
+const REPEAT_BLOCK_LIMIT: usize = 3;
+
+/// Answer handed to the model that re-issues the command of the turn before.
+const REPEAT_REFUSAL: &str =
+    "You already ran this exact command; its output has not changed (see above). Take a different action.";
+
+/// Nudge injected after a worker has explored long enough without changing
+/// anything: the answer to a stuck agent is a decision, not another turn.
+fn stagnation_nudge() -> String {
+    format!(
+        "No change to the repository in the last {STAGNATION_TURNS_LIMIT} turns. Stop exploring: make the edit, or ASK_ORCHESTRATOR if blocked."
+    )
+}
+
+/// Turns a worker may self-grant through `REQUEST_TURNS`: half of the budget
+/// its dispatch was given, never past the manifest ceiling. Without the bound
+/// a confused model walks itself from 150 to 500 turns with nobody watching.
+fn extension_budget(dispatch_max_turns: usize) -> usize {
+    (dispatch_max_turns / 2).min(MAX_TURNS_LIMIT)
+}
+
+/// Fingerprint of the worktree's uncommitted work: the HEAD id plus
+/// `git diff --stat HEAD`, so a commit alone counts as progress.
+///
+/// `None` when git could not answer, so a failed sample is never read as
+/// "the repository did not change".
+fn repository_sample(path: &Path) -> Option<String> {
+    let head = git(path, "rev-parse HEAD", &["rev-parse", "HEAD"]).ok()?;
+    let stat = git(path, "diff --stat HEAD", &["diff", "--stat", "HEAD"]).ok()?;
+    if !head.status.success() || !stat.status.success() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&head.stdout).trim(),
+        String::from_utf8_lossy(&stat.stdout).trim()
+    ))
+}
+
+/// Cross-turn state of the two loop detectors.
+///
+/// Owned by the phase loop and lent to every turn, because `TurnEngine` is
+/// rebuilt once per turn and a detector that lived in it would reset each time.
+#[derive(Default)]
+pub(super) struct ProgressWatch {
+    /// The command submitted by the previous turn, trimmed.
+    last_command: Option<String>,
+    /// Consecutive turns that ended in a blocked repetition of it.
+    repeat_blocks: usize,
+    /// Last repository sample taken by the stagnation detector.
+    last_sample: Option<String>,
+    /// Turns elapsed since that sample last changed.
+    unchanged_turns: usize,
+}
+
+impl ProgressWatch {
+    /// Record `command` as the latest one and report how many consecutive
+    /// turns it repeats, or `None` when it is a fresh command.
+    fn register_command(&mut self, command: &str) -> Option<usize> {
+        let command = command.trim();
+        if self.last_command.as_deref() == Some(command) {
+            self.repeat_blocks += 1;
+            Some(self.repeat_blocks)
+        } else {
+            self.repeat_blocks = 0;
+            self.last_command = Some(command.to_string());
+            None
+        }
+    }
+
+    /// Record a repository sample and return the turns the repository has been
+    /// unchanged for. A sample that could not be taken is ignored rather than
+    /// counted as "no change".
+    fn record_sample(&mut self, sample: Option<String>) -> usize {
+        if let Some(sample) = sample {
+            if self.last_sample.as_deref() == Some(sample.as_str()) {
+                self.unchanged_turns += STAGNATION_SAMPLE_TURNS;
+            } else {
+                self.unchanged_turns = 0;
+            }
+            self.last_sample = Some(sample);
+        }
+        self.unchanged_turns
+    }
+}
 
 /// How the engine handles an LLM API error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +198,11 @@ pub(super) struct TurnEngine<'a> {
     pub verify: Option<&'a str>,
     /// Number of consecutive failed verification runs for this phase.
     pub verify_failures: &'a mut usize,
+    /// The budget the dispatch was given, the base the self-grant cap is
+    /// measured from (`current_max_turns` moves as the worker extends it).
+    pub dispatch_max_turns: usize,
+    /// Loop and stagnation detector state, shared across turns.
+    pub watch: &'a mut ProgressWatch,
 }
 
 impl<'a> TurnEngine<'a> {
@@ -129,6 +245,16 @@ impl<'a> TurnEngine<'a> {
                     ),
                 ));
             }
+        }
+
+        // --- Automatic checkpoint (both phases) ---
+        if *self.step > 0 && (*self.step).is_multiple_of(AUTO_CHECKPOINT_TURNS) {
+            self.checkpoint();
+        }
+
+        // --- Stagnation detector (implementer only, like the sentinels) ---
+        if config.apply_sentinels {
+            self.check_stagnation().await;
         }
 
         // --- LLM call with error handling ---
@@ -279,23 +405,74 @@ impl<'a> TurnEngine<'a> {
             "Subagent step"
         );
 
+        // --- Repetition detector ---
+        // Re-issuing the identical command is not progress: running it again
+        // burns a turn and returns the output the history already carries, so
+        // the command is answered without being executed.
+        if let Some(blocks) = self.watch.register_command(&cmd_str) {
+            warn!(
+                worker = %self.worker_id,
+                step = *self.step,
+                op = %cmd_summary,
+                consecutive = blocks,
+                "Blocked a repeated command; its output is already in the history"
+            );
+            if blocks >= REPEAT_BLOCK_LIMIT {
+                return self.park_on_loop(config, &llm_resp, &cmd_summary, blocks).await;
+            }
+            self.push_exchange(
+                llm_resp.content,
+                llm_resp.reasoning_content,
+                llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+                REPEAT_REFUSAL.to_string(),
+            );
+            return Ok(TurnOutcome::Continue);
+        }
+
         // --- Execute command with semaphores ---
         let (output, code) = self.run_gated(&cmd_str).await?;
 
         // --- Orchestrator control sentinels (implementer only) ---
         if config.apply_sentinels {
-            // REQUEST_TURNS
+            // REQUEST_TURNS, bounded by the self-grant budget: a worker may
+            // add at most half of the budget its dispatch was given, so no
+            // model can walk itself to the manifest ceiling unattended.
             if let Some(additional) = parse_request_turns(&cmd_str) {
-                let old_max = *self.current_max_turns;
-                *self.current_max_turns =
-                    (*self.current_max_turns + additional).max(*self.current_max_turns).min(500);
-                info!(
-                    worker = %self.worker_id,
-                    requested = additional,
-                    old_max,
-                    new_max = *self.current_max_turns,
-                    "Subagent requested turn extension; granted"
-                );
+                let budget = extension_budget(self.dispatch_max_turns);
+                let granted = self.current_max_turns.saturating_sub(self.dispatch_max_turns);
+                let requested_max = self
+                    .dispatch_max_turns
+                    .saturating_add(granted)
+                    .saturating_add(additional)
+                    .min(MAX_TURNS_LIMIT);
+                if requested_max <= self.dispatch_max_turns + budget {
+                    let old_max = *self.current_max_turns;
+                    *self.current_max_turns = requested_max;
+                    info!(
+                        worker = %self.worker_id,
+                        requested = additional,
+                        old_max,
+                        new_max = *self.current_max_turns,
+                        granted_total = granted + additional,
+                        budget,
+                        "Subagent requested turn extension; granted"
+                    );
+                } else {
+                    warn!(
+                        worker = %self.worker_id,
+                        requested = additional,
+                        granted_total = granted,
+                        budget,
+                        "Refused turn extension beyond the self-grant budget"
+                    );
+                    self.messages.push(ChatMessage::text(
+                        Role::User,
+                        format!(
+                            "TURN EXTENSION REFUSED: {additional} more turns would take you to {requested_max}, past the {budget} turns you may self-grant on a {} turn budget. Wrap up your changes and execute `echo {COMPLETION_SENTINEL}`, or execute `echo \"ASK_ORCHESTRATOR: what is blocking you?\"` if you need a decision.",
+                            self.dispatch_max_turns
+                        ),
+                    ));
+                }
             }
 
             // ASK_ORCHESTRATOR
@@ -415,6 +592,114 @@ impl<'a> TurnEngine<'a> {
         Ok(TurnOutcome::Continue)
     }
 
+    /// Park a worker that re-issued one command [`REPEAT_BLOCK_LIMIT`] times in
+    /// a row. The implementer asks the orchestrator for a different action; the
+    /// reviewer ends its phase, since there is nobody to steer a review.
+    async fn park_on_loop(
+        &mut self,
+        config: &TurnConfig<'_>,
+        llm_resp: &LlmResponse,
+        cmd_summary: &str,
+        blocks: usize,
+    ) -> Result<TurnOutcome> {
+        if !config.apply_sentinels {
+            warn!(
+                worker = %self.worker_id,
+                step = *self.step,
+                op = %cmd_summary,
+                "Reviewer is looping on the same command; ending the review phase"
+            );
+            return Ok(TurnOutcome::EndReview);
+        }
+
+        let question = format!(
+            "Repetition loop: `{cmd_summary}` was blocked {blocks} turns in a row (byte-identical to the previous turn's command, output unchanged). The worker is not making progress; guide it to a different action."
+        );
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question: &question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: cmd_summary,
+                task: self.task,
+                model: config.model,
+                group: self.group,
+                repo_path_str: self.repo_path_str,
+                started_at_ts: self.started_at_ts,
+            })
+            .await?;
+
+        // The blocked turn is still answered, so the history the model sees
+        // next carries both the refusal and the orchestrator's guidance.
+        self.push_exchange(
+            llm_resp.content.clone(),
+            llm_resp.reasoning_content.clone(),
+            llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+            REPEAT_REFUSAL.to_string(),
+        );
+        if let Some(answer) = answer
+            && !answer.trim().is_empty()
+            && answer.trim() != "resume"
+        {
+            self.messages.push(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Commit whatever the worker has uncommitted, so a kill or a crash never
+    /// costs more than one checkpoint interval of work.
+    fn checkpoint(&mut self) {
+        let message = format!(
+            "worker({}): auto-checkpoint step {}",
+            self.worker_id, *self.step
+        );
+        match self.worktree.commit_changes(&message) {
+            Ok(Some(branch)) => info!(
+                worker = %self.worker_id,
+                step = *self.step,
+                branch = %branch,
+                "Committed worker checkpoint"
+            ),
+            Ok(None) => {}
+            Err(e) => warn!(
+                worker = %self.worker_id,
+                step = *self.step,
+                error = %e,
+                "Checkpoint commit failed; the worktree still holds uncommitted changes"
+            ),
+        }
+    }
+
+    /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
+    /// worker that stopped changing anything to make the edit or escalate.
+    async fn check_stagnation(&mut self) {
+        if *self.step == 0 || !(*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS) {
+            return;
+        }
+        let path = self.worktree.path.clone();
+        // `git` is a blocking subprocess, so it must not run on a runtime thread.
+        let sample = tokio::task::spawn_blocking(move || repository_sample(&path))
+            .await
+            .ok()
+            .flatten();
+        if self.watch.record_sample(sample) < STAGNATION_TURNS_LIMIT {
+            return;
+        }
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            unchanged_turns = self.watch.unchanged_turns,
+            "Repository unchanged for too long; nudging the worker to stop exploring"
+        );
+        self.messages
+            .push(ChatMessage::text(Role::User, stagnation_nudge()));
+    }
+
     /// Run `command` through the worker's semaphores: heavy commands take a
     /// build slot, every command takes a bash slot.
     async fn run_gated(&self, command: &str) -> Result<(String, Option<i32>)> {
@@ -517,5 +802,96 @@ impl<'a> TurnEngine<'a> {
                 "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_TURNS_LIMIT, ProgressWatch, REPEAT_BLOCK_LIMIT, STAGNATION_SAMPLE_TURNS,
+        extension_budget,
+    };
+
+    #[test]
+    fn self_grant_budget_is_half_the_dispatch_budget() {
+        assert_eq!(extension_budget(150), 75);
+        assert_eq!(extension_budget(4), 2);
+        // A budget too small to halve cannot be extended at all.
+        assert_eq!(extension_budget(1), 0);
+        assert_eq!(extension_budget(0), 0);
+    }
+
+    #[test]
+    fn self_grant_budget_never_passes_the_manifest_ceiling() {
+        assert_eq!(
+            extension_budget(MAX_TURNS_LIMIT * 4),
+            MAX_TURNS_LIMIT,
+            "an absurd dispatch budget is still clamped to the ceiling"
+        );
+        assert!(
+            extension_budget(usize::MAX) <= MAX_TURNS_LIMIT,
+            "a saturating dispatch budget must not overflow the ceiling"
+        );
+    }
+
+    #[test]
+    fn only_a_byte_identical_repeat_counts_as_a_repetition() {
+        let mut watch = ProgressWatch::default();
+        assert_eq!(watch.register_command("sed -n '1,5p' f"), None);
+        assert_eq!(
+            watch.register_command("  sed -n '1,5p' f  "),
+            Some(1),
+            "surrounding whitespace is not a different command"
+        );
+        assert_eq!(
+            watch.register_command("sed -n '6,9p' f"),
+            None,
+            "a different command is progress, not a repetition"
+        );
+        assert_eq!(
+            watch.register_command("sed -n '6,9p' f"),
+            Some(1),
+            "the block count is per command, not per worker"
+        );
+    }
+
+    #[test]
+    fn a_repeated_command_reaches_the_park_limit() {
+        let mut watch = ProgressWatch::default();
+        assert_eq!(watch.register_command("ls -la"), None);
+        for expected in 1..=REPEAT_BLOCK_LIMIT {
+            assert_eq!(watch.register_command("ls -la"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn an_unchanged_repository_accumulates_turns_until_the_nudge() {
+        let mut watch = ProgressWatch::default();
+        assert_eq!(
+            watch.record_sample(Some("head-a\nstat".to_string())),
+            0,
+            "the first sample has nothing to compare against"
+        );
+        assert_eq!(watch.record_sample(Some("head-a\nstat".to_string())), STAGNATION_SAMPLE_TURNS);
+        assert_eq!(
+            watch.record_sample(Some("head-a\nstat".to_string())),
+            2 * STAGNATION_SAMPLE_TURNS
+        );
+        assert_eq!(
+            watch.record_sample(Some("head-b\nstat".to_string())),
+            0,
+            "any change, including a commit, resets the streak"
+        );
+    }
+
+    #[test]
+    fn a_sample_that_could_not_be_taken_is_never_read_as_no_change() {
+        let mut watch = ProgressWatch::default();
+        assert_eq!(watch.record_sample(None), 0);
+        assert_eq!(
+            watch.record_sample(None),
+            0,
+            "a failed git call must not push a stuck worker towards the nudge"
+        );
     }
 }
