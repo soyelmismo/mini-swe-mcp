@@ -193,14 +193,14 @@ impl McpServer {
         match action {
             "manifest" => self.handle_manifest(),
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
-            "status" => self.handle_status(args).await,
+            "status" => self.handle_status(args, ctx).await,
             "collect" => self.handle_collect(args, ctx).await,
-            "logs" => self.handle_logs(args).await,
+            "logs" => self.handle_logs(args, ctx).await,
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
             "kill" => self.handle_kill(args, ctx).await,
             "steer" => self.handle_steer(args, token, tx, ctx).await,
-            "wait" => self.handle_wait(args, token, tx, ctx).await,
+            "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
@@ -312,7 +312,6 @@ impl McpServer {
             .map(|v| v as usize);
         let max_turns = ModelManifest::sanitize_max_turns(requested_turns, def_turns);
 
-        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         let group = args
             .get("group")
             .and_then(|v| v.as_str())
@@ -362,31 +361,27 @@ impl McpServer {
         )
         .await;
 
-        if wait {
-            self.await_worker_result_until(
-                &wid,
-                max_turns,
-                Self::get_timeout(args, "dispatch")?,
-                token,
-                tx,
-            )
-            .await
-        } else {
-            Ok(json!({
-                "worker_id": wid,
-                "owner": agent,
-                "status": "dispatched",
-                "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
-                "message": "Worker is executing in isolated worktree in background"
-            }))
-        }
+        // Dispatch never blocks: the worker id is the whole handle, and the
+        // event the caller actually wants arrives through `watch`.
+        Ok(json!({
+            "worker_id": wid,
+            "owner": agent,
+            "status": "dispatched",
+            "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
+            "message": "Worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
+        }))
     }
 
-    /// `status` and `logs` are the two verbs every agent may use on any
-    /// worker: reading another's run is what lets an orchestrator see that a
-    /// worker exists at all, and nothing here can change it.
-    async fn handle_status(&self, args: &Value) -> Result<Value> {
+    /// `status` action: the caller's own view of one worker's step and
+    /// progress. A foreign worker id is refused with its owner, never its
+    /// task or state.
+    async fn handle_status(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "status")?;
+        self.require_owner(wid, ctx).await?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
             // A finished worker's status carries the same review guidance as
             // the wait payload, so polling the status is enough to learn the
@@ -455,9 +450,14 @@ impl McpServer {
     }
 
     /// `logs` action: inspect a live worker's retained history without
-    /// collecting (and thus evicting) it.
-    async fn handle_logs(&self, args: &Value) -> Result<Value> {
+    /// collecting (and thus evicting) it. Same ownership rule as `status`.
+    async fn handle_logs(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "logs")?;
+        self.require_owner(wid, ctx).await?;
         let Some(buffer) = self.pool.get_worker_logs(wid).await else {
             anyhow::bail!("Worker not found: {wid}")
         };
@@ -530,13 +530,13 @@ impl McpServer {
     }
 
     /// `list` is scoped to the caller's own workers; `scope: "all"` widens it
-    /// to every agent's, each row carrying its `owner` (H-3).
+    /// to every agent's and needs the admin override (H-3).
     async fn handle_list(
         &self,
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let workers = if Self::lists_every_agent(args)? {
+        let workers = if Self::lists_every_agent(args, ctx)? {
             self.pool.list_workers().await
         } else {
             self.pool.list_workers_of(&ctx.agent()).await
@@ -544,16 +544,26 @@ impl McpServer {
         Ok(json!({ "workers": workers }))
     }
 
-    /// Whether the caller asked for every agent's workers.
+    /// Whether the caller asked for every agent's workers, and may have them.
     ///
     /// Only the two documented values are accepted: a typo is a hard error
     /// rather than a silent fallback to the caller's own workers, which would
-    /// look like a pool with nobody else's runs in it.
-    fn lists_every_agent(args: &Value) -> Result<bool> {
+    /// look like a pool with nobody else's runs in it. `scope: "all"` is the
+    /// admin override, so a non-admin caller gets a refusal rather than a
+    /// truncated list it would read as "nobody else is running".
+    fn lists_every_agent(
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<bool> {
         match args.get("scope") {
             None => Ok(false),
             Some(scope) => match scope.as_str() {
                 Some(scope) if super::schema::LIST_SCOPES.contains(&scope) => {
+                    if scope == super::schema::LIST_SCOPE_ALL && !ctx.is_admin() {
+                        anyhow::bail!(
+                            "'scope' \"all\" requires the admin override (--admin)"
+                        );
+                    }
                     Ok(scope == super::schema::LIST_SCOPE_ALL)
                 }
                 _ => anyhow::bail!(
@@ -632,12 +642,11 @@ impl McpServer {
         .await
     }
 
-    /// `steer` action: queue guidance, and with `wait: true` keep the call open
-    /// until the worker produces its next event.
+    /// `steer` action: queue guidance for the worker's next turn.
     ///
     /// Steering a finished worker starts a revision on its preserved branch
-    /// (same id, full context, fresh turn budget); `wait: true` then blocks
-    /// until that revision ends, exactly like a `dispatch --wait`.
+    /// (same id, full context, fresh turn budget). The reply is immediate:
+    /// `watch` is the only way to wait for the revision's next event.
     async fn handle_steer(
         &self,
         args: &Value,
@@ -666,34 +675,12 @@ impl McpServer {
                 }
             })?),
         };
-        // A revision restarts the turn budget, so a `steer --wait` on a
-        // finished worker must report the fresh budget as its denominator.
-        let was_terminal = self.pool.is_terminal(wid).await;
         let admission = self.admit_worker().await?;
         let outcome = self
             .pool
             .steer_with_budget(wid, message, revision_turns)
             .await?;
         drop(admission);
-        let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
-        if wait {
-            // A finished worker's revision runs on a fresh budget: report that
-            // denominator, not the finished run's, so `Step 3/60` reads true.
-            let budget = if was_terminal {
-                self.revision_await_budget(revision_turns)
-            } else {
-                Self::awaited_max_turns(wid)
-            };
-            return self
-                .await_worker_result_until(
-                    wid,
-                    budget,
-                    Self::get_timeout(args, "steer")?,
-                    token,
-                    tx,
-                )
-                .await;
-        }
         // The reply names exactly what happened: a live worker was steered or
         // resumed, a stopped one continued -- as a revision of its saved
         // conversation, or cold when none survived.
@@ -734,12 +721,8 @@ impl McpServer {
         }))
     }
 
-    /// Fresh turn budget a `steer --wait` on a finished worker reports.
-    ///
-    /// A revision restarts the loop from the explicit `max_turns` (or the
-    /// default revision budget), so the progress denominator must be that
-    /// budget, not the finished run's. A steer on a live worker keeps the
-    /// dispatch budget from the registry row.
+    /// Fresh turn budget a revision started by steering a finished worker runs
+    /// on: the explicit `max_turns`, or the default revision budget.
     fn revision_await_budget(&self, explicit: Option<usize>) -> usize {
         explicit.unwrap_or(crate::pool::DEFAULT_REVISION_TURNS)
     }
