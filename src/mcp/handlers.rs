@@ -3,6 +3,11 @@
 //! Turns `tools/call` into a [`Value`] payload; the JSON-RPC envelope is
 //! [`crate::mcp::protocol`]'s business and the stdio plumbing is
 //! [`crate::mcp::server`]'s.
+//!
+//! The verb table is also where per-agent ownership (H-3) is decided: the
+//! connection context names the agent, every worker records the agent that
+//! dispatched it, and the verbs with a side effect on a worker refuse anyone
+//! but its owner (or the operator's `admin` connection).
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
@@ -218,6 +223,11 @@ impl McpServer {
     /// `status` and `logs` stay open to every agent, and a worker neither the
     /// pool nor the registry knows is left to the verb's own "not found"
     /// answer.
+    ///
+    /// This is a coordination boundary between the agents sharing one hub, not
+    /// an authentication one: any process of this user may name itself another
+    /// agent, or ask for `admin`. What keeps a worker private to its user is
+    /// still the hub daemon's `SO_PEERCRED` check.
     async fn require_owner(
         &self,
         wid: &str,

@@ -65,7 +65,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). For unattended tracking, poll 'status' or pass wait:true; avoid short-interval busy-waiting.",
+            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). For unattended tracking, poll 'status' or pass wait:true; avoid short-interval busy-waiting. A worker belongs to the agent that dispatched it: 'steer', 'kill', 'collect' and 'wait' only act on your own workers, while 'status' and 'logs' read any worker's.",
         ),
     ),
     (

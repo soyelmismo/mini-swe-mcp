@@ -1244,3 +1244,148 @@ fn agent_runners_share_one_http_client() {
         "runners must reuse one client so connections and TLS sessions are shared"
     );
 }
+
+// ----------
+// Per-agent ownership (H-3)
+// ----------
+
+/// A synthetic record owned by `owner`, running.
+fn owned_worker(id: &str, owner: &str) -> WorkerRecord {
+    WorkerRecord {
+        owner: owner.to_string(),
+        ..running_worker(id)
+    }
+}
+
+/// The in-memory view: each agent sees only its own workers, and `owner`
+/// travels with every row.
+#[tokio::test]
+async fn listing_is_scoped_to_the_owning_agent() {
+    let dir = scratch_dir("h3-list-inmemory");
+    let _scope = ScopedTempDir::set(&dir);
+    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+    pool.__test_insert_worker(owned_worker("h3-mine", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h3-theirs", "agent-b")).await;
+
+    let ids = |rows: Vec<serde_json::Value>| -> Vec<String> {
+        rows.iter()
+            .map(|row| row["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    let all = ids(pool.list_workers().await);
+    assert_eq!(all.len(), 2, "both workers: {all:?}");
+
+    let mine = pool.list_workers_of("agent-a").await;
+    assert_eq!(ids(mine.clone()), vec!["h3-mine".to_string()]);
+    assert_eq!(mine[0]["owner"], "agent-a");
+    let theirs = pool.list_workers_of("agent-b").await;
+    assert_eq!(ids(theirs), vec!["h3-theirs".to_string()]);
+    assert!(
+        pool.list_workers_of("agent-c").await.is_empty(),
+        "an agent with no workers sees none"
+    );
+}
+
+/// The cross-process view: a worker of another connection lives in the
+/// registry, and the same scoping applies to those rows.
+#[tokio::test]
+async fn listing_is_scoped_across_processes_through_the_registry() {
+    let dir = scratch_dir("h3-list-registry");
+    let _scope = ScopedTempDir::set(&dir);
+    let mut row = measured_entry();
+    row.id = "h3-reg".to_string();
+    row.status = RegistryStatus::Running;
+    row.owner = Some("agent-a".to_string());
+    mini_swe_mcp::pool::save_registry_entry(&row);
+    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+
+    let mine = pool.list_workers_of("agent-a").await;
+    assert_eq!(mine.len(), 1, "the owner's own row: {mine:?}");
+    assert_eq!(mine[0]["id"], "h3-reg");
+    assert_eq!(mine[0]["owner"], "agent-a");
+    assert!(
+        pool.list_workers_of("agent-b").await.is_empty(),
+        "another agent must not see it in the default list"
+    );
+    let all = pool.list_workers().await;
+    assert_eq!(all.len(), 1, "scope=all sees every row: {all:?}");
+}
+
+/// Ownership survives a restart: a worker this pool never dispatched is still
+/// attributed to the agent that did, and a row written before ownership was
+/// tracked is attributed to nobody.
+#[tokio::test]
+async fn worker_ownership_falls_back_to_the_registry_row() {
+    let dir = scratch_dir("h3-owner-fallback");
+    let _scope = ScopedTempDir::set(&dir);
+    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+
+    assert_eq!(pool.worker_owner("h3-nobody").await, None);
+
+    let mut row = measured_entry();
+    row.id = "h3-foreign".to_string();
+    row.status = RegistryStatus::Running;
+    row.owner = Some("agent-a".to_string());
+    mini_swe_mcp::pool::save_registry_entry(&row);
+    assert_eq!(
+        pool.worker_owner("h3-foreign").await,
+        Some(mini_swe_mcp::pool::WorkerOwner::Agent("agent-a".to_string()))
+    );
+
+    row.id = "h3-ancient".to_string();
+    row.owner = None;
+    mini_swe_mcp::pool::save_registry_entry(&row);
+    assert_eq!(
+        pool.worker_owner("h3-ancient").await,
+        Some(mini_swe_mcp::pool::WorkerOwner::Unattributed),
+        "a row with no owner belongs to nobody"
+    );
+    assert_eq!(
+        mini_swe_mcp::pool::registry_owner_label(&row),
+        mini_swe_mcp::pool::UNATTRIBUTED_OWNER
+    );
+}
+
+/// A registry row written before `owner` existed still parses, so an upgrade
+/// cannot turn an old worker's row into a hard read error.
+#[test]
+fn a_registry_row_without_an_owner_still_parses() {
+    let row: WorkerRegistryEntry = serde_json::from_str(
+        r#"{"id":"legacy","pid":1,"task":"t","model":"m","status":"running","step":1,
+            "max_turns":5,"last_command":"ls","started_at":1,"updated_at":2}"#,
+    )
+    .expect("a pre-ownership row must parse");
+    assert_eq!(row.owner, None);
+    assert_eq!(row.status, RegistryStatus::Running);
+}
+
+/// The per-agent cap counts only that agent's *running* workers, which is what
+/// makes it a fairness gate rather than a global limit.
+#[tokio::test]
+async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
+    let dir = scratch_dir("h3-cap-count");
+    let _scope = ScopedTempDir::set(&dir);
+    let pool = WorkerPool::new(8, "http://x".into(), "k".into());
+    pool.__test_insert_worker(owned_worker("h3-a1", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h3-a2", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h3-b1", "agent-b")).await;
+    // A finished worker of the same agent no longer occupies the cap.
+    pool.__test_insert_worker(WorkerRecord {
+        state: WorkerState::Completed {
+            turns: 1,
+            diff: String::new(),
+            summary: String::new(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: None,
+            verified: None,
+            metrics: WorkerMetrics::default(),
+        },
+        ..owned_worker("h3-a3", "agent-a")
+    })
+    .await;
+
+    assert_eq!(pool.active_workers_of("agent-a").await, vec!["h3-a1", "h3-a2"]);
+    assert_eq!(pool.active_workers_of("agent-b").await, vec!["h3-b1"]);
+    assert!(pool.active_workers_of("agent-c").await.is_empty());
+}

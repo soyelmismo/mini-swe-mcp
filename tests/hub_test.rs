@@ -74,7 +74,9 @@ impl Client {
 
     /// Send one request and return its decoded `result`.
     async fn call(&mut self, method: &str) -> serde_json::Value {
-        self.request(method, serde_json::json!({}))["result"].clone()
+        self.request(method, serde_json::json!({}))
+            .await["result"]
+            .clone()
     }
 
     /// Send one request and return the whole reply envelope, error included.
@@ -116,13 +118,15 @@ impl Client {
 
     /// The handshake: the client name becomes part of the connection identity.
     async fn initialize(&mut self, client: &str) {
-        let reply = self.request(
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": client, "version": "test"}
-            }),
-        );
+        let reply = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": client, "version": "test"}
+                }),
+            )
+            .await;
         assert_eq!(reply["result"]["protocolVersion"], "2024-11-05");
     }
 
@@ -131,10 +135,12 @@ impl Client {
         &mut self,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let reply = self.request(
-            "tools/call",
-            serde_json::json!({"name": "worker", "arguments": arguments}),
-        );
+        let reply = self
+            .request(
+                "tools/call",
+                serde_json::json!({"name": "worker", "arguments": arguments}),
+            )
+            .await;
         if let Some(message) = reply.get("error").and_then(|e| e["message"].as_str()) {
             return Err(message.to_string());
         }
@@ -364,6 +370,10 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
             .expect("dispatch prints JSON");
     let wid = payload["worker_id"].as_str().expect("dispatch names the worker").to_string();
+    assert_eq!(
+        payload["owner"], "cli",
+        "a CLI dispatch is owned by the stable `cli` identity: {payload}"
+    );
     let mut status = Command::new(&exe);
     envs(&mut status);
     let out = status
@@ -375,6 +385,26 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         "the worker record must survive the dispatching CLI exiting: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // That identity is stable across invocations, so a *second* CLI process
+    // still sees (and could steer) the worker the first one dispatched.
+    let mut listing = Command::new(&exe);
+    envs(&mut listing);
+    let out = listing
+        .args(["list", "--json"])
+        .output()
+        .expect("second CLI list runs");
+    assert!(out.status.success(), "list must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    let listed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("list prints JSON");
+    let row = listed["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .find(|row| row["id"] == wid.as_str())
+        .unwrap_or_else(|| panic!("the `cli` identity must keep its workers across invocations: {listed}"));
+    assert_eq!(row["owner"], "cli");
 
     // The escape hatch never creates a socket.
     let bare = common::TempDir::new_in_tmp("hub-no-daemon");
