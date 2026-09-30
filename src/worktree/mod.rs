@@ -90,7 +90,7 @@ pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
     swe_base_dir().join(format!("swe-tmp-{name}"))
 }
 
-/// Delete private scratch and legacy targets, never shared slot targets.
+/// Delete private scratch and legacy targets, never shared build dirs.
 pub(crate) fn remove_target_dirs(wt_path: &Path) {
     if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
         for base in swe_base_dirs() {
@@ -111,8 +111,8 @@ mod target_tests {
         let worktree = base.join(&name);
         let legacy = base.join(format!("swe-target-{name}"));
         let scratch = scratch_dir(&worktree);
-        let shared = crate::cache::slot_target_dir(&base, 999999).unwrap();
-        let lease = crate::cache::TargetLease::acquire(&shared).unwrap();
+        let lease = crate::cache::BuildDirLease::acquire(&base).unwrap();
+        let shared = lease.dir().to_path_buf();
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::create_dir_all(&scratch).unwrap();
         remove_target_dirs(&worktree);
