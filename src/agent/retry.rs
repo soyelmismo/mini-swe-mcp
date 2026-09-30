@@ -9,6 +9,37 @@
 use crate::config::env_parse;
 use std::time::Duration;
 
+/// The LLM provider stayed unavailable (5xx/429, network failure or a stalled
+/// stream) through every retry of one request.
+///
+/// Distinct from a request the provider rejected (4xx): an outage is not the
+/// worker's or the orchestrator's fault, so the turn engine waits it out before
+/// escalating (see [`outage_patience`]).
+#[derive(Debug)]
+pub struct LlmUnavailable(pub String);
+
+impl std::fmt::Display for LlmUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LlmUnavailable {}
+
+/// Whether `error` is (or wraps) an [`LlmUnavailable`].
+pub fn is_llm_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<LlmUnavailable>())
+}
+
+/// How long a worker keeps retrying through a provider outage before it asks
+/// the orchestrator: `LLM_OUTAGE_PATIENCE_SECS`, default ten minutes.
+pub fn outage_patience() -> Duration {
+    Duration::from_secs(env_parse("LLM_OUTAGE_PATIENCE_SECS").unwrap_or(600))
+}
+
+/// Wait between two whole-request attempts during an outage.
+pub const OUTAGE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Attempts made before a request is reported as a failure.
 pub const DEFAULT_MAX_RETRIES: usize = 6;
 

@@ -38,6 +38,16 @@ pub fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     trimmed.parse().ok()
 }
 
+/// Worker loops allowed at once; heavy commands have a separate resource gate.
+pub fn max_concurrent_workers() -> usize {
+    env_parse("MAX_CONCURRENT_WORKERS").unwrap_or(128)
+}
+
+/// Process-wide in-flight LLM request limit. Zero or unset means unlimited.
+pub(crate) fn llm_concurrency() -> usize {
+    env_parse("HUB_LLM_CONCURRENCY").unwrap_or(0)
+}
+
 /// The available CPU cores (falls back to 2).
 ///
 /// The admission controller divides its job count over these, so the count is
@@ -128,7 +138,11 @@ mod tests {
         let name = "MINI_SWE_ENV_PARSE_BLANK_TEST";
         for blank in ["", " ", "   ", "\t", "\n", " \t\n "] {
             unsafe { env::set_var(name, blank) };
-            assert_eq!(env_parse::<usize>(name), None, "blank {blank:?} should be None");
+            assert_eq!(
+                env_parse::<usize>(name),
+                None,
+                "blank {blank:?} should be None"
+            );
         }
         unsafe { env::remove_var(name) };
     }

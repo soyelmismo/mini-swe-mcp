@@ -482,6 +482,28 @@ async fn stalled_stream_hits_idle_timeout_and_errors_after_retries() {
         msg.contains("stalled") || msg.contains("after retries"),
         "unexpected error: {msg}"
     );
+    assert!(
+        mini_swe_mcp::agent::retry::is_llm_unavailable(&err),
+        "a stalled provider is an outage the worker waits out: {msg}"
+    );
+}
+
+/// An unreachable provider is an outage too, not a rejected request.
+#[tokio::test]
+async fn an_unreachable_provider_is_reported_as_unavailable() {
+    let runner = AgentRunner::new(
+        "http://127.0.0.1:1".to_string(),
+        "test-key".to_string(),
+        "test-model".to_string(),
+        None,
+    )
+    .with_max_retries(1)
+    .with_initial_retry_delay(Duration::from_millis(10));
+    let err = runner
+        .run_step_llm(&user_turn())
+        .await
+        .expect_err("nothing listens on port 1");
+    assert!(mini_swe_mcp::agent::retry::is_llm_unavailable(&err), "{err:#}");
 }
 
 /// A slow-but-progressing stream that exceeds any single-read budget is *not*

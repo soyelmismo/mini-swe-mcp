@@ -158,7 +158,7 @@ impl WorkerPool {
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
-        let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
+        let _permit = self.worker_slots.acquire(&meta.owner).await;
         let revision = resume_base_commit.is_some();
         info!(worker = %worker_id, model = %model, revision, "Starting worker execution");
 

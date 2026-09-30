@@ -253,7 +253,7 @@ fn print_help() {
 
 /// Concurrent subagents supported out of the box.
 fn max_concurrent_workers() -> usize {
-    config::env_parse("MAX_CONCURRENT_WORKERS").unwrap_or(64)
+    config::max_concurrent_workers()
 }
 
 /// OpenAI-compatible base URL, overridable through `OPENAI_API_BASE`.
