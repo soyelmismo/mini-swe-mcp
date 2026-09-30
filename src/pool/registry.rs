@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::state::WorkerMetrics;
+
 /// Lifecycle status of a worker, as recorded in the on-disk registry.
 ///
 /// Serialized to lowercase so the on-disk JSON stays byte-identical to the
@@ -66,6 +68,10 @@ pub struct WorkerRegistryEntry {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Per-worker health counters as of this write. `#[serde(default)]` so a
+    /// row written by an older build still parses.
+    #[serde(default)]
+    pub metrics: WorkerMetrics,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -80,6 +86,13 @@ pub struct WorkerMeta {
     pub repo_path: Option<String>,
     pub started_at: u64,
     pub pid: u32,
+    /// The phase loop's running counters, written with every status update.
+    ///
+    /// The loop owns the counters and lends them to the turn engine, which
+    /// moves them at the exact point each guard fires; the meta carries them to
+    /// disk so a cross-process reader (the monitor, a `status` answered from a
+    /// registry row) sees the same numbers as the live record.
+    pub metrics: WorkerMetrics,
 }
 
 impl WorkerMeta {
@@ -107,6 +120,7 @@ impl WorkerMeta {
             updated_at: super::unix_timestamp(),
             group: self.group.clone(),
             repo_path: self.repo_path.clone(),
+            metrics: self.metrics,
         });
     }
 }

@@ -103,10 +103,16 @@ impl WorkerPool {
         }
     }
 
+    /// Run one worker to completion.
+    ///
+    /// `meta` is the dispatch's registry row, lent in so the phase loop can
+    /// move the health counters on it at every status write; the caller reads
+    /// them back if the worker fails.
     pub(super) async fn run_worker(
         &self,
         worker_id: String,
         config: WorkerLaunchConfig,
+        meta: &mut WorkerMeta,
     ) -> Result<()> {
         let WorkerLaunchConfig {
             task,
@@ -159,19 +165,9 @@ impl WorkerPool {
         let mut current_max_turns = max_turns;
         let mut consecutive_no_cmd = 0;
         let mut last_assistant_text = String::new();
-        let mut verify_failures = 0;
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
         let started_at_ts = unix_timestamp();
-
-        let meta = WorkerMeta {
-            id: worker_id.clone(),
-            task: task.clone(),
-            group: Some(group.clone()),
-            repo_path: Some(repo_path_str.clone()),
-            started_at: started_at_ts,
-            pid: std::process::id(),
-        };
 
         while step < current_max_turns {
             step += 1;
@@ -194,14 +190,13 @@ impl WorkerPool {
                 group: &group,
                 repo_path_str: &repo_path_str,
                 started_at_ts,
-                meta: &meta,
+                meta,
                 messages: &mut messages,
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: verify.as_deref(),
-                verify_failures: &mut verify_failures,
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
             };
@@ -234,6 +229,7 @@ impl WorkerPool {
                         started_at_ts,
                         step,
                         network_offline,
+                        meta,
                     },
                 )
                 .await?;

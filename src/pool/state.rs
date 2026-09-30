@@ -12,6 +12,66 @@ use crate::agent::AgentStepLog;
 use super::buffer::{LogBuffer, LogStats};
 use super::unix_timestamp;
 
+/// Per-worker health counters, recorded while the run happens.
+///
+/// A summary alone cannot grade a worker: a run that needed 150 turns, was
+/// refused three turn extensions and burned four turns on a repetition loop
+/// completes with the same payload as a clean one. Each counter is moved by the
+/// turn engine at the exact point its guard fires -- never re-derived from the
+/// log window afterwards -- so two workers of the same task can be compared.
+///
+/// Every field defaults to zero, so a registry row written before these
+/// counters existed still parses, and a worker that never moved one still
+/// reports as "nothing measured" instead of as a healthy zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkerMetrics {
+    /// Turns performed by the implementer and reviewer loops together.
+    pub turns_used: usize,
+    /// Extra turns a `REQUEST_TURNS` sentinel was granted.
+    pub extensions_granted: usize,
+    /// `REQUEST_TURNS` asks past the self-grant budget that were refused.
+    pub extensions_refused: usize,
+    /// Commands answered by the repetition detector instead of being run.
+    pub repeat_blocks: usize,
+    /// "Stop exploring" nudges the stagnation detector injected.
+    pub stagnation_nudges: usize,
+    /// Times the repetition limit parked the worker on the orchestrator.
+    pub loop_pauses: usize,
+    /// Verification-gate runs.
+    pub verify_runs: usize,
+    /// Verification-gate runs that exited non-zero.
+    pub verify_failures: usize,
+    /// Files touched by the final diff.
+    pub diff_files: usize,
+    /// Lines added by the final diff.
+    pub diff_insertions: usize,
+    /// Lines removed by the final diff.
+    pub diff_deletions: usize,
+}
+
+impl WorkerMetrics {
+    /// Whether any counter was ever moved off zero.
+    ///
+    /// An all-zero struct is what a registry row written before these counters
+    /// existed carries, so a view must render nothing for it rather than a
+    /// reassuring line of zeros.
+    pub fn is_recorded(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// Compact `3 repeats, 1 nudge` cell for the monitor's stacked row.
+    pub fn repeat_nudge_cell(&self) -> String {
+        format!(
+            "{} repeat{}, {} nudge{}",
+            self.repeat_blocks,
+            if self.repeat_blocks == 1 { "" } else { "s" },
+            self.stagnation_nudges,
+            if self.stagnation_nudges == 1 { "" } else { "s" },
+        )
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
@@ -36,11 +96,17 @@ pub enum WorkerState {
         branch: Option<String>,
         #[serde(default)]
         verified: Option<bool>,
+        #[serde(default)]
+        metrics: WorkerMetrics,
     },
     Failed {
         error: String,
         step: usize,
         failed_at: u64,
+        /// What the run had measured before it died; a worker killed before
+        /// its first turn reports the all-zero default.
+        #[serde(default)]
+        metrics: WorkerMetrics,
     },
 }
 
@@ -68,7 +134,7 @@ impl WorkerState {
                 "question": question,
                 "paused_at": paused_at,
             }),
-            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, .. } => serde_json::json!({
+            WorkerState::Completed { turns, summary, completed_at, artifacts, branch, verified, metrics, .. } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
@@ -76,12 +142,14 @@ impl WorkerState {
                 "artifacts": artifacts,
                 "branch": branch,
                 "verified": verified,
+                "metrics": metrics,
             }),
-            WorkerState::Failed { error, step, failed_at } => serde_json::json!({
+            WorkerState::Failed { error, step, failed_at, metrics } => serde_json::json!({
                 "status": "Failed",
                 "step": step,
                 "error": error,
                 "failed_at": failed_at,
+                "metrics": metrics,
             }),
         }
     }
@@ -92,6 +160,10 @@ pub struct WorkerRecord {
     pub task: String,
     pub model: String,
     pub state: WorkerState,
+    /// Cache of the phase loop's [`WorkerMetrics`], refreshed on every state
+    /// write, so a kill, a crash or a server shutdown can report what the run
+    /// had measured when the loop's own copy went away with the task.
+    pub metrics: WorkerMetrics,
     /// Bounded sliding window of step logs (audit 07, R1).
     pub logs: LogBuffer,
     pub pending_steer: Vec<String>,
@@ -105,6 +177,7 @@ impl WorkerRecord {
             error: error.into(),
             step: self.state.step(),
             failed_at: unix_timestamp(),
+            metrics: self.metrics,
         };
     }
 
@@ -204,7 +277,9 @@ pub(super) fn expired_terminal_ids(
 mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
-    use super::{DEFAULT_TERMINAL_TTL_SECS, WorkerRecord, WorkerState, expired_terminal_ids};
+    use super::{
+        DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerRecord, WorkerState, expired_terminal_ids,
+    };
     use std::collections::HashMap;
 
     // ----------
@@ -240,6 +315,7 @@ mod tests {
                 artifacts: Vec::new(),
                 branch: None,
                 verified: None,
+                metrics: WorkerMetrics::default(),
             }
             .step(),
             12
@@ -271,11 +347,13 @@ mod tests {
             artifacts: Vec::new(),
             branch: None,
             verified: None,
+            metrics: WorkerMetrics::default(),
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
             step: 1,
             failed_at: 1_700_000_001,
+            metrics: WorkerMetrics::default(),
         };
         assert!(!matches!(running, WorkerState::Completed { .. }));
         assert!(matches!(completed, WorkerState::Completed { .. }));
@@ -288,6 +366,7 @@ mod tests {
             task: "t".into(),
             model: "m".into(),
             state,
+            metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),
             pending_steer: Vec::new(),
             resume_tx: None,
@@ -304,6 +383,7 @@ mod tests {
             artifacts: Vec::new(),
             branch: None,
             verified: None,
+            metrics: WorkerMetrics::default(),
         }
     }
 
@@ -312,6 +392,7 @@ mod tests {
             error: "boom".into(),
             step: 1,
             failed_at: when,
+            metrics: WorkerMetrics::default(),
         }
     }
 

@@ -50,8 +50,8 @@ pub use self::runner::{
 };
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerPhase, WorkerProgress, WorkerRecord,
-    WorkerState,
+    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerPhase, WorkerProgress,
+    WorkerRecord, WorkerState,
 };
 
 use self::state::expired_terminal_ids;
@@ -223,6 +223,8 @@ impl WorkerPool {
             repo_path: Some(repo_path_str.clone()),
             started_at: now,
             pid: std::process::id(),
+            // Filled in by the phase loop; the dispatch itself measures nothing.
+            metrics: WorkerMetrics::default(),
         };
 
         let initial_record = WorkerRecord {
@@ -234,6 +236,7 @@ impl WorkerPool {
                 last_command: String::from("initializing"),
                 started_at: now,
             },
+            metrics: WorkerMetrics::default(),
             // Pre-size the retention window so the log buffer never
             // over-allocates (audit 07, R2).
             logs: LogBuffer::with_policy(self.log_policy),
@@ -281,7 +284,9 @@ impl WorkerPool {
         };
 
         let join_handle = tokio::spawn(async move {
-            if let Err(e) = pool.run_worker(wid.clone(), config).await {
+            // `meta_for_fail` is lent to the loop, so the counters it moved
+            // before failing are still readable here.
+            if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
                 error!(worker = %wid, error = %e, "Worker failed with error");
                 let mut lock = pool.workers.write().await;
                 if let Some(w) = lock.get_mut(&wid) {
