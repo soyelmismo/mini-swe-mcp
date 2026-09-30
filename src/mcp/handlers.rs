@@ -245,6 +245,29 @@ impl McpServer {
         }
     }
 
+    /// The shell command that waits on *this* caller's workers.
+    ///
+    /// A shell cannot know its session — the agent's `bash` tool sees none of
+    /// the session variables — so the token is what binds the command to the
+    /// caller: the hub resolves it back to exactly this identity, never to
+    /// `admin` and never to another agent's. `None` for a caller with no token
+    /// store, which is the in-process stdio server: it has no hub, so its
+    /// `watch` runs in the same process.
+    fn watch_command(ctx: &super::server::ConnectionContext) -> Option<String> {
+        let token = ctx.token_store()?.token_for(&ctx.agent())?;
+        Some(format!(
+            "MINI_SWE_WATCH_TOKEN={token} mini-swe-mcp watch"
+        ))
+    }
+
+    /// Add `watch_command` to a dispatch or steer payload, when this caller has
+    /// a token store to mint from.
+    fn with_watch_command(payload: &mut Value, ctx: &super::server::ConnectionContext) {
+        if let Some(command) = Self::watch_command(ctx) {
+            payload["watch_command"] = json!(command);
+        }
+    }
+
     /// Per-agent worker cap, `MAX_WORKERS_PER_AGENT`; `0` (the default) is
     /// unlimited.
     pub(super) fn max_workers_per_agent() -> usize {
@@ -359,13 +382,15 @@ impl McpServer {
 
         // Dispatch never blocks: the worker id is the whole handle, and the
         // event the caller actually wants arrives through `watch`.
-        Ok(json!({
+        let mut payload = json!({
             "worker_id": wid,
             "owner": agent,
             "status": "dispatched",
             "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
             "message": "Worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
-        }))
+        });
+        Self::with_watch_command(&mut payload, ctx);
+        Ok(payload)
     }
 
     /// `status` action: the caller's own view of one worker's step and
@@ -782,24 +807,30 @@ impl McpServer {
                     ),
                 )
             };
-            return Ok(json!({
+            let mut payload = json!({
                 "worker_id": wid,
                 "status": status,
                 "message": format!("{message}. Use watch for the next event."),
-            }));
+            });
+            Self::with_watch_command(&mut payload, ctx);
+            return Ok(payload);
         }
         if matches!(outcome, SteerOutcome::Resumed) {
-            return Ok(json!({
+            let mut payload = json!({
                 "worker_id": wid,
                 "status": "resumed",
                 "message": "Worker resumed with your steering instruction. Use watch for the next event."
-            }));
+            });
+            Self::with_watch_command(&mut payload, ctx);
+            return Ok(payload);
         }
-        Ok(json!({
+        let mut payload = json!({
             "worker_id": wid,
             "status": "steered",
             "message": "Steering instruction queued for next turn. Use watch for the next event."
-        }))
+        });
+        Self::with_watch_command(&mut payload, ctx);
+        Ok(payload)
     }
 
     /// Fresh turn budget a revision started by steering a finished worker runs

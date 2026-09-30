@@ -115,9 +115,19 @@ fn build_ts() -> u64 {
 /// `host_id` is computed here, on the client, because only the client can see
 /// its own ancestry: the daemon would otherwise have to trust a pid it cannot
 /// walk. It is a coordination identity, never an authenticated one.
+///
+/// `session_id` and `watch_token` are read from the environment for the same
+/// reason: only the client can see them. The session is the one the host named
+/// ([`identity::SESSION_ENV_VARS`]); the token is what a shell that cannot know
+/// its session presents to act as the session that dispatched a worker. The
+/// daemon combines the host with the session, so one shared connection can
+/// still carry several sessions — each MCP call overrides the session through
+/// its own `_meta.sessionID`.
 fn hello_params(admin: bool, version: &str, build: &Value) -> Value {
     json!({"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
            "host_id": identity::host_identity().map(|host| host.to_string()),
+           "session_id": identity::session_from_env(),
+           "watch_token": std::env::var(identity::WATCH_TOKEN_ENV).ok(),
            "pid": std::process::id(), "version": version, "build": build,
            "cwd": std::env::current_dir().ok(), "admin": admin})
 }

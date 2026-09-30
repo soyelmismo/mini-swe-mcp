@@ -451,6 +451,10 @@ impl HubServer {
         let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let server = self.server.clone();
         let open_conns = self.open_conns.clone();
+        // Every connection mints from this daemon's own token store, so the
+        // tokens a dispatch hands out are the ones this daemon resolves and
+        // they survive its restart.
+        let tokens = Arc::new(WatchTokens::new(self.config.paths().dir().to_path_buf()));
         tokio::spawn(async move {
             *open_conns.lock().await += 1;
             let (reader, writer) = stream.into_split();
@@ -458,7 +462,7 @@ impl HubServer {
                 .serve_connection(
                     tokio::io::BufReader::new(reader),
                     writer,
-                    crate::mcp::ConnectionContext::hub_connection(id),
+                    crate::mcp::ConnectionContext::hub_connection(id).with_watch_tokens(tokens),
                 )
                 .await;
             *open_conns.lock().await -= 1;
