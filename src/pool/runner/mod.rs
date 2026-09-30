@@ -309,6 +309,10 @@ impl WorkerPool {
                 status: RegistryStatus::Running,
                 model: &model,
                 max_turns: max_turns_for_config,
+                task: &task,
+                temperature,
+                review_after: review_after.as_deref(),
+                network_offline,
             };
             let mut engine = TurnEngine {
                 pool: self,

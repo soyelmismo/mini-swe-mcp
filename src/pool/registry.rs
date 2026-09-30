@@ -304,10 +304,11 @@ fn branch_exists(
     branches.contains(&format!("worker-{}", item.id))
 }
 
-/// Read registry rows without Git probes or pruning.
+/// Read registry rows without Git probes or pruning: the statusLine path.
 ///
-/// Dead workers are normalized to stopped, just as in the dashboard loader.
-/// Recovery uses the raw iterator instead to retain their stored status.
+/// One scan via [`raw_registry_entries`] with dead-pid normalisation on top,
+/// so the fast view agrees with the dashboard about liveness without ever
+/// deleting a row or shelling out to git.
 pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
     raw_registry_entries()
         .map(|(_, mut entry)| {
@@ -411,36 +412,25 @@ pub(crate) fn recover_orphaned_workers() -> usize {
 
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     let mut entries = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
     let mut branches_by_repo: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
-    for dir in crate::worktree::swe_base_dirs() {
-        let dir = dir.join("swe-registry");
-        if let Ok(read_dir) = std::fs::read_dir(dir) {
-            for entry in read_dir.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("json")
-                    && let Ok(content) = std::fs::read_to_string(&p)
-                    && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
-                    && seen_ids.insert(item.id.clone())
-                {
-                    if item.status.is_live() && !crate::worktree::is_process_alive(item.pid) {
-                        item.status = RegistryStatus::Stopped;
-                    }
-
-                    if item.status.is_terminal()
-                        && !worktree_exists(&item.id)
-                        && !branch_exists(&item, &mut branches_by_repo)
-                    {
-                        let _ = std::fs::remove_file(&p);
-                        continue;
-                    }
-
-                    entries.push(item);
-                }
-            }
+    // The directory scan, parsing and id dedupe live in [`raw_registry_entries`];
+    // this loader only adds liveness normalisation and terminal-row pruning.
+    for (path, mut item) in raw_registry_entries() {
+        if item.status.is_live() && !crate::worktree::is_process_alive(item.pid) {
+            item.status = RegistryStatus::Stopped;
         }
+
+        if item.status.is_terminal()
+            && !worktree_exists(&item.id)
+            && !branch_exists(&item, &mut branches_by_repo)
+        {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+
+        entries.push(item);
     }
     entries.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     entries
