@@ -382,6 +382,7 @@ mod tests {
             id: "w".into(),
             task: "t".into(),
             model: "m".into(),
+            owner: "test-owner".into(),
             state,
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

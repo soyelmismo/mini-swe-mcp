@@ -353,6 +353,20 @@ impl McpServer {
             .await
     }
 
+    /// Execute a tool call on behalf of the connection `ctx` describes.
+    ///
+    /// Ownership (H-3) is decided from this context, so every caller other
+    /// than the stdio transport — the CLI through the hub, a second
+    /// orchestrator — reaches the verb table through here.
+    pub async fn execute_tool_for(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &ConnectionContext,
+    ) -> Result<Value> {
+        self.execute_tool_in_context(name, args, None, None, ctx).await
+    }
+
     /// Execute a tool call, optionally streaming `notifications/progress`.
     pub async fn execute_tool_with_progress(
         &self,
@@ -499,6 +513,7 @@ impl McpServer {
                     let log_view = self.render_logs(wid).await;
                     let mut result = json!({
                         "worker_id": wid,
+                        "owner": self.owner_of(wid).await,
                         "state": state,
                     });
                     if let serde_json::Value::Object(map) = &mut result {
@@ -519,6 +534,7 @@ impl McpServer {
                     .await;
                     return Ok(json!({
                         "worker_id": wid,
+                        "owner": self.owner_of(wid).await,
                         "status": "needs_input",
                         "question": question,
                         "step": step,
@@ -539,6 +555,7 @@ impl McpServer {
                 .await;
                 return Ok(json!({
                     "worker_id": wid,
+                    "owner": self.owner_of(wid).await,
                     "status": "still_running",
                     "step": step,
                     "last_command": progress.last_command,

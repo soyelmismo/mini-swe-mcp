@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
-use crate::pool::emit_view;
+use crate::pool::{UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
+
+/// Owner label used when neither the pool nor the registry has a row.
+const UNKNOWN_OWNER: &str = "unknown";
 
 impl McpServer {
     /// Shared argument extraction and progress reporting, defined next to the
@@ -186,16 +189,75 @@ impl McpServer {
             "manifest" => self.handle_manifest(),
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args).await,
-            "collect" => self.handle_collect(args).await,
+            "collect" => self.handle_collect(args, ctx).await,
             "logs" => self.handle_logs(args).await,
             "reap" => self.handle_reap().await,
-            "list" => self.handle_list().await,
-            "kill" => self.handle_kill(args).await,
-            "steer" => self.handle_steer(args, token, tx).await,
-            "wait" => self.handle_wait(args, token, tx).await,
+            "list" => self.handle_list(args, ctx).await,
+            "kill" => self.handle_kill(args, ctx).await,
+            "steer" => self.handle_steer(args, token, tx, ctx).await,
+            "wait" => self.handle_wait(args, token, tx, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
+    }
+
+    /// Owner label of `wid` for a payload: the recorded agent, or a marker for
+    /// a row that names none / a worker nothing knows about.
+    pub(super) async fn owner_of(&self, wid: &str) -> String {
+        match self.pool.worker_owner(wid).await {
+            Some(WorkerOwner::Agent(owner)) => owner,
+            Some(WorkerOwner::Unattributed) => UNATTRIBUTED_OWNER.to_string(),
+            None => UNKNOWN_OWNER.to_string(),
+        }
+    }
+
+    /// Refuse to act on a worker another agent owns (H-3).
+    ///
+    /// Applied to every verb with a side effect on the worker itself: `steer`,
+    /// `kill`, `collect`, `wait` and the wait a `dispatch`/`steer` blocks on.
+    /// `status` and `logs` stay open to every agent, and a worker neither the
+    /// pool nor the registry knows is left to the verb's own "not found"
+    /// answer.
+    async fn require_owner(
+        &self,
+        wid: &str,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<()> {
+        if ctx.is_admin() {
+            return Ok(());
+        }
+        match self.pool.worker_owner(wid).await {
+            Some(WorkerOwner::Agent(owner)) if owner != ctx.agent() => {
+                anyhow::bail!("worker {wid} belongs to agent {owner}")
+            }
+            Some(WorkerOwner::Unattributed) => anyhow::bail!(
+                "worker {wid} has no recorded owner (dispatched before ownership was tracked)"
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Per-agent worker cap, `MAX_WORKERS_PER_AGENT`; `0` (the default) is
+    /// unlimited.
+    pub(super) fn max_workers_per_agent() -> usize {
+        crate::config::env_parse("MAX_WORKERS_PER_AGENT").unwrap_or(0)
+    }
+
+    /// Refuse a dispatch that would push `agent` past its cap, naming the
+    /// workers already running so the caller can pick one to collect.
+    async fn check_agent_cap(&self, agent: &str, cap: usize) -> Result<()> {
+        if cap == 0 {
+            return Ok(());
+        }
+        let running = self.pool.active_workers_of(agent).await;
+        if running.len() < cap {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "agent {agent} already has {} running workers (limit MAX_WORKERS_PER_AGENT={cap}): {}",
+            running.len(),
+            running.join(", ")
+        )
     }
 
     fn handle_manifest(&self) -> Result<Value> {
@@ -213,6 +275,10 @@ impl McpServer {
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let task = Self::required_string(args, "task", "dispatch")?.to_string();
+        let agent = ctx.agent();
+        // Fairness gate: one agent may not fill the pool, so its dispatches
+        // stop at `MAX_WORKERS_PER_AGENT` running workers (0 = unlimited).
+        self.check_agent_cap(&agent, Self::max_workers_per_agent()).await?;
         let repo_path = Self::get_repo_path(args, ctx);
         let requested_model = args
             .get("model")
@@ -262,6 +328,7 @@ impl McpServer {
         let wid = self
             .pool
             .dispatch(
+                agent.clone(),
                 task,
                 resolved_model,
                 temperature,
@@ -295,6 +362,7 @@ impl McpServer {
         } else {
             Ok(json!({
                 "worker_id": wid,
+                "owner": agent,
                 "status": "dispatched",
                 "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
                 "message": "Worker is executing in isolated worktree in background"
@@ -302,14 +370,18 @@ impl McpServer {
         }
     }
 
+    /// `status` and `logs` are the two verbs every agent may use on any
+    /// worker: reading another's run is what lets an orchestrator see that a
+    /// worker exists at all, and nothing here can change it.
     async fn handle_status(&self, args: &Value) -> Result<Value> {
         let wid = Self::get_worker_id(args, "status")?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
-            Ok(json!({ "worker_id": wid, "state": state }))
+            Ok(json!({ "worker_id": wid, "owner": self.owner_of(wid).await, "state": state }))
         } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
             let state_name = entry.status.display_name();
             Ok(json!({
                 "worker_id": wid,
+                "owner": crate::pool::registry_owner_label(&entry),
                 "task": entry.task,
                 "model": entry.model,
                 "state": {
@@ -389,8 +461,13 @@ impl McpServer {
         }))
     }
 
-    async fn handle_collect(&self, args: &Value) -> Result<Value> {
+    async fn handle_collect(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "collect")?;
+        self.require_owner(wid, ctx).await?;
         if let Some(collected) = self.pool.collect(wid).await {
             let log_view = LogView {
                 logs: collected.logs,
@@ -400,6 +477,7 @@ impl McpServer {
             };
             let mut result = json!({
                 "worker_id": wid,
+                "owner": collected.owner,
                 "state": collected.state,
             });
             if let serde_json::Value::Object(map) = &mut result {
@@ -411,13 +489,48 @@ impl McpServer {
         }
     }
 
-    async fn handle_list(&self) -> Result<Value> {
-        let workers = self.pool.list_workers().await;
+    /// `list` is scoped to the caller's own workers; `scope: "all"` widens it
+    /// to every agent's, each row carrying its `owner` (H-3).
+    async fn handle_list(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let workers = if Self::lists_every_agent(args)? {
+            self.pool.list_workers().await
+        } else {
+            self.pool.list_workers_of(&ctx.agent()).await
+        };
         Ok(json!({ "workers": workers }))
     }
 
-    async fn handle_kill(&self, args: &Value) -> Result<Value> {
+    /// Whether the caller asked for every agent's workers.
+    ///
+    /// Only the two documented values are accepted: a typo is a hard error
+    /// rather than a silent fallback to the caller's own workers, which would
+    /// look like a pool with nobody else's runs in it.
+    fn lists_every_agent(args: &Value) -> Result<bool> {
+        match args.get("scope") {
+            None => Ok(false),
+            Some(scope) => match scope.as_str() {
+                Some(scope) if super::schema::LIST_SCOPES.contains(&scope) => {
+                    Ok(scope == super::schema::LIST_SCOPE_ALL)
+                }
+                _ => anyhow::bail!(
+                    "'scope' must be one of: {}",
+                    super::schema::LIST_SCOPES.join(", ")
+                ),
+            },
+        }
+    }
+
+    async fn handle_kill(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "kill")?;
+        self.require_owner(wid, ctx).await?;
         let killed = self.pool.kill(wid).await;
         if killed {
             Ok(json!({ "worker_id": wid, "killed": true }))
@@ -462,8 +575,10 @@ impl McpServer {
         args: &Value,
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "wait")?;
+        self.require_owner(wid, ctx).await?;
         if self.pool.get_worker_state(wid).await.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
@@ -484,8 +599,10 @@ impl McpServer {
         args: &Value,
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "steer")?;
+        self.require_owner(wid, ctx).await?;
         let message = Self::required_string(args, "message", "steer")?.to_string();
         self.pool.steer(wid, message).await?;
         let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);

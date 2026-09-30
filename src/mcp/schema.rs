@@ -28,6 +28,14 @@ pub const WORKER_ACTIONS: &[&str] = &[
 /// vocabulary and the manifest vocabulary can never drift apart.
 pub const NETWORK_MODES: &[&str] = crate::manifest::NETWORK_POLICIES;
 
+/// Accepted values of the `list` `scope` property: the caller's own workers,
+/// or every agent's. [`LIST_SCOPE_ALL`] is the only way to look at another
+/// agent's rows; the mutating verbs refuse regardless (H-3).
+pub const LIST_SCOPES: &[&str] = &["mine", "all"];
+
+/// `scope` value that lists every agent's workers.
+pub const LIST_SCOPE_ALL: &str = "all";
+
 /// Policy applied when a `tools/call` omits the optional `network` property.
 ///
 /// Backwards compatible: a client that never heard of the property keeps the
@@ -141,6 +149,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         ),
     ),
     (
+        "scope",
+        "string",
+        DescriptionSource::Static(
+            "Listing scope for 'list': omitted or 'mine' returns only the calling agent's workers, 'all' returns every agent's, each row naming its 'owner'. Optional for 'list' (default: 'mine').",
+        ),
+    ),
+    (
         "network",
         "string",
         DescriptionSource::Static(
@@ -179,6 +194,18 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
             ),
         );
         schema.insert("default".to_string(), Value::String(NETWORK_DEFAULT.to_string()));
+    }
+    if name == "scope" {
+        schema.insert(
+            "enum".to_string(),
+            Value::Array(
+                LIST_SCOPES
+                    .iter()
+                    .map(|scope| Value::String((*scope).to_string()))
+                    .collect(),
+            ),
+        );
+        schema.insert("default".to_string(), Value::String(LIST_SCOPES[0].to_string()));
     }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));
@@ -313,6 +340,20 @@ mod tests {
                 .is_some_and(|text| text.contains("offline")),
             "the description must document what 'offline' does"
         );
+    }
+
+    /// The `scope` property advertises the two documented list scopes, so a
+    /// client never has to guess the vocabulary.
+    #[test]
+    fn scope_property_advertises_the_list_scopes() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let scope = &schema["properties"]["scope"];
+
+        assert_eq!(scope["type"], json!("string"));
+        assert_eq!(scope["enum"], json!(["mine", "all"]));
+        assert_eq!(scope["default"], json!("mine"));
+        assert!(LIST_SCOPES.contains(&LIST_SCOPE_ALL));
     }
 
     /// `network` is optional: a dispatch that omits it must still validate
