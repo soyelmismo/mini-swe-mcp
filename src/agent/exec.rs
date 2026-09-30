@@ -1089,7 +1089,7 @@ mod tests {
             .expect("an offline curl must fail as ordinary output, not an error");
         let elapsed = started.elapsed();
 
-        assert_ne!(code, Some(0), "egress must fail offline: {out:?}");
+        assert_eq!(code, Some(0), "the probe step itself must succeed: {out:?}");
         assert!(
             out.contains("exit=") && !out.contains("exit=0"),
             "the curl must not succeed: {out:?}"

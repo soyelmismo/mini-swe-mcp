@@ -20,9 +20,9 @@ pub use retry::{
 };
 pub use stream::extract_command;
 pub use sandbox::{
-    DISABLE_LANDLOCK_ENV, LandlockPlan, TRUNCATE_HEAD, TRUNCATE_LIMIT, TRUNCATE_TAIL,
-    build_landlock_plan, find_git_common_dir, find_git_dirs, has_bwrap, is_heavy_command,
-    truncate_output, validate_bash_command,
+    DISABLE_LANDLOCK_ENV, KernelConfinement, LandlockPlan, SeccompFilter, TRUNCATE_HEAD,
+    TRUNCATE_LIMIT, TRUNCATE_TAIL, build_landlock_plan, find_git_common_dir, find_git_dirs,
+    has_bwrap, is_heavy_command, truncate_output, validate_bash_command,
 };
 pub use types::{
     AgentStepLog, ChatMessage, DEFAULT_STREAM_IDLE_TIMEOUT, LlmResponse,
