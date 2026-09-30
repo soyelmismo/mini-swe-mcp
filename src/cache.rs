@@ -215,20 +215,20 @@ pub(crate) fn repo_key(repo: &Path) -> anyhow::Result<String> {
     Ok(format!("{hash:016x}"))
 }
 
-/// Warm dependencies are shared by repo and exclusive admission slot. Workspace
-/// incremental artifacts may rebuild when the worktree path changes; kache still
-/// reuses compiler outputs. The admission permit spans the entire heavy command.
-pub(crate) fn slot_target_dir(repo: &Path, slot: usize) -> anyhow::Result<PathBuf> {
-    Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-slot{slot}", repo_key(repo)?)))
+/// `n`th build directory of a repository's pool. Directories are indexed by
+/// lease order, not by admission slot: a live worker holds one exclusively for
+/// its whole lifetime, so two workers of one repository can never share a dir.
+pub(crate) fn build_dir(repo: &Path, index: usize) -> anyhow::Result<PathBuf> {
+    Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-{index}", repo_key(repo)?)))
 }
 
-fn slot_repo(path: &Path) -> Option<&str> {
+fn build_dir_repo(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?.strip_prefix("swe-target-")?;
-    let (repo, slot) = name.split_once("-slot")?;
+    let (repo, index) = name.split_once('-')?;
     (repo.len() == 16
         && repo.bytes().all(|b| b.is_ascii_hexdigit())
-        && !slot.is_empty()
-        && slot.bytes().all(|b| b.is_ascii_digit()))
+        && !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit()))
     .then_some(repo)
 }
 
@@ -251,7 +251,7 @@ fn target_evictions(
     let mut latest = std::collections::BTreeMap::new();
     let mut active_repos = std::collections::BTreeSet::new();
     for entry in entries {
-        if let Some(repo) = slot_repo(&entry.dir) {
+        if let Some(repo) = build_dir_repo(&entry.dir) {
             let at = latest.entry(repo).or_insert(entry.last_used);
             *at = (*at).max(entry.last_used);
             if !entry.idle {
@@ -270,10 +270,10 @@ fn target_evictions(
         .fold(0u64, |sum, e| sum.saturating_add(e.size));
     let mut removed = Vec::new();
     for entry in &ordered {
-        let expired = slot_repo(&entry.dir)
+        let expired = build_dir_repo(&entry.dir)
             .and_then(|repo| latest.get(repo))
             .is_some_and(|at| {
-                !active_repos.contains(slot_repo(&entry.dir).expect("slot repo"))
+                !active_repos.contains(build_dir_repo(&entry.dir).expect("slot repo"))
                     && now.duration_since(*at).unwrap_or_default() >= ttl
             });
         if expired {
@@ -325,37 +325,63 @@ fn flock(_file: &std::fs::File, _exclusive: bool, _nonblocking: bool) -> std::io
     ))
 }
 
-fn target_lease_path(target: &Path) -> PathBuf {
-    target.with_file_name(format!(
-        ".{}.lease",
-        target.file_name().expect("named target").to_string_lossy()
-    ))
+fn build_dir_lock_path(dir: &Path) -> PathBuf {
+    dir.join(".swe-target.lease")
 }
 
-/// A shared lease prevents idle eviction, without serializing light commands.
-/// Heavy-command exclusivity belongs to the admission controller.
-pub(crate) struct TargetLease(std::fs::File);
+/// Exclusive lease on one build directory of a repository's pool.
+///
+/// The `flock` on the directory's lock file is held for the guard's whole
+/// lifetime, so no second worker -- in this process or in another one -- can
+/// lease the same directory while this worker is live, and the sweep sees the
+/// directory as busy. Dropping the guard releases the directory for a later
+/// worker, which then inherits its warm dependency cache.
+pub(crate) struct BuildDirLease {
+    dir: PathBuf,
+    lock: std::fs::File,
+}
 
-impl TargetLease {
-    pub(crate) fn acquire(target: &Path) -> std::io::Result<Self> {
-        let base = target
-            .parent()
-            .ok_or_else(|| std::io::Error::other("Target has no parent"))?;
-        std::fs::create_dir_all(base)?;
+impl BuildDirLease {
+    /// Lease the lowest-indexed free directory of `repo`, creating a new one
+    /// when every directory the repository already has is live.
+    pub(crate) fn acquire(repo: &Path) -> std::io::Result<Self> {
+        let key = repo_key(repo).map_err(std::io::Error::other)?;
+        let base = crate::worktree::swe_base_dir();
+        std::fs::create_dir_all(&base)?;
+        // The sweep lock keeps eviction from removing a directory between the
+        // probe below and the lock that proves it free.
         let global = lock_file(&base.join(".swe-target-sweep.lock"))?;
         flock(&global, true, false)?;
-        std::fs::create_dir_all(target)?;
-        let lease = lock_file(&target_lease_path(target))?;
-        flock(&lease, false, false)?;
-        lease.set_modified(std::time::SystemTime::now())?;
+        let mut index = 0usize;
+        let lease = loop {
+            let dir = base.join(format!("swe-target-{key}-{index}"));
+            std::fs::create_dir_all(&dir)?;
+            let lock = lock_file(&build_dir_lock_path(&dir))?;
+            if flock(&lock, true, true).is_ok() {
+                break Self { dir, lock };
+            }
+            index += 1;
+        };
+        drop(global);
+        lease.touch()?;
         start_target_sweep();
-        Ok(Self(lease))
+        Ok(lease)
+    }
+
+    /// The directory this worker builds in.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Refresh the directory's last-used stamp for the sweep's LRU order.
+    fn touch(&self) -> std::io::Result<()> {
+        self.lock.set_modified(std::time::SystemTime::now())
     }
 }
 
-impl Drop for TargetLease {
+impl Drop for BuildDirLease {
     fn drop(&mut self) {
-        let _ = self.0.set_modified(std::time::SystemTime::now());
+        let _ = self.touch();
     }
 }
 
@@ -392,11 +418,11 @@ fn sweep_targets(base: &Path, ttl: std::time::Duration, max_bytes: u64) -> std::
     let mut entries = Vec::new();
     let mut idle_leases = Vec::new();
     for dir in std::fs::read_dir(base)?.flatten() {
-        if !dir.file_type()?.is_dir() || slot_repo(&dir.path()).is_none() {
+        if !dir.file_type()?.is_dir() || build_dir_repo(&dir.path()).is_none() {
             continue;
         }
         let path = dir.path();
-        let lease = lock_file(&target_lease_path(&path))?;
+        let lease = lock_file(&build_dir_lock_path(&path))?;
         let idle = flock(&lease, true, true).is_ok();
         let last_used = lease.metadata()?.modified()?;
         // A failed scan cannot safely participate in size eviction.
@@ -414,10 +440,9 @@ fn sweep_targets(base: &Path, ttl: std::time::Duration, max_bytes: u64) -> std::
     let now = std::time::SystemTime::now();
     for path in target_evictions(&entries, now, ttl, max_bytes) {
         if let Err(error) = std::fs::remove_dir_all(&path) {
+            // The lock file lives inside the directory, so the global lock keeps
+            // acquisitions out until the whole name is gone.
             tracing::warn!(%error, path = %path.display(), "Failed to evict idle build target");
-        } else {
-            // The global lock excludes acquisitions until both names are gone.
-            let _ = std::fs::remove_file(target_lease_path(&path));
         }
     }
     Ok(())
