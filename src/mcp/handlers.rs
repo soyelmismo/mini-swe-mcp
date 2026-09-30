@@ -689,6 +689,16 @@ impl McpServer {
                 )
                 .await;
         }
+        if was_terminal {
+            return Ok(json!({
+                "worker_id": wid,
+                "status": "revising",
+                "message": format!(
+                    "Revision started on branch worker-{wid} with a fresh budget of {} turns",
+                    self.revision_await_budget(revision_turns)
+                ),
+            }));
+        }
         Ok(json!({
             "worker_id": wid,
             "status": "steered",
