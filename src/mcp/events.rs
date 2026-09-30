@@ -334,6 +334,14 @@ pub(super) struct EventRouter {
 }
 
 impl EventRouter {
+    fn watch_channel_frame(&self, event: &ChannelEvent) -> Option<String> {
+        let mut frame: serde_json::Value = serde_json::from_str(&channel_frame(event)?).ok()?;
+        if let Some(payload) = self.watch_reported.get(&event.worker_id) {
+            frame["params"]["payload"] = payload.clone();
+        }
+        Some(frame.to_string() + "\n")
+    }
+
     pub(super) fn register(
         &mut self,
         ctx: &super::server::ConnectionContext,
@@ -349,7 +357,7 @@ impl EventRouter {
         }
         for (owner, event) in &self.latest {
             if (ctx.is_admin() || owner.as_deref() == Some(agent.as_str()))
-                && let Some(frame) = channel_frame(event)
+                && let Some(frame) = self.watch_channel_frame(event)
                 && !try_deliver(&tx, frame)
             {
                 return;
@@ -368,7 +376,7 @@ impl EventRouter {
         if self.latest.len() == 100 {
             self.latest.pop_front();
         }
-        if let Some(frame) = channel_frame(&event) {
+        if let Some(frame) = self.watch_channel_frame(&event) {
             self.connections.retain(|_, (agent, admin, tx)| {
                 if *admin || owner.as_deref() == Some(agent.as_str()) {
                     // A stalled connection must not block the pool watcher.
@@ -403,6 +411,8 @@ pub(super) async fn spawn_hub_events(
     tokio::spawn(async move {
         loop {
             let current = snapshot(&pool, &previous).await;
+            let views = watch_snapshot(&pool).await;
+            router.lock().await.observe_watch(views);
             for event in diff_events(&previous, &current) {
                 let owner = match pool.worker_owner(&event.worker_id).await {
                     Some(crate::pool::WorkerOwner::Agent(owner)) => Some(owner),
@@ -410,8 +420,6 @@ pub(super) async fn spawn_hub_events(
                 };
                 router.lock().await.publish(owner, event);
             }
-            let views = watch_snapshot(&pool).await;
-            router.lock().await.observe_watch(views);
             previous = current;
             tokio::select! {
                 _ = changes.changed() => {}
@@ -770,9 +778,11 @@ impl EventRouter {
                     "content":crate::cli::watch::render(&event),"payload":event,
                     "meta":{"worker_id":id,"event":event["event"].as_str().unwrap_or(""),"owner":owner}
                 }}).to_string() + "\n";
-                self.connections.retain(|_, (agent, admin, tx)| {
-                    if *admin || *agent == owner { try_deliver(tx, frame.clone()) } else { !tx.is_closed() }
-                });
+                if event["event"] == "stalled" {
+                    self.connections.retain(|_, (agent, admin, tx)| {
+                        if *admin || *agent == owner { try_deliver(tx, frame.clone()) } else { !tx.is_closed() }
+                    });
+                }
             }
         }
         self.watch_reported.retain(|id, _| views.contains_key(id));

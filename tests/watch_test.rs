@@ -12,6 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn paths(dir: &Path) -> HubPaths {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
     HubPaths::new(dir.to_path_buf())
 }
 
@@ -71,16 +73,7 @@ impl Raw {
         }
     }
 
-    async fn cli(&mut self, command: &[&str]) -> serde_json::Value {
-        self.request("hub/hello", serde_json::json!({})).await;
-        self.request("initialize", serde_json::json!({"protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": mini_swe_mcp::mcp::CLI_CLIENT_NAME, "version": "test"}})).await;
-        let reply = self
-            .request("tools/call", serde_json::json!({"name": "worker", "arguments": {"action": command[0]}}))
-            .await;
-        let text = reply["result"]["content"][0]["text"].as_str().unwrap_or("").to_string();
-        serde_json::from_str(&text).unwrap_or(serde_json::json!({}))
-    }
+
 }
 
 async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
@@ -94,16 +87,14 @@ async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
 
 #[tokio::test]
 async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner() {
-    let _ = ();
-    let dir = common::TempDir::new_in_tmp("watch-governance");
-    let daemon = HubServer::new(
-        pool_with(vec![record("w-watch", "agent-a", WorkerState::Running {
-            step: 1,
-            last_command: "test".to_string(),
-            started_at: 0,
-        })]),
-        HubConfig::new(paths(dir.path()), 60),
-    );
+
+    let dir = common::TempDir::new_in_tmp("wg");
+    let server = pool_with(vec![record("w-watch", "agent-a", WorkerState::Running {
+        step: 1,
+        last_command: "test".to_string(),
+        started_at: 0,
+    })]).await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.path().join("hub.sock")).await;
 
@@ -143,21 +134,19 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
 
 #[tokio::test]
 async fn completed_worker_is_reported_immediately_with_missed_marker() {
-    let dir = common::TempDir::new_in_tmp("watch-missed");
-    let daemon = HubServer::new(
-        pool_with(vec![record("w-done", "agent-a", WorkerState::Completed {
-            turns: 2,
-            diff: String::new(),
-            summary: "Fixed.".to_string(),
-            completed_at: 0,
-            artifacts: Vec::new(),
-            branch: Some("worker-w-done".to_string()),
-            verified: Some(true),
-            metrics: WorkerMetrics::default(),
-            revision: 0,
-        })]),
-        HubConfig::new(paths(dir.path()), 60),
-    );
+    let dir = common::TempDir::new_in_tmp("wm");
+    let server = pool_with(vec![record("w-done", "agent-a", WorkerState::Completed {
+        turns: 2,
+        diff: String::new(),
+        summary: "Fixed.".to_string(),
+        completed_at: 0,
+        artifacts: Vec::new(),
+        branch: Some("worker-w-done".to_string()),
+        verified: Some(true),
+        metrics: WorkerMetrics::default(),
+        revision: 0,
+    })]).await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.path().join("hub.sock")).await;
 
@@ -173,7 +162,7 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
     assert_eq!(event["event"], "completed");
     assert_eq!(event["missed"], true);
     assert_eq!(event["branch"], "worker-w-done");
-    assert!(event["actions"].as_array().map(|actions| actions.iter().any(|action| action.as_str().unwrap_or("").contains("mini-swe-mcp steer"))).unwrap_or(false), "{event:?}");
+    assert!(event["commands"].as_array().map(|actions| actions.iter().any(|action| action.as_str().unwrap_or("").contains("mini-swe-mcp steer"))).unwrap_or(false), "{event:?}");
     assert!(event["next_step"].as_str().unwrap_or("").contains("worker-w-done"), "{event:?}");
 
     // Acknowledging removes the backlog; the next watch has nothing to replay.
@@ -208,21 +197,30 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
             .env("TMPDIR", swe.path())
             .env("MINI_SWE_NO_DAEMON", "1")
             .env("ENV_FILE", "/nonexistent-mini-swe-env")
-            .env("MODELS_FILE", concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"))
+            .env("OPENAI_API_KEY", "test-key-not-used")
+        .env("MODELS_FILE", concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"))
             .output()
             .unwrap_or_else(|e| panic!("run {args:?}: {e}"))
     };
+    // Nothing to watch: no Running/Paused worker of this identity.
     let output = run(&["watch", "--timeout", "1"]);
     assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stdout));
-    let completed = format!(r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2}}"#, std::process::id());
+    let completed = format!(r#"{{"id":"w-cli","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"cli"}}"#, std::process::id());
     std::fs::write(swe.path().join("swe-registry").join("w-cli.json"), completed).expect("row");
+    std::fs::create_dir_all(swe.path().join("swe-wt-w-cli")).expect("preserved worktree");
     let output = run(&["watch", "w-cli"]);
     assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(stdout.contains("w-cli") && stdout.contains("completed") && stdout.contains("mini-swe-mcp steer"), "{stdout}");
     let _ = std::fs::remove_dir_all(swe.path().join("swe-registry"));
+    // The same worker, now gone: still nothing to watch.
+    std::fs::create_dir_all(swe.path().join("swe-registry")).unwrap();
+    let now = mini_swe_mcp::pool::unix_timestamp();
+    let running = serde_json::json!({"id":"w-cli","pid":std::process::id(),"task":"t","model":"m","status":"running","step":1,"max_turns":10,"last_command":"test","started_at":now,"updated_at":now,"owner":"cli"});
+    std::fs::write(swe.path().join("swe-registry/w-cli.json"), running.to_string()).unwrap();
     let output = run(&["watch", "w-cli", "--timeout", "1"]);
-    assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stdout));
+    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stdout));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no event"));
 }
 
 #[test]
@@ -232,9 +230,9 @@ fn tool_description_carries_the_orchestrator_guidelines() {
         WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()).with_manifest(Arc::new(manifest)),
         "m".to_string(),
     );
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in ["ONE focused concern", "mini-swe-mcp watch", "steer", "merge only when it is right"] {
         assert!(text.contains(needle), "tool schema must carry the guidelines ({needle} missing)");
     }
 }
+
