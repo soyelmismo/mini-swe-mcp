@@ -3,6 +3,7 @@
 pub mod env;
 pub mod exec;
 pub mod intercept;
+pub mod reap;
 pub mod retry;
 pub mod runner;
 pub mod sandbox;

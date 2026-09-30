@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
+use tracing::warn;
 
 use super::AgentRunner;
 use super::intercept::{check_command, strip_data_heredocs};
@@ -66,6 +67,20 @@ const NICE_VALUE: &str = "10";
 /// `SIGKILL`. Long enough to flush buffers, short enough that a wedged build
 /// still fails near its budget.
 const TERM_GRACE_MS: u64 = 5_000;
+
+/// Grace period after `SIGTERM` before a *finished* step's group is escalated
+/// to `SIGKILL`. The step is over, so a job the shell backgrounded with `&`
+/// only needs a moment to exit on its own before the escalation.
+const STEP_TERM_GRACE_MS: u64 = 500;
+
+/// Poll interval while waiting for a signalled process group to empty.
+const GROUP_POLL_MS: u64 = 25;
+
+/// [`TERM_GRACE_MS`] as a [`Duration`], for the callers that pass a grace.
+const TERM_GRACE: Duration = Duration::from_millis(TERM_GRACE_MS);
+
+/// [`STEP_TERM_GRACE_MS`] as a [`Duration`], for the callers that pass a grace.
+const STEP_TERM_GRACE: Duration = Duration::from_millis(STEP_TERM_GRACE_MS);
 
 /// Bound on the post-`SIGKILL` reap. `SIGKILL` cannot be caught, so a child
 /// still unreaped here is not ours to wait on and must not stall the result.
@@ -656,6 +671,10 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
         // Clean exit: the write ends are closed now that the child is gone, so
         // the readers reach EOF and the real output and code are reported.
         Ok(Ok(status)) => {
+            // The step is over, so the group goes down with it: a job the shell
+            // backgrounded with `&` is still a member, and leaving it running
+            // would outlive the worker that started it.
+            terminate_process_group(child_pid, &mut child, STEP_TERM_GRACE).await;
             // The group is already reaped; the guard must not signal it again.
             group_guard.disarm();
             let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
@@ -669,10 +688,15 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
         // build running behind us. Signalling a reaped group is inert
         // (`ESRCH`), and the PID cannot be recycled while tokio holds the
         // unreaped `Child`.
-        Ok(Err(e)) => Err(e).context("Failed waiting for bash process"),
+        Ok(Err(e)) => {
+            // The child's fate is unknown, so the group is taken down here too:
+            // an error is an end of the step like any other.
+            terminate_process_group(child_pid, &mut child, STEP_TERM_GRACE).await;
+            Err(e).context("Failed waiting for bash process")
+        }
         // The child outlived its budget: stop it, then report what it printed.
         Err(_elapsed) => {
-            terminate_process_group(child_pid, &mut child).await;
+            terminate_process_group(child_pid, &mut child, TERM_GRACE).await;
             // `terminate_process_group` reaped the group (or gave up after the
             // SIGKILL), so the drop guard has nothing left to do.
             group_guard.disarm();
@@ -865,27 +889,54 @@ impl PipeBuffer {
 }
 
 /// `SIGTERM` the child's process group, then `SIGKILL` any remaining members
-/// after the leader exits or [`TERM_GRACE_MS`] elapses.
+/// after the group goes quiet or `term_grace` elapses.
+///
+/// Called on *every* way a step can end -- clean exit, error and timeout -- so a
+/// job the shell backgrounded with `&` never outlives the step that started it.
 ///
 /// Best-effort at every step: the group may already be gone (the sandbox
 /// wrapper carries `--die-with-parent` and takes its children with it).
-async fn terminate_process_group(pid: Option<u32>, child: &mut Child) {
+async fn terminate_process_group(pid: Option<u32>, child: &mut Child, term_grace: Duration) {
     signal_process_group(pid, libc::SIGTERM);
 
-    // Bounded reap so a well-behaved child can exit on its own; the deadline
-    // stops a wedged child from extending the budget indefinitely.
-    let reaped = matches!(
-        tokio::time::timeout(Duration::from_millis(TERM_GRACE_MS), child.wait()).await,
-        Ok(Ok(_))
-    );
+    // The members are snapshotted once and the snapshot is what the grace
+    // period waits on. On the clean-exit path the leader is already reaped, so
+    // `child.wait()` alone cannot measure whether the rest of the group is
+    // gone, and re-reading `/proc` on every poll would rescan every process on
+    // the host.
+    let members = crate::agent::reap::process_group_members(pid.unwrap_or(0));
+    if !members.is_empty() {
+        warn!(
+            count = members.len(),
+            pids = ?members,
+            "Step left processes running in its process group; terminating them"
+        );
+    }
+    await_group_gone(&members, child, term_grace).await;
 
     // Reaping the leader does not imply its children stopped: a shell can
     // terminate on SIGTERM while a child ignores it. Kill remaining members
-    // before returning from the timeout path.
+    // before returning.
     signal_process_group(pid, libc::SIGKILL);
-    if !reaped {
-        let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), child.wait()).await;
+}
+
+/// Wait until `child` is reaped *and* every pid in `members` is gone, or until
+/// `grace` elapses.
+///
+/// Both conditions are required: a reaped leader says nothing about the rest of
+/// its group, and a live member says nothing about whether the leader was ever
+/// waited on.
+async fn await_group_gone(members: &[u32], child: &mut Child, grace: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    while tokio::time::Instant::now() < deadline {
+        let reaped = matches!(child.try_wait(), Ok(Some(_)));
+        if reaped && members.iter().all(|pid| !crate::agent::reap::pid_is_alive(*pid)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(GROUP_POLL_MS)).await;
     }
+    false
 }
 
 /// Send `sig` to the process group led by `pid`.
@@ -1262,7 +1313,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let started = std::time::Instant::now();
-        terminate_process_group(Some(pid), &mut child).await;
+        terminate_process_group(Some(pid), &mut child, TERM_GRACE).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -1294,7 +1345,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let started = std::time::Instant::now();
-        terminate_process_group(child.id(), &mut child).await;
+        terminate_process_group(child.id(), &mut child, TERM_GRACE).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -1316,7 +1367,7 @@ mod tests {
         let _ = child.wait().await;
 
         let started = std::time::Instant::now();
-        terminate_process_group(pid, &mut child).await;
+        terminate_process_group(pid, &mut child, TERM_GRACE).await;
         assert!(
             started.elapsed() < Duration::from_millis(TERM_GRACE_MS),
             "signalling a dead group must return promptly, took {:?}",

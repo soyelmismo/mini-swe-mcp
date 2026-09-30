@@ -751,8 +751,45 @@ impl WorktreeGuard {
     }
 }
 
+impl WorktreeGuard {
+    /// The worker id this guard belongs to, recovered from the worktree
+    /// directory name (`swe-wt-<id>`): the sweep logs it, and the id is not
+    /// stored on the guard.
+    fn worker_id(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("swe-wt-"))
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    /// Every directory this worker's commands may run in: the worktree, its
+    /// private scratch dir, its target dirs and the build dir it leased.
+    ///
+    /// This list is the whole definition of "belongs to this worker" for the
+    /// sweep in [`crate::agent::reap`], and it deliberately names no other
+    /// worker's directories, so a sweep can never take down a live sibling.
+    fn worker_process_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = crate::agent::reap::worker_dirs(&self.path);
+        if let Some(build_dir) = self.leased_build_dir() {
+            dirs.push(build_dir.to_path_buf());
+        }
+        dirs
+    }
+}
+
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        // A job the worker detached from every process group (`setsid cmd &`, a
+        // double fork) is reparented to init and outlives its step, so the only
+        // thing that still ties it to this worker is its working directory.
+        // This runs before anything is deleted: the directories are what the
+        // sweep matches on, and a live process may still be writing into the
+        // tree that is about to be salvaged.
+        let dirs = self.worker_process_dirs();
+        crate::agent::reap::sweep_worker_processes(&self.worker_id(), &dirs);
+
         let pid_file = pid_file_for(&self.path);
 
         // Sync report/audit artifacts to repo root before cleanup. This is the

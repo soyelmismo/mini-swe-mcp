@@ -426,6 +426,16 @@ fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEnt
         // does, so the two must agree on where the worktree was.
         let base = crate::worktree::swe_base_dir();
         let checkout = base.join(format!("swe-wt-{}", entry.id));
+        // The orphan's commands may have detached themselves from every process
+        // group (`setsid cmd &`, a double fork), so nothing but their working
+        // directory still ties them to the worker that is gone. The sweep runs
+        // before the salvage: the worktree must still exist to be matched on,
+        // and a live process may still be writing into the tree that is about
+        // to be committed.
+        crate::agent::reap::sweep_worker_processes(
+            &entry.id,
+            &crate::agent::reap::worker_dirs(&checkout),
+        );
         let salvaged =
             !checkout.is_dir() || crate::worktree::prune::salvage_dirty_worktree(&checkout);
         if salvaged && checkout.is_dir() {
