@@ -57,6 +57,11 @@ fn test_cli_help_flag() {
         assert!(stdout.contains("wait <worker_id>"), "help missing wait: {stdout}");
         assert!(stdout.contains("[--wait]"), "help missing steer --wait: {stdout}");
         assert!(stdout.contains("[--timeout <secs>]"), "help missing --timeout: {stdout}");
+        // The orchestrator guidelines live where every orchestrator reads them.
+        assert!(stdout.contains("Workflow:"), "help missing the workflow section: {stdout}");
+        assert!(stdout.contains("ONE focused concern"), "help missing the task guidance: {stdout}");
+        assert!(stdout.contains("mini-swe-mcp watch"), "help must name watch: {stdout}");
+        assert!(stdout.contains("watch [<worker_id>...]"), "help missing the watch usage: {stdout}");
     }
 }
 

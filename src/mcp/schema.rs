@@ -65,13 +65,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). For unattended tracking, poll 'status' or pass wait:true; avoid short-interval busy-waiting. A worker belongs to the agent that dispatched it: 'steer', 'kill', 'collect' and 'wait' only act on your own workers, while 'status' and 'logs' read any worker's.",
+            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). Use mini-swe-mcp watch for unattended events instead of polling status. A worker belongs to the agent that dispatched it: 'steer', 'kill', 'collect' and 'wait' only act on your own workers, while 'status' and 'logs' read any worker's.",
         ),
     ),
     (
         "task",
         "string",
-        DescriptionSource::Static("Task description or bug to fix. Required for 'dispatch'."),
+        DescriptionSource::Static("ONE focused concern, naming the files in scope and the acceptance gate. Avoid parallel workers with overlapping files. Required for 'dispatch'."),
     ),
     (
         "repo_path",
@@ -107,7 +107,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget."
+            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget."
         ),
     ),
     (
@@ -252,7 +252,7 @@ pub(super) fn build_tools_list(manifest: &ModelManifest) -> Value {
         "tools": [
             {
                 "name": "worker",
-                "description": WORKER_TOOL_DESCRIPTION,
+                "description": format!("{} {}", WORKER_TOOL_DESCRIPTION, crate::cli::watch::WORKFLOW),
                 "inputSchema": {
                     "type": "object",
                     "properties": Value::Object(properties),

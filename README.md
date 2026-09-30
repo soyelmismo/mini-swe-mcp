@@ -201,10 +201,38 @@ reads the registry directly, needs no API key, and always exits successfully.
 `mini-swe-mcp monitor` keeps its one-second registry refresh; `--once` prints a
 single dashboard without connecting to or starting the hub.
 
-#### 3. Steer a Running or Paused Subagent
+#### 3. Watch for the Next Actionable Event
 ```bash
+# Block until the next actionable event of your workers, then exit
+mini-swe-mcp watch --timeout 300
+mini-swe-mcp watch <worker_id> --follow --json
+```
+
+`watch` is the orchestrator's single blocking command: it prints one
+self-contained event (completed, failed, needs_input or stalled) with everything
+needed to decide — review+merge, steer, answer or kill — and the exact next
+command to run. Without `--follow` it prints that one event and exits; with
+`--follow` it streams one event per line until no watched worker remains.
+`--timeout <secs>` exits 2 with a short "no event" line, and an empty watch set
+exits 3. Events that happened while you were not watching are replayed once,
+under a `While you were not watching:` heading, and only for your own workers.
+
+Full usage:
+```bash
+mini-swe-mcp watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]
+```
+
+#### 4. Steer a Running or Paused Subagent
+```bash
+
 mini-swe-mcp steer <worker_id> "Focus on unit tests first, skip integration tests for now."
 ```
+
+A steer on a finished (completed/failed) worker starts a revision: it resumes on
+its preserved `worker-<id>` branch with its full conversation plus your message,
+on a fresh turn budget (`--max-turns <n>`, default 60). Send every correction
+and any merge conflict back to the same worker instead of editing its branch
+yourself; merge only when it is right.
 
 `steer` works from **any terminal, including one that did not dispatch the
 worker**. A worker running in another `mini-swe-mcp` process is steered through
@@ -226,13 +254,13 @@ mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
 mini-swe-mcp steer <worker_id> "Skip the integration tests for now."
 ```
 
-#### 4. Collect Diff & Logs
+#### 5. Collect Diff & Logs
 ```bash
 # Collect diff and execution summary (automatically removes the worker record)
 mini-swe-mcp collect <worker_id>
 ```
 
-#### 5. Inspect a Worker's Step Logs
+#### 6. Inspect a Worker's Step Logs
 ```bash
 # Read a live worker's retained (bounded) step history without collecting it
 mini-swe-mcp logs <worker_id>
@@ -242,7 +270,7 @@ The response always carries `total_steps`, `logs_retained`, `logs_omitted` and
 `logs_dropped`, plus a `logs_truncation_notice` whenever part of the history is
 missing — see [Step-Log Retention](#step-log-retention).
 
-#### 6. Kill a Worker
+#### 7. Kill a Worker
 ```bash
 mini-swe-mcp kill <worker_id>
 ```
@@ -250,13 +278,13 @@ mini-swe-mcp kill <worker_id>
 Uncommitted work is committed onto the worker's branch before the task is
 aborted, so a kill costs at most the work since the last checkpoint.
 
-#### 7. Reap Expired Worker Records
+#### 8. Reap Expired Worker Records
 ```bash
 # Evict terminal worker records whose TTL expired (also runs in the background)
 mini-swe-mcp reap
 ```
 
-#### 8. Prune Stale Worktrees
+#### 9. Prune Stale Worktrees
 ```bash
 # Clean up orphaned branches and stale temporary worktrees whose processes died
 mini-swe-mcp prune
@@ -266,7 +294,7 @@ Uncommitted changes in a dead worker's checkout are salvaged onto its
 `worker-<id>` branch before the checkout is removed, and a branch with commits
 missing from `HEAD` is preserved.
 
-#### 9. Inspect Model Manifest
+#### 10. Inspect Model Manifest
 ```bash
 mini-swe-mcp manifest
 ```
