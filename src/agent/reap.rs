@@ -181,9 +181,13 @@ fn process_group_of(pid: u32) -> Option<u32> {
 /// The real uid `/proc/<pid>/status` reports, when it can be read.
 fn uid_of(pid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next()?.parse().ok())
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    })
 }
 
 /// Whether `pid`'s working directory is inside one of `dirs`.
@@ -273,7 +277,8 @@ mod tests {
     /// A scratch directory under the same base the crate's worktrees use, so a
     /// test's paths are shaped like a real worker's.
     fn worker_dir(tag: &str) -> PathBuf {
-        let dir = crate::worktree::swe_base_dir().join(format!("swe-reap-{tag}-{}", std::process::id()));
+        let dir =
+            crate::worktree::swe_base_dir().join(format!("swe-reap-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
         dir
@@ -312,7 +317,8 @@ mod tests {
         let mut sleeper = detached_sleeper(&dir);
         await_process_in(&dir);
 
-        let killed = sweep_worker_processes("worker-test", &[dir.clone()]);
+        let dirs = [dir.clone()];
+        let killed = sweep_worker_processes("worker-test", &dirs);
 
         assert_eq!(killed, 1, "the detached sleeper must be signalled");
         // Reaped through `try_wait`, because a killed child of this test stays
@@ -333,7 +339,7 @@ mod tests {
             gone,
             "the sweep must leave no process behind in the worker's directories"
         );
-        assert!(processes_in_dirs(&[dir.clone()]).is_empty());
+        assert!(processes_in_dirs(&dirs).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -347,14 +353,18 @@ mod tests {
         let pid = sleeper.id();
         await_process_in(&outside);
 
-        let killed = sweep_worker_processes("worker-test", &[inside.clone()]);
+        let dirs = [inside.clone()];
+        let killed = sweep_worker_processes("worker-test", &dirs);
 
-        assert_eq!(killed, 0, "nothing outside the worker's directories may be killed");
+        assert_eq!(
+            killed, 0,
+            "nothing outside the worker's directories may be killed"
+        );
         assert!(
             pid_is_alive(pid),
             "a process outside the worker's directories must survive the sweep"
         );
-        let _ = signal_pid(pid, libc::SIGKILL);
+        signal_pid(pid, libc::SIGKILL);
         let _ = sleeper.wait();
         let _ = std::fs::remove_dir_all(&inside);
         let _ = std::fs::remove_dir_all(&outside);
@@ -394,11 +404,10 @@ mod tests {
         let pid = child.id();
         // A direct child shares this test's process group.
         assert!(
-            process_group_members(process_group_of(pid).expect("a process group"))
-                .contains(&pid),
+            process_group_members(process_group_of(pid).expect("a process group")).contains(&pid),
             "the child must be a member of its own process group"
         );
-        let _ = signal_pid(pid, libc::SIGKILL);
+        signal_pid(pid, libc::SIGKILL);
         let _ = child.wait();
     }
 }

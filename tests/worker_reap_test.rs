@@ -8,9 +8,9 @@
 //! step, the second survives the step and is taken down by the worker-end
 //! sweep, and nothing outside the worker's directories is ever signalled.
 
-use mini_swe_mcp::agent::reap::processes_in_dirs;
 use mini_swe_mcp::agent::AgentRunner;
-use mini_swe_mcp::worktree::{swe_base_dir, WorktreeGuard};
+use mini_swe_mcp::agent::reap::processes_in_dirs;
+use mini_swe_mcp::worktree::{WorktreeGuard, swe_base_dir};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,7 +48,10 @@ impl TestRepo {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("swe-reap-repo-{tag}-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "swe-reap-repo-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -120,9 +123,10 @@ async fn a_backgrounded_job_dies_with_its_step() {
 
     assert_eq!(code, Some(0), "{out:?}");
     assert!(out.contains("started"), "{out:?}");
+    let dirs = [dir.clone()];
     await_empty(&dir).await;
     assert!(
-        processes_in_dirs(&[dir.clone()]).is_empty(),
+        processes_in_dirs(&dirs).is_empty(),
         "a job backgrounded with `&` must not outlive the step that started it"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -136,24 +140,31 @@ async fn a_detached_job_survives_the_step_and_dies_at_worker_end() {
     let id = format!("reap-detached-{}", std::process::id());
     let worktree = {
         let guard = WorktreeGuard::new(repo.path(), &id).expect("worktree must be created");
+        // The settle is what makes the assertion deterministic: the step's
+        // teardown signals the group the instant the shell exits, and a
+        // `setsid` that has not run yet is still a member of that group.
+        // Waiting for the shell to settle guarantees the job really did
+        // escape, which is the case the worker-end sweep exists for.
         let (out, code) = runner()
-            .execute_bash(&guard.path, "(setsid sleep 300 &); echo started")
+            .execute_bash(&guard.path, "(setsid sleep 300 &); sleep 0.3; echo started")
             .await
             .expect("the step must run");
         assert_eq!(code, Some(0), "{out:?}");
         assert!(out.contains("started"), "{out:?}");
+        let worktree_dirs = [guard.path.clone()];
         await_process_in(&guard.path);
         assert!(
-            !processes_in_dirs(&[guard.path.clone()]).is_empty(),
+            !processes_in_dirs(&worktree_dirs).is_empty(),
             "a detached job must survive the step that started it"
         );
         guard.path.clone()
         // The guard drops here: worker end, on the completion path.
     };
 
+    let dirs = [worktree.clone()];
     await_empty(&worktree).await;
     assert!(
-        processes_in_dirs(&[worktree.clone()]).is_empty(),
+        processes_in_dirs(&dirs).is_empty(),
         "the worker-end sweep must take a detached job down"
     );
 }
@@ -177,8 +188,9 @@ async fn the_worker_end_sweep_never_signals_a_process_outside_the_workers_direct
         guard.path.clone()
     };
 
+    let dirs = [outside.clone()];
     assert!(
-        !processes_in_dirs(&[outside.clone()]).is_empty(),
+        !processes_in_dirs(&dirs).is_empty(),
         "a process outside the worker's directories must survive the worker-end sweep"
     );
     let _ = Command::new("kill")

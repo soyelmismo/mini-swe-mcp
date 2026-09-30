@@ -931,7 +931,11 @@ async fn await_group_gone(members: &[u32], child: &mut Child, grace: Duration) -
     let deadline = tokio::time::Instant::now() + grace;
     while tokio::time::Instant::now() < deadline {
         let reaped = matches!(child.try_wait(), Ok(Some(_)));
-        if reaped && members.iter().all(|pid| !crate::agent::reap::pid_is_alive(*pid)) {
+        if reaped
+            && members
+                .iter()
+                .all(|pid| !crate::agent::reap::pid_is_alive(*pid))
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(GROUP_POLL_MS)).await;
