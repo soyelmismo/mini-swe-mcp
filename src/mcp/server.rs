@@ -37,14 +37,41 @@ pub struct McpServer {
     pub(super) tools_list: Arc<Value>,
 }
 
+/// `clientInfo.name` the CLI sends in its `initialize` handshake.
+pub const CLI_CLIENT_NAME: &str = "mini-swe-cli";
+
+/// Owner identity shared by every CLI invocation, so a worker dispatched by one
+/// `mini-swe-mcp list` is still steerable from the next one.
+pub const CLI_AGENT: &str = "cli";
+
+/// Owner identity of the in-process stdio server (`MINI_SWE_NO_DAEMON=1`), which
+/// is its own only client.
+pub const LOCAL_AGENT: &str = "local";
+
+/// Owner identity of a hub connection that announced neither an agent id nor a
+/// client name, qualified by the connection so two such clients never share
+/// workers.
+pub const ANONYMOUS_AGENT_PREFIX: &str = "connection";
+
 /// Identity of one client connection serving MCP requests.
 ///
-/// Hello metadata is descriptive only; it does not grant ownership or authority.
+/// The hello metadata is descriptive except for `agent_id` and `admin`: the
+/// first names the agent that owns this connection's workers, the second is the
+/// human operator's override. Neither is authenticated — the hub accepts a
+/// connection only from the same uid, which is what makes the override safe to
+/// hand to a local client.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConnectionContext {
     /// Connection id, unique per process for log correlation.
     pub id: u64,
+    /// `MINI_SWE_AGENT_ID` from `hub/hello`, when the client sent one.
     pub agent_id: Option<String>,
+    /// `clientInfo.name` from `initialize`, when the client sent one.
+    pub client_name: Option<String>,
+    /// `admin: true` from `hub/hello`: the operator may act on any worker.
+    pub admin: bool,
+    /// This connection is the in-process stdio server, not a hub client.
+    pub local: bool,
     pub pid: Option<u32>,
     pub version: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
@@ -53,12 +80,57 @@ pub struct ConnectionContext {
 impl ConnectionContext {
     /// Context for the stdio transport, which serves exactly one connection.
     pub fn stdio() -> Self {
-        Self::hub_connection(0)
+        Self {
+            id: 0,
+            agent_id: None,
+            client_name: None,
+            admin: false,
+            local: true,
+            pid: None,
+            version: None,
+            cwd: None,
+        }
     }
 
     /// Context for the `id`-th accepted hub connection (1-based).
     pub fn hub_connection(id: u64) -> Self {
-        Self { id, agent_id: None, pid: None, version: None, cwd: None }
+        Self {
+            id,
+            agent_id: None,
+            client_name: None,
+            admin: false,
+            local: false,
+            pid: None,
+            version: None,
+            cwd: None,
+        }
+    }
+
+    /// The agent identity that owns the workers this connection dispatches
+    /// (H-3), in precedence order:
+    ///
+    /// 1. the `MINI_SWE_AGENT_ID` the client sent in `hub/hello`, so several
+    ///    connections of one orchestrator share their workers;
+    /// 2. `cli` for the CLI, whose identity is stable across invocations;
+    /// 3. `<clientInfo.name>#<connection id>`, which keeps two clients of the
+    ///    same host separate;
+    /// 4. `local` for the in-process stdio server, and `connection#<id>` for a
+    ///    hub client that announced nothing at all.
+    pub fn agent(&self) -> String {
+        if let Some(agent_id) = self.agent_id.as_deref().filter(|id| !id.is_empty()) {
+            return agent_id.to_string();
+        }
+        match self.client_name.as_deref().filter(|name| !name.is_empty()) {
+            Some(CLI_CLIENT_NAME) => CLI_AGENT.to_string(),
+            Some(name) => format!("{name}#{}", self.id),
+            None if self.local => LOCAL_AGENT.to_string(),
+            None => format!("{ANONYMOUS_AGENT_PREFIX}#{}", self.id),
+        }
+    }
+
+    /// Whether this connection may act on workers owned by other agents.
+    pub fn is_admin(&self) -> bool {
+        self.admin
     }
 }
 
@@ -166,6 +238,7 @@ impl McpServer {
                 if req.method == "hub/hello" {
                     let params = req.params.unwrap_or_default();
                     ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                    ctx.admin = params["admin"].as_bool().unwrap_or(false);
                     ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
                     ctx.version = params["version"].as_str().map(str::to_owned);
                     ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
@@ -173,6 +246,16 @@ impl McpServer {
                 }
                 trace!(method = %req.method, "Received notification");
                 continue;
+            }
+            // The handshake's `clientInfo.name` is the connection's agent
+            // identity, so it is read in wire order here too: a request sent
+            // after `initialize` must already see the name (H-3).
+            if req.method == "initialize" {
+                ctx.client_name = req
+                    .params
+                    .as_ref()
+                    .and_then(|params| params["clientInfo"]["name"].as_str())
+                    .map(str::to_owned);
             }
             let server = self.clone();
             let tx = out_tx.clone();
@@ -268,6 +351,20 @@ impl McpServer {
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<Value> {
         self.execute_tool_with_progress(name, args, None, None)
             .await
+    }
+
+    /// Execute a tool call on behalf of the connection `ctx` describes.
+    ///
+    /// Ownership (H-3) is decided from this context, so every caller other
+    /// than the stdio transport — the CLI through the hub, a second
+    /// orchestrator — reaches the verb table through here.
+    pub async fn execute_tool_for(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &ConnectionContext,
+    ) -> Result<Value> {
+        self.execute_tool_in_context(name, args, None, None, ctx).await
     }
 
     /// Execute a tool call, optionally streaming `notifications/progress`.
@@ -424,6 +521,7 @@ impl McpServer {
                     });
                     let mut result = json!({
                         "worker_id": wid,
+                        "owner": self.owner_of(wid).await,
                         "state": state,
                         "next_step": next_step,
                     });
@@ -445,6 +543,7 @@ impl McpServer {
                     .await;
                     return Ok(json!({
                         "worker_id": wid,
+                        "owner": self.owner_of(wid).await,
                         "status": "needs_input",
                         "question": question,
                         "step": step,
@@ -465,6 +564,7 @@ impl McpServer {
                 .await;
                 return Ok(json!({
                     "worker_id": wid,
+                    "owner": self.owner_of(wid).await,
                     "status": "still_running",
                     "step": step,
                     "last_command": progress.last_command,
@@ -611,6 +711,59 @@ mod tests {
                 "'{action}' is advertised in the schema but not dispatched: {unknown:?}"
             );
         }
+    }
+
+    /// A `hub/hello` agent id wins: it is how several connections of one
+    /// orchestrator end up sharing their workers.
+    #[test]
+    fn a_hello_agent_id_is_the_connection_identity() {
+        let mut ctx = ConnectionContext::hub_connection(3);
+        ctx.client_name = Some(CLI_CLIENT_NAME.to_string());
+        ctx.agent_id = Some("orchestrator-7".to_string());
+        assert_eq!(ctx.agent(), "orchestrator-7");
+    }
+
+    /// The CLI identity is stable across invocations, which is what lets
+    /// `mini-swe-mcp list` see the worker an earlier `dispatch` started.
+    #[test]
+    fn every_cli_connection_shares_the_cli_identity() {
+        let mut first = ConnectionContext::hub_connection(1);
+        first.client_name = Some(CLI_CLIENT_NAME.to_string());
+        let mut second = ConnectionContext::hub_connection(99);
+        second.client_name = Some(CLI_CLIENT_NAME.to_string());
+        assert_eq!(first.agent(), CLI_AGENT);
+        assert_eq!(second.agent(), CLI_AGENT);
+    }
+
+    /// Any other client is qualified by its connection id, so two orchestrators
+    /// of the same host never share workers by accident.
+    #[test]
+    fn another_client_is_scoped_to_its_connection() {
+        let mut ctx = ConnectionContext::hub_connection(12);
+        ctx.client_name = Some("claude-code".to_string());
+        assert_eq!(ctx.agent(), "claude-code#12");
+    }
+
+    /// The in-process stdio server is its own only client; a hub connection that
+    /// announced nothing falls back to its connection id.
+    #[test]
+    fn an_unannounced_connection_falls_back_to_its_transport() {
+        assert_eq!(ConnectionContext::stdio().agent(), LOCAL_AGENT);
+        assert_eq!(
+            ConnectionContext::hub_connection(4).agent(),
+            format!("{ANONYMOUS_AGENT_PREFIX}#4")
+        );
+    }
+
+    /// Admin is opt-in per connection: only an explicit `admin: true` in the
+    /// hello lifts the ownership check.
+    #[test]
+    fn admin_is_opt_in() {
+        assert!(!ConnectionContext::stdio().is_admin());
+        let mut ctx = ConnectionContext::hub_connection(1);
+        assert!(!ctx.is_admin());
+        ctx.admin = true;
+        assert!(ctx.is_admin());
     }
 
     /// The payload is immutable, hence built once and only cloned afterwards.

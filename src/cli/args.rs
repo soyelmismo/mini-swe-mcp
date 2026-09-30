@@ -59,7 +59,14 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
                 }
             }
         }
-        "manifest" | "list" | "reap" | "prune" => {}
+        "list" => {
+            // `--all` is the operator's view of the whole pool; without it the
+            // CLI sees only the workers the `cli` identity owns.
+            if flag_index(cli_args, &["--all"]).is_some() {
+                tool_args.insert("scope".into(), Value::String("all".into()));
+            }
+        }
+        "manifest" | "reap" | "prune" => {}
         _ => {
             let actions = crate::cli::available_actions();
             let msg = if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {
@@ -176,6 +183,21 @@ pub fn strip_json_flag(raw_args: Vec<String>) -> Vec<String> {
     raw_args.into_iter().filter(|arg| arg != "--json").collect()
 }
 
+/// True when the operator passed `--admin`.
+///
+/// The flag is the human operator's override: it is sent as `admin: true` in
+/// the hub handshake, which lifts the per-agent ownership check for that one
+/// connection (H-3).
+pub fn admin_requested(raw_args: &[String]) -> bool {
+    raw_args.iter().any(|arg| arg == "--admin")
+}
+
+/// argv with the `--admin` selector removed, for the same reason as
+/// [`strip_json_flag`]: it is a flag, never a positional argument.
+pub fn strip_admin_flag(raw_args: Vec<String>) -> Vec<String> {
+    raw_args.into_iter().filter(|arg| arg != "--admin").collect()
+}
+
 /// True when the binary should serve MCP over stdio rather than run an action.
 pub fn stdio_requested(cli_args: &[String]) -> bool {
     cli_args.iter().any(|arg| arg == "--stdio")
@@ -216,6 +238,35 @@ mod tests {
         assert_eq!(action_of(&args(&["mini-swe-mcp", "list"])), Some("list"));
         assert_eq!(action_of(&args(&["mini-swe-mcp", "--stdio"])), None);
         assert_eq!(action_of(&args(&["mini-swe-mcp"])), None);
+    }
+
+    /// `--admin` is a connection flag, not a positional: it must be stripped
+    /// before `status <id>` reads its worker id.
+    #[test]
+    fn test_admin_flag_is_detected_and_stripped() {
+        let raw = args(&["mini-swe-mcp", "--admin", "status", "w1"]);
+        assert!(admin_requested(&raw));
+        let stripped = strip_admin_flag(raw);
+        assert_eq!(stripped, args(&["mini-swe-mcp", "status", "w1"]));
+        assert!(!admin_requested(&stripped));
+
+        let plain = args(&["mini-swe-mcp", "status", "w1"]);
+        assert!(!admin_requested(&plain));
+    }
+
+    /// `list --all` is the CLI spelling of the tool's `scope` property.
+    #[test]
+    fn test_list_all_flag_maps_to_the_scope_property() {
+        let scoped = tool_args("list", &args(&["mini-swe-mcp", "list", "--all"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scoped["action"], "list");
+        assert_eq!(scoped["scope"], "all");
+
+        let mine = tool_args("list", &args(&["mini-swe-mcp", "list"]), true)
+            .unwrap()
+            .unwrap();
+        assert!(!mine.contains_key("scope"), "{mine:?}");
     }
 
     #[test]

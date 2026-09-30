@@ -170,6 +170,9 @@ pub struct WorkerRecord {
     pub id: String,
     pub task: String,
     pub model: String,
+    /// Agent identity that dispatched this worker, and the only identity
+    /// allowed to steer, kill, collect or wait on it (H-3).
+    pub owner: String,
     pub state: WorkerState,
     /// Cache of the phase loop's [`WorkerMetrics`], refreshed on every state
     /// write, so a kill, a crash or a server shutdown can report what the run
@@ -250,12 +253,25 @@ pub struct WorkerProgress {
     pub question: Option<String>,
 }
 
+/// Who a worker belongs to, as the pool and the registry record it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerOwner {
+    /// The agent identity that dispatched it.
+    Agent(String),
+    /// A row written before ownership was tracked: readable by anyone, but
+    /// mutable by nobody short of an admin connection.
+    Unattributed,
+}
+
 /// Result of a one-shot worker collection, detached from the live pool.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectedWorker {
     pub id: String,
     pub task: String,
     pub model: String,
+    /// The agent that owned the worker, carried through so a collected
+    /// payload names whose worker it was.
+    pub owner: String,
     pub state: WorkerState,
     /// The retained window, moved out of the pool (not a copy).
     pub logs: Vec<AgentStepLog>,
@@ -395,6 +411,7 @@ mod tests {
             id: "w".into(),
             task: "t".into(),
             model: "m".into(),
+            owner: "test-owner".into(),
             state,
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

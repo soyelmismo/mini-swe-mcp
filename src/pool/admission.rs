@@ -293,8 +293,16 @@ impl AdmissionController {
 
     /// Take a heavy slot, waiting FIFO while the host cannot take another
     /// build. The returned permit holds the slot until it is dropped.
+    ///
+    /// Cancellation-safe: a request dropped while queued (its worker killed,
+    /// its step timed out) leaves the queue, so it can never hold the head of
+    /// the line for every later request.
     pub async fn acquire(&self) -> HeavyPermit {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let ticket = QueueTicket {
+            controller: self,
+            id,
+        };
         loop {
             let sample = self.sample();
             // One critical section decides *and* reserves, so two waiters
@@ -331,6 +339,8 @@ impl AdmissionController {
             };
             match outcome {
                 Some(Ok(jobs)) => {
+                    // Granted: the ticket already left the queue.
+                    std::mem::forget(ticket);
                     // The slot this request took may be the one the next
                     // queued request was waiting for.
                     self.inner.wake.notify_waiters();
@@ -398,6 +408,25 @@ impl AdmissionController {
         };
         host.sampled = Some((Instant::now(), fresh));
         fresh
+    }
+}
+
+/// A queued request's place in line, released if the request is dropped.
+struct QueueTicket<'a> {
+    controller: &'a AdmissionController,
+    id: u64,
+}
+
+impl Drop for QueueTicket<'_> {
+    fn drop(&mut self) {
+        let mut gate = self.controller.lock_gate();
+        let was_head = gate.queue.front() == Some(&self.id);
+        gate.queue.retain(|queued| *queued != self.id);
+        drop(gate);
+        if was_head {
+            // The next request in line may be admissible right now.
+            self.controller.inner.wake.notify_waiters();
+        }
     }
 }
 

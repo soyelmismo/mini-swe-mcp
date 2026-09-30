@@ -35,7 +35,6 @@ use super::state::WorkerState;
 use super::steer::remove_steer_file;
 use super::revision::{WorkerHistory, save_worker_history};
 use super::{WorkerPool, unix_timestamp};
-use self::turn::commit_all_preserving;
 use self::review::ReviewPhase;
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
@@ -248,6 +247,7 @@ impl WorkerPool {
                 .get(&worker_id)
                 .map(|w| w.revision)
                 .unwrap_or(0),
+            owner: Some(meta.owner.clone()),
             messages,
         };
         if let Err(e) = save_worker_history(&worker_id, &history) {
@@ -527,7 +527,7 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
             commit_subject.to_string()
         };
         let commit_msg = format!("worker({branch}): {clean_subject}");
-        commit_all_preserving(&path, &repo_root, &branch, &base_commit, &commit_msg)?
+        WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &commit_msg)?
     };
     Ok((artifacts, diff, summary, committed, unix_timestamp()))
 }

@@ -430,15 +430,34 @@ impl WorktreeGuard {
     /// Commit all dirty changes in the worktree to preserve work in git history,
     /// marking the branch to be retained upon worktree cleanup.
     pub fn commit_changes(&mut self, message: &str) -> Result<Option<String>> {
-        if Self::commit_all(&self.path, message)? {
+        let committed = Self::commit_changes_at(
+            &self.path,
+            &self.repo_root,
+            &self.branch,
+            &self.base_commit,
+            message,
+        )?;
+        if committed.is_some() {
             self.preserve_branch = true;
-            return Ok(Some(self.branch.clone()));
         }
-        // Even if the working tree is clean, check if the branch already
-        // has commits beyond base_commit.
-        if self.branch_has_commits() {
-            self.preserve_branch = true;
-            return Ok(Some(self.branch.clone()));
+        Ok(committed)
+    }
+
+    /// Shared core of [`WorktreeGuard::commit_changes`] on owned paths, so it
+    /// can run off the runtime thread: commit the checkout at `path` when it is
+    /// dirty, and name `branch` when it carries work (new or already
+    /// committed beyond `base_commit`). The caller marks the branch preserved.
+    pub fn commit_changes_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        message: &str,
+    ) -> Result<Option<String>> {
+        if Self::commit_all(path, message)?
+            || Self::branch_has_commits_at(repo_root, base_commit, branch)
+        {
+            return Ok(Some(branch.to_string()));
         }
         Ok(None)
     }
@@ -448,17 +467,17 @@ impl WorktreeGuard {
     /// Shared by [`WorktreeGuard::commit_changes`] and [`Drop`]: a branch with
     /// committed work is never deleted, whatever else cleanup decides.
     fn branch_has_commits(&self) -> bool {
-        if self.base_commit.is_empty() {
+        Self::branch_has_commits_at(&self.repo_root, &self.base_commit, &self.branch)
+    }
+
+    fn branch_has_commits_at(repo_root: &Path, base_commit: &str, branch: &str) -> bool {
+        if base_commit.is_empty() {
             return false;
         }
         git(
-            &self.repo_root,
+            repo_root,
             "rev-list",
-            &[
-                "rev-list",
-                "--count",
-                &format!("{}..{}", self.base_commit, self.branch),
-            ],
+            &["rev-list", "--count", &format!("{base_commit}..{branch}")],
         )
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)

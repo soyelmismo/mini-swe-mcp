@@ -1043,6 +1043,7 @@ mod tests {
                 updated_at: self.updated_at,
                 group: self.group.map(str::to_string),
                 repo_path: self.repo.map(str::to_string),
+                owner: None,
                 metrics: self.metrics,
             }
         }

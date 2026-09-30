@@ -146,7 +146,8 @@ impl AgentRunner {
     /// hard error.
     pub async fn run_step_llm(&self, messages: &[ChatMessage]) -> Result<LlmResponse> {
         let tools = bash_tool();
-        let payload = self.chat_request(messages, &tools);
+        let messages = super::types::with_replayed_reasoning(messages);
+        let payload = self.chat_request(&messages, &tools);
 
         let mut attempts = 0;
         let accumulator = loop {

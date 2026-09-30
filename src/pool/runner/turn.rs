@@ -72,43 +72,6 @@ fn extension_budget(dispatch_max_turns: usize) -> usize {
     (dispatch_max_turns / 2).min(MAX_TURNS_LIMIT)
 }
 
-/// Commit `path` like [`WorktreeGuard::commit_changes`], off the runtime
-/// thread: stage everything, commit when dirty, and still report the branch
-/// when it already carries commits beyond `base_commit`.
-pub(super) fn commit_all_preserving(
-    path: &Path,
-    repo_root: &Path,
-    branch: &str,
-    base_commit: &str,
-    message: &str,
-) -> anyhow::Result<Option<String>> {
-    if WorktreeGuard::commit_all(path, message)? {
-        return Ok(Some(branch.to_string()));
-    }
-    if !base_commit.is_empty()
-        && crate::worktree::git(
-            repo_root,
-            "rev-list",
-            &[
-                "rev-list",
-                "--count",
-                &format!("{base_commit}..{branch}"),
-            ],
-        )
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .unwrap_or(0)
-                > 0
-        })
-        .unwrap_or(false)
-    {
-        return Ok(Some(branch.to_string()));
-    }
-    Ok(None)
-}
-
 /// Fingerprint of the worktree's uncommitted work: the HEAD id plus
 /// `git diff --stat HEAD`, so a commit alone counts as progress.
 ///
@@ -772,7 +735,7 @@ impl<'a> TurnEngine<'a> {
         let branch = self.worktree.branch.clone();
         let base_commit = self.worktree.base_commit.clone();
         let committed = tokio::task::spawn_blocking(move || {
-            commit_all_preserving(&path, &repo_root, &branch, &base_commit, &message)
+            WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &message)
         })
         .await
         .unwrap_or(Ok(None));

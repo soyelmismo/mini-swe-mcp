@@ -4,7 +4,10 @@
 //! the library so it can be unit-tested directly.
 
 use anyhow::Result;
-use mini_swe_mcp::cli::args::{action_of, json_requested, stdio_requested, strip_json_flag, tool_args};
+use mini_swe_mcp::cli::args::{
+    action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag,
+    strip_json_flag, tool_args,
+};
 use mini_swe_mcp::cli::format::format_output;
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
@@ -37,7 +40,10 @@ async fn async_main() -> Result<()> {
     }
 
     let json_output = json_requested(&raw_args);
-    let cli_args = strip_json_flag(raw_args);
+    // `--admin` is a connection flag like `--json`: stripped before the
+    // positional parse, remembered as the operator's ownership override.
+    let admin = admin_requested(&raw_args);
+    let cli_args = strip_admin_flag(strip_json_flag(raw_args));
 
     // The dashboards read only the on-disk registry, so they run before any
     // configuration is resolved and work without an API key in any flag order.
@@ -60,7 +66,7 @@ async fn async_main() -> Result<()> {
         && action != "daemon"
         && env::var("MINI_SWE_NO_DAEMON").ok().as_deref() != Some("1")
     {
-        return run_remote_action(action, &cli_args, json_output).await;
+        return run_remote_action(action, &cli_args, json_output, admin).await;
     }
 
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
@@ -74,7 +80,7 @@ async fn async_main() -> Result<()> {
         if action == "daemon" {
             return run_daemon_cmd(&server).await;
         }
-        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty()).await;
+        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty(), admin).await;
     }
 
     run_local_stdio().await
@@ -106,12 +112,21 @@ async fn run_local_stdio() -> Result<()> {
 
 /// Route one CLI action through the hub daemon: initialize, hello and one
 /// `tools/call` whose payload and plain-text rendering match the local path.
-async fn run_remote_action(action: &str, cli_args: &[String], json_output: bool) -> Result<()> {
+///
+/// `admin` is the operator's `--admin`: the handshake then lifts the per-agent
+/// ownership check, so the CLI can steer, kill, collect and wait on a worker
+/// another agent dispatched.
+async fn run_remote_action(
+    action: &str,
+    cli_args: &[String],
+    json_output: bool,
+    admin: bool,
+) -> Result<()> {
     let api_key_present = !env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
         return Ok(());
     };
-    let mut client = mini_swe_mcp::hub::HubClient::connect().await?;
+    let mut client = mini_swe_mcp::hub::HubClient::connect_as_admin(admin).await?;
     let result = drive_worker_call(tool_args, async |args| client.worker(args).await).await?;
     print_result(action, &result, json_output)
 }
@@ -163,19 +178,30 @@ async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
 }
 
 /// Execute one CLI-selected action in this process and print the result.
+///
+/// `admin` is the operator's `--admin`: the in-process connection owns every
+/// worker it dispatches, but the override is what lets it act on the rows a
+/// hub-mode agent left in the shared registry.
 async fn run_action(
     server: &McpServer,
     action: &str,
     cli_args: &[String],
     json_output: bool,
     api_key_present: bool,
+    admin: bool,
 ) -> Result<()> {
     // `None` means the verb was already answered (or exited) by `tool_args`.
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
         return Ok(());
     };
-    let result =
-        drive_worker_call(tool_args, async |args| server.execute_tool("worker", args).await).await?;
+    let ctx = mini_swe_mcp::mcp::ConnectionContext {
+        admin,
+        ..mini_swe_mcp::mcp::ConnectionContext::stdio()
+    };
+    let result = drive_worker_call(tool_args, async |args| {
+        server.execute_tool_for("worker", args, &ctx).await
+    })
+    .await?;
     print_result(action, &result, json_output)
 }
 
@@ -202,7 +228,7 @@ fn print_help() {
     println!("  reap");
     println!("  steer <worker_id> <message> [--wait] [--timeout <secs>]");
     println!("  wait <worker_id> [--timeout <secs>]");
-    println!("  list");
+    println!("  list [--all]");
     println!("  monitor [--once]");
     println!("  supervisor [--once]");
     println!("  kill <worker_id>");
@@ -210,9 +236,7 @@ fn print_help() {
     println!("  prune");
     println!("  daemon");
     println!("\nFlags:");
-    println!("      --json     Output in JSON format (default is formatted plain text)");
-    println!("  -h, --help     Print help");
-    println!("  -V, --version  Print version");
+    println!("{}", mini_swe_mcp::cli::HELP_FLAGS);
 }
 
 /// Concurrent subagents supported out of the box.
