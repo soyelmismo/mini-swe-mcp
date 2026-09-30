@@ -2035,9 +2035,9 @@ async fn an_agent_cannot_read_another_agents_worker() {
         json!({ "action": "collect", "worker_id": "h11-theirs" }),
         json!({ "action": "watch", "worker_id": "h11-theirs", "timeout_secs": 0 }),
     ] {
-        let action = arguments["action"].as_str().expect("action");
+        let action = arguments["action"].as_str().expect("action").to_string();
         let error = server
-            .execute_tool_for("worker", arguments, &agent_context("agent-a"))
+            .execute_tool_for("worker", arguments.clone(), &agent_context("agent-a"))
             .await
             .expect_err("another agent's worker must be refused");
         assert_eq!(
