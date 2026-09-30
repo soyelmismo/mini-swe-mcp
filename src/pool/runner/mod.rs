@@ -40,7 +40,7 @@ use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 
-mod history;
+pub(crate) mod history;
 mod pause;
 mod review;
 mod sentinels;

@@ -1092,6 +1092,10 @@ mod tests {
                 repo_path: self.repo.map(str::to_string),
                 owner: None,
                 metrics: self.metrics,
+                base_branch: None,
+                base_commit: None,
+                revision: 0,
+                auto_continues: 0,
             }
         }
     }
@@ -1113,6 +1117,10 @@ mod tests {
             repo_path: None,
             owner: None,
             metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            revision: 0,
+            auto_continues: 0,
         }
     }
 

@@ -793,6 +793,20 @@ impl WorkerPool {
         .filter(|s| !s.is_empty())
     }
 
+    /// Rebuild the conversation a request sends: compaction applied on top of
+    /// the append-only log.
+    ///
+    /// The log keeps every message as it was pushed, so the compacted view is
+    /// derived here rather than stored, and a continuation replays the same
+    /// shape the live loop sent.
+    pub fn compact_for_request(
+        messages: &[crate::agent::ChatMessage],
+    ) -> Vec<crate::agent::ChatMessage> {
+        let mut messages = messages.to_vec();
+        crate::pool::runner::history::compact_history(&mut messages);
+        messages
+    }
+
     /// Id of every registry row left `interrupted` by a hub crash.
     ///
     /// The daemon asks this at startup to decide what to continue: a row is

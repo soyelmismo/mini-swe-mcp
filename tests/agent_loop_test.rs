@@ -1201,6 +1201,8 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
     assert!(size(40) - size(24) < 16 * 1500, "older turns must add only compact stubs");
 
     // Persistence can lag the terminal state notification by a few milliseconds.
+    // The on-disk log is append-only, so it holds the *uncompacted* conversation:
+    // compaction is applied when the conversation is rebuilt for a request.
     let history = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(history) = mini_swe_mcp::pool::load_worker_history(&worker_id) {
@@ -1210,9 +1212,18 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
         }
     })
     .await
-    .expect("compacted history must be persisted");
+    .expect("the conversation log must be persisted");
+    let logged: Vec<_> = history
+        .messages
+        .iter()
+        .filter(|m| m.role() == mini_swe_mcp::agent::Role::Assistant)
+        .count();
+    assert_eq!(logged, 40, "every turn is appended, none compacted away");
+    // Rebuilding the conversation for a request compacts it back to the same
+    // shape the live loop sent.
+    let rebuilt = mini_swe_mcp::pool::compact_for_request(&history.messages);
     assert_eq!(
-        serde_json::to_value(history.messages).unwrap(),
+        serde_json::to_value(rebuilt).unwrap(),
         requests[40]["messages"]
     );
 }

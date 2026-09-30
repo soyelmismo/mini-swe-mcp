@@ -1065,6 +1065,10 @@ fn measured_entry() -> WorkerRegistryEntry {
         group: Some("g".into()),
         repo_path: Some("/tmp/repo".into()),
         owner: Some(TEST_OWNER.into()),
+        base_branch: Some("master".into()),
+        base_commit: Some("abc123".into()),
+        revision: 1,
+        auto_continues: 0,
         metrics: WorkerMetrics {
             turns_used: 142,
             extensions_granted: 4,
@@ -1185,6 +1189,7 @@ fn sample_history(repo_path: &std::path::Path, base_commit: &str, branch: &str) 
         max_turns: 10,
         review_after: None,
         revision: 0,
+        auto_continues: 0,
         owner: Some("test-owner".to_string()),
         messages: vec![
             ChatMessage::text(Role::System, "system prompt"),
@@ -1545,6 +1550,8 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         started_at: 0,
         pid: std::process::id(),
         metrics: WorkerMetrics::default(),
+        revision: 0,
+        auto_continues: 0,
     };
     let row_path =
         std::path::PathBuf::from(&dir).join("swe-registry").join("h5a-reg.json");

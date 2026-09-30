@@ -446,6 +446,41 @@ ask a subagent to) and the next dispatch picks it up.
 
 ---
 
+## Continuing a worker
+
+A worker that stopped for **any** reason -- `completed`, `failed`, `killed`, or
+`interrupted` by a hub crash -- is continued with `steer`, never replaced:
+
+```bash
+mini-swe-mcp steer <id> "the retry logic still drops the last page"
+```
+
+The worker keeps its id and its branch `worker-<id>`, so the orchestrator never
+dispatches a replacement. What `steer` does depends on what stopped it:
+
+| What stopped it | What `steer` does |
+| --- | --- |
+| `completed` | Revises the saved conversation with `REVISION REQUEST …` |
+| `failed` / `killed` / `interrupted` | Continues the saved conversation with `CONTINUE: your previous run stopped (…)` |
+| No saved conversation (legacy worker) | Cold continuation: same id and branch, a fresh conversation that names the work the branch already holds |
+
+Only a missing branch is an error (`branch worker-<id> no longer exists`).
+
+The conversation is durable: every message is appended as one line to
+`swe-wt-<id>.history.jsonl` as it is pushed, so a crash loses at most the
+in-flight turn and a torn last line is dropped on load. Compaction is applied
+when the conversation is rebuilt for a request; the on-disk log stays
+append-only.
+
+A hub crash is not a worker failure: at startup the daemon marks orphans
+`interrupted` (terminal for listing, continuable) and automatically continues
+every interrupted worker that has a history, at most 3 times per worker. Set
+`HUB_AUTO_RESUME=0` to leave them for the orchestrator.
+
+Transient failures -- an LLM outage, a network error, a stream stall, a 5xx
+during a revision -- never end a worker in `failed`: it pauses with a question
+instead, and `steer` resumes it.
+
 ## Verification & Testing
 
 Run the full automated test suite:

@@ -1586,6 +1586,10 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         repo_path: None,
         owner: Some(String::from("registry-owner")),
         metrics: WorkerMetrics::default(),
+        base_branch: None,
+        base_commit: None,
+        revision: 0,
+        auto_continues: 0,
     }
 }
 
