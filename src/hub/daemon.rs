@@ -35,6 +35,12 @@ pub struct HubPaths {
 }
 
 impl HubPaths {
+    /// Paths rooted at `dir` (test support; production uses [`hub_dir`]).
+    #[doc(hidden)]
+    pub fn for_test(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
     /// The hub directory itself.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -177,6 +183,7 @@ impl HubServer {
             .with_context(|| format!("Could not restrict {} to 0600", socket.display()))?;
 
         info!(socket = %socket.display(), idle_secs = self.config.idle_secs(), "Hub daemon listening");
+        append_log(&paths.log(), "listening");
 
         let reaper = crate::pool::spawn_reaper((*self.server.pool()).clone());
         let idle_watcher = self.clone();
@@ -226,6 +233,7 @@ impl HubServer {
             info!(workers = killed, "Terminated workers on hub shutdown");
         }
         let _ = std::fs::remove_file(&socket);
+        append_log(&paths.log(), "stopped");
         drop(lock);
         debug!("Hub daemon stopped");
         Ok(true)
@@ -283,6 +291,26 @@ impl HubServer {
                 debug!(connection = id, error = %e, "Hub connection ended");
             }
         });
+    }
+}
+
+/// Append one timestamped line to the hub log; failures are traced, never fatal.
+fn append_log(path: &Path, event: &str) {
+    use std::fmt::Write as _;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut line = String::new();
+    let _ = writeln!(line, "{now} pid={} {event}", std::process::id());
+    use std::io::Write as _;
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+    {
+        warn!(error = %e, path = %path.display(), "Could not append to hub log");
     }
 }
 

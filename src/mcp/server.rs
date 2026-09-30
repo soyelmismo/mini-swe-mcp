@@ -75,12 +75,21 @@ impl McpServer {
 
     /// Serve MCP over stdin/stdout until the client closes the input.
     pub async fn run_stdio(&self) -> Result<()> {
-        self.serve_connection(
-            BufReader::new(tokio::io::stdin()),
-            tokio::io::stdout(),
-            ConnectionContext::stdio(),
-        )
-        .await
+        // Background reaper: bounds the memory held by terminal worker records
+        // even when the orchestrator never calls `collect`. The hub daemon
+        // starts its own once for every connection it serves.
+        let reaper = crate::pool::spawn_reaper((*self.pool).clone());
+
+        info!("Mini-SWE-MCP server listening on stdio");
+        let served = self
+            .serve_connection(
+                BufReader::new(tokio::io::stdin()),
+                tokio::io::stdout(),
+                ConnectionContext::stdio(),
+            )
+            .await;
+        reaper.abort();
+        served
     }
 
     /// Serve one MCP connection over any byte transport.
@@ -100,15 +109,11 @@ impl McpServer {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        // Background reaper: bounds the memory held by terminal worker records
-        // even when the orchestrator never calls `collect`.
-        let reaper = crate::pool::spawn_reaper((*self.pool).clone());
-
         let mut reader = reader;
         let mut writer = writer;
         let mut input = Vec::new();
 
-        info!("Mini-SWE-MCP server listening on stdio");
+        info!(connection = ctx.id, "Serving MCP connection");
 
         let (out_tx, mut out_rx) = mpsc::channel::<String>(128);
 
@@ -174,7 +179,6 @@ impl McpServer {
         }
 
         drop(out_tx);
-        reaper.abort();
         events.abort();
         let _ = writer_task.await;
 
