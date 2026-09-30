@@ -116,16 +116,16 @@ pub enum Role {
 /// message with no `tool_call_id`, an `assistant` message with
 /// `tool_calls: Some(vec![])`) while keeping the per-field `skip_serializing_if`
 /// each role's wire shape needs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     role: Role,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
 }
 
@@ -204,6 +204,27 @@ impl ChatMessage {
     /// no caller can set an arbitrary one.
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Whether this message is a shape the provider accepts.
+    ///
+    /// The constructors above cannot build an invalid one, but a conversation
+    /// reloaded from disk ([`crate::pool::revision`]) is deserialized straight
+    /// into the fields, so the loader re-checks the two invariants that would
+    /// otherwise make the whole request fail: a `tool` turn must name the call
+    /// it answers, and an assistant turn must not advertise an empty call list.
+    pub(crate) fn is_wire_valid(&self) -> bool {
+        match self.role {
+            Role::Tool => self
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            Role::Assistant => match &self.tool_calls {
+                Some(calls) => !calls.is_empty(),
+                None => true,
+            },
+            Role::System | Role::User => true,
+        }
     }
 
     /// The message content, if any.
