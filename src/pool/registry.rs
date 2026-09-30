@@ -416,10 +416,11 @@ fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEnt
         {
             continue;
         }
-        let base = path
-            .parent()
-            .and_then(|dir| dir.parent())
-            .expect("registry base");
+        // The base dir the worker was created under, not the registry row's own
+        // grandparent: the registry may live anywhere, and the target/scratch
+        // cleanup below resolves through `swe_base_dir()` the same way teardown
+        // does, so the two must agree on where the worktree was.
+        let base = crate::worktree::swe_base_dir();
         let checkout = base.join(format!("swe-wt-{}", entry.id));
         let salvaged =
             !checkout.is_dir() || crate::worktree::prune::salvage_dirty_worktree(&checkout);
@@ -516,7 +517,7 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
 #[cfg(test)]
 mod recovery_cleanup_tests {
     use super::*;
-    use crate::worktree::pid_file_for;
+    use crate::worktree::{pid_file_for, swe_base_dir};
 
     /// A pid that is certainly dead: a child that has already exited, so
     /// `is_process_alive` reports it dead and the sweep treats the row as an
@@ -561,9 +562,10 @@ mod recovery_cleanup_tests {
     /// lease behind, and every hub restart would leak another pair.
     #[test]
     fn recovery_removes_the_orphans_target_dir_and_pid_file() {
-        let base = std::env::temp_dir().join(format!("h11-recovery-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&base).unwrap();
-        let id = "recovery-cleanup";
+        // The real base dir, because the sweep's cleanup resolves the target
+        // and scratch paths through `swe_base_dir()` exactly as teardown does.
+        let base = swe_base_dir();
+        let id = format!("recovery-{}", uuid::Uuid::new_v4().simple());
         let worktree = base.join(format!("swe-wt-{id}"));
         let target = base.join(format!("swe-target-swe-wt-{id}"));
         let scratch = base.join(format!("swe-tmp-swe-wt-{id}"));
@@ -571,10 +573,12 @@ mod recovery_cleanup_tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(&pid, serde_json::json!({"pid": 1}).to_string()).unwrap();
+        // A private registry file: the sweep is driven directly, so no other
+        // process's rows can be recovered by accident.
         let registry = base.join("swe-registry");
         std::fs::create_dir_all(&registry).unwrap();
         let path = registry.join(format!("{id}.json"));
-        let row = orphan_row(id);
+        let row = orphan_row(&id);
         std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
 
         let recovered = recover_entries([(path.clone(), row)]);
@@ -585,7 +589,5 @@ mod recovery_cleanup_tests {
         assert!(!target.exists(), "the orphan's target dir must be removed");
         assert!(!scratch.exists(), "the orphan's scratch dir must be removed");
         assert!(!pid.exists(), "the orphan's lease must be removed");
-
-        std::fs::remove_dir_all(base).unwrap();
     }
 }
