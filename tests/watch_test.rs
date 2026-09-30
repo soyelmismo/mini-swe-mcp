@@ -6,10 +6,34 @@ use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// Point this process's registry at a scratch directory.
+///
+/// The daemon under test runs *inside* the test process, so it reads the
+/// registry through this process's environment. Without this it would report
+/// whatever workers the host's real registry happens to hold, which is both
+/// flaky and a leak of unrelated state into the assertions.
+fn isolate_registry() -> PathBuf {
+    static REGISTRY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            // The directory must outlive the test that created it: the daemon
+            // keeps reading it for as long as the test binary runs.
+            let dir = common::TempDir::new_in_tmp("watch-registry");
+            let path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            // SAFETY: `OnceLock` runs this closure exactly once and blocks every
+            // other caller until it returns, so no thread observes a half-set
+            // environment.
+            unsafe { std::env::set_var("SWE_TEMP_DIR", &path) };
+            path
+        })
+        .clone()
+}
 
 fn paths(dir: &Path) -> HubPaths {
     use std::os::unix::fs::PermissionsExt;
@@ -87,7 +111,7 @@ async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
 
 #[tokio::test]
 async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner() {
-
+    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wg");
     let server = pool_with(vec![record("w-watch", "agent-a", WorkerState::Running {
         step: 1,
@@ -134,6 +158,7 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
 
 #[tokio::test]
 async fn completed_worker_is_reported_immediately_with_missed_marker() {
+    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wm");
     let server = pool_with(vec![record("w-done", "agent-a", WorkerState::Completed {
         turns: 2,
@@ -247,9 +272,9 @@ fn tool_description_carries_the_orchestrator_guidelines() {
 /// process, and a current-thread runtime would never let the daemon answer it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_watches_through_the_hub() {
+    isolate_registry();
     let hub = common::TempDir::new_in_tmp("watch-hub-cli");
     let swe = common::TempDir::new_in_tmp("watch-hub-swe");
-    std::fs::create_dir_all(swe.path().join("swe-registry")).expect("registry dir");
     let server = pool_with(vec![
         record("w-hub", "cli", WorkerState::Completed {
             turns: 3,

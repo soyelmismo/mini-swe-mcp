@@ -115,12 +115,20 @@ fn commands(v: &Value) -> Vec<String> {
 
 pub fn render(v: &Value) -> String {
     let text = |key: &str| v[key].as_str().unwrap_or("unknown");
+    // A registry row carries no branch, but every worker commits to its own
+    // `worker-<id>` branch, so name that instead of admitting we do not know.
+    let branch = v["branch"]
+        .as_str()
+        .map_or_else(|| format!("worker-{}", text("worker_id")), str::to_string);
     let mut out = if v["missed"] == true { "While you were not watching:\n".to_string() } else { String::new() };
     if let Some(dropped) = v["dropped_events"].as_u64().filter(|n| *n > 0) { out.push_str(&format!("{dropped} older events dropped (backlog limit 100).\n")); }
-    out.push_str(&format!("{}: {} | {} | owner {} | group {} | branch {} | revision {}\nStep {}/{} | elapsed {}s | {}\n", text("worker_id"), text("event"), text("model"), text("owner"), text("group"), text("branch"), v["revision"], v["step"], v["max_turns"], v["elapsed"], text("task")));
+    out.push_str(&format!("{}: {} | {} | owner {} | group {} | branch {} | revision {}\nStep {}/{} | elapsed {}s | {}\n", text("worker_id"), text("event"), text("model"), text("owner"), text("group"), branch, v["revision"], v["step"], v["max_turns"], v["elapsed"], text("task")));
     match text("event") {
         "completed" | "failed" => {
-            out.push_str(&format!("Verified: {} | Diff: {} files, +{} -{}\n", v["verified"], v["diff_stat"]["files"], v["diff_stat"]["insertions"], v["diff_stat"]["deletions"]));
+            // A registry-only row never ran the gate: stay silent rather than
+            // printing a null the orchestrator would have to interpret.
+            let verified = v["verified"].as_bool().map_or_else(String::new, |ok| format!("Verified: {ok} | "));
+            out.push_str(&format!("{verified}Diff: {} files, +{} -{}\n", v["diff_stat"]["files"], v["diff_stat"]["insertions"], v["diff_stat"]["deletions"]));
             for key in ["summary", "error", "verify_output_tail", "next_step"] { if let Some(value) = v[key].as_str() { out.push_str(&format!("{key}: {value}\n")); } }
         }
         "needs_input" => out.push_str(&format!("Question: {}\n", text("question"))),
@@ -281,5 +289,21 @@ mod tests {
         assert!(out.contains("mini-swe-mcp steer") && out.contains("git diff"), "{out}");
         let text = render(&select_event(&state("running", 2, repeated, 100, 10), Some(&state("running", 2, metrics, 100, 10)), 110).unwrap());
         assert!(text.contains("mini-swe-mcp kill"), "{text}");
+    }
+
+    #[test]
+    fn a_registry_only_row_names_the_branch_and_stays_silent_about_verification() {
+        let mut view = state("completed", 3, WorkerMetrics::default(), 100, 10);
+        view["branch"] = Value::Null;
+        view["verified"] = Value::Null;
+        let text = render(&select_event(&view, None, 110).expect("terminal row is actionable"));
+        assert!(text.contains("branch worker-w"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
+        assert!(!text.contains("Verified"), "{text}");
+        // A row that did run the gate still reports the outcome.
+        let mut verified = view.clone();
+        verified["verified"] = json!(false);
+        let text = render(&select_event(&verified, None, 110).expect("terminal row is actionable"));
+        assert!(text.contains("Verified: false"), "{text}");
     }
 }
