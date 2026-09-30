@@ -377,6 +377,14 @@ impl McpServer {
         let id = req.id_or_null().map(|v| v.to_owned());
         match req.method.as_str() {
             "ping" => JsonRpcResponse::ok(id, json!({})),
+            "hub/watch" | "hub/watch/ack" => {
+                match super::events::watch_request(&self.pool, &self.hub_events, &ctx,
+                    req.params.unwrap_or_default(), req.method == "hub/watch/ack").await {
+                    Ok(value) => JsonRpcResponse::ok(id, value),
+                    Err(error) => JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Owned(error.to_string())),
+                }
+            }
+
 
             // The handshake document lives in a `static`; it is cloned out of
             // it per request.

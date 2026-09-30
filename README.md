@@ -201,10 +201,38 @@ reads the registry directly, needs no API key, and always exits successfully.
 `mini-swe-mcp monitor` keeps its one-second registry refresh; `--once` prints a
 single dashboard without connecting to or starting the hub.
 
-#### 3. Steer a Running or Paused Subagent
+#### 3. Watch for the Next Actionable Event
 ```bash
+# Block until the next actionable event of your workers, then exit
+mini-swe-mcp watch --timeout 300
+mini-swe-mcp watch <worker_id> --follow --json
+```
+
+`watch` is the orchestrator's single blocking command: it prints one
+self-contained event (completed, failed, needs_input or stalled) with everything
+needed to decide — review+merge, steer, answer or kill — and the exact next
+command to run. Without `--follow` it prints that one event and exits; with
+`--follow` it streams one event per line until no watched worker remains.
+`--timeout <secs>` exits 2 with a short "no event" line, and an empty watch set
+exits 3. Events that happened while you were not watching are replayed once,
+under a `While you were not watching:` heading, and only for your own workers.
+
+Full usage:
+```bash
+mini-swe-mcp watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]
+```
+
+#### 4. Steer a Running or Paused Subagent
+```bash
+
 mini-swe-mcp steer <worker_id> "Focus on unit tests first, skip integration tests for now."
 ```
+
+A steer on a finished (completed/failed) worker starts a revision: it resumes on
+its preserved `worker-<id>` branch with its full conversation plus your message,
+on a fresh turn budget (`--max-turns <n>`, default 60). Send every correction
+and any merge conflict back to the same worker instead of editing its branch
+yourself; merge only when it is right.
 
 `steer` works from **any terminal, including one that did not dispatch the
 worker**. A worker running in another `mini-swe-mcp` process is steered through
@@ -226,13 +254,13 @@ mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
 mini-swe-mcp steer <worker_id> "Skip the integration tests for now."
 ```
 
-#### 4. Collect Diff & Logs
+#### 5. Collect Diff & Logs
 ```bash
 # Collect diff and execution summary (automatically removes the worker record)
 mini-swe-mcp collect <worker_id>
 ```
 
-#### 5. Inspect a Worker's Step Logs
+#### 6. Inspect a Worker's Step Logs
 ```bash
 # Read a live worker's retained (bounded) step history without collecting it
 mini-swe-mcp logs <worker_id>
@@ -242,7 +270,7 @@ The response always carries `total_steps`, `logs_retained`, `logs_omitted` and
 `logs_dropped`, plus a `logs_truncation_notice` whenever part of the history is
 missing — see [Step-Log Retention](#step-log-retention).
 
-#### 6. Kill a Worker
+#### 7. Kill a Worker
 ```bash
 mini-swe-mcp kill <worker_id>
 ```
@@ -250,13 +278,13 @@ mini-swe-mcp kill <worker_id>
 Uncommitted work is committed onto the worker's branch before the task is
 aborted, so a kill costs at most the work since the last checkpoint.
 
-#### 7. Reap Expired Worker Records
+#### 8. Reap Expired Worker Records
 ```bash
 # Evict terminal worker records whose TTL expired (also runs in the background)
 mini-swe-mcp reap
 ```
 
-#### 8. Prune Stale Worktrees
+#### 9. Prune Stale Worktrees
 ```bash
 # Clean up orphaned branches and stale temporary worktrees whose processes died
 mini-swe-mcp prune
@@ -266,7 +294,7 @@ Uncommitted changes in a dead worker's checkout are salvaged onto its
 `worker-<id>` branch before the checkout is removed, and a branch with commits
 missing from `HEAD` is preserved.
 
-#### 9. Inspect Model Manifest
+#### 10. Inspect Model Manifest
 ```bash
 mini-swe-mcp manifest
 ```
@@ -492,6 +520,56 @@ cargo test
 # Strict clippy linting over every target
 cargo clippy --all-targets -- -D warnings
 ```
+
+---
+
+## Load testing
+
+`tests/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub
+daemon out to many agents of many workers and asserts the hub keeps the machine
+busy without memory pressure. It is excluded from `cargo test` so the normal
+suite stays fast — run it explicitly:
+
+```bash
+# Quick smoke: 2 agents x 3 workers (the defaults), ~5 s.
+cargo test --test load_test -- --ignored --nocapture
+
+# Full load: 5 agents x 20 workers (100 total), ~75 s on 4 cores.
+LOAD_AGENTS=5 LOAD_WORKERS_PER_AGENT=20 \
+    cargo test --test load_test -- --ignored --nocapture
+```
+
+Every worker is driven by a fake OpenAI-compatible SSE server
+(`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a
+heavy command (`cargo build` plus a bounded CPU burn, classified heavy by
+`is_heavy_command` so the pool's admission controller has to dose it), then the
+completion sentinel. The test dispatches each worker over the hub socket with a
+distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the
+daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy
+commands in flight by watching the daemon's children, and records the order
+workers finish in. It then asserts — and prints a one-screen report of:
+
+- **all workers complete** — every dispatched worker reaches `completed`;
+- **bounded daemon RSS** — peak `VmHWM` stays under a generous 300 MB;
+- **dosed heavy commands** — the number in flight never exceeds
+  `BASH_BUILD_LIMIT`;
+- **fairness** — no agent finishes all of its workers before another agent has
+  completed any of its own.
+
+The shape is configurable through the environment: `LOAD_AGENTS`,
+`LOAD_WORKERS_PER_AGENT`, `LOAD_MAX_WORKERS` (`MAX_CONCURRENT_WORKERS`),
+`LOAD_MAX_HEAVY` (`BASH_BUILD_LIMIT`), `LOAD_HEAVY_SECS`, and `LOAD_TIMEOUT_SECS`.
+
+Measured on a 4-core host (all other settings at their defaults):
+
+| run         | wall  | peak daemon RSS (VmHWM) | peak heavy in flight | completed |
+| ----------- | ----- | ----------------------- | -------------------- | --------- |
+| smoke 2 x 3 | 4.7 s | 20.1 MB                 | 4 / 4                | 6 / 6     |
+| full 5 x 20 | 72 s  | 24.6 MB                 | 4 / 4                | 100 / 100 |
+
+In the full run the admission controller logged 108 heavy-command admission
+waits for the four build slots and the completion order interleaved all five
+agents, so the daemon stayed busy and bounded under 100 concurrent workers.
 
 ---
 

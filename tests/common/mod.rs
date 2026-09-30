@@ -20,6 +20,7 @@
 
 #![allow(dead_code)] // not every integration test opts into every helper
 
+pub mod fake_llm;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};

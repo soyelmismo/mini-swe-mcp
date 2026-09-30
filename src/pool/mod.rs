@@ -105,13 +105,12 @@ fn registry_row_live_elsewhere(id: &str) -> bool {
 /// Tells the orchestrator the review loop exists: the finished worker's branch
 /// is still there, and `steer` with corrections resumes it in place.
 pub fn next_step_for(branch: Option<&str>) -> String {
-    let on_branch = match branch {
-        Some(branch) => format!(" on branch {branch}"),
-        None => String::new(),
-    };
-    format!(
-        "Review the diff (collect) and run the project's checks. To correct this worker -- or to continue any worker that stopped (failed, interrupted, killed) -- call steer <id> \"...\" with the concrete corrections; it continues{on_branch} with its full context. Never dispatch a replacement for a stopped worker. Merge only when it is right."
-    )
+    match branch {
+        Some(branch) => format!(
+            "Review the diff (collect) and run the project's checks. To correct this worker -- or to continue any worker that stopped (failed, interrupted, killed) -- call steer <id> \"...\" with the concrete corrections; it continues on branch {branch} with its full context. Never dispatch a replacement for a stopped worker. Merge only when it is right."
+        ),
+        None => "Review the result and run the project's checks. To correct this worker -- or to continue any worker that stopped (failed, interrupted, killed) -- call steer <id> \"...\" with the concrete corrections; it continues with its full context. Never dispatch a replacement for a stopped worker. Merge only when it is right.".to_string(),
+    }
 }
 
 /// The branch a terminal [`WorkerState`] finished on, if it kept one.
