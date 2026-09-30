@@ -10,7 +10,9 @@ use super::{
     force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs, swe_base_dir,
 };
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
@@ -136,6 +138,11 @@ pub struct WorktreeGuard {
     pub repo_root: PathBuf,
     pub base_commit: String,
     pub preserve_branch: bool,
+    /// Fingerprint of every artifact file seeded into the worktree, keyed by
+    /// repository-relative path. A file still matching its entry was never
+    /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
+    /// repository root's copy alone.
+    seeded: BTreeMap<String, FileFingerprint>,
 }
 
 impl WorktreeGuard {
@@ -184,13 +191,15 @@ impl WorktreeGuard {
         // Seed unversioned directories so subagents can read them without git
         // tracking. Uses the same copy path (and skipped-directory guards) as
         // the sync back, so a `.git` or `node_modules` tree planted inside an
-        // artifact directory is never mirrored in either direction.
+        // artifact directory is never mirrored in either direction. The walk
+        // records what each seeded file contained, so the sync back can tell a
+        // file the worker edited from one it merely inherited.
+        let mut seeded = BTreeMap::new();
         for dir in ARTIFACT_DIRS {
             let src = repo_root.join(dir);
             if src.is_dir() {
                 let dst = path.join(dir);
-                let mut dummy = BTreeSet::new();
-                let _ = copy_dir_all(&src, &dst, &mut dummy, repo_root);
+                let _ = copy_dir_all(&src, &dst, &mut seeded, repo_root, None);
             }
         }
 
@@ -209,6 +218,7 @@ impl WorktreeGuard {
             repo_root: repo_root.to_path_buf(),
             base_commit,
             preserve_branch: false,
+            seeded,
         })
     }
 
@@ -245,24 +255,39 @@ impl WorktreeGuard {
     /// Sync report and audit directories (audits, reports, .agents, artifacts)
     /// from the worktree back into the repository root.
     ///
+    /// Only what the worker actually produced travels: a file the worker
+    /// created, or one whose content still differs from the copy seeded into
+    /// its worktree. A seeded file left untouched is *not* copied, so a repo
+    /// root that moved on while the worker ran (another worker's result merged,
+    /// the user edited the file) keeps its newer content instead of being
+    /// reverted to the stale copy the worker never looked at.
+    ///
     /// Returns the sorted, duplicate-free list of repository-relative files in
-    /// sync after the call. The copy is conservative: unchanged files are left
-    /// untouched, dependency caches and build output ([`SKIP_DIR_NAMES`]) are
-    /// never mirrored, and each file is published atomically so a concurrent
-    /// reader never observes a partially written artifact.
+    /// sync after the call, including the seeded-unchanged ones, so callers
+    /// keep counting every artifact the worktree holds. The copy is otherwise
+    /// conservative: unchanged files are left untouched, dependency caches and
+    /// build output ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is
+    /// published atomically so a concurrent reader never observes a partially
+    /// written artifact.
     ///
     /// Per-directory I/O errors are logged rather than propagated: both call
     /// sites discard the `Result` (`pool::runner` wants the artifact count,
     /// `Drop` is a best-effort safety net), so failing here would abort a
     /// worker's teardown over a single unreadable report.
     pub fn sync_artifacts(&self) -> Vec<String> {
-        let mut synced = BTreeSet::new();
+        let mut synced = BTreeMap::new();
 
         for dir in ARTIFACT_DIRS {
             let src_dir = self.path.join(dir);
             if src_dir.is_dir() {
                 let dest_dir = self.repo_root.join(dir);
-                if let Err(e) = copy_dir_all(&src_dir, &dest_dir, &mut synced, &self.path) {
+                if let Err(e) = copy_dir_all(
+                    &src_dir,
+                    &dest_dir,
+                    &mut synced,
+                    &self.path,
+                    Some(&self.seeded),
+                ) {
                     debug!(
                         dir = %dir,
                         path = %src_dir.display(),
@@ -273,7 +298,7 @@ impl WorktreeGuard {
             }
         }
 
-        synced.into_iter().collect()
+        synced.into_keys().collect()
     }
 
     /// Commit all dirty changes in the worktree to preserve work in git history,
@@ -410,6 +435,37 @@ fn tmp_sibling_name(dir: &Path, file_name: &str) -> PathBuf {
     ))
 }
 
+/// Fingerprint of one artifact file's content: its byte length plus a hash of
+/// the bytes.
+///
+/// Length is the cheap discriminator and the hash only has to separate files of
+/// the same size, so a collision costs a redundant re-copy, never a lost edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    hash: u64,
+}
+
+impl FileFingerprint {
+    fn of(bytes: &[u8]) -> Self {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Self {
+            len: bytes.len() as u64,
+            hash: hasher.finish(),
+        }
+    }
+
+    /// Fingerprint of the file at `path`, or `None` when it cannot be read as
+    /// a regular file.
+    fn of_path(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(Self::of(&std::fs::read(path).ok()?))
+    }
+}
 
 /// True when `dst` already holds `src`'s exact bytes.
 ///
@@ -460,10 +516,11 @@ fn copy_file_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     result
 }
 
-/// Recursively copy `src` into `dst`, recording every copied file (relative to
-/// `worktree_root`) in `collected`.
+/// Recursively copy `src` into `dst`, recording every file it walks
+/// (relative to `worktree_root`) in `collected` together with the fingerprint
+/// of the bytes that were copied.
 ///
-/// Three properties make the sync cheap enough to run on every worker teardown:
+/// Four properties make the sync cheap enough to run on every worker teardown:
 ///
 /// * **Skipped directories** ([`SKIP_DIR_NAMES`]) are pruned before their
 ///   contents are walked, so `.git`, `node_modules` and build output never
@@ -473,16 +530,22 @@ fn copy_file_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// * **Unchanged files are left alone.** A destination that already holds the
 ///   exact same bytes is not rewritten, which turns a repeated sync into a
 ///   metadata scan and keeps destination mtimes stable for downstream watchers.
+/// * **Seeded, untouched files are left alone too**, when `seeded` is given:
+///   a file whose bytes still match the fingerprint recorded when it was
+///   copied into the worktree was never changed by the worker, so re-publishing
+///   it could only revert whatever the repository root grew in the meantime.
+///   The seeding pass itself passes `None` and fills the map instead.
 ///
 /// A file that is already in sync is still recorded in `collected`, so callers
-/// see a complete and stable artifact list across repeated syncs. The set also
+/// see a complete and stable artifact list across repeated syncs. The map also
 /// deduplicates by relative path instead of re-checking membership per file,
 /// so overlapping artifact directories scale linearly (audit §11).
 fn copy_dir_all(
     src: &Path,
     dst: &Path,
-    collected: &mut BTreeSet<String>,
+    collected: &mut BTreeMap<String, FileFingerprint>,
     worktree_root: &Path,
+    seeded: Option<&BTreeMap<String, FileFingerprint>>,
 ) -> std::io::Result<()> {
     if !src.exists() {
         return Ok(());
@@ -505,13 +568,26 @@ fn copy_dir_all(
                 );
                 continue;
             }
-            copy_dir_all(&src_path, &dst_path, collected, worktree_root)?;
+            copy_dir_all(&src_path, &dst_path, collected, worktree_root, seeded)?;
         } else if ft.is_file() {
-            if !is_up_to_date(&src_path, &dst_path) {
+            let rel = src_path
+                .strip_prefix(worktree_root)
+                .ok()
+                .map(|rel| rel.to_string_lossy().into_owned());
+            // An unreadable file is still walked, just not fingerprinted: it
+            // counts as changed and travels back rather than going missing.
+            let fingerprint = FileFingerprint::of_path(&src_path);
+            let inherited = match (seeded, &rel, fingerprint) {
+                (Some(seeded), Some(rel), Some(fingerprint)) => {
+                    seeded.get(rel) == Some(&fingerprint)
+                }
+                _ => false,
+            };
+            if !inherited && !is_up_to_date(&src_path, &dst_path) {
                 copy_file_atomic(&src_path, &dst_path)?;
             }
-            if let Ok(rel) = src_path.strip_prefix(worktree_root) {
-                collected.insert(rel.to_string_lossy().into_owned());
+            if let (Some(rel), Some(fingerprint)) = (rel, fingerprint) {
+                collected.insert(rel, fingerprint);
             }
         }
     }
