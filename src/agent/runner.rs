@@ -80,6 +80,8 @@ pub struct AgentRunner {
     /// `execute_bash` call. `None` keeps the default parallelism; `BUILD_PARALLELISM`
     /// still overrides either way.
     pub build_jobs: Option<usize>,
+    /// Shared target selected by the pool; absent until the first heavy step.
+    pub(crate) build_target_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentRunner {
@@ -98,6 +100,7 @@ impl AgentRunner {
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
             build_jobs: None,
+            build_target_dir: None,
         }
     }
 

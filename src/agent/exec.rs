@@ -119,14 +119,25 @@ impl AgentRunner {
         }
 
         let parallelism = build_parallelism(self.build_jobs);
-        let target_dir = resolve_target_dir(dir);
-        let _ = std::fs::create_dir_all(&target_dir);
-
-        // A writable private temp dir, replacing the tmpfs bubblewrap mounts
-        // over `/tmp`: it lives under the isolated target dir, so the
-        // Landlock grant on the target covers it with no extra rule.
-        let tmp_dir = target_dir.join("tmp");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let target_dir = resolve_target_dir(self.build_target_dir.as_deref());
+        // The lease protects even light steps using their previous slot from eviction.
+        let _target_lease = match &target_dir {
+            Some(target) => {
+                let target = target.clone();
+                Some(tokio::task::spawn_blocking(move || crate::cache::TargetLease::acquire(&target))
+                    .await.context("Target lease task failed")??)
+            }
+            None => None,
+        };
+        let sandbox_target = target_dir.as_deref().unwrap_or(dir);
+        let tmp_dir = crate::worktree::scratch_dir(dir);
+        std::fs::create_dir_all(&tmp_dir).context("Failed to create worker scratch directory")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))
+                .context("Failed to make worker scratch private")?;
+        }
 
         let mut cmd = Command::new("nice");
         configure_process(&mut cmd);
@@ -145,7 +156,7 @@ impl AgentRunner {
                 // this kernel could not install one, the network namespace
                 // still enforces the policy rather than silently dropping it.
                 let network_denied =
-                    apply_kernel_confinement(&mut cmd, dir, &target_dir, self.network_offline);
+                    apply_kernel_confinement(&mut cmd, dir, sandbox_target, self.network_offline);
                 let final_command = if network_denied {
                     command.to_string()
                 } else {
@@ -159,7 +170,7 @@ impl AgentRunner {
                 // Landlock here would only risk re-confining a process bwrap
                 // already confined. Offline still needs its network namespace.
                 let final_command = wrap_network_command(command, self.network_offline);
-                apply_sandbox_args(&mut cmd, dir, &target_dir);
+                apply_sandbox_args(&mut cmd, dir, sandbox_target);
                 cmd.args(["--chdir", &dir.to_string_lossy()]);
                 cmd.args(["/usr/bin/bash", "-c", &final_command]);
             }
@@ -177,7 +188,7 @@ impl AgentRunner {
         // credential from the operator's shell reaches the model. Build/cache
         // variables are layered on top afterwards.
         apply_sanitized_environment(&mut cmd, dir);
-        apply_build_env(&mut cmd, &target_dir, &tmp_dir, &parallelism);
+        apply_build_env(&mut cmd, target_dir.as_deref(), &tmp_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
 
         run_with_timeout(&mut cmd, timeout_secs).await
@@ -255,18 +266,9 @@ fn build_parallelism(granted: Option<usize>) -> String {
         .unwrap_or_else(|| crate::config::half_the_cores().to_string())
 }
 
-/// Directory the child builds into: `CARGO_TARGET_DIR` when set, otherwise a
-/// per-worktree dir under the SWE base so concurrent workers never share a
-/// build cache.
-fn resolve_target_dir(dir: &Path) -> PathBuf {
-    if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
-        return PathBuf::from(custom);
-    }
-    let dir_name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("default");
-    crate::worktree::swe_base_dir().join(format!("swe-target-{dir_name}"))
+/// A light step without slot affinity leaves Cargo's normal target selection intact.
+fn resolve_target_dir(granted: Option<&Path>) -> Option<PathBuf> {
+    granted.map(Path::to_path_buf)
 }
 
 /// Which confinement a worker step runs under.
@@ -554,8 +556,11 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
         }
     }
 
-    // Isolated build target read-write.
+    // Shared build target and worker-private scratch read-write.
     cmd.args(["--bind", &target_str, &target_str]);
+    let scratch = crate::worktree::scratch_dir(dir);
+    let scratch_str = scratch.to_string_lossy();
+    cmd.args(["--bind", &scratch_str, &scratch_str]);
 
     // Modular shared package/compiler caches.
     crate::cache::append_bwrap_cache_args(cmd, home.as_deref());
@@ -587,12 +592,12 @@ fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
 
 /// Universal build/test parallelism caps so a command cannot oversubscribe the
 /// machine no matter which build tool it drives.
-fn apply_build_env(cmd: &mut Command, target_dir: &Path, tmp_dir: &Path, parallelism: &str) {
-    cmd.env("CARGO_TARGET_DIR", target_dir)
-        // A writable private temp dir under the isolated target: the kernel
-        // backend grants no `/tmp`, and the bubblewrap backend mounts an empty
-        // tmpfs there, so tools must use the sandbox-writable scratch space.
-        .env("TMPDIR", tmp_dir)
+fn apply_build_env(cmd: &mut Command, target_dir: Option<&Path>, tmp_dir: &Path, parallelism: &str) {
+    if let Some(target) = target_dir {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
+    // Private scratch is never shared with another slot user.
+    cmd.env("TMPDIR", tmp_dir)
         .env("TMP", tmp_dir)
         .env("TEMP", tmp_dir)
         // A mini-swe run nested inside the step (this crate's own test suite,
@@ -1104,22 +1109,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_dir_defaults_to_per_worktree_path() {
-        let dir = Path::new("/tmp/swe/worktree-alpha");
-        if std::env::var_os("CARGO_TARGET_DIR").is_some() {
-            return; // The override wins; covered by the caller-visible behaviour.
-        }
-        let target = resolve_target_dir(dir);
-        assert!(target.ends_with("swe-target-worktree-alpha"), "{target:?}");
-    }
-
-    #[test]
-    fn resolve_target_dir_uses_anonymous_dir_name_safely() {
-        if std::env::var_os("CARGO_TARGET_DIR").is_some() {
-            return;
-        }
-        let target = resolve_target_dir(Path::new("/"));
-        assert!(target.ends_with("swe-target-default"), "{target:?}");
+    fn target_override_requires_slot_affinity() {
+        assert_eq!(resolve_target_dir(None), None);
+        let target = Path::new("/tmp/swe-target-0123456789abcdef-slot0");
+        assert_eq!(resolve_target_dir(Some(target)), Some(target.to_path_buf()));
+        let mut cmd = Command::new("true");
+        apply_build_env(&mut cmd, None, Path::new("/tmp/private"), "1");
+        assert!(!cmd.as_std().get_envs().any(|(key, _)| key == "CARGO_TARGET_DIR"));
     }
 
     #[test]
