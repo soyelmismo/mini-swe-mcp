@@ -630,9 +630,6 @@ impl McpServer {
         // A named worker must exist and be the caller's own: watching a
         // foreign id is refused with its owner, never with its task or state.
         for id in &ids {
-            if self.pool.get_worker_state(id).await.is_none() {
-                anyhow::bail!("Worker not found: {id}");
-            }
             self.require_owner(id, ctx).await?;
         }
         let started = tokio::time::Instant::now();
@@ -663,6 +660,10 @@ impl McpServer {
                     "message": "nothing to watch",
                 }));
             }
+            if initial {
+                ids = reply["watching"].as_array().into_iter().flatten()
+                    .filter_map(|id| id.as_str().map(str::to_string)).collect();
+            }
             initial = false;
             if !watching {
                 return Ok(json!({"status": "no_event", "events": [], "watching": []}));
@@ -684,7 +685,7 @@ impl McpServer {
             // the pool's change channel is what makes it prompt.
             tokio::select! {
                 _ = changes.changed() => {}
-                _ = tokio::time::sleep(left) => {}
+                _ = tokio::time::sleep(left.min(Duration::from_secs(1))) => {}
             }
         }
     }
@@ -783,20 +784,20 @@ impl McpServer {
             return Ok(json!({
                 "worker_id": wid,
                 "status": status,
-                "message": message,
+                "message": format!("{message}. Use watch for the next event."),
             }));
         }
         if matches!(outcome, SteerOutcome::Resumed) {
             return Ok(json!({
                 "worker_id": wid,
                 "status": "resumed",
-                "message": "Worker resumed with your steering instruction"
+                "message": "Worker resumed with your steering instruction. Use watch for the next event."
             }));
         }
         Ok(json!({
             "worker_id": wid,
             "status": "steered",
-            "message": "Steering instruction queued for next turn"
+            "message": "Steering instruction queued for next turn. Use watch for the next event."
         }))
     }
 

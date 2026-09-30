@@ -146,8 +146,9 @@ Add `mini-swe-mcp` to your MCP configuration file (e.g. `~/.config/Claude/claude
 # Async dispatch (returns worker_id immediately)
 mini-swe-mcp dispatch "Implement unit tests for src/config.rs" --model ninja --repo .
 
-# Synchronous dispatch with interactive steering (--wait)
-mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
+# Detached dispatch; watch for events and steer when input is needed
+mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo .
+mini-swe-mcp watch
 
 # Offline dispatch: every bash step runs with no network egress
 mini-swe-mcp dispatch "Rename the internal helper" --model ninja --repo . --offline
@@ -161,7 +162,7 @@ Full usage:
 
 ```
 dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>]
-          [--wait] [--max-turns <n>] [--group <group>] [--offline]
+          [--max-turns <n>] [--group <group>] [--offline]
           [--verify <cmd>]
 ```
 
@@ -239,7 +240,7 @@ worker**. A worker running in another `mini-swe-mcp` process is steered through
 a per-worker mailbox file at `<base>/swe-wt-<worker_id>.steer`, where `<base>` is
 `/var/tmp` by default or `$SWE_TEMP_DIR` when set. The message is appended
 atomically and picked up by the worker on its next step, so guidance sent to a
-worker dispatched with `--wait` in a different shell is never lost.
+worker dispatched in a different shell is never lost.
 
 The mailbox is a JSON-lines file (one `{message, sent_at, pid}` record per line),
 so multi-line messages — a pasted stack trace, a diff hunk — survive intact. The
@@ -248,7 +249,8 @@ loop, and deletes it on exit.
 
 ```bash
 # Terminal A: dispatch and block
-mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo . --wait
+mini-swe-mcp dispatch "Refactor auth middleware" --model nerd --repo .
+mini-swe-mcp watch
 
 # Terminal B: steer that worker mid-flight
 mini-swe-mcp steer <worker_id> "Skip the integration tests for now."
@@ -377,7 +379,7 @@ residency tracks *concurrent* workers, not historical ones:
 |---|---|---|---|
 | Entries per worker | `WORKER_MAX_RETAINED_LOGS` | 200 (max 1000) | Sliding window; the oldest entries are evicted |
 | Bytes per worker | derived from the window | ~430 KiB | Each entry stores a `<= 64 B` command summary and a `<= 2048 B` output excerpt |
-| Entries per response | `WORKER_MAX_EMITTED_LOGS` | 40 (max 500) | A single `collect` / `dispatch --wait` / `logs` reply |
+| Entries per response | `WORKER_MAX_EMITTED_LOGS` | 40 (max 500) | A single `collect` / `logs` reply |
 | Terminal record TTL | `WORKER_TERMINAL_TTL_SECS` | 300 | How long a finished worker is kept before eviction |
 
 The truncation marker (`... [N bytes truncated]`) is charged *against* the

@@ -404,8 +404,12 @@ pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
 }
 
 pub(crate) fn recover_orphaned_workers() -> usize {
+    recover_entries(raw_registry_entries())
+}
+
+fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEntry)>) -> usize {
     let mut recovered = 0;
-    for (path, mut entry) in raw_registry_entries() {
+    for (path, mut entry) in entries {
         if !entry.status.is_live()
             || entry.pid == std::process::id()
             || crate::worktree::is_process_alive(entry.pid)
@@ -512,7 +516,7 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
 #[cfg(test)]
 mod recovery_cleanup_tests {
     use super::*;
-    use crate::worktree::{pid_file_for, swe_base_dir};
+    use crate::worktree::pid_file_for;
 
     /// A pid that is certainly dead: a child that has already exited, so
     /// `is_process_alive` reports it dead and the sweep treats the row as an
@@ -557,8 +561,9 @@ mod recovery_cleanup_tests {
     /// lease behind, and every hub restart would leak another pair.
     #[test]
     fn recovery_removes_the_orphans_target_dir_and_pid_file() {
-        let base = swe_base_dir();
-        let id = format!("rec-cleanup-{}", uuid::Uuid::new_v4().simple());
+        let base = std::env::temp_dir().join(format!("h11-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let id = "recovery-cleanup";
         let worktree = base.join(format!("swe-wt-{id}"));
         let target = base.join(format!("swe-target-swe-wt-{id}"));
         let scratch = base.join(format!("swe-tmp-swe-wt-{id}"));
@@ -566,17 +571,21 @@ mod recovery_cleanup_tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(&pid, serde_json::json!({"pid": 1}).to_string()).unwrap();
-        save_registry_entry(&orphan_row(&id));
+        let registry = base.join("swe-registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let path = registry.join(format!("{id}.json"));
+        let row = orphan_row(id);
+        std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
 
-        let recovered = recover_orphaned_workers();
-        assert!(recovered >= 1, "the orphan row must be recovered");
+        let recovered = recover_entries([(path.clone(), row)]);
+        assert_eq!(recovered, 1, "the orphan row must be recovered");
+        let row: WorkerRegistryEntry = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(row.status, RegistryStatus::Interrupted);
 
         assert!(!target.exists(), "the orphan's target dir must be removed");
         assert!(!scratch.exists(), "the orphan's scratch dir must be removed");
         assert!(!pid.exists(), "the orphan's lease must be removed");
 
-        let _ = std::fs::remove_dir_all(&target);
-        let _ = std::fs::remove_dir_all(&scratch);
-        let _ = std::fs::remove_file(&pid);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -87,12 +87,13 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     };
     if let Some(old) = previous {
         let old_event = old["event"].as_str().unwrap_or("");
+        // Real progress ends the stall episode: the next idle period is a new
+        // one and must be reported, not swallowed by the last suppression.
+        if old_event == "stalled" && old["step"] != view["step"] && idle < 600 {
+            return None;
+        }
         if event != "stalled" && old_event == event && old["revision"] == view["revision"] && old["step"] == view["step"] && old["question"] == view["question"] { return None; }
-        // A stall is one episode, not one poll: repeat it only when the worker
-        // has since blocked again or been nudged again. Keying the suppression
-        // on the step would re-fire it on every step the worker takes while
-        // still idle, which is exactly the "Step 160/162, no step for 600s"
-        // spam a stalled worker produced.
+        // Suppress the same stall until another blocking episode occurs.
         if event == "stalled" && old_event == event
             && metrics
                 .repeat_blocks
@@ -113,7 +114,7 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     Some(payload)
 }
 fn shell(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
-fn commands(v: &Value) -> Vec<String> {
+pub(crate) fn commands(v: &Value) -> Vec<String> {
     let id = shell(v["worker_id"].as_str().unwrap_or(""));
     let steer = format!("mini-swe-mcp steer {id} \"<concrete redirection or answer>\"");
     match v["event"].as_str().unwrap_or("") {
@@ -202,7 +203,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // A hub that predates `hub/watch` cannot stream events; the registry
         // poll sees the same workers, just a second late.
         Err(error) if error.to_string().contains("Method not found") => {
-            println!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
+            eprintln!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
             return polling(opts, json_output, admin).await;
         }
         Err(error) => return Err(error),
@@ -215,7 +216,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             Ok(value) => value,
             Err(error) if error.to_string().contains("belongs to agent") => { println!("{error}"); return Ok(4); }
             Err(error) if error.to_string().contains("Method not found") => {
-                println!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
+                eprintln!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
                 return polling(opts, json_output, admin).await;
             }
             Err(error) => return Err(error),
