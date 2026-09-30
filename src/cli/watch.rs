@@ -48,7 +48,7 @@ impl Options {
 /// whose tree was torn down would otherwise report "0 files, +0 -0" for commits
 /// that are still on its branch. The branch is what the orchestrator merges, so
 /// measure it against its merge-base with the checked-out base branch.
-fn branch_diff_stat(entry: &WorkerRegistryEntry) -> Option<(usize, usize, usize)> {
+pub fn branch_diff_stat(entry: &WorkerRegistryEntry) -> Option<(usize, usize, usize)> {
     let repo = entry.repo_path.as_deref().map(std::path::Path::new).filter(|path| path.is_dir())?;
     let branch = format!("worker-{}", entry.id);
     let merge_base = crate::worktree::git(repo, "merge-base", &["merge-base", "HEAD", &branch]).ok()?;
@@ -224,19 +224,24 @@ fn render_event(v: &Value) -> String {
 /// Print one batch of events: the missed heading once, then every event body,
 /// so a single `watch` call catches the caller up completely.
 fn print_events(events: &[Value], json_output: bool, follow: bool) -> Result<()> {
+    print_events_to(&mut std::io::stdout(), events, json_output, follow)
+}
+
+/// [`print_events`] against an explicit sink, so the batch layout is testable.
+fn print_events_to(out: &mut impl Write, events: &[Value], json_output: bool, follow: bool) -> Result<()> {
     if json_output {
-        for event in events { println!("{}", serde_json::to_string(event)?); }
-        std::io::stdout().flush()?;
+        for event in events { writeln!(out, "{}", serde_json::to_string(event)?)?; }
+        out.flush()?;
         return Ok(());
     }
     if events.iter().any(|event| event["missed"] == true) {
-        print!("{MISSED_HEADING}{}", if follow { " | " } else { "\n" });
+        write!(out, "{MISSED_HEADING}{}", if follow { " | " } else { "\n" })?;
     }
     for event in events {
         let body = render_event(event);
-        println!("{}", if follow { body.replace('\n', " | ") } else { body });
+        writeln!(out, "{}", if follow { body.replace('\n', " | ") } else { body })?;
     }
-    std::io::stdout().flush()?;
+    out.flush()?;
     Ok(())
 }
 
@@ -430,5 +435,35 @@ mod tests {
         verified["verified"] = json!(false);
         let text = render(&select_event(&verified, None, 110).expect("terminal row is actionable"));
         assert!(text.contains("Verified: false"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod replay_batch_tests {
+    use super::*;
+
+    fn missed(id: &str, summary: &str) -> Value {
+        json!({"worker_id": id, "event": "completed", "missed": true, "owner": "cli",
+            "summary": summary, "verified": true, "diff_stat": {"files": 1, "insertions": 2, "deletions": 0}})
+    }
+
+    #[test]
+    fn a_missed_batch_shares_one_heading_and_prints_every_event() {
+        let batch = vec![missed("w-one", "First."), missed("w-two", "Second.")];
+        let mut out = Vec::new();
+        print_events_to(&mut out, &batch, false, false).expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
+        assert!(text.contains("First.") && text.contains("Second."), "{text}");
+        assert!(text.contains("w-one") && text.contains("w-two"), "{text}");
+    }
+
+    #[test]
+    fn a_live_event_carries_no_missed_heading() {
+        let live = json!({"worker_id": "w-live", "event": "needs_input", "question": "go on?",
+            "owner": "cli", "missing_marker": false});
+        let mut out = Vec::new();
+        print_events_to(&mut out, &[live], false, false).expect("print");
+        assert!(!String::from_utf8(out).expect("utf8").contains(MISSED_HEADING));
     }
 }

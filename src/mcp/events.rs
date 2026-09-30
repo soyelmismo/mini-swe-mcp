@@ -570,7 +570,12 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
         question: entry.question.clone(),
         outcome: Outcome {
             error: registry_error(entry),
-            diff_stat: diff_stat(&entry.metrics),
+            diff_stat: diff_stat(&entry.metrics).or_else(|| {
+                // Zero metrics on a terminal row mean the worktree was already
+                // gone when the row was sampled, not that the branch is empty.
+                let (files, insertions, deletions) = crate::cli::watch::branch_diff_stat(entry)?;
+                stat_text(files, insertions, deletions)
+            }),
             ..Outcome::default()
         },
         // A registry row names no branch, so the guidance falls back to the
@@ -619,14 +624,19 @@ fn outcome_of(state: &WorkerState) -> Outcome {
 
 /// `3 files, +40 -12`, or `None` when the run measured no diff at all.
 fn diff_stat(metrics: &WorkerMetrics) -> Option<String> {
-    let touched = metrics.diff_files + metrics.diff_insertions + metrics.diff_deletions;
-    (touched > 0).then(|| {
+    stat_text(
+        metrics.diff_files,
+        metrics.diff_insertions,
+        metrics.diff_deletions,
+    )
+}
+
+/// [`diff_stat`] from raw counts, so a branch-derived diff renders identically.
+fn stat_text(files: usize, insertions: usize, deletions: usize) -> Option<String> {
+    (files + insertions + deletions > 0).then(|| {
         format!(
-            "{} file{}, +{} -{}",
-            metrics.diff_files,
-            if metrics.diff_files == 1 { "" } else { "s" },
-            metrics.diff_insertions,
-            metrics.diff_deletions
+            "{files} file{}, +{insertions} -{deletions}",
+            if files == 1 { "" } else { "s" }
         )
     })
 }
@@ -974,5 +984,54 @@ mod watch_stall_regression_tests {
         ctx.agent_id = Some("owner".into());
         let reply = router.watch_reply(&ctx, &json!({"worker_ids":["stall-probe"], "initial":true})).unwrap();
         assert_eq!(reply["events"][0]["step"], 162);
+    }
+}
+
+#[cfg(test)]
+mod verify_tail_tests {
+    use super::verify_tail;
+
+    /// A verify run's noise: one line per passing test.
+    fn passing(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("test suite::case_{i} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_huge_passing_tail_is_cut_to_forty_lines_and_four_kib() {
+        let output = passing(400);
+        let tail = verify_tail(&output);
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("case_399"), "the newest lines are kept: {tail}");
+    }
+
+    #[test]
+    fn failure_lines_survive_a_wall_of_passing_noise() {
+        let output = format!(
+            "{}\n---- verify stdout ----\nthread 'main' panicked at src/lib.rs:1\nassertion failed\n{}",
+            passing(200),
+            passing(200)
+        );
+        let tail = verify_tail(&output);
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+        assert!(tail.len() <= 4096, "{} bytes", tail.len());
+        assert!(tail.contains("panicked") && tail.contains("assertion failed"), "{tail}");
+    }
+
+    #[test]
+    fn a_failure_marker_inside_the_window_is_kept() {
+        let output = format!("{}\nFAILED test suite::boom\n{}", passing(20), passing(20));
+        let tail = verify_tail(&output);
+        assert!(tail.contains("FAILED test suite::boom"), "{tail}");
+        assert!(tail.lines().count() <= 40, "{} lines", tail.lines().count());
+    }
+
+    #[test]
+    fn a_verbose_marker_line_cannot_grow_the_tail_past_four_kib() {
+        let output = format!("error: {}", "x".repeat(9000));
+        assert!(verify_tail(&output).len() <= 4096, "{} bytes", verify_tail(&output).len());
     }
 }
