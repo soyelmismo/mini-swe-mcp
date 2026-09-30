@@ -34,6 +34,14 @@ fn scratch_dir() -> PathBuf {
     dir
 }
 
+/// The identity a CLI child of this test process resolves to: this process,
+/// named with its pid and its start time (see [`mini_swe_mcp::hub::identity`]).
+fn host_of_this_process() -> String {
+    let me = mini_swe_mcp::hub::identity::process(std::process::id())
+        .expect("read /proc/self/stat");
+    format!("host:{}:{}:{}", me.comm, me.pid, me.starttime)
+}
+
 /// A server backed by a pool that can answer handshake verbs without an LLM.
 fn server() -> Arc<McpServer> {
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
@@ -479,8 +487,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .expect("dispatch names the worker")
         .to_string();
     assert_eq!(
-        payload["owner"], "cli",
-        "a CLI dispatch is owned by the stable `cli` identity: {payload}"
+        payload["owner"],
+        host_of_this_process(),
+        "a CLI dispatch is owned by the host process it ran under: {payload}"
     );
     let mut status = Command::new(&exe);
     envs(&mut status);
@@ -516,9 +525,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .iter()
         .find(|row| row["id"] == wid.as_str())
         .unwrap_or_else(|| {
-            panic!("the `cli` identity must keep its workers across invocations: {listed}")
+            panic!("the host identity must keep its workers across invocations: {listed}")
         });
-    assert_eq!(row["owner"], "cli");
+    assert_eq!(row["owner"], host_of_this_process());
 
     // The escape hatch never creates a socket.
     let bare = common::TempDir::new_in_tmp("hub-no-daemon");
@@ -1083,7 +1092,10 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         checkpoint.messages.len() >= 40,
         "must retain exchanges before turn 20"
     );
-    assert_eq!(checkpoint.owner.as_deref(), Some("cli"));
+    assert_eq!(
+        checkpoint.owner.as_deref(),
+        Some(host_of_this_process().as_str())
+    );
     assert_eq!(checkpoint.verify, None);
     first.kill().await.unwrap();
     first.wait().await.unwrap();

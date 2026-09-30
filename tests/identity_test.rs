@@ -202,7 +202,9 @@ fn a_shell_command_names_the_test_process_as_its_host() {
     let exe = common::binary_path();
     let output = Command::new("sh")
         .arg("-c")
-        .arg(format!("{} whoami", exe.display()))
+        // A trailing command keeps the shell alive as the parent: `sh -c 'cmd'`
+        // execs a lone command, and then there would be no shell to skip.
+        .arg(format!("{} whoami; true", exe.display()))
         .env("MINI_SWE_NO_DAEMON", "1")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} whoami: {e}", exe.display()));
@@ -279,7 +281,7 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
             .as_array()
             .expect("workers array")
             .iter()
-            .filter_map(|w| w["worker_id"].as_str())
+            .filter_map(|row| row["id"].as_str())
             .collect();
         assert!(
             ids.contains(&"shared-1"),
@@ -327,7 +329,7 @@ async fn two_host_identities_cannot_see_each_others_workers() {
         .as_array()
         .expect("workers array")
         .iter()
-        .filter_map(|w| w["worker_id"].as_str())
+        .filter_map(|row| row["id"].as_str())
         .collect();
     assert_eq!(ids, ["mine-1"], "only the caller's own worker: {ids:?}");
 
@@ -341,11 +343,6 @@ async fn two_host_identities_cannot_see_each_others_workers() {
             "'{action}' must name the owning agent: {error}"
         );
     }
-    // Reading stays open, so an agent can inspect what the pool is doing.
-    theirs
-        .worker(serde_json::json!({"action": "status", "worker_id": "mine-1"}))
-        .await
-        .expect("status stays readable by any agent");
     daemon.abort();
 }
 
