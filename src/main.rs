@@ -80,7 +80,7 @@ async fn async_main() -> Result<()> {
         if action == "daemon" {
             return run_daemon_cmd(&server).await;
         }
-        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty()).await;
+        return run_action(&server, action, &cli_args, json_output, !api_key.is_empty(), admin).await;
     }
 
     run_local_stdio().await
@@ -178,19 +178,30 @@ async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
 }
 
 /// Execute one CLI-selected action in this process and print the result.
+///
+/// `admin` is the operator's `--admin`: the in-process connection owns every
+/// worker it dispatches, but the override is what lets it act on the rows a
+/// hub-mode agent left in the shared registry.
 async fn run_action(
     server: &McpServer,
     action: &str,
     cli_args: &[String],
     json_output: bool,
     api_key_present: bool,
+    admin: bool,
 ) -> Result<()> {
     // `None` means the verb was already answered (or exited) by `tool_args`.
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
         return Ok(());
     };
-    let result =
-        drive_worker_call(tool_args, async |args| server.execute_tool("worker", args).await).await?;
+    let ctx = mini_swe_mcp::mcp::ConnectionContext {
+        admin,
+        ..mini_swe_mcp::mcp::ConnectionContext::stdio()
+    };
+    let result = drive_worker_call(tool_args, async |args| {
+        server.execute_tool_for("worker", args, &ctx).await
+    })
+    .await?;
     print_result(action, &result, json_output)
 }
 

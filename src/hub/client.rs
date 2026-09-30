@@ -67,7 +67,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
 /// `agent_id` is the operator's `MINI_SWE_AGENT_ID`, the one way a client can
 /// name the agent its workers belong to; without it the daemon derives the
 /// identity from the `initialize` `clientInfo` (see [`crate::mcp::ConnectionContext::agent`]).
-/// `admin` is the operator override that may act on any worker's agent.
+/// `admin` is the operator override that lifts the per-agent ownership check.
 async fn hello<W: AsyncWrite + Unpin>(writer: &mut W, admin: bool) -> Result<()> {
     let frame = json!({
         "jsonrpc": "2.0", "method": "hub/hello",

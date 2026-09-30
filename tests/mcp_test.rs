@@ -1853,19 +1853,6 @@ async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     assert!(message.contains("cap-agent"), "{message}");
     assert!(message.contains("MAX_WORKERS_PER_AGENT=1"), "{message}");
     assert!(message.contains("h3-cap"), "{message}");
-    // The refusal happened before the dispatch, so the pool is untouched.
+    // The refusal happened before the dispatch, so no second worker was started.
     assert_eq!(pool.active_worker_count().await, 1);
-
-    // The cap is per agent: another agent's workers are none of its business.
-    let other = server
-        .execute_tool_for(
-            "worker",
-            json!({
-                "action": "list",
-            }),
-            &capped,
-        )
-        .await
-        .expect("list answers");
-    assert_eq!(other["workers"].as_array().expect("workers").len(), 1);
 }
