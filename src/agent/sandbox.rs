@@ -1170,7 +1170,7 @@ impl Drop for Scratch {
 fn a_kernel_without_landlock_yields_no_plan_instead_of_an_error() {
     let scratch = Scratch::new("noplan");
 
-    let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None);
+    let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false);
 
     assert!(
         built.is_ok(),
@@ -1197,7 +1197,7 @@ fn a_missing_root_is_reported_even_where_landlock_is_unavailable() {
     let scratch = Scratch::new("noplan-missing");
     let missing = scratch.0.join("does-not-exist");
 
-    let err = build_plan_with_abi(&missing, &scratch.target(), None).unwrap_err();
+    let err = build_plan_with_abi(&missing, &scratch.target(), None, false).unwrap_err();
     assert!(
         format!("{err:#}").contains("does not exist"),
         "a malformed policy must be reported regardless of kernel support: {err:#}"
@@ -1437,19 +1437,24 @@ fn writable_roots_win_over_the_system_prefixes() {
     let (worktree, target) = (scratch.worktree(), scratch.target());
     let rules = build_path_rules(&worktree, &target);
 
-    // The writable roots are appended last, so a later (more specific) rule can
-    // refine an earlier read-only one instead of being shadowed by it.
-    let last_read_only = rules
+    // The writable roots come after the read-only system prefixes, so a later
+    // (more specific) rule can refine an earlier read-only one instead of
+    // being shadowed by it. Toolchain, cache and git rules follow the roots;
+    // they refine nothing the roots cover.
+    let last_system_read_only = rules
         .iter()
-        .rposition(|r| r.allowed == READ_ONLY_RIGHTS)
-        .expect("the policy grants read-only prefixes");
+        .rposition(|r| {
+            r.allowed == READ_ONLY_RIGHTS
+                && READ_ONLY_SYSTEM_PATHS.contains(&r.path.to_str().unwrap_or_default())
+        })
+        .expect("the policy grants read-only system prefixes");
     let worktree_at = rules
         .iter()
         .position(|r| r.path == worktree)
         .expect("worktree is granted");
     assert!(
-        worktree_at > last_read_only,
-        "writable roots must come after the read-only prefixes"
+        worktree_at > last_system_read_only,
+        "writable roots must come after the read-only system prefixes"
     );
     let _ = target;
 }
@@ -1550,13 +1555,16 @@ fn the_abi_query_is_stable_within_a_process() {
     }
 }
 
-    /// Write access must go to the worktree and the target dir and nowhere else.
+    /// Write access must go to the declared roots and the shared caches, and
+    /// nowhere else.
     ///
     /// This is the property that makes the sandbox worth having, and it is easy
     /// to lose by accident: Landlock is allow-only, so a `/tmp` rule would also
     /// cover the worktree/target (which live there by default) and hand the
     /// agent write access to every other worker's files. Scratch space is
-    /// therefore never granted: only the two declared roots are writable.
+    /// therefore never granted: only the two declared roots, the shared
+    /// compiler/package caches (which the bubblewrap backend binds writable
+    /// too) and the null sinks are writable.
     #[test]
     fn write_access_is_exclusive_to_the_two_declared_roots() {
         let scratch = Scratch::new("exclusive");
@@ -1584,13 +1592,17 @@ fn the_abi_query_is_stable_within_a_process() {
                 "{sink} must stay usable as a redirection sink, got: {writable:?}"
             );
         }
+        let cache_root = crate::cache::shared_cache_root();
         for path in &writable {
             let is_root = *path == worktree || *path == target;
             let is_sink = WRITABLE_SINKS.contains(&path.to_str().unwrap_or_default());
+            let is_cache = path.starts_with(&cache_root)
+                || path.ends_with(".cache/kache")
+                || **path == cache_root;
             assert!(
-                is_root || is_sink,
-                "{} may not be writable: only the two declared roots and the \
-                 null sinks are, got: {writable:?}",
+                is_root || is_sink || is_cache,
+                "{} may not be writable: only the two declared roots, the \
+                 shared caches and the null sinks are, got: {writable:?}",
                 path.display()
             );
         }
@@ -1689,7 +1701,7 @@ fn run_landlock_enforcement_mode() -> ! {
     // Build the plan in the parent and apply it here, exactly as `exec.rs`
     // does through the `pre_exec` hook. From here on the process is confined:
     // anything outside the domain fails with EACCES.
-    let plan = match build_landlock_plan(&worktree, &target) {
+    let plan = match build_landlock_plan(&worktree, &target, false) {
         Ok(Some(plan)) => plan,
         Ok(None) => {
             eprintln!("FAIL: this kernel cannot confine the process");
@@ -1855,8 +1867,6 @@ const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
 const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
 /// `BPF_JMP | BPF_JSET | BPF_K`: test the accumulator against a bitmask.
 const BPF_JMP_JSET_K: u16 = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
-/// `BPF_ALU | BPF_AND | BPF_K`: mask the accumulator with a constant.
-const BPF_ALU_AND_K: u16 = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
 /// `BPF_RET | BPF_K`: return a constant to the kernel.
 const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 
@@ -2091,12 +2101,6 @@ fn seccomp_supported() -> bool {
     // SAFETY: `prctl(PR_GET_SECCOMP)` takes one argument and reads nothing.
     let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
     mode >= 0
-}
-
-/// Whether the running kernel can scope Landlock's signal and abstract-socket
-/// rules, which arrived together in ABI 6.
-fn landlock_scope_supported(abi: i64) -> bool {
-    abi >= 6
 }
 
 /// Harden the calling process after confinement is installed.

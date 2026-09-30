@@ -279,11 +279,6 @@ fn bwrap_requested() -> bool {
     std::env::var(BWRAP_BACKEND_ENV).as_deref() == Ok(BWRAP_BACKEND_VALUE)
 }
 
-/// Whether the bubblewrap sandbox is usable and not explicitly disabled.
-fn sandbox_enabled() -> bool {
-    has_bwrap() && !sandbox_disabled()
-}
-
 /// Pick the backend for the next worker step.
 ///
 /// The kernel confines every step unless the operator opted out entirely
@@ -1053,37 +1048,15 @@ mod tests {
     }
 
     /// End-to-end contract: with the policy on, a request needing egress fails
-    /// *immediately* (no interface, no route) instead of hanging out a connect
-    /// timeout, while a local command still runs normally.
-    ///
-    /// Where the host forbids namespace creation (an unprivileged container, a
-    /// kernel without `CONFIG_NET_NS`) the wrapper is still applied and the
-    /// step fails loudly; that fallback is asserted separately below rather
-    /// than letting the test quietly pass in isolation.
+    /// instead of reaching the network, while a local command still runs
+    /// normally. The kernel backend denies INET sockets with seccomp and TCP
+    /// bind/connect with Landlock, so no network namespace is needed; the
+    /// bubblewrap backend keeps the `unshare -n` wrapper instead.
     #[tokio::test]
     async fn an_offline_worker_has_no_egress_and_still_runs_local_commands() {
-        if !has_unshare() {
-            eprintln!("skipping: unshare is unavailable on this host");
-            return;
-        }
         let tmp = crate::worktree::swe_base_dir().join("exec-offline-test");
         let _ = std::fs::create_dir_all(&tmp);
         let offline = runner().with_network_offline(true);
-
-        if !can_create_network_namespace() {
-            // Policy must never silently degrade into "with network access".
-            let (out, code) = offline
-                .execute_bash(&tmp, "printf 'must not run\n'")
-                .await
-                .expect("an offline command must still be spawned");
-            assert_ne!(
-                code,
-                Some(0),
-                "an unavailable namespace must fail loudly, never run unisolated: {out:?}"
-            );
-            let _ = std::fs::remove_dir_all(&tmp);
-            return;
-        }
 
         let (out, code) = offline
             .execute_bash(&tmp, "printf 'still runs\n'")
@@ -1091,6 +1064,20 @@ mod tests {
             .expect("an offline command must still be spawned");
         assert_eq!(code, Some(0), "local commands must work offline: {out:?}");
         assert!(out.contains("still runs"), "{out:?}");
+
+        // Creating an IPv4 socket must fail outright under the offline policy.
+        let (out, code) = offline
+            .execute_bash(
+                &tmp,
+                "python3 -c 'import socket; socket.socket(socket.AF_INET)'; echo exit=$?",
+            )
+            .await
+            .expect("an offline socket probe must fail as ordinary output, not an error");
+        assert_eq!(code, Some(0), "the probe step itself must succeed: {out:?}");
+        assert!(
+            out.contains("exit=1"),
+            "creating an INET socket must fail offline: {out:?}"
+        );
 
         let started = std::time::Instant::now();
         let (out, code) = offline
@@ -1109,8 +1096,7 @@ mod tests {
         );
         assert!(
             elapsed < std::time::Duration::from_secs(15),
-            "offline must fail fast on ENETUNREACH, not wait out a connect \
-             timeout (took {elapsed:?})"
+            "offline must fail fast, not wait out a connect timeout (took {elapsed:?})"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1817,7 +1803,7 @@ mod tests {
     #[test]
     fn a_landlock_plan_is_built_for_two_existing_roots() {
         let scratch = LandlockScratch::new("plan");
-        let plan = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+        let plan = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false)
             .expect("building a plan must not fail on a Landlock-capable kernel");
 
         if let Some(plan) = plan {
@@ -1850,14 +1836,14 @@ mod tests {
         let scratch = LandlockScratch::new("missing");
         let missing = scratch.worktree.join("no-such-dir");
         let err =
-            super::super::sandbox::build_landlock_plan(&missing, &scratch.target).unwrap_err();
+            super::super::sandbox::build_landlock_plan(&missing, &scratch.target, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a missing worktree must be reported, got: {err:#}"
         );
 
         let err =
-            super::super::sandbox::build_landlock_plan(&scratch.worktree, &missing).unwrap_err();
+            super::super::sandbox::build_landlock_plan(&scratch.worktree, &missing, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a missing target dir must be reported, got: {err:#}"
@@ -1874,7 +1860,7 @@ mod tests {
         // process; nothing else in the suite reads this variable concurrently
         // with the window below.
         unsafe { std::env::set_var(super::super::sandbox::DISABLE_LANDLOCK_ENV, "1") };
-        let built = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target);
+        let built = super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false);
         unsafe { std::env::remove_var(super::super::sandbox::DISABLE_LANDLOCK_ENV) };
 
         assert!(
@@ -1883,21 +1869,59 @@ mod tests {
         );
     }
 
-    /// The hook is only installed when there is no bubblewrap: with bwrap
-    /// present it builds the mount namespace itself and a second, LSM-level
-    /// confinement would be redundant (and would confine `bwrap` itself).
+    /// Backend selection: the kernel confines by default, bubblewrap is an
+    /// explicit opt-in, and a kernel that cannot confine falls back to
+    /// bubblewrap when it is installed.
     #[test]
-    fn the_landlock_hook_is_skipped_when_bubblewrap_is_available() {
-        if !has_bwrap() {
-            eprintln!("skipping: bubblewrap is unavailable on this host");
-            return;
+    fn backend_selection_prefers_the_kernel_and_falls_back() {
+        let _guard = super::super::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let save_sandbox = std::env::var_os("SWE_SANDBOX");
+        let save_disable = std::env::var_os("SWE_DISABLE_SANDBOX");
+        // SAFETY: the env lock is held for the whole test, so no other test
+        // observes the overrides below.
+        unsafe {
+            std::env::remove_var("SWE_SANDBOX");
+            std::env::remove_var("SWE_DISABLE_SANDBOX");
         }
-        // Both branches are driven by `sandbox_enabled()`; this asserts the
-        // predicate that selects them, which is what the hook hangs off.
-        assert!(
-            sandbox_enabled(),
-            "with bwrap present and no opt-out, the bwrap branch must win"
-        );
+
+        // An explicit opt-out confines nothing.
+        // SAFETY: the env lock is held; see above.
+        unsafe { std::env::set_var("SWE_DISABLE_SANDBOX", "1") };
+        assert_eq!(select_backend(), SandboxBackend::Unconfined);
+        // SAFETY: the env lock is held; see above.
+        unsafe { std::env::remove_var("SWE_DISABLE_SANDBOX") };
+
+        // The default backend confines with the kernel when the kernel can,
+        // and degrades to bubblewrap only where it cannot.
+        let backend = select_backend();
+        if super::super::sandbox::KernelConfinement::probe_available() {
+            assert_eq!(backend, SandboxBackend::Kernel);
+        } else if has_bwrap() {
+            assert_eq!(backend, SandboxBackend::Bwrap);
+        } else {
+            assert_eq!(backend, SandboxBackend::Unconfined);
+        }
+
+        // The opt-in selects bubblewrap where it is installed.
+        // SAFETY: the env lock is held; see above.
+        unsafe { std::env::set_var("SWE_SANDBOX", "bwrap") };
+        let backend = select_backend();
+        if has_bwrap() {
+            assert_eq!(backend, SandboxBackend::Bwrap);
+        }
+        // SAFETY: the env lock is held; see above.
+        unsafe {
+            std::env::remove_var("SWE_SANDBOX");
+            if let Some(v) = save_sandbox {
+                std::env::set_var("SWE_SANDBOX", v);
+            }
+            if let Some(v) = save_disable {
+                std::env::set_var("SWE_DISABLE_SANDBOX", v);
+            }
+        }
+        let _ = backend;
     }
 
     /// A confined command still runs, and it still gets its own process group
@@ -1911,7 +1935,7 @@ mod tests {
     async fn a_command_runs_while_the_landlock_hook_is_installed() {
         let scratch = LandlockScratch::new("runs");
         let mut cmd = Command::new("/bin/sh");
-        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
         cmd.arg("-c").arg("echo confined-and-alive");
 
         let out = cmd
@@ -1946,7 +1970,7 @@ mod tests {
         // without Landlock the hook is never installed at all, which is the
         // documented graceful degradation.
         let scratch = LandlockScratch::new("e2e");
-        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false)
             .expect("plan")
             .is_none()
         {
@@ -1983,7 +2007,7 @@ mod tests {
         );
 
         let mut cmd = Command::new("/bin/sh");
-        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
         cmd.arg("-c").arg(&probe);
         let out = cmd.output().await.expect("spawn the confined probe");
 
@@ -2020,7 +2044,7 @@ mod tests {
             return;
         }
         let scratch = LandlockScratch::new("parent");
-        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target)
+        if super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false)
             .expect("plan")
             .is_none()
         {
@@ -2037,13 +2061,13 @@ mod tests {
         std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
 
         let mut cmd = Command::new("/bin/sh");
-        apply_landlock_pre_exec(&mut cmd, &scratch.worktree, &scratch.target);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
         cmd.arg("-c").arg("true");
         let _ = cmd.output().await.expect("spawn");
 
         // The child could not have read it...
         let mut child = Command::new("/bin/sh");
-        apply_landlock_pre_exec(&mut child, &scratch.worktree, &scratch.target);
+        apply_kernel_confinement(&mut child, &scratch.worktree, &scratch.target, false);
         child.arg("-c").arg(format!("cat {}", outside.display()));
         let out = child.output().await.expect("spawn");
         assert!(
@@ -2062,10 +2086,10 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
     }
 
-    /// The confinement must be the *fallback*, never a replacement: with
-    /// bubblewrap present the bwrap argument vector is unchanged.
+    /// The bubblewrap backend stays intact as the opt-in: with bubblewrap
+    /// present the bwrap argument vector is unchanged.
     #[test]
-    fn bubblewrap_remains_the_primary_sandbox_when_available() {
+    fn bubblewrap_remains_available_as_the_opt_in_backend() {
         if !has_bwrap() {
             eprintln!("skipping: bubblewrap is unavailable on this host");
             return;
