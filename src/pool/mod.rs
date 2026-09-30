@@ -455,12 +455,15 @@ impl WorkerPool {
 
     /// Deliver an orchestrator message to a worker.
     ///
-    /// Two delivery paths, tried in order:
+    /// Three delivery paths, tried in order:
     ///
     /// 1. **In-process.** A `Running` worker queues the message on
     ///    `pending_steer` for its next turn; a `Paused` one is handed to its
     ///    resume channel.
-    /// 2. **Cross-process mailbox.** The worker is owned by a different
+    /// 2. **Revision.** A `Completed`/`Failed` worker (or a registry-only one,
+    ///    e.g. after a hub restart) is relaunched on its preserved branch with
+    ///    its saved conversation plus this message (see [`WorkerPool::revise`]).
+    /// 3. **Cross-process mailbox.** The worker is owned by a different
     ///    `mini-swe-mcp` process (the normal `dispatch … --wait` case): the
     ///    message is appended atomically to its mailbox (see [`steer_path`]),
     ///    which the owner drains on every step.
@@ -469,7 +472,22 @@ impl WorkerPool {
     /// and the guard is dropped *before* `send().await`: awaiting a full `mpsc`
     /// channel while holding the write-guard would serialise the whole pool.
     /// A missing sender is reported instead of silently dropping the guidance.
+    ///
+    /// `revision_turns` is the fresh turn budget of a revision (`None` takes
+    /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
+        self.steer_with_budget(id, message, None).await
+    }
+
+    /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
+    /// `max_turns` argument): a finished worker restarts its loop from this
+    /// many turns instead of [`DEFAULT_REVISION_TURNS`].
+    pub async fn steer_with_budget(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> Result<()> {
         let tx_opt = {
             let mut lock = self.workers.write().await;
             let Some(w) = lock.get_mut(id) else {
@@ -477,6 +495,15 @@ impl WorkerPool {
                 // mailbox so the process that owns it picks it up. The guard is
                 // released before the write, and the write is a blocking
                 // `std::fs` call, so it must happen outside the lock.
+                // Not in this process: it may still be a finished worker whose
+                // registry row and history file survived (e.g. after a hub
+                // restart). A revision there relaunches the loop here, on the
+                // same id and branch; otherwise the message is queued for the
+                // owning process.
+                if load_registry_entry(id).is_some_and(|e| e.status.is_terminal()) {
+                    drop(lock);
+                    return self.revise(id, message, revision_turns).await;
+                }
                 drop(lock);
                 let path = write_steer_message(id, &message).map_err(|e| {
                     anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
@@ -494,11 +521,12 @@ impl WorkerPool {
                     return Ok(());
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
-                _ => {
-                    anyhow::bail!(
-                        "Worker {} is not in a steerable state (running or paused)",
-                        id
-                    )
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
+                    // A finished worker cannot be resumed mid-turn -- it has no
+                    // turn left -- so the message becomes a revision below,
+                    // outside the guard.
+                    drop(lock);
+                    return self.revise(id, message, revision_turns).await;
                 }
             }
             // write-guard released here, before any `.await`

@@ -172,13 +172,6 @@ impl WorkerPool {
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
         self.register_worktree(&worker_id, worktree.path.clone()).await;
-        let runner = AgentRunner::new(
-            self.api_base.clone(),
-            self.api_key.clone(),
-            model.clone(),
-            temperature,
-        )
-        .with_network_offline(network_offline);
 
         // The system prompt carries this role's persistent memory
         // (`.agents/memory/<alias>.md`) when the repository provides any, so a
@@ -218,7 +211,6 @@ impl WorkerPool {
                 },
                 meta,
                 &mut worktree,
-                &runner,
                 &mut messages,
             )
             .await;
@@ -270,7 +262,6 @@ impl WorkerPool {
         config: &RunConfig<'_>,
         meta: &mut WorkerMeta,
         mut worktree: &mut WorktreeGuard,
-        runner: &AgentRunner,
         mut messages: &mut Vec<ChatMessage>,
     ) -> Result<()> {
         let task = config.task.to_string();
@@ -435,6 +426,15 @@ impl WorkerPool {
         // The completion payload (diff/summary/artifacts/branch) is assembled
         // *before* the write-guard is taken: the critical section only performs
         // the O(1) move of the pre-built value into the record.
+        // The completion carries the revision that produced it: a fresh
+        // dispatch completes at zero, a revised worker at its attempt number.
+        let revision = self
+            .workers
+            .read()
+            .await
+            .get(worker_id)
+            .map(|w| w.revision)
+            .unwrap_or(0);
         let completed_state = WorkerState::Completed {
             turns: step,
             diff,
@@ -444,6 +444,7 @@ impl WorkerPool {
             branch,
             verified,
             metrics: meta.metrics,
+            revision,
         };
         {
             let mut lock = self.workers.write().await;

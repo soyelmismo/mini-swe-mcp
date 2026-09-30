@@ -1070,6 +1070,7 @@ fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
         pending_steer: Vec::new(),
         resume_tx: None,
         handle: None,
+        revision: 0,
     }
 }
 
@@ -1085,6 +1086,7 @@ fn completed_worker(id: &str) -> WorkerRecord {
             branch: Some("swe-wt-done".to_string()),
             verified: Some(true),
             metrics: WorkerMetrics::default(),
+            revision: 0,
         },
     )
 }

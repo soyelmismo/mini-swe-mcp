@@ -161,3 +161,194 @@ pub fn remove_worker_history(worker_id: &str) {
         }
     }
 }
+
+use super::runner::WorkerLaunchConfig;
+
+impl super::WorkerPool {
+    /// Relaunch a finished worker as a revision: same id, same branch, full
+    /// context plus the orchestrator's corrections.
+    ///
+    /// The history file supplies the saved conversation and the relaunch facts
+    /// (model, repo, base commit, network policy, verify gate). The steer text
+    /// is appended as a user message with the [`REVISION_PREFIX`] marker, the
+    /// turn budget restarts at `revision_turns` (or [`DEFAULT_REVISION_TURNS`]),
+    /// the state returns to `Running`, and the same loop runs again -- same
+    /// verify gate, same checkpoints, same completion payload. The revision
+    /// counter in the record (and in every payload) is bumped once.
+    ///
+    /// Works for a worker held in this process *and* for a registry-only one
+    /// (e.g. after a hub restart): the latter is re-registered here first, so
+    /// both cases converge on one relaunch path. Refuses with a clear error
+    /// when the history file is missing or the branch is gone (which of the
+    /// two is named in the message).
+    pub async fn revise(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let mut history = super::load_worker_history(id)?;
+        let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
+        if max_turns == 0 {
+            anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
+        }
+
+        let repo_path = std::path::PathBuf::from(&history.repo_path);
+        if !repo_path.is_dir() {
+            anyhow::bail!(
+                "Repository {} of worker {id} no longer exists; the finished worker cannot be revised",
+                history.repo_path
+            );
+        }
+        // Fail fast when the reviewed branch is gone, before the record is
+        // touched: the error names the branch, not just the worker.
+        {
+            let branch = history.branch.clone();
+            let repo = repo_path.clone();
+            let exists = tokio::task::spawn_blocking(move || {
+                crate::worktree::git(
+                    &repo,
+                    "show-ref",
+                    &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+                )
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !exists {
+                anyhow::bail!(
+                    "Worker branch {} no longer exists; the finished worker {id} cannot be revised",
+                    history.branch
+                );
+            }
+        }
+
+        history.messages.push(ChatMessage::text(
+            crate::agent::Role::User,
+            format!("{REVISION_PREFIX}\n{message}"),
+        ));
+        history.max_turns = max_turns;
+        history.revision += 1;
+        let revision = history.revision;
+
+        // A registry-only worker has no record here yet: register it so the
+        // relaunch below -- and every poll on it -- sees one process's worker,
+        // with the same id and branch the orchestrator reviewed.
+        let now = super::unix_timestamp();
+        {
+            let mut lock = self.workers.write().await;
+            match lock.get_mut(id) {
+                Some(w) => {
+                    w.state = super::WorkerState::Running {
+                        step: 0,
+                        last_command: format!("revision {revision} starting"),
+                        started_at: now,
+                    };
+                    w.model = history.model.clone();
+                    w.task = history.task.clone();
+                    w.revision = revision;
+                }
+                None => {
+                    let record = super::WorkerRecord {
+                        id: id.to_string(),
+                        task: history.task.clone(),
+                        model: history.model.clone(),
+                        state: super::WorkerState::Running {
+                            step: 0,
+                            last_command: format!("revision {revision} starting"),
+                            started_at: now,
+                        },
+                        metrics: super::WorkerMetrics::default(),
+                        logs: super::LogBuffer::with_policy(self.log_policy),
+                        pending_steer: Vec::new(),
+                        resume_tx: None,
+                        handle: None,
+                        revision,
+                    };
+                    lock.insert(id.to_string(), record);
+                }
+            }
+        }
+
+        let pool = self.clone();
+        let wid = id.to_string();
+        let history_for_run = history.clone();
+        let model_for_fail = history.model.clone();
+        let meta = super::WorkerMeta {
+            id: wid.clone(),
+            task: history.task.clone(),
+            group: history.group.clone(),
+            repo_path: Some(history.repo_path.clone()),
+            started_at: now,
+            pid: std::process::id(),
+            metrics: super::WorkerMetrics::default(),
+        };
+        let mut meta_for_fail = meta;
+        let config = WorkerLaunchConfig {
+            task: history.task.clone(),
+            model: history.model.clone(),
+            temperature: history.temperature,
+            repo_path,
+            max_turns,
+            review_after: history.review_after.clone(),
+            network_offline: history.network_offline,
+            verify: history.verify.clone(),
+            resume_messages: Some(history.messages),
+            resume_base_commit: Some(history_for_run.base_commit.clone()),
+        };
+        let handle = tokio::spawn(async move {
+            if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
+                tracing::error!(worker = %wid, error = %e, "Revision failed with error");
+                let mut lock = pool.workers.write().await;
+                if let Some(w) = lock.get_mut(&wid) {
+                    w.fail(e.to_string());
+                }
+                meta_for_fail.save_status(
+                    &model_for_fail,
+                    super::RegistryStatus::Failed,
+                    0,
+                    max_turns,
+                    &format!("error: {e}"),
+                    None,
+                );
+            }
+        });
+        {
+            let mut lock = self.workers.write().await;
+            if let Some(w) = lock.get_mut(id) {
+                w.handle = Some(handle);
+            }
+        }
+        // The revision's launch is what a re-attached `status` reports until
+        // the first turn writes its own row.
+        history_for_run.save_revision_status(id, revision, max_turns);
+        tracing::info!(worker = %id, revision, max_turns, "Worker revision started");
+        Ok(())
+    }
+}
+
+impl WorkerHistory {
+    /// The registry row that makes a just-started revision visible to
+    /// cross-process readers before its first turn writes its own.
+    fn save_revision_status(&self, worker_id: &str, revision: usize, max_turns: usize) {
+        // Reuse the canonical row writer with the history's identity: the row
+        // for the worker id carries the fresh budget and the revision marker.
+        super::save_registry_entry(&super::WorkerRegistryEntry {
+            id: worker_id.to_string(),
+            pid: std::process::id(),
+            task: self.task.clone(),
+            model: self.model.clone(),
+            status: super::RegistryStatus::Running,
+            step: 0,
+            max_turns,
+            last_command: format!("revision {revision} starting"),
+            question: None,
+            started_at: super::unix_timestamp(),
+            updated_at: super::unix_timestamp(),
+            group: self.group.clone(),
+            repo_path: Some(self.repo_path.clone()),
+            metrics: super::WorkerMetrics::default(),
+        });
+    }
+}

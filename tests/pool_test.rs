@@ -544,6 +544,7 @@ fn running_worker(id: &str) -> WorkerRecord {
         pending_steer: Vec::new(),
         resume_tx: None,
         handle: None,
+        revision: 0,
     }
 }
 
@@ -687,6 +688,7 @@ async fn steer_rejects_unsteerable_workers() {
         branch: None,
         verified: None,
         metrics: WorkerMetrics::default(),
+        revision: 0,
     };
     pool.__test_insert_worker(done).await;
     let err = pool.steer("w4", "x".into()).await.unwrap_err();
@@ -725,6 +727,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
         branch: Some("feature".into()),
         verified: None,
         metrics: WorkerMetrics::default(),
+        revision: 0,
     };
     pool.__test_insert_worker(w).await;
 
@@ -762,6 +765,7 @@ async fn worker_progress_reports_failed_workers() {
         step: 3,
         failed_at: 0,
         metrics: WorkerMetrics::default(),
+        revision: 0,
     };
     pool.__test_insert_worker(w).await;
 
@@ -1118,6 +1122,7 @@ fn test_a_completed_state_serializes_its_health_counters() {
         branch: None,
         verified: Some(true),
         metrics: measured_entry().metrics,
+        revision: 0,
     };
     let json = serde_json::to_value(&state).expect("state serializes");
     assert_eq!(json["state"], "Completed");
