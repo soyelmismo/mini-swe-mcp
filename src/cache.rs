@@ -336,7 +336,7 @@ fn build_dir_lock_path(dir: &Path) -> PathBuf {
 /// lease the same directory while this worker is live, and the sweep sees the
 /// directory as busy. Dropping the guard releases the directory for a later
 /// worker, which then inherits its warm dependency cache.
-pub(crate) struct BuildDirLease {
+pub struct BuildDirLease {
     dir: PathBuf,
     lock: std::fs::File,
 }
@@ -344,7 +344,7 @@ pub(crate) struct BuildDirLease {
 impl BuildDirLease {
     /// Lease the lowest-indexed free directory of `repo`, creating a new one
     /// when every directory the repository already has is live.
-    pub(crate) fn acquire(repo: &Path) -> std::io::Result<Self> {
+    pub fn acquire(repo: &Path) -> std::io::Result<Self> {
         let base = crate::worktree::swe_base_dir();
         std::fs::create_dir_all(&base)?;
         // The sweep lock keeps eviction from removing a directory between the
@@ -368,7 +368,7 @@ impl BuildDirLease {
     }
 
     /// The directory this worker builds in.
-    pub(crate) fn dir(&self) -> &Path {
+    pub fn dir(&self) -> &Path {
         &self.dir
     }
 
