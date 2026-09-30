@@ -13,8 +13,8 @@
 //! The renderers themselves are split by what they describe:
 //!
 //! * `worker` — the per-worker inspection verbs: `status`, `collect`, `logs`,
-//!   `dispatch`, `steer`, `wait`, `kill`, `reap`, plus the shared `log_counters_line`
-//!   helper that keeps step-log truncation visible (audit 07, R7) and the
+//!   `dispatch`, `steer`, `wait`, `kill`, `reap`, plus the shared
+//!   `log_counters_line` helper that keeps step-log truncation visible (audit 07, R7) and the
 //!   `health_line` that keeps a run's quality measurable.
 //! * `catalog` — the system-catalog verbs: `manifest`, `list`, `prune`.
 //!

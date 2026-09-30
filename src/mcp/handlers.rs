@@ -538,6 +538,30 @@ impl LogView {
 mod tests {
     use super::*;
 
+    /// An omitted `timeout_secs` means "wait indefinitely"; a non-integer one
+    /// is a hard error, because a dropped deadline is the unbounded hang the
+    /// argument exists to prevent.
+    #[test]
+    fn timeout_absent_is_unbounded_and_a_non_integer_is_rejected() {
+        assert_eq!(
+            McpServer::get_timeout(&json!({ "action": "wait" }), "wait")
+                .expect("an absent deadline is not an error"),
+            None
+        );
+        assert_eq!(
+            McpServer::get_timeout(&json!({ "timeout_secs": 90 }), "wait")
+                .expect("a whole number of seconds is accepted"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        let err = McpServer::get_timeout(&json!({ "timeout_secs": "90" }), "wait")
+            .expect_err("a string deadline must not be accepted");
+        assert!(
+            err.to_string()
+                .contains("'timeout_secs' must be a non-negative integer"),
+            "{err}"
+        );
+    }
+
     /// An omitted `network` yields `None`: the caller falls back to the
     /// manifest policy, then the runtime default.
     #[test]

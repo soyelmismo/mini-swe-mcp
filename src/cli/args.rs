@@ -331,6 +331,50 @@ mod tests {
         }
     }
 
+    /// `--timeout <secs>` is the CLI spelling of the tool's `timeout_secs`
+    /// property on every blocking verb, and a malformed value is rejected
+    /// rather than dropped (dropping it is the unbounded wait it prevents).
+    #[test]
+    fn test_timeout_flag_maps_to_the_timeout_property() {
+        let w = args(&["mini-swe-mcp", "wait", "w1", "--timeout", "90"]);
+        let waited = tool_args("wait", &w, true).unwrap().unwrap();
+        assert_eq!(waited["worker_id"], "w1");
+        assert_eq!(waited["timeout_secs"], 90);
+
+        let s = args(&["mini-swe-mcp", "steer", "w1", "keep going", "--wait", "--timeout", "120"]);
+        let steered = tool_args("steer", &s, true).unwrap().unwrap();
+        assert_eq!(steered["wait"], Value::Bool(true));
+        assert_eq!(steered["timeout_secs"], 120);
+
+        let d = args(&["mini-swe-mcp", "dispatch", "t", "--wait", "--timeout", "45"]);
+        let dispatched = tool_args("dispatch", &d, true).unwrap().unwrap();
+        assert_eq!(dispatched["wait"], Value::Bool(true));
+        assert_eq!(dispatched["timeout_secs"], 45);
+
+        // No flag at all leaves the wait unbounded.
+        let unbounded = tool_args("wait", &args(&["mini-swe-mcp", "wait", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert!(!unbounded.contains_key("timeout_secs"), "{unbounded:?}");
+    }
+
+    #[test]
+    fn test_malformed_timeout_is_an_error() {
+        for bad in [
+            args(&["mini-swe-mcp", "wait", "w1", "--timeout", "90s"]),
+            args(&["mini-swe-mcp", "wait", "w1", "--timeout"]),
+            args(&["mini-swe-mcp", "dispatch", "t", "--wait", "--timeout", "-5"]),
+        ] {
+            let action = if bad[1] == "dispatch" { "dispatch" } else { "wait" };
+            let error = tool_args(action, &bad, true)
+                .expect_err("a malformed --timeout must not be dropped");
+            assert!(
+                error.to_string().contains("--timeout expects"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn test_tool_args_returns_none_for_a_taskless_dispatch() {
         let d = args(&["mini-swe-mcp", "dispatch"]);
@@ -346,7 +390,7 @@ mod tests {
             "-m", "m3", "-r", "/tmp/r2", "-g", "g2", "-t", "3", "-w",
         ]);
         let mut tool_args = Map::new();
-        dispatch_args(&cli_args, &mut tool_args);
+        dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
 
         assert_eq!(tool_args["task"], "fix it");
         assert_eq!(tool_args["model"], "m3"); // the last flag wins
@@ -361,7 +405,7 @@ mod tests {
     fn test_dispatch_args_ignores_unknown_flags_and_unparsable_turns() {
         let cli_args = args(&["mini-swe-mcp", "dispatch", "t", "--nope", "x", "-t", "nan"]);
         let mut tool_args = Map::new();
-        dispatch_args(&cli_args, &mut tool_args);
+        dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
 
         assert_eq!(tool_args["task"], "t");
         assert_eq!(tool_args.len(), 1, "unknown flags add nothing: {tool_args:?}");
@@ -373,7 +417,7 @@ mod tests {
         // is, so `dispatch t --model --repo` sets model="--repo" and nothing else.
         let cli_args = args(&["mini-swe-mcp", "dispatch", "t", "--model", "--repo"]);
         let mut tool_args = Map::new();
-        dispatch_args(&cli_args, &mut tool_args);
+        dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
 
         assert_eq!(tool_args["model"], "--repo");
         assert!(!tool_args.contains_key("repo_path"), "{tool_args:?}");
@@ -381,7 +425,7 @@ mod tests {
         // A value flag with nothing after it is dropped, not defaulted.
         let trailing = args(&["mini-swe-mcp", "dispatch", "t", "--group"]);
         let mut tool_args = Map::new();
-        dispatch_args(&trailing, &mut tool_args);
+        dispatch_args(&trailing, &mut tool_args).expect("valid flags");
         assert_eq!(tool_args.len(), 1, "{tool_args:?}");
     }
 }

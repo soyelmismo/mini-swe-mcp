@@ -51,6 +51,10 @@ fn test_cli_help_flag() {
         );
         assert!(stdout.contains("dispatch"));
         assert!(stdout.contains("prune"));
+        // The blocking verbs are advertised with their wait/deadline flags.
+        assert!(stdout.contains("wait <worker_id>"), "help missing wait: {stdout}");
+        assert!(stdout.contains("[--wait]"), "help missing steer --wait: {stdout}");
+        assert!(stdout.contains("[--timeout <secs>]"), "help missing --timeout: {stdout}");
     }
 }
 
@@ -343,4 +347,44 @@ fn test_cli_list_json() {
         .get("workers")
         .unwrap_or_else(|| panic!("list output missing `workers`: {val}"));
     assert!(workers.is_array(), "`workers` must be a JSON array, got: {workers}");
+}
+
+/// `wait <worker_id>` reaches the `worker` tool's `wait` verb: an unknown
+/// worker therefore fails the way every other verb reports one, instead of
+/// being swallowed by the argv mapper.
+#[test]
+fn test_cli_wait_on_an_unknown_worker_fails() {
+    let exe = binary_path();
+    let output = run_action(&exe, &["wait", "cli-wait-missing-xyz"]);
+    assert!(
+        !output.status.success(),
+        "waiting on an unknown worker must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Worker not found: cli-wait-missing-xyz"),
+        "stderr should name the missing worker: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("still_running") && !stdout.contains("finished"),
+        "an unknown worker must not be reported as running or finished: {stdout}"
+    );
+}
+
+/// A malformed `--timeout` is rejected instead of silently dropping the
+/// deadline the operator asked for.
+#[test]
+fn test_cli_wait_rejects_a_malformed_timeout() {
+    let exe = binary_path();
+    let output = run_action(&exe, &["wait", "cli-wait-missing-xyz", "--timeout", "90s"]);
+    assert!(
+        !output.status.success(),
+        "a malformed --timeout must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--timeout expects a whole number of seconds"),
+        "stderr should explain the expected value: {stderr}"
+    );
 }

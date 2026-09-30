@@ -210,14 +210,7 @@ impl McpServer {
             .await
     }
 
-    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
-    ///
-    /// Returns the terminal payload:
-    /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
-    /// * `{ worker_id, status: "needs_input", question, step, message }` when
-    ///   paused waiting for steering.
-    ///
-    /// Wait indefinitely for the worker's next event.
+    /// Wait indefinitely for a worker's next event.
     ///
     /// Thin wrapper over [`McpServer::await_worker_result_until`] for the
     /// callers that have no client deadline of their own.
@@ -232,13 +225,18 @@ impl McpServer {
             .await
     }
 
-    /// [`McpServer::await_worker_result`] with a client-side deadline.
+    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
     ///
-    /// `timeout` bounds how long the call blocks. When it expires before the
-    /// worker completes, fails or pauses, the call answers
-    /// `{worker_id, status: "still_running", step, last_command}` instead of
-    /// hanging, so an agent running under a short tool deadline can simply call
-    /// it again (long-polling). `None` waits indefinitely.
+    /// Returns the terminal payload:
+    /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
+    /// * `{ worker_id, status: "needs_input", question, step, message }` when
+    ///   paused waiting for steering
+    /// * `{ worker_id, status: "still_running", step, last_command }` when the
+    ///   optional `timeout` deadline expires first
+    ///
+    /// The deadline exists for hosts that abort a tool call of their own
+    /// accord: rather than being cut off, the agent gets the worker's current
+    /// step and can simply call again. `None` waits indefinitely.
     ///
     /// Progress notifications are emitted only when a `progress_token`/`tx`
     /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,

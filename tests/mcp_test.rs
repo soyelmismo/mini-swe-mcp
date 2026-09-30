@@ -13,7 +13,8 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
-use mini_swe_mcp::mcp::{NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
+use mini_swe_mcp::mcp::{McpServer, NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
+use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
 use mini_swe_mcp::agent::wrap_network_command;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -970,4 +971,175 @@ fn can_create_network_namespace() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+
+// ----------
+// `wait`: re-attaching to a worker, and the wait heartbeat
+// ----------
+
+/// A synthetic pool record: the `worker` verb table is exercised here without
+/// dispatching an LLM-backed worker, exactly like the pool's own tests do.
+fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
+    WorkerRecord {
+        id: id.to_string(),
+        task: "t".to_string(),
+        model: "m".to_string(),
+        state,
+        metrics: WorkerMetrics::default(),
+        logs: LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+    }
+}
+
+fn completed_worker(id: &str) -> WorkerRecord {
+    synthetic_worker(
+        id,
+        WorkerState::Completed {
+            turns: 4,
+            diff: "--- a\n+++ b".to_string(),
+            summary: "fixed the parser".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("swe-wt-done".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+        },
+    )
+}
+
+fn running_worker(id: &str) -> WorkerRecord {
+    synthetic_worker(
+        id,
+        WorkerState::Running {
+            step: 2,
+            last_command: "cargo test --all-targets".to_string(),
+            started_at: 0,
+        },
+    )
+}
+
+/// An unknown worker is a clear error, never a wait that never returns.
+#[tokio::test]
+async fn wait_on_an_unknown_worker_is_a_clear_error() {
+    let server = McpServer::new(
+        WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
+        "ninja".to_string(),
+    );
+
+    let error = server
+        .execute_tool("worker", json!({ "action": "wait", "worker_id": "wait-test-ghost" }))
+        .await
+        .expect_err("waiting on a worker that was never dispatched must fail");
+    assert!(
+        error.to_string().contains("Worker not found: wait-test-ghost"),
+        "the error must name the worker: {error}"
+    );
+
+    // The verb still requires a worker id.
+    let error = server
+        .execute_tool("worker", json!({ "action": "wait" }))
+        .await
+        .expect_err("a workerless wait must fail");
+    assert!(
+        error.to_string().contains("'worker_id'"),
+        "the error must ask for the worker id: {error}"
+    );
+}
+
+/// A worker that already finished answers immediately with the very payload
+/// `dispatch` with `wait: true` returns, so a re-attached orchestrator sees
+/// the terminal state (and the log counters) without another poll.
+#[tokio::test]
+async fn wait_on_a_completed_worker_returns_its_state() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(completed_worker("wait-test-done")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let result = server
+        .execute_tool("worker", json!({ "action": "wait", "worker_id": "wait-test-done" }))
+        .await
+        .expect("a finished worker must answer without waiting");
+
+    assert_eq!(result["worker_id"], "wait-test-done");
+    assert_eq!(result["state"]["state"], "Completed");
+    assert_eq!(result["state"]["details"]["summary"], "fixed the parser");
+    assert!(
+        result.get("logs").is_some() && result.get("logs_omitted").is_some(),
+        "the awaited payload carries the log counters: {result}"
+    );
+}
+
+/// `timeout_secs` turns the blocking wait into a bounded long-poll: a worker
+/// that is still running yields `still_running` plus the state needed to
+/// continue, instead of a call the host may abort.
+#[tokio::test]
+async fn wait_with_a_deadline_returns_still_running() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("wait-test-running")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let result = server
+        .execute_tool(
+            "worker",
+            json!({
+                "action": "wait",
+                "worker_id": "wait-test-running",
+                "timeout_secs": 0,
+            }),
+        )
+        .await
+        .expect("an expired deadline must answer, not hang");
+
+    assert_eq!(result["worker_id"], "wait-test-running");
+    assert_eq!(result["status"], "still_running");
+    assert_eq!(result["step"], 2);
+    assert_eq!(result["last_command"], "cargo test --all-targets");
+    assert!(
+        result.get("state").is_none(),
+        "a bounded wait reports progress, not a terminal state: {result}"
+    );
+}
+
+/// The heartbeat has to fire well inside the 30-minute window an MCP client
+/// allows a silent stdio call before aborting it as idle.
+#[test]
+fn the_wait_heartbeat_fires_within_a_minute() {
+    assert!(
+        McpServer::PROGRESS_HEARTBEAT_INTERVAL <= Duration::from_secs(60),
+        "the heartbeat interval is {:?}, which can outlast a client's idle abort",
+        McpServer::PROGRESS_HEARTBEAT_INTERVAL
+    );
+    assert!(McpServer::PROGRESS_HEARTBEAT_INTERVAL > Duration::ZERO);
+}
+
+/// The new verb is routed by the live stdio dispatcher, and an unknown worker
+/// surfaces as a tool error rather than a silent hang.
+#[test]
+fn test_tools_call_wait_on_an_unknown_worker_errors() {
+    let mut server = McpProcess::spawn();
+    server.initialize();
+
+    server.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 500,
+        "method": "tools/call",
+        "params": {
+            "name": "worker",
+            "arguments": { "action": "wait", "worker_id": "missing-xyz" }
+        }
+    }));
+
+    let response = server
+        .expect_response("tools/call wait")
+        .expect("wait must be answered");
+    let error = expect_error_code(&response, -32000);
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Worker not found")),
+        "expected a clear unknown-worker error, got: {error}"
+    );
 }
