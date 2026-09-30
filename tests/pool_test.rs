@@ -1395,23 +1395,21 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // revision would read -- i.e. the messages the loop started with. The
     // loop owns them now, so assert on the registry row + branch instead.
     let wt_path = mini_swe_mcp::worktree::swe_base_dir().join("swe-wt-revwork");
-    // The directory exists before git finishes populating the worktree.
-    let out = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Ok(out) = std::process::Command::new("git")
-                .current_dir(&wt_path)
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                && out.status.success()
-                && String::from_utf8_lossy(&out.stdout).trim() == branch
-            {
-                break out;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Give the spawned revision task a moment to check out the branch.
+    // The directory appears before `git worktree add` writes its `.git` link,
+    // so wait for the link: only then does the checkout name its branch.
+    for _ in 0..200 {
+        if wt_path.join(".git").exists() {
+            break;
         }
-    })
-    .await
-    .expect("the revision must finish checking out its preserved branch");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(wt_path.join(".git").exists(), "the revision must re-create the worktree");
+    let out = std::process::Command::new("git")
+        .current_dir(&wt_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("rev-parse in worktree");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         branch,

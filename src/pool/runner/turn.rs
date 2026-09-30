@@ -40,6 +40,16 @@ use super::sentinels::{
     summarize_command,
 };
 
+/// Prefix used by both tool results and code-block command output messages.
+pub(super) const COMMAND_OUTPUT_PREFIX: &str = "COMMAND OUTPUT (exit code: ";
+
+/// Prefix of verification feedback; user-role feedback remains an instruction.
+pub(super) const VERIFICATION_OUTPUT_PREFIX: &str = "VERIFICATION FAILED (exit ";
+
+/// Follow-up when the model produced no executable bash command.
+pub(super) const NO_COMMAND_NUDGE: &str =
+    "ERROR: No bash command found. You MUST call the `bash` tool with your command.";
+
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
 const AUTO_CHECKPOINT_TURNS: usize = 20;
@@ -586,7 +596,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         let output_text = format!(
-            "COMMAND OUTPUT (exit code: {}):\n```\n{}\n```",
+            "{COMMAND_OUTPUT_PREFIX}{}):\n```\n{}\n```",
             code.unwrap_or(-1),
             output
         );
@@ -654,7 +664,7 @@ impl<'a> TurnEngine<'a> {
             }
         }
         let output_text = format!(
-            "VERIFICATION FAILED (exit {exit}) - fix these problems before completing:\n{output}"
+            "{VERIFICATION_OUTPUT_PREFIX}{exit}) - fix these problems before completing:\n{output}"
         );
         // The completion turn is replayed with the same rules as a command
         // turn, so the next request never carries a dangling tool_call.
@@ -891,7 +901,7 @@ impl<'a> TurnEngine<'a> {
             self.messages.push(msg);
             self.messages.push(ChatMessage::text(
                 Role::User,
-                "ERROR: No bash command found. You MUST call the `bash` tool with your command.",
+                NO_COMMAND_NUDGE,
             ));
         }
     }

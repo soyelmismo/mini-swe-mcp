@@ -7,6 +7,8 @@
 use crate::agent::{ChatMessage, Role};
 use crate::config::env_parse;
 
+use super::turn::{COMMAND_OUTPUT_PREFIX, NO_COMMAND_NUDGE, VERIFICATION_OUTPUT_PREFIX};
+
 const DEFAULT_FULL_TURNS: usize = 12;
 const OUTPUT_PREVIEW_BYTES: usize = 300;
 const PROSE_BYTES: usize = 500;
@@ -45,8 +47,13 @@ fn compact_with_policy(messages: &mut [ChatMessage], full_turns: usize, keep_rea
         if let Some(text) = message.content() {
             let compacted = match message.role() {
                 Role::Assistant => shorten(text, PROSE_BYTES, PROSE_SUFFIX),
-                Role::User | Role::Tool => output_stub(text),
-                Role::System => None,
+                Role::Tool => output_stub(text),
+                Role::User
+                    if text.starts_with(COMMAND_OUTPUT_PREFIX) || text == NO_COMMAND_NUDGE =>
+                {
+                    output_stub(text)
+                }
+                Role::System | Role::User => None,
             };
             if let Some(text) = compacted {
                 message.replace_content(text);
@@ -78,8 +85,8 @@ fn output_stub(text: &str) -> Option<String> {
         return None;
     }
     let exit = text
-        .strip_prefix("COMMAND OUTPUT (exit code: ")
-        .or_else(|| text.strip_prefix("VERIFICATION FAILED (exit "))
+        .strip_prefix(COMMAND_OUTPUT_PREFIX)
+        .or_else(|| text.strip_prefix(VERIFICATION_OUTPUT_PREFIX))
         .and_then(|rest| rest.split_once(')'))
         .and_then(|(code, _)| code.parse::<i32>().ok());
     let exit = exit.map_or_else(|| "unknown".to_string(), |code| code.to_string());
@@ -153,9 +160,10 @@ mod tests {
             messages[2].reasoning_content().unwrap().len()
                 <= REASONING_BYTES + REASONING_SUFFIX.len()
         );
-        for message in &messages[3..=5] {
+        for message in &messages[3..=4] {
             assert!(message.content().unwrap().starts_with(OUTPUT_PREFIX));
         }
+        assert_eq!(compacted[5], original[5], "guidance is not command output");
         assert!(
             messages[3]
                 .content()
@@ -197,7 +205,7 @@ mod tests {
                 "COMMAND OUTPUT (exit code: 0):\n```\nhello\n```",
             ),
             ChatMessage::text(Role::Assistant, "no command"),
-            ChatMessage::text(Role::User, "ERROR: No bash command found."),
+            ChatMessage::text(Role::User, NO_COMMAND_NUDGE),
         ];
         compact_with_policy(&mut messages, 0, true);
         assert_eq!(
@@ -219,6 +227,46 @@ mod tests {
         );
         let compacted = serde_json::to_value(&messages).unwrap();
         compact_with_policy(&mut messages, 0, true);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), compacted);
+    }
+
+    #[test]
+    fn old_orchestrator_instructions_survive_beside_compacted_outputs() {
+        let instructions = [
+            format!(
+                "{}\n{}",
+                crate::pool::revision::REVISION_PREFIX,
+                "fix empty inputs".repeat(100)
+            ),
+            format!("ORCHESTRATOR GUIDANCE:\n{}", "keep validation".repeat(100)),
+            "STEER / ORCHESTRATOR GUIDANCE:\nrun the full suite".to_string(),
+            "ORCHESTRATOR RESPONSE / GUIDANCE:\nuse the existing API".to_string(),
+            "TURN EXTENSION REFUSED: wrap up now".to_string(),
+            "VERIFICATION FAILED (exit 1) - fix these problems before completing:\nfailed test"
+                .to_string(),
+        ];
+        let mut messages = vec![
+            ChatMessage::text(Role::System, "system"),
+            ChatMessage::text(Role::User, "task"),
+            ChatMessage::text(Role::Assistant, "```bash\necho hello\n```"),
+            ChatMessage::text(
+                Role::User,
+                "COMMAND OUTPUT (exit code: 0):\n```\nhello\n```",
+            ),
+        ];
+        messages.extend(
+            instructions
+                .iter()
+                .map(|text| ChatMessage::text(Role::User, text)),
+        );
+        exchange(&mut messages, 1, 1);
+        compact_with_policy(&mut messages, 1, false);
+        assert!(messages[3].content().unwrap().starts_with(OUTPUT_PREFIX));
+        for (message, expected) in messages[4..].iter().zip(&instructions) {
+            assert_eq!(message.content(), Some(expected.as_str()));
+        }
+        let compacted = serde_json::to_value(&messages).unwrap();
+        compact_with_policy(&mut messages, 1, false);
         assert_eq!(serde_json::to_value(&messages).unwrap(), compacted);
     }
 
