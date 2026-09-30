@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::daemon::hub_lock_held;
 use super::{HubPaths, hub_dir};
 
 /// Dial the hub, starting a detached daemon if none is listening.
@@ -206,7 +207,13 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                         drop(client);
                         let paths = HubPaths::new(hub_dir()?);
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                        while paths.socket().exists() {
+                        // Teardown removes the socket before it drops the lock;
+                        // wait for both, or the replacement would find the lock
+                        // still held and exit as "hub already running".
+                        loop {
+                            if !paths.socket().exists() && !hub_lock_held(&paths.lock())? {
+                                break;
+                            }
                             anyhow::ensure!(
                                 tokio::time::Instant::now() < deadline,
                                 "Old hub did not stop"

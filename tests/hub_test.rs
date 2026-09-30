@@ -216,6 +216,39 @@ async fn second_daemon_defers_to_the_lock_holder() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Teardown removes `hub.sock` before it drops `hub.lock`; a starter that
+/// arrives in that window must wait for the lock instead of concluding that a
+/// hub is already running.
+#[tokio::test]
+async fn a_starting_daemon_waits_out_a_shutting_down_predecessor() {
+    let dir = scratch_dir();
+    let paths = hub_paths_for_test(&dir);
+    let lock = hold_hub_lock(&paths.lock());
+    // The predecessor has already removed its socket.
+    assert!(!paths.socket().exists(), "no socket while shutting down");
+
+    let daemon = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+
+    // The predecessor releases the lock half a second later.
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(lock);
+    });
+
+    let socket = dir.join("hub.sock");
+    let probe = socket.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(8), wait_for_socket(&probe))
+        .await
+        .expect("the starter must outwait the lock holder");
+    release.await.expect("release task joins");
+    assert!(socket.exists(), "the replacement daemon must be listening");
+
+    task.abort();
+    let _ = task.await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An idle daemon exits by itself and removes its socket.
 #[tokio::test]
 async fn idle_daemon_removes_its_socket() {
@@ -263,6 +296,28 @@ async fn world_writable_hub_dir_is_refused() {
 /// Build hub paths for a scratch directory without touching global state.
 fn hub_paths_for_test(dir: &Path) -> HubPaths {
     HubPaths::new(dir.to_path_buf())
+}
+
+/// Take the exclusive `flock` on `path`, standing in for a daemon that has not
+/// finished its teardown; the lock is released when the returned file drops.
+fn hold_hub_lock(path: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .expect("open hub lock");
+    // SAFETY: `flock` takes the fd and an operation flag; no pointers.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        rc,
+        0,
+        "test must take the hub lock: {}",
+        std::io::Error::last_os_error()
+    );
+    file
 }
 
 /// Thin-client lifecycle over the real binary: the first CLI call auto-starts
@@ -1429,6 +1484,81 @@ fn newer_cli_replaces_an_idle_daemon() {
         "{log}"
     );
     assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}
+
+/// A newer client that asked the idle hub to stop waits for the predecessor to
+/// drop `hub.lock`, not merely for `hub.sock` to vanish, before it spawns the
+/// replacement daemon. The predecessor here removes its socket but keeps the
+/// lock for half a second.
+#[test]
+fn a_replacing_client_waits_for_the_predecessor_to_release_the_lock() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-lockwait");
+    let _reaper = DaemonReaper(hub.path().to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = hub.path().join("hub.sock");
+    let lock_path = hub.path().join("hub.lock");
+    let listener = UnixListener::bind(&socket).expect("bind the fake predecessor");
+    let fake = std::thread::spawn(move || {
+        let lock = hold_hub_lock(&lock_path);
+        {
+            let (stream, _) = listener.accept().expect("accept the client");
+            let mut writer = stream.try_clone().expect("clone the stream");
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).expect("client sends JSON");
+                let method = frame["method"].as_str().unwrap_or_default().to_string();
+                let Some(id) = frame.get("id") else { continue };
+                // An older release with an idle pool: the client supersedes it.
+                let reply = match &method[..] {
+                    "hub/hello" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"version": "0.0.9", "busy": false}}),
+                    "hub/shutdown" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"busy": false}}),
+                    _ => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(writer, "{reply}").expect("reply to the client");
+                if method == "hub/shutdown" {
+                    break;
+                }
+            }
+        }
+        // Teardown: the socket goes first, the lock lags behind.
+        std::fs::remove_file(&socket).expect("remove the predecessor socket");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(lock);
+    });
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(["list", "--json"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", hub.subdir("swe"))
+        .env("ENV_FILE", "/nonexistent-mini-swe-env");
+    let out = cmd.output().expect("run the CLI");
+    fake.join().expect("fake predecessor thread");
+    assert!(
+        out.status.success(),
+        "the client must outwait the predecessor: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("list prints JSON");
+    assert!(listed["workers"].is_array(), "{listed}");
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with(" listening"))
+            .count(),
+        1,
+        "{log}"
+    );
 }
 
 /// Start a hub with `list --json`, then call it again as a client whose build
