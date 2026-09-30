@@ -404,8 +404,8 @@ root that is loaded into the system prompt when the worker starts:
 
 The file is keyed by the **alias** from `models.yaml`, so `ninja` and `nerd` have
 separate memories and neither leaks into the other's prompt. Memory is read fresh
-on every dispatch (never memoized), so a note written by one run is visible to the
-next:
+on every dispatch and never memoized, so an edit is picked up by the very next
+run:
 
 - **Absent, blank or unreadable** -> no memory section at all; the system prompt
   is byte-identical to the pre-memory behaviour. Nothing to configure, nothing to
