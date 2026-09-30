@@ -1329,3 +1329,67 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
     let _ = task.await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A client newer than the running hub still works when that hub predates the
+/// version handshake: `hub/hello` as a request is answered "Method not found",
+/// and the client falls back to the notification form instead of failing.
+#[test]
+fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    let hub = common::TempDir::new_in_tmp("hub-legacy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the hub dir to 0700");
+    }
+    let listener = UnixListener::bind(hub.path().join("hub.sock")).expect("bind the fake hub");
+    let fake = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept the client");
+        let mut writer = stream.try_clone().expect("clone the stream");
+        let mut methods = Vec::new();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("client sends JSON");
+            let method = frame["method"].as_str().unwrap_or_default().to_string();
+            let reply = match (&method[..], frame.get("id")) {
+                (_, None) => None,
+                ("hub/hello", Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": "Method not found: hub/hello"}})),
+                ("tools/call", Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": "{\"workers\":[]}"}]}})),
+                (_, Some(id)) => Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            };
+            methods.push((method.clone(), frame.get("id").is_some()));
+            if let Some(reply) = reply {
+                writeln!(writer, "{reply}").expect("reply to the client");
+            }
+            if method == "tools/call" {
+                break;
+            }
+        }
+        methods
+    });
+
+    let out = Command::new(common::binary_path())
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env("ENV_FILE", hub.path().join("absent.env"))
+        .output()
+        .expect("run the CLI");
+    assert!(
+        out.status.success(),
+        "the CLI must work against an old hub: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("predates the version handshake"));
+    let methods = fake.join().expect("fake hub thread");
+    assert!(
+        methods.contains(&("hub/hello".to_string(), false)),
+        "the identity must still be announced as a notification: {methods:?}"
+    );
+}

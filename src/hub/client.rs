@@ -118,7 +118,20 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
         if cli && params["agent_id"].as_str().is_none_or(str::is_empty) {
             params["agent_id"] = json!(crate::mcp::CLI_AGENT);
         }
-        let reply = client.request("hub/hello", params).await?;
+        let reply = match client.request("hub/hello", params.clone()).await {
+            Ok(reply) => reply,
+            // A daemon from before the version handshake only knows hello as
+            // a notification: announce the identity that way and keep going,
+            // since it cannot be asked to step aside either.
+            Err(error) if error.to_string().starts_with("Method not found") => {
+                client.notify("hub/hello", params).await?;
+                eprintln!(
+                    "[mini-swe] The running hub predates the version handshake; restart it when idle to pick up {version}."
+                );
+                Value::Null
+            }
+            Err(error) => return Err(error),
+        };
         let daemon = reply["version"].as_str().unwrap_or("");
         if daemon != version && newer(&version, daemon) {
             if !reply["busy"].as_bool().unwrap_or(true) && attempt == 0 {
@@ -222,6 +235,16 @@ impl HubClient {
     /// `mini-swe-mcp --admin` bypass of the per-agent ownership check.
     pub async fn connect_as_admin(admin: bool) -> Result<Self> {
         negotiated(admin, true).await
+    }
+
+    /// Send a JSON-RPC notification (no id, no reply).
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        self.stream
+            .get_mut()
+            .write_all(format!("{frame}\n").as_bytes())
+            .await?;
+        Ok(())
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
