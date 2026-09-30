@@ -35,9 +35,8 @@ pub struct HubPaths {
 }
 
 impl HubPaths {
-    /// Paths rooted at `dir` (test support; production uses [`hub_dir`]).
-    #[doc(hidden)]
-    pub fn for_test(dir: PathBuf) -> Self {
+    /// Paths rooted at a previously validated hub directory.
+    pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
 
