@@ -76,6 +76,9 @@ impl McpProcess {
             // this dummy also keeps the suite independent of (and unable to
             // read) whatever key the developer happens to have exported.
             .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
+            // Protocol tests exercise the in-process server; the hub transport
+            // has its own end-to-end tests (tests/hub_test.rs).
+            .env("MINI_SWE_NO_DAEMON", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -212,9 +215,11 @@ impl McpProcess {
     }
 
     /// Wait for the next worker-event notification, stepping over any other
-    /// frame the server volunteers in the meantime.
-    fn expect_channel_event(&mut self, context: &str) -> Value {
-        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    /// frame the server volunteers in the meantime. The budget is explicit
+    /// because a cross-process row change is only discovered on the server's
+    /// coarse fallback tick, while an in-process one arrives at once.
+    fn expect_channel_event_within(&mut self, context: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
@@ -236,7 +241,7 @@ impl McpProcess {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    panic!("timed out after {RESPONSE_TIMEOUT:?} waiting for {context}")
+                    panic!("timed out after {timeout:?} waiting for {context}")
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     panic!("stdout reader thread vanished while waiting for {context}")
@@ -1057,6 +1062,50 @@ fn can_create_network_namespace() -> bool {
 // `wait`: re-attaching to a worker, and the wait heartbeat
 // ----------
 
+/// A waiter blocked in `await_worker_result_until` returns within ~100 ms of a
+/// synthetic state change, proving the wait sleeps on the pool's change
+/// subscription rather than on a fixed tick.
+#[tokio::test]
+async fn a_blocked_wait_returns_promptly_on_a_state_change() {
+    use std::time::{Duration, Instant};
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("wait-test-wakes")).await;
+    let server = McpServer::new(pool.clone(), "ninja".to_string());
+
+    let waiter = tokio::spawn(async move {
+        server
+            .await_worker_result_until("wait-test-wakes", 10, None, None, None)
+            .await
+    });
+    // Let the waiter reach its sleep; then pause the worker behind it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let changed_at = Instant::now();
+    pool.__test_set_worker_state(
+        "wait-test-wakes",
+        WorkerState::Paused {
+            question: "which branch?".to_string(),
+            step: 2,
+            paused_at: 0,
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the waiter must answer")
+        .expect("the waiter task stays alive")
+        .expect("a paused worker answers needs_input");
+    assert_eq!(result["worker_id"], "wait-test-wakes");
+    assert_eq!(result["status"], "needs_input");
+    assert_eq!(result["question"], "which branch?");
+    // ~100 ms is the bar; 500 ms of scheduling slack keeps the assertion
+    // honest on a loaded host without weakening it into the old 500 ms tick.
+    assert!(
+        changed_at.elapsed() < Duration::from_millis(500),
+        "the waiter took {:?} to observe the change; it must wake on the notification",
+        changed_at.elapsed()
+    );
+}
+
 /// A synthetic pool record: the `worker` verb table is exercised here without
 /// dispatching an LLM-backed worker, exactly like the pool's own tests do.
 fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
@@ -1521,7 +1570,9 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
     paused.question = Some(String::from("Ship the migration or roll it back?"));
     save_registry_entry(&paused);
-    let event = server.expect_channel_event("the paused worker");
+    // The row belongs to another process, so the server only discovers it on
+    // its coarse cross-process fallback tick.
+    let event = server.expect_channel_event_within("the paused worker", Duration::from_secs(45));
     remove_registry_entry(&worker_id);
 
     let meta = &event["params"]["meta"];

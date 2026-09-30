@@ -28,42 +28,15 @@ use tracing::error;
 /// Root directory hosting all subagent scratch data (worktrees, target dirs, caches).
 pub fn swe_base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SWE_TEMP_DIR") {
-        return PathBuf::from(dir);
+        PathBuf::from(dir)
+    } else {
+        let var_tmp = PathBuf::from("/var/tmp");
+        if var_tmp.is_dir() {
+            var_tmp
+        } else {
+            std::env::temp_dir()
+        }
     }
-    // `/var/tmp` is the default only when it is actually usable: a read-only
-    // mount (hardened CI image, locked-down container) would otherwise make
-    // every worktree creation fail with a permission error deep inside git.
-    // Falling back to the process temp dir keeps the documented behaviour on
-    // every host where `/var/tmp` exists and is writable.
-    let var_tmp = PathBuf::from("/var/tmp");
-    if var_tmp.is_dir() && var_tmp_is_writable(&var_tmp) {
-        return var_tmp;
-    }
-    std::env::temp_dir()
-}
-
-/// Whether `dir` accepts a new entry, probed with a unique file.
-///
-/// `is_dir()` only proves the path exists: a root-owned `/var/tmp` in a
-/// container without `CAP_DAC_OVERRIDE` is a directory nobody may write to. The
-/// probe is one `create_new` on a process-unique name, so two concurrent
-/// processes never collide and a failure never leaves debris behind.
-fn var_tmp_is_writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(
-        ".swe-write-probe-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let writable = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .is_ok();
-    let _ = std::fs::remove_file(&probe);
-    writable
 }
 
 /// All directories that can host `swe-wt-*` / `swe-target-*` scratch data.
@@ -71,13 +44,6 @@ fn var_tmp_is_writable(dir: &Path) -> bool {
 /// Yielded at most once each: `swe_base_dir()` frequently *is* the system temp
 /// dir, and sweeping it twice used to re-scan the same tree (audit §07).
 pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
-    swe_base_dirs_for_cleanup()
-}
-
-/// The same sweep, visible to the pool's history-file cleanup: a worker's
-/// conversation file lives next to its scratch data, so it leaks unless every
-/// base dir is swept when the worker is pruned, reaped or collected.
-pub fn swe_base_dirs_for_cleanup() -> Vec<PathBuf> {
     let mut dirs = vec![swe_base_dir()];
     let tmp = std::env::temp_dir();
     if !dirs.contains(&tmp) {

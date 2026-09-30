@@ -101,13 +101,22 @@ impl McpServer {
         ))
     }
 
-    pub(super) fn get_repo_path(args: &Value) -> PathBuf {
+    pub(super) fn get_repo_path(args: &Value, ctx: &super::server::ConnectionContext) -> PathBuf {
         let repo_path_str = args
             .get("repo_path")
             .or_else(|| args.get("path"))
             .and_then(|v| v.as_str())
             .unwrap_or(".");
-        PathBuf::from(repo_path_str)
+        // A bare "." names the caller's own directory, not a child of it.
+        if repo_path_str == "." {
+            return ctx.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        }
+        let path = PathBuf::from(repo_path_str);
+        if path.is_relative() && let Some(cwd) = &ctx.cwd {
+            cwd.join(path)
+        } else {
+            path
+        }
     }
 
     /// Send a `notifications/progress` frame when the caller supplied both a
@@ -146,6 +155,20 @@ impl McpServer {
     pub const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(60);
 
+    /// Coarse fallback tick for a worker this process does not own.
+    ///
+    /// Its state changes happen in another process, so no in-process
+    /// notification can arrive and the registry has to be re-read. Thirty
+    /// seconds is far coarser than the 500 ms poll this replaced, because the
+    /// only thing it can still discover is a transition that already happened.
+    pub(super) const CROSS_PROCESS_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Tick used while waiting on a worker this process owns.
+    ///
+    /// Such a worker wakes the wait through the change subscription, so this
+    /// only has to be short enough to carry the heartbeat deadline.
+    pub(super) const HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
     /// Map a `tools/call` request to its handler.
     ///
     /// Verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`,
@@ -157,10 +180,11 @@ impl McpServer {
         args: &Value,
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         match action {
             "manifest" => self.handle_manifest(),
-            "dispatch" => self.handle_dispatch(args, token, tx).await,
+            "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args).await,
             "collect" => self.handle_collect(args).await,
             "logs" => self.handle_logs(args).await,
@@ -169,7 +193,7 @@ impl McpServer {
             "kill" => self.handle_kill(args).await,
             "steer" => self.handle_steer(args, token, tx).await,
             "wait" => self.handle_wait(args, token, tx).await,
-            "prune" => self.handle_prune(args, token, tx).await,
+            "prune" => self.handle_prune(args, token, tx, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
     }
@@ -186,9 +210,10 @@ impl McpServer {
         args: &Value,
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let task = Self::required_string(args, "task", "dispatch")?.to_string();
-        let repo_path = Self::get_repo_path(args);
+        let repo_path = Self::get_repo_path(args, ctx);
         let requested_model = args
             .get("model")
             .and_then(|v| v.as_str())
@@ -554,8 +579,9 @@ impl McpServer {
         args: &Value,
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let repo_path = Self::get_repo_path(args);
+        let repo_path = Self::get_repo_path(args, ctx);
         Self::emit_progress(
             tx,
             token,
@@ -565,6 +591,7 @@ impl McpServer {
         )
         .await;
         crate::worktree::prune_stale_worktrees(&repo_path);
+        crate::pool::prune_orphan_histories(&repo_path);
         Self::emit_progress(tx, token, 1, 1, "Prune complete").await;
         Ok(json!({
             "status": "pruned",

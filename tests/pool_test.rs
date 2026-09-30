@@ -1264,6 +1264,36 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// `prune` retires the saved conversation of a worker whose branch is gone
+/// (merged and deleted) and keeps one whose branch can still be revised.
+#[test]
+fn prune_retires_histories_whose_branch_is_gone() {
+    let dir = scratch_dir("history-orphans");
+    let _scope = ScopedTempDir::set(&dir);
+    let repo = scratch_repo("history-orphans");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["branch", "worker-alive"]);
+    mini_swe_mcp::pool::save_worker_history("alive", &sample_history(&repo, "abc", "worker-alive"))
+        .expect("save the revisable history");
+    mini_swe_mcp::pool::save_worker_history("merged", &sample_history(&repo, "abc", "worker-merged"))
+        .expect("save the orphaned history");
+
+    assert_eq!(mini_swe_mcp::pool::prune_orphan_histories(&repo), 1);
+    assert!(mini_swe_mcp::pool::history_path("alive").is_file(), "a live branch keeps its history");
+    assert!(!mini_swe_mcp::pool::history_path("merged").exists(), "a deleted branch loses it");
+
+    mini_swe_mcp::pool::remove_worker_history("alive");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 #[tokio::test]
 async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // A finished worker steered with corrections restarts on its preserved
@@ -1367,7 +1397,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
 #[tokio::test]
 async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     // Collection evicts the record but the worker becomes registry-only, not
-    // unrevisable: the history file must survive it (only prune/reap retire
+    // unrevisable: the history file must survive it (only prune retires
     // it), so a later steer can still revise the same id and branch.
     let dir = scratch_dir("collect-keeps-history");
     let _scope = ScopedTempDir::set(&dir);
@@ -1391,7 +1421,7 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     pool.collect("keep1").await.expect("collect the worker");
     assert!(
         mini_swe_mcp::pool::history_path("keep1").is_file(),
-        "collect must not delete the history file; only prune/reap retire it"
+        "collect must not delete the history file; only prune retires it"
     );
     mini_swe_mcp::pool::remove_worker_history("keep1");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1431,4 +1461,98 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+// ----------
+// Hub H-5a: event-driven waits, coalesced registry writes, one HTTP client
+// ----------
+
+/// A synthetic state change wakes a subscribed waiter without any tick.
+#[tokio::test]
+async fn change_subscription_fires_on_every_state_change() {
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    pool.__test_insert_worker(running_worker("h5a-sub")).await;
+    let mut changes = pool.subscribe_changes();
+    // The subscription starts at the current generation, so only the state
+    // change below may resolve it.
+    let changed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        changes.changed(),
+    );
+    pool.__test_set_worker_state(
+        "h5a-sub",
+        WorkerState::Paused {
+            question: "q?".into(),
+            step: 1,
+            paused_at: 0,
+        },
+    )
+    .await;
+    changed.await.expect("the waiter must observe the change").expect("watch open");
+}
+
+/// Step-only registry updates coalesce; a status transition writes at once.
+#[tokio::test]
+async fn step_only_registry_updates_coalesce_to_one_write() {
+    let dir = scratch_dir("h5a-reg");
+    let _scope = ScopedTempDir::set(&dir);
+    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let meta = mini_swe_mcp::pool::WorkerMeta {
+        id: "h5a-reg".into(),
+        task: "t".into(),
+        group: None,
+        repo_path: None,
+        started_at: 0,
+        pid: std::process::id(),
+        metrics: WorkerMetrics::default(),
+    };
+    let row_path =
+        std::path::PathBuf::from(&dir).join("swe-registry").join("h5a-reg.json");
+    let mtime = || std::fs::metadata(&row_path).ok().and_then(|m| m.modified().ok());
+
+    // First write always lands (there is no row yet to coalesce with)...
+    pool.__test_save_status(&meta, "m", RegistryStatus::Running, 1, 10, "ls", None);
+    assert!(row_path.exists(), "the first registry row must be written");
+    let first = mtime();
+    // ...but N rapid step-only updates behind the throttle window do not.
+    for step in 2..=10usize {
+        pool.__test_save_status(&meta, "m", RegistryStatus::Running, step, 10, "ls", None);
+    }
+    assert_eq!(mtime(), first, "rapid step updates must coalesce to one file write");
+
+    // Past the throttle window a step update lands again, so the final state
+    // can never be stuck behind the throttle.
+    pool.__test_reset_registry_throttle("h5a-reg");
+    pool.__test_save_status(&meta, "m", RegistryStatus::Running, 11, 10, "ls", None);
+    assert!(mtime() >= first, "a step update past the window must be written");
+    let stepped = mtime();
+
+    // A status transition is never throttled.
+    pool.__test_save_status(&meta, "m", RegistryStatus::Paused, 11, 10, "ls", Some("q?".into()));
+    let entry: WorkerRegistryEntry =
+        serde_json::from_str(&std::fs::read_to_string(&row_path).expect("row readable"))
+            .expect("row parses");
+    assert_eq!(entry.status, RegistryStatus::Paused);
+    assert_eq!(entry.question.as_deref(), Some("q?"));
+    assert!(mtime() >= stepped, "a status transition must write immediately");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every runner reuses the single process-wide HTTP client.
+#[test]
+fn agent_runners_share_one_http_client() {
+    use mini_swe_mcp::agent::AgentRunner;
+    let _first = AgentRunner::new("http://x".into(), "k".into(), "m".into(), None);
+    let builds = AgentRunner::__test_shared_client_builds();
+    assert_eq!(builds, 1, "the first runner builds the one shared client");
+    // Further runners — even against another base URL — must not build again:
+    // they clone the shared client, so connections and TLS sessions are reused.
+    let _second = AgentRunner::new("http://y".into(), "k".into(), "m".into(), None);
+    let _third = AgentRunner::new("http://z".into(), "k".into(), "m".into(), None);
+    assert_eq!(
+        AgentRunner::__test_shared_client_builds(),
+        builds,
+        "runners must reuse one client so connections and TLS sessions are shared"
+    );
 }

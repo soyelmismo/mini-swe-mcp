@@ -424,11 +424,13 @@ impl<'a> TurnEngine<'a> {
         let label = format!("{}{}", config.label_prefix, cmd_summary);
 
         // --- In-memory state update ---
-        {
-            let mut lock = self.pool.workers.write().await;
-            if let Some(w) = lock.get_mut(self.worker_id) {
-                // Same critical section refreshes the cached metrics, so a kill
-                // racing this turn still reports the counters up to it.
+        // One write-guard moves the step counter, refreshes the cached metrics
+        // and bumps the change generation, so a waiter parked in
+        // `await_worker_result_until` wakes on this step instead of on the next
+        // 500 ms tick. Refreshing the cached metrics in the same critical
+        // section keeps a kill racing this turn reporting the counters to it.
+        self.pool
+            .update_worker(self.worker_id, |w| {
                 w.metrics = self.meta.metrics;
                 if let WorkerState::Running {
                     step: ref mut s,
@@ -439,11 +441,12 @@ impl<'a> TurnEngine<'a> {
                     *s = *self.step;
                     *last_command = label.clone();
                 }
-            }
-        }
+            })
+            .await;
 
-        // --- Registry update through WorkerMeta::save_status ---
-        self.meta.save_status(
+        // --- Registry update, coalesced by the pool's writer ---
+        self.pool.save_status(
+            self.meta,
             config.model,
             config.status,
             *self.step,

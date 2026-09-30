@@ -363,10 +363,8 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     if let Some(name) = wt_path.file_name().and_then(|n| n.to_str())
         && let Some(id) = name.strip_prefix("swe-wt-")
     {
-        for base in super::swe_base_dirs() {
-            let _ = std::fs::remove_file(base.join(format!("swe-wt-{id}.history.json")));
-            let _ = std::fs::remove_file(base.join(format!("swe-wt-{id}.steer")));
-        }
+        crate::pool::remove_worker_history(id);
+        crate::pool::remove_steer_file(id);
     }
 }
 

@@ -12,7 +12,8 @@
 //! file carries both.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{ChatMessage, Role};
 
@@ -142,12 +143,12 @@ pub fn load_worker_history(worker_id: &str) -> Result<WorkerHistory> {
     Ok(history)
 }
 
-/// Delete the conversation file of `worker_id` (prune, reap, collect).
+/// Delete the conversation file of `worker_id` (on prune).
 ///
 /// Every known base dir is swept: a `SWE_TEMP_DIR` that moved is not a reason
 /// to leak an owner-only file carrying tool output.
 pub fn remove_worker_history(worker_id: &str) {
-    for base in crate::worktree::swe_base_dirs_for_cleanup() {
+    for base in crate::worktree::swe_base_dirs() {
         let path = base.join(format!("swe-wt-{worker_id}.history.json"));
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -160,6 +161,60 @@ pub fn remove_worker_history(worker_id: &str) {
             ),
         }
     }
+}
+
+/// Delete the saved conversations of `repo_root`'s workers whose branch is
+/// gone (merged and deleted, or pruned): nothing can revise them any more.
+///
+/// A finished worker has no worktree left, so the worktree sweep of `prune`
+/// never reaches its history file; this is the sweep that does.
+pub fn prune_orphan_histories(repo_root: &Path) -> usize {
+    /// The two fields the sweep needs, without parsing the conversation.
+    #[derive(Deserialize)]
+    struct Owner {
+        repo_path: String,
+        branch: String,
+    }
+    let Ok(root) = repo_root.canonicalize() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for base in crate::worktree::swe_base_dirs() {
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("swe-wt-"))
+                .and_then(|n| n.strip_suffix(".history.json"))
+            else {
+                continue;
+            };
+            let Some(owner) = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Owner>(&raw).ok())
+            else {
+                continue;
+            };
+            if Path::new(&owner.repo_path).canonicalize().ok().as_deref() != Some(root.as_path()) {
+                continue;
+            }
+            let reference = format!("refs/heads/{}", owner.branch);
+            let branch_exists = crate::worktree::git(
+                &root,
+                "rev-parse",
+                &["rev-parse", "--verify", "--quiet", &reference],
+            )
+            .is_ok_and(|out| out.status.success());
+            if !branch_exists {
+                remove_worker_history(id);
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 use super::runner::WorkerLaunchConfig;

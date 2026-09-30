@@ -6,6 +6,7 @@
 //! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::retry;
@@ -27,6 +28,37 @@ enum StreamRun {
     Retry,
 }
 
+/// How many process-wide HTTP clients have been built.
+///
+/// `reqwest::Client::clone` shares the inner connection pool, so every runner
+/// constructed from [`shared_http_client`] reuses the same connections and TLS
+/// sessions; the counter pins that down to one build per process.
+static SHARED_CLIENT_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        SHARED_CLIENT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        reqwest::Client::builder()
+            .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
+
+impl AgentRunner {
+    /// How many process-wide HTTP clients have been built (test support).
+    ///
+    /// Building more runners must not move this counter: they all clone the
+    /// one shared client, so connections and TLS sessions are reused.
+    #[doc(hidden)]
+    pub fn __test_shared_client_builds() -> usize {
+        SHARED_CLIENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub struct AgentRunner {
     pub http_client: reqwest::Client,
     pub api_base: String,
@@ -38,17 +70,16 @@ pub struct AgentRunner {
     pub network_offline: bool,
     /// Idle deadline applied to each SSE body read.
     pub stream_idle_timeout: Duration,
+    /// Fixed per-step command budget in seconds, replacing the light/heavy
+    /// classification (tests use it to avoid mutating the process env).
+    pub command_timeout_override: Option<u64>,
     pub max_retries: usize,
     pub initial_retry_delay: Duration,
 }
 
 impl AgentRunner {
     pub fn new(api_base: String, api_key: String, model: String, temperature: Option<f32>) -> Self {
-        let http_client = reqwest::Client::builder()
-            .user_agent(format!("mini-swe-mcp/{}", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HTTP client");
+        let http_client = shared_http_client().clone();
 
         Self {
             http_client,
@@ -58,6 +89,7 @@ impl AgentRunner {
             temperature,
             network_offline: false,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            command_timeout_override: None,
             max_retries: retry::max_llm_retries(),
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
         }
@@ -66,6 +98,12 @@ impl AgentRunner {
     /// Confine every bash step to an isolated network namespace (`unshare -n`).
     pub fn with_network_offline(mut self, offline: bool) -> Self {
         self.network_offline = offline;
+        self
+    }
+
+    /// Give every bash step the same `secs` budget, whatever the command.
+    pub fn with_command_timeout(mut self, secs: u64) -> Self {
+        self.command_timeout_override = Some(secs);
         self
     }
 

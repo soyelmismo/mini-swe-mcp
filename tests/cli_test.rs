@@ -20,6 +20,7 @@ fn test_cli_version_flag() {
     let exe = binary_path();
     for flag in ["--version", "-V"] {
         let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
             .arg(flag)
             .output()
             .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -39,6 +40,7 @@ fn test_cli_help_flag() {
     let exe = binary_path();
     for flag in ["--help", "-h"] {
         let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
             .arg(flag)
             .output()
             .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -71,6 +73,7 @@ fn test_cli_flags_without_api_key() {
     let mut outputs = Vec::new();
     for flag in ["--version", "-V", "--help", "-h"] {
         let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
             .current_dir(&temp)
             .arg(flag)
             .env_remove("OPENAI_API_KEY")
@@ -120,6 +123,7 @@ fn test_cli_flags_without_api_key() {
 fn test_cli_unknown_action() {
     let exe = binary_path();
     let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
         .arg("nonexistent_action_xyz")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -147,6 +151,7 @@ fn test_cli_unknown_action() {
 fn test_cli_typo_suggestion() {
     let exe = binary_path();
     let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
         .arg("statsu")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -163,6 +168,7 @@ fn test_cli_typo_suggestion() {
 fn test_cli_prefix_suggestion() {
     let exe = binary_path();
     let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
         .arg("disp")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
@@ -184,6 +190,7 @@ fn test_cli_prune_action() {
 
     // 1. Plain text format (default)
     let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .arg("prune")
         .output()
@@ -192,12 +199,13 @@ fn test_cli_prune_action() {
     assert!(output.status.success(), "prune plain text failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("✓ Stale worktrees and orphaned worker branches pruned"),
+        stdout.contains("✓ Stale worktrees and dead worker branches cleaned up"),
         "expected formatted plain text, got: {stdout}"
     );
 
     // 2. JSON format with --json flag
     let output_json = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(&temp)
         .args(["prune", "--json"])
         .output()
@@ -209,12 +217,13 @@ fn test_cli_prune_action() {
     let stdout_json = String::from_utf8_lossy(&output_json.stdout);
     let val: serde_json::Value =
         serde_json::from_str(stdout_json.trim()).expect("prune --json must return valid JSON");
-    assert_eq!(val["status"], "ok");
+    assert_eq!(val["status"], "pruned");
 }
 
 fn run_action(exe: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(exe)
         .args(args)
+        .env("MINI_SWE_NO_DAEMON", "1")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("OPENAI_API_KEY", "test-key-not-used-by-manifest-or-list")
         .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
@@ -305,8 +314,12 @@ fn test_cli_status_renders_the_health_line() {
     std::fs::write(registry.join(format!("{legacy}.json")), legacy_row)
         .expect("write the legacy registry row");
 
+    // The registry lives under `SWE_TEMP_DIR` and the hub must not share it:
+    // orphaned registry rows with no worktree or branch are reaped on `list`,
+    // so the hub gets its own scratch dir and `status` reads rows in-process.
     let status = |wid: &str| {
         let output = Command::new(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
             .args(["status", wid])
             .env("SWE_TEMP_DIR", &swe)
             .env("OPENAI_API_KEY", "test-key-not-used-by-status")

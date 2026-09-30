@@ -111,12 +111,17 @@ impl Drop for TempDir {
 // ----------
 // Running the crate's binary
 // ----------
+//
+// Every helper pins `MINI_SWE_NO_DAEMON=1`: these tests exercise the CLI
+// itself, and must never auto-start or reach the developer's real hub daemon.
+// The hub transport is tested end to end in tests/hub_test.rs.
 
 /// Run the binary in the current working directory.
 pub fn run_exe(args: &[&str]) -> Output {
     let exe = binary_path();
     Command::new(&exe)
         .args(args)
+        .env("MINI_SWE_NO_DAEMON", "1")
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} {args:?}: {e}", exe.display()))
 }
@@ -129,6 +134,7 @@ pub fn run_exe_in_dir(exe: &Path, dir: &Path, args: &[&str]) -> Output {
     Command::new(exe)
         .args(args)
         .current_dir(dir)
+        .env("MINI_SWE_NO_DAEMON", "1")
         .env("HOME", dir)
         .env("XDG_CONFIG_HOME", dir.join(".config"))
         .env("ENV_FILE", dir.join(".env.does-not-exist"))
@@ -150,6 +156,7 @@ pub fn run_exe_on_manifest(args: &[&str]) -> Output {
     Command::new(binary_path())
         .args(args)
         .current_dir(manifest_dir)
+        .env("MINI_SWE_NO_DAEMON", "1")
         .env("OPENAI_API_KEY", "test-key-not-used-by-manifest-or-list")
         .env("ENV_FILE", manifest_dir.join(".env.does-not-exist"))
         .env("MODELS_FILE", manifest_dir.join("models.yaml"))

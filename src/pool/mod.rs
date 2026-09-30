@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -51,7 +51,7 @@ pub use self::runner::{
 };
 pub use self::revision::{
     DEFAULT_REVISION_TURNS, REVISION_PREFIX, WorkerHistory, history_path, is_replayable,
-    load_worker_history, remove_worker_history, save_worker_history,
+    load_worker_history, prune_orphan_histories, remove_worker_history, save_worker_history,
 };
 pub use self::runner::RunConfig;
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
@@ -93,6 +93,8 @@ pub struct WorkerPool {
     bash_semaphore: Arc<Semaphore>,
     build_semaphore: Arc<Semaphore>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
+    changes: watch::Sender<u64>,
+    registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
     /// Checkout directory of every live worker. The `WorktreeGuard` stays the
     /// owner of the worktree itself; the pool only needs to know *where* a
     /// worker works so `kill` can commit what it leaves behind before the
@@ -147,6 +149,8 @@ impl WorkerPool {
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             build_semaphore: Arc::new(Semaphore::new(build_slots)),
             workers: Arc::new(RwLock::new(HashMap::new())),
+            changes: watch::channel(0).0,
+            registry: Arc::new(std::sync::Mutex::new(registry::RegistryWriter::default())),
             worktrees: Arc::new(RwLock::new(HashMap::new())),
             api_base,
             api_key,
@@ -154,6 +158,40 @@ impl WorkerPool {
             terminal_ttl,
             manifest: Arc::new(ModelManifest::default()),
         }
+    }
+
+    /// Subscribe before reading state so a concurrent change cannot be missed.
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify_change(&self) {
+        self.changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// All worker progress and lifecycle mutations notify under the write lock.
+    async fn update_worker(&self, id: &str, update: impl FnOnce(&mut WorkerRecord)) {
+        let mut workers = self.workers.write().await;
+        if let Some(worker) = workers.get_mut(id) {
+            update(worker);
+            self.notify_change();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_status(
+        &self,
+        meta: &WorkerMeta,
+        model: &str,
+        status: RegistryStatus,
+        step: usize,
+        max_turns: usize,
+        last_command: &str,
+        question: Option<String>,
+    ) {
+        self.registry.lock().expect("registry lock poisoned").save(
+            meta.entry(model, status, step, max_turns, last_command, question),
+        );
     }
 
     /// Attach the model manifest this pool's workers resolve against (the
@@ -212,11 +250,10 @@ impl WorkerPool {
         for id in &expired {
             lock.remove(id);
             remove_registry_entry(id);
-            // The conversation outlives the record only for review; a reaped
-            // worker is past review, so its history file goes with it.
-            remove_worker_history(id);
+            self.registry.lock().expect("registry lock poisoned").remove(id);
         }
         if !expired.is_empty() {
+            self.notify_change();
             tracing::info!(
                 count = expired.len(),
                 ttl_secs = ttl,
@@ -278,7 +315,7 @@ impl WorkerPool {
             revision: 0,
         };
 
-        meta.save_status(&model, RegistryStatus::Running, 0, max_turns, "initializing", None);
+        self.save_status(&meta, &model, RegistryStatus::Running, 0, max_turns, "initializing", None);
 
         // Prune stale terminal records *before* inserting, so a long-lived
         // server bounds residency even without the background reaper
@@ -287,6 +324,7 @@ impl WorkerPool {
             let mut lock = self.workers.write().await;
             let expired = self.reap_locked(&mut lock);
             lock.insert(worker_id.clone(), initial_record);
+            self.notify_change();
             expired
         };
         self.forget_worktrees(&expired).await;
@@ -322,11 +360,9 @@ impl WorkerPool {
             // before failing are still readable here.
             if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {
                 error!(worker = %wid, error = %e, "Worker failed with error");
-                let mut lock = pool.workers.write().await;
-                if let Some(w) = lock.get_mut(&wid) {
-                    w.fail(e.to_string());
-                }
-                meta_for_fail.save_status(
+                pool.update_worker(&wid, |w| w.fail(e.to_string())).await;
+                pool.save_status(
+                    &meta_for_fail,
                     &model_for_fail,
                     RegistryStatus::Failed,
                     0,
@@ -391,9 +427,44 @@ impl WorkerPool {
             .write()
             .await
             .insert(record.id.clone(), record);
+        self.notify_change();
     }
 
-    /// Lightweight poll for the 500 ms progress loops.
+    /// Change a synthetic worker's state through the normal notification path.
+    #[doc(hidden)]
+    pub async fn __test_set_worker_state(&self, id: &str, state: WorkerState) {
+        self.update_worker(id, |worker| worker.state = state).await;
+    }
+
+    /// Route one registry write through the coalescing writer (test support).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __test_save_status(
+        &self,
+        meta: &WorkerMeta,
+        model: &str,
+        status: RegistryStatus,
+        step: usize,
+        max_turns: usize,
+        last_command: &str,
+        question: Option<String>,
+    ) {
+        self.save_status(meta, model, status, step, max_turns, last_command, question);
+    }
+
+    /// Forget the last-write timestamp of `id`'s row (test support).
+    ///
+    /// Lets a test drive the coalescing writer past its throttle window
+    /// without sleeping for it.
+    #[doc(hidden)]
+    pub fn __test_reset_registry_throttle(&self, id: &str) {
+        self.registry
+            .lock()
+            .expect("registry lock poisoned")
+            .reset_throttle(id);
+    }
+
+    /// Lightweight snapshot for progress waiters.
     ///
     /// Clones only the small strings needed to render progress and never the
     /// potentially multi-megabyte terminal payload.
@@ -535,20 +606,18 @@ impl WorkerPool {
         let tx_opt = {
             let mut lock = self.workers.write().await;
             let Some(w) = lock.get_mut(id) else {
-                // Not ours: queue the guidance in the worker's on-disk
-                // mailbox so the process that owns it picks it up. The guard is
-                // released before the write, and the write is a blocking
-                // `std::fs` call, so it must happen outside the lock.
-                // Not in this process: it may still be a finished worker whose
-                // registry row and history file survived (e.g. after a hub
-                // restart). A revision there relaunches the loop here, on the
-                // same id and branch; otherwise the message is queued for the
-                // owning process.
-                if load_registry_entry(id).is_some_and(|e| e.status.is_terminal()) {
-                    drop(lock);
+                drop(lock);
+                // Not in this process. A finished worker (its record reaped,
+                // or the hub restarted) still has its history file: unless a
+                // live process owns the row, the message relaunches it here as
+                // a revision on the same id and branch.
+                let owned_elsewhere =
+                    load_registry_entry(id).is_some_and(|e| !e.status.is_terminal());
+                if !owned_elsewhere && revision::history_path(id).is_file() {
                     return self.revise(id, message, revision_turns).await;
                 }
-                drop(lock);
+                // Otherwise queue it in the on-disk mailbox for the owning
+                // process (a blocking write, so outside the lock).
                 let path = write_steer_message(id, &message).map_err(|e| {
                     anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
                 })?;
@@ -641,18 +710,61 @@ impl WorkerPool {
         }
     }
 
+    /// The registry row a killed worker must end on.
+    ///
+    /// A kill is a status transition like any other, so the row is written at
+    /// once rather than coalesced: the monitor and crash recovery read these
+    /// files, and a row left at `running` with a dead pid is only normalised
+    /// to `stopped` by a reader that happens to look. `None` when the worker
+    /// never wrote a row (a synthetic record), so nothing is invented.
+    fn killed_entry(&self, worker: &WorkerRecord) -> Option<WorkerRegistryEntry> {
+        let mut entry = self
+            .registry
+            .lock()
+            .expect("registry lock poisoned")
+            .entry(&worker.id)
+            .cloned()?;
+        entry.status = RegistryStatus::Failed;
+        entry.step = worker.state.step();
+        entry.last_command = match &worker.state {
+            WorkerState::Failed { error, .. } => format!("error: {error}"),
+            _ => return None,
+        };
+        entry.question = None;
+        entry.metrics = worker.metrics;
+        entry.updated_at = unix_timestamp();
+        Some(entry)
+    }
+
+    /// Write the rows of workers killed in one pass, after the guard is gone.
+    fn persist_kills(&self, entries: Vec<WorkerRegistryEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut registry = self.registry.lock().expect("registry lock poisoned");
+        for entry in entries {
+            registry.save(entry);
+        }
+    }
+
     pub async fn kill(&self, id: &str) -> bool {
         self.checkpoint_before_kill(id).await;
-        let mut lock = self.workers.write().await;
-        if let Some(w) = lock.get_mut(id) {
+        // The row is built under the guard and written after it is released:
+        // a blocking file write must never sit inside a pool write-lock.
+        let entry = {
+            let mut lock = self.workers.write().await;
+            let Some(w) = lock.get_mut(id) else {
+                return false;
+            };
             if let Some(handle) = w.handle.take() {
                 handle.abort();
             }
             w.fail("Manually terminated by user/orchestrator");
-            true
-        } else {
-            false
-        }
+            self.notify_change();
+            self.killed_entry(w)
+        };
+        self.persist_kills(entry.into_iter().collect());
+        true
     }
 
     /// Terminate every worker currently tracked by the pool.
@@ -660,18 +772,27 @@ impl WorkerPool {
     /// Walks the map once under a single write-guard with no `.await`, so the
     /// critical section stays O(n) and is never prolonged in wall-clock time.
     pub async fn kill_all(&self) -> usize {
-        let mut lock = self.workers.write().await;
-        let mut count = 0usize;
-        for worker in lock.values_mut() {
-            if !matches!(worker.state, WorkerState::Running { .. } | WorkerState::Paused { .. }) {
-                continue;
+        let (count, entries) = {
+            let mut lock = self.workers.write().await;
+            let mut count = 0usize;
+            let mut entries = Vec::new();
+            for worker in lock.values_mut() {
+                if !matches!(worker.state, WorkerState::Running { .. } | WorkerState::Paused { .. }) {
+                    continue;
+                }
+                if let Some(handle) = worker.handle.take() {
+                    handle.abort();
+                }
+                worker.fail("Server shutting down (received SIGINT)");
+                if let Some(entry) = self.killed_entry(worker) {
+                    entries.push(entry);
+                }
+                self.notify_change();
+                count += 1;
             }
-            if let Some(handle) = worker.handle.take() {
-                handle.abort();
-            }
-            worker.fail("Server shutting down (received SIGINT)");
-            count += 1;
-        }
+            (count, entries)
+        };
+        self.persist_kills(entries);
         count
     }
 
@@ -686,13 +807,15 @@ impl WorkerPool {
         let record = {
             let mut lock = self.workers.write().await;
             let record = lock.remove(id)?;
+            self.registry.lock().expect("registry lock poisoned").remove(id);
+            self.notify_change();
             drop(lock);
             record
         };
         self.worktrees.write().await.remove(id);
         // The saved conversation stays: a collected worker is registry-only
         // from here on, and steering it must still revise it (same id, same
-        // branch, full context). Only prune/reap retire the history file.
+        // branch, full context). Only prune retires the history file.
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         let dropped = record.logs.dropped();
         let view = emit_view(&record.logs, self.log_policy.max_emitted);

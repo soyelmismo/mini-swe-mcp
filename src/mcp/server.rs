@@ -13,6 +13,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace};
@@ -38,23 +39,26 @@ pub struct McpServer {
 
 /// Identity of one client connection serving MCP requests.
 ///
-/// Carried into request handling so later tasks can attach per-connection
-/// state (such as the owning agent); for now it is only an id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Hello metadata is descriptive only; it does not grant ownership or authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConnectionContext {
     /// Connection id, unique per process for log correlation.
     pub id: u64,
+    pub agent_id: Option<String>,
+    pub pid: Option<u32>,
+    pub version: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl ConnectionContext {
     /// Context for the stdio transport, which serves exactly one connection.
     pub fn stdio() -> Self {
-        Self { id: 0 }
+        Self::hub_connection(0)
     }
 
     /// Context for the `id`-th accepted hub connection (1-based).
     pub fn hub_connection(id: u64) -> Self {
-        Self { id }
+        Self { id, agent_id: None, pid: None, version: None, cwd: None }
     }
 }
 
@@ -103,7 +107,7 @@ impl McpServer {
         &self,
         reader: R,
         writer: W,
-        ctx: ConnectionContext,
+        mut ctx: ConnectionContext,
     ) -> Result<()>
     where
         R: AsyncBufRead + Unpin,
@@ -149,27 +153,31 @@ impl McpServer {
                 continue;
             }
 
+            let req = match parse_frame(line) {
+                Ok(req) => req,
+                Err(rejection) => {
+                    error!("Rejected JSON-RPC frame: {rejection:?}");
+                    let _ = out_tx.send(rejection.into_frame()).await;
+                    continue;
+                }
+            };
+            // Process hello in wire order before snapshotting the next request's context.
+            if req.id.is_none() {
+                if req.method == "hub/hello" {
+                    let params = req.params.unwrap_or_default();
+                    ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
+                    ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
+                    ctx.version = params["version"].as_str().map(str::to_owned);
+                    ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
+                        .filter(|cwd| cwd.is_absolute());
+                }
+                trace!(method = %req.method, "Received notification");
+                continue;
+            }
             let server = self.clone();
             let tx = out_tx.clone();
-            let owned_line = line.to_string();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                let line = owned_line.as_str();
-                let req = match parse_frame(line) {
-                    Ok(req) => req,
-                    Err(rejection) => {
-                        error!("Rejected JSON-RPC frame: {rejection:?}");
-                        let _ = tx.send(rejection.into_frame()).await;
-                        return;
-                    }
-                };
-
-                // JSON-RPC 2.0 §4.1: a Notification is a Request object without
-                // an `id` (absent or `null`); the server MUST NOT reply to it.
-                if req.id.is_none() {
-                    trace!(method = %req.method, "Received notification");
-                    return;
-                }
-
                 let response = server.handle_request(req, ctx, Some(tx.clone())).await;
                 let frame = response
                     .to_frame()
@@ -224,7 +232,7 @@ impl McpServer {
                     .cloned();
 
                 match self
-                    .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
+                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, &ctx)
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
@@ -270,13 +278,20 @@ impl McpServer {
         progress_token: Option<Value>,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> Result<Value> {
+        self.execute_tool_in_context(name, args, progress_token, progress_tx, &ConnectionContext::stdio()).await
+    }
+
+    async fn execute_tool_in_context(
+        &self, name: &str, args: Value, progress_token: Option<Value>,
+        progress_tx: Option<mpsc::Sender<String>>, ctx: &ConnectionContext,
+    ) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{name}'. Only 'worker' is supported.");
         }
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref())
+        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref(), ctx)
             .await
     }
 
@@ -295,7 +310,8 @@ impl McpServer {
             .await
     }
 
-    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
+    /// Wait on a worker until it finishes, fails, or pauses for orchestrator
+    /// input.
     ///
     /// Returns the terminal payload:
     /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
@@ -310,10 +326,19 @@ impl McpServer {
     ///
     /// Progress notifications are emitted only when a `progress_token`/`tx`
     /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
-    /// and the polling algorithm stays identical for both callers. While the
+    /// and the waiting algorithm stays identical for both callers. While the
     /// worker runs, the current step is re-sent as a heartbeat every
     /// [`PROGRESS_HEARTBEAT_INTERVAL`](Self::PROGRESS_HEARTBEAT_INTERVAL) so a
     /// step that never ends cannot be mistaken for an idle call.
+    ///
+    /// The wait itself is event-driven: the pool bumps a generation counter on
+    /// every worker state change and this loop sleeps on that subscription, so
+    /// a step, a pause, a resume or a terminal state is observed as it happens
+    /// instead of on a fixed tick. The only coarse tick left is
+    /// [`CROSS_PROCESS_TICK`](Self::CROSS_PROCESS_TICK), for a worker this
+    /// process does not own (another `mini-swe-mcp` process, or
+    /// `MINI_SWE_NO_DAEMON` mode): its state changes are invisible to the
+    /// subscription, so the registry has to be re-read.
     pub async fn await_worker_result_until(
         &self,
         wid: &str,
@@ -328,15 +353,25 @@ impl McpServer {
         let mut last_reported_step = 0;
         let mut last_reported_at = std::time::Instant::now();
         let mut last_progress: Option<crate::pool::WorkerProgress> = None;
+        // Subscribed before the first read, so a change landing between the
+        // read and the sleep is still seen by `changed()`.
+        let mut changes = self.pool.subscribe_changes();
+        // A worker owned by another process never bumps this pool's counter, so
+        // its wait falls back to re-reading the registry on a coarse tick.
+        let tick = if self.pool.worker_progress(wid).await.is_some() {
+            Self::HEARTBEAT_TICK
+        } else {
+            Self::CROSS_PROCESS_TICK
+        };
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            // H-5: poll the lightweight progress snapshot. It never clones the
+            // H-5: read the lightweight progress snapshot. It never clones the
             // (potentially multi-megabyte) `diff`/`summary`/`artifacts` that a
-            // `get_worker_state` clone would copy on every 500 ms tick.
+            // `get_worker_state` clone would copy on every tick.
             if let Some(progress) = self.pool.worker_progress(wid).await {
                 last_progress = Some(progress);
             }
             let Some(progress) = last_progress.as_ref() else {
+                Self::wait_for_change(&mut changes, tick).await;
                 continue;
             };
             match progress.phase {
@@ -435,6 +470,22 @@ impl McpServer {
                     "last_command": progress.last_command,
                 }));
             }
+            Self::wait_for_change(&mut changes, tick).await;
+        }
+    }
+
+    /// Sleep until the pool reports a worker state change, or `tick` elapses.
+    ///
+    /// The tick is a safety net rather than the primary wake-up: it bounds how
+    /// long a missed notification can stall the wait, and it is clamped to the
+    /// heartbeat interval so a step that never ends still reports in.
+    async fn wait_for_change(changes: &mut tokio::sync::watch::Receiver<u64>, tick: Duration) {
+        let wait = tick.min(Self::PROGRESS_HEARTBEAT_INTERVAL);
+        tokio::select! {
+            // A new generation means some worker moved; the caller re-reads the
+            // snapshot it cares about and decides whether it was the one.
+            _ = changes.changed() => {}
+            _ = tokio::time::sleep(wait) => {}
         }
     }
 }

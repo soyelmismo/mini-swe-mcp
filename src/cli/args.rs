@@ -59,7 +59,7 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
                 }
             }
         }
-        "manifest" | "list" | "reap" => {}
+        "manifest" | "list" | "reap" | "prune" => {}
         _ => {
             let actions = crate::cli::available_actions();
             let msg = if let Some(suggestion) = crate::cli::suggest_action(action, &actions) {

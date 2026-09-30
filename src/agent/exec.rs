@@ -134,7 +134,9 @@ impl AgentRunner {
         // Classify on the model's own command, before any offline wrapper is
         // applied: a wrapper would otherwise mask the command's heaviness
         // from the timeout classifier.
-        let timeout_secs = command_timeout_secs(command);
+        let timeout_secs = self
+            .command_timeout_override
+            .unwrap_or_else(|| command_timeout_secs(command));
 
         match select_backend() {
             SandboxBackend::Kernel => {
@@ -590,6 +592,10 @@ fn apply_build_env(cmd: &mut Command, target_dir: &Path, tmp_dir: &Path, paralle
         .env("TMPDIR", tmp_dir)
         .env("TMP", tmp_dir)
         .env("TEMP", tmp_dir)
+        // A mini-swe run nested inside the step (this crate's own test suite,
+        // or a worker driving the CLI) keeps its scratch data there too:
+        // the default `/var/tmp` is outside every sandbox's writable set.
+        .env("SWE_TEMP_DIR", tmp_dir)
         .env("CARGO_BUILD_JOBS", parallelism)
         .env("RUST_TEST_THREADS", parallelism)
         .env("NEXTEST_TEST_THREADS", parallelism)
@@ -1513,17 +1519,12 @@ mod tests {
     async fn timed_out_command_still_reports_the_output_it_produced() {
         let tmp = crate::worktree::swe_base_dir().join("exec-drain-test");
         let _ = std::fs::create_dir_all(&tmp);
-        // A one-second budget, so the test stays quick.
-        // SAFETY: this test binary runs its tests single-threaded, and no other
-        // thread in this process reads the command timeout variables.
-        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
 
         let (out, code) = runner()
+            .with_command_timeout(1)
             .execute_bash(&tmp, "echo EARLY-STDOUT; echo EARLY-STDERR >&2; sleep 300")
             .await
             .expect("a timeout is an ordinary result, not an error");
-
-        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
 
         assert_eq!(
             code,
@@ -1551,18 +1552,16 @@ mod tests {
     async fn a_leaked_pipe_does_not_hang_the_timeout_path() {
         let tmp = crate::worktree::swe_base_dir().join("exec-leak-test");
         let _ = std::fs::create_dir_all(&tmp);
-        unsafe { std::env::set_var("COMMAND_LIGHT_TIMEOUT_SECS", "1") };
 
         // `setsid` detaches the sleeper from the killed process group, so it
         // keeps the inherited stdout open past the SIGKILL.
         let started = std::time::Instant::now();
         let (out, code) = runner()
+            .with_command_timeout(1)
             .execute_bash(&tmp, "echo BEFORE-LEAK; (setsid sleep 300 &); sleep 300")
             .await
             .expect("a leaked pipe must not turn the timeout into a hang");
         let elapsed = started.elapsed();
-
-        unsafe { std::env::remove_var("COMMAND_LIGHT_TIMEOUT_SECS") };
 
         assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "{out:?}");
         assert!(
@@ -1870,6 +1869,24 @@ mod tests {
         assert_eq!(choose_backend(false, false, no, no), Unconfined);
     }
 
+    /// A step's temp and nested-scratch variables point at one private dir the
+    /// sandbox lets it write, whichever backend confines it.
+    #[tokio::test]
+    async fn a_step_gets_a_writable_private_scratch_dir() {
+        let tmp = crate::worktree::swe_base_dir().join("exec-scratch-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let (out, code) = runner()
+            .execute_bash(
+                &tmp,
+                r#"[ "$TMPDIR" = "$SWE_TEMP_DIR" ] && mkdir -p "$SWE_TEMP_DIR/nested" && touch "$TMPDIR/probe" && echo scratch-ok"#,
+            )
+            .await
+            .expect("the probe must spawn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(code, Some(0), "{out:?}");
+        assert!(out.contains("scratch-ok"), "{out:?}");
+    }
+
     /// Run a python snippet under the kernel backend and return its stdout.
     ///
     /// Python's `ctypes` issues raw syscalls, which is the only way to check
@@ -1969,11 +1986,15 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             "unix sockets stay usable:\n{offline}"
         );
 
-        let online = run_confined_python(false, "seccomp-online", script).await;
-        assert!(
-            online.lines().any(|l| l == "tcp4 ok"),
-            "online workers keep inet sockets:\n{online}"
-        );
+        // The online half only means something where this process may open
+        // INET sockets itself (not, say, inside an offline worker step).
+        if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
+            let online = run_confined_python(false, "seccomp-online", script).await;
+            assert!(
+                online.lines().any(|l| l == "tcp4 ok"),
+                "online workers keep inet sockets:\n{online}"
+            );
+        }
     }
 
     /// A confined command still runs, and it still gets its own process group
