@@ -1,4 +1,5 @@
-//! One identity per agent session: the host process that owns it.
+//! One identity per agent session: the host process that owns it, and the
+//! session running inside it.
 //!
 //! An agent session is the HOST process — the `claude`, `opencode` or `agy`
 //! process an operator started. It spawns both the MCP stdio proxy and the
@@ -7,12 +8,22 @@
 //! and the `mini-swe-mcp watch` its shell runs afterwards see the same
 //! workers, while two hosts never see each other's.
 //!
+//! One host process is not always one session, though: opencode v2 runs a tab
+//! per session inside ONE process, over ONE shared MCP connection. So when the
+//! session is known it qualifies the host — `host:<comm>:<pid>:<start>/
+//! session:<id>` — and two sessions of one host are two agents. The session is
+//! read per MCP call from `CallToolRequest.params._meta.sessionID` (never
+//! cached on the connection, which several sessions share) and from the
+//! environment for the handshakes (see [`SESSION_ENV_VARS`]).
+//!
 //! The walk starts at the client process's *parent* and steps over the shells
 //! and wrappers a host puts between itself and the binary it launches
 //! (`mini-swe-mcp <- bash <- claude`), then names the first process left:
 //! `host:<comm>:<pid>:<starttime>`. The start time is field 22 of
 //! `/proc/<pid>/stat`, so a pid the kernel recycled never collides with the
-//! agent that held it before.
+//! agent that held it before. A service manager is never a host: a process
+//! daemonized with `setsid -f` is reparented to the user's `systemd`, which
+//! would otherwise give every detached process of that user one identity.
 //!
 //! The client computes its own identity and sends it in `hub/hello`. The
 //! daemon treats it as a coordination identity, exactly like the
@@ -37,6 +48,37 @@ const WRAPPERS: &[&str] = &[
 /// Ancestors the walk reads before giving up: a bound, so a corrupt or
 /// pathological `/proc` cannot spin here.
 const MAX_DEPTH: usize = 32;
+
+/// Processes that are never an agent host, however the walk reaches them.
+///
+/// A command started with `setsid -f` (or any other daemonizing fork) is
+/// reparented to the per-user service manager, so naming it would give every
+/// detached process of this user one shared identity — the same hole a single
+/// shared `cli` identity would be. The walk stops here and the next identity
+/// rule answers instead. The list is explicit: guessing at "looks like a
+/// daemon" would either miss the per-user manager or refuse a real host.
+const SERVICE_MANAGERS: &[&str] = &[
+    "systemd", "init", "launchd", "openrc", "openrc-init", "runit", "runsvdir", "s6-svscan",
+    "supervisord", "tini", "docker-init",
+];
+
+/// Environment variables that name the session inside the host process, in
+/// precedence order: the first one that is set wins.
+///
+/// `CLAUDE_CODE_SESSION_ID` is exported to both the shell commands and the MCP
+/// server of a Claude Code session; `OPENCODE_SESSION_ID` is opencode v2's
+/// spelling. `MINI_SWE_SESSION_ID` is the generic one for any other host. None
+/// of them reaches a plain `bash` tool call, which is what a watch token is
+/// for (see [`crate::hub::WatchTokens`]).
+pub const SESSION_ENV_VARS: &[&str] = &[
+    "CLAUDE_CODE_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+    "MINI_SWE_SESSION_ID",
+];
+
+/// Environment variable carrying a watch token: the caller is then exactly the
+/// identity that token was minted for (see [`crate::hub::WatchTokens`]).
+pub const WATCH_TOKEN_ENV: &str = "MINI_SWE_WATCH_TOKEN";
 
 /// One process in an ancestry, as `/proc/<pid>/stat` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +127,19 @@ pub enum Source {
     Override,
     /// The host process, plus the wrappers the walk stepped over.
     Host { host: Host, skipped: Vec<String> },
+    /// The host process *and* the session running inside it: a host that runs
+    /// several sessions is not one agent.
+    Session {
+        host: Host,
+        skipped: Vec<String>,
+        session: String,
+    },
+    /// A session the environment named, with no host process to attach it to.
+    SessionOnly { session: String },
+    /// A `MINI_SWE_WATCH_TOKEN`: the caller is exactly the identity that token
+    /// was minted for, which is how a shell that cannot know its session still
+    /// acts as the session that dispatched a worker.
+    Token,
     /// No host process to name, so the caller's transport identity stands.
     Fallback,
 }
@@ -110,13 +165,60 @@ impl Identity {
                 host.pid,
                 skipped.join(", ")
             ),
+            Source::Session { host, skipped, session } => format!(
+                "host process {} (pid {}){} in session {}",
+                host.comm,
+                host.pid,
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(", skipping {}", skipped.join(", "))
+                },
+                session
+            ),
+            Source::SessionOnly { session } => {
+                format!("session {session} (no host process to attach it to)")
+            }
+            Source::Token => "MINI_SWE_WATCH_TOKEN".to_string(),
             Source::Fallback => format!("no host process found; using '{}'", self.id),
         }
     }
 }
 
+/// The agent identity a hub connection presents: the host process the client
+/// walked, qualified by the session running inside it.
+///
+/// The one place the `host:…/session:…` spelling lives, so the client that
+/// computes its own identity and the daemon that combines the two fields of a
+/// `hub/hello` can never drift apart. `None` when neither is known, which
+/// leaves the caller's transport identity to answer.
+pub fn qualify(host: Option<&str>, session: Option<&str>) -> Option<String> {
+    let host = host.filter(|host| !host.is_empty());
+    let session = session.filter(|session| !session.is_empty());
+    match (host, session) {
+        (Some(host), Some(session)) => Some(format!("{host}/session:{session}")),
+        (Some(host), None) => Some(host.to_string()),
+        (None, Some(session)) => Some(format!("session:{session}")),
+        (None, None) => None,
+    }
+}
+
+/// The session this process runs in, when its host named one: the first of
+/// [`SESSION_ENV_VARS`] that is set to a non-empty value.
+pub fn session_from_env() -> Option<String> {
+    SESSION_ENV_VARS
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
+        .filter(|session| !session.is_empty())
+}
+
+/// Whether `comm` names a service manager rather than an agent host.
+pub fn is_service_manager(comm: &str) -> bool {
+    SERVICE_MANAGERS.contains(&comm)
+}
+
 /// Walk `ancestry` from `pid`'s parent and name the first ancestor that is
-/// neither a shell nor a wrapper.
+/// neither a shell, nor a wrapper, nor a service manager.
 ///
 /// The client process itself is never the host: it is the thing the host
 /// launched, so the walk starts one level up. `None` means every ancestor was
@@ -136,6 +238,12 @@ pub fn resolve(ancestry: &Ancestry, pid: u32) -> Option<Resolution> {
             return None;
         }
         visited.push(cursor);
+        // A service manager is not a host either: a process daemonized with
+        // `setsid -f` is reparented to the user's `systemd`, so naming it
+        // would give every detached process of this user one identity.
+        if is_service_manager(&process.comm) {
+            return None;
+        }
         if WRAPPERS.contains(&process.comm.as_str()) {
             skipped.push(process.comm.clone());
             cursor = process.ppid;
@@ -206,35 +314,91 @@ pub fn host_identity() -> Option<Host> {
 }
 
 /// Resolve this process's agent identity the way the hub will, in precedence
-/// order: the operator's `MINI_SWE_AGENT_ID`, then the host process, then
+/// order: the operator's `MINI_SWE_AGENT_ID`, then a `MINI_SWE_WATCH_TOKEN`,
+/// then the host process plus the session the environment names, then
 /// `fallback` for a client whose ancestry names no host.
 pub fn identity(fallback: &str) -> Identity {
     let override_id = std::env::var("MINI_SWE_AGENT_ID").ok();
     identity_of(std::process::id(), override_id.as_deref(), fallback)
 }
 
-/// The identity of `pid`: `override_id` when the operator named the agent, else
-/// the host process, else `fallback`.
+/// The identity of `pid`, reading the session and the watch token from this
+/// process's environment.
 pub fn identity_of(pid: u32, override_id: Option<&str>, fallback: &str) -> Identity {
+    identity_with_session(
+        pid,
+        override_id,
+        session_from_env().as_deref(),
+        fallback,
+    )
+}
+
+/// The identity of `pid` with the session supplied by the caller.
+///
+/// The seam the session split is tested through: the environment is
+/// process-global, so a test cannot set `CLAUDE_CODE_SESSION_ID` for one case
+/// and clear it for the next.
+pub fn identity_with_session(
+    pid: u32,
+    override_id: Option<&str>,
+    session: Option<&str>,
+    fallback: &str,
+) -> Identity {
     if let Some(agent_id) = override_id.filter(|id| !id.is_empty()) {
         return Identity {
             id: agent_id.to_string(),
             source: Source::Override,
         };
     }
-    match resolve(&ancestry(pid), pid) {
-        Some(resolution) => Identity {
+    // A watch token outranks the host: it is the only thing that ties a shell
+    // that cannot know its session to the session that dispatched a worker.
+    if let Some(identity) = watch_token_identity() {
+        return Identity {
+            id: identity,
+            source: Source::Token,
+        };
+    }
+    let session = session.filter(|session| !session.is_empty());
+    match (resolve(&ancestry(pid), pid), session) {
+        (Some(resolution), Some(session)) => Identity {
+            id: format!("{}/session:{session}", resolution.host),
+            source: Source::Session {
+                host: resolution.host,
+                skipped: resolution.skipped,
+                session: session.to_string(),
+            },
+        },
+        (Some(resolution), None) => Identity {
             id: resolution.host.to_string(),
             source: Source::Host {
                 host: resolution.host,
                 skipped: resolution.skipped,
             },
         },
-        None => Identity {
+        (None, Some(session)) => Identity {
+            id: format!("session:{session}"),
+            source: Source::SessionOnly {
+                session: session.to_string(),
+            },
+        },
+        (None, None) => Identity {
             id: fallback.to_string(),
             source: Source::Fallback,
         },
     }
+}
+
+/// The identity a `MINI_SWE_WATCH_TOKEN` in this process's environment names,
+/// resolved against the hub's token store.
+///
+/// `None` when no token is set, or the hub does not know it: an unknown token
+/// is not an identity, so the next rule answers rather than the caller being
+/// locked out.
+fn watch_token_identity() -> Option<String> {
+    let token = std::env::var(WATCH_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())?;
+    super::watch_token_identity(&token)
 }
 
 #[cfg(test)]
@@ -312,6 +476,48 @@ mod tests {
         assert_eq!(resolve(&table, 40), None);
     }
 
+    /// A chain that ends at the per-user service manager names no host: a
+    /// command daemonized with `setsid -f` is reparented to `systemd`, and
+    /// every detached process of this user would otherwise share that one
+    /// identity.
+    #[test]
+    fn a_chain_that_ends_at_a_service_manager_names_no_host() {
+        let mut table = Ancestry::new();
+        table.insert(700, row(700, "mini-swe-mcp", 730, 40));
+        table.insert(730, row(730, "systemd", 1, 12));
+        assert_eq!(
+            resolve(&table, 700),
+            None,
+            "the user's service manager is not an agent host"
+        );
+    }
+
+    /// Every listed service manager stops the walk, whatever sits below it.
+    #[test]
+    fn every_listed_service_manager_stops_the_walk() {
+        for manager in SERVICE_MANAGERS {
+            let mut table = Ancestry::new();
+            table.insert(60, row(60, "mini-swe-mcp", 59, 1));
+            table.insert(59, row(59, manager, 1, 1));
+            assert_eq!(
+                resolve(&table, 60),
+                None,
+                "{manager} must not be named as a host"
+            );
+        }
+    }
+
+    /// A service manager below a shell is still not a host: the walk steps over
+    /// the shell and stops at the manager instead of naming it.
+    #[test]
+    fn a_service_manager_below_a_shell_is_not_a_host() {
+        let mut table = Ancestry::new();
+        table.insert(70, row(70, "mini-swe-mcp", 69, 1));
+        table.insert(69, row(69, "bash", 730, 1));
+        table.insert(730, row(730, "systemd", 1, 1));
+        assert_eq!(resolve(&table, 70), None);
+    }
+
     /// An unknown pid, and a cycle, both answer `None` rather than looping.
     #[test]
     fn an_unreadable_or_cyclic_ancestry_names_no_host() {
@@ -351,6 +557,106 @@ mod tests {
         assert!(
             matches!(resolved.source, Source::Host { .. } | Source::Fallback),
             "{resolved:?}"
+        );
+    }
+
+    /// A session qualifies the host: two sessions of one host process are two
+    /// agents, which is what opencode v2's tabs need.
+    #[test]
+    fn a_session_qualifies_the_host() {
+        let resolved = identity_with_session(std::process::id(), None, Some("tab-7"), "cli");
+        assert_eq!(
+            resolved.id,
+            format!("{}/session:tab-7", host_of(std::process::id()).unwrap())
+        );
+        assert_eq!(
+            resolved.source,
+            Source::Session {
+                host: host_of(std::process::id()).unwrap(),
+                skipped: Vec::new(),
+                session: "tab-7".to_string(),
+            }
+        );
+        assert!(
+            resolved.explain().contains("session tab-7"),
+            "whoami must name the session: {}",
+            resolved.explain()
+        );
+    }
+
+    /// A session with no host process to attach it to keeps its own identity,
+    /// and a host with no session keeps today's host identity.
+    #[test]
+    fn a_session_without_a_host_is_still_an_identity() {
+        let mut table = Ancestry::new();
+        table.insert(80, row(80, "mini-swe-mcp", 79, 1));
+        table.insert(79, row(79, "systemd", 1, 1));
+        let resolved = identity_with_session(80, None, Some("tab-9"), "cli");
+        assert_eq!(resolved.id, "session:tab-9");
+        assert_eq!(
+            resolved.source,
+            Source::SessionOnly {
+                session: "tab-9".to_string()
+            }
+        );
+
+        let bare = identity_with_session(80, None, None, "cli");
+        assert_eq!(bare.id, "cli");
+        assert_eq!(bare.source, Source::Fallback);
+    }
+
+    /// `MINI_SWE_AGENT_ID` outranks the session, and a blank session is not
+    /// one: neither splits nor invents an identity.
+    #[test]
+    fn the_override_outranks_the_session() {
+        let resolved = identity_with_session(std::process::id(), Some("orchestrator-7"), Some("tab-7"), "cli");
+        assert_eq!(resolved.id, "orchestrator-7");
+        assert_eq!(resolved.source, Source::Override);
+
+        let host_only = identity_with_session(std::process::id(), None, Some(""), "cli");
+        assert!(
+            matches!(host_only.source, Source::Host { .. }),
+            "{:?}",
+            host_only.source
+        );
+        assert_eq!(host_only.id, host_of(std::process::id()).unwrap().to_string());
+    }
+
+    /// The session variables are read in one fixed order, and the first one
+    /// that is set wins.
+    #[test]
+    fn the_session_variables_have_one_precedence_order() {
+        assert_eq!(
+            SESSION_ENV_VARS,
+            [
+                "CLAUDE_CODE_SESSION_ID",
+                "OPENCODE_SESSION_ID",
+                "MINI_SWE_SESSION_ID"
+            ]
+        );
+    }
+
+    /// `qualify` is the one place the `host:…/session:…` spelling lives, so the
+    /// client and the daemon cannot drift apart.
+    #[test]
+    fn qualify_spells_the_qualified_identity_once() {
+        assert_eq!(
+            qualify(Some("host:claude:700:2"), Some("tab-7")).as_deref(),
+            Some("host:claude:700:2/session:tab-7")
+        );
+        assert_eq!(
+            qualify(Some("host:claude:700:2"), None).as_deref(),
+            Some("host:claude:700:2")
+        );
+        assert_eq!(
+            qualify(None, Some("tab-7")).as_deref(),
+            Some("session:tab-7")
+        );
+        assert_eq!(qualify(None, None), None);
+        assert_eq!(
+            qualify(Some("host:claude:700:2"), Some("")).as_deref(),
+            Some("host:claude:700:2"),
+            "a blank session is not a session"
         );
     }
 

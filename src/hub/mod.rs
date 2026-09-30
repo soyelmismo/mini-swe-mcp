@@ -19,4 +19,4 @@ mod daemon;
 pub mod identity;
 
 pub use client::{HubClient, connect_or_spawn, proxy_stdio};
-pub use daemon::{HubConfig, HubPaths, HubServer, hub_dir, run_daemon};
+pub use daemon::{HubConfig, HubPaths, HubServer, WatchTokens, hub_dir, run_daemon, watch_token_identity};
