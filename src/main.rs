@@ -60,6 +60,11 @@ async fn async_main() -> Result<()> {
     telemetry::init(stdio_requested(&cli_args));
     bootstrap::load_dotenv_files();
 
+    if action_of(&cli_args) == Some("watch") {
+        let code = mini_swe_mcp::cli::watch::run(&cli_args, json_output, admin).await?;
+        std::process::exit(code);
+    }
+
     if stdio_requested(&cli_args) || action_of(&cli_args).is_none() {
         if env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
             return run_local_stdio().await;
@@ -231,7 +236,8 @@ fn print_help() {
     println!("  collect <worker_id>");
     println!("  logs <worker_id>");
     println!("  reap");
-    println!("  steer <worker_id> <message> [--wait] [--timeout <secs>]");
+    println!("  steer <worker_id> <message> [--wait] [--timeout <secs>] [--max-turns <n>] (finished workers: revision)");
+    println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
     println!("  wait <worker_id> [--timeout <secs>]");
     println!("  list [--all]");
     println!("  monitor [--once]");
@@ -240,6 +246,7 @@ fn print_help() {
     println!("  manifest");
     println!("  prune");
     println!("  daemon");
+    println!("\nWorkflow:\n{}", mini_swe_mcp::cli::watch::WORKFLOW);
     println!("\nFlags:");
     println!("{}", mini_swe_mcp::cli::HELP_FLAGS);
 }

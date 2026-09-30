@@ -353,6 +353,30 @@ impl HubClient {
         }
     }
 
+    /// Owner-scoped actionable replay and the current watch set.
+    pub async fn watch_snapshot(&mut self, ids: &std::collections::BTreeSet<String>, group: Option<&str>, initial: bool) -> Result<Value> {
+        self.request("hub/watch", json!({"worker_ids":ids,"group":group,"initial":initial})).await
+    }
+
+    /// Acknowledge only after the caller successfully printed an event.
+    pub async fn watch_ack(&mut self, sequence: u64) -> Result<()> {
+        self.request("hub/watch/ack", json!({"sequence":sequence})).await?;
+        Ok(())
+    }
+
+    /// Consume the existing channel stream; snapshot replay repairs dropped frames.
+    pub async fn next_watch_notification(&mut self) -> Result<()> {
+        if !self.notifications.is_empty() {
+            self.notifications.clear();
+            return Ok(());
+        }
+        let mut line = Vec::new();
+        (&mut self.stream).take(1024 * 1024 + 1).read_until(b'\n', &mut line).await?;
+        anyhow::ensure!(!line.is_empty(), "Hub closed the connection");
+        anyhow::ensure!(line.len() <= 1024 * 1024, "Hub notification exceeds 1 MiB");
+        Ok(())
+    }
+
     pub async fn worker(&mut self, arguments: Value) -> Result<Value> {
         let result = self
             .request(

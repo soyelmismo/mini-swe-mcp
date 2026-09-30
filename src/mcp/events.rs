@@ -63,7 +63,6 @@ pub enum EventKind {
     Completed,
     /// A worker died and wants an inspection.
     Failed,
-
 }
 
 impl EventKind {
@@ -124,7 +123,6 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Times the worker was revised after finishing.
     pub revision: usize,
-
 }
 
 /// One tick's view of every known worker, keyed by worker id.
@@ -149,7 +147,6 @@ pub struct ChannelEvent {
     pub status: String,
     /// The rendered message.
     pub content: String,
-
 }
 
 /// The events for the transitions between two snapshots, ordered by worker id.
@@ -330,6 +327,10 @@ async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &st
 pub(super) struct EventRouter {
     latest: VecDeque<(Option<String>, ChannelEvent)>,
     connections: BTreeMap<u64, (String, bool, mpsc::Sender<String>)>,
+    watch_current: crate::cli::watch::Snapshot,
+    watch_reported: crate::cli::watch::Snapshot,
+    watch_history: BTreeMap<String, WatchHistory>,
+    sequence: u64,
 }
 
 impl EventRouter {
@@ -409,10 +410,12 @@ pub(super) async fn spawn_hub_events(
                 };
                 router.lock().await.publish(owner, event);
             }
+            let views = watch_snapshot(&pool).await;
+            router.lock().await.observe_watch(views);
             previous = current;
             tokio::select! {
                 _ = changes.changed() => {}
-                _ = tokio::time::sleep(FALLBACK_INTERVAL) => {}
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
     })
@@ -691,4 +694,151 @@ mod router_tests {
         assert_eq!(frames.last().unwrap()["params"]["meta"]["worker_id"], "1");
         assert_eq!(frames.last().unwrap()["params"]["meta"]["event"], "failed");
     }
+}
+
+/// An identity retains at most 100 unacknowledged events. Identity storage is
+/// capped too; inactive identities are evicted oldest-first with their cursor.
+#[derive(Default)]
+struct WatchHistory {
+    pending: VecDeque<serde_json::Value>,
+    cursor: u64,
+    dropped: u64,
+    last_sequence: u64,
+}
+
+/// Read bounded watch facts in the daemon, without collecting the worker.
+async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
+    use crate::cli::watch::{enrich_state, registry_snapshot};
+    let now = crate::pool::unix_timestamp();
+    let mut views: crate::cli::watch::Snapshot = crate::pool::load_all_registry_entries()
+        .iter().map(|entry| (entry.id.clone(), registry_snapshot(entry, now))).collect();
+    for row in pool.list_workers().await {
+        let Some(id) = row["id"].as_str() else { continue; };
+        let view = views.entry(id.to_string()).or_insert_with(|| json!({
+            "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
+            "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
+            "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
+            "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
+        }));
+        view["owner"] = row["owner"].clone();
+        if let Some(progress) = pool.worker_progress(id).await {
+            view["step"] = json!(progress.step);
+            view["status"] = json!(phase_status(progress.phase));
+            view["question"] = json!(progress.question);
+            if progress.phase != WorkerPhase::Running
+                && let Some(state) = pool.get_worker_state(id).await { enrich_state(view, &state); }
+        }
+        if let Some(logs) = pool.get_worker_logs(id).await {
+            view["last_ops"] = json!(logs.tail(5).iter().map(|log| clamp_string(&log.command,256)).collect::<Vec<_>>());
+            if view["verified"] == false || view["metrics"]["verify_failures"].as_u64().unwrap_or(0) > 0 {
+                view["verify_output_tail"] = json!(logs.tail(1000).iter().rev().find(|log| log.command.starts_with("[verify]")).map(|log| {
+                    let tail: String = log.output.chars().rev().take(1500).collect::<String>().chars().rev().collect();
+                    tail
+                }));
+            }
+        }
+    }
+    views
+}
+
+impl EventRouter {
+    fn history(&mut self, owner: &str) -> &mut WatchHistory {
+        if !self.watch_history.contains_key(owner) && self.watch_history.len() >= 1024
+            && let Some(oldest) = self.watch_history.iter().min_by_key(|(_, h)| h.last_sequence).map(|(k, _)| k.clone()) { self.watch_history.remove(&oldest); }
+        self.watch_history.entry(owner.to_string()).or_default()
+    }
+
+    fn observe_watch(&mut self, mut views: crate::cli::watch::Snapshot) {
+        let now = crate::pool::unix_timestamp();
+        for (id, view) in &mut views {
+            crate::cli::watch::progress_clock(view, self.watch_current.get(id), now);
+            // A resumed worker may ask the same question at the same turn again.
+            if self.watch_current.get(id).is_some_and(|old| old["status"] != view["status"]) {
+                self.watch_reported.remove(id);
+            }
+            if let Some(mut event) = crate::cli::watch::select_event(view, self.watch_reported.get(id), now) {
+                self.sequence += 1;
+                event["sequence"] = json!(self.sequence);
+                self.watch_reported.insert(id.clone(), event.clone());
+                let owner = event["owner"].as_str().unwrap_or("unattributed").to_string();
+                let sequence = self.sequence;
+                let history = self.history(&owner);
+                if history.pending.len() == 100 { history.pending.pop_front(); history.dropped += 1; }
+                history.last_sequence = sequence;
+                history.pending.push_back(event.clone());
+                let frame = json!({"jsonrpc":"2.0","method":CHANNEL_METHOD,"params":{
+                    "content":crate::cli::watch::render(&event),"payload":event,
+                    "meta":{"worker_id":id,"event":event["event"].as_str().unwrap_or(""),"owner":owner}
+                }}).to_string() + "\n";
+                self.connections.retain(|_, (agent, admin, tx)| {
+                    if *admin || *agent == owner { try_deliver(tx, frame.clone()) } else { !tx.is_closed() }
+                });
+            }
+        }
+        self.watch_reported.retain(|id, _| views.contains_key(id));
+        self.watch_current = views;
+    }
+
+    fn watch_reply(&mut self, ctx: &super::server::ConnectionContext, params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        use std::collections::BTreeSet;
+        let ids: BTreeSet<String> = params["worker_ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        let initial = params["initial"].as_bool().unwrap_or(false);
+        let group = params["group"].as_str();
+        let owner = ctx.agent();
+        let allowed = |v: &serde_json::Value| ctx.is_admin() || v["owner"] == owner;
+        for id in &ids {
+            let known = self.watch_current.get(id).or_else(|| self.watch_history.values().flat_map(|h| &h.pending).find(|v| v["worker_id"] == *id));
+            if let Some(v) = known {
+                anyhow::ensure!(allowed(v), "worker {id} belongs to agent {}", v["owner"].as_str().unwrap_or("unattributed"));
+            } else if initial { anyhow::bail!("Worker not found: {id}"); }
+        }
+        let mut watching: BTreeSet<String> = self.watch_current.values().filter(|v| allowed(v) && crate::cli::watch::matches(v, &ids, group)
+            && matches!(v["status"].as_str(), Some("running" | "paused" | "reviewing"))).filter_map(|v| v["worker_id"].as_str().map(str::to_string)).collect();
+        let mut events = Vec::new();
+        for (agent, history) in &self.watch_history {
+            if !ctx.is_admin() && *agent != owner { continue; }
+            for v in &history.pending {
+                if !crate::cli::watch::matches(v, &ids, group) { continue; }
+                let mut event = v.clone();
+                event["missed"] = json!(initial);
+                event["dropped_events"] = json!(history.dropped);
+                events.push(event);
+            }
+        }
+        events.sort_by_key(|v| v["sequence"].as_u64());
+        // An explicit terminal id is reported immediately even if another
+        // watch already acknowledged its transition.
+        if initial {
+            for id in &ids {
+                if !events.iter().any(|v| v["worker_id"] == *id)
+                    && let Some(v) = self.watch_reported.get(id).filter(|v| allowed(v) && crate::cli::watch::matches(v, &ids, group)) { events.push(v.clone()); }
+            }
+        }
+        // A caller that resumes with no live ids must not start watching new
+        // dispatches made after its original selection.
+        if !initial && ids.is_empty() { watching.clear(); }
+        Ok(json!({"watching":watching,"events":events}))
+    }
+
+    fn acknowledge_watch(&mut self, ctx: &super::server::ConnectionContext, sequence: u64) {
+        let owner = ctx.agent();
+        for (agent, history) in &mut self.watch_history {
+            if !ctx.is_admin() && *agent != owner { continue; }
+            if history.pending.iter().any(|v| v["sequence"].as_u64() == Some(sequence)) {
+                history.pending.retain(|v| v["sequence"].as_u64() != Some(sequence));
+                history.cursor = history.cursor.max(sequence);
+                history.dropped = 0;
+            }
+        }
+    }
+}
+
+pub(super) async fn watch_request(pool: &WorkerPool, router: &Arc<Mutex<EventRouter>>, ctx: &super::server::ConnectionContext, params: serde_json::Value, ack: bool) -> anyhow::Result<serde_json::Value> {
+    if ack {
+        router.lock().await.acknowledge_watch(ctx, params["sequence"].as_u64().unwrap_or(0));
+        return Ok(json!({}));
+    }
+    let mut guard = router.lock().await;
+    guard.observe_watch(watch_snapshot(pool).await);
+    guard.watch_reply(ctx, &params)
 }

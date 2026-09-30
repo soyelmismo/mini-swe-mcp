@@ -228,3 +228,38 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
         tokio::time::sleep(opts.timeout.map(|t| t.saturating_sub(started.elapsed()).min(Duration::from_secs(1))).unwrap_or(Duration::from_secs(1))).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::WorkerMetrics;
+
+    fn state(status: &str, step: usize, metrics: WorkerMetrics, last: u64, max: usize) -> Value {
+        json!({"worker_id":"w","owner":"cli","model":"m","group":"g","branch":"worker-w","revision":0,
+            "step":step,"turns":step,"max_turns":max,"elapsed":7,"last_step_at":last,"task":"fix it",
+            "question":"go on?","summary":"Done.","verified":true,"error":null,"metrics":metrics,
+            "status":status,"last_ops":["a"]})
+    }
+
+    #[test]
+    fn every_actionable_event_is_selected_and_rendered() {
+        let metrics = WorkerMetrics::default();
+        assert_eq!(select_event(&state("completed", 3, metrics, 100, 10), None, 110).unwrap()["event"], "completed");
+        assert_eq!(select_event(&state("failed", 3, metrics, 100, 10), None, 110).unwrap()["event"], "failed");
+        assert_eq!(select_event(&state("paused", 2, metrics, 100, 10), None, 110).unwrap()["event"], "needs_input");
+        let mut repeated = metrics;
+        repeated.repeat_blocks = 3;
+        assert_eq!(
+            select_event(&state("running", 2, repeated, 100, 10), Some(&state("running", 2, metrics, 100, 10)), 110).unwrap()["event"],
+            "stalled"
+        );
+        assert_eq!(select_event(&state("running", 2, metrics, 0, 10), None, 700).unwrap()["event"], "stalled");
+        assert!(select_event(&state("running", 2, metrics, 100, 10), None, 110).is_none());
+        let done = select_event(&state("completed", 3, metrics, 100, 10), None, 110).unwrap();
+        assert!(select_event(&state("completed", 3, metrics, 100, 10), Some(&done), 110).is_none());
+        let out = render(&done);
+        assert!(out.contains("mini-swe-mcp steer") && out.contains("git diff"), "{out}");
+        let text = render(&select_event(&state("running", 2, repeated, 100, 10), Some(&state("running", 2, metrics, 100, 10)), 110).unwrap());
+        assert!(text.contains("mini-swe-mcp kill"), "{text}");
+    }
+}

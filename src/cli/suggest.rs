@@ -10,7 +10,7 @@ use crate::mcp::WORKER_ACTIONS;
 
 /// CLI-only verbs: actions the binary handles directly instead of dispatching
 /// through the `worker` tool.
-const CLI_ONLY_ACTIONS: &[&str] = &["monitor", "supervisor"];
+const CLI_ONLY_ACTIONS: &[&str] = &["monitor", "supervisor", "watch"];
 
 /// Everything the CLI accepts: the tool's own actions (single-sourced from the
 /// MCP server) plus the CLI-only verbs.
