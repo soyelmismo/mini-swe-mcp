@@ -4,7 +4,9 @@
 //! and `reap` — the actions that answer about one worker (or, for `reap`, about
 //! a set of terminal workers) rather than about the system catalog.
 //! [`log_counters_line`] is the shared counter/notice line that `collect` and
-//! `logs` both append so step-log truncation is never silent (audit 07, R7).
+//! `logs` both append so step-log truncation is never silent (audit 07, R7), and
+//! [`health_line`] is the per-worker health line `status`, `collect` and
+//! `dispatch --wait` append so a run can be graded, not just read.
 //!
 //! Every function here is a pure function over [`serde_json::Value`]: no I/O,
 //! no state, no formatting knobs. That is what keeps them unit-testable and
@@ -456,6 +458,90 @@ mod tests {
             r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3}}}"#,
         ));
         assert!(!unflagged.contains("Verified"), "{unflagged}");
+    }
+
+    #[test]
+    fn test_health_line_renders_every_measured_counter() {
+        let line = health_line(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"metrics":{
+                 "turns_used":142,"extensions_granted":0,"extensions_refused":0,
+                 "repeat_blocks":3,"stagnation_nudges":1,"loop_pauses":0,
+                 "verify_runs":2,"verify_failures":1,
+                 "diff_files":5,"diff_insertions":120,"diff_deletions":340}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            line,
+            "Health: 142 turns, +0/-0 ext, 3 repeats, 1 nudge, verify 1/2 failed, diff 5 files +120/-340"
+        );
+    }
+
+    #[test]
+    fn test_health_line_reports_the_rare_counters_only_when_they_happened() {
+        let clean = health_line(&v(
+            r#"{"state":{"details":{"metrics":{"turns_used":7,"diff_files":1,
+                 "diff_insertions":4,"diff_deletions":0}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            clean,
+            "Health: 7 turns, +0/-0 ext, 0 repeats, 0 nudges, diff 1 file +4/-0"
+        );
+
+        let looping = health_line(&v(
+            r#"{"state":{"Failed":{"metrics":{"turns_used":9,"extensions_granted":3,
+                 "extensions_refused":1,"repeat_blocks":3,"loop_pauses":1,
+                 "verify_runs":3,"verify_failures":3}}}}"#,
+        ))
+        .expect("a measured run renders a health line");
+        assert_eq!(
+            looping,
+            "Health: 9 turns, +3/-1 ext, 3 repeats, 0 nudges, 1 loop pause, verify 3/3 failed"
+        );
+    }
+
+    #[test]
+    fn test_health_line_is_omitted_when_nothing_was_measured() {
+        // No metrics at all: a payload from a build that did not record them.
+        assert_eq!(health_line(&v(r#"{"worker_id":"w","state":"Running"}"#)), None);
+        // Metrics present but untouched: a worker killed before its first turn.
+        assert_eq!(health_line(&v(r#"{"state":{"details":{"metrics":{}}}}"#)), None);
+        assert_eq!(
+            health_line(&v(
+                r#"{"state":{"state":"Failed","details":{"metrics":{"turns_used":0,"repeat_blocks":0}}}}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_the_worker_views_append_the_health_line() {
+        let payload = r#"{"worker_id":"w","state":{"state":"Completed","details":{
+                       "turns":3,"summary":"done","diff":"--- a","total_steps":3,
+                       "metrics":{"turns_used":3,"repeat_blocks":1}}}}"#;
+        assert!(
+            format_status(&v(payload)).ends_with("Health: 3 turns, +0/-0 ext, 1 repeat, 0 nudges"),
+            "status must end with the health line: {}",
+            format_status(&v(payload))
+        );
+        assert!(
+            format_collect(&v(payload)).ends_with("Health: 3 turns, +0/-0 ext, 1 repeat, 0 nudges"),
+            "collect must end with the health line: {}",
+            format_collect(&v(payload))
+        );
+        let dispatched = format_dispatch(&v(payload));
+        assert!(
+            dispatched.contains("\nHealth: 3 turns, +0/-0 ext, 1 repeat, 0 nudges\n\nDiff:\n"),
+            "dispatch --wait must report health before the diff: {dispatched}"
+        );
+        // A failed worker reports what it measured too.
+        let failed = format_dispatch(&v(
+            r#"{"worker_id":"w","state":{"Failed":{"error":"boom","metrics":{"turns_used":4}}}}"#,
+        ));
+        assert!(
+            failed.ends_with("Health: 4 turns, +0/-0 ext, 0 repeats, 0 nudges"),
+            "{failed}"
+        );
     }
 
     #[test]

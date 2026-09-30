@@ -609,6 +609,13 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
         "worker must complete after review, got {state:?}"
     );
 
+    // One counter for the whole worker: the reviewer's turns land on the same
+    // run as the implementer's, and a turn the engine refunded is not counted.
+    let WorkerState::Completed { turns, .. } = &state else {
+        panic!("worker must complete after review, got {state:?}");
+    };
+    assert_eq!(metrics_of(&state).turns_used, *turns);
+
     let requests = server.requests.all().await;
     assert_eq!(
         requests.len(),

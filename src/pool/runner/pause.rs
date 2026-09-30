@@ -20,8 +20,8 @@ use super::super::unix_timestamp;
 ///
 /// `last_command` is the command that carried the sentinel, so the registry
 /// keeps showing what the worker was doing while it waits. `meta` is the
-/// worker's registry row, so a pause is written with the same identity -- and
-/// the same health counters -- as every other status update of the run.
+/// worker's registry row, so a pause is written with the same identity — and
+/// the same health counters — as every other status update of the run.
 pub struct PauseRequest<'a> {
     pub worker_id: &'a str,
     pub question: &'a str,

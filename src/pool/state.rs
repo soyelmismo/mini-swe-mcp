@@ -17,8 +17,8 @@ use super::unix_timestamp;
 /// A summary alone cannot grade a worker: a run that needed 150 turns, was
 /// refused three turn extensions and burned four turns on a repetition loop
 /// completes with the same payload as a clean one. Each counter is moved by the
-/// turn engine at the exact point its guard fires -- never re-derived from the
-/// log window afterwards -- so two workers of the same task can be compared.
+/// turn engine at the exact point its guard fires — never re-derived from the
+/// log window afterwards — so two workers of the same task can be compared.
 ///
 /// Every field defaults to zero, so a registry row written before these
 /// counters existed still parses, and a worker that never moved one still

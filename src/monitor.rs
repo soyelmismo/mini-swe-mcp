@@ -484,7 +484,7 @@ fn stack_row(
         pad_visible(&format_duration(duration_secs), layout.uptime),
     );
     // Health counters ride the label line, which has room the inline row does
-    // not -- but only whole: a cell that would overflow the terminal is
+    // not — but only whole: a cell that would overflow the terminal is
     // dropped rather than clipped, so the row stays readable.
     let health = w.metrics.repeat_nudge_cell();
     if visible_width(&second) + 2 + visible_width(&health) <= layout.total {
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     /// The stacked row has room the inline row does not, so the repeat/nudge
-    /// counts ride its label line -- and never overflow it.
+    /// counts ride its label line — and never overflow it.
     #[test]
     fn test_stacked_row_carries_the_repeat_and_nudge_counts() {
         let entries = vec![Row::new("health01")
