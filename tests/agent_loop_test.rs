@@ -1140,3 +1140,79 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
     );
     assert_eq!(metrics.turns_used, 41, "implementer and reviewer turns together");
 }
+
+/// Large outputs and thinking-mode responses must age out of the full window,
+/// leaving only a small per-exchange increment in subsequent requests.
+#[tokio::test]
+async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
+    let repo = TestRepo::new("compact-history");
+    let reasoning = "r".repeat(60 * 1024);
+    let prose = "p".repeat(4096);
+    let mut script: Vec<ScriptedTurn> = (1..=40)
+        .map(|turn| {
+            let mut response = ScriptedSseServer::bash_turn(
+                &format!("call_{turn}"),
+                &format!("printf '%016000d\\n' {turn}"),
+            );
+            response.push(frame(&json!({
+                "choices": [{"delta": {"reasoning_content": reasoning, "content": prose}}]
+            })));
+            response
+        })
+        .collect();
+    script.push(ScriptedSseServer::completion_turn("call_done"));
+    let server = ScriptedSseServer::spawn(script).await;
+    let (_pool, worker_id, state) =
+        dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
+    assert!(matches!(state, WorkerState::Completed { .. }), "{state:?}");
+    let requests = server.requests.all().await;
+    assert_eq!(requests.len(), 41);
+    for request in &requests {
+        assert!(serde_json::to_vec(request).unwrap().len() < 1_100_000);
+        let mut pending = std::collections::HashSet::new();
+        for message in messages_of(request) {
+            if let Some(calls) = message["tool_calls"].as_array() {
+                for call in calls {
+                    assert!(pending.insert(call["id"].as_str().unwrap().to_string()));
+                }
+            }
+            if message["role"] == "tool" {
+                assert!(pending.remove(message["tool_call_id"].as_str().unwrap()));
+            }
+        }
+        assert!(pending.is_empty(), "every advertised tool call must be answered");
+    }
+    let final_messages = messages_of(requests.last().unwrap());
+    let assistants: Vec<_> = final_messages.iter().filter(|m| m["role"] == "assistant").collect();
+    assert_eq!(assistants.len(), 40);
+    for (i, assistant) in assistants.iter().enumerate() {
+        if i < 28 {
+            assert!(assistant["reasoning_content"].as_str().unwrap().ends_with(" [reasoning elided]"));
+            assert!(assistant["content"].as_str().unwrap().ends_with(" [prose elided]"));
+        } else {
+            assert_eq!(assistant["reasoning_content"], reasoning);
+            assert_eq!(assistant["content"], prose);
+        }
+    }
+    let outputs = tool_results(requests.last().unwrap());
+    assert!(outputs["call_1"].starts_with("[output elided: exit 0, "));
+    assert!(outputs["call_40"].len() > 16000);
+    let size = |i| serde_json::to_vec(&requests[i]).unwrap().len();
+    assert!(size(40) - size(24) < 16 * 1500, "older turns must add only compact stubs");
+
+    // Persistence can lag the terminal state notification by a few milliseconds.
+    let history = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(history) = mini_swe_mcp::pool::load_worker_history(&worker_id) {
+                break history;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("compacted history must be persisted");
+    assert_eq!(
+        serde_json::to_value(history.messages).unwrap(),
+        requests[40]["messages"]
+    );
+}
