@@ -1066,7 +1066,7 @@ impl<'a> TurnEngine<'a> {
             };
             let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
+            self.push_message(msg);
             for tc in tool_calls {
                 let args = tc.function.arguments;
                 let truncated = if args.len() > 200 {
@@ -1075,7 +1075,7 @@ impl<'a> TurnEngine<'a> {
                 } else {
                     args
                 };
-                self.messages.push(ChatMessage::tool_result(
+                self.push_message(ChatMessage::tool_result(
                     tc.id,
                     format!(
                         "ERROR: could not parse a `command` from the bash tool arguments: {truncated}"
@@ -1090,9 +1090,8 @@ impl<'a> TurnEngine<'a> {
             };
             let msg = ChatMessage::text(Role::Assistant, assistant_content)
                 .with_reasoning_content(reasoning);
-            self.messages.push(msg);
-            self.messages
-                .push(ChatMessage::text(Role::User, NO_COMMAND_NUDGE));
+            self.push_message(msg);
+            self.push_message(ChatMessage::text(Role::User, NO_COMMAND_NUDGE));
         }
     }
 }
