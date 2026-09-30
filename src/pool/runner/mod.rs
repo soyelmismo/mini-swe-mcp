@@ -212,55 +212,56 @@ impl WorkerPool {
             ],
         };
 
-        let result = self
-            .run_phases(
-                &worker_id,
-                &RunConfig {
-                    task: &task,
-                    model: &model,
-                    temperature,
-                    max_turns,
-                    review_after: review_after.clone(),
-                    network_offline,
-                    verify: verify.as_deref(),
-                    repo_path_str: &repo_path_str,
-                },
-                meta,
-                &mut worktree,
-                &mut messages,
-            )
-            .await;
-
-        // Completion and propagated errors save the final conversation.
-        // Aborted tasks cannot reach this tail; auto-checkpoints persist their
-        // most recent conversation for crash recovery instead.
-        history::compact_history(&mut messages);
-        let history = WorkerHistory {
-            task,
+        // The opening messages are the log's first lines, so a worker that dies
+        // before its first turn still leaves a continuable conversation behind.
+        let opening_meta = WorkerHistory {
+            task: task.clone(),
             group: meta.group.clone(),
-            model,
+            model: model.clone(),
             temperature,
-            repo_path: repo_path_str,
+            repo_path: repo_path_str.clone(),
             base_commit: worktree.base_commit.clone(),
             base_branch: worktree.base_branch.clone(),
             branch: worktree.branch.clone(),
             network_offline,
-            verify: verify.map(|v| v.to_string()),
+            verify: verify.clone(),
             max_turns,
-            review_after,
+            review_after: review_after.clone(),
             revision: meta.revision,
             auto_continues: meta.auto_continues,
             owner: Some(meta.owner.clone()),
-            messages,
+            messages: Vec::new(),
         };
-        if let Err(e) = Self::append_history_messages(&worker_id, &history, &history.messages) {
+        if !super::revision::history_log_path(&worker_id).exists()
+            && let Err(e) = Self::append_history_messages(&worker_id, &opening_meta, &messages)
+        {
             warn!(
                 worker = %worker_id,
                 error = %e,
                 "Could not persist the worker conversation; this worker can no longer be revised"
             );
         }
-        result
+
+        // The conversation is durable one line per message (see
+        // `TurnEngine::push_message`), so nothing is rewritten here: a crash may
+        // lose only the in-flight turn.
+        self.run_phases(
+            &worker_id,
+            &RunConfig {
+                task: &task,
+                model: &model,
+                temperature,
+                max_turns,
+                review_after: review_after.clone(),
+                network_offline,
+                verify: verify.as_deref(),
+                repo_path_str: &repo_path_str,
+            },
+            meta,
+            &mut worktree,
+            &mut messages,
+        )
+        .await
     }
 
     /// The implementer loop, the review phase and the completion payload.
@@ -314,27 +315,6 @@ impl WorkerPool {
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
 
-        // Metadata line of the append-only history log: written with the first
-        // message, so the log always opens with the facts a continuation needs.
-        let history_meta = WorkerHistory {
-            task: task.clone(),
-            group: meta.group.clone(),
-            model: model.clone(),
-            temperature,
-            repo_path: repo_path_str.clone(),
-            base_commit: worktree.base_commit.clone(),
-            base_branch: worktree.base_branch.clone(),
-            branch: worktree.branch.clone(),
-            network_offline,
-            verify: verify.clone(),
-            max_turns,
-            review_after: review_after.clone(),
-            revision: meta.revision,
-            auto_continues: meta.auto_continues,
-            owner: Some(meta.owner.clone()),
-            messages: Vec::new(),
-        };
-
         while step < current_max_turns {
             step += 1;
             let max_turns_for_config = current_max_turns;
@@ -358,7 +338,6 @@ impl WorkerPool {
                 worker_id,
                 meta,
                 messages,
-                history_meta: history_meta.clone(),
                 unsaved_messages: Vec::new(),
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
@@ -378,7 +357,7 @@ impl WorkerPool {
             }
             // One line per message, flushed at the turn boundary: a crash can
             // only lose the turn that was in flight.
-            engine.flush_history_log().await;
+            engine.flush_history_log(&turn_config).await;
         }
 
         // --- MULTI-PHASE REVIEW PIPELINE ---

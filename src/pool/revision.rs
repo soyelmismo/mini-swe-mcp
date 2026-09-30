@@ -153,13 +153,6 @@ pub fn history_log_path(worker_id: &str) -> PathBuf {
     crate::worktree::swe_base_dir().join(format!("swe-wt-{worker_id}.history.jsonl"))
 }
 
-/// First line of the log: the metadata, without the messages.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct HistoryMeta {
-    #[serde(flatten)]
-    pub history: WorkerHistory,
-}
-
 /// Append one message to `worker_id`'s conversation log, creating it with the
 /// metadata line when it does not exist yet.
 ///
@@ -332,11 +325,6 @@ pub fn load_worker_history(worker_id: &str) -> Result<WorkerHistory> {
     Ok(history)
 }
 
-/// Whether any conversation file (log or legacy whole-file) exists.
-pub fn has_worker_history(worker_id: &str) -> bool {
-    history_log_path(worker_id).is_file() || history_path(worker_id).is_file()
-}
-
 /// Delete the conversation file of `worker_id` (on prune).
 ///
 /// Every known base dir is swept: a `SWE_TEMP_DIR` that moved is not a reason
@@ -351,7 +339,7 @@ pub fn remove_worker_history(worker_id: &str) {
 }
 
 fn remove_quietly(worker_id: &str, path: &Path) {
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(

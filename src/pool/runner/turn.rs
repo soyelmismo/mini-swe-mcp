@@ -290,8 +290,6 @@ pub(super) struct TurnEngine<'a> {
     /// the point it fires, and the row is written from the same struct.
     pub meta: &'a mut WorkerMeta,
     pub messages: &'a mut Vec<ChatMessage>,
-    /// Metadata line of this run's append-only history log.
-    pub history_meta: WorkerHistory,
     /// Messages pushed since the last [`Self::flush_history_log`], waiting to
     /// be appended to the durable log.
     pub unsaved_messages: Vec<ChatMessage>,
@@ -354,7 +352,7 @@ impl<'a> TurnEngine<'a> {
         // --- Automatic checkpoint (both phases) ---
         if *self.step > 0 && (*self.step).is_multiple_of(AUTO_CHECKPOINT_TURNS) {
             self.checkpoint().await;
-            self.persist_checkpoint_history().await;
+            self.persist_checkpoint_history(config).await;
         }
 
         // --- Stagnation detector (implementer only, like the sentinels) ---
@@ -883,8 +881,8 @@ impl<'a> TurnEngine<'a> {
     /// The log is append-only and already holds every message pushed up to the
     /// previous turn boundary, so a checkpoint is a flush of what this turn
     /// added: one line per message, never a whole-file rewrite.
-    async fn persist_checkpoint_history(&mut self) {
-        self.flush_history_log().await;
+    async fn persist_checkpoint_history(&mut self, config: &TurnConfig<'_>) {
+        self.flush_history_log(config).await;
     }
 
     /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
@@ -992,11 +990,11 @@ impl<'a> TurnEngine<'a> {
     /// The metadata line is written with the first message, so a log always
     /// opens with the facts a continuation needs. A failed append warns and
     /// carries on: the checkpoint snapshot still covers the whole conversation.
-    pub(super) async fn flush_history_log(&mut self) {
+    pub(super) async fn flush_history_log(&mut self, config: &TurnConfig<'_>) {
         if self.unsaved_messages.is_empty() {
             return;
         }
-        let meta = self.history_meta();
+        let meta = self.history_meta(config);
         let pending = std::mem::take(&mut self.unsaved_messages);
         let worker_id = self.worker_id.to_string();
         let step = *self.step;
@@ -1019,8 +1017,33 @@ impl<'a> TurnEngine<'a> {
     }
 
     /// The metadata line of this run's history log.
-    fn history_meta(&self) -> WorkerHistory {
-        self.history_meta.clone()
+    ///
+    /// The dispatch facts (`task`, `temperature`, `review_after`,
+    /// `network_offline`) are replayed from the turn config rather than kept
+    /// twice, so a continuation describes the run it continues.
+    fn history_meta(&self, config: &TurnConfig<'_>) -> WorkerHistory {
+        WorkerHistory {
+            task: config.task.to_string(),
+            group: self.meta.group.clone(),
+            model: config.model.to_string(),
+            temperature: config.temperature,
+            repo_path: self
+                .meta
+                .repo_path
+                .clone()
+                .unwrap_or_else(|| self.worktree.repo_root.to_string_lossy().to_string()),
+            base_commit: self.worktree.base_commit.clone(),
+            base_branch: self.worktree.base_branch.clone(),
+            branch: self.worktree.branch.clone(),
+            network_offline: config.network_offline,
+            verify: self.verify.map(str::to_string),
+            max_turns: config.max_turns,
+            review_after: config.review_after.map(str::to_string),
+            revision: self.meta.revision,
+            auto_continues: self.meta.auto_continues,
+            owner: Some(self.meta.owner.clone()),
+            messages: Vec::new(),
+        }
     }
 
     /// Push the protocol-correct history for a response with no usable command.

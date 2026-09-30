@@ -18,7 +18,6 @@ use std::path::Path;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
-use crate::pool::revision::WorkerHistory;
 use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
@@ -158,28 +157,6 @@ impl WorkerPool {
             None,
         );
 
-        // Metadata line of the review phase's append-only history log: the
-        // review conversation is part of the same worker conversation, so it
-        // continues the implementer's log rather than starting a new one.
-        let history_meta = WorkerHistory {
-            task: task.clone(),
-            group: meta.group.clone(),
-            model: reviewer_model.clone(),
-            temperature,
-            repo_path: repo_path_str.clone(),
-            base_commit: worktree.base_commit.clone(),
-            base_branch: worktree.base_branch.clone(),
-            branch: worktree.branch.clone(),
-            network_offline,
-            verify: None,
-            max_turns: current_max_turns + review_max_turns,
-            review_after: None,
-            revision: meta.revision,
-            auto_continues: meta.auto_continues,
-            owner: Some(meta.owner.clone()),
-            messages: Vec::new(),
-        };
-
         let mut review_step = 0;
         let mut last_assistant_text = String::new();
         let mut consecutive_no_cmd = 0;
@@ -210,7 +187,6 @@ impl WorkerPool {
                 worker_id: &worker_id,
                 meta,
                 messages: &mut review_messages,
-                history_meta: history_meta.clone(),
                 unsaved_messages: Vec::new(),
                 step: &mut step,
                 current_max_turns: &mut combined_max_turns,

@@ -398,7 +398,6 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
 /// terminal for listing but its branch and conversation are intact.
 pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
     raw_registry_entries()
-        .into_iter()
         .map(|(_, entry)| entry)
         .filter(|e| e.status == RegistryStatus::Interrupted)
         .collect()

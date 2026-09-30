@@ -1220,8 +1220,11 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
         .count();
     assert_eq!(logged, 40, "every turn is appended, none compacted away");
     // Rebuilding the conversation for a request compacts it back to the same
-    // shape the live loop sent.
-    let rebuilt = mini_swe_mcp::pool::compact_for_request(&history.messages);
+    // shape the live loop sent. The log ends one message later than the last
+    // request -- turn 40's tool result is pushed after the response -- so the
+    // comparison drops that trailing message.
+    let mut rebuilt = mini_swe_mcp::pool::compact_for_request(&history.messages);
+    rebuilt.pop();
     assert_eq!(
         serde_json::to_value(rebuilt).unwrap(),
         requests[40]["messages"]
