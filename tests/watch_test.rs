@@ -242,22 +242,34 @@ fn tool_description_carries_the_orchestrator_guidelines() {
 
 /// The real binary against an in-process daemon: the immediate event, the
 /// timeout and the ownership refusal all go through the hub transport.
-#[tokio::test]
+///
+/// The daemon needs its own worker thread: the test body blocks on the child
+/// process, and a current-thread runtime would never let the daemon answer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_watches_through_the_hub() {
     let hub = common::TempDir::new_in_tmp("watch-hub-cli");
     let swe = common::TempDir::new_in_tmp("watch-hub-swe");
     std::fs::create_dir_all(swe.path().join("swe-registry")).expect("registry dir");
-    let server = pool_with(vec![record("w-hub", "cli", WorkerState::Completed {
-        turns: 3,
-        diff: String::new(),
-        summary: "Fixed the parser.".to_string(),
-        completed_at: 0,
-        artifacts: Vec::new(),
-        branch: Some("worker-w-hub".to_string()),
-        verified: Some(true),
-        metrics: WorkerMetrics::default(),
-        revision: 0,
-    })]).await;
+    let server = pool_with(vec![
+        record("w-hub", "cli", WorkerState::Completed {
+            turns: 3,
+            diff: String::new(),
+            summary: "Fixed the parser.".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-hub".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        }),
+        // Another agent's live worker: never watchable, never leaked.
+        record("w-foreign", "other", WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        }),
+    ])
+    .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&hub.path().join("hub.sock")).await;
@@ -279,11 +291,7 @@ async fn the_binary_watches_through_the_hub() {
     assert!(stdout.contains("w-hub") && stdout.contains("completed"), "{stdout}");
     assert!(stdout.contains("While you were not watching:"), "{stdout}");
     assert!(stdout.contains("worker-w-hub"), "{stdout}");
-    // The other agent's row is refused, and never leaks into the output.
-    let now = mini_swe_mcp::pool::unix_timestamp();
-    let foreign = serde_json::json!({"id":"w-foreign","pid":std::process::id(),"task":"t","model":"m",
-        "status":"running","step":1,"max_turns":10,"last_command":"x","started_at":now,"updated_at":now,"owner":"other"});
-    std::fs::write(swe.path().join("swe-registry/w-foreign.json"), foreign.to_string()).unwrap();
+    // The other agent's worker is refused, and never leaks into the output.
     let output = run(&["watch", "w-foreign", "--timeout", "5"]);
     assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stdout));
     assert!(String::from_utf8_lossy(&output.stdout).contains("belongs to agent other"));
