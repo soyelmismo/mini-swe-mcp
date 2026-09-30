@@ -58,15 +58,15 @@ Write the task as ONE focused concern with the files in scope and an acceptance 
 
 ### 2. watch
 
-`watch` is the only way to wait. It reads the hub's worker events and **replays what a late watcher missed**, so there is no `wait` action and no `--wait` flag.
+`watch` is the only way to wait. It reports an event when a watched worker **completes, fails, needs input or stalls**, and **replays events a late watcher missed**, so there is no `wait` action and no `--wait` flag.
 
 ```bash
-mini-swe-mcp watch                # every worker this agent owns
-mini-swe-mcp watch <id> [...]     # named workers
-mini-swe-mcp watch --group build --follow
+mini-swe-mcp watch --follow             # every worker this agent owns
+mini-swe-mcp watch <id> [...] --follow  # named workers
+mini-swe-mcp watch --group build        # first event in the group, then return
 ```
 
-`watch` returns once the selected workers reach a terminal state. `--follow` keeps streaming after that; `--timeout <secs>` bounds the wait; `--json` emits the raw event stream.
+Without `--follow` it prints the next event and returns; with `--follow` it streams until every watched worker is terminal. `--timeout <secs>` bounds the wait; `--json` emits the raw event stream.
 
 ### 3. review
 
@@ -131,7 +131,7 @@ Defaults are what the code uses when the variable is unset.
 | `OPENAI_API_KEY` | — | API key; required by `dispatch`. |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible base URL. |
 | `DEFAULT_MODEL` | manifest default | Alias when a dispatch omits `--model`. |
-| `MODELS_FILE` | — | Path to `models.yaml` (else XDG/home/crate). |
+| `MODELS_FILE` | — | Path to `models.yaml` (else `./models.yaml`, XDG, exe). |
 | `ENV_FILE` | `.env` | Dotenv file loaded at startup. |
 | `MAX_CONCURRENT_WORKERS` | `128` | Workers the pool can run at once. |
 | `MAX_WORKERS_PER_AGENT` | `0` (unlimited) | Running workers one agent may hold. |
