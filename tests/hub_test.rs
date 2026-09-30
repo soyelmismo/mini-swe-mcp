@@ -791,3 +791,116 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
     assert!(log.contains("recovered 1 orphaned workers"), "{log}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// SIGKILL bypasses the worker's exit path: only checkpoint history makes the
+/// salvaged worker revisable when the next daemon starts.
+#[tokio::test]
+async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let root = common::TempDir::new_in_tmp("hub-checkpoint-revision");
+    // Unix socket paths are bounded by sockaddr_un, unlike scratch paths.
+    let hub = std::env::temp_dir().join(format!("h5-{}", std::process::id()));
+    std::fs::create_dir_all(&hub).unwrap();
+    let swe = root.subdir("swe");
+    let repo = root.subdir("repo");
+    for dir in [&hub, &swe] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    common::git(&repo, &["init", "-b", "master"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    common::git(&repo, &["config", "user.email", "test@localhost"]);
+    common::git(&repo, &["commit", "--allow-empty", "-m", "seed"]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let llm = tokio::spawn(async move {
+        for turn in 1..=21 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+                if bytes.ends_with(b"\r\n\r\n") { break bytes.len(); }
+            };
+            let headers = String::from_utf8_lossy(&bytes).to_lowercase();
+            let length: usize = headers.lines().find_map(|line| {
+                line.strip_prefix("content-length:")?.trim().parse().ok()
+            }).unwrap();
+            bytes.resize(header_end + length, 0);
+            socket.read_exact(&mut bytes[header_end..]).await.unwrap();
+            if turn == 20 {
+                // Leave the post-checkpoint LLM call unfinished until SIGKILL.
+                continue;
+            }
+            let command = match turn {
+                19 => "echo checkpoint > kept.txt".to_string(),
+                21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
+                _ => format!("echo turn {turn}"),
+            };
+            let chunk = serde_json::json!({"choices":[{"delta":{
+                "content": format!("```bash\n{command}\n```"),
+            }}]});
+            let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        }
+    });
+    let command = || {
+        let mut cmd = tokio::process::Command::new(common::binary_path());
+        cmd.env("SWE_HUB_DIR", &hub).env("SWE_TEMP_DIR", &swe).env("TMPDIR", &swe)
+            .env_remove("MINI_SWE_NO_DAEMON")
+            .env("OPENAI_API_BASE", &api_base).env("OPENAI_API_KEY", "test-key")
+            .env("ENV_FILE", root.path().join("absent.env"))
+            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .env("HUB_IDLE_SECS", "60");
+        cmd
+    };
+    let mut first = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+        .kill_on_drop(true).spawn().unwrap();
+    wait_for_socket(&hub.join("hub.sock")).await;
+    let out = command().args(["dispatch", "checkpoint recovery", "--repo", repo.to_str().unwrap(),
+        "--model", "test-model", "--max-turns", "30", "--verify", "", "--json"])
+        .output().await.unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let dispatched: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let wid = dispatched["worker_id"].as_str().unwrap();
+    let history_path = swe.join(format!("swe-wt-{wid}.history.json"));
+    for _ in 0..400 {
+        if history_path.is_file() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let checkpoint: mini_swe_mcp::pool::WorkerHistory = serde_json::from_slice(
+        &std::fs::read(&history_path).expect("checkpoint must save history before exit")
+    ).unwrap();
+    assert!(mini_swe_mcp::pool::is_replayable(&checkpoint.messages));
+    assert!(checkpoint.messages.len() >= 40, "must retain exchanges before turn 20");
+    assert_eq!(checkpoint.owner.as_deref(), Some("cli"));
+    assert_eq!(checkpoint.verify, None);
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+
+    let mut second = command().arg("daemon").stdout(Stdio::null()).stderr(Stdio::null())
+        .kill_on_drop(true).spawn().unwrap();
+    wait_for_socket(&hub.join("hub.sock")).await;
+    let recovered: mini_swe_mcp::pool::WorkerRegistryEntry = serde_json::from_slice(
+        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json"))).unwrap()
+    ).unwrap();
+    assert_eq!(recovered.status, mini_swe_mcp::pool::RegistryStatus::Failed);
+    assert_eq!(recovered.last_command, format!("hub restarted; work salvaged on branch worker-{wid}"));
+    let out = tokio::time::timeout(std::time::Duration::from_secs(15),
+        command().args(["steer", wid, "resume after crash", "--max-turns", "2", "--wait", "--json"])
+            .output()).await.expect("revision must finish").unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&checkpoint.branch));
+    assert_eq!(common::git(&repo, &["show", &format!("{}:kept.txt", checkpoint.branch)]).trim(), "checkpoint");
+    second.kill().await.unwrap();
+    second.wait().await.unwrap();
+    llm.await.unwrap();
+    std::fs::remove_dir_all(&hub).unwrap();
+}

@@ -772,11 +772,12 @@ impl<'a> TurnEngine<'a> {
     /// Persist the conversation at an auto-checkpoint, so a killed hub
     /// leaves a revisable history file behind instead of only the branch.
     ///
-    /// Same [`WorkerHistory`] the exit path writes, serialized off the runtime
-    /// thread like the checkpoint commit; a failure only warns, so a slow or
-    /// read-only scratch dir can never stall the worker it was saving.
+    /// The exit path's history format is serialized off the runtime thread.
+    /// A failed snapshot warns without interrupting the worker.
     async fn persist_checkpoint_history(&self, config: &TurnConfig<'_>) {
         use super::super::revision::{WorkerHistory, save_worker_history};
+        let revision = self.pool.workers.read().await.get(self.worker_id)
+            .map(|worker| worker.revision).unwrap_or(0);
         let history = WorkerHistory {
             task: config.task.to_string(),
             group: self.meta.group.clone(),
@@ -793,7 +794,7 @@ impl<'a> TurnEngine<'a> {
             verify: self.verify.map(str::to_string),
             max_turns: config.max_turns,
             review_after: config.review_after.map(str::to_string),
-            revision: 0,
+            revision,
             owner: Some(self.meta.owner.clone()),
             messages: self.messages.clone(),
         };
