@@ -178,18 +178,41 @@ impl Client {
     }
 }
 
-/// A daemon on a scratch directory: the socket to dial it on, the server whose
-/// pool the test seeds, and the task to stop when the assertions are done.
-async fn daemon() -> (PathBuf, Arc<McpServer>, tokio::task::JoinHandle<()>) {
-    let dir = scratch_dir();
-    let socket = dir.join("hub.sock");
-    let server = server();
-    let daemon = HubServer::new(server.clone(), HubConfig::new(HubPaths::new(dir), 60));
-    let task = tokio::spawn(async move {
-        let _ = daemon.run().await;
-    });
-    wait_for_socket(&socket).await;
-    (socket, server, task)
+/// A daemon on a scratch directory, stopped and removed when it drops.
+struct Daemon {
+    socket: PathBuf,
+    server: Arc<McpServer>,
+    task: tokio::task::JoinHandle<()>,
+    dir: PathBuf,
+}
+
+impl Daemon {
+    async fn start() -> Self {
+        let dir = scratch_dir();
+        let socket = dir.join("hub.sock");
+        let server = server();
+        let daemon = HubServer::new(
+            server.clone(),
+            HubConfig::new(HubPaths::new(dir.clone()), 60),
+        );
+        let task = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+        wait_for_socket(&socket).await;
+        Self {
+            socket,
+            server,
+            task,
+            dir,
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// A shell command of this session names the test process as its host, not the
@@ -255,17 +278,17 @@ fn an_explicit_agent_id_outranks_the_host_of_a_shell_command() {
 /// sees and steers the worker the first dispatched.
 #[tokio::test]
 async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
-    let (socket, server, daemon) = daemon().await;
+    let daemon = Daemon::start().await;
     let host = "host:claude:4242:9182734";
-    let pool = server.pool();
+    let pool = daemon.server.pool();
     pool.__test_insert_worker(owned_worker("shared-1", host))
         .await;
 
     // The agent's MCP connection: it dispatched the worker.
-    let mut connection = Client::connect(&socket).await;
+    let mut connection = Client::connect(&daemon.socket).await;
     connection.handshake("claude-code", None, Some(host)).await;
     // The agent's shell: the same host, announced by the CLI's own hello.
-    let mut shell = Client::connect(&socket).await;
+    let mut shell = Client::connect(&daemon.socket).await;
     shell.handshake(CLI_CLIENT_NAME, None, Some(host)).await;
 
     for caller in [&mut connection, &mut shell] {
@@ -297,24 +320,23 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
             .expect("the owner may steer its own worker");
         assert_eq!(steered["status"], "steered");
     }
-    daemon.abort();
 }
 
 /// Two host processes are two agents: neither sees nor steers the other's
 /// workers, whatever client name they connect under.
 #[tokio::test]
 async fn two_host_identities_cannot_see_each_others_workers() {
-    let (socket, server, daemon) = daemon().await;
-    let pool = server.pool();
+    let daemon = Daemon::start().await;
+    let pool = daemon.server.pool();
     pool.__test_insert_worker(owned_worker("mine-1", "host:claude:4242:9182734"))
         .await;
     pool.__test_insert_worker(owned_worker("theirs-1", "host:opencode:5253:9182735"))
         .await;
 
-    let mut mine = Client::connect(&socket).await;
+    let mut mine = Client::connect(&daemon.socket).await;
     mine.handshake("claude-code", None, Some("host:claude:4242:9182734"))
         .await;
-    let mut theirs = Client::connect(&socket).await;
+    let mut theirs = Client::connect(&daemon.socket).await;
     theirs
         .handshake("claude-code", None, Some("host:opencode:5253:9182735"))
         .await;
@@ -343,24 +365,23 @@ async fn two_host_identities_cannot_see_each_others_workers() {
             "'{action}' must name the owning agent: {error}"
         );
     }
-    daemon.abort();
 }
 
 /// An explicit `MINI_SWE_AGENT_ID` still wins over the host process, so an
 /// operator can pin one session to a name of their choosing.
 #[tokio::test]
 async fn an_explicit_agent_id_outranks_the_host_identity() {
-    let (socket, server, daemon) = daemon().await;
+    let daemon = Daemon::start().await;
     let host = "host:claude:4242:9182734";
-    let pool = server.pool();
+    let pool = daemon.server.pool();
     pool.__test_insert_worker(owned_worker("pinned-1", "orchestrator-7"))
         .await;
 
-    let mut pinned = Client::connect(&socket).await;
+    let mut pinned = Client::connect(&daemon.socket).await;
     pinned
         .handshake("claude-code", Some("orchestrator-7"), Some(host))
         .await;
-    let mut host_named = Client::connect(&socket).await;
+    let mut host_named = Client::connect(&daemon.socket).await;
     host_named.handshake("claude-code", None, Some(host)).await;
 
     pinned
@@ -372,5 +393,4 @@ async fn an_explicit_agent_id_outranks_the_host_identity() {
         .await
         .expect_err("the host identity does not own it");
     assert!(error.contains("belongs to agent orchestrator-7"), "{error}");
-    daemon.abort();
 }

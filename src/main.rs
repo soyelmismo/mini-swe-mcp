@@ -57,17 +57,18 @@ async fn async_main() -> Result<()> {
         return mini_swe_mcp::monitor::run_monitor(once).await;
     }
 
-    // `whoami` answers from `/proc` alone: no hub, no API key, no
-    // configuration, so it works wherever the agent itself can run.
+    telemetry::init(stdio_requested(&cli_args));
+    bootstrap::load_dotenv_files();
+
+    // `whoami` answers from `/proc` and the environment alone: no hub, no API
+    // key, no manifest, so it works wherever the agent itself can run. It runs
+    // after the dotenv load so it reports the identity a dispatch would use.
     if action_of(&cli_args) == Some("whoami") {
         let identity = mini_swe_mcp::hub::identity::identity(mini_swe_mcp::mcp::CLI_AGENT);
         println!("agent {}", identity.id);
         println!("derived from {}", identity.explain());
         return Ok(());
     }
-
-    telemetry::init(stdio_requested(&cli_args));
-    bootstrap::load_dotenv_files();
 
     if action_of(&cli_args) == Some("watch") {
         let code = mini_swe_mcp::cli::watch::run(&cli_args, json_output, admin).await?;
