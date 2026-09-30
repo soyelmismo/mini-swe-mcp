@@ -76,9 +76,37 @@ fn client_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-fn hello_params(admin: bool, version: &str) -> Value {
+/// This build's identity: `id` matches only the exact binary, `ts` is the
+/// comparable build clock, both stamped by `build.rs`.
+///
+/// `MINI_SWE_FAKE_BUILD_TS` is the test seam, as `MINI_SWE_FAKE_VERSION` is for
+/// the release, so a test can present a client built before or after the hub.
+fn client_build() -> Value {
+    #[cfg(debug_assertions)]
+    if let Some(ts) = std::env::var("MINI_SWE_FAKE_BUILD_TS")
+        .ok()
+        .and_then(|ts| ts.parse::<u64>().ok())
+    {
+        return json!({"id": format!("test-{ts:016x}"), "ts": ts});
+    }
+    build()
+}
+
+/// The build identity of this binary, in the shape the handshake carries it and
+/// the daemon answers in its own `hub/hello` reply.
+fn build() -> Value {
+    json!({"id": env!("MINI_SWE_BUILD_ID"), "ts": build_ts()})
+}
+
+/// The build's clock in unix nanoseconds; it only fails to parse if `build.rs`
+/// did not run, which cannot leave a compiled binary behind.
+fn build_ts() -> u64 {
+    env!("MINI_SWE_BUILD_TS").parse().unwrap_or_default()
+}
+
+fn hello_params(admin: bool, version: &str, build: &Value) -> Value {
     json!({"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
-           "pid": std::process::id(), "version": version,
+           "pid": std::process::id(), "version": version, "build": build,
            "cwd": std::env::current_dir().ok(), "admin": admin})
 }
 
@@ -103,9 +131,40 @@ fn newer(client: &str, daemon: &str) -> bool {
     }
 }
 
+/// Whether this client should step over the daemon it just greeted.
+///
+/// A newer release always wins. At the same release — what every `cargo build`
+/// leaves behind, since `CARGO_PKG_VERSION` does not move — the build clocks
+/// decide, so a rebuilt binary replaces an idle hub built before it. A daemon
+/// that reports no `build` predates the build handshake and is judged on the
+/// release alone.
+fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) -> bool {
+    if version != daemon && newer(version, daemon) {
+        return true;
+    }
+    match (
+        build["id"].as_str(),
+        build["ts"].as_u64(),
+        daemon_build["id"].as_str(),
+        daemon_build["ts"].as_u64(),
+    ) {
+        (Some(id), Some(ts), Some(daemon_id), Some(daemon_ts)) => id != daemon_id && ts > daemon_ts,
+        _ => false,
+    }
+}
+
+/// How one side of the handshake names itself when they have to be told apart.
+fn label(version: &str, build: &Value) -> String {
+    match build["id"].as_str() {
+        Some(id) => format!("{version} build {id}"),
+        None => version.to_string(),
+    }
+}
+
 /// Negotiate once, replacing only an older idle daemon. The retry is bounded.
 async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
     let version = client_version();
+    let build = client_build();
     for attempt in 0..2 {
         let mut client = HubClient {
             stream: BufReader::new(connect_or_spawn().await?),
@@ -114,7 +173,7 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
         };
         // Announce the final CLI identity before any replay. The proxy's
         // identity comes from hello or the host's later initialize.
-        let mut params = hello_params(admin, &version);
+        let mut params = hello_params(admin, &version, &build);
         if cli && params["agent_id"].as_str().is_none_or(str::is_empty) {
             params["agent_id"] = json!(crate::mcp::CLI_AGENT);
         }
@@ -133,7 +192,8 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
             Err(error) => return Err(error),
         };
         let daemon = reply["version"].as_str().unwrap_or("");
-        if daemon != version && newer(&version, daemon) {
+        let daemon_build = &reply["build"];
+        if supersedes(&version, &build, daemon, daemon_build) {
             if !reply["busy"].as_bool().unwrap_or(true) && attempt == 0 {
                 match client.request("hub/shutdown", json!({})).await {
                     Ok(_) => {
@@ -160,7 +220,9 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                 }
             }
             eprintln!(
-                "[mini-swe] Client {version} is newer than hub {daemon}; continuing with the existing daemon (busy or replacement unavailable)."
+                "[mini-swe] Client {} is newer than hub {}; continuing with the existing daemon (busy or replacement unavailable).",
+                label(&version, &build),
+                label(daemon, daemon_build)
             );
         }
         if cli {
