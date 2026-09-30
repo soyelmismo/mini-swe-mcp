@@ -258,10 +258,7 @@ fn render(view: &WorkerView, kind: EventKind) -> String {
 /// Frames go out on the same outbound channel as the responses, so a
 /// notification can never land inside a response frame. The returned handle is
 /// aborted when the stdio loop ends.
-pub(super) fn spawn_event_stream(
-    pool: WorkerPool,
-    tx: mpsc::Sender<String>,
-) -> JoinHandle<()> {
+pub(super) fn spawn_event_stream(pool: WorkerPool, tx: mpsc::Sender<String>) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Seed the first snapshot instead of diffing against an empty one: a
         // server that starts next to already-terminal workers must not replay
@@ -288,9 +285,9 @@ pub(super) fn spawn_event_stream(
 ///
 /// The registry is the only cross-process view, so it supplies both the id set
 /// and the workers another `mini-swe-mcp` process owns; this process's pool is
-/// then read for the payload a registry row cannot carry. `load_all_registry_
-/// entries` skips a row it cannot parse, so a half-written or foreign registry
-/// file is skipped here too instead of taking the loop down.
+/// then read for the payload a registry row cannot carry. The loader skips a
+/// row it cannot parse, so a half-written or foreign registry file is skipped
+/// here too instead of taking the loop down.
 async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapshot {
     let mut current = WorkerSnapshot::new();
     for entry in crate::pool::load_all_registry_entries() {
@@ -321,10 +318,11 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
         // The terminal payload costs a full state clone — a completed worker's
         // diff is megabytes — so it is read once per transition: a worker
         // whose event was already reported keeps what the registry described.
-        if view.event.is_some() && reported.get(&id).and_then(|was| was.event) != view.event {
-            if let Some(state) = pool.get_worker_state(&id).await {
-                view.outcome = outcome_of(&state);
-            }
+        if view.event.is_some()
+            && reported.get(&id).and_then(|was| was.event) != view.event
+            && let Some(state) = pool.get_worker_state(&id).await
+        {
+            view.outcome = outcome_of(&state);
         }
     }
     current
@@ -382,9 +380,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             diff_stat: diff_stat(metrics),
             error: None,
         },
-        WorkerState::Failed {
-            error, metrics, ..
-        } => Outcome {
+        WorkerState::Failed { error, metrics, .. } => Outcome {
             error: (!error.trim().is_empty()).then(|| quote(error)),
             diff_stat: diff_stat(metrics),
             ..Outcome::default()

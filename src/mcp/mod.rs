@@ -21,6 +21,8 @@ mod protocol;
 mod schema;
 mod server;
 
-pub use events::{ChannelEvent, EventKind, Outcome, WorkerSnapshot, WorkerView, channel_frame, diff_events};
+pub use events::{
+    ChannelEvent, EventKind, Outcome, WorkerSnapshot, WorkerView, channel_frame, diff_events,
+};
 pub use schema::{NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
 pub use server::McpServer;

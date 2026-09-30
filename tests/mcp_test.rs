@@ -258,8 +258,10 @@ impl McpProcess {
             }
             match self.stdout_rx.recv_timeout(remaining) {
                 Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return,
-                Ok(ServerOutput::Eof) => return,
-                Ok(ServerOutput::Line(raw)) => {
+                Ok(out) => {
+                    let ServerOutput::Line(raw) = &out else {
+                        return;
+                    };
                     let trimmed = raw.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -267,12 +269,13 @@ impl McpProcess {
                     let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
                         panic!("server wrote non-JSON to stdout: {trimmed:?} ({e})")
                     });
-                    assert_ne!(
-                        value["method"],
-                        json!(CHANNEL_NOTIFICATION),
-                        "a worker-event notification is expected background traffic"
+                    if value["method"] == json!(CHANNEL_NOTIFICATION) {
+                        continue;
+                    }
+                    panic!(
+                        "expected no response for {context}, but got {}",
+                        out.describe()
                     );
-                    panic!("expected no response for {context}, but got {value}");
                 }
             }
         }
@@ -1168,7 +1171,12 @@ fn worker_transitions_become_one_event_each() {
     );
 
     let completed = content_of(&events, "w-done");
-    for expected in ["Fixed the retry loop.", "Verified: yes", "2 files, +30 -4", "\"collect\""] {
+    for expected in [
+        "Fixed the retry loop.",
+        "Verified: yes",
+        "2 files, +30 -4",
+        "\"collect\"",
+    ] {
         assert!(
             completed.contains(expected),
             "a completion must carry `{expected}`: {completed}"
@@ -1184,9 +1192,9 @@ fn worker_transitions_become_one_event_each() {
     }
 
     assert!(
-        events
-            .iter()
-            .all(|event| event.group == "backend" && event.model == "ninja" && !event.status.is_empty()),
+        events.iter().all(|event| event.group == "backend"
+            && event.model == "ninja"
+            && !event.status.is_empty()),
         "every event must carry the context the client renders as tag attributes: {events:?}"
     );
 }
@@ -1245,7 +1253,11 @@ fn workers_that_were_already_terminal_at_startup_are_not_replayed() {
             resumed,
         ]),
     );
-    assert_eq!(events.len(), 1, "only the new transition is news: {events:?}");
+    assert_eq!(
+        events.len(),
+        1,
+        "only the new transition is news: {events:?}"
+    );
     assert_eq!(events[0].worker_id, "w-old-c");
     assert_eq!(events[0].kind, EventKind::NeedsInput);
 }
@@ -1286,10 +1298,7 @@ fn channel_frames_carry_content_and_valid_meta_keys() {
     }
     for (key, value) in meta {
         assert!(
-            !key.is_empty()
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "meta key `{key}` must be a plain identifier: {wire}"
         );
         assert!(
@@ -1344,7 +1353,10 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     let meta = &event["params"]["meta"];
     assert_eq!(event["jsonrpc"], json!("2.0"));
     assert_eq!(event["method"], json!(CHANNEL_NOTIFICATION));
-    assert!(event.get("id").is_none(), "a notification carries no id: {event}");
+    assert!(
+        event.get("id").is_none(),
+        "a notification carries no id: {event}"
+    );
     assert_eq!(meta["event"], json!("needs_input"));
     assert_eq!(meta["worker_id"], json!(worker_id));
     assert_eq!(meta["group"], json!("backend"));
