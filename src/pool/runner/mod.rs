@@ -267,10 +267,6 @@ impl WorkerPool {
     ///
     /// Append `messages` to `worker_id`'s history log, creating it with the
     /// metadata line when it does not exist yet.
-    ///
-    /// The log is append-only, so replaying a conversation that is already in
-    /// it would duplicate every line; the caller passes only the messages it
-    /// has not appended yet.
     fn append_history_messages(
         worker_id: &str,
         meta: &WorkerHistory,

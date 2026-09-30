@@ -1213,7 +1213,7 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
     })
     .await
     .expect("the conversation log must be persisted");
-    let logged: Vec<_> = history
+    let logged = history
         .messages
         .iter()
         .filter(|m| m.role() == mini_swe_mcp::agent::Role::Assistant)

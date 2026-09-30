@@ -75,6 +75,20 @@ use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
 use crate::worktree::WorktreeGuard;
 
+/// Rebuild the conversation a request sends: compaction applied on top of the
+/// append-only log.
+///
+/// The log keeps every message as it was pushed, so the compacted view is
+/// derived here rather than stored, and a continuation replays the same shape
+/// the live loop sent.
+pub fn compact_for_request(
+    messages: &[crate::agent::ChatMessage],
+) -> Vec<crate::agent::ChatMessage> {
+    let mut messages = messages.to_vec();
+    crate::pool::runner::history::compact_history(&mut messages);
+    messages
+}
+
 /// Whether `id`'s registry row is live in a process other than this one.
 ///
 /// The on-disk steer mailbox is only written for such a worker: a row whose
@@ -791,20 +805,6 @@ impl WorkerPool {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
-    }
-
-    /// Rebuild the conversation a request sends: compaction applied on top of
-    /// the append-only log.
-    ///
-    /// The log keeps every message as it was pushed, so the compacted view is
-    /// derived here rather than stored, and a continuation replays the same
-    /// shape the live loop sent.
-    pub fn compact_for_request(
-        messages: &[crate::agent::ChatMessage],
-    ) -> Vec<crate::agent::ChatMessage> {
-        let mut messages = messages.to_vec();
-        crate::pool::runner::history::compact_history(&mut messages);
-        messages
     }
 
     /// Id of every registry row left `interrupted` by a hub crash.
