@@ -616,14 +616,25 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let ids: std::collections::BTreeSet<String> = args["worker_ids"]
+        let mut ids: std::collections::BTreeSet<String> = args["worker_ids"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        if let Some(id) = args.get("worker_id").and_then(Value::as_str) {
+            ids.insert(id.to_string());
+        }
         let group = args.get("group").and_then(Value::as_str);
         let timeout = Self::get_timeout(args, "watch")?;
+        // A named worker must exist and be the caller's own: watching a
+        // foreign id is refused with its owner, never with its task or state.
+        for id in &ids {
+            if self.pool.get_worker_state(id).await.is_none() {
+                anyhow::bail!("Worker not found: {id}");
+            }
+            self.require_owner(id, ctx).await?;
+        }
         let started = tokio::time::Instant::now();
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;

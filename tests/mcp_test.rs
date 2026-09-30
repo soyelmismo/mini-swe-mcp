@@ -1185,86 +1185,61 @@ fn running_worker(id: &str) -> WorkerRecord {
     )
 }
 
-/// An unknown worker is a clear error, never a wait that never returns.
+/// An unknown worker is a clear error, never a watch that never returns.
 #[tokio::test]
-async fn wait_on_an_unknown_worker_is_a_clear_error() {
+async fn watch_on_an_unknown_worker_is_a_clear_error() {
     let server = McpServer::new(
         WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
         "ninja".to_string(),
     );
 
     let error = server
-        .execute_tool("worker", json!({ "action": "wait", "worker_id": "wait-test-ghost" }))
+        .execute_tool("worker", json!({ "action": "watch", "worker_id": "watch-test-ghost" }))
         .await
-        .expect_err("waiting on a worker that was never dispatched must fail");
+        .expect_err("watching a worker that was never dispatched must fail");
     assert!(
-        error.to_string().contains("Worker not found: wait-test-ghost"),
+        error.to_string().contains("Worker not found: watch-test-ghost"),
         "the error must name the worker: {error}"
     );
-
-    // The verb still requires a worker id.
-    let error = server
-        .execute_tool("worker", json!({ "action": "wait" }))
-        .await
-        .expect_err("a workerless wait must fail");
-    assert!(
-        error.to_string().contains("'worker_id'"),
-        "the error must ask for the worker id: {error}"
-    );
 }
 
-/// A worker that already finished answers immediately with the very payload
-/// `dispatch` with `wait: true` returns, so a re-attached orchestrator sees
-/// the terminal state (and the log counters) without another poll.
+/// `timeout_secs` turns the watch into a bounded long-poll: with nothing to
+/// watch it answers `no_event` instead of blocking past the host deadline.
 #[tokio::test]
-async fn wait_on_a_completed_worker_returns_its_state() {
+async fn watch_with_a_deadline_returns_no_event() {
     let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(completed_worker("wait-test-done")).await;
-    let server = McpServer::new(pool, "ninja".to_string());
-
-    let result = server
-        .execute_tool("worker", json!({ "action": "wait", "worker_id": "wait-test-done" }))
-        .await
-        .expect("a finished worker must answer without waiting");
-
-    assert_eq!(result["worker_id"], "wait-test-done");
-    assert_eq!(result["state"]["state"], "Completed");
-    assert_eq!(result["state"]["details"]["summary"], "fixed the parser");
-    assert!(
-        result.get("logs").is_some() && result.get("logs_omitted").is_some(),
-        "the awaited payload carries the log counters: {result}"
-    );
-}
-
-/// `timeout_secs` turns the blocking wait into a bounded long-poll: a worker
-/// that is still running yields `still_running` plus the state needed to
-/// continue, instead of a call the host may abort.
-#[tokio::test]
-async fn wait_with_a_deadline_returns_still_running() {
-    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    pool.__test_insert_worker(running_worker("wait-test-running")).await;
     let server = McpServer::new(pool, "ninja".to_string());
 
     let result = server
         .execute_tool(
             "worker",
-            json!({
-                "action": "wait",
-                "worker_id": "wait-test-running",
-                "timeout_secs": 0,
-            }),
+            json!({ "action": "watch", "timeout_secs": 0 }),
         )
         .await
         .expect("an expired deadline must answer, not hang");
 
-    assert_eq!(result["worker_id"], "wait-test-running");
-    assert_eq!(result["status"], "still_running");
-    assert_eq!(result["step"], 2);
-    assert_eq!(result["last_command"], "cargo test --all-targets");
-    assert!(
-        result.get("state").is_none(),
-        "a bounded wait reports progress, not a terminal state: {result}"
-    );
+    assert_eq!(result["status"], "no_event");
+    assert_eq!(result["events"].as_array().map(Vec::len), Some(0));
+}
+
+/// A worker that is already finished reports its event on the first poll, so
+/// an MCP-only orchestrator never has to poll `status` to learn the outcome.
+#[tokio::test]
+async fn watch_on_a_completed_worker_returns_its_event() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(completed_worker("watch-test-done")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let result = server
+        .execute_tool("worker", json!({ "action": "watch", "worker_id": "watch-test-done" }))
+        .await
+        .expect("a finished worker must answer without waiting");
+
+    assert_eq!(result["status"], "event");
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "one event per finished worker: {result}");
+    assert_eq!(events[0]["worker_id"], "watch-test-done");
+    assert_eq!(events[0]["event"], "completed");
 }
 
 /// The heartbeat has to fire well inside the 30-minute window an MCP client
@@ -1292,13 +1267,13 @@ fn test_tools_call_wait_on_an_unknown_worker_errors() {
         "method": "tools/call",
         "params": {
             "name": "worker",
-            "arguments": { "action": "wait", "worker_id": "missing-xyz" }
+            "arguments": { "action": "watch", "worker_id": "missing-xyz" }
         }
     }));
 
     let response = server
-        .expect_response("tools/call wait")
-        .expect("wait must be answered");
+        .expect_response("tools/call watch")
+        .expect("watch must be answered");
     let error = expect_error_code(&response, -32000);
     assert!(
         error["message"]
@@ -1688,7 +1663,9 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
         json!({ "action": "steer", "worker_id": "h3-foreign", "message": "stop" }),
         json!({ "action": "kill", "worker_id": "h3-foreign" }),
         json!({ "action": "collect", "worker_id": "h3-foreign" }),
-        json!({ "action": "wait", "worker_id": "h3-foreign", "timeout_secs": 0 }),
+        json!({ "action": "watch", "worker_id": "h3-foreign", "timeout_secs": 0 }),
+        json!({ "action": "status", "worker_id": "h3-foreign" }),
+        json!({ "action": "logs", "worker_id": "h3-foreign" }),
     ] {
         let action = arguments["action"].as_str().expect("action");
         let error = server
@@ -1718,18 +1695,43 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
         .expect("the owner may steer its own worker");
     assert_eq!(steered["status"], "steered");
 
-    // Reading another agent's run is what tells an orchestrator the worker
-    // exists at all, so `status` and `logs` stay open and name the owner.
+    // The refusals changed nothing: the worker is still running and still owned
+    // by agent A, and A can steer it.
+    assert!(
+        pool.worker_progress("h3-foreign").await.is_some(),
+        "a refused verb must not evict the worker"
+    );
+    let steered = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "steer", "worker_id": "h3-foreign", "message": "carry on" }),
+            &agent_context("agent-a"),
+        )
+        .await
+        .expect("the owner may steer its own worker");
+    assert_eq!(steered["status"], "steered");
+
+    // `status` and `logs` are reads, but they are private reads: the owner
+    // sees its own worker, and only the admin override sees a foreign one.
     let status = server
         .execute_tool_for(
             "worker",
             json!({ "action": "status", "worker_id": "h3-foreign" }),
-            &agent_b,
+            &agent_context("agent-a"),
         )
         .await
-        .expect("status is readable by every agent");
+        .expect("the owner may read its own worker");
     assert_eq!(status["owner"], "agent-a");
     assert_eq!(status["state"]["state"], "Running");
+    let admin_status = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "status", "worker_id": "h3-foreign" }),
+            &admin_context("operator"),
+        )
+        .await
+        .expect("the admin override may read any worker");
+    assert_eq!(admin_status["owner"], "agent-a");
 }
 
 /// The operator's `--admin` connection is the one caller allowed past the check.
@@ -1808,9 +1810,13 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
     save_registry_entry(&owned_registry_row("h3-mine", "agent-a"));
     save_registry_entry(&owned_registry_row("h3-theirs", "agent-b"));
     let all = server
-        .execute_tool_for("worker", json!({ "action": "list", "scope": "all" }), &agent_a)
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "list", "scope": "all" }),
+            &admin_context("agent-a"),
+        )
         .await
-        .expect("scope=all answers");
+        .expect("scope=all answers for the admin override");
     remove_registry_entry("h3-mine");
     remove_registry_entry("h3-theirs");
     assert!(ids(&all).contains(&"h3-mine".to_string()), "{all}");
@@ -1878,7 +1884,7 @@ async fn completed_payloads_carry_the_review_guidance() {
     let server = McpServer::new(pool, "ninja".to_string());
 
     // `collect` evicts the record, so it goes last.
-    for action in ["wait", "status", "collect"] {
+    for action in ["status", "collect"] {
         let result = server
             .execute_tool("worker", json!({ "action": action, "worker_id": "guide-done" }))
             .await
@@ -1945,4 +1951,137 @@ fn completed_channel_event_carries_the_review_guidance() {
         "the completed event must name the branch: {}",
         event.content
     );
+}
+
+// ----------
+// H-11: dispatch never waits, and every verb is private to its owner
+// ----------
+
+/// `dispatch` answers with the worker id and a pointer to `watch`, and it
+/// answers *now*: no `wait`, no `timeout_secs`, no blocking.
+#[tokio::test]
+async fn dispatch_returns_immediately_with_a_watch_hint() {
+    let server = McpServer::new(
+        WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
+        "ninja".to_string(),
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        server.execute_tool(
+            "worker",
+            json!({
+                "action": "dispatch",
+                "task": "probe",
+                "wait": true,
+                "timeout_secs": 0,
+            }),
+        ),
+    )
+    .await
+    .expect("dispatch must not block")
+    .expect("dispatch must answer");
+
+    let wid = result["worker_id"].as_str().expect("worker id").to_string();
+    assert_eq!(result["status"], "dispatched");
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("watch")),
+        "the reply must point at watch: {result}"
+    );
+    assert!(
+        result.get("state").is_none() && result.get("logs").is_none(),
+        "an immediate dispatch carries no terminal payload: {result}"
+    );
+    remove_registry_entry(&wid);
+}
+
+/// The `watch` action is the only way to wait, and it is bounded by
+/// `timeout_secs`: an expired deadline answers `no_event` rather than hanging.
+#[tokio::test]
+async fn watch_action_answers_no_event_on_an_expired_deadline() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("h11-watch-running")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.execute_tool(
+            "worker",
+            json!({ "action": "watch", "worker_id": "h11-watch-running", "timeout_secs": 0 }),
+        ),
+    )
+    .await
+    .expect("watch must honour its deadline")
+    .expect("watch must answer");
+
+    assert_eq!(result["status"], "no_event");
+    assert_eq!(result["events"].as_array().map(Vec::len), Some(0));
+}
+
+/// A worker is private to its owner: agent B gets the owner's name and nothing
+/// else -- not the task, not the state -- for `status`, `logs`, `collect` and
+/// `watch`, and `list` shows it only to its owner.
+#[tokio::test]
+async fn an_agent_cannot_read_another_agents_worker() {
+    let (pool, server) = owned_server();
+    pool.__test_insert_worker(owned_worker("h11-mine", "agent-a")).await;
+    pool.__test_insert_worker(owned_worker("h11-theirs", "agent-b")).await;
+
+    for arguments in [
+        json!({ "action": "status", "worker_id": "h11-theirs" }),
+        json!({ "action": "logs", "worker_id": "h11-theirs" }),
+        json!({ "action": "collect", "worker_id": "h11-theirs" }),
+        json!({ "action": "watch", "worker_id": "h11-theirs", "timeout_secs": 0 }),
+    ] {
+        let action = arguments["action"].as_str().expect("action");
+        let error = server
+            .execute_tool_for("worker", arguments, &agent_context("agent-a"))
+            .await
+            .expect_err("another agent's worker must be refused");
+        assert_eq!(
+            error.to_string(),
+            "worker h11-theirs belongs to agent agent-b",
+            "'{action}' must name the owning agent: {error}"
+        );
+    }
+
+    // `list` shows the caller its own workers only.
+    let mine = server
+        .execute_tool_for("worker", json!({ "action": "list" }), &agent_context("agent-a"))
+        .await
+        .expect("list answers");
+    let ids: Vec<String> = mine["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(ids.contains(&"h11-mine".to_string()), "{mine}");
+    assert!(!ids.contains(&"h11-theirs".to_string()), "{mine}");
+
+    // The admin override still sees and acts on everything.
+    let admin = server
+        .execute_tool_for("worker", json!({ "action": "list", "scope": "all" }), &admin_context("op"))
+        .await
+        .expect("admin scope=all answers");
+    let admin_ids: Vec<String> = admin["workers"]
+        .as_array()
+        .expect("workers array")
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(admin_ids.contains(&"h11-mine".to_string()), "{admin}");
+    assert!(admin_ids.contains(&"h11-theirs".to_string()), "{admin}");
+
+    let admin_status = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "status", "worker_id": "h11-theirs" }),
+            &admin_context("op"),
+        )
+        .await
+        .expect("the admin override may read any worker");
+    assert_eq!(admin_status["owner"], "agent-b");
 }
