@@ -75,7 +75,13 @@ impl McpProcess {
             // `dotenvy` never overrides a variable that is already set, so
             // this dummy also keeps the suite independent of (and unable to
             // read) whatever key the developer happens to have exported.
+            // Each spawned server gets a private hub directory, so parallel
+            // protocol tests never share a daemon or its registry view.
             .env("OPENAI_API_KEY", "test-key-not-used-by-these-protocol-tests")
+            .env("SWE_HUB_DIR", mcp_hub_dir())
+            // The daemon inherits this process's registry view, so the
+            // channel smoke test's synthetic row must be visible to it.
+            .env("SWE_TEMP_DIR", swe_temp_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -295,6 +301,48 @@ impl Drop for McpProcess {
 
 /// Locate the freshly built server binary. Cargo exports `CARGO_BIN_EXE_<name>`
 /// for integration tests; fall back to the standard `target/<profile>/` path.
+/// A private hub directory for one spawned server, so parallel protocol tests
+/// never share a daemon or its registry view.
+fn mcp_hub_dir() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TAG: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "swe-mcp-test-hub-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos(),
+        TAG.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the test hub dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the test hub dir to 0700");
+    }
+    dir.to_string_lossy().into_owned()
+}
+
+/// A shared registry scratch dir for spawned servers, so the daemon behind
+/// `--stdio` sees the same rows the test writes.
+fn swe_temp_dir() -> String {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "swe-mcp-test-swe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("swe-registry")).expect("create the test registry dir");
+        dir.to_string_lossy().into_owned()
+    })
+    .clone()
+}
+
 fn binary_command() -> (PathBuf, Vec<String>) {
     if let Ok(exe) = std::env::var("CARGO_BIN_EXE_mini-swe-mcp") {
         return (PathBuf::from(exe), vec!["--stdio".to_string()]);
