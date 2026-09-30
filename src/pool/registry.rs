@@ -304,11 +304,17 @@ fn branch_exists(
     branches.contains(&format!("worker-{}", item.id))
 }
 
-/// Read registry rows without Git probes, pruning or liveness normalization.
+/// Read registry rows without Git probes or pruning.
 ///
-/// Status-line reads must be cheap and recovery needs the original status.
+/// Dead workers are normalized to stopped, just as in the dashboard loader.
+/// Recovery uses the raw iterator instead to retain their stored status.
 pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
-    raw_registry_entries().map(|(_, entry)| entry).collect()
+    raw_registry_entries().map(|(_, mut entry)| {
+        if entry.status.is_live() && !crate::worktree::is_process_alive(entry.pid) {
+            entry.status = RegistryStatus::Stopped;
+        }
+        entry
+    }).collect()
 }
 
 fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
@@ -337,10 +343,12 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
     })
 }
 
-/// Salvage crashed workers before the new hub accepts any requests.
+/// Rewrite the dead rows of a crashed hub into failed ones before serving.
 ///
-/// Keep the checkout, branch and history intact for a later revision. Write
-/// back to the source registry, including rows in the fallback scratch base.
+/// Recovery treats any `running`/`paused`/`reviewing` row with a dead pid as
+/// an orphan of the previous hub: salvage the checkout onto `worker-<id>` and
+/// mark it failed with the branch name, keeping branch and history for revision.
+/// The checkout is released only after a successful salvage. Rows of this daemon are live work, so they are never orphans.
 pub(crate) fn recover_orphaned_workers() -> usize {
     let mut recovered = 0;
     for (path, mut entry) in raw_registry_entries() {
@@ -352,14 +360,27 @@ pub(crate) fn recover_orphaned_workers() -> usize {
         }
         let base = path.parent().and_then(|dir| dir.parent()).expect("registry base");
         let checkout = base.join(format!("swe-wt-{}", entry.id));
-        if checkout.is_dir() {
-            crate::worktree::prune::salvage_dirty_worktree(&checkout);
+        let salvaged = !checkout.is_dir()
+            || crate::worktree::prune::salvage_dirty_worktree(&checkout);
+        if salvaged && checkout.is_dir() {
+            // Release the registration so steer can reattach to the branch.
+            // Unlike prune, recovery never retires the branch or history.
+            let removed = crate::worktree::git(
+                &checkout, "worktree remove", &["worktree", "remove", "--force", &checkout.to_string_lossy()],
+            );
+            if !removed.is_ok_and(|out| out.status.success()) {
+                tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
+            }
         }
         entry.status = RegistryStatus::Failed;
         entry.question = None;
-        entry.last_command = format!(
-            "hub restarted; work salvaged on branch worker-{}", entry.id
-        );
+        entry.last_command = if salvaged {
+            format!("hub restarted; work salvaged on branch worker-{}", entry.id)
+        } else {
+            format!(
+                "hub restarted; salvage failed; work retained in {}", checkout.display()
+            )
+        };
         entry.updated_at = super::unix_timestamp();
         match serde_json::to_vec(&entry).map_err(std::io::Error::other)
             .and_then(|json| std::fs::write(&path, json))
