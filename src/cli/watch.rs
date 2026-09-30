@@ -182,7 +182,16 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     if std::env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
         return polling(opts, json_output, admin).await;
     }
-    let mut client = crate::hub::HubClient::connect_as_admin(admin).await?;
+    let mut client = match crate::hub::HubClient::connect_as_admin(admin).await {
+        Ok(client) => client,
+        // A hub that predates `hub/watch` cannot stream events; the registry
+        // poll sees the same workers, just a second late.
+        Err(error) if error.to_string().contains("Method not found") => {
+            println!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
+            return polling(opts, json_output, admin).await;
+        }
+        Err(error) => return Err(error),
+    };
     let started = tokio::time::Instant::now();
     let mut ids = opts.ids.clone();
     let mut initial = true;
@@ -190,6 +199,10 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         let response = match client.watch_snapshot(&ids, opts.group.as_deref(), initial).await {
             Ok(value) => value,
             Err(error) if error.to_string().contains("belongs to agent") => { println!("{error}"); return Ok(4); }
+            Err(error) if error.to_string().contains("Method not found") => {
+                println!("[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.");
+                return polling(opts, json_output, admin).await;
+            }
             Err(error) => return Err(error),
         };
         ids = response["watching"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();

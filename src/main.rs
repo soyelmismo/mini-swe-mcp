@@ -236,9 +236,8 @@ fn print_help() {
     println!("  collect <worker_id>");
     println!("  logs <worker_id>");
     println!("  reap");
-    println!("  steer <worker_id> <message> [--wait] [--timeout <secs>] [--max-turns <n>] (finished workers: revision)");
+    println!("  steer <worker_id> <message> [--max-turns <n>] (finished workers: revision)");
     println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
-    println!("  wait <worker_id> [--timeout <secs>]");
     println!("  list [--all]");
     println!("  monitor [--once]");
     println!("  supervisor [--once]");

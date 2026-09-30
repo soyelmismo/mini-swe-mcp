@@ -830,6 +830,59 @@ mod tests {
         )
     }
 
+    /// A `steer` answer is immediate, so the admission guard it took to queue
+    /// the guidance must be released by the time the reply is built: holding it
+    /// would wedge the pool's admission for every later dispatch.
+    #[tokio::test]
+    async fn steer_returns_immediately_and_releases_its_admission_guard() {
+        use crate::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
+        let server = server();
+        server
+            .pool
+            .__test_insert_worker(WorkerRecord {
+                id: "h4-steer-gate".to_string(),
+                task: "probe".to_string(),
+                model: "test".to_string(),
+                owner: LOCAL_AGENT.to_string(),
+                state: WorkerState::Running {
+                    step: 1,
+                    last_command: "probe".to_string(),
+                    started_at: 0,
+                },
+                metrics: WorkerMetrics::default(),
+                logs: LogBuffer::new(),
+                pending_steer: Vec::new(),
+                resume_tx: None,
+                handle: None,
+                revision: 0,
+            })
+            .await;
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.execute_tool_with_progress(
+                "worker",
+                json!({"action": "steer", "worker_id": "h4-steer-gate", "message": "go"}),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("steer must not block")
+        .expect("steer must succeed");
+        assert_eq!(reply["status"], "steered");
+        assert!(
+            server.hub_shutdown_gate.try_write().is_ok(),
+            "steer must not retain admission"
+        );
+    }
+
+    fn server() -> McpServer {
+        McpServer::new(
+            WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
+            "ninja".to_string(),
+        )
+    }
+
     #[tokio::test]
     async fn waiting_steer_releases_its_admission_guard() {
         use crate::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
