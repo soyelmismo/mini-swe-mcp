@@ -388,6 +388,7 @@ impl WorkerPool {
 
     /// Route one registry write through the coalescing writer (test support).
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn __test_save_status(
         &self,
         meta: &WorkerMeta,

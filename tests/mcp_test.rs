@@ -212,14 +212,9 @@ impl McpProcess {
     }
 
     /// Wait for the next worker-event notification, stepping over any other
-    /// frame the server volunteers in the meantime.
-    fn expect_channel_event(&mut self, context: &str) -> Value {
-        self.expect_channel_event_within(context, RESPONSE_TIMEOUT)
-    }
-
-    /// [`McpProcess::expect_channel_event`] with an explicit budget, for a
-    /// cross-process row change the server only discovers on its coarse
-    /// fallback tick.
+    /// frame the server volunteers in the meantime. The budget is explicit
+    /// because a cross-process row change is only discovered on the server's
+    /// coarse fallback tick, while an in-process one arrives at once.
     fn expect_channel_event_within(&mut self, context: &str, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
