@@ -431,6 +431,13 @@ pub(crate) fn recover_orphaned_workers() -> usize {
                 tracing::warn!(worker = %entry.id, "Could not release recovered worktree");
             }
         }
+        // The orphan's private build dirs and its lease outlive the worktree
+        // directory itself, so they need their own cleanup: without it every
+        // hub restart leaks one `swe-target-<id>` tree and one stale `.pid`.
+        if !checkout.is_dir() {
+            crate::worktree::remove_target_dirs(&checkout);
+            let _ = std::fs::remove_file(crate::worktree::pid_file_for(&checkout));
+        }
         // Interrupted, not failed: the worker stopped because the hub did, not
         // because it cannot continue. Its branch and conversation survive, so
         // the daemon continues it and the orchestrator can steer it.
@@ -500,4 +507,65 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod recovery_cleanup_tests {
+    use super::*;
+    use crate::worktree::{pid_file_for, swe_base_dir};
+
+    /// A registry row whose `pid` is dead: the shape of a worker orphaned by a
+    /// hub crash. PID 1 is never this process, and `is_process_alive` reports
+    /// it dead, so the sweep treats the row as recoverable.
+    fn orphan_row(id: &str) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
+            id: id.to_string(),
+            pid: 1,
+            task: "orphan".to_string(),
+            model: "test".to_string(),
+            status: RegistryStatus::Running,
+            step: 1,
+            max_turns: 10,
+            last_command: "orphaned".to_string(),
+            question: None,
+            started_at: 0,
+            updated_at: 0,
+            group: None,
+            repo_path: None,
+            owner: Some("agent-a".to_string()),
+            metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            revision: 0,
+            auto_continues: 0,
+        }
+    }
+
+    /// The sweep releases the worktree registration so `steer` can reattach to
+    /// the branch. That alone leaves the worker's private build dirs and its
+    /// lease behind, and every hub restart would leak another pair.
+    #[test]
+    fn recovery_removes_the_orphans_target_dir_and_pid_file() {
+        let base = swe_base_dir();
+        let id = format!("rec-cleanup-{}", uuid::Uuid::new_v4().simple());
+        let worktree = base.join(format!("swe-wt-{id}"));
+        let target = base.join(format!("swe-target-swe-wt-{id}"));
+        let scratch = base.join(format!("swe-tmp-swe-wt-{id}"));
+        let pid = pid_file_for(&worktree);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(&pid, serde_json::json!({"pid": 1}).to_string()).unwrap();
+        save_registry_entry(&orphan_row(&id));
+
+        let recovered = recover_orphaned_workers();
+        assert!(recovered >= 1, "the orphan row must be recovered");
+
+        assert!(!target.exists(), "the orphan's target dir must be removed");
+        assert!(!scratch.exists(), "the orphan's scratch dir must be removed");
+        assert!(!pid.exists(), "the orphan's lease must be removed");
+
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_file(&pid);
+    }
 }
