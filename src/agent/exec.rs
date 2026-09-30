@@ -297,16 +297,32 @@ fn bwrap_requested() -> bool {
 /// A kernel with neither Landlock nor seccomp cannot confine anything, so it
 /// falls back to bubblewrap when installed and otherwise runs unconfined.
 pub(crate) fn select_backend() -> SandboxBackend {
-    if sandbox_disabled() {
+    choose_backend(
+        sandbox_disabled(),
+        bwrap_requested(),
+        KernelConfinement::probe_available,
+        has_bwrap,
+    )
+}
+
+/// The selection rule itself, free of environment and host probes so it can
+/// be tested without mutating process-global state under concurrent tests.
+fn choose_backend(
+    disabled: bool,
+    bwrap_opt_in: bool,
+    kernel_available: impl FnOnce() -> bool,
+    bwrap_installed: impl Fn() -> bool,
+) -> SandboxBackend {
+    if disabled {
         return SandboxBackend::Unconfined;
     }
-    if bwrap_requested() && has_bwrap() {
+    if bwrap_opt_in && bwrap_installed() {
         return SandboxBackend::Bwrap;
     }
-    if KernelConfinement::probe_available() {
+    if kernel_available() {
         return SandboxBackend::Kernel;
     }
-    if has_bwrap() {
+    if bwrap_installed() {
         tracing::debug!("kernel offers no Landlock or seccomp; falling back to bubblewrap");
         return SandboxBackend::Bwrap;
     }
@@ -1838,54 +1854,20 @@ mod tests {
     /// bubblewrap when it is installed.
     #[test]
     fn backend_selection_prefers_the_kernel_and_falls_back() {
-        let _guard = super::super::env::ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let save_sandbox = std::env::var_os("SWE_SANDBOX");
-        let save_disable = std::env::var_os("SWE_DISABLE_SANDBOX");
-        // SAFETY: the env lock is held for the whole test, so no other test
-        // observes the overrides below.
-        unsafe {
-            std::env::remove_var("SWE_SANDBOX");
-            std::env::remove_var("SWE_DISABLE_SANDBOX");
-        }
-
-        // An explicit opt-out confines nothing.
-        // SAFETY: the env lock is held; see above.
-        unsafe { std::env::set_var("SWE_DISABLE_SANDBOX", "1") };
-        assert_eq!(select_backend(), SandboxBackend::Unconfined);
-        // SAFETY: the env lock is held; see above.
-        unsafe { std::env::remove_var("SWE_DISABLE_SANDBOX") };
-
-        // The default backend confines with the kernel when the kernel can,
-        // and degrades to bubblewrap only where it cannot.
-        let backend = select_backend();
-        if super::super::sandbox::KernelConfinement::probe_available() {
-            assert_eq!(backend, SandboxBackend::Kernel);
-        } else if has_bwrap() {
-            assert_eq!(backend, SandboxBackend::Bwrap);
-        } else {
-            assert_eq!(backend, SandboxBackend::Unconfined);
-        }
-
-        // The opt-in selects bubblewrap where it is installed.
-        // SAFETY: the env lock is held; see above.
-        unsafe { std::env::set_var("SWE_SANDBOX", "bwrap") };
-        let backend = select_backend();
-        if has_bwrap() {
-            assert_eq!(backend, SandboxBackend::Bwrap);
-        }
-        // SAFETY: the env lock is held; see above.
-        unsafe {
-            std::env::remove_var("SWE_SANDBOX");
-            if let Some(v) = save_sandbox {
-                std::env::set_var("SWE_SANDBOX", v);
-            }
-            if let Some(v) = save_disable {
-                std::env::set_var("SWE_DISABLE_SANDBOX", v);
-            }
-        }
-        let _ = backend;
+        use SandboxBackend::*;
+        let yes = || true;
+        let no = || false;
+        // An explicit opt-out confines nothing, whatever the host offers.
+        assert_eq!(choose_backend(true, true, yes, yes), Unconfined);
+        // The kernel confines by default, even with bubblewrap installed.
+        assert_eq!(choose_backend(false, false, yes, yes), Kernel);
+        // The opt-in selects bubblewrap where it is installed...
+        assert_eq!(choose_backend(false, true, yes, yes), Bwrap);
+        // ...and is ignored where it is not.
+        assert_eq!(choose_backend(false, true, yes, no), Kernel);
+        // A kernel that cannot confine degrades to bubblewrap, then to none.
+        assert_eq!(choose_backend(false, false, no, yes), Bwrap);
+        assert_eq!(choose_backend(false, false, no, no), Unconfined);
     }
 
     /// Run a python snippet under the kernel backend and return its stdout.
