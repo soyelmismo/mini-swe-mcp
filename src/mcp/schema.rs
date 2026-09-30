@@ -66,7 +66,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction, or continue any stopped worker -- completed, failed, interrupted, killed -- on its own id and branch; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; pair with 'timeout_secs' for a bounded long-poll), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). Use 'watch' (or mini-swe-mcp watch) for unattended events instead of polling status. A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
+            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
         ),
     ),
     (
@@ -110,7 +110,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering a finished (completed/failed) worker starts a revision: it resumes on its preserved worker-<id> branch with its full conversation plus this message (prefixed as a revision request), on a fresh turn budget. Optional 'max_turns' sets that budget.",
+            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering corrects a completed worker or continues any stopped one (failed, interrupted, killed): it resumes on its own worker-<id> branch with the full conversation plus this message, on a fresh turn budget. Optional 'max_turns' sets that budget. Never dispatch a replacement for a stopped worker.",
         ),
     ),
     (
@@ -129,14 +129,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Client-side deadline in seconds for a blocking call ('watch'). When it expires before an event arrives, the call returns {status:'no_event'} instead of blocking, so the agent can simply call 'watch' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
+            "Client-side deadline in seconds for the blocking 'watch' action, which is a fallback for agents with no shell: prefer running `mini-swe-mcp watch` in the background. When the deadline expires before an event arrives, the call returns {status:'no_event'} instead of blocking, so the agent can simply call 'watch' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
         ),
     ),
     (
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget of a revision started by steering a finished worker (default 60), and is ignored for running or paused workers.",
+            "Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget when continuing a stopped worker (completed, failed, interrupted or killed; default 60), and is ignored for running or paused workers.",
         ),
     ),
     (
@@ -389,6 +389,60 @@ mod tests {
                 .iter()
                 .any(|entry| entry == "network"),
             "network must stay optional so existing callers are unaffected"
+        );
+    }
+
+    /// The tool description teaches the transport-neutral wait: the `watch`
+    /// action over MCP (bounded by `timeout_secs`, re-called on `no_event`),
+    /// the shell command, and the channel push notifications.
+    #[test]
+    fn tool_description_teaches_the_mcp_wait() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let description = tools_list["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == "worker"))
+            .and_then(|tool| tool["description"].as_str())
+            .expect("tools/list must expose the 'worker' tool description");
+
+        for needle in [
+            "mini-swe-mcp watch",
+            "timeout_secs",
+            "no_event",
+            "push notifications",
+        ] {
+            assert!(
+                description.contains(needle),
+                "the tool description must mention {needle}: {description}"
+            );
+        }
+    }
+
+    /// `message` teaches that steer corrects a completed worker or continues
+    /// any stopped one on its own branch; it never dispatches a replacement.
+    #[test]
+    fn message_description_covers_every_stopped_state() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let text = schema["properties"]["message"]["description"]
+            .as_str()
+            .expect("the message property needs a description");
+
+        for needle in [
+            "completed",
+            "failed",
+            "interrupted",
+            "killed",
+            "worker-<id>",
+            "max_turns",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the message description must mention {needle}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("finished (completed/failed)"),
+            "steer continues any stopped state, not just finished ones: {text}"
         );
     }
 }
