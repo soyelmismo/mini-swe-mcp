@@ -1806,7 +1806,7 @@ const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 /// error instead of being killed. Chosen over `SECCOMP_RET_KILL_PROCESS`
 /// because a worker that trips a denied syscall must report a diagnosable
 /// error to the model, not vanish with no output.
-fn seccomp_ret_errno(errno: libc::c_int) -> u32 {
+const fn seccomp_ret_errno(errno: libc::c_int) -> u32 {
     (libc::SECCOMP_RET_ERRNO | (errno as u32 & libc::SECCOMP_RET_DATA)) as u32
 }
 
@@ -1974,6 +1974,18 @@ impl SeccompFilter {
         self.denies_inet_sockets
     }
 
+    pub fn build_action_clone3_for_test(action: u32) -> Self {
+        let mut program = Vec::new();
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFF));
+        program.push(bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 1, 0));
+        program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW as u32));
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFF));
+        program.push(bpf_jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
+        program.push(bpf_stmt(BPF_RET_K, action));
+        program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW as u32));
+        Self { program, denies_inet_sockets: false }
+    }
+
     /// Number of BPF instructions in the compiled program.
     pub fn instruction_count(&self) -> usize {
         self.program.len()
@@ -1990,7 +2002,7 @@ impl SeccompFilter {
     ///
     /// Requires `PR_SET_NO_NEW_PRIVS` to have been set first; the kernel
     /// refuses `SECCOMP_SET_MODE_FILTER` without it.
-    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+    pub unsafe fn apply(&self) -> std::io::Result<()> {
         // Translate the crate's own instruction type into the kernel's
         // `struct sock_filter` layout. Both are plain data with the same field
         // order, so the conversion is a field-by-field copy.
@@ -2028,23 +2040,25 @@ impl SeccompFilter {
     }
 }
 
-/// Syscalls a sandboxed worker may not call, each paired with the errno the
-/// kernel should report.
+/// Syscalls a sandboxed worker may not call, each paired with the seccomp
+/// action the kernel should take.
 ///
-/// Every entry returns an errno rather than killing the process: a worker that
-/// trips one of these must produce a diagnosable failure for the model, and a
-/// `SIGSYS` would take the whole step down with no output at all.
+/// Every entry is a `SECCOMP_RET_ERRNO` action rather than a kill: a worker
+/// that trips one of these must produce a diagnosable failure for the model,
+/// and a `SIGSYS` would take the whole step down with no output at all. The
+/// `SECCOMP_RET_*` wrapper matters: a bare errno as the action falls into the
+/// `SECCOMP_RET_KILL_THREAD` range and kills the process.
 ///
 /// The list is deliberately about *privilege and cross-process reach*, not
 /// about the filesystem (Landlock owns that) or scheduling (the timeout layer
 /// owns that).
 fn default_denied_syscalls() -> Vec<(libc::c_long, u32)> {
     /// Deny with `EPERM`: the operation is not permitted for this worker.
-    const EPERM: u32 = libc::EPERM as u32;
+    const EPERM: u32 = seccomp_ret_errno(libc::EPERM);
     /// Deny with `ENOSYS`: pretend the syscall does not exist. Used for
     /// `clone3` so `glibc`'s `clone` fallback runs instead, where the flags
     /// can actually be inspected.
-    const ENOSYS: u32 = libc::ENOSYS as u32;
+    const ENOSYS: u32 = seccomp_ret_errno(libc::ENOSYS);
 
     let denied: &[(libc::c_long, u32)] = &[
         // Inspecting or driving another process's memory and registers.
@@ -2193,6 +2207,30 @@ impl KernelConfinement {
         }))
     }
 
+    pub fn prepare_narrow_for_test(
+        worktree: &Path,
+        target_dir: &Path,
+        keep: &str,
+    ) -> Result<Option<Self>> {
+        let landlock = None;
+        let full = default_denied_syscalls();
+        let denied: Vec<(libc::c_long, u32)> = if keep == "all" {
+            full
+        } else if keep == "none" {
+            Vec::new()
+        } else {
+            let (lo, hi) = keep.split_once('-').unwrap();
+            let (lo, hi): (usize, usize) = (lo.parse().unwrap(), hi.parse().unwrap());
+            full.into_iter().enumerate().filter(|(i, _)| *i >= lo && *i <= hi).map(|(_, v)| v).collect()
+        };
+        let seccomp = seccomp_supported().then(|| SeccompFilter::build_with(false, &denied));
+        if landlock.is_none() && seccomp.is_none() {
+            return Ok(None);
+        }
+        let _ = (worktree, target_dir);
+        Ok(Some(Self { landlock, seccomp, parent_pid: std::process::id() }))
+    }
+
     /// Whether this kernel can confine a worker at all: Landlock, seccomp,
     /// or both. Neither `lsm=` without `landlock` nor a kernel built without
     /// `CONFIG_SECCOMP` confines anything, and the caller must know that
@@ -2202,6 +2240,17 @@ impl KernelConfinement {
             return false;
         }
         query_abi_version().is_some() || seccomp_supported()
+    }
+
+    pub unsafe fn apply_seccomp_only_for_test(&self) -> std::io::Result<()> {
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if let Some(f) = &self.seccomp { unsafe { f.apply()? }; }
+        Ok(())
+    }
+
+    pub unsafe fn apply_landlock_only_for_test(&self) -> std::io::Result<()> {
+        if let Some(p) = &self.landlock { unsafe { p.apply()? }; }
+        Ok(())
     }
 
     /// Whether a Landlock domain is part of this confinement.
