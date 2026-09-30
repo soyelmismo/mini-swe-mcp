@@ -344,39 +344,42 @@ default: ninja
 models:
   ninja:
     id: combo:ninja
-    role: "Fast, precise, low-token autonomous execution for targeted fixes and audits."
+    role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
     temperature: 0.2
-    max_turns: 50
+    max_turns: 150
     policy:
       network: "allow"
-      fs: "full"
   nerd:
     id: combo:nerd
-    role: "Deep architectural reasoning, extensive documentation, and heavy refactors."
+    role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
     temperature: 0.6
-    max_turns: 100
+    max_turns: 200
     policy:
       network: "allow"
-      fs: "full"
 ```
 
 ### Execution policy
 
-A model entry may declare the execution policy its workers run under. Both
-fields are optional, and an entry without a `policy:` block keeps the runtime
-defaults, so a manifest written before this block existed is still valid:
+A model entry may declare the execution policy its workers run under. The
+`policy:` block and its field are both optional, and an entry without one keeps
+the runtime defaults, so a manifest written before this block existed is still
+valid:
 
 | Field | Accepted values | Meaning |
 |-------|-----------------|---------|
-| `network` | `"offline"` \| `"allow"` | `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool. |
-| `fs` | `"read-only"` \| `"worktree-only"` \| `"full"` | How much of the filesystem a worker may write, from least to most capable. |
+| `network` | `"offline"` \| `"allow"` | The dispatch default for the worker: `offline` runs every bash step in its own network namespace (no egress); `allow` keeps the host's normal connectivity. Same spelling as the `network` argument of the `worker` tool, and an explicit argument on the dispatch wins over the manifest. |
 
 Values are trimmed and matched case-insensitively, so `Offline` and
-`" worktree_only "` are accepted. An **unknown value never fails the load**: it is
+`" offLINE "` are accepted. An **unknown value never fails the load**: it is
 reported as a warning naming the exact text you wrote and is repaired to the
-*restrictive* default (`offline` / `read-only`), so a typo can never quietly widen
-a sandbox. Warnings are emitted on startup, alongside the existing manifest
-checks (temperature bounds, turn budgets, duplicate ids).
+*restrictive* default (`offline`), so a typo can never quietly widen a sandbox.
+Warnings are emitted on startup, alongside the other manifest checks (temperature
+bounds, turn budgets, duplicate ids).
+
+`fs:` is **not supported**: it is ignored with a startup warning, because
+filesystem confinement is not negotiated per model. A worker always writes inside
+its own worktree and build directory, confined by the sandbox rather than by the
+manifest.
 
 ---
 
@@ -404,14 +407,13 @@ next:
 - **Bounded** -> at most 8 KiB of memory is injected (the newest entries), so a
   memory file that grows forever can never squeeze out the instructions.
 - **Traversal-safe** -> the alias is reduced to an `[a-z0-9_-]` slug before it
-  touches the filesystem, so a `model` argument can never read or write outside
+  touches the filesystem, so a `model` argument can never read outside
   `.agents/memory/`.
 
-Notes are appended as atomic, single-line markdown entries
-(`append_agent_memory`): the new file is staged next to the target and moved into
-place with `rename`, and the read-modify-write is serialized, so a reader (or a
-`worktree` artifact sync) never sees a half-written note and two agents finishing
-at once cannot lose each other's takeaway.
+Memory is **read-only** from the server's side: it loads a role's notes and never
+writes them, so the files stay a reviewable artefact of the repository rather
+than something a run can silently rewrite. Edit `.agents/memory/<alias>.md` (or
+ask a subagent to) and the next dispatch picks it up.
 
 ---
 
@@ -423,8 +425,8 @@ Run the full automated test suite:
 # Unit tests + CLI tests + MCP JSON-RPC integration + WorktreeGuard tests
 cargo test
 
-# Strict clippy linting
-cargo clippy -- -D warnings
+# Strict clippy linting over every target
+cargo clippy --all-targets -- -D warnings
 ```
 
 ---

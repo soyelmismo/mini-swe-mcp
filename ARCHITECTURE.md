@@ -127,15 +127,21 @@ Two independent layers stand between a model-authored command and the host.
   line (`bash <<EOF`, `cat <<EOF | sh`). A heredoc that only writes data — a source file or a
   fixture that happens to mention `rm -rf /` — is stripped before scanning, so editing the
   guard itself is never blocked by it. Plain developer verbs (`cargo`, `git`, `ls`, `cat`)
-  with no shell composition take a fast path.
-- **Landlock (`agent::sandbox::build_landlock_plan`)** — the *only* filesystem confinement
-  path. The plan is built in the parent (ABI probe, canonicalisation, syscall-backed
-  existence checks) and installed from a `Command::pre_exec` hook, because
-  `landlock_restrict_self` restricts the *calling* process and `pre_exec` runs after `fork`
-  but before `exec`, in the child that is about to become the command. A kernel without
-  Landlock — or `SWE_DISABLE_LANDLOCK=1` — yields `Ok(None)`, registers no hook, and the
-  command runs unconfined rather than failing; a malformed plan (a missing worktree or
-  target dir) is a caller bug and stays an `Err`.
+  with no shell composition take a fast path. The same stripped command then faces
+  `sandbox::validate_bash_command`, which refuses whole-filesystem searches (`find /`,
+  `grep -r /`) that would turn a worktree into a disk-wide scan. Neither check is an `Err`:
+  both are reported to the model as output with a non-zero exit code, so the worker can
+  recover on its next turn.
+- **Filesystem confinement** — bubblewrap builds the mount namespace when it is available
+  (`SWE_DISABLE_SANDBOX=1` opts out). Otherwise there is exactly one Landlock path:
+  `sandbox::build_landlock_plan` builds the plan in the parent (ABI probe,
+  canonicalisation, syscall-backed existence checks) and a `Command::pre_exec` hook installs
+  it, because `landlock_restrict_self` restricts the *calling* process and `pre_exec` runs
+  after `fork` but before `exec`, in the child that is about to become the command. The two
+  are never stacked — bwrap already confines the process, so a second restriction could only
+  conflict. A kernel without Landlock — or `SWE_DISABLE_LANDLOCK=1` — yields `Ok(None)`,
+  registers no hook, and the command runs unconfined rather than failing; a malformed plan
+  (a missing worktree or target dir) is a caller bug and stays an `Err`.
 - **Output truncation (`truncate_with_dropped`)** — a step's combined output is bounded by
   `TRUNCATE_LIMIT` (16 KiB), keeping `TRUNCATE_HEAD` (12 KiB) at the start and
   `TRUNCATE_TAIL` (4 KiB) at the end. The count of bytes already dropped by the streaming
