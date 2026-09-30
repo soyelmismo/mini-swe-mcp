@@ -488,6 +488,56 @@ cargo clippy --all-targets -- -D warnings
 
 ---
 
+## Load testing
+
+`tests/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub
+daemon out to many agents of many workers and asserts the hub keeps the machine
+busy without memory pressure. It is excluded from `cargo test` so the normal
+suite stays fast — run it explicitly:
+
+```bash
+# Quick smoke: 2 agents x 3 workers (the defaults), ~5 s.
+cargo test --test load_test -- --ignored --nocapture
+
+# Full load: 5 agents x 20 workers (100 total), ~75 s on 4 cores.
+LOAD_AGENTS=5 LOAD_WORKERS_PER_AGENT=20 \
+    cargo test --test load_test -- --ignored --nocapture
+```
+
+Every worker is driven by a fake OpenAI-compatible SSE server
+(`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a
+heavy command (`cargo build` plus a bounded CPU burn, classified heavy by
+`is_heavy_command` so the pool's admission controller has to dose it), then the
+completion sentinel. The test dispatches each worker over the hub socket with a
+distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the
+daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy
+commands in flight by watching the daemon's children, and records the order
+workers finish in. It then asserts — and prints a one-screen report of:
+
+- **all workers complete** — every dispatched worker reaches `completed`;
+- **bounded daemon RSS** — peak `VmHWM` stays under a generous 300 MB;
+- **dosed heavy commands** — the number in flight never exceeds
+  `BASH_BUILD_LIMIT`;
+- **fairness** — no agent finishes all of its workers before another agent has
+  completed any of its own.
+
+The shape is configurable through the environment: `LOAD_AGENTS`,
+`LOAD_WORKERS_PER_AGENT`, `LOAD_MAX_WORKERS` (`MAX_CONCURRENT_WORKERS`),
+`LOAD_MAX_HEAVY` (`BASH_BUILD_LIMIT`), `LOAD_HEAVY_SECS`, and `LOAD_TIMEOUT_SECS`.
+
+Measured on a 4-core host (all other settings at their defaults):
+
+| run         | wall  | peak daemon RSS (VmHWM) | peak heavy in flight | completed |
+| ----------- | ----- | ----------------------- | -------------------- | --------- |
+| smoke 2 x 3 | 4.7 s | 20.1 MB                 | 4 / 4                | 6 / 6     |
+| full 5 x 20 | 72 s  | 24.6 MB                 | 4 / 4                | 100 / 100 |
+
+In the full run the admission controller logged 108 heavy-command admission
+waits for the four build slots and the completion order interleaved all five
+agents, so the daemon stayed busy and bounded under 100 concurrent workers.
+
+---
+
 ## License
 
 GNU General Public License v3.0 (GPL-3.0-or-later)
