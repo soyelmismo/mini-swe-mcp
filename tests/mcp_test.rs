@@ -13,9 +13,15 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
-use mini_swe_mcp::mcp::{McpServer, NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
+use mini_swe_mcp::mcp::{
+    ChannelEvent, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome, WorkerSnapshot,
+    WorkerView, WORKER_ACTIONS, channel_frame, diff_events,
+};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
 use mini_swe_mcp::agent::wrap_network_command;
+use mini_swe_mcp::pool::{
+    RegistryStatus, WorkerRegistryEntry, remove_registry_entry, save_registry_entry,
+};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -26,6 +32,10 @@ use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "mini-swe-mcp";
+/// The worker-event notification the server pushes at any moment (Claude
+/// Code's `claude/channel` extension): background traffic, never an answer to a
+/// request, so a test waiting for one must step over it.
+const CHANNEL_NOTIFICATION: &str = "notifications/claude/channel";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const SILENCE_GRACE: Duration = Duration::from_millis(500);
 
@@ -177,6 +187,13 @@ impl McpProcess {
                     let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
                         panic!("server wrote non-JSON to stdout: {trimmed:?} ({e})")
                     });
+                    // A worker-event notification is not an answer to the
+                    // pending request; reading one as a response would make
+                    // every test that shares a registry with a live worker
+                    // flaky.
+                    if value["method"] == json!(CHANNEL_NOTIFICATION) {
+                        continue;
+                    }
                     assert_eq!(
                         value["jsonrpc"].as_str(),
                         Some("2.0"),
@@ -194,12 +211,74 @@ impl McpProcess {
         }
     }
 
+    /// Wait for the next worker-event notification, stepping over any other
+    /// frame the server volunteers in the meantime.
+    fn expect_channel_event(&mut self, context: &str) -> Value {
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out after {RESPONSE_TIMEOUT:?} waiting for {context}"
+            );
+            match self.stdout_rx.recv_timeout(remaining) {
+                Ok(ServerOutput::Eof) => panic!("server exited while waiting for {context}"),
+                Ok(ServerOutput::Line(raw)) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                        panic!("server wrote non-JSON to stdout: {trimmed:?} ({e})")
+                    });
+                    if value["method"] == json!(CHANNEL_NOTIFICATION) {
+                        return value;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timed out after {RESPONSE_TIMEOUT:?} waiting for {context}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("stdout reader thread vanished while waiting for {context}")
+                }
+            }
+        }
+    }
+
     /// Assert the server writes nothing on stdout for a short grace period.
+    ///
+    /// The one frame that may appear anyway is a worker-event notification: it
+    /// is background traffic the server emits on its own schedule and says
+    /// nothing about the request under test.
     fn expect_silence(&mut self, context: &str) {
-        match self.stdout_rx.recv_timeout(SILENCE_GRACE) {
-            Err(RecvTimeoutError::Timeout) => {}
-            Ok(out) => panic!("expected no response for {context}, but got {}", out.describe()),
-            Err(RecvTimeoutError::Disconnected) => {}
+        let deadline = Instant::now() + SILENCE_GRACE;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.stdout_rx.recv_timeout(remaining) {
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(out) => {
+                    let ServerOutput::Line(raw) = &out else {
+                        return;
+                    };
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                        panic!("server wrote non-JSON to stdout: {trimmed:?} ({e})")
+                    });
+                    if value["method"] == json!(CHANNEL_NOTIFICATION) {
+                        continue;
+                    }
+                    panic!(
+                        "expected no response for {context}, but got {}",
+                        out.describe()
+                    );
+                }
+            }
         }
     }
 }
@@ -1141,5 +1220,324 @@ fn test_tools_call_wait_on_an_unknown_worker_errors() {
             .as_str()
             .is_some_and(|message| message.contains("Worker not found")),
         "expected a clear unknown-worker error, got: {error}"
+    );
+}
+
+// ----------
+// `claude/channel` worker events
+// ----------
+
+/// A worker view carrying the context every notification renders, so a test
+/// only has to set the fields it is actually about.
+fn worker_view(worker_id: &str, event: Option<EventKind>) -> WorkerView {
+    WorkerView {
+        worker_id: worker_id.to_string(),
+        event,
+        group: String::from("backend"),
+        model: String::from("ninja"),
+        status: event.map_or("running", EventKind::as_str).to_string(),
+        ..WorkerView::default()
+    }
+}
+
+/// One tick's snapshot of the given workers.
+fn worker_snapshot(views: impl IntoIterator<Item = WorkerView>) -> WorkerSnapshot {
+    views
+        .into_iter()
+        .map(|view| (view.worker_id.clone(), view))
+        .collect()
+}
+
+/// The rendered text of the event about `worker_id`.
+fn content_of(events: &[ChannelEvent], worker_id: &str) -> String {
+    events
+        .iter()
+        .find(|event| event.worker_id == worker_id)
+        .unwrap_or_else(|| panic!("no event for worker {worker_id} in {events:?}"))
+        .content
+        .clone()
+}
+
+/// The handshake opts into the `claude/channel` extension and tells the model
+/// how to answer what arrives through it.
+#[test]
+fn initialize_declares_the_claude_channel_extension() {
+    let mut server = McpProcess::spawn();
+    let response = server.initialize();
+    let result = &response["result"];
+
+    assert_eq!(
+        result["capabilities"]["experimental"]["claude/channel"],
+        json!({}),
+        "the channel capability must be declared, and declared empty: {result}"
+    );
+    assert_eq!(
+        result["capabilities"]["tools"]["listChanged"],
+        json!(false),
+        "opting into the channel must not drop the tools capability: {result}"
+    );
+    let instructions = result["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the channel extension needs instructions: {result}"));
+    for expected in [
+        "needs_input",
+        "steer",
+        "completed",
+        "collect",
+        "failed",
+        "status",
+        "logs",
+        "worker_id",
+    ] {
+        assert!(
+            instructions.contains(expected),
+            "the instructions must tell the model what to do about `{expected}`: {instructions}"
+        );
+    }
+}
+
+/// A pause, a completion and a failure each reach the session, carrying what
+/// the orchestrator needs to answer and the verb it answers with.
+#[test]
+fn worker_transitions_become_one_event_each() {
+    let running = worker_snapshot([worker_view("w-run", None)]);
+
+    let mut paused = worker_view("w-run", Some(EventKind::NeedsInput));
+    paused.question = Some(String::from("Ship the migration or roll it back?"));
+    let mut completed = worker_view("w-done", Some(EventKind::Completed));
+    completed.outcome = Outcome {
+        summary: Some(String::from("Fixed the retry loop.")),
+        verified: Some(true),
+        diff_stat: Some(String::from("2 files, +30 -4")),
+        error: None,
+    };
+    let mut failed = worker_view("w-dead", Some(EventKind::Failed));
+    failed.outcome = Outcome {
+        error: Some(String::from("bash exited 1")),
+        ..Outcome::default()
+    };
+
+    let events = diff_events(&running, &worker_snapshot([paused, completed, failed]));
+    let reported: Vec<(&str, &str)> = events
+        .iter()
+        .map(|event| (event.worker_id.as_str(), event.kind.as_str()))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            ("w-dead", "failed"),
+            ("w-done", "completed"),
+            ("w-run", "needs_input")
+        ],
+        "one event per transition, ordered by worker id"
+    );
+
+    let needs_input = content_of(&events, "w-run");
+    assert!(
+        needs_input.contains("Ship the migration or roll it back?"),
+        "a pause must carry the question: {needs_input}"
+    );
+    assert!(
+        needs_input.contains("\"steer\"") && needs_input.contains("w-run"),
+        "a pause must say how to answer it: {needs_input}"
+    );
+
+    let completed = content_of(&events, "w-done");
+    for expected in [
+        "Fixed the retry loop.",
+        "Verified: yes",
+        "2 files, +30 -4",
+        "\"collect\"",
+    ] {
+        assert!(
+            completed.contains(expected),
+            "a completion must carry `{expected}`: {completed}"
+        );
+    }
+
+    let failed = content_of(&events, "w-dead");
+    for expected in ["bash exited 1", "\"status\"", "\"logs\""] {
+        assert!(
+            failed.contains(expected),
+            "a failure must carry `{expected}`: {failed}"
+        );
+    }
+
+    assert!(
+        events.iter().all(|event| event.group == "backend"
+            && event.model == "ninja"
+            && !event.status.is_empty()),
+        "every event must carry the context the client renders as tag attributes: {events:?}"
+    );
+}
+
+/// One transition produces one notification: the next tick sees the same
+/// `(worker_id, event)` pair and stays silent.
+#[test]
+fn a_reported_transition_is_not_reported_again() {
+    let running = worker_snapshot([worker_view("w-done", None)]);
+    let mut finished = worker_view("w-done", Some(EventKind::Completed));
+    finished.outcome = Outcome {
+        summary: Some(String::from("Done.")),
+        ..Outcome::default()
+    };
+    let after = worker_snapshot([finished]);
+
+    assert_eq!(
+        diff_events(&running, &after).len(),
+        1,
+        "the transition into `completed` must be reported"
+    );
+    assert!(
+        diff_events(&after, &after).is_empty(),
+        "an unchanged worker must stay silent: {:?}",
+        diff_events(&after, &after)
+    );
+    assert!(
+        diff_events(&after, &running).is_empty(),
+        "a collected worker must not be re-reported: {:?}",
+        diff_events(&after, &running)
+    );
+}
+
+/// The first snapshot is seeded, never diffed against an empty one: a server
+/// started next to finished workers stays silent instead of replaying history.
+#[test]
+fn workers_that_were_already_terminal_at_startup_are_not_replayed() {
+    let seeded = worker_snapshot([
+        worker_view("w-old-a", Some(EventKind::Completed)),
+        worker_view("w-old-b", Some(EventKind::Failed)),
+        worker_view("w-old-c", None),
+    ]);
+    assert!(
+        diff_events(&seeded, &seeded.clone()).is_empty(),
+        "no historical flood on the first tick: {:?}",
+        diff_events(&seeded, &seeded.clone())
+    );
+
+    let mut resumed = worker_view("w-old-c", Some(EventKind::NeedsInput));
+    resumed.question = Some(String::from("Which branch?"));
+    let events = diff_events(
+        &seeded,
+        &worker_snapshot([
+            worker_view("w-old-a", Some(EventKind::Completed)),
+            worker_view("w-old-b", Some(EventKind::Failed)),
+            resumed,
+        ]),
+    );
+    assert_eq!(
+        events.len(),
+        1,
+        "only the new transition is news: {events:?}"
+    );
+    assert_eq!(events[0].worker_id, "w-old-c");
+    assert_eq!(events[0].kind, EventKind::NeedsInput);
+}
+
+/// A channel notification is one JSON-RPC line whose `params.meta` keys are
+/// identifiers and whose values are strings — what the client turns into the
+/// `<channel source=… key=…>` wrapper.
+#[test]
+fn channel_frames_carry_content_and_valid_meta_keys() {
+    let mut paused = worker_view("w-run", Some(EventKind::NeedsInput));
+    paused.question = Some(String::from("Ship the migration?"));
+    let events = diff_events(&WorkerSnapshot::new(), &worker_snapshot([paused]));
+    let frame = channel_frame(&events[0]).expect("a channel event must serialize");
+
+    assert!(
+        frame.ends_with('\n') && frame.matches('\n').count() == 1,
+        "one line per frame: {frame:?}"
+    );
+    let wire: Value = serde_json::from_str(&frame).expect("the frame is one JSON document");
+    assert_eq!(wire["jsonrpc"], json!("2.0"));
+    assert_eq!(wire["method"], json!("notifications/claude/channel"));
+    assert!(
+        wire.get("id").is_none(),
+        "a notification must not carry an id: {wire}"
+    );
+    assert!(
+        wire["params"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Ship the migration?")),
+        "the question must reach the session: {wire}"
+    );
+
+    let meta = wire["params"]["meta"]
+        .as_object()
+        .unwrap_or_else(|| panic!("params.meta must be an object: {wire}"));
+    for key in ["event", "worker_id", "group", "model", "status"] {
+        assert!(meta.contains_key(key), "meta must carry `{key}`: {wire}");
+    }
+    for (key, value) in meta {
+        assert!(
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "meta key `{key}` must be a plain identifier: {wire}"
+        );
+        assert!(
+            value.is_string(),
+            "meta value for `{key}` must be a string: {wire}"
+        );
+    }
+    assert_eq!(meta["event"], json!("needs_input"));
+    assert_eq!(meta["worker_id"], json!("w-run"));
+}
+
+/// A registry row for a synthetic worker, owned by this process so the reader
+/// never normalizes it to `stopped`.
+fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegistryEntry {
+    WorkerRegistryEntry {
+        id: worker_id.to_string(),
+        pid: std::process::id(),
+        task: String::from("channel smoke test"),
+        model: String::from("ninja"),
+        status,
+        step: 3,
+        max_turns: 20,
+        last_command: String::from("cargo test"),
+        question: None,
+        started_at: 0,
+        updated_at: 0,
+        group: Some(String::from("backend")),
+        repo_path: None,
+        metrics: WorkerMetrics::default(),
+    }
+}
+
+/// End to end: a worker that pauses after the server started is pushed into the
+/// session as one newline-terminated `notifications/claude/channel` frame.
+///
+/// The row exists (as a running worker) before the server does, so the event
+/// task's seeded first snapshot already knows it and the pause that follows is
+/// a genuine transition rather than history.
+#[test]
+fn a_worker_transition_reaches_the_session_over_stdio() {
+    let worker_id = format!("chan-smoke-{}", std::process::id());
+    save_registry_entry(&synthetic_registry_row(&worker_id, RegistryStatus::Running));
+
+    let mut server = McpProcess::spawn();
+    server.initialize();
+    let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
+    paused.question = Some(String::from("Ship the migration or roll it back?"));
+    save_registry_entry(&paused);
+    let event = server.expect_channel_event("the paused worker");
+    remove_registry_entry(&worker_id);
+
+    let meta = &event["params"]["meta"];
+    assert_eq!(event["jsonrpc"], json!("2.0"));
+    assert_eq!(event["method"], json!(CHANNEL_NOTIFICATION));
+    assert!(
+        event.get("id").is_none(),
+        "a notification carries no id: {event}"
+    );
+    assert_eq!(meta["event"], json!("needs_input"));
+    assert_eq!(meta["worker_id"], json!(worker_id));
+    assert_eq!(meta["group"], json!("backend"));
+    assert_eq!(meta["model"], json!("ninja"));
+    assert_eq!(meta["status"], json!("paused"));
+    assert!(
+        event["params"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Ship the migration or roll it back?")),
+        "the escalated question must reach the session: {event}"
     );
 }

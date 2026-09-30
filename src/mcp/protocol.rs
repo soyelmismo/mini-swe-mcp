@@ -307,13 +307,28 @@ impl Serialize for JsonRpcResponse {
 /// with no `json!` tree to build and no per-call map churn. `LazyLock` is the
 /// std spelling of "once per process"; `src/mcp/server.rs` clones the document
 /// out of it when a handshake arrives.
+///
+/// `capabilities.experimental["claude/channel"]` opts into Claude Code's
+/// research-preview channel extension, and `instructions` tells the model how
+/// to answer what comes back through it (see `src/mcp/events.rs`). A client
+/// that does not know the capability ignores both, and a session that did not
+/// load development channels drops the notifications themselves, so declaring
+/// it costs a non-Claude peer nothing.
 pub(super) static INITIALIZE_RESULT: LazyLock<Value> = LazyLock::new(|| {
     let wire = concat!(
         r#"{"protocolVersion":"2024-11-05","#,
-        r#""capabilities":{"tools":{"listChanged":false}},"#,
+        r#""capabilities":{"experimental":{"claude/channel":{}},"tools":{"listChanged":false}},"#,
         r#""serverInfo":{"name":"mini-swe-mcp","version":""#,
         env!("CARGO_PKG_VERSION"),
-        r#""}}"#,
+        r#""},"#,
+        r#""instructions":"This server pushes worker events into the session as"#,
+        r#" <channel source=\"mini-swe\" event=\"...\" worker_id=\"...\"> tags."#,
+        r#" On event=\"needs_input\" answer with the worker tool, action \"steer\","#,
+        r#" using the worker_id from the tag. On event=\"completed\" review the work with"#,
+        r#" action \"collect\". On event=\"failed\" inspect it with action \"status\""#,
+        r#" (action \"logs\" for the transcript). Events are only delivered when"#,
+        r#" this server was started with --dangerously-load-development-channels."#,
+        r#""}"#,
     );
     serde_json::from_str::<Value>(wire).expect("the initialize result must be valid JSON")
 });
@@ -577,6 +592,35 @@ mod tests {
             "the advertised version is the package version"
         );
         assert_eq!(initialize["capabilities"]["tools"]["listChanged"], json!(false));
+    }
+
+    /// The handshake also opts into the `claude/channel` extension and tells the
+    /// model how to answer what arrives through it.
+    #[test]
+    fn initialize_result_declares_the_channel_extension() {
+        let initialize: &Value = &INITIALIZE_RESULT;
+        assert_eq!(
+            initialize["capabilities"]["experimental"]["claude/channel"],
+            json!({}),
+            "the channel capability is declared, and declared empty"
+        );
+        let instructions = initialize["instructions"]
+            .as_str()
+            .expect("the channel extension needs instructions");
+        for expected in [
+            "needs_input",
+            "steer",
+            "completed",
+            "collect",
+            "failed",
+            "status",
+            "worker_id",
+        ] {
+            assert!(
+                instructions.contains(expected),
+                "the instructions must mention `{expected}`: {instructions}"
+            );
+        }
     }
 
     /// An id as it arrives on the wire, for the round-trip assertions below.

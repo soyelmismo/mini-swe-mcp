@@ -63,6 +63,11 @@ impl McpServer {
 
         let (out_tx, mut out_rx) = mpsc::channel::<String>(128);
 
+        // Worker events: one `claude/channel` notification per state transition,
+        // written through the same outbound channel as the responses so a
+        // notification can never land inside a response frame.
+        let events = super::events::spawn_event_stream((*self.pool).clone(), out_tx.clone());
+
         // Dedicated background writer draining stdout messages
         let stdout_task = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
@@ -120,6 +125,7 @@ impl McpServer {
 
         drop(out_tx);
         reaper.abort();
+        events.abort();
         let _ = stdout_task.await;
 
         Ok(())
