@@ -12,6 +12,7 @@
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::server::McpServer;
@@ -193,14 +194,14 @@ impl McpServer {
         match action {
             "manifest" => self.handle_manifest(),
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
-            "status" => self.handle_status(args).await,
+            "status" => self.handle_status(args, ctx).await,
             "collect" => self.handle_collect(args, ctx).await,
-            "logs" => self.handle_logs(args).await,
+            "logs" => self.handle_logs(args, ctx).await,
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
             "kill" => self.handle_kill(args, ctx).await,
             "steer" => self.handle_steer(args, token, tx, ctx).await,
-            "wait" => self.handle_wait(args, token, tx, ctx).await,
+            "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
@@ -312,7 +313,6 @@ impl McpServer {
             .map(|v| v as usize);
         let max_turns = ModelManifest::sanitize_max_turns(requested_turns, def_turns);
 
-        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
         let group = args
             .get("group")
             .and_then(|v| v.as_str())
@@ -362,31 +362,27 @@ impl McpServer {
         )
         .await;
 
-        if wait {
-            self.await_worker_result_until(
-                &wid,
-                max_turns,
-                Self::get_timeout(args, "dispatch")?,
-                token,
-                tx,
-            )
-            .await
-        } else {
-            Ok(json!({
-                "worker_id": wid,
-                "owner": agent,
-                "status": "dispatched",
-                "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
-                "message": "Worker is executing in isolated worktree in background"
-            }))
-        }
+        // Dispatch never blocks: the worker id is the whole handle, and the
+        // event the caller actually wants arrives through `watch`.
+        Ok(json!({
+            "worker_id": wid,
+            "owner": agent,
+            "status": "dispatched",
+            "network": if network_offline { "offline" } else { super::schema::NETWORK_DEFAULT },
+            "message": "Worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
+        }))
     }
 
-    /// `status` and `logs` are the two verbs every agent may use on any
-    /// worker: reading another's run is what lets an orchestrator see that a
-    /// worker exists at all, and nothing here can change it.
-    async fn handle_status(&self, args: &Value) -> Result<Value> {
+    /// `status` action: the caller's own view of one worker's step and
+    /// progress. A foreign worker id is refused with its owner, never its
+    /// task or state.
+    async fn handle_status(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "status")?;
+        self.require_owner(wid, ctx).await?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
             // A finished worker's status carries the same review guidance as
             // the wait payload, so polling the status is enough to learn the
@@ -455,9 +451,14 @@ impl McpServer {
     }
 
     /// `logs` action: inspect a live worker's retained history without
-    /// collecting (and thus evicting) it.
-    async fn handle_logs(&self, args: &Value) -> Result<Value> {
+    /// collecting (and thus evicting) it. Same ownership rule as `status`.
+    async fn handle_logs(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "logs")?;
+        self.require_owner(wid, ctx).await?;
         let Some(buffer) = self.pool.get_worker_logs(wid).await else {
             anyhow::bail!("Worker not found: {wid}")
         };
@@ -530,13 +531,13 @@ impl McpServer {
     }
 
     /// `list` is scoped to the caller's own workers; `scope: "all"` widens it
-    /// to every agent's, each row carrying its `owner` (H-3).
+    /// to every agent's and needs the admin override (H-3).
     async fn handle_list(
         &self,
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let workers = if Self::lists_every_agent(args)? {
+        let workers = if Self::lists_every_agent(args, ctx)? {
             self.pool.list_workers().await
         } else {
             self.pool.list_workers_of(&ctx.agent()).await
@@ -544,16 +545,26 @@ impl McpServer {
         Ok(json!({ "workers": workers }))
     }
 
-    /// Whether the caller asked for every agent's workers.
+    /// Whether the caller asked for every agent's workers, and may have them.
     ///
     /// Only the two documented values are accepted: a typo is a hard error
     /// rather than a silent fallback to the caller's own workers, which would
-    /// look like a pool with nobody else's runs in it.
-    fn lists_every_agent(args: &Value) -> Result<bool> {
+    /// look like a pool with nobody else's runs in it. `scope: "all"` is the
+    /// admin override, so a non-admin caller gets a refusal rather than a
+    /// truncated list it would read as "nobody else is running".
+    fn lists_every_agent(
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<bool> {
         match args.get("scope") {
             None => Ok(false),
             Some(scope) => match scope.as_str() {
                 Some(scope) if super::schema::LIST_SCOPES.contains(&scope) => {
+                    if scope == super::schema::LIST_SCOPE_ALL && !ctx.is_admin() {
+                        anyhow::bail!(
+                            "'scope' \"all\" requires the admin override (--admin)"
+                        );
+                    }
                     Ok(scope == super::schema::LIST_SCOPE_ALL)
                 }
                 _ => anyhow::bail!(
@@ -591,58 +602,136 @@ impl McpServer {
         }
     }
 
-    /// Turn budget used as the progress denominator of an awaited worker.
+    /// `watch` action: block until one of the caller's own workers produces an
+    /// event, replaying the ones it missed while it was away.
     ///
-    /// The registry row written at dispatch time is the only record of the
-    /// budget that outlives the originating call, so a re-attached `wait`
-    /// (and a `steer --wait`) reports the same `N/M` the dispatch did. A
-    /// worker with no row reports `0` rather than a fabricated budget.
-    fn awaited_max_turns(wid: &str) -> usize {
-        crate::pool::load_registry_entry(wid)
-            .map(|entry| entry.max_turns)
-            .unwrap_or(0)
-    }
-
-    /// `wait` action: re-attach to a worker dispatched earlier and block until
-    /// it finishes, fails or pauses for steering.
-    ///
-    /// The payload is exactly what `dispatch` with `wait: true` returns, so an
-    /// orchestrator that lost the handle to a long call can still be notified
-    /// of the next event by a single new call. With `timeout_secs` the wait
-    /// instead ends with `status: "still_running"` and the caller waits again.
-    async fn handle_wait(
+    /// This is the MCP-only orchestrator's equivalent of `mini-swe-mcp watch`:
+    /// dispatch and steer never block, so this is the only way to wait. It is
+    /// the same long-poll the CLI runs -- the router already filters every
+    /// worker to its owner -- and it answers `status: "no_event"` when
+    /// `timeout_secs` expires first, so a caller under a host deadline can
+    /// simply call `watch` again.
+    async fn handle_watch(
         &self,
         args: &Value,
-        token: Option<&Value>,
-        tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "wait")?;
-        self.require_owner(wid, ctx).await?;
-        if self.pool.get_worker_state(wid).await.is_none() {
-            anyhow::bail!("Worker not found: {wid}");
+        let mut ids: std::collections::BTreeSet<String> = args["worker_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if let Some(id) = args.get("worker_id").and_then(Value::as_str) {
+            ids.insert(id.to_string());
         }
-        self.await_worker_result_until(
-            wid,
-            Self::awaited_max_turns(wid),
-            Self::get_timeout(args, "wait")?,
-            token,
-            tx,
+        let group = args.get("group").and_then(Value::as_str);
+        let timeout = Self::get_timeout(args, "watch")?;
+        // A named worker must exist and be the caller's own: watching a
+        // foreign id is refused with its owner, never with its task or state.
+        for id in &ids {
+            self.require_owner(id, ctx).await?;
+        }
+        let started = tokio::time::Instant::now();
+        let mut changes = self.pool.subscribe_changes();
+        let mut initial = true;
+        loop {
+            let reply = self.watch_poll(ctx, &ids, group, initial).await?;
+            let events = reply["events"].as_array().cloned().unwrap_or_default();
+            if !events.is_empty() {
+                // Acknowledge what was delivered: the router's per-agent
+                // backlog is bounded, and a caller that never acks would
+                // eventually see `dropped_events` instead of its own history.
+                for event in &events {
+                    self.watch_ack(ctx, event["sequence"].as_u64().unwrap_or(0)).await?;
+                }
+                return Ok(json!({
+                    "status": "event",
+                    "events": events,
+                    "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
+                }));
+            }
+            let watching = reply["watching"].as_array().is_some_and(|w| !w.is_empty());
+            if initial && !watching {
+                return Ok(json!({
+                    "status": "no_event",
+                    "events": [],
+                    "watching": [],
+                    "message": "nothing to watch",
+                }));
+            }
+            if initial {
+                ids = reply["watching"].as_array().into_iter().flatten()
+                    .filter_map(|id| id.as_str().map(str::to_string)).collect();
+            }
+            initial = false;
+            if !watching {
+                return Ok(json!({"status": "no_event", "events": [], "watching": []}));
+            }
+            let left = match timeout {
+                Some(t) => match t.checked_sub(started.elapsed()) {
+                    Some(left) => left,
+                    None => {
+                        return Ok(json!({
+                            "status": "no_event",
+                            "events": [],
+                            "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
+                        }));
+                    }
+                },
+                None => Duration::from_secs(1),
+            };
+            // The tick bounds how long a missed wake-up can stall the poll;
+            // the pool's change channel is what makes it prompt.
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep(left.min(Duration::from_secs(1))) => {}
+            }
+        }
+    }
+
+    /// One `hub/watch` request against this server's own event router.
+    async fn watch_poll(
+        &self,
+        ctx: &super::server::ConnectionContext,
+        ids: &std::collections::BTreeSet<String>,
+        group: Option<&str>,
+        initial: bool,
+    ) -> Result<Value> {
+        let params = json!({
+            "worker_ids": ids.iter().collect::<Vec<_>>(),
+            "group": group,
+            "initial": initial,
+        });
+        super::events::watch_request(&self.pool, &self.hub_events, ctx, params, false).await
+    }
+
+    /// Acknowledge one delivered event so it leaves the caller's backlog.
+    async fn watch_ack(
+        &self,
+        ctx: &super::server::ConnectionContext,
+        sequence: u64,
+    ) -> Result<Value> {
+        super::events::watch_request(
+            &self.pool,
+            &self.hub_events,
+            ctx,
+            json!({ "sequence": sequence }),
+            true,
         )
         .await
     }
 
-    /// `steer` action: queue guidance, and with `wait: true` keep the call open
-    /// until the worker produces its next event.
+    /// `steer` action: queue guidance for the worker's next turn.
     ///
     /// Steering a finished worker starts a revision on its preserved branch
-    /// (same id, full context, fresh turn budget); `wait: true` then blocks
-    /// until that revision ends, exactly like a `dispatch --wait`.
+    /// (same id, full context, fresh turn budget). The reply is immediate:
+    /// `watch` is the only way to wait for the revision's next event.
     async fn handle_steer(
         &self,
         args: &Value,
-        token: Option<&Value>,
-        tx: Option<&mpsc::Sender<String>>,
+        _token: Option<&Value>,
+        _tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "steer")?;
@@ -666,34 +755,12 @@ impl McpServer {
                 }
             })?),
         };
-        // A revision restarts the turn budget, so a `steer --wait` on a
-        // finished worker must report the fresh budget as its denominator.
-        let was_terminal = self.pool.is_terminal(wid).await;
         let admission = self.admit_worker().await?;
         let outcome = self
             .pool
             .steer_with_budget(wid, message, revision_turns)
             .await?;
         drop(admission);
-        let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
-        if wait {
-            // A finished worker's revision runs on a fresh budget: report that
-            // denominator, not the finished run's, so `Step 3/60` reads true.
-            let budget = if was_terminal {
-                self.revision_await_budget(revision_turns)
-            } else {
-                Self::awaited_max_turns(wid)
-            };
-            return self
-                .await_worker_result_until(
-                    wid,
-                    budget,
-                    Self::get_timeout(args, "steer")?,
-                    token,
-                    tx,
-                )
-                .await;
-        }
         // The reply names exactly what happened: a live worker was steered or
         // resumed, a stopped one continued -- as a revision of its saved
         // conversation, or cold when none survived.
@@ -717,29 +784,25 @@ impl McpServer {
             return Ok(json!({
                 "worker_id": wid,
                 "status": status,
-                "message": message,
+                "message": format!("{message}. Use watch for the next event."),
             }));
         }
         if matches!(outcome, SteerOutcome::Resumed) {
             return Ok(json!({
                 "worker_id": wid,
                 "status": "resumed",
-                "message": "Worker resumed with your steering instruction"
+                "message": "Worker resumed with your steering instruction. Use watch for the next event."
             }));
         }
         Ok(json!({
             "worker_id": wid,
             "status": "steered",
-            "message": "Steering instruction queued for next turn"
+            "message": "Steering instruction queued for next turn. Use watch for the next event."
         }))
     }
 
-    /// Fresh turn budget a `steer --wait` on a finished worker reports.
-    ///
-    /// A revision restarts the loop from the explicit `max_turns` (or the
-    /// default revision budget), so the progress denominator must be that
-    /// budget, not the finished run's. A steer on a live worker keeps the
-    /// dispatch budget from the registry row.
+    /// Fresh turn budget a revision started by steering a finished worker runs
+    /// on: the explicit `max_turns`, or the default revision budget.
     fn revision_await_budget(&self, explicit: Option<usize>) -> usize {
         explicit.unwrap_or(crate::pool::DEFAULT_REVISION_TURNS)
     }

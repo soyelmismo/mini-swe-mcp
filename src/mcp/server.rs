@@ -35,7 +35,7 @@ pub struct McpServer {
     /// mutated after construction, so the payload is byte-identical for the
     /// process lifetime and is cloned (an `Arc` memcpy) instead of rebuilt.
     pub(super) tools_list: Arc<Value>,
-    hub_events: Arc<Mutex<super::events::EventRouter>>,
+    pub(super) hub_events: Arc<Mutex<super::events::EventRouter>>,
     hub_enabled: Arc<std::sync::atomic::AtomicBool>,
     shutdown: watch::Sender<bool>,
     daemon_version: Arc<str>,
@@ -830,14 +830,17 @@ mod tests {
         )
     }
 
+    /// A `steer` answer is immediate, so the admission guard it took to queue
+    /// the guidance must be released by the time the reply is built: holding it
+    /// would wedge the pool's admission for every later dispatch.
     #[tokio::test]
-    async fn waiting_steer_releases_its_admission_guard() {
+    async fn steer_returns_immediately_and_releases_its_admission_guard() {
         use crate::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
         let server = server();
         server
             .pool
             .__test_insert_worker(WorkerRecord {
-                id: "h4-wait-gate".to_string(),
+                id: "h4-steer-gate".to_string(),
                 task: "probe".to_string(),
                 model: "test".to_string(),
                 owner: LOCAL_AGENT.to_string(),
@@ -854,41 +857,25 @@ mod tests {
                 revision: 0,
             })
             .await;
-        let (tx, mut rx) = mpsc::channel(8);
-        let waiter = server.clone();
-        let task = tokio::spawn(async move {
-            waiter.execute_tool_with_progress("worker", json!({
-                "action": "steer", "worker_id": "h4-wait-gate", "message": "go", "wait": true
-            }), Some(json!("waiting")), Some(tx)).await
-        });
-        // The first progress frame is emitted only after steering admission
-        // has completed and the waiter has read the still-running worker.
-        tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!task.is_finished());
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            server.execute_tool_with_progress(
+                "worker",
+                json!({"action": "steer", "worker_id": "h4-steer-gate", "message": "go"}),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("steer must not block")
+        .expect("steer must succeed");
+        assert_eq!(reply["status"], "steered");
         assert!(
             server.hub_shutdown_gate.try_write().is_ok(),
-            "wait must not retain admission"
+            "steer must not retain admission"
         );
-        server
-            .pool
-            .__test_set_worker_state(
-                "h4-wait-gate",
-                WorkerState::Failed {
-                    error: "done".to_string(),
-                    step: 1,
-                    failed_at: 1,
-                    metrics: WorkerMetrics::default(),
-                    revision: 0,
-                },
-            )
-            .await;
-        assert!(task.await.unwrap().is_ok());
     }
 
-    /// No verb may be advertised without a handler behind it.
     #[tokio::test]
     async fn every_advertised_action_is_dispatchable() {
         let server = server();
