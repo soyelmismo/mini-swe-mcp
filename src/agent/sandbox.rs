@@ -1681,7 +1681,7 @@ const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
 /// `BPF_JMP | BPF_JEQ | BPF_K`: compare the accumulator against a constant.
 const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
 /// `BPF_JMP | BPF_JSET | BPF_K`: test the accumulator against a bitmask.
-const BPF_JMP_JSET_K: u16 = (libc::BPF_JMP | 0x20 | libc::BPF_K) as u16;
+const BPF_JMP_JSET_K: u16 = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
 /// `BPF_ALU | BPF_AND | BPF_K`: mask the accumulator with a constant.
 const BPF_ALU_AND_K: u16 = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
 /// `BPF_RET | BPF_K`: return a constant to the kernel.
@@ -1714,7 +1714,7 @@ impl SeccompFilter {
     /// creation, which is what makes an offline worker unable to reach the
     /// network without a network namespace.
     pub fn build(offline: bool) -> Self {
-        Self::build_with(offline, default_denied_syscalls())
+        Self::build_with(offline, &default_denied_syscalls())
     }
 
     /// The body of [`build`](Self::build), with the deny list as a parameter.
@@ -1745,6 +1745,20 @@ impl SeccompFilter {
             program.push(bpf_stmt(BPF_RET_K, *action));
         }
 
+        // Namespace escapes through `clone(2)` and `unshare(2)`: both take the
+        // flags as their first argument, so the filter allows the call unless
+        // a namespace bit is set. Every namespace bit fits in the low word of
+        // the 64-bit argument, which is what classic BPF can load and test.
+        for nr in [libc::SYS_clone, libc::SYS_unshare] {
+            program.push(bpf_jump(BPF_JMP_JEQ_K, nr as u32, 0, 3));
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFF));
+            program.push(bpf_jump(BPF_JMP_JSET_K, CLONE_NS_FLAGS as u32, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
+            // The argument load clobbered the syscall number every later
+            // rule compares against, so load it back before continuing.
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFF));
+        }
+
         // Offline policy: no IPv4 or IPv6 socket may be created at all. Both
         // address families are checked, so a dual-stack host offers no
         // fallback, and the check is on `socket(2)` rather than on
@@ -1752,11 +1766,11 @@ impl SeccompFilter {
         if offline {
             program.push(bpf_jump(BPF_JMP_JEQ_K, libc::SYS_socket as u32, 0, 5));
             program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFF));
-            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET, 0, 2));
-            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EACCES)));
+            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
             program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET6, 0, 1));
-            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EACCES)));
-            // Not an INET family: fall through to the next rule.
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
+            // Not an INET family: fall through to the default allow.
         }
 
         // Default: everything not explicitly denied is allowed. A worker still
