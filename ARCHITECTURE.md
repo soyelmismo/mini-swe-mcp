@@ -27,7 +27,7 @@ To prevent host resource saturation when fanning out dozens of parallel subagent
                        │  (heavy commands only)
                        ▼
 ┌───────────────────────────────────────────────┐
-│ Tier 3: Build Gate                           │
+│ Tier 3: Build Gate                            │
 │ Arc<Semaphore> (default: cores / 2 permits)   │
 │ Throttles cargo, make, pytest, compilers ...  │
 └──────────────────────┬────────────────────────┘
@@ -41,9 +41,10 @@ To prevent host resource saturation when fanning out dozens of parallel subagent
 │ - Injected thread caps:                       │
 │   CARGO_BUILD_JOBS, RUST_TEST_THREADS,        │
 │   NEXTEST_TEST_THREADS, MAKEFLAGS (-j),       │
-│   CMAKE_BUILD_PARALLEL_LEVEL, RAYON_NUM_THREADS│
-│   OMP_NUM_THREADS, OPENBLAS_NUM_THREADS,      │
-│   MKL_NUM_THREADS, GOMAXPROCS                 │
+│   CMAKE_BUILD_PARALLEL_LEVEL,                 │
+│   RAYON_NUM_THREADS, OMP_NUM_THREADS,         │
+│   OPENBLAS_NUM_THREADS, MKL_NUM_THREADS,      │
+│   GOMAXPROCS                                  │
 └───────────────────────────────────────────────┘
 ```
 
@@ -77,8 +78,10 @@ The agent runner interacts with OpenAI-compatible endpoints using native Server-
      search is a single forward pass: no byte is scanned twice, even when a frame is split
      across thousands of one-byte TCP segments.
    - Multi-byte UTF-8 split across chunk boundaries is safe (a line is always complete
-     before decoding). A genuinely malformed frame is decoded lossily, counted on
-     `LlmResponse::invalid_utf8_lines`, and warned about — once per stream, not once per frame.
+     before decoding). A frame that is not valid UTF-8 is decoded lossily and counted on
+     `LlmResponse::invalid_utf8_lines`, so corruption is observable instead of absorbed; a
+     frame that does not parse as JSON is skipped with a warning emitted once per stream
+     rather than once per frame.
    - The accumulator is deliberately tolerant of the shapes real providers emit: a
      continuation delta that re-sends empty `id` / `name` fields continues the call it
      belongs to instead of opening a new one; a frame carrying explicit `null`s
@@ -102,8 +105,9 @@ The agent runner interacts with OpenAI-compatible endpoints using native Server-
      never run are dropped, since replaying them would leave unanswered `tool_calls` on the
      assistant turn — which the tool-call protocol rejects on the next request.
 4. **Idle (not whole-request) Timeout**:
-   - The client uses `connect_timeout` for the handshake and `read_timeout` for a single
-     stalled read; `run_step_llm` additionally wraps each `resp.chunk()` in
+   - The HTTP client sets only `connect_timeout` (30 s). A whole-request or
+     `read_timeout` deadline would kill a healthy-but-slow generation, so the stream
+     body is instead guarded per chunk: `run_step_llm` wraps every `resp.chunk()` in
      `tokio::time::timeout(DEFAULT_STREAM_IDLE_TIMEOUT)`.
    - The deadline resets on every chunk, so a healthy-but-slow long generation runs to
      completion while a genuinely stalled stream is aborted and retried with backoff
@@ -144,9 +148,9 @@ Two independent layers stand between a model-authored command and the host.
   (a missing worktree or target dir) is a caller bug and stays an `Err`.
 - **Output truncation (`truncate_with_dropped`)** — a step's combined output is bounded by
   `TRUNCATE_LIMIT` (16 KiB), keeping `TRUNCATE_HEAD` (12 KiB) at the start and
-  `TRUNCATE_TAIL` (4 KiB) at the end. The count of bytes already dropped by the streaming
-  reader is folded in, so a run that streamed a 40 MiB build log reports the discarded
-  middle in its marker instead of pretending the tail was the whole story.
+  `TRUNCATE_TAIL` (4 KiB) at the end. The pipes are read through a fixed head/tail buffer, so
+  a chatty command costs 16 KiB of memory whether it printed 16 KiB or 16 GiB, and the
+  elision count is folded into the truncation marker instead of being forgotten.
 
 ---
 
@@ -382,9 +386,10 @@ future-dated record is never evicted.
 - **MCP stdio** (`mcp::protocol`): every frame is serde-derived JSON-RPC 2.0 — a
   request struct whose `id` stays a `RawValue` so it is echoed byte for byte,
   and one newline-terminated frame buffer per response. Inbound frames are
-  refused above `MAX_FRAME_BYTES` (1 MiB) before the parse runs, and progress
-  notifications are emitted per awaited worker result with no throttle of their
-  own.
+  refused above `MAX_FRAME_BYTES` (1 MiB) before the parse runs. The stdio wait
+  loop polls a worker's lightweight progress snapshot every 500 ms and emits a
+  `notifications/progress` frame whenever its step advances (plus one terminal
+  frame); the CLI path passes no token and gets the same loop without them.
 - **Configuration** (`config::env_parse`): every optional numeric setting is read
   through one helper that treats unset, blank and unparsable values alike — all
   return `None` and the caller falls back to its documented default (or clamps to

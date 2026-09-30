@@ -224,6 +224,9 @@ missing — see [Step-Log Retention](#step-log-retention).
 mini-swe-mcp kill <worker_id>
 ```
 
+Uncommitted work is committed onto the worker's branch before the task is
+aborted, so a kill costs at most the work since the last checkpoint.
+
 #### 7. Reap Expired Worker Records
 ```bash
 # Evict terminal worker records whose TTL expired (also runs in the background)
@@ -235,6 +238,10 @@ mini-swe-mcp reap
 # Clean up orphaned branches and stale temporary worktrees whose processes died
 mini-swe-mcp prune
 ```
+
+Uncommitted changes in a dead worker's checkout are salvaged onto its
+`worker-<id>` branch before the checkout is removed, and a branch with commits
+missing from `HEAD` is preserved.
 
 #### 9. Inspect Model Manifest
 ```bash
@@ -253,7 +260,7 @@ Every `dispatch` may declare a network policy for its worker:
 
 | Value | Effect |
 |---|---|
-| `allow` (default) | Steps run with the host's normal connectivity |
+| `allow` | Steps run with the host's normal connectivity (the fallback when no policy is declared) |
 | `offline` | Each bash step runs inside its own network namespace with no egress |
 
 `network` is optional. When it is absent the dispatch default for the resolved
