@@ -40,6 +40,7 @@ use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 
+mod history;
 mod pause;
 mod review;
 mod sentinels;
@@ -228,6 +229,7 @@ impl WorkerPool {
         // error, cancellation -- because a terminal worker is exactly what the
         // orchestrator reviews and then revises, and a revision without the
         // history would restart the model from scratch.
+        history::compact_history(&mut messages);
         let history = WorkerHistory {
             task,
             group: meta.group.clone(),

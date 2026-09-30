@@ -33,6 +33,7 @@ use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
 use super::super::WorkerPool;
+use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
@@ -312,6 +313,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         // --- LLM call with error handling ---
+        compact_history(self.messages);
         let llm_resp = match self.runner.run_step_llm(self.messages).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -384,6 +386,7 @@ impl<'a> TurnEngine<'a> {
                                     ));
                                 }
                                 // Re-run the LLM step now that network/connectivity is restored
+                                compact_history(self.messages);
                                 self.runner.run_step_llm(self.messages).await?
                             }
                             None => return Err(e),
