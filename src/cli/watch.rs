@@ -42,7 +42,44 @@ impl Options {
     }
 }
 
+/// `git diff --shortstat <merge-base>...worker-<id>` in the worker's repo.
+///
+/// The registry samples diff metrics only while the worktree lives, so a worker
+/// whose tree was torn down would otherwise report "0 files, +0 -0" for commits
+/// that are still on its branch. The branch is what the orchestrator merges, so
+/// measure it against its merge-base with the checked-out base branch.
+pub fn branch_diff_stat(entry: &WorkerRegistryEntry) -> Option<(usize, usize, usize)> {
+    let repo = entry.repo_path.as_deref().map(std::path::Path::new).filter(|path| path.is_dir())?;
+    let branch = format!("worker-{}", entry.id);
+    let merge_base = crate::worktree::git(repo, "merge-base", &["merge-base", "HEAD", &branch]).ok()?;
+    if !merge_base.status.success() { return None; }
+    let base = String::from_utf8_lossy(&merge_base.stdout).trim().to_string();
+    if base.is_empty() { return None; }
+    let range = format!("{base}...{branch}");
+    let output = crate::worktree::git(repo, "diff --shortstat", &["diff", "--shortstat", &range]).ok()?;
+    if !output.status.success() { return None; }
+    crate::pool::parse_shortstat(&String::from_utf8_lossy(&output.stdout))
+}
+
 pub fn registry_snapshot(entry: &WorkerRegistryEntry, now: u64) -> Value {
+    let mut view = registry_snapshot_row(entry, now);
+    // A torn-down worktree means the row's metrics were sampled while the worker
+    // still lived: fall back to the branch it left behind, but never overwrite a
+    // measured diff with a guess.
+    if matches!(view["status"].as_str(), Some("completed" | "failed"))
+        && view["metrics"]["diff_files"].as_u64().unwrap_or(0) == 0
+        && view["metrics"]["diff_insertions"].as_u64().unwrap_or(0) == 0
+        && view["metrics"]["diff_deletions"].as_u64().unwrap_or(0) == 0
+        && let Some((files, insertions, deletions)) = branch_diff_stat(entry)
+    {
+        view["metrics"]["diff_files"] = json!(files);
+        view["metrics"]["diff_insertions"] = json!(insertions);
+        view["metrics"]["diff_deletions"] = json!(deletions);
+    }
+    view
+}
+
+fn registry_snapshot_row(entry: &WorkerRegistryEntry, now: u64) -> Value {
     json!({"worker_id":entry.id, "owner":entry.owner.as_deref().unwrap_or("unattributed"),
         "model":entry.model, "group":entry.group.as_deref().unwrap_or("default"),
         "status":match entry.status { crate::pool::RegistryStatus::Running=>"running", crate::pool::RegistryStatus::Paused=>"paused", crate::pool::RegistryStatus::Reviewing=>"reviewing", crate::pool::RegistryStatus::Completed=>"completed", crate::pool::RegistryStatus::Failed=>"failed", crate::pool::RegistryStatus::Stopped=>"stopped", crate::pool::RegistryStatus::Interrupted=>"interrupted" }.to_string(),
@@ -129,14 +166,27 @@ pub(crate) fn commands(v: &Value) -> Vec<String> {
     }
 }
 
+/// The heading a missed batch shares: a `watch` call prints it once, not once
+/// per replayed event.
+pub const MISSED_HEADING: &str = "While you were not watching:";
+
 pub fn render(v: &Value) -> String {
+    if v["missed"] == true {
+        format!("{MISSED_HEADING}\n{}", render_event(v))
+    } else {
+        render_event(v)
+    }
+}
+
+/// One event body, without the heading a whole missed batch shares.
+fn render_event(v: &Value) -> String {
     let text = |key: &str| v[key].as_str().unwrap_or("unknown");
     // A registry row carries no branch, but every worker commits to its own
     // `worker-<id>` branch, so name that instead of admitting we do not know.
     let branch = v["branch"]
         .as_str()
         .map_or_else(|| format!("worker-{}", text("worker_id")), str::to_string);
-    let mut out = if v["missed"] == true { "While you were not watching:\n".to_string() } else { String::new() };
+    let mut out = String::new();
     if let Some(dropped) = v["dropped_events"].as_u64().filter(|n| *n > 0) { out.push_str(&format!("{dropped} older events dropped (backlog limit 100).\n")); }
     out.push_str(&format!("{}: {} | {} | owner {} | group {} | branch {} | revision {}\nStep {}/{} | elapsed {}s | {}\n", text("worker_id"), text("event"), text("model"), text("owner"), text("group"), branch, v["revision"], v["step"], v["max_turns"], v["elapsed"], text("task")));
     match text("event") {
@@ -171,10 +221,27 @@ pub fn render(v: &Value) -> String {
     out.trim_end().to_string()
 }
 
-fn print_event(event: &Value, json_output: bool, follow: bool) -> Result<()> {
-    let output = if json_output { serde_json::to_string(event)? } else { render(event) };
-    println!("{}", if follow && !json_output { output.replace('\n', " | ") } else { output });
-    std::io::stdout().flush()?;
+/// Print one batch of events: the missed heading once, then every event body,
+/// so a single `watch` call catches the caller up completely.
+fn print_events(events: &[Value], json_output: bool, follow: bool) -> Result<()> {
+    print_events_to(&mut std::io::stdout(), events, json_output, follow)
+}
+
+/// [`print_events`] against an explicit sink, so the batch layout is testable.
+fn print_events_to(out: &mut impl Write, events: &[Value], json_output: bool, follow: bool) -> Result<()> {
+    if json_output {
+        for event in events { writeln!(out, "{}", serde_json::to_string(event)?)?; }
+        out.flush()?;
+        return Ok(());
+    }
+    if events.iter().any(|event| event["missed"] == true) {
+        write!(out, "{MISSED_HEADING}{}", if follow { " | " } else { "\n" })?;
+    }
+    for event in events {
+        let body = render_event(event);
+        writeln!(out, "{}", if follow { body.replace('\n', " | ") } else { body })?;
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -224,11 +291,13 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         ids = response["watching"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
         let events = response["events"].as_array().cloned().unwrap_or_default();
         if initial && ids.is_empty() && events.is_empty() { println!("nothing to watch"); return Ok(3); }
-        for event in events {
-            print_event(&event, json_output, opts.follow)?;
+        print_events(&events, json_output, opts.follow)?;
+        for event in &events {
             client.watch_ack(event["sequence"].as_u64().unwrap_or(0)).await?;
-            if !opts.follow { return Ok(0); }
         }
+        // Every missed event came back in this one reply, so a non-following
+        // caller leaves as soon as it has been caught up.
+        if !events.is_empty() && !opts.follow { return Ok(0); }
         initial = false;
         if ids.is_empty() { return Ok(0); }
         let wait = match opts.timeout {
@@ -267,17 +336,19 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             initial = false;
         }
         current.retain(|id, v| ids.contains(id) && (admin || v["owner"] == owner) && matches(v, &ids, opts.group.as_deref()));
+        let mut events = Vec::new();
         for (id, view) in &mut current {
             progress_clock(view, previous.get(id), now);
             if previous.get(id).is_some_and(|old| old["status"] != view["status"]) {
                 reported.remove(id);
             }
             if let Some(event) = select_event(view, reported.get(id), now) {
-                print_event(&event, json_output, opts.follow)?;
-                reported.insert(id.clone(), event);
-                if !opts.follow { return Ok(0); }
+                reported.insert(id.clone(), event.clone());
+                events.push(event);
             }
         }
+        print_events(&events, json_output, opts.follow)?;
+        if !events.is_empty() && !opts.follow { return Ok(0); }
         ids.retain(|id| current.get(id).is_some_and(|v| !matches!(v["status"].as_str(), Some("completed" | "failed" | "stopped"))));
         if ids.is_empty() { return Ok(0); }
         previous = current;
@@ -364,5 +435,37 @@ mod tests {
         verified["verified"] = json!(false);
         let text = render(&select_event(&verified, None, 110).expect("terminal row is actionable"));
         assert!(text.contains("Verified: false"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod replay_batch_tests {
+    use super::*;
+
+    fn missed(id: &str, summary: &str) -> Value {
+        json!({"worker_id": id, "event": "completed", "missed": true, "owner": "cli",
+            "summary": summary, "verified": true, "diff_stat": {"files": 1, "insertions": 2, "deletions": 0}})
+    }
+
+    #[test]
+    fn a_missed_batch_shares_one_heading_and_prints_every_event() {
+        let batch = vec![missed("w-one", "First."), missed("w-two", "Second.")];
+        let mut out = Vec::new();
+        print_events_to(&mut out, &batch, false, false).expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
+        assert!(text.contains("First.") && text.contains("Second."), "{text}");
+        assert!(text.contains("w-one") && text.contains("w-two"), "{text}");
+    }
+
+    #[test]
+    fn a_mixed_batch_still_prints_the_heading_once() {
+        let live = json!({"worker_id": "w-live", "event": "needs_input", "question": "go on?",
+            "owner": "cli"});
+        let mut out = Vec::new();
+        print_events_to(&mut out, &[missed("w-old", "Late."), live], false, false).expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
+        assert!(text.contains("Late.") && text.contains("go on?"), "{text}");
     }
 }
