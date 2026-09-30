@@ -176,7 +176,30 @@ mini-swe-mcp list
 
 # Check status of a specific worker
 mini-swe-mcp status <worker_id>
+
+# Registry-only summary (never starts or connects to the hub)
+mini-swe-mcp status --line
 ```
+
+For Claude Code, add this to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "mini-swe-mcp status --line"
+  }
+}
+```
+
+The line looks like `⚙ 3 running · 1 needs input · 2 done`. Zero counts are
+omitted; reviewing workers count as running, and failed and stopped workers
+are shown separately. Terminal rows are recent for five minutes after their
+last update. With no active or recent workers, it prints nothing. This command
+reads the registry directly, needs no API key, and always exits successfully.
+
+`mini-swe-mcp monitor` keeps its one-second registry refresh; `--once` prints a
+single dashboard without connecting to or starting the hub.
 
 #### 3. Steer a Running or Paused Subagent
 ```bash
