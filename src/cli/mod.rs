@@ -16,6 +16,7 @@ pub mod args;
 pub mod format;
 pub mod help;
 pub mod suggest;
+pub mod watch;
 
 pub use self::args::{
     DISPATCH_USAGE, action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag,

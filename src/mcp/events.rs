@@ -63,6 +63,7 @@ pub enum EventKind {
     Completed,
     /// A worker died and wants an inspection.
     Failed,
+
 }
 
 impl EventKind {
@@ -123,6 +124,7 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Times the worker was revised after finishing.
     pub revision: usize,
+
 }
 
 /// One tick's view of every known worker, keyed by worker id.
@@ -147,6 +149,7 @@ pub struct ChannelEvent {
     pub status: String,
     /// The rendered message.
     pub content: String,
+
 }
 
 /// The events for the transitions between two snapshots, ordered by worker id.
