@@ -694,7 +694,7 @@ async fn events_are_owner_scoped_and_replayed_after_hello() {
     a.request("hub/hello", serde_json::json!({"agent_id": "h4-a"})).await;
     b.request("hub/hello", serde_json::json!({"agent_id": "h4-b"})).await;
     pool.__test_set_worker_state("h4-live", WorkerState::Paused {
-        question: "continue?".to_string(), step: 1,
+        question: "continue?".to_string(), step: 1, paused_at: 0,
     }).await;
     let event = next_event(&mut a).await;
     assert_eq!(event["params"]["meta"]["worker_id"], "h4-live");
@@ -740,7 +740,7 @@ async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
     assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(hello["result"]["busy"], true);
     assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
-    pool.__test_set_worker_state("h4-busy", WorkerState::Paused { question: "wait".to_string(), step: 1 }).await;
+    pool.__test_set_worker_state("h4-busy", WorkerState::Paused { question: "wait".to_string(), step: 1, paused_at: 0 }).await;
     assert_eq!(client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"], "Hub is busy");
     pool.__test_set_worker_state("h4-busy", WorkerState::Failed {
         error: "done".to_string(), step: 1, failed_at: 1, metrics: WorkerMetrics::default(), revision: 0,
@@ -773,4 +773,46 @@ fn newer_cli_replaces_an_idle_daemon() {
     let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap();
     assert_eq!(log.lines().filter(|line| line.ends_with(" listening")).count(), 2, "{log}");
     assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}
+
+#[tokio::test]
+async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
+    let dir = scratch_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(event_worker("h4-version-busy", "owner")).await;
+    let daemon = HubServer::new(Arc::new(McpServer::new(pool, "test".to_string())),
+        HubConfig::new(hub_paths_for_test(&dir), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&dir.join("hub.sock")).await;
+    let mut command = tokio::process::Command::new(common::binary_path());
+    command.args(["list", "--json"]).env("SWE_HUB_DIR", &dir)
+        .env("MINI_SWE_FAKE_VERSION", "99.0.0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env");
+    let output = command.output().await.unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().filter(|line| line.contains("is newer than hub")).count(), 1, "{stderr}");
+    assert!(dir.join("hub.sock").exists());
+
+    let mut proxy = tokio::process::Command::new(common::binary_path());
+    proxy.arg("--stdio").env("SWE_HUB_DIR", &dir)
+        .env("MINI_SWE_FAKE_VERSION", "99.0.0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped()).kill_on_drop(true);
+    let mut child = proxy.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), stdout.read_line(&mut line)).await.unwrap().unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"], serde_json::json!({}));
+    drop(stdin);
+    let output = child.wait_with_output().await.unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().filter(|line| line.contains("is newer than hub")).count(), 1, "{stderr}");
+    task.abort(); let _ = task.await;
+    let _ = std::fs::remove_dir_all(dir);
 }

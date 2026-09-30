@@ -369,11 +369,11 @@ impl EventRouter {
     }
 }
 
-pub(super) fn spawn_hub_events(pool: WorkerPool, router: Arc<Mutex<EventRouter>>) -> JoinHandle<()> {
+pub(super) async fn spawn_hub_events(pool: WorkerPool, router: Arc<Mutex<EventRouter>>) -> JoinHandle<()> {
+    let mut changes = pool.subscribe_changes();
+    let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
+    previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
     tokio::spawn(async move {
-        let mut changes = pool.subscribe_changes();
-        let mut previous = snapshot(&pool, &WorkerSnapshot::new()).await;
-        previous.retain(|_, view| view.event != Some(EventKind::NeedsInput));
         loop {
             let current = snapshot(&pool, &previous).await;
             for event in diff_events(&previous, &current) {
@@ -570,5 +570,44 @@ fn phase_status(phase: WorkerPhase) -> &'static str {
         WorkerPhase::Paused => "paused",
         WorkerPhase::Completed => "completed",
         WorkerPhase::Failed => "failed",
+    }
+}
+
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::mcp::ConnectionContext;
+
+    fn event(id: &str, kind: EventKind) -> ChannelEvent {
+        ChannelEvent {
+            worker_id: id.to_string(), kind, group: "default".to_string(),
+            model: "test".to_string(), status: kind.as_str().to_string(), content: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_is_bounded_latest_per_worker_and_owner_scoped() {
+        let mut router = EventRouter::default();
+        for id in 0..101 {
+            router.publish(Some("a".to_string()), event(&id.to_string(), EventKind::Completed));
+        }
+        router.publish(Some("a".to_string()), event("1", EventKind::Failed));
+        assert_eq!(router.latest.len(), 100);
+        assert!(!router.latest.iter().any(|(_, event)| event.worker_id == "0"));
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut ctx = ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("b".to_string());
+        router.register(&ctx, tx.clone()).await;
+        assert!(rx.try_recv().is_err());
+        ctx.agent_id = Some("a".to_string());
+        router.register(&ctx, tx).await;
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        assert_eq!(frames.len(), 100);
+        assert_eq!(frames.last().unwrap()["params"]["meta"]["worker_id"], "1");
+        assert_eq!(frames.last().unwrap()["params"]["meta"]["event"], "failed");
     }
 }

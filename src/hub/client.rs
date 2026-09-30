@@ -106,15 +106,13 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
             next_id: 1,
             notifications: Vec::new(),
         };
-        // CLI identity is stable before hello's replay; the proxy's identity
-        // comes from its hello or the host's later initialize.
-        if cli {
-            client.request("initialize", json!({
-                "protocolVersion": "2024-11-05", "capabilities": {},
-                "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": version}
-            })).await?;
+        // Announce the final CLI identity before any replay. The proxy's
+        // identity comes from hello or the host's later initialize.
+        let mut params = hello_params(admin, &version);
+        if cli && params["agent_id"].as_str().is_none_or(str::is_empty) {
+            params["agent_id"] = json!(crate::mcp::CLI_AGENT);
         }
-        let reply = client.request("hub/hello", hello_params(admin, &version)).await?;
+        let reply = client.request("hub/hello", params).await?;
         let daemon = reply["version"].as_str().unwrap_or("");
         if daemon != version && newer(&version, daemon) {
             if !reply["busy"].as_bool().unwrap_or(true) && attempt == 0 {
@@ -141,6 +139,12 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
             {
                 eprintln!("[mini-swe] Client {version} is newer than hub {daemon}; continuing with the existing daemon (busy or replacement unavailable).");
             }
+        }
+        if cli {
+            client.request("initialize", json!({
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": version}
+            })).await?;
         }
         return Ok(client);
     }

@@ -221,7 +221,7 @@ impl HubServer {
         info!(socket = %socket.display(), idle_secs = self.config.idle_secs(), "Hub daemon listening");
         append_log(&paths.log(), "listening");
 
-        let events = self.server.start_hub_events();
+        let events = self.server.start_hub_events().await;
         let mut shutdown = self.server.subscribe_shutdown();
 
         let reaper = crate::pool::spawn_reaper((*self.server.pool()).clone());

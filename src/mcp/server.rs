@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tracing::{error, info, trace};
 
 use super::protocol::{
@@ -39,6 +39,7 @@ pub struct McpServer {
     hub_enabled: Arc<std::sync::atomic::AtomicBool>,
     shutdown: watch::Sender<bool>,
     daemon_version: Arc<str>,
+    hub_shutdown_gate: Arc<RwLock<bool>>,
 }
 
 /// `clientInfo.name` the CLI sends in its `initialize` handshake.
@@ -154,6 +155,7 @@ impl McpServer {
             hub_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown: watch::channel(false).0,
             daemon_version: Arc::from(env!("CARGO_PKG_VERSION")),
+            hub_shutdown_gate: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -227,6 +229,8 @@ impl McpServer {
             }
         });
 
+        let mut requested_shutdown = false;
+        let served = async {
         while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
             if oversized {
                 let _ = out_tx
@@ -284,7 +288,13 @@ impl McpServer {
                 continue;
             }
             if hub && req.method == "hub/shutdown" {
-                let busy = self.pool.active_worker_count().await > 0;
+                let mut busy = self.pool.active_worker_count().await > 0;
+                if !busy {
+                    // Serialize the idle decision with dispatch/revision admission.
+                    let mut stopping = self.hub_shutdown_gate.write().await;
+                    busy = self.pool.active_worker_count().await > 0;
+                    if !busy { *stopping = true; }
+                }
                 let id = req.id_or_null().map(ToOwned::to_owned);
                 let response = if busy {
                     JsonRpcResponse::err(id, code::SERVER_ERROR, Cow::Borrowed("Hub is busy"))
@@ -293,13 +303,9 @@ impl McpServer {
                 };
                 if !busy {
                     // Drain through the shutdown reply before the daemon closes sockets.
-                    events.as_ref().inspect(|task| task.abort());
-                    self.hub_events.lock().await.remove(ctx.id);
                     let _ = out_tx.send(response.to_frame()?).await;
-                    drop(out_tx);
-                    let _ = writer_task.await;
-                    self.shutdown.send_replace(true);
-                    return Ok(());
+                    requested_shutdown = true;
+                    break;
                 }
                 let _ = out_tx.send(response.to_frame()?).await;
                 continue;
@@ -316,12 +322,14 @@ impl McpServer {
             });
         }
 
+        Ok::<(), anyhow::Error>(())
+        }.await;
         drop(out_tx);
         if let Some(events) = events { events.abort(); }
         self.hub_events.lock().await.remove(ctx.id);
         let _ = writer_task.await;
-
-        Ok(())
+        if requested_shutdown { self.shutdown.send_replace(true); }
+        served
     }
 
     /// Route one JSON-RPC request to its response envelope.
@@ -380,9 +388,9 @@ impl McpServer {
     }
 
     /// Start the daemon's single watcher before accepting any connections.
-    pub fn start_hub_events(&self) -> tokio::task::JoinHandle<()> {
+    pub async fn start_hub_events(&self) -> tokio::task::JoinHandle<()> {
         self.hub_enabled.store(true, std::sync::atomic::Ordering::Release);
-        super::events::spawn_hub_events((*self.pool).clone(), self.hub_events.clone())
+        super::events::spawn_hub_events((*self.pool).clone(), self.hub_events.clone()).await
     }
 
     /// Subscribe to an idle shutdown requested through the hub transport.
@@ -446,6 +454,15 @@ impl McpServer {
         }
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        let admission = if matches!(action, "dispatch" | "steer") {
+            Some(self.hub_shutdown_gate.read().await)
+        } else {
+            None
+        };
+        if admission.as_ref().is_some_and(|stopping| **stopping) {
+            anyhow::bail!("Hub is shutting down");
+        }
 
         self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref(), ctx)
             .await
