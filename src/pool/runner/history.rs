@@ -3,13 +3,29 @@
 //! Keep the prompt, task and recent exchanges intact. Older calls and their ids
 //! remain in order, but their text is replaced, not merely sliced, so the live
 //! history and saved revisions no longer own the original output allocations.
+//! The newest outputs share a byte budget, with at least four exchanges kept
+//! verbatim. An explicit HISTORY_FULL_TURNS restores the fixed-turn window.
 
 use crate::agent::{ChatMessage, Role};
 use crate::config::env_parse;
 
 use super::turn::{COMMAND_OUTPUT_PREFIX, NO_COMMAND_NUDGE, VERIFICATION_OUTPUT_PREFIX};
 
-const DEFAULT_FULL_TURNS: usize = 12;
+const DEFAULT_BUDGET_BYTES: usize = 160_000;
+const MIN_VERBATIM_EXCHANGES: usize = 4;
+const OUTPUT_KEEP_BYTES: usize = 4_000;
+
+#[derive(Clone, Copy)]
+enum KeepPolicy {
+    Budget(usize),
+    Turns(usize),
+}
+
+impl KeepPolicy {
+    fn from_limits(full_turns: Option<usize>, budget_bytes: usize) -> Self {
+        full_turns.map_or(Self::Budget(budget_bytes), Self::Turns)
+    }
+}
 const OUTPUT_PREVIEW_BYTES: usize = 300;
 const PROSE_BYTES: usize = 500;
 const REASONING_BYTES: usize = 200;
@@ -20,25 +36,74 @@ const OUTPUT_PREFIX: &str = "[output elided: exit ";
 pub(crate) fn compact_history(messages: &mut [ChatMessage]) {
     compact_with_policy(
         messages,
-        env_parse::<usize>("HISTORY_FULL_TURNS").unwrap_or(DEFAULT_FULL_TURNS),
+        KeepPolicy::from_limits(
+            env_parse("HISTORY_FULL_TURNS"),
+            env_parse("HISTORY_BUDGET_BYTES").unwrap_or(DEFAULT_BUDGET_BYTES),
+        ),
         env_parse::<u8>("HISTORY_KEEP_ALL_REASONING") == Some(1),
     );
 }
 
-fn compact_with_policy(messages: &mut [ChatMessage], full_turns: usize, keep_reasoning: bool) {
-    // An exchange starts at its assistant message and includes all its results.
-    let cutoff = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, m)| m.role() == Role::Assistant)
-        .nth(full_turns.saturating_sub(1))
-        .map_or(0, |(i, _)| i);
-    let cutoff = if full_turns == 0 {
-        messages.len()
-    } else {
-        cutoff
+// Count original output sizes in stubs so repeated passes choose the same window.
+fn output_bytes(message: &ChatMessage) -> usize {
+    let Some(text) = message.content() else {
+        return 0;
     };
+    if message.role() != Role::Tool && !(message.role() == Role::User && is_command_output(text)) {
+        return 0;
+    }
+    if let Some(stub) = text.strip_prefix(OUTPUT_PREFIX)
+        && let Some((_, rest)) = stub.split_once(", ")
+        && let Some((bytes, _)) = rest.split_once(" bytes; first lines: ")
+        && let Ok(bytes) = bytes.parse::<usize>()
+    {
+        return bytes;
+    }
+    text.len()
+}
+
+fn is_command_output(text: &str) -> bool {
+    text.starts_with(COMMAND_OUTPUT_PREFIX)
+        || text.starts_with(OUTPUT_PREFIX)
+        || text == NO_COMMAND_NUDGE
+}
+
+fn verbatim_cutoff(messages: &[ChatMessage], policy: KeepPolicy) -> usize {
+    if let KeepPolicy::Turns(full_turns) = policy {
+        return if full_turns == 0 {
+            messages.len()
+        } else {
+            messages
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, m)| m.role() == Role::Assistant)
+                .nth(full_turns - 1)
+                .map_or(0, |(i, _)| i)
+        };
+    }
+    let KeepPolicy::Budget(budget) = policy else {
+        unreachable!();
+    };
+    let mut bytes = 0usize;
+    let mut kept = 0;
+    let mut cutoff = messages.len();
+    // All outputs between assistant messages belong to one exchange.
+    for (i, message) in messages.iter().enumerate().rev() {
+        bytes = bytes.saturating_add(output_bytes(message));
+        if message.role() == Role::Assistant {
+            if kept >= MIN_VERBATIM_EXCHANGES && bytes > budget {
+                return cutoff;
+            }
+            kept += 1;
+            cutoff = i;
+        }
+    }
+    0
+}
+
+fn compact_with_policy(messages: &mut [ChatMessage], policy: KeepPolicy, keep_reasoning: bool) {
+    let cutoff = verbatim_cutoff(messages, policy);
     let task = messages.iter().position(|m| m.role() == Role::User);
     for (i, message) in messages[..cutoff].iter_mut().enumerate() {
         if message.role() == Role::System || Some(i) == task {
@@ -48,11 +113,7 @@ fn compact_with_policy(messages: &mut [ChatMessage], full_turns: usize, keep_rea
             let compacted = match message.role() {
                 Role::Assistant => shorten(text, PROSE_BYTES, PROSE_SUFFIX),
                 Role::Tool => output_stub(text),
-                Role::User
-                    if text.starts_with(COMMAND_OUTPUT_PREFIX) || text == NO_COMMAND_NUDGE =>
-                {
-                    output_stub(text)
-                }
+                Role::User if is_command_output(text) => output_stub(text),
                 Role::System | Role::User => None,
             };
             if let Some(text) = compacted {
@@ -80,8 +141,8 @@ fn shorten(text: &str, bytes: usize, suffix: &str) -> Option<String> {
 }
 
 fn output_stub(text: &str) -> Option<String> {
-    // Recognize our bounded stub so reapplying compaction preserves byte counts.
-    if text.starts_with(OUTPUT_PREFIX) && text.ends_with(']') && text.len() <= 400 {
+    // Small read-like outputs and already-bounded stubs stay whole.
+    if text.len() <= OUTPUT_KEEP_BYTES {
         return None;
     }
     let exit = text
@@ -122,7 +183,7 @@ mod tests {
                 format!("call_{turn}_{call}"),
                 format!(
                     "COMMAND OUTPUT (exit code: -7):\n```\n{}\n```",
-                    "出".repeat(1000)
+                    "出".repeat(2000)
                 ),
             ));
         }
@@ -139,7 +200,7 @@ mod tests {
         exchange(&mut messages, 1, 1);
         exchange(&mut messages, 2, 1);
         let original = serde_json::to_value(&messages).unwrap();
-        compact_with_policy(&mut messages, 2, false);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(2), false);
         let compacted = serde_json::to_value(&messages).unwrap();
         assert_eq!(compacted[0], original[0]);
         assert_eq!(compacted[1], original[1]);
@@ -185,7 +246,7 @@ mod tests {
             assert_eq!(before.get("tool_call_id"), after.get("tool_call_id"));
             assert_eq!(before.get("tool_calls"), after.get("tool_calls"));
         }
-        compact_with_policy(&mut messages, 2, false);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(2), false);
         assert_eq!(serde_json::to_value(&messages).unwrap(), compacted);
     }
 
@@ -202,12 +263,15 @@ mod tests {
                 .with_reasoning_content(Some("thinking".repeat(1000))),
             ChatMessage::text(
                 Role::User,
-                "COMMAND OUTPUT (exit code: 0):\n```\nhello\n```",
+                format!(
+                    "COMMAND OUTPUT (exit code: 0):\n```\n{}\n```",
+                    "hello".repeat(1000)
+                ),
             ),
             ChatMessage::text(Role::Assistant, "no command"),
             ChatMessage::text(Role::User, NO_COMMAND_NUDGE),
         ];
-        compact_with_policy(&mut messages, 0, true);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(0), true);
         assert_eq!(
             messages[2].reasoning_content(),
             Some("thinking".repeat(1000).as_str())
@@ -219,14 +283,9 @@ mod tests {
                 .unwrap()
                 .starts_with("[output elided: exit 0, ")
         );
-        assert!(
-            messages[5]
-                .content()
-                .unwrap()
-                .starts_with("[output elided: exit unknown, ")
-        );
+        assert_eq!(messages[5].content(), Some(NO_COMMAND_NUDGE));
         let compacted = serde_json::to_value(&messages).unwrap();
-        compact_with_policy(&mut messages, 0, true);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(0), true);
         assert_eq!(serde_json::to_value(&messages).unwrap(), compacted);
     }
 
@@ -251,7 +310,10 @@ mod tests {
             ChatMessage::text(Role::Assistant, "```bash\necho hello\n```"),
             ChatMessage::text(
                 Role::User,
-                "COMMAND OUTPUT (exit code: 0):\n```\nhello\n```",
+                format!(
+                    "COMMAND OUTPUT (exit code: 0):\n```\n{}\n```",
+                    "hello".repeat(1000)
+                ),
             ),
         ];
         messages.extend(
@@ -260,13 +322,13 @@ mod tests {
                 .map(|text| ChatMessage::text(Role::User, text)),
         );
         exchange(&mut messages, 1, 1);
-        compact_with_policy(&mut messages, 1, false);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(1), false);
         assert!(messages[3].content().unwrap().starts_with(OUTPUT_PREFIX));
         for (message, expected) in messages[4..].iter().zip(&instructions) {
             assert_eq!(message.content(), Some(expected.as_str()));
         }
         let compacted = serde_json::to_value(&messages).unwrap();
-        compact_with_policy(&mut messages, 1, false);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(1), false);
         assert_eq!(serde_json::to_value(&messages).unwrap(), compacted);
     }
 
@@ -275,7 +337,171 @@ mod tests {
         let mut messages = vec![ChatMessage::text(Role::User, "task")];
         exchange(&mut messages, 0, 1);
         let original = serde_json::to_value(&messages).unwrap();
-        compact_with_policy(&mut messages, usize::MAX, false);
+        compact_with_policy(&mut messages, KeepPolicy::Turns(usize::MAX), false);
         assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::agent::{ToolCall, ToolCallFn};
+
+    fn history(sizes: &[usize]) -> Vec<ChatMessage> {
+        let mut messages = vec![
+            ChatMessage::text(Role::System, "system"),
+            ChatMessage::text(Role::User, "task"),
+        ];
+        for (turn, &size) in sizes.iter().enumerate() {
+            let id = format!("budget_call_{turn}");
+            messages.push(
+                ChatMessage::assistant_with_tool_calls(
+                    Some("prose".repeat(200)),
+                    vec![ToolCall {
+                        id: id.clone(),
+                        r#type: "function".into(),
+                        function: ToolCallFn {
+                            name: "bash".into(),
+                            arguments: format!(r#"{{"command":"echo {turn}"}}"#),
+                        },
+                    }],
+                )
+                .with_reasoning_content(Some("thinking".repeat(200))),
+            );
+            let prefix = "COMMAND OUTPUT (exit code: 0):\n```\n";
+            assert!(size >= prefix.len() + 4);
+            messages.push(ChatMessage::tool_result(
+                id,
+                format!("{prefix}{}\n```", "x".repeat(size - prefix.len() - 4)),
+            ));
+        }
+        messages
+    }
+
+    #[test]
+    fn many_small_outputs_keep_whole_exchanges() {
+        let mut messages = history(&[1_000; 60]);
+        let original = serde_json::to_value(&messages).unwrap();
+        compact_with_policy(
+            &mut messages,
+            KeepPolicy::Budget(DEFAULT_BUDGET_BYTES),
+            false,
+        );
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    fn assert_idempotent(messages: &mut [ChatMessage], policy: KeepPolicy) {
+        let once = serde_json::to_value(&*messages).unwrap();
+        compact_with_policy(messages, policy, false);
+        assert_eq!(serde_json::to_value(messages).unwrap(), once);
+    }
+
+    #[test]
+    fn older_large_outputs_are_stubbed_but_newer_small_exchanges_survive() {
+        let mut sizes = vec![20_000; 9];
+        sizes.extend([1_000; 12]);
+        let mut messages = history(&sizes);
+        let original = serde_json::to_value(&messages).unwrap();
+        let policy = KeepPolicy::Budget(DEFAULT_BUDGET_BYTES);
+        compact_with_policy(&mut messages, policy, false);
+        // 12 KB of recent outputs plus seven 20 KB outputs fit; eight do not.
+        assert!(messages[3].content().unwrap().starts_with(OUTPUT_PREFIX));
+        assert!(messages[5].content().unwrap().starts_with(OUTPUT_PREFIX));
+        let after = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            after.as_array().unwrap()[6..],
+            original.as_array().unwrap()[6..]
+        );
+        assert_idempotent(&mut messages, policy);
+    }
+
+    #[test]
+    fn mandatory_four_exchanges_count_against_the_budget() {
+        let mut messages = history(&[20_000; 7]);
+        let original = serde_json::to_value(&messages).unwrap();
+        let policy = KeepPolicy::Budget(1_000);
+        compact_with_policy(&mut messages, policy, false);
+        for turn in 0..3 {
+            assert!(
+                messages[3 + turn * 2]
+                    .content()
+                    .unwrap()
+                    .starts_with(OUTPUT_PREFIX)
+            );
+        }
+        let after = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            after.as_array().unwrap()[8..],
+            original.as_array().unwrap()[8..]
+        );
+        assert_idempotent(&mut messages, policy);
+
+        // The mandatory window costs 80 KB, so another 20 KB cannot fit in 90 KB.
+        let mut messages = history(&[20_000; 7]);
+        compact_with_policy(&mut messages, KeepPolicy::Budget(90_000), false);
+        assert!(messages[7].content().unwrap().starts_with(OUTPUT_PREFIX));
+    }
+
+    #[test]
+    fn fixed_turn_override_wins_and_can_keep_fewer_than_four() {
+        let mut messages = history(&[5_000; 6]);
+        let original = serde_json::to_value(&messages).unwrap();
+        let policy = KeepPolicy::from_limits(Some(2), usize::MAX);
+        compact_with_policy(&mut messages, policy, false);
+        assert!(messages[9].content().unwrap().starts_with(OUTPUT_PREFIX));
+        let after = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            after.as_array().unwrap()[10..],
+            original.as_array().unwrap()[10..]
+        );
+        assert_idempotent(&mut messages, policy);
+    }
+
+    #[test]
+    fn small_outputs_survive_outside_window_and_large_preview_is_utf8_safe() {
+        let mut messages = history(&[4_000, 4_001]);
+        let small = messages[3].content().unwrap().to_string();
+        let policy = KeepPolicy::Turns(0);
+        compact_with_policy(&mut messages, policy, false);
+        assert_eq!(messages[3].content(), Some(small.as_str()));
+        assert!(messages[2].content().unwrap().ends_with(PROSE_SUFFIX));
+        assert!(messages[5].content().unwrap().starts_with(OUTPUT_PREFIX));
+        assert_idempotent(&mut messages, policy);
+        let unicode = format!("COMMAND OUTPUT (exit code: -7):\n{}", "出".repeat(2_000));
+        let stub = output_stub(&unicode).unwrap();
+        assert!(stub.starts_with("[output elided: exit -7, "));
+        assert!(stub.len() <= OUTPUT_PREVIEW_BYTES + 100);
+        assert_eq!(output_stub(&stub), None);
+    }
+
+    #[test]
+    fn budget_counts_all_tool_results_and_fallback_outputs_not_guidance() {
+        let mut messages = history(&[10_000; 5]);
+        // A second result in the fifth-oldest exchange tips it over 55 KB.
+        messages.insert(4, ChatMessage::tool_result("extra".into(), "x".repeat(10_000)));
+        let original = serde_json::to_value(&messages).unwrap();
+        let policy = KeepPolicy::Budget(55_000);
+        compact_with_policy(&mut messages, policy, false);
+        assert!(messages[3].content().unwrap().starts_with(OUTPUT_PREFIX));
+        let after = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            after.as_array().unwrap()[5..],
+            original.as_array().unwrap()[5..]
+        );
+        assert_idempotent(&mut messages, policy);
+
+        // User-role command outputs charge the same budget; instructions do not.
+        let mut messages = history(&[20_000; 7]);
+        for message in &mut messages {
+            if message.role() == Role::Tool {
+                *message = ChatMessage::text(Role::User, message.content().unwrap());
+            }
+        }
+        messages.push(ChatMessage::text(Role::User, "guidance".repeat(20_000)));
+        compact_with_policy(&mut messages, KeepPolicy::Budget(100_000), false);
+        assert!(messages[5].content().unwrap().starts_with(OUTPUT_PREFIX));
+        assert_eq!(messages[7].content().unwrap().len(), 20_000);
+        assert_eq!(messages.last().unwrap().content().unwrap().len(), 160_000);
+        assert_idempotent(&mut messages, KeepPolicy::Budget(100_000));
     }
 }

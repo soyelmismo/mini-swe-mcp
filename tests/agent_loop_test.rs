@@ -1144,7 +1144,7 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
 /// Large outputs and thinking-mode responses must age out of the full window,
 /// leaving only a small per-exchange increment in subsequent requests.
 #[tokio::test]
-async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
+async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     let repo = TestRepo::new("compact-history");
     let reasoning = "r".repeat(60 * 1024);
     let prose = "p".repeat(4096);
@@ -1186,7 +1186,8 @@ async fn long_conversation_requests_keep_only_twelve_full_exchanges() {
     let assistants: Vec<_> = final_messages.iter().filter(|m| m["role"] == "assistant").collect();
     assert_eq!(assistants.len(), 40);
     for (i, assistant) in assistants.iter().enumerate() {
-        if i < 28 {
+        // Nine 16 KB results fit the budget, plus the current unanswered assistant.
+        if i < 30 {
             assert!(assistant["reasoning_content"].as_str().unwrap().ends_with(" [reasoning elided]"));
             assert!(assistant["content"].as_str().unwrap().ends_with(" [prose elided]"));
         } else {
