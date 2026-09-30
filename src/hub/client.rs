@@ -68,17 +68,102 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
 /// name the agent its workers belong to; without it the daemon derives the
 /// identity from the `initialize` `clientInfo` (see [`crate::mcp::ConnectionContext::agent`]).
 /// `admin` is the operator override that lifts the per-agent ownership check.
-async fn hello<W: AsyncWrite + Unpin>(writer: &mut W, admin: bool) -> Result<()> {
-    let frame = json!({
-        "jsonrpc": "2.0", "method": "hub/hello",
-        "params": {"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
-                   "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
-                   "cwd": std::env::current_dir().ok(),
-                   "admin": admin}
-    });
-    writer.write_all(format!("{frame}\n").as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
+fn client_version() -> String {
+    #[cfg(debug_assertions)]
+    if let Ok(version) = std::env::var("MINI_SWE_FAKE_VERSION") {
+        return version;
+    }
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn hello_params(admin: bool, version: &str) -> Value {
+    json!({"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
+           "pid": std::process::id(), "version": version,
+           "cwd": std::env::current_dir().ok(), "admin": admin})
+}
+
+/// Compare release versions numerically; prereleases precede the same release.
+fn newer(client: &str, daemon: &str) -> bool {
+    fn parts(version: &str) -> Option<([u64; 3], Option<&str>)> {
+        let version = version.split('+').next()?;
+        let (core, pre) = version
+            .split_once('-')
+            .map_or((version, None), |(v, p)| (v, Some(p)));
+        let mut numbers = core.split('.');
+        let tuple = [
+            numbers.next()?.parse().ok()?,
+            numbers.next()?.parse().ok()?,
+            numbers.next()?.parse().ok()?,
+        ];
+        numbers.next().is_none().then_some((tuple, pre))
+    }
+    match (parts(client), parts(daemon)) {
+        (Some((c, cp)), Some((d, dp))) => c > d || (c == d && cp.is_none() && dp.is_some()),
+        _ => false,
+    }
+}
+
+/// Negotiate once, replacing only an older idle daemon. The retry is bounded.
+async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
+    let version = client_version();
+    for attempt in 0..2 {
+        let mut client = HubClient {
+            stream: BufReader::new(connect_or_spawn().await?),
+            next_id: 1,
+            notifications: Vec::new(),
+        };
+        // Announce the final CLI identity before any replay. The proxy's
+        // identity comes from hello or the host's later initialize.
+        let mut params = hello_params(admin, &version);
+        if cli && params["agent_id"].as_str().is_none_or(str::is_empty) {
+            params["agent_id"] = json!(crate::mcp::CLI_AGENT);
+        }
+        let reply = client.request("hub/hello", params).await?;
+        let daemon = reply["version"].as_str().unwrap_or("");
+        if daemon != version && newer(&version, daemon) {
+            if !reply["busy"].as_bool().unwrap_or(true) && attempt == 0 {
+                match client.request("hub/shutdown", json!({})).await {
+                    Ok(_) => {
+                        // The reply precedes teardown. Wait for EOF, not merely
+                        // the reply, so connect_or_spawn cannot dial the old hub.
+                        let mut byte = [0u8; 1];
+                        tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut byte))
+                            .await??;
+                        drop(client);
+                        let paths = HubPaths::new(hub_dir()?);
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while paths.socket().exists() {
+                            anyhow::ensure!(
+                                tokio::time::Instant::now() < deadline,
+                                "Old hub did not stop"
+                            );
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        // A dispatch may have made the daemon busy since hello.
+                    }
+                }
+            }
+            eprintln!(
+                "[mini-swe] Client {version} is newer than hub {daemon}; continuing with the existing daemon (busy or replacement unavailable)."
+            );
+        }
+        if cli {
+            client
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": version}
+                    }),
+                )
+                .await?;
+        }
+        return Ok(client);
+    }
+    unreachable!("the second negotiation always returns")
 }
 
 /// Forward bytes unchanged with fixed-size buffers and immediate output flushes.
@@ -99,12 +184,21 @@ async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// Proxy stdio until either input closes. The daemon owns all MCP semantics.
 pub async fn proxy_stdio() -> Result<()> {
-    let mut stream = connect_or_spawn().await?;
-    hello(&mut stream, false).await?;
-    let (reader, writer) = stream.into_split();
+    let client = negotiated(false, false).await?;
+    let buffered = client.stream.buffer().to_vec();
+    let (reader, writer) = client.stream.into_inner().into_split();
+    let output = async move {
+        let mut stdout = tokio::io::stdout();
+        for frame in client.notifications {
+            stdout.write_all(&frame).await?;
+        }
+        stdout.write_all(&buffered).await?;
+        stdout.flush().await?;
+        forward(reader, stdout).await
+    };
     tokio::select! {
         result = forward(tokio::io::stdin(), writer) => result,
-        result = forward(reader, tokio::io::stdout()) => result,
+        result = output => result,
     }
 }
 
@@ -112,6 +206,7 @@ pub async fn proxy_stdio() -> Result<()> {
 pub struct HubClient {
     stream: BufReader<UnixStream>,
     next_id: u64,
+    notifications: Vec<Vec<u8>>,
 }
 
 impl HubClient {
@@ -126,21 +221,7 @@ impl HubClient {
     /// stable `cli` identity (H-3), and `admin` is the human operator's
     /// `mini-swe-mcp --admin` bypass of the per-agent ownership check.
     pub async fn connect_as_admin(admin: bool) -> Result<Self> {
-        let mut client = Self {
-            stream: BufReader::new(connect_or_spawn().await?),
-            next_id: 1,
-        };
-        client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": {"name": crate::mcp::CLI_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}
-                }),
-            )
-            .await?;
-        hello(client.stream.get_mut(), admin).await?;
-        Ok(client)
+        negotiated(admin, true).await
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -166,6 +247,14 @@ impl HubClient {
             );
             let reply: Value = serde_json::from_slice(&line)?;
             if reply.get("id") != Some(&json!(id)) {
+                // Negotiation can race owner replay. Preserve it for the proxy
+                // with both frame count and byte retention bounded.
+                if self.notifications.len() < 100
+                    && self.notifications.iter().map(Vec::len).sum::<usize>() + line.len()
+                        <= 1024 * 1024
+                {
+                    self.notifications.push(line);
+                }
                 continue;
             }
             if let Some(error) = reply.get("error") {

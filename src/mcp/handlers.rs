@@ -335,6 +335,7 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let admission = self.admit_worker().await?;
         let wid = self
             .pool
             .dispatch(
@@ -350,6 +351,7 @@ impl McpServer {
                 verify,
             )
             .await?;
+        drop(admission);
 
         Self::emit_progress(
             tx,
@@ -667,9 +669,11 @@ impl McpServer {
         // A revision restarts the turn budget, so a `steer --wait` on a
         // finished worker must report the fresh budget as its denominator.
         let was_terminal = self.pool.is_terminal(wid).await;
+        let admission = self.admit_worker().await?;
         self.pool
             .steer_with_budget(wid, message, revision_turns)
             .await?;
+        drop(admission);
         let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
         if wait {
             // A finished worker's revision runs on a fresh budget: report that
@@ -688,6 +692,16 @@ impl McpServer {
                     tx,
                 )
                 .await;
+        }
+        if was_terminal {
+            return Ok(json!({
+                "worker_id": wid,
+                "status": "revising",
+                "message": format!(
+                    "Revision started on branch worker-{wid} with a fresh budget of {} turns",
+                    self.revision_await_budget(revision_turns)
+                ),
+            }));
         }
         Ok(json!({
             "worker_id": wid,
