@@ -124,7 +124,24 @@ pub fn render(v: &Value) -> String {
             for key in ["summary", "error", "verify_output_tail", "next_step"] { if let Some(value) = v[key].as_str() { out.push_str(&format!("{key}: {value}\n")); } }
         }
         "needs_input" => out.push_str(&format!("Question: {}\n", text("question"))),
-        _ => out.push_str(&format!("No step for {}s | counters {}\nLast 5 ops: {}\nSteer with a concrete redirection, or kill.\n", v["time_since_last_step"], v["metrics"], v["last_ops"])),
+        _ => {
+            let metrics = &v["metrics"];
+            let counters = ["repeat_blocks", "stagnation_nudges", "loop_pauses", "extensions_refused", "verify_failures"]
+                .iter()
+                .filter_map(|key| metrics[*key].as_u64().filter(|n| *n > 0).map(|n| format!("{key}={n}")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ops = v["last_ops"]
+                .as_array()
+                .map(|ops| ops.iter().filter_map(|op| op.as_str()).collect::<Vec<_>>().join("; "))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "No step for {}s | {} | Last 5 ops: {}\nSteer with a concrete redirection, or kill.\n",
+                v["time_since_last_step"],
+                if counters.is_empty() { "no health counter moved".to_string() } else { counters },
+                ops
+            ));
+        }
     }
     if let Some(cmds) = v["commands"].as_array() { for cmd in cmds { out.push_str(cmd.as_str().unwrap_or("")); out.push('\n'); } }
     out.trim_end().to_string()

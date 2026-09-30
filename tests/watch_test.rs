@@ -213,6 +213,9 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(stdout.contains("w-cli") && stdout.contains("completed") && stdout.contains("mini-swe-mcp steer"), "{stdout}");
     let _ = std::fs::remove_dir_all(swe.path().join("swe-registry"));
+    // The registry-only row carries no branch, so the guidance falls back to
+    // the branch-less wording instead of naming a branch that is not there.
+    assert!(stdout.contains("Review the result"), "{stdout}");
     // The same worker, now gone: still nothing to watch.
     std::fs::create_dir_all(swe.path().join("swe-registry")).unwrap();
     let now = mini_swe_mcp::pool::unix_timestamp();
