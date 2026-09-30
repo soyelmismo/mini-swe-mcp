@@ -11,7 +11,7 @@ cargo install --path .     # or put it on PATH
 
 Requirements: `git`, an OpenAI-compatible endpoint, and `OPENAI_API_KEY`. A `.env` in the working directory is loaded automatically (`ENV_FILE` points elsewhere); `OPENAI_API_BASE` defaults to `https://api.openai.com/v1`.
 
-Model aliases resolve from the first `models.yaml` found: `MODELS_FILE`, then `$XDG_CONFIG_HOME/mini-swe-mcp/models.yaml`, then `$HOME/.config/mini-swe-mcp/models.yaml`, then the copy shipped with the crate. `mini-swe-mcp manifest` prints the resolved catalog; `DEFAULT_MODEL` names the alias used when a dispatch omits `--model`.
+Model aliases resolve from the first `models.yaml` found: `MODELS_FILE`, then `./models.yaml`, then `$XDG_CONFIG_HOME/mini-swe/models.yaml`, then next to the executable, then the built-in catalog. `mini-swe-mcp manifest` prints the resolved catalog; `DEFAULT_MODEL` names the alias used when a dispatch omits `--model`.
 
 ## Connect an agent
 
@@ -98,7 +98,7 @@ One daemon, many orchestrators.
 
 - **One daemon.** The CLI and `--stdio` auto-start the hub when none is running. Its socket lives in `SWE_HUB_DIR` (default `<SWE_TEMP_DIR>/mini-swe-hub-<uid>`, private to your uid). `mini-swe-mcp daemon` runs it in the foreground; it exits after `HUB_IDLE_SECS` without clients.
 - **Ownership & privacy.** A client may only read, steer, kill, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, or the MCP `initialize` client info when that is unset.
-- **`--admin`.** The human operator's override: act on any agent's workers. `list --all` requires it. `--admin` is a connection flag for both the CLI and `--stdio`.
+- **`--admin`.** The human operator's override on the CLI: act on workers owned by any agent. `list --all` requires it.
 - **Crash recovery.** If the hub dies, its workers become `interrupted`; on restart it auto-resumes them from their durable conversation (`HUB_AUTO_RESUME=0` disables this).
 - **`MINI_SWE_NO_DAEMON=1`.** No daemon: each process serves MCP and owns its own pool. Useful for tests and single-shot use, but its state is invisible to other clients.
 
@@ -171,7 +171,7 @@ Defaults are what the code uses when the variable is unset.
 | `HUB_TARGET_MAX_GB` | `40` | Size cap on shared build slots. |
 | `MONITOR_WIDTH` | terminal size | Width used by `monitor` / `status`. |
 | `COLUMNS` | terminal size | Fallback width when `MONITOR_WIDTH` is unset. |
-| `XDG_CONFIG_HOME` | `$HOME/.config` | Base for `mini-swe-mcp/models.yaml`. |
+| `XDG_CONFIG_HOME` | `$HOME/.config` | Base for `mini-swe/models.yaml`. |
 
 ## Load testing
 

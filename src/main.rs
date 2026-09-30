@@ -222,13 +222,13 @@ fn print_help() {
     println!("  list [--all]");
     println!("           Workers you own; --all (with --admin) lists every agent's.");
     println!("  kill <worker_id>");
-    println!("           Stop a running worker.");
+    println!("           Terminate a worker.");
     println!("  reap");
-    println!("           Re-read worker state from disk.");
+    println!("           Evict expired terminal worker records.");
     println!("  prune");
-    println!("           Drop expired worktrees and caches.");
+    println!("           Clean stale worktrees and caches.");
     println!("  manifest");
-    println!("           Print the resolved model catalog.");
+    println!("           Print the models catalog.");
     println!("  monitor [--once]");
     println!("           Full-screen view of the pool.");
     println!("  supervisor [--once]");
