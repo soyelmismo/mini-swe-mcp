@@ -46,6 +46,9 @@ pub struct WorkerHistory {
     /// re-attaches to the branch with this as the diff base, so history and
     /// checkpoints survive.
     pub base_commit: String,
+    /// Branch checked out at the original dispatch, absent in older histories.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// The branch the previous run committed to (`worker-<id>`).
     pub branch: String,
     pub network_offline: bool,
@@ -390,6 +393,7 @@ impl super::WorkerPool {
             verify: history.verify.clone(),
             resume_messages: Some(history.messages),
             resume_base_commit: Some(base_commit.clone()),
+            resume_base_branch: history.base_branch.clone(),
         };
         let handle = tokio::spawn(async move {
             if let Err(e) = pool.run_worker(wid.clone(), config, &mut meta_for_fail).await {

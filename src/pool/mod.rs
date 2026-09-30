@@ -370,6 +370,7 @@ impl WorkerPool {
             verify,
             resume_messages: None,
             resume_base_commit: None,
+            resume_base_branch: None,
         };
 
         let join_handle = tokio::spawn(async move {
