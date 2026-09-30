@@ -27,11 +27,11 @@ use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
 use crate::manifest::MAX_TURNS_LIMIT;
 use crate::worktree::{BaseSync, WorktreeGuard, git};
 
+use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages;
-use super::super::WorkerPool;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
@@ -64,8 +64,7 @@ const STAGNATION_TURNS_LIMIT: usize = 30;
 const REPEAT_BLOCK_LIMIT: usize = 3;
 
 /// Answer handed to the model that re-issues the command of the turn before.
-const REPEAT_REFUSAL: &str =
-    "You already ran this exact command; its output has not changed (see above). Take a different action.";
+const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
 
 /// Nudge injected after a worker has explored long enough without changing
 /// anything: the answer to a stuck agent is a decision, not another turn.
@@ -137,7 +136,11 @@ pub(super) fn parse_shortstat(line: &str) -> Option<(usize, usize, usize)> {
 /// commits along the way and the still-uncommitted tail are counted together.
 /// `git` is a blocking subprocess, so the sample runs off the runtime thread,
 /// and `None` means "not measured", never "measured as empty".
-pub(super) async fn shortstat_of(path: &Path, base: &str, base_branch: Option<&str>) -> Option<(usize, usize, usize)> {
+pub(super) async fn shortstat_of(
+    path: &Path,
+    base: &str,
+    base_branch: Option<&str>,
+) -> Option<(usize, usize, usize)> {
     let path = path.to_path_buf();
     let base = if base.is_empty() {
         "HEAD".to_string()
@@ -166,8 +169,16 @@ async fn sync_base_for_completion(worktree: &WorktreeGuard) -> Result<BaseSync> 
     let base_commit = worktree.base_commit.clone();
     let base_branch = worktree.base_branch.clone();
     tokio::task::spawn_blocking(move || {
-        WorktreeGuard::sync_base_at(&path, &repo_root, &branch, &base_commit, base_branch.as_deref())
-    }).await.context("Base integration task failed")?
+        WorktreeGuard::sync_base_at(
+            &path,
+            &repo_root,
+            &branch,
+            &base_commit,
+            base_branch.as_deref(),
+        )
+    })
+    .await
+    .context("Base integration task failed")?
 }
 
 /// Cross-turn state of the two loop detectors.
@@ -346,85 +357,100 @@ impl<'a> TurnEngine<'a> {
         }
 
         // --- LLM call with error handling ---
-        compact_history(self.messages);
-        let llm_resp = match self.runner.run_step_llm(self.messages).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                match config.llm_error_policy {
-                    LlmErrorPolicy::EndQuietly => {
-                        warn!(
-                            worker = %self.worker_id,
-                            step = *self.step,
-                            error = %e,
-                            "Reviewer LLM step failed; completing review phase"
+        // A provider outage is waited out (up to `outage_patience`) before the
+        // orchestrator is asked, and a resume retries the step rather than
+        // failing the worker on the next error.
+        let mut outage_waited = std::time::Duration::ZERO;
+        let llm_resp = loop {
+            compact_history(self.messages);
+            let e = match self.runner.run_step_llm(self.messages).await {
+                Ok(resp) => break resp,
+                Err(e) => e,
+            };
+            if crate::agent::retry::is_llm_unavailable(&e)
+                && outage_waited < crate::agent::retry::outage_patience()
+            {
+                let delay = crate::agent::retry::OUTAGE_RETRY_INTERVAL;
+                warn!(
+                    worker = %self.worker_id,
+                    step = *self.step,
+                    waited_secs = outage_waited.as_secs(),
+                    error = %e,
+                    "LLM provider unavailable; waiting before retrying the step"
+                );
+                tokio::time::sleep(delay).await;
+                outage_waited += delay;
+                continue;
+            }
+            match config.llm_error_policy {
+                LlmErrorPolicy::EndQuietly => {
+                    warn!(
+                        worker = %self.worker_id,
+                        step = *self.step,
+                        error = %e,
+                        "Reviewer LLM step failed; completing review phase"
+                    );
+                    return Ok(TurnOutcome::EndReview);
+                }
+                LlmErrorPolicy::PauseForOrchestrator => {
+                    // Safe checkpoint of uncommitted worktree changes so work is never lost.
+                    // `commit_changes` shells out to git, so it runs off the runtime thread.
+                    {
+                        let path = self.worktree.path.clone();
+                        let message = format!(
+                            "worker({}): checkpoint step {} before pause (error: {})",
+                            self.worker_id, *self.step, e
                         );
-                        return Ok(TurnOutcome::EndReview);
-                    }
-                    LlmErrorPolicy::PauseForOrchestrator => {
-                        // Safe checkpoint of uncommitted worktree changes so work is never lost.
-                        // `commit_changes` shells out to git, so it runs off the runtime thread.
-                        {
-                            let path = self.worktree.path.clone();
-                            let message = format!(
-                                "worker({}): checkpoint step {} before pause (error: {})",
-                                self.worker_id, *self.step, e
-                            );
-                            let committed =
-                                tokio::task::spawn_blocking(move || {
-                                    WorktreeGuard::commit_all(&path, &message)
-                                })
-                                .await
-                                .unwrap_or(Ok(false));
-                            if committed.unwrap_or(false) {
-                                self.worktree.preserve_branch = true;
-                            }
-                        }
-
-                        warn!(
-                            worker = %self.worker_id,
-                            step = *self.step,
-                            error = %e,
-                            "LLM step failed after retries; pausing worker for orchestrator resume"
-                        );
-
-                        let question = format!(
-                            "LLM API error (step {}): {}. Send steer/resume to retry.",
-                            *self.step, e
-                        );
-
-                        let answer = self
-                            .pool
-                            .pause_for_orchestrator(PauseRequest {
-                                worker_id: self.worker_id,
-                                question: &question,
-                                step: *self.step,
-                                max_turns: *self.current_max_turns,
-                                last_command: &format!("paused_on_error: {e}"),
-                                model: config.model,
-                                meta: self.meta,
-                            })
-                            .await?;
-
-                        match answer {
-                            Some(resume_msg) => {
-                                info!(
-                                    worker = %self.worker_id,
-                                    msg = %resume_msg,
-                                    "Worker resumed after error by orchestrator"
-                                );
-                                if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
-                                    self.messages.push(ChatMessage::text(
-                                        Role::User,
-                                        format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
-                                    ));
-                                }
-                                // Re-run the LLM step now that network/connectivity is restored
-                                compact_history(self.messages);
-                                self.runner.run_step_llm(self.messages).await?
-                            }
-                            None => return Err(e),
+                        let committed = tokio::task::spawn_blocking(move || {
+                            WorktreeGuard::commit_all(&path, &message)
+                        })
+                        .await
+                        .unwrap_or(Ok(false));
+                        if committed.unwrap_or(false) {
+                            self.worktree.preserve_branch = true;
                         }
                     }
+
+                    warn!(
+                        worker = %self.worker_id,
+                        step = *self.step,
+                        error = %e,
+                        "LLM step failed after retries; pausing worker for orchestrator resume"
+                    );
+
+                    let question = format!(
+                        "LLM API error (step {}): {}. Send steer/resume to retry.",
+                        *self.step, e
+                    );
+
+                    let answer = self
+                        .pool
+                        .pause_for_orchestrator(PauseRequest {
+                            worker_id: self.worker_id,
+                            question: &question,
+                            step: *self.step,
+                            max_turns: *self.current_max_turns,
+                            last_command: &format!("paused_on_error: {e}"),
+                            model: config.model,
+                            meta: self.meta,
+                        })
+                        .await?;
+
+                    let Some(resume_msg) = answer else {
+                        return Err(e);
+                    };
+                    info!(
+                        worker = %self.worker_id,
+                        msg = %resume_msg,
+                        "Worker resumed after error by orchestrator"
+                    );
+                    if !resume_msg.trim().is_empty() && resume_msg.trim() != "resume" {
+                        self.messages.push(ChatMessage::text(
+                            Role::User,
+                            format!("ORCHESTRATOR GUIDANCE:\n{}", resume_msg),
+                        ));
+                    }
+                    outage_waited = std::time::Duration::ZERO;
                 }
             }
         };
@@ -526,7 +552,9 @@ impl<'a> TurnEngine<'a> {
                 "Blocked a repeated command; its output is already in the history"
             );
             if blocks >= REPEAT_BLOCK_LIMIT {
-                return self.park_on_loop(config, &llm_resp, &cmd_summary, blocks).await;
+                return self
+                    .park_on_loop(config, &llm_resp, &cmd_summary, blocks)
+                    .await;
             }
             self.push_exchange(
                 llm_resp.content,
@@ -547,7 +575,9 @@ impl<'a> TurnEngine<'a> {
             // model can walk itself to the manifest ceiling unattended.
             if let Some(additional) = parse_request_turns(&cmd_str) {
                 let budget = extension_budget(self.dispatch_max_turns);
-                let granted = self.current_max_turns.saturating_sub(self.dispatch_max_turns);
+                let granted = self
+                    .current_max_turns
+                    .saturating_sub(self.dispatch_max_turns);
                 let requested_max = self
                     .dispatch_max_turns
                     .saturating_add(granted)
@@ -681,7 +711,10 @@ impl<'a> TurnEngine<'a> {
                 self.push_exchange(
                     llm_resp.content.clone(),
                     llm_resp.reasoning_content.clone(),
-                    llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+                    llm_resp
+                        .tool_calls
+                        .clone()
+                        .zip(llm_resp.tool_call_id.clone()),
                     refusal,
                 );
                 return Ok(TurnOutcome::Continue);
@@ -697,7 +730,9 @@ impl<'a> TurnEngine<'a> {
 
         let exit = code.unwrap_or(-1);
         if exit == 0 {
-            return Ok(TurnOutcome::Completed { verified: Some(true) });
+            return Ok(TurnOutcome::Completed {
+                verified: Some(true),
+            });
         }
 
         // Verification failed. Record a step log and push the output back to
@@ -706,7 +741,9 @@ impl<'a> TurnEngine<'a> {
         // unverified.
         self.meta.metrics.verify_failures += 1;
         if self.meta.metrics.verify_failures >= 3 {
-            return Ok(TurnOutcome::Completed { verified: Some(false) });
+            return Ok(TurnOutcome::Completed {
+                verified: Some(false),
+            });
         }
         let label = format!("[verify] {}", summarize_command(verify));
         let step_log = build_step_log(*self.step, &label, output.clone(), code);
@@ -727,7 +764,10 @@ impl<'a> TurnEngine<'a> {
         self.push_exchange(
             llm_resp.content.clone(),
             llm_resp.reasoning_content.clone(),
-            llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+            llm_resp
+                .tool_calls
+                .clone()
+                .zip(llm_resp.tool_call_id.clone()),
             output_text,
         );
         Ok(TurnOutcome::Continue)
@@ -775,7 +815,10 @@ impl<'a> TurnEngine<'a> {
         self.push_exchange(
             llm_resp.content.clone(),
             llm_resp.reasoning_content.clone(),
-            llm_resp.tool_calls.clone().zip(llm_resp.tool_call_id.clone()),
+            llm_resp
+                .tool_calls
+                .clone()
+                .zip(llm_resp.tool_call_id.clone()),
             REPEAT_REFUSAL.to_string(),
         );
         if let Some(answer) = answer
@@ -835,8 +878,14 @@ impl<'a> TurnEngine<'a> {
     /// A failed snapshot warns without interrupting the worker.
     async fn persist_checkpoint_history(&self, config: &TurnConfig<'_>) {
         use super::super::revision::{WorkerHistory, save_worker_history};
-        let revision = self.pool.workers.read().await.get(self.worker_id)
-            .map(|worker| worker.revision).unwrap_or(0);
+        let revision = self
+            .pool
+            .workers
+            .read()
+            .await
+            .get(self.worker_id)
+            .map(|worker| worker.revision)
+            .unwrap_or(0);
         let history = WorkerHistory {
             task: config.task.to_string(),
             group: self.meta.group.clone(),
@@ -860,13 +909,11 @@ impl<'a> TurnEngine<'a> {
         };
         let worker_id = self.worker_id.to_string();
         let step = *self.step;
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            save_worker_history(&worker_id, &history)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            Err(anyhow::anyhow!("history snapshot task failed: {e}"))
-        }) {
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || save_worker_history(&worker_id, &history))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("history snapshot task failed: {e}")))
+        {
             warn!(
                 worker = %self.worker_id,
                 step,
@@ -927,7 +974,9 @@ impl<'a> TurnEngine<'a> {
             self.worktree.last_build_slot = Some(permit.slot());
             runner = runner.with_build_jobs(permit.jobs());
         }
-        runner.build_target_dir = self.worktree.last_build_slot
+        runner.build_target_dir = self
+            .worktree
+            .last_build_slot
             .map(|slot| crate::cache::slot_target_dir(&self.worktree.repo_root, slot))
             .transpose()?;
         runner.execute_bash(&self.worktree.path, command).await
@@ -949,7 +998,8 @@ impl<'a> TurnEngine<'a> {
             let msg = ChatMessage::assistant_with_tool_calls(content, tool_calls)
                 .with_reasoning_content(reasoning);
             self.messages.push(msg);
-            self.messages.push(ChatMessage::tool_result(tc_id, output_text));
+            self.messages
+                .push(ChatMessage::tool_result(tc_id, output_text));
         } else {
             let content = if content.trim().is_empty() {
                 "I will execute a bash command.".to_string()
@@ -958,7 +1008,8 @@ impl<'a> TurnEngine<'a> {
             };
             let msg = ChatMessage::text(Role::Assistant, content).with_reasoning_content(reasoning);
             self.messages.push(msg);
-            self.messages.push(ChatMessage::text(Role::User, output_text));
+            self.messages
+                .push(ChatMessage::text(Role::User, output_text));
         }
     }
 
@@ -1007,10 +1058,8 @@ impl<'a> TurnEngine<'a> {
             let msg = ChatMessage::text(Role::Assistant, assistant_content)
                 .with_reasoning_content(reasoning);
             self.messages.push(msg);
-            self.messages.push(ChatMessage::text(
-                Role::User,
-                NO_COMMAND_NUDGE,
-            ));
+            self.messages
+                .push(ChatMessage::text(Role::User, NO_COMMAND_NUDGE));
         }
     }
 }
@@ -1082,7 +1131,10 @@ mod tests {
             0,
             "the first sample has nothing to compare against"
         );
-        assert_eq!(watch.record_sample(Some("head-a\nstat".to_string())), STAGNATION_SAMPLE_TURNS);
+        assert_eq!(
+            watch.record_sample(Some("head-a\nstat".to_string())),
+            STAGNATION_SAMPLE_TURNS
+        );
         assert_eq!(
             watch.record_sample(Some("head-a\nstat".to_string())),
             2 * STAGNATION_SAMPLE_TURNS

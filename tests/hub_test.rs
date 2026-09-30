@@ -1084,10 +1084,18 @@ async fn events_are_owner_scoped_and_replayed_after_hello() {
     admin
         .request("hub/hello", serde_json::json!({"admin": true}))
         .await;
-    assert_eq!(
-        next_event(&mut admin).await["params"]["meta"]["worker_id"],
-        "h4-late"
-    );
+    // An admin sees every agent's events, including real workers in this
+    // host's registry, so look for this test's event among the first few.
+    let mut admin_saw = Vec::new();
+    for _ in 0..20 {
+        let event = next_event(&mut admin).await;
+        let id = event["params"]["meta"]["worker_id"].clone();
+        admin_saw.push(id.clone());
+        if id == "h4-late" {
+            break;
+        }
+    }
+    assert_eq!(admin_saw.last(), Some(&serde_json::json!("h4-late")), "{admin_saw:?}");
     drop(a);
     drop(b);
     drop(late);

@@ -190,7 +190,11 @@ impl AgentRunner {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("LLM API returned HTTP {}: {}", status, body);
+                let message = format!("LLM API returned HTTP {status}: {body}");
+                if retry::is_transient_status(status) {
+                    return Err(retry::LlmUnavailable(message).into());
+                }
+                anyhow::bail!(message);
             }
 
             let mut acc = SseAccumulator::default();
@@ -300,7 +304,10 @@ impl AgentRunner {
                 tokio::time::sleep(delay).await;
                 Ok(None)
             }
-            Err(e) => Err(e).context("Failed to send request to LLM API after retries"),
+            Err(e) => Err(retry::LlmUnavailable(format!(
+                "Failed to send request to LLM API after retries: {e}"
+            ))
+            .into()),
         }
     }
 
@@ -325,11 +332,12 @@ impl AgentRunner {
                             tracing::warn!(attempt, "LLM SSE stream stalled (idle timeout)");
                             return Ok(StreamRun::Retry);
                         }
-                        anyhow::bail!(
+                        return Err(retry::LlmUnavailable(format!(
                             "LLM SSE stream stalled for {}s and did not resume after {} attempts",
                             self.stream_idle_timeout.as_secs(),
                             attempt
-                        );
+                        ))
+                        .into());
                     }
                 };
 
@@ -345,7 +353,10 @@ impl AgentRunner {
                         tracing::warn!(attempt, error = %e, "LLM SSE stream chunk read failed");
                         return Ok(StreamRun::Retry);
                     }
-                    return Err(e).context("Failed reading stream chunk after retries");
+                    return Err(retry::LlmUnavailable(format!(
+                        "Failed reading stream chunk after retries: {e}"
+                    ))
+                    .into());
                 }
             }
         }
