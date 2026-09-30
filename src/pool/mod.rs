@@ -49,9 +49,10 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
-    load_all_registry_entries, load_registry_entry, registry_dir, registry_owner_label,
+    load_all_registry_entries, load_registry_entries_read_only, load_registry_entry, registry_dir, registry_owner_label,
     remove_registry_entry, save_registry_entry,
 };
+pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
     parse_request_turns, summarize_command,

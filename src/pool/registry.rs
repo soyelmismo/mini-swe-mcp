@@ -304,6 +304,73 @@ fn branch_exists(
     branches.contains(&format!("worker-{}", item.id))
 }
 
+/// Read registry rows without Git probes, pruning or liveness normalization.
+///
+/// Status-line reads must be cheap and recovery needs the original status.
+pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
+    raw_registry_entries().map(|(_, entry)| entry).collect()
+}
+
+fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
+    let mut seen = std::collections::HashSet::new();
+    crate::worktree::swe_base_dirs().into_iter().flat_map(|base| {
+        std::fs::read_dir(base.join("swe-registry"))
+            .into_iter()
+            .flatten()
+            .flatten()
+    }).filter_map(move |file| {
+        let path = file.path();
+        if path.extension()?.to_str()? != "json" {
+            return None;
+        }
+        let entry: WorkerRegistryEntry =
+            serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        // IDs are path components, never paths supplied by registry contents.
+        if entry.id.is_empty()
+            || !entry.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || path.file_stem()?.to_str()? != entry.id
+            || !seen.insert(entry.id.clone())
+        {
+            return None;
+        }
+        Some((path, entry))
+    })
+}
+
+/// Salvage crashed workers before the new hub accepts any requests.
+///
+/// Keep the checkout, branch and history intact for a later revision. Write
+/// back to the source registry, including rows in the fallback scratch base.
+pub(crate) fn recover_orphaned_workers() -> usize {
+    let mut recovered = 0;
+    for (path, mut entry) in raw_registry_entries() {
+        if !entry.status.is_live()
+            || entry.pid == std::process::id()
+            || crate::worktree::is_process_alive(entry.pid)
+        {
+            continue;
+        }
+        let base = path.parent().and_then(|dir| dir.parent()).expect("registry base");
+        let checkout = base.join(format!("swe-wt-{}", entry.id));
+        if checkout.is_dir() {
+            crate::worktree::prune::salvage_dirty_worktree(&checkout);
+        }
+        entry.status = RegistryStatus::Failed;
+        entry.question = None;
+        entry.last_command = format!(
+            "hub restarted; work salvaged on branch worker-{}", entry.id
+        );
+        entry.updated_at = super::unix_timestamp();
+        match serde_json::to_vec(&entry).map_err(std::io::Error::other)
+            .and_then(|json| std::fs::write(&path, json))
+        {
+            Ok(()) => recovered += 1,
+            Err(error) => tracing::warn!(%error, worker = %entry.id, "Could not record hub recovery"),
+        }
+    }
+    recovered
+}
+
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
     let mut entries = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();

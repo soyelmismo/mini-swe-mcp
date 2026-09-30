@@ -213,6 +213,12 @@ impl HubServer {
         // "address already in use"; the lock proves nobody owns it now.
         let socket = paths.socket();
         let _ = std::fs::remove_file(&socket);
+        let recovered = tokio::task::spawn_blocking(crate::pool::recover_orphaned_workers)
+            .await
+            .context("Hub recovery task failed")?;
+        info!(workers = recovered, "Recovered orphaned hub workers");
+        append_log(&paths.log(), &format!("recovered {recovered} orphaned workers"));
+
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("Could not bind hub socket {}", socket.display()))?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))

@@ -259,7 +259,7 @@ fn reclaim_abandoned_worktree(dir: &Path) -> bool {
 /// unmerged, so the branch sweep preserves it. An orphan directory whose git
 /// metadata is already gone cannot be committed and is skipped (the status
 /// probe fails). Fallback credentials match `guard::commit_changes`.
-fn salvage_dirty_worktree(dir: &Path) {
+pub(crate) fn salvage_dirty_worktree(dir: &Path) {
     let Ok(status) = git(dir, "status --porcelain", &["status", "--porcelain"]) else {
         return;
     };
