@@ -107,20 +107,6 @@ async fn run_local_stdio() -> Result<()> {
 /// Route one CLI action through the hub daemon: initialize, hello and one
 /// `tools/call` whose payload and plain-text rendering match the local path.
 async fn run_remote_action(action: &str, cli_args: &[String], json_output: bool) -> Result<()> {
-    // `prune` sweeps the worktrees of the repository the operator is standing
-    // in, so the daemon is told that path explicitly: it may well have been
-    // started from a different working directory.
-    if action == "prune" {
-        let mut args = serde_json::Map::new();
-        args.insert("action".into(), serde_json::Value::String("prune".into()));
-        if let Ok(cwd) = std::env::current_dir() {
-            args.insert("repo_path".into(), serde_json::Value::String(cwd.to_string_lossy().into_owned()));
-        }
-        let mut client = mini_swe_mcp::hub::HubClient::connect().await?;
-        let result = client.worker(serde_json::Value::Object(args)).await?;
-        return print_result(action, &result, json_output);
-    }
-
     let api_key_present = !env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
         return Ok(());

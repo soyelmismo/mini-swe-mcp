@@ -46,6 +46,7 @@ pub struct ConnectionContext {
     pub agent_id: Option<String>,
     pub pid: Option<u32>,
     pub version: Option<String>,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl ConnectionContext {
@@ -56,7 +57,7 @@ impl ConnectionContext {
 
     /// Context for the `id`-th accepted hub connection (1-based).
     pub fn hub_connection(id: u64) -> Self {
-        Self { id, agent_id: None, pid: None, version: None }
+        Self { id, agent_id: None, pid: None, version: None, cwd: None }
     }
 }
 
@@ -166,6 +167,8 @@ impl McpServer {
                     ctx.agent_id = params["agent_id"].as_str().map(str::to_owned);
                     ctx.pid = params["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok());
                     ctx.version = params["version"].as_str().map(str::to_owned);
+                    ctx.cwd = params["cwd"].as_str().map(std::path::PathBuf::from)
+                        .filter(|cwd| cwd.is_absolute());
                 }
                 trace!(method = %req.method, "Received notification");
                 continue;
@@ -228,7 +231,7 @@ impl McpServer {
                     .cloned();
 
                 match self
-                    .execute_tool_with_progress(tool_name, arguments, progress_token, progress_tx)
+                    .execute_tool_in_context(tool_name, arguments, progress_token, progress_tx, &ctx)
                     .await
                 {
                     Ok(payload) => JsonRpcResponse::tool_call(id, payload),
@@ -274,13 +277,20 @@ impl McpServer {
         progress_token: Option<Value>,
         progress_tx: Option<mpsc::Sender<String>>,
     ) -> Result<Value> {
+        self.execute_tool_in_context(name, args, progress_token, progress_tx, &ConnectionContext::stdio()).await
+    }
+
+    async fn execute_tool_in_context(
+        &self, name: &str, args: Value, progress_token: Option<Value>,
+        progress_tx: Option<mpsc::Sender<String>>, ctx: &ConnectionContext,
+    ) -> Result<Value> {
         if name != "worker" {
             anyhow::bail!("Unknown tool: '{name}'. Only 'worker' is supported.");
         }
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref())
+        self.dispatch(action, &args, progress_token.as_ref(), progress_tx.as_ref(), ctx)
             .await
     }
 

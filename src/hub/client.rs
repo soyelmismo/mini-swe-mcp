@@ -14,7 +14,7 @@ use super::{HubPaths, hub_dir};
 /// Dial the hub, starting a detached daemon if none is listening.
 /// Racing starters are serialized by the daemon's exclusive flock.
 pub async fn connect_or_spawn() -> Result<UnixStream> {
-    let paths = HubPaths::for_test(hub_dir()?);
+    let paths = HubPaths::new(hub_dir()?);
     if let Ok(stream) = UnixStream::connect(paths.socket()).await {
         return Ok(stream);
     }
@@ -60,7 +60,8 @@ async fn hello<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
     let frame = json!({
         "jsonrpc": "2.0", "method": "hub/hello",
         "params": {"agent_id": std::env::var("MINI_SWE_AGENT_ID").ok(),
-                   "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION")}
+                   "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"),
+                   "cwd": std::env::current_dir()?}
     });
     writer.write_all(format!("{frame}\n").as_bytes()).await?;
     writer.flush().await?;

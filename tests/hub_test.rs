@@ -204,7 +204,7 @@ async fn world_writable_hub_dir_is_refused() {
 
 /// Build hub paths for a scratch directory without touching global state.
 fn hub_paths_for_test(dir: &Path) -> HubPaths {
-    HubPaths::for_test(dir.to_path_buf())
+    HubPaths::new(dir.to_path_buf())
 }
 
 /// Thin-client lifecycle over the real binary: the first CLI call auto-starts
@@ -337,4 +337,82 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         .expect("local CLI call runs");
     assert!(out.status.success(), "escape-hatch call must succeed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!bare.path().join("hub.sock").exists(), "MINI_SWE_NO_DAEMON=1 creates no socket");
+}
+
+/// Two clients with different working directories and no `repo_path` each get
+/// their own repository: the daemon resolves a relative path against the
+/// caller's `cwd` from `hub/hello`, not against its own.
+#[test]
+fn a_relative_repo_path_resolves_against_the_callers_cwd() {
+    use std::process::Command;
+
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-cwd");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the hub dir to 0700");
+    }
+    let (repo_a, repo_b) = (hub.subdir("repo-a"), hub.subdir("repo-b"));
+    // A shared registry scratch dir, so both clients' worker rows land in one
+    // place the daemon (which inherits `SWE_TEMP_DIR`) can be read back from.
+    let swe = hub.subdir("swe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&swe, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the scratch dir to 0700");
+    }
+    for repo in [&repo_a, &repo_b] {
+        let _ = Command::new("git").args(["init", "-q"]).current_dir(repo).output();
+        let _ = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", "seed"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output();
+    }
+
+    // A dead API base keeps the dispatch from an LLM call: the worker record
+    // still names the repository the daemon resolved for this caller.
+    let dispatch = |repo: &std::path::Path| -> String {
+        let out = Command::new(&exe)
+            .current_dir(repo)
+            .args(["dispatch", "cwd probe", "--json"])
+            .env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", &swe)
+            .env("OPENAI_API_KEY", "test-key-not-used-by-dispatch")
+            .env("OPENAI_API_BASE", "http://127.0.0.1:1")
+            .env("ENV_FILE", format!("{}/.env.does-not-exist", env!("CARGO_MANIFEST_DIR")))
+            .env("MODELS_FILE", format!("{}/models.yaml", env!("CARGO_MANIFEST_DIR")))
+            .output()
+            .expect("dispatch runs");
+        assert!(out.status.success(), "dispatch must be accepted: {}", String::from_utf8_lossy(&out.stderr));
+        let payload: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("dispatch prints JSON");
+        payload["worker_id"].as_str().expect("dispatch names the worker").to_string()
+    };
+
+    let (a, b) = (dispatch(&repo_a), dispatch(&repo_b));
+    // The registry row the daemon wrote is the record of which repository the
+    // caller's `cwd` resolved to.
+    let record = |wid: &str| -> serde_json::Value {
+        let path = swe.join("swe-registry").join(format!("{wid}.json"));
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {wid} row: {e}"));
+        serde_json::from_str(&raw).expect("registry row is JSON")
+    };
+
+    let (seen_a, seen_b) = (record(&a), record(&b));
+    assert_ne!(a, b, "each dispatch is its own worker");
+    assert_eq!(
+        seen_a["repo_path"].as_str(),
+        Some(repo_a.join(".").to_string_lossy().as_ref()),
+        "the first caller's cwd must win: {seen_a}"
+    );
+    assert_eq!(
+        seen_b["repo_path"].as_str(),
+        Some(repo_b.to_string_lossy().as_ref()),
+        "the second caller's cwd must win: {seen_b}"
+    );
 }
