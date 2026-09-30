@@ -45,6 +45,7 @@ impl Pool {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(dir.join(".swe-target.lease"))
         {
             Ok(file) => file,

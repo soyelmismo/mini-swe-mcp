@@ -931,6 +931,92 @@ mod tests {
         assert!(sanitize_worker_id(&"x".repeat(500)).len() <= MAX_WORKER_ID_LEN);
     }
 
+    /// A guard over `repo` with no worktree on disk: the build-dir lease is
+    /// the only part under test here.
+    fn guard_for(repo: &Path) -> WorktreeGuard {
+        WorktreeGuard {
+            path: repo.join("worktree"),
+            branch: "worker-test".to_string(),
+            repo_root: repo.to_path_buf(),
+            build_dir: None,
+            base_commit: String::new(),
+            base_branch: None,
+            preserve_branch: false,
+            seeded: BTreeMap::new(),
+        }
+    }
+
+    /// Whether another worker could still take `dir`: the lock file a lease
+    /// holds is what the sweep probes to decide a dir is busy.
+    fn dir_is_free(dir: &Path) -> bool {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".swe-target.lease"))
+        {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        // SAFETY: `file` owns a live descriptor for the duration of the call.
+        let locked =
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked == 0 {
+            // SAFETY: releasing a lock this call just took.
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN) };
+            true
+        } else {
+            false
+        }
+    }
+
+    fn repo_dir(tag: &str) -> PathBuf {
+        let path = crate::worktree::swe_base_dir().join(format!("swe-lease-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&path).expect("repository root must be creatable");
+        path
+    }
+
+    /// The worker's dir is leased once and held for its whole lifetime, so a
+    /// light step between two heavy ones cannot lose it to another worker.
+    #[tokio::test]
+    async fn a_workers_build_dir_survives_light_and_heavy_alternation() {
+        let repo = repo_dir("alternating");
+        let mut worker = guard_for(&repo);
+
+        assert_eq!(
+            worker.leased_build_dir(),
+            None,
+            "a worker that ran no heavy command must hold no dir"
+        );
+        let first = worker.build_dir().await.expect("a heavy step must lease a dir");
+        assert_eq!(
+            worker.leased_build_dir(),
+            Some(first.as_path()),
+            "a light step must reuse the worker's dir"
+        );
+        assert_eq!(
+            worker.build_dir().await.as_deref(),
+            Some(first.as_path()),
+            "a later heavy step must reuse the worker's dir"
+        );
+        assert!(!dir_is_free(&first), "the worker must hold its dir");
+
+        // A second live worker of the same repository gets a dir of its own.
+        let mut other = guard_for(&repo);
+        let second = other.build_dir().await.expect("a second worker must lease a dir");
+        assert_ne!(second, first, "two live workers shared {}", first.display());
+
+        drop(worker);
+        assert!(dir_is_free(&first), "ending the worker must release its dir");
+        assert!(!dir_is_free(&second), "the other worker must keep its dir");
+
+        drop(other);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// Git must receive a private directory, not create a public one and wait
     /// for a post-checkout chmod to close the exposure window.
     #[cfg(unix)]
