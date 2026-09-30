@@ -1,8 +1,10 @@
 //! Plain-text renderers for the per-worker inspection verbs.
 //!
-//! Formatters behind `status`, `collect`, `logs`, `dispatch`, `steer`, `kill`
-//! and `reap` — the actions that answer about one worker (or, for `reap`, about
-//! a set of terminal workers) rather than about the system catalog.
+//! Formatters behind `status`, `collect`, `logs`, `dispatch`, `steer`, `wait`,
+//! `kill` and `reap` — the actions that answer about one worker (or, for
+//! `reap`, about a set of terminal workers) rather than about the system
+//! catalog. `format_dispatch` doubles as the worker-result view, because
+//! `wait` and `steer --wait` answer with exactly that payload.
 //! [`log_counters_line`] is the shared counter/notice line that `collect` and
 //! `logs` both append so step-log truncation is never silent (audit 07, R7), and
 //! [`health_line`] is the per-worker health line `status`, `collect` and
@@ -263,10 +265,28 @@ pub fn format_reap(val: &serde_json::Value) -> String {
     }
 }
 
+/// True when `val` is an awaited worker result rather than the plain
+/// acknowledgement of a verb that queued something.
+fn is_awaited_result(val: &serde_json::Value) -> bool {
+    val.get("state").is_some()
+        || val.get("status").and_then(|v| v.as_str()) == Some("still_running")
+}
+
 pub fn format_dispatch(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
         format!("✓ Worker {wid} dispatched in background.\nUse 'mini-swe-mcp status {wid}' to check progress.")
+    } else if val.get("status").and_then(|v| v.as_str()) == Some("still_running") {
+        // A bounded wait hands the worker back unfinished; say so instead of
+        // implying it finished.
+        let step = val.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
+        let last_command = val
+            .get("last_command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no command reported");
+        format!(
+            "Worker {wid} is still running (step {step}): {last_command}\nCall 'mini-swe-mcp wait {wid}' again to keep waiting."
+        )
     } else {
         let health = health_line(val);
         let mut out = format!("✓ Worker {wid} finished.\n");
@@ -318,7 +338,13 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
     }
 }
 
+/// `steer` action. A `steer --wait` answers with the awaited worker result
+/// (the same payload `wait` returns), which is rendered by the shared
+/// worker-result view instead of the one-line acknowledgement.
 pub fn format_steer(val: &serde_json::Value) -> String {
+    if is_awaited_result(val) {
+        return format_dispatch(val);
+    }
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let msg = val
         .get("message")
@@ -390,6 +416,31 @@ mod tests {
         assert_eq!(
             log_counters_line(&v(r#"{"logs_truncation_notice":"head of the window was evicted"}"#)),
             "head of the window was evicted"
+        );
+    }
+
+    /// `steer --wait` answers with the awaited result, so it must be rendered
+    /// by the worker-result view rather than as a bare acknowledgement.
+    #[test]
+    fn test_format_steer_renders_an_awaited_result_as_the_worker_result() {
+        let queued = format_steer(&v(r#"{"worker_id":"w","status":"steered","message":"queued"}"#));
+        assert_eq!(queued, "✓ Worker w: queued");
+
+        let awaited = format_steer(&v(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{"turns":3,"summary":"s"}}}"#,
+        ));
+        assert!(
+            awaited.contains("✓ Worker w finished.") && awaited.contains("Turns: 3"),
+            "a waited-on steer must read like the dispatch result: {awaited}"
+        );
+
+        let bounded = format_steer(&v(
+            r#"{"worker_id":"w","status":"still_running","step":4,"last_command":"cargo test"}"#,
+        ));
+        assert!(
+            bounded.contains("Worker w is still running (step 4): cargo test")
+                && bounded.contains("wait w"),
+            "an expired deadline must not read as a finished worker: {bounded}"
         );
     }
 

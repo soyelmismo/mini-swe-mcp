@@ -210,16 +210,10 @@ impl McpServer {
             .await
     }
 
-    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
+    /// Wait indefinitely for a worker's next event.
     ///
-    /// Returns the terminal payload:
-    /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
-    /// * `{ worker_id, status: "needs_input", question, step, message }` when
-    ///   paused waiting for steering.
-    ///
-    /// Progress notifications are emitted only when a `progress_token`/`tx`
-    /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
-    /// and the polling algorithm stays identical for both callers.
+    /// Thin wrapper over [`McpServer::await_worker_result_until`] for the
+    /// callers that have no client deadline of their own.
     pub async fn await_worker_result(
         &self,
         wid: &str,
@@ -227,27 +221,79 @@ impl McpServer {
         token: Option<&Value>,
         tx: Option<&mpsc::Sender<String>>,
     ) -> Result<Value> {
+        self.await_worker_result_until(wid, max_turns, None, token, tx)
+            .await
+    }
+
+    /// Poll a worker until it finishes, fails, or pauses for orchestrator input.
+    ///
+    /// Returns the terminal payload:
+    /// * `{ worker_id, state, logs }` on `Completed`/`Failed`
+    /// * `{ worker_id, status: "needs_input", question, step, message }` when
+    ///   paused waiting for steering
+    /// * `{ worker_id, status: "still_running", step, last_command }` when the
+    ///   optional `timeout` deadline expires first
+    ///
+    /// The deadline exists for hosts that abort a tool call of their own
+    /// accord: rather than being cut off, the agent gets the worker's current
+    /// step and can simply call again. `None` waits indefinitely.
+    ///
+    /// Progress notifications are emitted only when a `progress_token`/`tx`
+    /// pair is supplied (the MCP stdio path); the plain-CLI path passes `None`,
+    /// and the polling algorithm stays identical for both callers. While the
+    /// worker runs, the current step is re-sent as a heartbeat every
+    /// [`PROGRESS_HEARTBEAT_INTERVAL`](Self::PROGRESS_HEARTBEAT_INTERVAL) so a
+    /// step that never ends cannot be mistaken for an idle call.
+    pub async fn await_worker_result_until(
+        &self,
+        wid: &str,
+        max_turns: usize,
+        timeout: Option<std::time::Duration>,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
+        // A deadline too large to represent is no deadline at all; `checked_add`
+        // keeps an absurd `timeout_secs` from panicking the wait.
+        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
         let mut last_reported_step = 0;
+        let mut last_reported_at = std::time::Instant::now();
+        let mut last_progress: Option<crate::pool::WorkerProgress> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             // H-5: poll the lightweight progress snapshot. It never clones the
             // (potentially multi-megabyte) `diff`/`summary`/`artifacts` that a
             // `get_worker_state` clone would copy on every 500 ms tick.
-            let Some(progress) = self.pool.worker_progress(wid).await else {
+            if let Some(progress) = self.pool.worker_progress(wid).await {
+                last_progress = Some(progress);
+            }
+            let Some(progress) = last_progress.as_ref() else {
                 continue;
             };
             match progress.phase {
                 crate::pool::WorkerPhase::Running => {
                     let step = progress.step;
+                    let last_command = progress.last_command.as_deref().unwrap_or("");
                     if step > last_reported_step {
                         last_reported_step = step;
-                        let last_command = progress.last_command.as_deref().unwrap_or("");
+                        last_reported_at = std::time::Instant::now();
                         Self::emit_progress(
                             tx,
                             token,
                             step,
                             max_turns,
                             format!("Step {step}/{max_turns}: {last_command}"),
+                        )
+                        .await;
+                    } else if last_reported_at.elapsed() >= Self::PROGRESS_HEARTBEAT_INTERVAL {
+                        // Heartbeat: one step can outlast the client's idle
+                        // timeout on its own, so the unchanged step is resent.
+                        last_reported_at = std::time::Instant::now();
+                        Self::emit_progress(
+                            tx,
+                            token,
+                            step,
+                            max_turns,
+                            format!("Step {step}/{max_turns}: {last_command} (still running)"),
                         )
                         .await;
                     }
@@ -291,6 +337,24 @@ impl McpServer {
                         "message": "Worker is paused waiting for orchestrator steering."
                     }));
                 }
+            }
+
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                let step = progress.step;
+                Self::emit_progress(
+                    tx,
+                    token,
+                    step,
+                    max_turns,
+                    format!("Step {step}/{max_turns}: still running, call again to keep waiting"),
+                )
+                .await;
+                return Ok(json!({
+                    "worker_id": wid,
+                    "status": "still_running",
+                    "step": step,
+                    "last_command": progress.last_command,
+                }));
             }
         }
     }

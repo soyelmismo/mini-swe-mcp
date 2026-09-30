@@ -15,7 +15,8 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "collect", "logs", "list", "kill", "reap", "manifest", "prune",
+    "dispatch", "status", "steer", "wait", "collect", "logs", "list", "kill", "reap", "manifest",
+    "prune",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -56,7 +57,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). For unattended tracking, poll 'status' or pass wait:true; avoid short-interval busy-waiting.",
+            "Action to perform: 'dispatch' (spawn subagent), 'status' (check step & progress), 'steer' (inject follow-up instruction), 'wait' (re-attach to a running worker and block until it finishes, fails or asks a question; pair with 'timeout_secs' under a short host deadline), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). For unattended tracking, poll 'status' or pass wait:true; avoid short-interval busy-waiting.",
         ),
     ),
     (
@@ -86,7 +87,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'wait', 'collect', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -105,7 +106,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "wait",
         "boolean",
         DescriptionSource::Static(
-            "If true, blocks until worker completes and returns final diff immediately. Optional for 'dispatch' (default: false). Recommended for unattended single-worker runs to avoid manual polling loops.",
+            "If true, blocks until worker completes and returns final diff immediately. Optional for 'dispatch' (default: false) and for 'steer' (default: false), where it makes steer-and-wait one call that reports the worker's next event. Recommended for unattended single-worker runs to avoid manual polling loops, and pair it with 'timeout_secs' when the host enforces its own tool deadline.",
+        ),
+    ),
+    (
+        "timeout_secs",
+        "integer",
+        DescriptionSource::Static(
+            "Client-side deadline in seconds for a blocking call ('dispatch'/'steer' with wait:true, and 'wait'). When it expires before the worker completes, fails or pauses, the call returns {status:'still_running', step, last_command} instead of blocking, so the agent can simply call 'wait' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
         ),
     ),
     (
@@ -178,6 +186,9 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
             "maximum".to_string(),
             Value::from(crate::manifest::MAX_TURNS_LIMIT),
         );
+    }
+    if name == "timeout_secs" {
+        schema.insert("minimum".to_string(), Value::from(0));
     }
     if name == "temperature" {
         schema.insert(

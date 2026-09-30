@@ -37,6 +37,24 @@ impl McpServer {
             })
     }
 
+    /// Parse the optional `timeout_secs` deadline of a blocking call.
+    ///
+    /// Clients disagree wildly on how long a tool call may run, so a caller
+    /// that would rather re-poll than risk its own deadline passes the budget
+    /// explicitly. An absent argument means "wait indefinitely", which is the
+    /// historical behaviour; a non-integer one is a hard error rather than a
+    /// silently dropped deadline, because dropping it is what makes the call
+    /// hang.
+    pub(super) fn get_timeout(args: &Value, action: &str) -> Result<Option<std::time::Duration>> {
+        let Some(value) = args.get("timeout_secs") else {
+            return Ok(None);
+        };
+        let secs = value.as_u64().ok_or_else(|| {
+            anyhow::anyhow!("'timeout_secs' must be a non-negative integer for action '{action}'")
+        })?;
+        Ok(Some(std::time::Duration::from_secs(secs)))
+    }
+
     /// Parse the explicit `network` argument of a `dispatch` call.
     ///
     /// Returns `None` when the argument is absent (the caller then falls back
@@ -118,11 +136,21 @@ impl McpServer {
         }
     }
 
+    /// Longest gap between two progress notifications while a wait blocks.
+    ///
+    /// A worker can sit inside one long step (a slow build, a big test run)
+    /// for far longer than a step change, and an MCP client aborts a stdio call
+    /// that sends no notification at all as idle. The wait loop therefore
+    /// re-emits the current step on this interval, well under the 30-minute
+    /// idle timeout.
+    pub const PROGRESS_HEARTBEAT_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(60);
+
     /// Map a `tools/call` request to its handler.
     ///
-    /// Verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`, `prune`
-    /// and `await_worker_result` may emit progress notifications, the rest
-    /// answer immediately.
+    /// Verbs are exactly [`super::schema::WORKER_ACTIONS`]; `dispatch`,
+    /// `prune`, `wait` and a `steer` carrying `wait: true` may emit progress
+    /// notifications, the rest answer immediately.
     pub(super) async fn dispatch(
         &self,
         action: &str,
@@ -139,7 +167,8 @@ impl McpServer {
             "reap" => self.handle_reap().await,
             "list" => self.handle_list().await,
             "kill" => self.handle_kill(args).await,
-            "steer" => self.handle_steer(args).await,
+            "steer" => self.handle_steer(args, token, tx).await,
+            "wait" => self.handle_wait(args, token, tx).await,
             "prune" => self.handle_prune(args, token, tx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
@@ -230,7 +259,14 @@ impl McpServer {
         .await;
 
         if wait {
-            self.await_worker_result(&wid, max_turns, token, tx).await
+            self.await_worker_result_until(
+                &wid,
+                max_turns,
+                Self::get_timeout(args, "dispatch")?,
+                token,
+                tx,
+            )
+            .await
         } else {
             Ok(json!({
                 "worker_id": wid,
@@ -377,10 +413,68 @@ impl McpServer {
         }
     }
 
-    async fn handle_steer(&self, args: &Value) -> Result<Value> {
+    /// Turn budget used as the progress denominator of an awaited worker.
+    ///
+    /// The registry row written at dispatch time is the only record of the
+    /// budget that outlives the originating call, so a re-attached `wait`
+    /// (and a `steer --wait`) reports the same `N/M` the dispatch did. A
+    /// worker with no row reports `0` rather than a fabricated budget.
+    fn awaited_max_turns(wid: &str) -> usize {
+        crate::pool::load_registry_entry(wid)
+            .map(|entry| entry.max_turns)
+            .unwrap_or(0)
+    }
+
+    /// `wait` action: re-attach to a worker dispatched earlier and block until
+    /// it finishes, fails or pauses for steering.
+    ///
+    /// The payload is exactly what `dispatch` with `wait: true` returns, so an
+    /// orchestrator that lost the handle to a long call can still be notified
+    /// of the next event by a single new call. With `timeout_secs` the wait
+    /// instead ends with `status: "still_running"` and the caller waits again.
+    async fn handle_wait(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "wait")?;
+        if self.pool.get_worker_state(wid).await.is_none() {
+            anyhow::bail!("Worker not found: {wid}");
+        }
+        self.await_worker_result_until(
+            wid,
+            Self::awaited_max_turns(wid),
+            Self::get_timeout(args, "wait")?,
+            token,
+            tx,
+        )
+        .await
+    }
+
+    /// `steer` action: queue guidance, and with `wait: true` keep the call open
+    /// until the worker produces its next event.
+    async fn handle_steer(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+    ) -> Result<Value> {
         let wid = Self::get_worker_id(args, "steer")?;
         let message = Self::required_string(args, "message", "steer")?.to_string();
         self.pool.steer(wid, message).await?;
+        let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+        if wait {
+            return self
+                .await_worker_result_until(
+                    wid,
+                    Self::awaited_max_turns(wid),
+                    Self::get_timeout(args, "steer")?,
+                    token,
+                    tx,
+                )
+                .await;
+        }
         Ok(json!({
             "worker_id": wid,
             "status": "steered",
@@ -443,6 +537,30 @@ impl LogView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An omitted `timeout_secs` means "wait indefinitely"; a non-integer one
+    /// is a hard error, because a dropped deadline is the unbounded hang the
+    /// argument exists to prevent.
+    #[test]
+    fn timeout_absent_is_unbounded_and_a_non_integer_is_rejected() {
+        assert_eq!(
+            McpServer::get_timeout(&json!({ "action": "wait" }), "wait")
+                .expect("an absent deadline is not an error"),
+            None
+        );
+        assert_eq!(
+            McpServer::get_timeout(&json!({ "timeout_secs": 90 }), "wait")
+                .expect("a whole number of seconds is accepted"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        let err = McpServer::get_timeout(&json!({ "timeout_secs": "90" }), "wait")
+            .expect_err("a string deadline must not be accepted");
+        assert!(
+            err.to_string()
+                .contains("'timeout_secs' must be a non-negative integer"),
+            "{err}"
+        );
+    }
 
     /// An omitted `network` yields `None`: the caller falls back to the
     /// manifest policy, then the runtime default.
