@@ -1116,6 +1116,11 @@ async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
         .request("hub/hello", serde_json::json!({"version": "99.0.0"}))
         .await;
     assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["result"]["build"]["id"], env!("MINI_SWE_BUILD_ID"));
+    assert_eq!(
+        hello["result"]["build"]["ts"],
+        env!("MINI_SWE_BUILD_TS").parse::<u64>().unwrap()
+    );
     assert_eq!(hello["result"]["busy"], true);
     assert_eq!(
         client.request("hub/shutdown", serde_json::json!({})).await["error"]["message"],
@@ -1195,6 +1200,82 @@ fn newer_cli_replaces_an_idle_daemon() {
         "{log}"
     );
     assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}
+
+/// Start a hub with `list --json`, then call it again as a client whose build
+/// clock is shifted by `build_skew_nanos` from the daemon's own; returns the hub
+/// log. The shift is an hour: the stamps only have to be ordered, not dated.
+async fn run_list_twice_with_client_build_skew(build_skew_nanos: i128) -> String {
+    use tokio::process::Command;
+
+    async fn invoke(exe: &Path, hub: &Path, swe: &Path, fake_build_ts: Option<String>) {
+        let mut cmd = Command::new(exe);
+        cmd.args(["list", "--json"])
+            .env("SWE_HUB_DIR", hub)
+            .env("SWE_TEMP_DIR", swe)
+            .env("ENV_FILE", "/nonexistent-mini-swe-env");
+        if let Some(ts) = fake_build_ts {
+            cmd.env("MINI_SWE_FAKE_BUILD_TS", ts);
+        }
+        let output = cmd.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-build");
+    let _reaper = DaemonReaper(hub.path().to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let swe = hub.subdir("swe");
+    invoke(&exe, hub.path(), &swe, None).await;
+
+    // The daemon's own clock is the reference, whatever this test binary was
+    // itself compiled with.
+    let mut probe = Client::connect(&hub.path().join("hub.sock")).await;
+    let hello = probe
+        .request("hub/hello", serde_json::json!({"agent_id": "build-probe"}))
+        .await;
+    let daemon_ts = hello["result"]["build"]["ts"]
+        .as_u64()
+        .expect("the daemon reports its build clock") as i128;
+    drop(probe);
+
+    let fake = daemon_ts + build_skew_nanos;
+    invoke(&exe, hub.path(), &swe, Some(fake.to_string())).await;
+    std::fs::read_to_string(hub.path().join("hub.log")).unwrap()
+}
+
+/// A rebuild moves no release version, so the build clock is the only thing
+/// that tells a client the idle daemon it dialed was built before it.
+#[tokio::test]
+async fn a_rebuilt_client_replaces_an_idle_daemon_at_the_same_version() {
+    let log = run_list_twice_with_client_build_skew(3_600_000_000_000).await;
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with(" listening"))
+            .count(),
+        2,
+        "{log}"
+    );
+    assert!(log.lines().any(|line| line.ends_with(" stopped")), "{log}");
+}
+
+/// The reverse skew must not cost a healthy daemon its workers.
+#[tokio::test]
+async fn an_older_client_build_keeps_the_running_daemon() {
+    let log = run_list_twice_with_client_build_skew(-3_600_000_000_000).await;
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.ends_with(" listening"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!log.lines().any(|line| line.ends_with(" stopped")), "{log}");
 }
 
 #[tokio::test]
@@ -1391,5 +1472,99 @@ fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
     assert!(
         methods.contains(&("hub/hello".to_string(), false)),
         "the identity must still be announced as a notification: {methods:?}"
+    );
+}
+
+/// A hub whose `hub/hello` reply carries no `build` predates build ids, so the
+/// client decides on the release alone: an equal release is left alone, an
+/// older one is still asked to step aside.
+#[test]
+fn a_hub_without_a_build_field_falls_back_to_the_release() {
+    /// Run `list --json` against a fake hub answering `hub/hello` with
+    /// `version` and no `build`; return the methods that hub received and the
+    /// params of the client's hello.
+    fn list_against_fake_hub(version: &str) -> (Vec<(String, bool)>, serde_json::Value) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+
+        let hub = common::TempDir::new_in_tmp("hub-nobuild");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restrict the hub dir to 0700");
+        }
+        let version = version.to_string();
+        let listener = UnixListener::bind(hub.path().join("hub.sock")).expect("bind the fake hub");
+        let fake = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the client");
+            let mut writer = stream.try_clone().expect("clone the stream");
+            let mut methods = Vec::new();
+            let mut hello_params = serde_json::Value::Null;
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let frame: serde_json::Value =
+                    serde_json::from_str(&line).expect("client sends JSON");
+                let method = frame["method"].as_str().unwrap_or_default().to_string();
+                methods.push((method.clone(), frame.get("id").is_some()));
+                if method == "hub/hello" {
+                    hello_params = frame["params"].clone();
+                }
+                let Some(id) = frame.get("id") else { continue };
+                // No `build`: this reply is shaped like a pre-build-id hub's.
+                let reply = match &method[..] {
+                    "hub/hello" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"version": version.as_str(), "busy": false}}),
+                    // Refuse the shutdown as a busy hub would, so the client
+                    // keeps going instead of waiting for a teardown it cannot see.
+                    "hub/shutdown" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32000, "message": "Hub is busy"}}),
+                    "tools/call" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": "{\"workers\":[]}"}]}}),
+                    _ => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(writer, "{reply}").expect("reply to the client");
+                if method == "tools/call" {
+                    break;
+                }
+            }
+            (methods, hello_params)
+        });
+
+        let out = Command::new(common::binary_path())
+            .args(["list", "--json"])
+            .env("SWE_HUB_DIR", hub.path())
+            .env("OPENAI_API_KEY", "test-key-not-used")
+            .env("ENV_FILE", hub.path().join("absent.env"))
+            .output()
+            .expect("run the CLI");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fake.join().expect("fake hub thread")
+    }
+
+    // A reply without a build is still asked for the release of the client,
+    // which must announce its own build in `hub/hello` either way.
+    let (methods, hello) = list_against_fake_hub(env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        hello["build"]["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "{hello}"
+    );
+    assert!(hello["build"]["ts"].is_u64(), "{hello}");
+    assert!(
+        !methods.contains(&("hub/shutdown".to_string(), true)),
+        "{methods:?}"
+    );
+
+    // An older release still loses the argument on the semver fallback.
+    let (methods, _) = list_against_fake_hub("0.0.9");
+    assert!(
+        methods.contains(&("hub/shutdown".to_string(), true)),
+        "{methods:?}"
     );
 }

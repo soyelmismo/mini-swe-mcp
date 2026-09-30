@@ -87,6 +87,7 @@ pub struct WorkerLaunchConfig {
     /// worktree re-attach to the worker's preserved branch instead of creating
     /// a fresh one, so a revision keeps its id, its branch and its checkpoints.
     pub resume_base_commit: Option<String>,
+    pub resume_base_branch: Option<String>,
 }
 
 /// Deletes a worker's steering mailbox when the worker exits.
@@ -153,6 +154,7 @@ impl WorkerPool {
             verify,
             resume_messages,
             resume_base_commit,
+            resume_base_branch,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
@@ -173,7 +175,11 @@ impl WorkerPool {
         let repo_path_owned = repo_path.clone();
         let worker_id_owned = worker_id.clone();
         let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
-            Some(base) => WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base),
+            Some(base) => {
+                let mut guard = WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base)?;
+                guard.base_branch = resume_base_branch;
+                Ok(guard)
+            },
             None => WorktreeGuard::new(&repo_path_owned, &worker_id_owned),
         })
         .await
@@ -236,6 +242,7 @@ impl WorkerPool {
             temperature,
             repo_path: repo_path_str,
             base_commit: worktree.base_commit.clone(),
+            base_branch: worktree.base_branch.clone(),
             branch: worktree.branch.clone(),
             network_offline,
             verify: verify.map(|v| v.to_string()),
@@ -376,15 +383,18 @@ impl WorkerPool {
         let path = worktree.path.clone();
         let repo_root = worktree.repo_root.clone();
         let base_commit = worktree.base_commit.clone();
+        let base_branch = worktree.base_branch.clone();
         let branch = worktree.branch.clone();
         let seeded = worktree.seeded();
         let metrics_path = path.clone();
         let metrics_base = base_commit.clone();
+        let metrics_base_branch = base_branch.clone();
         let (artifacts, diff, summary, branch, now) = tokio::task::spawn_blocking(move || {
             finalize_worktree(FinalizeInput {
                 path,
                 repo_root,
                 base_commit,
+                base_branch,
                 branch,
                 seeded,
                 task_headline,
@@ -408,7 +418,7 @@ impl WorkerPool {
         // subprocess, so the shortstat sample is taken off the runtime.
         meta.metrics.turns_used = step;
         if let Some((files, insertions, deletions)) =
-            shortstat_of(&metrics_path, &metrics_base).await
+            shortstat_of(&metrics_path, &metrics_base, metrics_base_branch.as_deref()).await
         {
             meta.metrics.diff_files = files;
             meta.metrics.diff_insertions = insertions;
@@ -476,6 +486,7 @@ struct FinalizeInput {
     path: PathBuf,
     repo_root: PathBuf,
     base_commit: String,
+    base_branch: Option<String>,
     branch: String,
     seeded: BTreeMap<String, FileFingerprint>,
     task_headline: String,
@@ -496,14 +507,18 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
         path,
         repo_root,
         base_commit,
+        base_branch,
         branch,
         seeded,
         task_headline,
         agent_summary,
         step,
     } = input;
+    if WorktreeGuard::merge_in_progress_at(&path)? {
+        anyhow::bail!("Base merge is unresolved; worker cannot complete");
+    }
     let artifacts = WorktreeGuard::sync_artifacts_at(&path, &repo_root, &seeded);
-    let diff = WorktreeGuard::diff_at(&path, &base_commit)?;
+    let diff = WorktreeGuard::diff_with_base_at(&path, &base_commit, base_branch.as_deref())?;
     let summary = if !agent_summary.is_empty() {
         agent_summary.to_string()
     } else if !diff.trim().is_empty() {
@@ -511,9 +526,7 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
     } else {
         format!("{task_headline} (completed in {step} turns)")
     };
-    let committed = if diff.trim().is_empty() {
-        None
-    } else {
+    let committed = {
         let commit_subject: &str = if !agent_summary.is_empty() {
             let first_line = agent_summary.lines().next().unwrap_or(&task_headline).trim();
             let stripped = first_line.trim_start_matches('#').trim();
