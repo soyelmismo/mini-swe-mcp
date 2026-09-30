@@ -28,15 +28,42 @@ use tracing::error;
 /// Root directory hosting all subagent scratch data (worktrees, target dirs, caches).
 pub fn swe_base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SWE_TEMP_DIR") {
-        PathBuf::from(dir)
-    } else {
-        let var_tmp = PathBuf::from("/var/tmp");
-        if var_tmp.is_dir() {
-            var_tmp
-        } else {
-            std::env::temp_dir()
-        }
+        return PathBuf::from(dir);
     }
+    // `/var/tmp` is the default only when it is actually usable: a read-only
+    // mount (hardened CI image, locked-down container) would otherwise make
+    // every worktree creation fail with a permission error deep inside git.
+    // Falling back to the process temp dir keeps the documented behaviour on
+    // every host where `/var/tmp` exists and is writable.
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() && var_tmp_is_writable(&var_tmp) {
+        return var_tmp;
+    }
+    std::env::temp_dir()
+}
+
+/// Whether `dir` accepts a new entry, probed with a unique file.
+///
+/// `is_dir()` only proves the path exists: a root-owned `/var/tmp` in a
+/// container without `CAP_DAC_OVERRIDE` is a directory nobody may write to. The
+/// probe is one `create_new` on a process-unique name, so two concurrent
+/// processes never collide and a failure never leaves debris behind.
+fn var_tmp_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(
+        ".swe-write-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let writable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    let _ = std::fs::remove_file(&probe);
+    writable
 }
 
 /// All directories that can host `swe-wt-*` / `swe-target-*` scratch data.
