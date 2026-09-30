@@ -141,7 +141,9 @@ pub(crate) fn binary_available(name: &'static str) -> bool {
     use std::sync::{LazyLock, Mutex};
     static AVAILABLE: LazyLock<Mutex<HashMap<&'static str, bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut map = AVAILABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut map = AVAILABLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *map.entry(name).or_insert_with(|| {
         std::process::Command::new(name)
             .arg("--version")
@@ -296,15 +298,30 @@ struct PathRule {
     allowed: u64,
 }
 
-/// `struct landlock_ruleset_attr` truncated to the field this module sets.
+/// `struct landlock_ruleset_attr` as this module uses it.
 ///
 /// The UAPI lets the struct grow across ABI versions and validates `size`, so
-/// only `handled_access_fs` is populated and only its size is passed. A
-/// `size == 0` query returns the highest supported ABI.
+/// only the prefix the running kernel understands is passed: `handled_access_fs`
+/// alone below ABI 4, plus `handled_access_net` from ABI 4, plus `scoped` from
+/// ABI 6. A `size == 0` query returns the highest supported ABI.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct RulesetAttr {
     handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+/// Byte size of the ruleset attribute prefix a kernel of the given ABI
+/// understands: 8 below ABI 4, 16 from ABI 4, 24 from ABI 6.
+fn ruleset_attr_size(abi: i64) -> usize {
+    if abi >= ABI_SCOPE {
+        std::mem::size_of::<RulesetAttr>()
+    } else if abi >= ABI_NET {
+        2 * std::mem::size_of::<u64>()
+    } else {
+        std::mem::size_of::<u64>()
+    }
 }
 
 /// `struct landlock_path_beneath_attr` as the kernel defines it.
@@ -548,7 +565,10 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     // Landlock is allow-only: a rule on /etc would also grant /etc/shadow.
     // Grant only the individual non-secret configuration files needed by tools.
     for config in CONFIG_PATHS {
-        push(PathBuf::from(config), ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR);
+        push(
+            PathBuf::from(config),
+            ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR,
+        );
     }
 
     // Pseudo-filesystems, always readable.
@@ -570,7 +590,109 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     push(canonical_root(worktree), WRITE_RIGHTS);
     push(canonical_root(target_dir), WRITE_RIGHTS);
 
+    // Toolchain caches, readable and executable but never writable: the child
+    // environment forwards `CARGO_HOME`/`RUSTUP_HOME` at these locations so an
+    // offline `cargo build` resolves against the host's registry instead of
+    // the network. Missing paths are skipped when the plan is applied.
+    for cache in toolchain_cache_paths() {
+        push(cache, READ_ONLY_RIGHTS);
+    }
+
+    // Shared compiler/package caches, writable like the bubblewrap backend
+    // binds them: `GOCACHE`, the JS/Python caches and friends live here and
+    // must accept writes for builds to succeed.
+    for cache in writable_cache_paths() {
+        push(cache, WRITE_RIGHTS);
+    }
+
+    // Git metadata: the common `.git` dir read-only so `git status` resolves
+    // refs and objects, the worktree's own gitdir writable so the index can
+    // refresh. Workers must not commit, so read-only is the right grant for
+    // the shared half. Relative `gitdir:` pointers resolve against the
+    // worktree before canonicalisation.
+    for (common, worktree_gitdir) in git_rule_paths(worktree) {
+        push(common, READ_ONLY_RIGHTS);
+        if let Some(gitdir) = worktree_gitdir {
+            push(gitdir, WRITE_RIGHTS);
+        }
+    }
+
     rules
+}
+
+/// Read-only toolchain locations a sandboxed build resolves binaries and the
+/// registry from.
+///
+/// Mirrors the mounts the bubblewrap backend binds: the host's `CARGO_HOME`
+/// (or `~/.cargo` when it exists), `RUSTUP_HOME` when set, and `~/.local/bin`
+/// for tool discovery through `PATH`. Everything here is resolved in the
+/// parent, where reading the environment and probing the filesystem is safe.
+fn toolchain_cache_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(4);
+    if let Some(cargo_home) = crate::agent::env::host_cargo_home() {
+        paths.push(cargo_home);
+    } else if let Some(home) = home_dir() {
+        // `host_cargo_home` only reports `~/.cargo` when it exists; without a
+        // Cargo home there is no registry to grant, so nothing is added.
+        let _ = home;
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        paths.push(rustup_home);
+    }
+    if let Some(home) = home_dir() {
+        for dir in [".cargo", ".rustup", ".local/bin"] {
+            paths.push(home.join(dir));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Writable cache locations shared across workers.
+///
+/// The same directories the bubblewrap backend binds read-write and the child
+/// environment points `GOCACHE`, `UV_CACHE_DIR` and friends at: the shared
+/// cache root, the user's `kache` directory, and any `SWE_SHARED_CACHES`
+/// host-side binds. Missing paths are skipped when the plan is applied.
+fn writable_cache_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(4);
+    paths.push(crate::cache::shared_cache_root());
+    if let Some(home) = home_dir() {
+        paths.push(home.join(".cache").join("kache"));
+    }
+    if let Ok(custom) = std::env::var("SWE_SHARED_CACHES") {
+        for (host, _guest) in crate::cache::parse_custom_cache_binds(&custom) {
+            paths.push(host);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Git directories covering `worktree`, resolved to absolute canonical paths.
+///
+/// The worktree's `.git` is a `gitdir:` pointer file, not a directory, so the
+/// common `.git` and the worktree's own gitdir come from [`find_git_dirs`].
+/// A relative pointer resolves against the worktree; anything
+/// un-canonicalisable is dropped rather than granted blind.
+fn git_rule_paths(worktree: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let Some((common, worktree_gitdir)) = find_git_dirs(worktree) else {
+        return Vec::new();
+    };
+    let resolve = |p: PathBuf| {
+        let absolute = if p.is_absolute() { p } else { worktree.join(p) };
+        std::fs::canonicalize(&absolute).ok()
+    };
+    let Some(common) = resolve(common) else {
+        return Vec::new();
+    };
+    let worktree_gitdir = worktree_gitdir.and_then(resolve);
+    vec![(common, worktree_gitdir)]
 }
 
 /// Union of every right any rule asks for, narrowed to what the kernel
@@ -579,10 +701,7 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
 /// Handled rights turn Landlock's "allow" model into "deny by default", so
 /// this is also the set of operations an ungranted path loses.
 fn handled_access_fs(rules: &[PathRule], access: u64) -> u64 {
-    rules
-        .iter()
-        .fold(0, |acc, rule| acc | rule.allowed)
-        & access
+    rules.iter().fold(0, |acc, rule| acc | rule.allowed) & access
 }
 
 // ----------
@@ -613,6 +732,15 @@ fn handled_access_fs(rules: &[PathRule], access: u64) -> u64 {
 pub struct LandlockPlan {
     /// Bitmask of `ACCESS_FS_*` rights the ruleset handles.
     handled: u64,
+    /// Bitmask of `ACCESS_NET_*` rights the ruleset handles.
+    ///
+    /// Non-zero only for an offline worker on ABI >= 4: with no network rule
+    /// ever added, handling TCP bind/connect denies every port.
+    handled_net: u64,
+    /// Bitmask of `LANDLOCK_SCOPE_*` restrictions, set on ABI >= 6.
+    scoped: u64,
+    /// Byte size of the `RulesetAttr` prefix the running kernel understands.
+    attr_size: usize,
     /// One pre-resolved, NUL-terminated rule path per rule.
     ///
     /// Allocated in the parent and inherited across the fork, so the child
@@ -661,6 +789,16 @@ impl LandlockPlan {
         self.handled
     }
 
+    /// Bitmask of `ACCESS_NET_*` rights the ruleset will handle.
+    pub fn handled_net_access(&self) -> u64 {
+        self.handled_net
+    }
+
+    /// Bitmask of `LANDLOCK_SCOPE_*` restrictions the ruleset will install.
+    pub fn scoped(&self) -> u64 {
+        self.scoped
+    }
+
     /// Apply the domain to the calling process.
     ///
     /// # Safety
@@ -670,20 +808,23 @@ impl LandlockPlan {
     /// async-signal-safe, but **irreversible**: `landlock_restrict_self`
     /// confines the calling process for good, along with everything it forks.
     pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
-        // Handled mask was already narrowed to the running ABI by
-        // `build_landlock_plan`, so the kernel cannot reject it.
+        // Masks were already narrowed to the running ABI by
+        // `build_landlock_plan`, so the kernel cannot reject them.
         let attr = RulesetAttr {
             handled_access_fs: self.handled,
+            handled_access_net: self.handled_net,
+            scoped: self.scoped,
         };
         // SAFETY: `attr` is a live, correctly laid out `landlock_ruleset_attr`
-        // prefix and `size` is its exact size, which is what the kernel
-        // validates. Both are stack locals that outlive the call.
+        // prefix and `size` is the exact prefix length the running kernel
+        // understands, which is what the kernel validates. Both are stack
+        // locals that outlive the call.
         let ruleset_fd = {
             landlock_syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
                 [
                     &attr as *const RulesetAttr as libc::c_long,
-                    std::mem::size_of::<RulesetAttr>() as libc::c_long,
+                    self.attr_size as libc::c_long,
                     0,
                     0,
                 ],
@@ -797,8 +938,17 @@ impl LandlockPlan {
 /// construction, the syscall-backed existence checks - runs in the parent
 /// process, where allocating is safe. The returned plan holds no file
 /// descriptor, so nothing leaks into the child through an inherited one.
-pub fn build_landlock_plan(worktree: &Path, target_dir: &Path) -> Result<Option<LandlockPlan>> {
-    build_plan_with_abi(worktree, target_dir, query_abi_version())
+///
+/// `offline` adds the network deny policy: on ABI >= 4 the ruleset handles
+/// TCP bind/connect with no allowed port, so every TCP socket stays
+/// unusable; below ABI 4 there is no network support and the seccomp filter
+/// alone carries the offline policy.
+pub fn build_landlock_plan(
+    worktree: &Path,
+    target_dir: &Path,
+    offline: bool,
+) -> Result<Option<LandlockPlan>> {
+    build_plan_with_abi(worktree, target_dir, query_abi_version(), offline)
 }
 
 /// The body of [`build_landlock_plan`], with the ABI probe as a parameter.
@@ -814,6 +964,7 @@ fn build_plan_with_abi(
     worktree: &Path,
     target_dir: &Path,
     abi: Option<i64>,
+    offline: bool,
 ) -> Result<Option<LandlockPlan>> {
     if landlock_disabled() {
         tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
@@ -843,6 +994,23 @@ fn build_plan_with_abi(
     let rules = build_path_rules(worktree, target_dir);
     let handled = handled_access_fs(&rules, supported_access_fs(abi));
 
+    // Offline network policy: handle TCP bind/connect with no rule granting
+    // any port, which denies them all. Online workers leave the network
+    // unhandled and therefore unrestricted.
+    let handled_net = if offline && abi >= ABI_NET {
+        ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
+    } else {
+        0
+    };
+
+    // A worker's signals and abstract sockets stay inside its own domain, so
+    // one agent cannot kill or impersonate the daemon or another worker.
+    let scoped = if abi >= ABI_SCOPE {
+        LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET
+    } else {
+        0
+    };
+
     // Counts are fixed by the policy, so size both vectors up front.
     let mut paths = Vec::with_capacity(rules.len());
     let mut allowed = Vec::with_capacity(rules.len());
@@ -871,6 +1039,9 @@ fn build_plan_with_abi(
     );
     Ok(Some(LandlockPlan {
         handled,
+        handled_net,
+        scoped,
+        attr_size: ruleset_attr_size(abi),
         paths,
         allowed,
     }))
@@ -946,444 +1117,490 @@ mod tests {
         assert_eq!(find_git_common_dir(&tmp), None);
     }
 
-// ---------- Landlock confinement tests ----------
+    // ---------- Landlock confinement tests ----------
 
-/// Rule granted to `path` by `rules`, if any. Later rules win, mirroring the
-/// kernel's refine-previous semantics.
-fn rule_for<'a>(rules: &'a [PathRule], path: &Path) -> Option<&'a PathRule> {
-    rules.iter().rev().find(|r| path == r.path)
-}
-
-/// Scratch directory unique to the calling test, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = crate::worktree::swe_base_dir()
-            .join("landlock-test")
-            .join(format!("{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        Self(dir)
+    /// Rule granted to `path` by `rules`, if any. Later rules win, mirroring the
+    /// kernel's refine-previous semantics.
+    fn rule_for<'a>(rules: &'a [PathRule], path: &Path) -> Option<&'a PathRule> {
+        rules.iter().rev().find(|r| path == r.path)
     }
 
-    fn worktree(&self) -> PathBuf {
-        let w = self.0.join("worktree");
-        std::fs::create_dir_all(&w).expect("create worktree");
-        w
+    /// Scratch directory unique to the calling test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = crate::worktree::swe_base_dir()
+                .join("landlock-test")
+                .join(format!("{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn worktree(&self) -> PathBuf {
+            let w = self.0.join("worktree");
+            std::fs::create_dir_all(&w).expect("create worktree");
+            w
+        }
+
+        fn target(&self) -> PathBuf {
+            let t = self.0.join("target");
+            std::fs::create_dir_all(&t).expect("create target dir");
+            t
+        }
     }
 
-    fn target(&self) -> PathBuf {
-        let t = self.0.join("target");
-        std::fs::create_dir_all(&t).expect("create target dir");
-        t
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
-}
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+    /// A host with no Landlock must still run workers.
+    ///
+    /// The probe is the only thing distinguishing such a machine from this one, so
+    /// the "unsupported" branch is driven through the [`build_plan_with_abi`] seam
+    /// rather than left to whatever kernel the suite runs on. A `bail!` here would
+    /// take every worker on every kernel without Landlock offline, buying no
+    /// security.
+    #[test]
+    fn a_kernel_without_landlock_yields_no_plan_instead_of_an_error() {
+        let scratch = Scratch::new("noplan");
 
-/// A host with no Landlock must still run workers.
-///
-/// The probe is the only thing distinguishing such a machine from this one, so
-/// the "unsupported" branch is driven through the [`build_plan_with_abi`] seam
-/// rather than left to whatever kernel the suite runs on. A `bail!` here would
-/// take every worker on every kernel without Landlock offline, buying no
-/// security.
-#[test]
-fn a_kernel_without_landlock_yields_no_plan_instead_of_an_error() {
-    let scratch = Scratch::new("noplan");
+        let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false);
 
-    let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None);
-
-    assert!(
-        built.is_ok(),
-        "a kernel without Landlock must degrade, not fail: {built:?}"
-    );
-    assert!(
-        built.unwrap().is_none(),
-        "no kernel support must yield *no plan*, so the caller registers no \
+        assert!(
+            built.is_ok(),
+            "a kernel without Landlock must degrade, not fail: {built:?}"
+        );
+        assert!(
+            built.unwrap().is_none(),
+            "no kernel support must yield *no plan*, so the caller registers no \
          pre_exec hook and the worker runs unconfined"
-    );
-
-    // Degrading means unconfined: the process keeps the access it had, which
-    // is what makes this a downgrade rather than a silent partial sandbox.
-    std::fs::write(scratch.worktree().join("still-writable"), b"ok")
-        .expect("an unconfined process keeps its access");
-}
-
-/// The malformed-policy check must survive the unsupported-kernel path.
-///
-/// Ordering matters: a missing root is a caller bug reported *before* the ABI
-/// probe, so a host with no Landlock still gets told its arguments are wrong.
-#[test]
-fn a_missing_root_is_reported_even_where_landlock_is_unavailable() {
-    let scratch = Scratch::new("noplan-missing");
-    let missing = scratch.0.join("does-not-exist");
-
-    let err = build_plan_with_abi(&missing, &scratch.target(), None).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("does not exist"),
-        "a malformed policy must be reported regardless of kernel support: {err:#}"
-    );
-}
-
-#[test]
-fn system_prefixes_are_read_only() {
-    let scratch = Scratch::new("readonly");
-    let rules = build_path_rules(&scratch.worktree(), &scratch.target());
-
-    for sys in ["/usr", "/bin", "/lib", "/opt"] {
-        let rule = rule_for(&rules, Path::new(sys))
-            .unwrap_or_else(|| panic!("{sys} must be granted so the toolchain can run"));
-        assert_eq!(
-            rule.allowed, READ_ONLY_RIGHTS,
-            "{sys} must be read-only, not writable"
         );
+
+        // Degrading means unconfined: the process keeps the access it had, which
+        // is what makes this a downgrade rather than a silent partial sandbox.
+        std::fs::write(scratch.worktree().join("still-writable"), b"ok")
+            .expect("an unconfined process keeps its access");
     }
-}
 
-/// Directory-only rights must never reach the kernel on a non-directory.
-///
-/// A `PATH_BENEATH` rule naming a regular file or character device is rejected
-/// outright with `EINVAL` when it carries them, aborting the whole spawn: a
-/// policy correct on paper but rejected at install confines *nothing* and fails
-/// every worker.
-///
-/// `/dev/null` is the case that matters - it is a character device, so the
-/// obvious `Path::is_file` test answers `false`, and both failure modes are
-/// live: keeping `READ_DIR` gets the rule rejected, and narrowing to
-/// `READ_FILE` silently takes away the write every `> /dev/null` needs.
-#[test]
-fn non_directory_rules_are_narrowed_without_losing_their_write() {
-    for path in ["/dev/null", "/dev/zero", "/dev/full"] {
-        let p = Path::new(path);
-        if !p.exists() {
-            continue; // Minimal images may not ship every sink.
-        }
-        let narrowed = rights_for(p, READ_ONLY_RIGHTS | ACCESS_FS_WRITE_FILE);
+    /// The malformed-policy check must survive the unsupported-kernel path.
+    ///
+    /// Ordering matters: a missing root is a caller bug reported *before* the ABI
+    /// probe, so a host with no Landlock still gets told its arguments are wrong.
+    #[test]
+    fn a_missing_root_is_reported_even_where_landlock_is_unavailable() {
+        let scratch = Scratch::new("noplan-missing");
+        let missing = scratch.0.join("does-not-exist");
 
-        assert_eq!(
-            narrowed & NON_DIRECTORY_RIGHTS,
-            0,
-            "{path} is not a directory, so no directory-only right may survive: {narrowed:#x}"
-        );
-        assert_ne!(
-            narrowed & ACCESS_FS_WRITE_FILE,
-            0,
-            "{path} must stay writable, or `> {path}` breaks in every command"
-        );
-        assert_ne!(
-            narrowed & ACCESS_FS_READ_FILE,
-            0,
-            "{path} must stay readable"
-        );
-    }
-}
-
-/// A directory keeps every right it was granted.
-#[test]
-fn directory_rules_keep_every_right_they_were_granted() {
-    let scratch = Scratch::new("dirrights");
-    let dir = scratch.target();
-    assert!(dir.is_dir());
-    assert_eq!(
-        rights_for(&dir, WRITE_RIGHTS),
-        WRITE_RIGHTS,
-        "a directory must not lose any right - that would silently make the \
-         worktree read-only"
-    );
-}
-
-/// Redirection sinks are writable without making the rest of `/dev` so.
-#[test]
-fn null_sinks_are_writable_but_the_dev_pseudo_filesystem_is_not() {
-    let scratch = Scratch::new("devsink");
-    let rules = build_path_rules(&scratch.worktree(), &scratch.target());
-
-    let dev = rule_for(&rules, Path::new("/dev")).expect("/dev is granted");
-    assert_eq!(
-        dev.allowed & ACCESS_FS_WRITE_FILE,
-        0,
-        "/dev itself must stay read-only: a writable pseudo-filesystem is a \
-         much larger grant than a redirection sink"
-    );
-
-    for sink in ["/dev/null", "/dev/zero", "/dev/full"] {
-        if !Path::new(sink).exists() {
-            continue;
-        }
-        let rule = rule_for(&rules, Path::new(sink))
-            .unwrap_or_else(|| panic!("{sink} must be granted as a sink"));
-        assert_ne!(
-            rule.allowed & ACCESS_FS_WRITE_FILE,
-            0,
-            "{sink} must be writable or every `> {sink}` fails"
-        );
-    }
-}
-
-#[test]
-fn worktree_and_target_are_writable() {
-    let scratch = Scratch::new("writable");
-    let (worktree, target) = (scratch.worktree(), scratch.target());
-    let rules = build_path_rules(&worktree, &target);
-
-    for root in [&worktree, &target] {
-        let rule = rule_for(&rules, root)
-            .unwrap_or_else(|| panic!("{} must be writable", root.display()));
+        let err = build_plan_with_abi(&missing, &scratch.target(), None, false).unwrap_err();
         assert!(
-            rule.allowed & ACCESS_FS_WRITE_FILE != 0,
-            "{} must allow write access",
-            root.display()
-        );
-        assert!(
-            rule.allowed & ACCESS_FS_MAKE_REG != 0,
-            "{} must allow creating files",
-            root.display()
-        );
-        assert!(
-            rule.allowed & ACCESS_FS_MAKE_DIR != 0,
-            "{} must allow creating directories",
-            root.display()
-        );
-    }
-}
-
-#[test]
-fn writable_roots_are_narrowed_to_the_supported_abi() {
-    let scratch = Scratch::new("abi");
-    let rules = build_path_rules(&scratch.worktree(), &scratch.target());
-
-    // On the oldest supported ABI only EXECUTE exists, so a ruleset may not ask
-    // for anything the kernel would reject.
-    for abi in 1..=9 {
-        let access = supported_access_fs(abi);
-        assert_eq!(access & !ALL_ACCESS_FS, 0, "ABI {abi} mask escapes the UAPI");
-        let handled = handled_access_fs(&rules, access);
-        assert_eq!(
-            handled & !access,
-            0,
-            "ABI {abi}: handled rights must be a subset of supported rights"
+            format!("{err:#}").contains("does not exist"),
+            "a malformed policy must be reported regardless of kernel support: {err:#}"
         );
     }
 
-    // Rights only exist from their introducing ABI onwards.
-    assert_eq!(supported_access_fs(1), ACCESS_FS_EXECUTE);
-    assert_eq!(
-        supported_access_fs(2) & ACCESS_FS_REFER,
-        ACCESS_FS_REFER,
-        "REFER arrived in ABI 2"
-    );
-    assert_eq!(
-        supported_access_fs(2) & ACCESS_FS_TRUNCATE,
-        0,
-        "TRUNCATE only arrived in ABI 3"
-    );
-    assert_eq!(
-        supported_access_fs(4) & ACCESS_FS_IOCTL_DEV,
-        0,
-        "IOCTL_DEV only arrived in ABI 5"
-    );
-    assert_eq!(
-        supported_access_fs(8) & ACCESS_FS_RESOLVE_UNIX,
-        0,
-        "RESOLVE_UNIX only arrived in ABI 9"
-    );
-    assert_eq!(supported_access_fs(9), ALL_ACCESS_FS, "ABI 9 knows every right");
-    assert_eq!(
-        supported_access_fs(999),
-        ALL_ACCESS_FS,
-        "a future ABI is a superset, not a subset"
-    );
-}
+    #[test]
+    fn system_prefixes_are_read_only() {
+        let scratch = Scratch::new("readonly");
+        let rules = build_path_rules(&scratch.worktree(), &scratch.target());
 
-#[test]
-fn sensitive_paths_are_never_granted() {
-    let scratch = Scratch::new("denied");
-    let (worktree, target) = (scratch.worktree(), &scratch.target());
-    let rules = build_path_rules(&worktree, target);
-    let denied = denied_paths();
-
-    // The documented set must be present, resolved against $HOME where relative.
-    let home = home_dir().expect("tests run with a discoverable $HOME");
-    for rel in [".ssh", ".aws", ".gnupg"] {
-        assert!(
-            denied.contains(&home.join(rel)),
-            "$HOME/{rel} must be on the deny list"
-        );
-    }
-    assert!(
-        denied.iter().any(|p| p == Path::new("/etc/shadow")),
-        "/etc/shadow must be on the deny list"
-    );
-
-    // Home-relative secrets must never appear in any rule: they are denied by
-    // omission (no rule covers them), so the handled-rights deny-by-default
-    // model keeps them unreachable.
-    for path in &denied {
-        assert!(
-            !is_denied(path, &[]),
-            "a denied path must not be classified as allowed by an empty list"
-        );
-        for rule in &rules {
-            assert!(
-                rule.path != *path && !rule.path.starts_with(path),
-                "rule {} grants access to denied path {}",
-                rule.path.display(),
-                path.display()
+        for sys in ["/usr", "/bin", "/lib", "/opt"] {
+            let rule = rule_for(&rules, Path::new(sys))
+                .unwrap_or_else(|| panic!("{sys} must be granted so the toolchain can run"));
+            assert_eq!(
+                rule.allowed, READ_ONLY_RIGHTS,
+                "{sys} must be read-only, not writable"
             );
         }
     }
 
-    // A broad /etc grant would also grant these files. They must be denied
-    // by omission, not an impossible zero-rights rule (the kernel rejects it).
-    for secret in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"] {
-        assert!(!rules.iter().any(|r| Path::new(secret).starts_with(&r.path)));
-    }
-}
+    /// Directory-only rights must never reach the kernel on a non-directory.
+    ///
+    /// A `PATH_BENEATH` rule naming a regular file or character device is rejected
+    /// outright with `EINVAL` when it carries them, aborting the whole spawn: a
+    /// policy correct on paper but rejected at install confines *nothing* and fails
+    /// every worker.
+    ///
+    /// `/dev/null` is the case that matters - it is a character device, so the
+    /// obvious `Path::is_file` test answers `false`, and both failure modes are
+    /// live: keeping `READ_DIR` gets the rule rejected, and narrowing to
+    /// `READ_FILE` silently takes away the write every `> /dev/null` needs.
+    #[test]
+    fn non_directory_rules_are_narrowed_without_losing_their_write() {
+        for path in ["/dev/null", "/dev/zero", "/dev/full"] {
+            let p = Path::new(path);
+            if !p.exists() {
+                continue; // Minimal images may not ship every sink.
+            }
+            let narrowed = rights_for(p, READ_ONLY_RIGHTS | ACCESS_FS_WRITE_FILE);
 
-#[test]
-fn a_denied_subtree_is_filtered_out_of_the_rule_set() {
-    let _scratch = Scratch::new("filter");
-    let home = home_dir().expect("tests run with a discoverable $HOME");
-    // A worktree pinned at a denied location must be filtered out, not granted.
-    let denied = vec![home.join(".ssh")];
-    assert!(is_denied(&home.join(".ssh"), &denied));
-    assert!(is_denied(&home.join(".ssh/id_rsa"), &denied));
-    assert!(!is_denied(&home.join(".cargo"), &denied));
-    assert!(!is_denied(&home.join(".sshx"), &denied), "prefix must match on a path segment");
-}
-
-#[test]
-fn writable_roots_win_over_the_system_prefixes() {
-    let scratch = Scratch::new("order");
-    let (worktree, target) = (scratch.worktree(), scratch.target());
-    let rules = build_path_rules(&worktree, &target);
-
-    // The writable roots are appended last, so a later (more specific) rule can
-    // refine an earlier read-only one instead of being shadowed by it.
-    let last_read_only = rules
-        .iter()
-        .rposition(|r| r.allowed == READ_ONLY_RIGHTS)
-        .expect("the policy grants read-only prefixes");
-    let worktree_at = rules
-        .iter()
-        .position(|r| r.path == worktree)
-        .expect("worktree is granted");
-    assert!(
-        worktree_at > last_read_only,
-        "writable roots must come after the read-only prefixes"
-    );
-    let _ = target;
-}
-
-#[test]
-fn relative_roots_are_never_granted() {
-    // Landlock rules are matched on absolute paths; a relative one would be
-    // silently useless, so it is dropped rather than granted.
-    let rules = build_path_rules(Path::new("relative-worktree"), Path::new("relative-target"));
-    assert!(!rules.iter().any(|r| r.path == Path::new("relative-worktree")));
-}
-
-/// A symlinked writable root must not smuggle a grant onto a denied directory.
-///
-/// This is the whole point of [`canonical_root`]: Landlock resolves a
-/// `PATH_BENEATH` rule onto the real inode, but [`is_denied`] compares path
-/// strings. A root supplied as a symlink pointing at `~/.ssh` therefore looks
-/// innocent to the lexical check while the rule would really cover the
-/// operator's private keys. Canonicalising makes the two agree.
-#[test]
-fn a_symlinked_root_cannot_smuggle_a_grant_onto_a_denied_directory() {
-    let scratch = Scratch::new("symlink");
-    let home = home_dir().expect("tests run with a discoverable $HOME");
-    let secret_dir = home.join(".ssh");
-    std::fs::create_dir_all(&secret_dir).expect("create a denied directory");
-
-    // Ordinary-looking scratch space that is really a symlink onto the
-    // operator's key material.
-    let link = scratch.0.join("looks-innocent");
-    std::os::unix::fs::symlink(&secret_dir, &link).expect("create the symlink");
-
-    // Without canonicalisation the lexical deny-check would pass and the rule
-    // would cover ~/.ssh.
-    let resolved = canonical_root(&link);
-    assert_eq!(
-        resolved, secret_dir,
-        "canonicalisation must resolve the link to its real target"
-    );
-
-    let rules = build_path_rules(&link, &scratch.target());
-    assert!(
-        !rules.iter().any(|r| r.path.starts_with(&secret_dir) || r.path == secret_dir),
-        "a symlinked root must never be granted once it resolves into a denied path"
-    );
-    assert!(
-        !rules.iter().any(|r| r.path == link),
-        "the un-resolved symlink path must not be granted either"
-    );
-}
-
-#[test]
-fn an_unsupported_kernel_degrades_instead_of_failing() {
-    // `supported_access_fs` is total: every ABI, including one below the minimum
-    // this build supports, yields a mask the kernel can actually be asked for.
-    // That is the property that makes the kernel-version probe a pure
-    // optimisation rather than a correctness dependency.
-    for abi in 0..=12 {
-        let access = supported_access_fs(abi);
-        assert_eq!(access & !ALL_ACCESS_FS, 0, "ABI {abi} mask escapes the UAPI");
+            assert_eq!(
+                narrowed & NON_DIRECTORY_RIGHTS,
+                0,
+                "{path} is not a directory, so no directory-only right may survive: {narrowed:#x}"
+            );
+            assert_ne!(
+                narrowed & ACCESS_FS_WRITE_FILE,
+                0,
+                "{path} must stay writable, or `> {path}` breaks in every command"
+            );
+            assert_ne!(
+                narrowed & ACCESS_FS_READ_FILE,
+                0,
+                "{path} must stay readable"
+            );
+        }
     }
 
-    // A nonexistent kernel: the syscall fails, `query_abi_version` reports
-    // "unsupported" instead of an error, and the caller proceeds unconfined.
-    // The kernel running the suite supports Landlock (the enforcement test
-    // proves it end-to-end); the degradation path is exercised by the
-    // opt-out test above, which does not depend on kernel capabilities.
-    assert!(query_abi_version().is_some(), "this kernel does support it");
-}
-
-/// An ABI that does not exist must not silently produce an empty ruleset: a
-/// handled-mask of zero would deny *everything*, including the worktree, so a
-/// bogus value threaded through the seam has to be visibly wrong.
-#[test]
-fn an_impossible_abi_handles_no_rights() {
-    assert_eq!(
-        supported_access_fs(0),
-        0,
-        "ABI 0 does not exist and must grant nothing"
-    );
-    let scratch = Scratch::new("badabi");
-    let rules = build_path_rules(&scratch.worktree(), &scratch.target());
-    assert_eq!(
-        handled_access_fs(&rules, supported_access_fs(0)),
-        0,
-        "an ABI-0 ruleset must handle no rights at all"
-    );
-}
-
-#[test]
-fn the_abi_query_is_stable_within_a_process() {
-    // The probe is a syscall, not a cached value, so it must be consistent; a
-    // flaky reading would mean a partial ruleset was installed.
-    let a = query_abi_version();
-    let b = query_abi_version();
-    assert_eq!(a, b, "the Landlock ABI query must be deterministic");
-    if let Some(abi) = a {
-        assert!(abi >= MIN_SUPPORTED_ABI, "a reported ABI is always usable");
+    /// A directory keeps every right it was granted.
+    #[test]
+    fn directory_rules_keep_every_right_they_were_granted() {
+        let scratch = Scratch::new("dirrights");
+        let dir = scratch.target();
+        assert!(dir.is_dir());
+        assert_eq!(
+            rights_for(&dir, WRITE_RIGHTS),
+            WRITE_RIGHTS,
+            "a directory must not lose any right - that would silently make the \
+         worktree read-only"
+        );
     }
-}
 
-    /// Write access must go to the worktree and the target dir and nowhere else.
+    /// Redirection sinks are writable without making the rest of `/dev` so.
+    #[test]
+    fn null_sinks_are_writable_but_the_dev_pseudo_filesystem_is_not() {
+        let scratch = Scratch::new("devsink");
+        let rules = build_path_rules(&scratch.worktree(), &scratch.target());
+
+        let dev = rule_for(&rules, Path::new("/dev")).expect("/dev is granted");
+        assert_eq!(
+            dev.allowed & ACCESS_FS_WRITE_FILE,
+            0,
+            "/dev itself must stay read-only: a writable pseudo-filesystem is a \
+         much larger grant than a redirection sink"
+        );
+
+        for sink in ["/dev/null", "/dev/zero", "/dev/full"] {
+            if !Path::new(sink).exists() {
+                continue;
+            }
+            let rule = rule_for(&rules, Path::new(sink))
+                .unwrap_or_else(|| panic!("{sink} must be granted as a sink"));
+            assert_ne!(
+                rule.allowed & ACCESS_FS_WRITE_FILE,
+                0,
+                "{sink} must be writable or every `> {sink}` fails"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_and_target_are_writable() {
+        let scratch = Scratch::new("writable");
+        let (worktree, target) = (scratch.worktree(), scratch.target());
+        let rules = build_path_rules(&worktree, &target);
+
+        for root in [&worktree, &target] {
+            let rule = rule_for(&rules, root)
+                .unwrap_or_else(|| panic!("{} must be writable", root.display()));
+            assert!(
+                rule.allowed & ACCESS_FS_WRITE_FILE != 0,
+                "{} must allow write access",
+                root.display()
+            );
+            assert!(
+                rule.allowed & ACCESS_FS_MAKE_REG != 0,
+                "{} must allow creating files",
+                root.display()
+            );
+            assert!(
+                rule.allowed & ACCESS_FS_MAKE_DIR != 0,
+                "{} must allow creating directories",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn writable_roots_are_narrowed_to_the_supported_abi() {
+        let scratch = Scratch::new("abi");
+        let rules = build_path_rules(&scratch.worktree(), &scratch.target());
+
+        // On the oldest supported ABI only EXECUTE exists, so a ruleset may not ask
+        // for anything the kernel would reject.
+        for abi in 1..=9 {
+            let access = supported_access_fs(abi);
+            assert_eq!(
+                access & !ALL_ACCESS_FS,
+                0,
+                "ABI {abi} mask escapes the UAPI"
+            );
+            let handled = handled_access_fs(&rules, access);
+            assert_eq!(
+                handled & !access,
+                0,
+                "ABI {abi}: handled rights must be a subset of supported rights"
+            );
+        }
+
+        // Rights only exist from their introducing ABI onwards.
+        assert_eq!(supported_access_fs(1), ACCESS_FS_EXECUTE);
+        assert_eq!(
+            supported_access_fs(2) & ACCESS_FS_REFER,
+            ACCESS_FS_REFER,
+            "REFER arrived in ABI 2"
+        );
+        assert_eq!(
+            supported_access_fs(2) & ACCESS_FS_TRUNCATE,
+            0,
+            "TRUNCATE only arrived in ABI 3"
+        );
+        assert_eq!(
+            supported_access_fs(4) & ACCESS_FS_IOCTL_DEV,
+            0,
+            "IOCTL_DEV only arrived in ABI 5"
+        );
+        assert_eq!(
+            supported_access_fs(8) & ACCESS_FS_RESOLVE_UNIX,
+            0,
+            "RESOLVE_UNIX only arrived in ABI 9"
+        );
+        assert_eq!(
+            supported_access_fs(9),
+            ALL_ACCESS_FS,
+            "ABI 9 knows every right"
+        );
+        assert_eq!(
+            supported_access_fs(999),
+            ALL_ACCESS_FS,
+            "a future ABI is a superset, not a subset"
+        );
+    }
+
+    #[test]
+    fn sensitive_paths_are_never_granted() {
+        let scratch = Scratch::new("denied");
+        let (worktree, target) = (scratch.worktree(), &scratch.target());
+        let rules = build_path_rules(&worktree, target);
+        let denied = denied_paths();
+
+        // The documented set must be present, resolved against $HOME where relative.
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+        for rel in [".ssh", ".aws", ".gnupg"] {
+            assert!(
+                denied.contains(&home.join(rel)),
+                "$HOME/{rel} must be on the deny list"
+            );
+        }
+        assert!(
+            denied.iter().any(|p| p == Path::new("/etc/shadow")),
+            "/etc/shadow must be on the deny list"
+        );
+
+        // Home-relative secrets must never appear in any rule: they are denied by
+        // omission (no rule covers them), so the handled-rights deny-by-default
+        // model keeps them unreachable.
+        for path in &denied {
+            assert!(
+                !is_denied(path, &[]),
+                "a denied path must not be classified as allowed by an empty list"
+            );
+            for rule in &rules {
+                assert!(
+                    rule.path != *path && !rule.path.starts_with(path),
+                    "rule {} grants access to denied path {}",
+                    rule.path.display(),
+                    path.display()
+                );
+            }
+        }
+
+        // A broad /etc grant would also grant these files. They must be denied
+        // by omission, not an impossible zero-rights rule (the kernel rejects it).
+        for secret in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"] {
+            assert!(!rules.iter().any(|r| Path::new(secret).starts_with(&r.path)));
+        }
+    }
+
+    #[test]
+    fn a_denied_subtree_is_filtered_out_of_the_rule_set() {
+        let _scratch = Scratch::new("filter");
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+        // A worktree pinned at a denied location must be filtered out, not granted.
+        let denied = vec![home.join(".ssh")];
+        assert!(is_denied(&home.join(".ssh"), &denied));
+        assert!(is_denied(&home.join(".ssh/id_rsa"), &denied));
+        assert!(!is_denied(&home.join(".cargo"), &denied));
+        assert!(
+            !is_denied(&home.join(".sshx"), &denied),
+            "prefix must match on a path segment"
+        );
+    }
+
+    #[test]
+    fn writable_roots_win_over_the_system_prefixes() {
+        let scratch = Scratch::new("order");
+        let (worktree, target) = (scratch.worktree(), scratch.target());
+        let rules = build_path_rules(&worktree, &target);
+
+        // The writable roots come after the read-only system prefixes, so a later
+        // (more specific) rule can refine an earlier read-only one instead of
+        // being shadowed by it. Toolchain, cache and git rules follow the roots;
+        // they refine nothing the roots cover.
+        let last_system_read_only = rules
+            .iter()
+            .rposition(|r| {
+                r.allowed == READ_ONLY_RIGHTS
+                    && READ_ONLY_SYSTEM_PATHS.contains(&r.path.to_str().unwrap_or_default())
+            })
+            .expect("the policy grants read-only system prefixes");
+        let worktree_at = rules
+            .iter()
+            .position(|r| r.path == worktree)
+            .expect("worktree is granted");
+        assert!(
+            worktree_at > last_system_read_only,
+            "writable roots must come after the read-only system prefixes"
+        );
+        let _ = target;
+    }
+
+    #[test]
+    fn relative_roots_are_never_granted() {
+        // Landlock rules are matched on absolute paths; a relative one would be
+        // silently useless, so it is dropped rather than granted.
+        let rules = build_path_rules(Path::new("relative-worktree"), Path::new("relative-target"));
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.path == Path::new("relative-worktree"))
+        );
+    }
+
+    /// A symlinked writable root must not smuggle a grant onto a denied directory.
+    ///
+    /// This is the whole point of [`canonical_root`]: Landlock resolves a
+    /// `PATH_BENEATH` rule onto the real inode, but [`is_denied`] compares path
+    /// strings. A root supplied as a symlink pointing at `~/.ssh` therefore looks
+    /// innocent to the lexical check while the rule would really cover the
+    /// operator's private keys. Canonicalising makes the two agree.
+    #[test]
+    fn a_symlinked_root_cannot_smuggle_a_grant_onto_a_denied_directory() {
+        let scratch = Scratch::new("symlink");
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+        let secret_dir = home.join(".ssh");
+        std::fs::create_dir_all(&secret_dir).expect("create a denied directory");
+
+        // Ordinary-looking scratch space that is really a symlink onto the
+        // operator's key material.
+        let link = scratch.0.join("looks-innocent");
+        std::os::unix::fs::symlink(&secret_dir, &link).expect("create the symlink");
+
+        // Without canonicalisation the lexical deny-check would pass and the rule
+        // would cover ~/.ssh.
+        let resolved = canonical_root(&link);
+        assert_eq!(
+            resolved, secret_dir,
+            "canonicalisation must resolve the link to its real target"
+        );
+
+        let rules = build_path_rules(&link, &scratch.target());
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.path.starts_with(&secret_dir) || r.path == secret_dir),
+            "a symlinked root must never be granted once it resolves into a denied path"
+        );
+        assert!(
+            !rules.iter().any(|r| r.path == link),
+            "the un-resolved symlink path must not be granted either"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_kernel_degrades_instead_of_failing() {
+        // `supported_access_fs` is total: every ABI, including one below the minimum
+        // this build supports, yields a mask the kernel can actually be asked for.
+        // That is the property that makes the kernel-version probe a pure
+        // optimisation rather than a correctness dependency.
+        for abi in 0..=12 {
+            let access = supported_access_fs(abi);
+            assert_eq!(
+                access & !ALL_ACCESS_FS,
+                0,
+                "ABI {abi} mask escapes the UAPI"
+            );
+        }
+
+        // A nonexistent kernel: the syscall fails, `query_abi_version` reports
+        // "unsupported" instead of an error, and the caller proceeds unconfined.
+        // The kernel running the suite supports Landlock (the enforcement test
+        // proves it end-to-end); the degradation path is exercised by the
+        // opt-out test above, which does not depend on kernel capabilities.
+        assert!(query_abi_version().is_some(), "this kernel does support it");
+    }
+
+    /// An ABI that does not exist must not silently produce an empty ruleset: a
+    /// handled-mask of zero would deny *everything*, including the worktree, so a
+    /// bogus value threaded through the seam has to be visibly wrong.
+    /// A syscall made through a foreign architecture (a 32-bit `int 0x80` call
+    /// on x86-64) is refused, never allowed: the rules are written in the native
+    /// numbering and would otherwise be bypassed wholesale.
+    #[test]
+    fn a_foreign_architecture_is_refused_not_allowed() {
+        let filter = SeccompFilter::build(false);
+        let program = &filter.program;
+        assert_eq!(program[0], bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFF));
+        assert_eq!(program[1], bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 1, 0));
+        assert_eq!(
+            program[2],
+            bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::ENOSYS)),
+            "the mismatch branch must deny, not allow"
+        );
+        assert_eq!(filter.kernel_program.len(), program.len());
+    }
+
+    #[test]
+    fn an_impossible_abi_handles_no_rights() {
+        assert_eq!(
+            supported_access_fs(0),
+            0,
+            "ABI 0 does not exist and must grant nothing"
+        );
+        let scratch = Scratch::new("badabi");
+        let rules = build_path_rules(&scratch.worktree(), &scratch.target());
+        assert_eq!(
+            handled_access_fs(&rules, supported_access_fs(0)),
+            0,
+            "an ABI-0 ruleset must handle no rights at all"
+        );
+    }
+
+    #[test]
+    fn the_abi_query_is_stable_within_a_process() {
+        // The probe is a syscall, not a cached value, so it must be consistent; a
+        // flaky reading would mean a partial ruleset was installed.
+        let a = query_abi_version();
+        let b = query_abi_version();
+        assert_eq!(a, b, "the Landlock ABI query must be deterministic");
+        if let Some(abi) = a {
+            assert!(abi >= MIN_SUPPORTED_ABI, "a reported ABI is always usable");
+        }
+    }
+
+    /// Write access must go to the declared roots and the shared caches, and
+    /// nowhere else.
     ///
     /// This is the property that makes the sandbox worth having, and it is easy
     /// to lose by accident: Landlock is allow-only, so a `/tmp` rule would also
     /// cover the worktree/target (which live there by default) and hand the
     /// agent write access to every other worker's files. Scratch space is
-    /// therefore never granted: only the two declared roots are writable.
+    /// therefore never granted: only the two declared roots, the shared
+    /// compiler/package caches (which the bubblewrap backend binds writable
+    /// too) and the null sinks are writable.
     #[test]
     fn write_access_is_exclusive_to_the_two_declared_roots() {
         let scratch = Scratch::new("exclusive");
@@ -1411,13 +1628,17 @@ fn the_abi_query_is_stable_within_a_process() {
                 "{sink} must stay usable as a redirection sink, got: {writable:?}"
             );
         }
+        let cache_root = crate::cache::shared_cache_root();
         for path in &writable {
             let is_root = *path == worktree || *path == target;
             let is_sink = WRITABLE_SINKS.contains(&path.to_str().unwrap_or_default());
+            let is_cache = path.starts_with(&cache_root)
+                || path.ends_with(".cache/kache")
+                || **path == cache_root;
             assert!(
-                is_root || is_sink,
-                "{} may not be writable: only the two declared roots and the \
-                 null sinks are, got: {writable:?}",
+                is_root || is_sink || is_cache,
+                "{} may not be writable: only the two declared roots, the \
+                 shared caches and the null sinks are, got: {writable:?}",
                 path.display()
             );
         }
@@ -1441,110 +1662,110 @@ fn the_abi_query_is_stable_within_a_process() {
         }
     }
 
-/// Sentinel that turns this test binary into a Landlock probe instead of a
-/// libtest run.
-const ENFORCE_ENV: &str = "MINI_SWE_LANDLOCK_ENFORCE";
+    /// Sentinel that turns this test binary into a Landlock probe instead of a
+    /// libtest run.
+    const ENFORCE_ENV: &str = "MINI_SWE_LANDLOCK_ENFORCE";
 
-/// End-to-end enforcement check, run in a dedicated child process.
-///
-/// `landlock_restrict_self` is irreversible - it confines *the calling process*
-/// for good - so the probe cannot share an address space with the rest of the
-/// test suite. The parent re-executes this same binary with
-/// [`ENFORCE_ENV`] set; the child then applies a domain and reports what it can
-/// and cannot still reach. Re-using the test binary keeps the probe honest: it
-/// runs exactly the code that ships, not a copy.
-#[test]
-fn landlock_actually_denies_paths_outside_the_sandbox() {
-    use std::process::Command;
+    /// End-to-end enforcement check, run in a dedicated child process.
+    ///
+    /// `landlock_restrict_self` is irreversible - it confines *the calling process*
+    /// for good - so the probe cannot share an address space with the rest of the
+    /// test suite. The parent re-executes this same binary with
+    /// [`ENFORCE_ENV`] set; the child then applies a domain and reports what it can
+    /// and cannot still reach. Re-using the test binary keeps the probe honest: it
+    /// runs exactly the code that ships, not a copy.
+    #[test]
+    fn landlock_actually_denies_paths_outside_the_sandbox() {
+        use std::process::Command;
 
-    // Child mode: apply the domain here and report, never run the suite.
-    if std::env::var_os(ENFORCE_ENV).is_some() {
-        run_landlock_enforcement_mode();
-    }
-
-    let scratch = Scratch::new("enforce");
-    let (worktree, target) = (scratch.worktree(), scratch.target());
-    let home = home_dir().expect("tests run with a discoverable $HOME");
-
-    // A file the domain must not be able to read, outside every granted rule.
-    let secret = home.join(".ssh");
-    let _ = std::fs::create_dir_all(&secret);
-    std::fs::write(secret.join("id_rsa"), b"PRIVATE KEY").expect("seed a decoy secret");
-
-    let out = Command::new(std::env::current_exe().expect("test binary path"))
-        // The child applies a domain that would break the harness itself, so
-        // the sentinel is set through a dedicated "run this test" filter.
-        .arg("--exact")
-        .arg("agent::sandbox::tests::landlock_actually_denies_paths_outside_the_sandbox")
-        .arg("--nocapture")
-        .env(ENFORCE_ENV, "1")
-        .env("LL_WORKTREE", &worktree)
-        .env("LL_TARGET", &target)
-        .output()
-        .expect("re-run the test binary in enforcement mode");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "enforcement mode failed\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("RESULT ") {
-            assert_eq!(rest, "OK", "landlock enforcement check reported: {rest}");
-            return;
+        // Child mode: apply the domain here and report, never run the suite.
+        if std::env::var_os(ENFORCE_ENV).is_some() {
+            run_landlock_enforcement_mode();
         }
+
+        let scratch = Scratch::new("enforce");
+        let (worktree, target) = (scratch.worktree(), scratch.target());
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+
+        // A file the domain must not be able to read, outside every granted rule.
+        let secret = home.join(".ssh");
+        let _ = std::fs::create_dir_all(&secret);
+        std::fs::write(secret.join("id_rsa"), b"PRIVATE KEY").expect("seed a decoy secret");
+
+        let out = Command::new(std::env::current_exe().expect("test binary path"))
+            // The child applies a domain that would break the harness itself, so
+            // the sentinel is set through a dedicated "run this test" filter.
+            .arg("--exact")
+            .arg("agent::sandbox::tests::landlock_actually_denies_paths_outside_the_sandbox")
+            .arg("--nocapture")
+            .env(ENFORCE_ENV, "1")
+            .env("LL_WORKTREE", &worktree)
+            .env("LL_TARGET", &target)
+            .output()
+            .expect("re-run the test binary in enforcement mode");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "enforcement mode failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("RESULT ") {
+                assert_eq!(rest, "OK", "landlock enforcement check reported: {rest}");
+                return;
+            }
+        }
+        panic!("enforcement mode produced no RESULT line\nstdout: {stdout}\nstderr: {stderr}");
     }
-    panic!("enforcement mode produced no RESULT line\nstdout: {stdout}\nstderr: {stderr}");
-}
 
-/// Child-process half of [`landlock_actually_denies_paths_outside_the_sandbox`].
-///
-/// `libtest` owns the process argument list, so the sentinel is consumed before
-/// the harness sees it and the checks run here instead of being reported as a
-/// test.
-fn run_landlock_enforcement_mode() -> ! {
-    let Some(worktree) = std::env::var_os("LL_WORKTREE").map(PathBuf::from) else {
-        eprintln!("enforcement mode needs LL_WORKTREE");
-        std::process::exit(2);
-    };
-    let Some(target) = std::env::var_os("LL_TARGET").map(PathBuf::from) else {
-        eprintln!("enforcement mode needs LL_TARGET");
-        std::process::exit(2);
-    };
+    /// Child-process half of [`landlock_actually_denies_paths_outside_the_sandbox`].
+    ///
+    /// `libtest` owns the process argument list, so the sentinel is consumed before
+    /// the harness sees it and the checks run here instead of being reported as a
+    /// test.
+    fn run_landlock_enforcement_mode() -> ! {
+        let Some(worktree) = std::env::var_os("LL_WORKTREE").map(PathBuf::from) else {
+            eprintln!("enforcement mode needs LL_WORKTREE");
+            std::process::exit(2);
+        };
+        let Some(target) = std::env::var_os("LL_TARGET").map(PathBuf::from) else {
+            eprintln!("enforcement mode needs LL_TARGET");
+            std::process::exit(2);
+        };
 
-    // Build the plan in the parent and apply it here, exactly as `exec.rs`
-    // does through the `pre_exec` hook. From here on the process is confined:
-    // anything outside the domain fails with EACCES.
-    let plan = match build_landlock_plan(&worktree, &target) {
-        Ok(Some(plan)) => plan,
-        Ok(None) => {
-            eprintln!("FAIL: this kernel cannot confine the process");
+        // Build the plan in the parent and apply it here, exactly as `exec.rs`
+        // does through the `pre_exec` hook. From here on the process is confined:
+        // anything outside the domain fails with EACCES.
+        let plan = match build_landlock_plan(&worktree, &target, false) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                eprintln!("FAIL: this kernel cannot confine the process");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("FAIL: could not build a landlock plan: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        // SAFETY: this child is single-threaded (it has not spawned anything yet)
+        // and `apply` performs only raw syscalls, so it is safe here.
+        if let Err(e) = unsafe { plan.apply() } {
+            eprintln!("FAIL: could not apply landlock: {e}");
             std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("FAIL: could not build a landlock plan: {e:#}");
-            std::process::exit(1);
-        }
-    };
-    // SAFETY: this child is single-threaded (it has not spawned anything yet)
-    // and `apply` performs only raw syscalls, so it is safe here.
-    if let Err(e) = unsafe { plan.apply() } {
-        eprintln!("FAIL: could not apply landlock: {e}");
-        std::process::exit(1);
-    }
 
         let mut failures: Vec<String> = Vec::new();
-        let mut check =
-            |what: &str, must_succeed: bool, outcome: std::io::Result<()>| match outcome {
-                Ok(()) if must_succeed => {}
-                Ok(()) => failures.push(format!("{what} was ALLOWED but must be denied")),
-                Err(e) if must_succeed => {
-                    failures.push(format!("{what} was denied ({e}) but must be allowed"));
-                }
-                // Denial is the desired outcome; Landlock reports EACCES.
-                Err(_) => {}
-            };
+        let mut check = |what: &str, must_succeed: bool, outcome: std::io::Result<()>| match outcome
+        {
+            Ok(()) if must_succeed => {}
+            Ok(()) => failures.push(format!("{what} was ALLOWED but must be denied")),
+            Err(e) if must_succeed => {
+                failures.push(format!("{what} was denied ({e}) but must be allowed"));
+            }
+            // Denial is the desired outcome; Landlock reports EACCES.
+            Err(_) => {}
+        };
 
         // Denied: the operator's private key material.
         check(
@@ -1598,6 +1819,523 @@ fn run_landlock_enforcement_mode() -> ! {
         for f in &failures {
             eprintln!("FAIL: {f}");
         }
-    std::process::exit(1);
+        std::process::exit(1);
+    }
 }
+
+// ----------
+// Seccomp syscall confinement
+// ----------
+
+/// `AUDIT_ARCH_X86_64`: the `arch` value the kernel reports for a 64-bit
+/// x86-64 task, as understood by `seccomp_data`.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_003E;
+/// `AUDIT_ARCH_AARCH64`: the same for a 64-bit ARM task.
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xC000_00B7;
+
+/// `SECCOMP_SET_MODE_FILTER`: install a BPF filter on the calling thread.
+const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+
+/// `SECCOMP_RET_ERRNO` ORed with an `errno` value: the syscall fails with that
+/// error instead of being killed. Chosen over `SECCOMP_RET_KILL_PROCESS`
+/// because a worker that trips a denied syscall must report a diagnosable
+/// error to the model, not vanish with no output.
+const fn seccomp_ret_errno(errno: libc::c_int) -> u32 {
+    libc::SECCOMP_RET_ERRNO | (errno as u32 & libc::SECCOMP_RET_DATA)
 }
+
+/// Byte offset of `nr` inside `struct seccomp_data`.
+const SECCOMP_DATA_NR_OFF: u32 = 0;
+/// Byte offset of `arch` inside `struct seccomp_data`.
+const SECCOMP_DATA_ARCH_OFF: u32 = 4;
+/// Byte offset of `args[0]` inside `struct seccomp_data`.
+const SECCOMP_DATA_ARG0_OFF: u32 = 16;
+
+/// `AF_INET`: IPv4, the address family whose sockets an offline worker must
+/// not create.
+const AF_INET: u32 = libc::AF_INET as u32;
+/// `AF_INET6`: IPv6, denied alongside IPv4 so a dual-stack host offers no
+/// fallback path.
+const AF_INET6: u32 = libc::AF_INET6 as u32;
+
+/// Namespace-creating flags shared by `clone(2)` and `unshare(2)`.
+///
+/// `CLONE_NEWTIME` is included because it grants control of the clock, which
+/// is a host-wide resource and not a per-process one.
+const CLONE_NS_FLAGS: u64 = (libc::CLONE_NEWNS as u64)
+    | (libc::CLONE_NEWUTS as u64)
+    | (libc::CLONE_NEWIPC as u64)
+    | (libc::CLONE_NEWUSER as u64)
+    | (libc::CLONE_NEWPID as u64)
+    | (libc::CLONE_NEWNET as u64)
+    | (libc::CLONE_NEWCGROUP as u64)
+    | (libc::CLONE_NEWTIME as u64);
+
+/// One classic-BPF instruction of a seccomp filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BpfInsn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+/// Emit an unconditional instruction.
+fn bpf_stmt(code: u16, k: u32) -> BpfInsn {
+    BpfInsn {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// Emit a conditional jump: `jt` instructions ahead when `A == k`, else `jf`.
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> BpfInsn {
+    BpfInsn { code, jt, jf, k }
+}
+
+/// `BPF_LD | BPF_W | BPF_ABS`: load a 32-bit word from the seccomp metadata.
+const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+/// `BPF_JMP | BPF_JEQ | BPF_K`: compare the accumulator against a constant.
+const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+/// `BPF_JMP | BPF_JGE | BPF_K`: unsigned `A >= k`.
+#[cfg(target_arch = "x86_64")]
+const BPF_JMP_JGE_K: u16 = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
+/// `__X32_SYSCALL_BIT`: set in the number of every x32-ABI syscall.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+/// `BPF_JMP | BPF_JSET | BPF_K`: test the accumulator against a bitmask.
+const BPF_JMP_JSET_K: u16 = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+/// `BPF_RET | BPF_K`: return a constant to the kernel.
+const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+
+/// A compiled seccomp filter, ready to install in a `pre_exec` hook.
+///
+/// # Why the BPF is built in the parent
+///
+/// A `pre_exec` closure runs between `fork(2)` and `exec(2)` in a child of a
+/// multi-threaded server, where only async-signal-safe operations are allowed.
+/// Building the instruction vector allocates, so the whole program is
+/// assembled here and the child is left with a pointer to a live `Vec` plus
+/// one `seccomp(2)` call - see [`SeccompFilter::apply`].
+#[derive(Clone)]
+pub struct SeccompFilter {
+    /// Classic-BPF instructions, in execution order.
+    program: Vec<BpfInsn>,
+    /// The same program in the kernel's `struct sock_filter` layout, built in
+    /// the parent so installing it in the child allocates nothing.
+    kernel_program: Vec<libc::sock_filter>,
+    /// Whether the filter denies `socket(AF_INET/AF_INET6, ...)`.
+    ///
+    /// Recorded so the caller (and a test) can see the offline policy without
+    /// re-deriving it from the instruction stream.
+    denies_inet_sockets: bool,
+}
+
+impl std::fmt::Debug for SeccompFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeccompFilter")
+            .field("instructions", &self.program.len())
+            .field("denies_inet_sockets", &self.denies_inet_sockets)
+            .finish()
+    }
+}
+
+impl SeccompFilter {
+    /// Build the filter for a worker's policy.
+    ///
+    /// `offline` adds the `socket(2)` rule that blocks IPv4/IPv6 socket
+    /// creation, which is what makes an offline worker unable to reach the
+    /// network without a network namespace.
+    pub fn build(offline: bool) -> Self {
+        Self::build_with(offline, &default_denied_syscalls())
+    }
+
+    /// The body of [`build`](Self::build), with the deny list as a parameter.
+    ///
+    /// Split out so a test can drive the *assembly* (jump offsets, the
+    /// architecture gate, the default-allow tail) against a synthetic list
+    /// instead of only against whatever the host kernel happens to number.
+    fn build_with(offline: bool, denied: &[(libc::c_long, u32)]) -> Self {
+        let mut program: Vec<BpfInsn> = Vec::with_capacity(denied.len() + 8);
+
+        // Architecture gate: the rules below are written in the native
+        // numbering, so a syscall made through another ABI (a 32-bit
+        // `int 0x80` call on x86-64 reports AUDIT_ARCH_I386) would match none
+        // of them. Allowing it would bypass the whole filter, so any foreign
+        // architecture is refused outright.
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFF));
+        program.push(bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_NATIVE, 1, 0));
+        program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::ENOSYS)));
+
+        // Load the syscall number once; every rule below compares against it.
+        program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFF));
+
+        // x32 ABI: on x86-64 the same AUDIT_ARCH carries x32 syscalls, whose
+        // numbers have `__X32_SYSCALL_BIT` set and therefore match no rule.
+        // Refuse them for the same reason as a foreign architecture.
+        #[cfg(target_arch = "x86_64")]
+        {
+            program.push(bpf_jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::ENOSYS)));
+        }
+
+        for (nr, action) in denied {
+            // `jt = 0` falls through to the next rule when the number does not
+            // match; `jf = 1` skips the single return that follows.
+            program.push(bpf_jump(BPF_JMP_JEQ_K, *nr as u32, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, *action));
+        }
+
+        // Namespace escapes through `clone(2)` and `unshare(2)`: both take the
+        // flags as their first argument, so the filter allows the call unless
+        // a namespace bit is set. Every namespace bit fits in the low word of
+        // the 64-bit argument, which is what classic BPF can load and test.
+        for nr in [libc::SYS_clone, libc::SYS_unshare] {
+            program.push(bpf_jump(BPF_JMP_JEQ_K, nr as u32, 0, 3));
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFF));
+            program.push(bpf_jump(BPF_JMP_JSET_K, CLONE_NS_FLAGS as u32, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
+            // The argument load clobbered the syscall number every later
+            // rule compares against, so load it back before continuing.
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFF));
+        }
+
+        // Offline policy: no IPv4 or IPv6 socket may be created at all. Both
+        // address families are checked, so a dual-stack host offers no
+        // fallback, and the check is on `socket(2)` rather than on
+        // `connect(2)` so UDP and raw sockets are covered too.
+        if offline {
+            program.push(bpf_jump(BPF_JMP_JEQ_K, libc::SYS_socket as u32, 0, 5));
+            program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFF));
+            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
+            program.push(bpf_jump(BPF_JMP_JEQ_K, AF_INET6, 0, 1));
+            program.push(bpf_stmt(BPF_RET_K, seccomp_ret_errno(libc::EPERM)));
+            // Not an INET family: fall through to the default allow.
+        }
+
+        // Default: everything not explicitly denied is allowed. A worker still
+        // has to compile, test and write files, so a default-deny filter would
+        // be an outage rather than a sandbox.
+        program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW));
+
+        let kernel_program = program
+            .iter()
+            .map(|insn| libc::sock_filter {
+                code: insn.code,
+                jt: insn.jt,
+                jf: insn.jf,
+                k: insn.k,
+            })
+            .collect();
+        Self {
+            program,
+            kernel_program,
+            denies_inet_sockets: offline,
+        }
+    }
+
+    /// Whether this filter blocks INET socket creation.
+    pub fn denies_inet_sockets(&self) -> bool {
+        self.denies_inet_sockets
+    }
+
+    /// Number of BPF instructions in the compiled program.
+    pub fn instruction_count(&self) -> usize {
+        self.program.len()
+    }
+
+    /// Install the filter on the calling thread.
+    ///
+    /// # Safety
+    ///
+    /// Only sound between `fork(2)` and `exec(2)`, where the calling process
+    /// is single-threaded by construction. Performs a single `seccomp(2)`
+    /// syscall against a live, correctly sized `sock_fprog`: it allocates
+    /// nothing, takes no lock and never unwinds, so it is async-signal-safe.
+    ///
+    /// Requires `PR_SET_NO_NEW_PRIVS` to have been set first; the kernel
+    /// refuses `SECCOMP_SET_MODE_FILTER` without it.
+    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+        // The kernel-layout program was built in the parent (see `build_with`):
+        // converting it here would allocate after the fork. `seccomp(2)` only
+        // reads through the pointer, so the shared borrow is enough.
+        let prog = libc::sock_fprog {
+            len: self.kernel_program.len() as libc::c_ushort,
+            filter: self.kernel_program.as_ptr().cast_mut(),
+        };
+
+        // SAFETY: `prog` names `len` live instructions owned by this function,
+        // and `seccomp(2)` only reads them. The mode and flags are the
+        // documented filter-installation values.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER as libc::c_long,
+                0,
+                &prog as *const libc::sock_fprog as libc::c_long,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Syscalls a sandboxed worker may not call, each paired with the seccomp
+/// action the kernel should take.
+///
+/// Every entry is a `SECCOMP_RET_ERRNO` action rather than a kill: a worker
+/// that trips one of these must produce a diagnosable failure for the model,
+/// and a `SIGSYS` would take the whole step down with no output at all. The
+/// `SECCOMP_RET_*` wrapper matters: a bare errno as the action falls into the
+/// `SECCOMP_RET_KILL_THREAD` range and kills the process.
+///
+/// The list is deliberately about *privilege and cross-process reach*, not
+/// about the filesystem (Landlock owns that) or scheduling (the timeout layer
+/// owns that).
+fn default_denied_syscalls() -> Vec<(libc::c_long, u32)> {
+    /// Deny with `EPERM`: the operation is not permitted for this worker.
+    const EPERM: u32 = seccomp_ret_errno(libc::EPERM);
+    /// Deny with `ENOSYS`: pretend the syscall does not exist. Used for
+    /// `clone3` so `glibc`'s `clone` fallback runs instead, where the flags
+    /// can actually be inspected.
+    const ENOSYS: u32 = seccomp_ret_errno(libc::ENOSYS);
+
+    let denied: &[(libc::c_long, u32)] = &[
+        // Inspecting or driving another process's memory and registers.
+        (libc::SYS_ptrace, EPERM),
+        (libc::SYS_process_vm_readv, EPERM),
+        (libc::SYS_process_vm_writev, EPERM),
+        // Mounting: a worker must not reshape the host's mount table.
+        (libc::SYS_mount, EPERM),
+        (libc::SYS_umount2, EPERM),
+        (libc::SYS_pivot_root, EPERM),
+        (libc::SYS_move_mount, EPERM),
+        (libc::SYS_fsopen, EPERM),
+        (libc::SYS_fsmount, EPERM),
+        (libc::SYS_open_tree, EPERM),
+        // Loading kernel code.
+        (libc::SYS_kexec_load, EPERM),
+        (libc::SYS_kexec_file_load, EPERM),
+        (libc::SYS_init_module, EPERM),
+        (libc::SYS_finit_module, EPERM),
+        (libc::SYS_delete_module, EPERM),
+        // Attaching to kernel tracing and key management.
+        (libc::SYS_bpf, EPERM),
+        (libc::SYS_perf_event_open, EPERM),
+        (libc::SYS_keyctl, EPERM),
+        (libc::SYS_add_key, EPERM),
+        (libc::SYS_request_key, EPERM),
+        // Memory-management tricks that can pin or corrupt host pages.
+        (libc::SYS_userfaultfd, EPERM),
+        // Power and swap state are host-wide.
+        (libc::SYS_reboot, EPERM),
+        (libc::SYS_swapon, EPERM),
+        (libc::SYS_swapoff, EPERM),
+        // Raw I/O port access.
+        (libc::SYS_iopl, EPERM),
+        (libc::SYS_ioperm, EPERM),
+        // Entering another namespace, or building a new one.
+        (libc::SYS_setns, EPERM),
+        (libc::SYS_unshare, EPERM),
+        // io_uring performs socket, connect and file operations without the
+        // corresponding syscalls, so it would bypass the offline socket rule.
+        (libc::SYS_io_uring_setup, EPERM),
+        (libc::SYS_io_uring_enter, EPERM),
+        (libc::SYS_io_uring_register, EPERM),
+        // Duplicating another process's file descriptors.
+        (libc::SYS_pidfd_getfd, EPERM),
+    ];
+
+    let mut denied = denied.to_vec();
+    // `clone3` carries its flags in a userspace struct the filter cannot read,
+    // so it is answered with `ENOSYS` and libc falls back to `clone`, whose
+    // flags are a plain argument the namespace rule can inspect.
+    denied.push((libc::SYS_clone3, ENOSYS));
+    denied
+}
+
+/// Whether this host's kernel can install a seccomp filter at all.
+///
+/// `PR_GET_SECCOMP` reports the thread's current mode; `-1` means the
+/// `prctl` itself is unknown, which is how a kernel built without
+/// `CONFIG_SECCOMP` answers. Probing in the parent keeps the child's hook
+/// free of a decision it cannot report.
+fn seccomp_supported() -> bool {
+    // SAFETY: `prctl(PR_GET_SECCOMP)` takes one argument and reads nothing.
+    let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+    mode >= 0
+}
+
+/// Harden the calling process after confinement is installed.
+///
+/// * `PR_SET_PDEATHSIG(SIGKILL)` dies with the parent, replacing bubblewrap's
+///   `--die-with-parent`. The `getppid` re-check closes the fork race: when
+///   the parent died before the `prctl`, the child was already reparented and
+///   the death signal would never fire, so the spawn is aborted instead.
+/// * `PR_SET_DUMPABLE(0)` keeps the worker's memory out of other users'
+///   debuggers and core dumps.
+/// * `RLIMIT_CORE=0` stops the worker from writing core files into the
+///   worktree, where the model could read them back.
+///
+/// # Safety
+///
+/// Only sound between `fork(2)` and `exec(2)`: `prctl`, `getppid` and
+/// `setrlimit` are async-signal-safe raw syscalls that allocate nothing.
+unsafe fn apply_process_hardening(parent_pid: u32) -> std::io::Result<()> {
+    // SAFETY: `prctl(PR_SET_PDEATHSIG)` takes plain integers.
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The parent may have died between the fork and the `prctl above`, in
+    // which case this process was reparented and the death signal is armed
+    // against the wrong pid. Aborting the spawn is the only safe answer: the
+    // daemon is going away anyway.
+    //
+    // SAFETY: `getppid` takes no argument and reads nothing.
+    if unsafe { libc::getppid() } as u32 != parent_pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "worker parent died before the death signal was armed",
+        ));
+    }
+    // SAFETY: `prctl(PR_SET_DUMPABLE)` takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `no_core` is a live struct the kernel only reads.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The whole kernel backend for one worker step, prepared in the parent.
+///
+/// Landlock owns the filesystem, seccomp owns the syscalls, and the hardening
+/// owns the process itself; all three install from the same `pre_exec` hook.
+/// Either half may be absent - no Landlock on this kernel, no seccomp without
+/// `CONFIG_SECCOMP` - and the hook installs whatever is present. `None` for
+/// both means the caller registers no hook at all.
+#[derive(Debug)]
+pub struct KernelConfinement {
+    landlock: Option<LandlockPlan>,
+    seccomp: Option<SeccompFilter>,
+    parent_pid: u32,
+}
+
+impl KernelConfinement {
+    /// Prepare confinement for `worktree`/`target_dir` under `offline`.
+    ///
+    /// Returns `Ok(None)` when this kernel offers neither Landlock nor
+    /// seccomp, so the caller can fall back to bubblewrap or run unconfined.
+    /// A malformed policy (a missing root) stays an `Err`.
+    pub fn prepare(worktree: &Path, target_dir: &Path, offline: bool) -> Result<Option<Self>> {
+        if landlock_disabled() {
+            tracing::debug!("kernel confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
+            return Ok(None);
+        }
+        let landlock = build_landlock_plan(worktree, target_dir, offline)?;
+        let seccomp = seccomp_supported().then(|| SeccompFilter::build(offline));
+        if landlock.is_none() && seccomp.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            landlock,
+            seccomp,
+            // The pid the `pre_exec` child checks its parent against, so a
+            // parent that died in between aborts the spawn instead of running
+            // with no death signal armed.
+            parent_pid: std::process::id(),
+        }))
+    }
+
+    /// Whether this kernel can confine a worker at all: Landlock, seccomp,
+    /// or both. Neither `lsm=` without `landlock` nor a kernel built without
+    /// `CONFIG_SECCOMP` confines anything, and the caller must know that
+    /// before choosing the backend.
+    pub fn probe_available() -> bool {
+        if landlock_disabled() {
+            return false;
+        }
+        query_abi_version().is_some() || seccomp_supported()
+    }
+
+    /// Whether a Landlock domain is part of this confinement.
+    pub fn has_landlock(&self) -> bool {
+        self.landlock.is_some()
+    }
+
+    /// Whether a seccomp filter is part of this confinement.
+    pub fn has_seccomp(&self) -> bool {
+        self.seccomp.is_some()
+    }
+
+    /// Install every prepared layer on the calling process: the filesystem
+    /// domain, then the syscall filter, then hardening.
+    ///
+    /// # Safety
+    ///
+    /// Only sound between `fork(2)` and `exec(2)`, where the calling process
+    /// is single-threaded by construction. Every step is async-signal-safe,
+    /// but the Landlock half is irreversible.
+    pub(crate) unsafe fn apply(&self) -> std::io::Result<()> {
+        if self.landlock.is_none() {
+            // The Landlock half sets `no_new_privs` itself before restricting;
+            // without it the seccomp half needs the flag set explicitly, as
+            // the kernel refuses `SECCOMP_SET_MODE_FILTER` without it.
+            //
+            // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS)` takes plain integers and
+            // is async-signal-safe.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if let Some(plan) = &self.landlock {
+            // SAFETY: forwarded from this function's contract; the plan holds
+            // only pre-resolved paths and raw-syscall installation.
+            unsafe { plan.apply()? };
+        }
+        if let Some(filter) = &self.seccomp {
+            // SAFETY: forwarded from this function's contract; the filter is
+            // a pre-built instruction vector installed with one syscall.
+            unsafe { filter.apply()? };
+        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { apply_process_hardening(self.parent_pid) }
+    }
+}
+
+/// `LANDLOCK_SCOPE_SIGNAL`: restrict signalling to the caller's own domain.
+const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 0;
+/// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: restrict abstract-socket reach.
+const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 1;
+
+/// `LANDLOCK_ACCESS_NET_BIND_TCP`: binding a TCP socket.
+const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+/// `LANDLOCK_ACCESS_NET_CONNECT_TCP`: connecting a TCP socket.
+const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+
+/// Landlock ABI that introduced the network access rights.
+const ABI_NET: i64 = 4;
+/// Landlock ABI that introduced the `scoped` ruleset attribute.
+const ABI_SCOPE: i64 = 6;

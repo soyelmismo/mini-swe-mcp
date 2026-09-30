@@ -15,7 +15,7 @@ use mini_swe_mcp::agent::sandbox::{
 fn sandbox_module_is_exported_with_its_opt_out_knob() {
     assert_eq!(DISABLE_LANDLOCK_ENV, "SWE_DISABLE_LANDLOCK");
     // Referencing the plan builder is enough: it must be nameable from outside.
-    let _f: fn(&Path, &Path) -> anyhow::Result<Option<LandlockPlan>> = build_landlock_plan;
+    let _f: fn(&Path, &Path, bool) -> anyhow::Result<Option<LandlockPlan>> = build_landlock_plan;
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn a_missing_worktree_is_an_error_for_external_callers() {
     let missing = std::env::temp_dir().join("landlock-it-does-not-exist");
     assert!(!missing.exists());
     let target = std::env::temp_dir();
-    let err = build_landlock_plan(&missing, &target).unwrap_err();
+    let err = build_landlock_plan(&missing, &target, false).unwrap_err();
     assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
 }
 
@@ -92,7 +92,7 @@ impl Drop for Roots {
 fn the_plan_builder_is_exported_and_degrades_instead_of_failing() {
     let roots = Roots::new("plan");
     let built: anyhow::Result<Option<LandlockPlan>> =
-        build_landlock_plan(&roots.worktree, &roots.target);
+        build_landlock_plan(&roots.worktree, &roots.target, false);
     let plan = built.expect("a Landlock-capable kernel must not fail to build a plan");
 
     // Either a plan, or a documented skip. Both are acceptable; a panic is not.
@@ -117,7 +117,7 @@ fn the_plan_builder_is_exported_and_degrades_instead_of_failing() {
 fn a_missing_root_is_reported_rather_than_producing_an_empty_plan() {
     let roots = Roots::new("missing");
     let missing = roots.worktree.join("nope");
-    let err = build_landlock_plan(&missing, &roots.target).unwrap_err();
+    let err = build_landlock_plan(&missing, &roots.target, false).unwrap_err();
     assert!(
         format!("{err:#}").contains("does not exist"),
         "a missing worktree must be reported, got: {err:#}"
@@ -219,7 +219,7 @@ fn run_exec_confined_probe() -> ! {
 
     // No plan means this kernel cannot confine at all; that is the documented
     // degradation, not a failure.
-    match build_landlock_plan(&worktree, &target) {
+    match build_landlock_plan(&worktree, &target, false) {
         Ok(None) => {
             println!("NO_LANDLOCK");
             std::process::exit(0);
