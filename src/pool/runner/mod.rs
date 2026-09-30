@@ -45,6 +45,7 @@ mod pause;
 mod review;
 mod sentinels;
 mod turn;
+pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,

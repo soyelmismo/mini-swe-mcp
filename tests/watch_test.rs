@@ -6,6 +6,8 @@ use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
+use mini_swe_mcp::cli::watch;
+use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -324,4 +326,111 @@ async fn the_binary_watches_through_the_hub() {
     assert_eq!(output.status.code(), Some(3), "{}", String::from_utf8_lossy(&output.stdout));
     task.abort();
     let _ = task.await;
+}
+
+#[test]
+fn one_watch_call_replays_every_missed_event() {
+    let dir = common::TempDir::new_in_tmp("watch-replay");
+    let registry = dir.path().join("swe-registry");
+    std::fs::create_dir_all(&registry).expect("create the scratch registry");
+    // The registry prunes a terminal row with neither a worktree nor a branch,
+    // so each missed worker leaves the branch its torn-down worktree pushed.
+    let repo = dir.subdir("repo");
+    common::git(&repo, &["init", "-q", "-b", "main"]);
+    common::git(&repo, &["config", "user.email", "test@example.invalid"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("write the base file");
+    common::git(&repo, &["add", "-A"]);
+    common::git(&repo, &["commit", "-qm", "base"]);
+    for id in ["w-first", "w-second"] {
+        let branch = format!("worker-{id}");
+        common::git(&repo, &["checkout", "-q", "-b", &branch, "main"]);
+        std::fs::write(repo.join(format!("{id}.txt")), format!("{id}\n")).expect("write");
+        common::git(&repo, &["add", "-A"]);
+        common::git(&repo, &["commit", "-qm", &branch]);
+        common::git(&repo, &["checkout", "-q", "main"]);
+        let row = serde_json::json!({
+            "id": id, "pid": std::process::id(), "task": "t", "model": "test",
+            "status": "completed", "step": 2, "max_turns": 10,
+            "last_command": "cargo test", "started_at": 1, "updated_at": 1_700_000_000u64,
+            "owner": "agent-a", "repo_path": repo.to_string_lossy(),
+        })
+        .to_string();
+        std::fs::write(registry.join(format!("{id}.json")), row).expect("write the row");
+    }
+
+    let exe = common::binary_path();
+    let output = std::process::Command::new(&exe)
+        .args(["--json", "watch", "w-first", "w-second"])
+        .current_dir(dir.path())
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("SWE_TEMP_DIR", dir.path())
+        .env("MINI_SWE_AGENT_ID", "agent-a")
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join(".config"))
+        .env("ENV_FILE", dir.path().join(".env.does-not-exist"))
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+    let stdout = common::stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "one call must exit 0: {stdout}{}",
+        common::stderr_of(&output)
+    );
+    let replayed: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| event["worker_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        replayed.contains(&"w-first".to_string()) && replayed.contains(&"w-second".to_string()),
+        "one call must replay every missed event: {stdout}"
+    );
+}
+
+#[test]
+fn torn_down_worker_diff_stat_comes_from_its_branch() {
+    let dir = common::TempDir::new_in_tmp("watch-branch");
+    let repo = dir.subdir("repo");
+    common::git(&repo, &["init", "-q", "-b", "main"]);
+    common::git(&repo, &["config", "user.email", "test@example.invalid"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("write the base file");
+    common::git(&repo, &["add", "-A"]);
+    common::git(&repo, &["commit", "-qm", "base"]);
+    common::git(&repo, &["checkout", "-q", "-b", "worker-w-gone"]);
+    std::fs::write(repo.join("one.txt"), "one\n").expect("write");
+    std::fs::write(repo.join("two.txt"), "two\n").expect("write");
+    common::git(&repo, &["add", "-A"]);
+    common::git(&repo, &["commit", "-qm", "work"]);
+    // The worker's worktree is gone; the repo sits back on its base branch.
+    common::git(&repo, &["checkout", "-q", "main"]);
+
+    let entry = WorkerRegistryEntry {
+        id: "w-gone".to_string(),
+        pid: std::process::id(),
+        task: "fix the parser".to_string(),
+        model: "test".to_string(),
+        status: RegistryStatus::Completed,
+        step: 2,
+        max_turns: 10,
+        last_command: "cargo test".to_string(),
+        question: None,
+        started_at: 0,
+        updated_at: 0,
+        group: None,
+        repo_path: Some(repo.to_string_lossy().to_string()),
+        owner: Some("agent-a".to_string()),
+        metrics: WorkerMetrics::default(),
+        base_branch: Some("main".to_string()),
+        base_commit: None,
+        revision: 0,
+        auto_continues: 0,
+    };
+    let now = 1_700_000_000;
+    let view = watch::registry_snapshot(&entry, now);
+    let event = watch::select_event(&view, None, now).expect("a completed worker yields an event");
+    let text = watch::render(&event);
+    assert!(text.contains("Diff: 2 files, +2 -0"), "{text}");
 }
