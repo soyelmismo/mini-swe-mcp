@@ -1186,8 +1186,8 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     let assistants: Vec<_> = final_messages.iter().filter(|m| m["role"] == "assistant").collect();
     assert_eq!(assistants.len(), 40);
     for (i, assistant) in assistants.iter().enumerate() {
-        // Nine 16 KB results fit the budget, plus the current unanswered assistant.
-        if i < 30 {
+        // Nine 16 KB results, including their wrappers, fit the byte budget.
+        if i < 31 {
             assert!(assistant["reasoning_content"].as_str().unwrap().ends_with(" [reasoning elided]"));
             assert!(assistant["content"].as_str().unwrap().ends_with(" [prose elided]"));
         } else {
