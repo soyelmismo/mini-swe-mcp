@@ -59,8 +59,10 @@ pub use self::runner::{
     parse_request_turns, summarize_command,
 };
 pub use self::revision::{
-    DEFAULT_REVISION_TURNS, REVISION_PREFIX, WorkerHistory, history_path, is_replayable,
-    load_worker_history, prune_orphan_histories, remove_worker_history, save_worker_history,
+    CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
+    WorkerHistory, append_history_message, history_log_path, history_path, is_replayable,
+    load_worker_history, load_worker_history_log, prune_orphan_histories, remove_worker_history,
+    save_worker_history,
 };
 pub use self::runner::RunConfig;
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
@@ -72,6 +74,17 @@ pub use self::state::{
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
 use crate::worktree::WorktreeGuard;
+
+/// Whether `id`'s registry row is live in a process other than this one.
+///
+/// The on-disk steer mailbox is only written for such a worker: a row whose
+/// pid is dead (or is this process, which already holds the worker map) has
+/// nobody to drain it, so the message continues the worker instead.
+fn registry_row_live_elsewhere(id: &str) -> bool {
+    load_registry_entry(id).is_some_and(|e| {
+        e.status.is_live() && e.pid != std::process::id() && crate::worktree::is_process_alive(e.pid)
+    })
+}
 
 /// Guidance appended to every terminal payload and channel event.
 ///
@@ -675,49 +688,53 @@ impl WorkerPool {
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
     /// `max_turns` argument): a finished worker restarts its loop from this
     /// many turns instead of [`DEFAULT_REVISION_TURNS`].
+    ///
+    /// Returns what it did, so the reply can only claim what happened: a live
+    /// worker was `Queued` or `Resumed`, a stopped one was `Continuing` -- as
+    /// a revision of its saved conversation, or cold when none survived.
     pub async fn steer_with_budget(
         &self,
         id: &str,
         message: String,
         revision_turns: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<SteerOutcome> {
         let tx_opt = {
             let mut lock = self.workers.write().await;
             let Some(w) = lock.get_mut(id) else {
                 drop(lock);
-                // Not in this process. A finished worker (its record reaped,
-                // or the hub restarted) still has its history file: unless a
-                // live process owns the row, the message relaunches it here as
-                // a revision on the same id and branch.
-                let owned_elsewhere =
-                    load_registry_entry(id).is_some_and(|e| !e.status.is_terminal());
-                if !owned_elsewhere && revision::history_path(id).is_file() {
-                    return self.revise(id, message, revision_turns).await;
+                // Not in this process. The mailbox is only for a worker whose
+                // registry row is live in another process: writing to one
+                // nobody reads would silently swallow the guidance.
+                if registry_row_live_elsewhere(id) {
+                    // Queue it in the on-disk mailbox for the owning process
+                    // (a blocking write, so outside the lock).
+                    let path = write_steer_message(id, &message).map_err(|e| {
+                        anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
+                    })?;
+                    info!(
+                        worker = %id,
+                        path = %path.display(),
+                        "Worker not in this process; steering message queued to mailbox"
+                    );
+                    return Ok(SteerOutcome::Queued);
                 }
-                // Otherwise queue it in the on-disk mailbox for the owning
-                // process (a blocking write, so outside the lock).
-                let path = write_steer_message(id, &message).map_err(|e| {
-                    anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
-                })?;
-                info!(
-                    worker = %id,
-                    path = %path.display(),
-                    "Worker not in this process; steering message queued to mailbox"
-                );
-                return Ok(());
+                // No live owner: the worker stopped for any reason -- completed,
+                // failed, killed, or interrupted by a hub crash -- and is
+                // continued here on its own id and branch.
+                return self.continue_worker(id, message, revision_turns).await;
             };
             match &w.state {
                 WorkerState::Running { .. } => {
                     w.pending_steer.push(message);
-                    return Ok(());
+                    return Ok(SteerOutcome::Queued);
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
                 WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
                     // A finished worker cannot be resumed mid-turn -- it has no
-                    // turn left -- so the message becomes a revision below,
-                    // outside the guard.
+                    // turn left -- so the message continues it below, outside
+                    // the guard.
                     drop(lock);
-                    return self.revise(id, message, revision_turns).await;
+                    return self.continue_worker(id, message, revision_turns).await;
                 }
             }
             // write-guard released here, before any `.await`
@@ -732,7 +749,44 @@ impl WorkerPool {
         // Send without holding the lock: the worker needs the write-guard to
         // transition back to `Running` right after `rx.recv().await`.
         let _ = tx.send(message).await;
-        Ok(())
+        Ok(SteerOutcome::Resumed)
+    }
+
+    /// The commit a continuation measures its diff from: the recorded base,
+    /// else the merge-base of the branch with the base branch.
+    ///
+    /// A history saved before base-branch tracking existed names no
+    /// `base_branch`, and a legacy worker may name no `base_commit` either, so
+    /// the merge-base with the branch the repo has checked out is the honest
+    /// answer. `None` when neither can be resolved.
+    pub(crate) async fn resolve_continuation_base(
+        repo_path: &std::path::Path,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Option<String> {
+        let base_branch = base_branch
+            .map(str::to_string)
+            .or_else(|| revision::detect_base_branch(repo_path))?;
+        let repo = repo_path.to_path_buf();
+        let base_branch = base_branch.clone();
+        let branch = branch.to_string();
+        tokio::task::spawn_blocking(move || {
+            let out = crate::worktree::git(
+                &repo,
+                "merge-base",
+                &["merge-base", &base_branch, &branch],
+            )
+            .ok()?;
+            out.status.success().then(|| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .to_string()
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
     }
 
     /// Record where a running worker's worktree lives.

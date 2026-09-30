@@ -429,7 +429,214 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
 
 use super::runner::WorkerLaunchConfig;
 
+/// What [`WorkerPool::steer_with_budget`] actually did, so the reply can only
+/// claim what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// A running worker took the message: it is applied on its next step.
+    Queued,
+    /// A paused worker was resumed with the message.
+    Resumed,
+    /// A stopped worker was continued on its own id and branch. `revision`
+    /// counts the run; `cold` is true when the conversation had to be rebuilt
+    /// from the registry row because no history survived.
+    Continuing {
+        revision: usize,
+        cold: bool,
+    },
+}
+
+impl SteerOutcome {
+    /// The verb the reply uses: `steered`, `resumed`, `revising` or
+    /// `continuing`. A cold continuation is a continuation, not a revision --
+    /// nothing was replayed.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Queued => "steered",
+            Self::Resumed => "resumed",
+            Self::Continuing { cold: true, .. } => "continuing",
+            Self::Continuing { .. } => "revising",
+        }
+    }
+}
+
+/// Revision counter of a [`SteerOutcome::Continuing`], for the reply.
+fn outcome_revision(outcome: &SteerOutcome) -> usize {
+    match outcome {
+        SteerOutcome::Continuing { revision, .. } => *revision,
+        _ => 0,
+    }
+}
+
 impl super::WorkerPool {
+    /// Continue a stopped worker `id` with `message`, whatever stopped it.
+    ///
+    /// With a surviving conversation the worker is revised on its own branch
+    /// (the [`REVISION_PREFIX`] path after a completed review, the
+    /// [`CONTINUE_PREFIX`] path after anything else). Without one -- a legacy
+    /// worker, or one whose log was lost -- it is continued cold: the same id
+    /// and branch, a fresh conversation that names the work the branch already
+    /// holds. Only a missing branch is an error.
+    pub async fn continue_worker(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> anyhow::Result<SteerOutcome> {
+        match super::load_worker_history(id) {
+            Ok(mut history) => {
+                let repo_path = std::path::PathBuf::from(&history.repo_path);
+                // A history from before base-branch tracking would never sync
+                // the base before completing; detect and store it now.
+                let detected = ensure_base_branch(&mut history, &repo_path).await;
+                let reason = super::load_registry_entry(id)
+                    .map(|e| e.status)
+                    .unwrap_or(super::RegistryStatus::Stopped);
+                let prefix = match reason {
+                    super::RegistryStatus::Completed => REVISION_PREFIX.to_string(),
+                    other => format!(
+                        "{CONTINUE_PREFIX} ({reason}). Orchestrator:",
+                        reason = other.display_name()
+                    ),
+                };
+                let outcome = self
+                    .revise_with_prefix(id, history, prefix, message, revision_turns)
+                    .await?;
+                if let Some(branch) = detected {
+                    // Persist the detected base branch on the row so the next
+                    // continuation and every reader see it.
+                    self.record_base_branch(id, &branch);
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    worker = %id,
+                    error = %e,
+                    "No surviving conversation; continuing the worker cold"
+                );
+                self.cold_continue(id, message, revision_turns).await
+            }
+        }
+    }
+
+    /// Store the base branch detected during a continuation on the registry
+    /// row, so the pre-completion base sync keeps running for that worker.
+    fn record_base_branch(&self, id: &str, base_branch: &str) {
+        let base_branch = base_branch.to_string();
+        let id = id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut entry) = super::load_registry_entry(&id) else {
+                return;
+            };
+            if entry.base_branch.as_deref() == Some(base_branch.as_str()) {
+                return;
+            }
+            entry.base_branch = Some(base_branch);
+            super::save_registry_entry(&entry);
+        })
+        .await;
+    }
+
+    /// Continue a worker with no surviving conversation: same id, same branch,
+    /// a fresh conversation built from the registry row.
+    ///
+    /// The registry row still names the task, the model and the branch, so the
+    /// fresh conversation is the system prompt, the original task, a note that
+    /// the branch already holds the previous attempt's work, and the steer
+    /// message. Only a missing branch is an error.
+    async fn cold_continue(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> anyhow::Result<SteerOutcome> {
+        let entry = super::load_registry_entry(id).with_context(|| {
+            format!(
+                "Worker {id} has no saved conversation and no registry row, so it cannot be continued"
+            )
+        })?;
+        let repo_path = entry
+            .repo_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .with_context(|| {
+                format!("Repository of worker {id} no longer exists; it cannot be continued")
+            })?;
+        let branch = format!("worker-{id}");
+        // Fail fast when the branch is gone, before anything is relaunched:
+        // this is the one condition a continuation cannot work around.
+        {
+            let repo = repo_path.clone();
+            let reference = format!("refs/heads/{branch}");
+            let exists = tokio::task::spawn_blocking(move || {
+                crate::worktree::git(
+                    &repo,
+                    "show-ref",
+                    &["show-ref", "--verify", "--quiet", &reference],
+                )
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !exists {
+                anyhow::bail!("branch {branch} no longer exists");
+            }
+        }
+
+        let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
+        if max_turns == 0 {
+            anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
+        }
+
+        let system = crate::manifest::build_system_prompt(&repo_path, &entry.model);
+        let base_branch = detect_base_branch(&repo_path);
+        // The base the diff is measured from: the recorded one, else the
+        // merge-base of the branch with the base branch.
+        let base_commit = super::resolve_continuation_base(&repo_path, &branch, base_branch.as_deref())
+            .await
+            .unwrap_or_else(|| entry.base_commit.clone().unwrap_or_default());
+        let task = entry.task.clone();
+        let conversation = format!(
+            "{system}\n\n\
+             The task you were dispatched with:\n{task}\n\n\
+             CONTINUATION: your previous run stopped ({reason}) without finishing, and its \
+             conversation was not saved. The branch `{branch}` still holds the work that run \
+             left behind -- start by reading it:\n  \
+             git log --oneline <base>..HEAD\n  \
+             git diff <base>...HEAD --stat\n\
+             then continue from there. The orchestrator's message:\n{message}",
+            reason = entry.status.display_name(),
+        );
+        let history = WorkerHistory {
+            worker_id: id.to_string(),
+            task,
+            model: entry.model.clone(),
+            temperature: None,
+            repo_path: repo_path.to_string_lossy().to_string(),
+            branch: branch.clone(),
+            base_commit,
+            base_branch,
+            review_after: None,
+            network_offline: false,
+            verify: Vec::new(),
+            revision: entry.revision,
+            auto_continues: 0,
+            owner: entry.owner.clone(),
+            group: entry.group.clone(),
+            messages: vec![ChatMessage::text(crate::agent::Role::User, conversation)],
+        };
+        let outcome = self
+            .revise_with_prefix(id, history, String::new(), String::new(), Some(max_turns))
+            .await?;
+        Ok(SteerOutcome::Continuing {
+            revision: outcome_revision(&outcome),
+            cold: true,
+        })
+    }
+
     /// Relaunch a finished worker as a revision: same id, same branch, full
     /// context plus the orchestrator's corrections.
     ///
@@ -453,6 +660,39 @@ impl super::WorkerPool {
         revision_turns: Option<usize>,
     ) -> anyhow::Result<()> {
         let mut history = super::load_worker_history(id)?;
+        let repo_path = std::path::PathBuf::from(&history.repo_path);
+        // A history from before base-branch tracking would never sync the base
+        // before completing; detect and store it here too.
+        let detected = ensure_base_branch(&mut history, &repo_path).await;
+        let outcome = self
+            .revise_with_prefix(
+                id,
+                history,
+                REVISION_PREFIX.to_string(),
+                message,
+                revision_turns,
+            )
+            .await?;
+        if let Some(branch) = detected {
+            self.record_base_branch(id, &branch);
+        }
+        let _ = outcome;
+        Ok(())
+    }
+
+    /// [`WorkerPool::revise`] with an explicit conversation and message prefix.
+    ///
+    /// A completed worker is revised with [`REVISION_PREFIX`]; one that stopped
+    /// for any other reason is continued with [`CONTINUE_PREFIX`], which names
+    /// the reason so the model knows what it is picking up from.
+    pub(crate) async fn revise_with_prefix(
+        &self,
+        id: &str,
+        mut history: WorkerHistory,
+        prefix: String,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> anyhow::Result<SteerOutcome> {
         let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
         if max_turns == 0 {
             anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
@@ -489,10 +729,12 @@ impl super::WorkerPool {
             }
         }
 
-        history.messages.push(ChatMessage::text(
-            crate::agent::Role::User,
-            format!("{REVISION_PREFIX}\n{message}"),
-        ));
+        if !prefix.is_empty() {
+            history.messages.push(ChatMessage::text(
+                crate::agent::Role::User,
+                format!("{prefix}\n{message}"),
+            ));
+        }
         history.max_turns = max_turns;
         history.revision += 1;
         let revision = history.revision;
@@ -620,7 +862,10 @@ impl super::WorkerPool {
         }
         super::save_registry_entry(&row);
         tracing::info!(worker = %id, revision, max_turns, "Worker revision started");
-        Ok(())
+        Ok(SteerOutcome::Continuing {
+            revision,
+            cold: false,
+        })
     }
 }
 
