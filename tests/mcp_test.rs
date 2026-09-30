@@ -1601,6 +1601,8 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     save_registry_entry(&synthetic_registry_row(&worker_id, RegistryStatus::Running));
 
     let mut server = McpProcess::spawn();
+    server.send(&json!({"jsonrpc": "2.0", "method": "hub/hello",
+        "params": {"agent_id": "registry-owner"}}));
     server.initialize();
     let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
     paused.question = Some(String::from("Ship the migration or roll it back?"));

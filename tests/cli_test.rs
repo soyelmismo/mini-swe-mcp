@@ -401,3 +401,85 @@ fn test_cli_wait_rejects_a_malformed_timeout() {
         "stderr should explain the expected value: {stderr}"
     );
 }
+
+/// `status --line` is the Claude Code statusLine probe: one registry-only line
+/// that never auto-starts the hub daemon.
+#[test]
+fn test_cli_status_line_never_autostarts_the_hub() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let exe = binary_path();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("test-status-line-{}-{nanos}", std::process::id()));
+    let hub = root.join("hub");
+    let swe = root.join("swe");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&hub).expect("create the scratch hub dir");
+    std::fs::create_dir_all(swe.join("swe-registry")).expect("create the scratch registry");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the scratch hub dir to 0700");
+        std::fs::set_permissions(&swe, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the scratch swe dir to 0700");
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    // One live worker and one recent completion; the line names both buckets.
+    let registry = |id: &str, status: &str, updated_at: u64| {
+        format!(
+            r#"{{"id":"{id}","pid":{},"task":"t","model":"ninja","status":"{status}","step":1,"max_turns":10,"last_command":"done","started_at":1,"updated_at":{updated_at}}}"#, std::process::id()
+        )
+    };
+    std::fs::write(
+        swe.join("swe-registry").join("line-live.json"),
+        registry("line-live", "running", now),
+    )
+    .expect("write the live row");
+    std::fs::write(
+        swe.join("swe-registry").join("line-done.json"),
+        registry("line-done", "completed", now),
+    )
+    .expect("write the done row");
+
+    let run = |args: &[&str]| {
+        Command::new(&exe)
+            .args(args)
+            .env("SWE_HUB_DIR", &hub)
+            .env("SWE_TEMP_DIR", &swe)
+            .env("TMPDIR", &swe)
+            .env_remove("MINI_SWE_NO_DAEMON")
+            .env_remove("OPENAI_API_KEY")
+            .env("ENV_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/.env.does-not-exist")
+            .env("MODELS_FILE", env!("CARGO_MANIFEST_DIR").to_owned() + "/models.yaml")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {} {args:?}: {e}", exe.display()))
+    };
+
+    let output = run(&["status", "--line"]);
+    assert!(output.status.success(), "status --line must exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "⚙ 1 running · 1 done", "unexpected status line: {stdout:?}");
+    assert!(
+        !hub.join("hub.sock").exists(),
+        "status --line must never auto-start the daemon"
+    );
+
+    // Flag order must not matter, and an empty registry prints nothing.
+    let output = run(&["--json", "status", "--line"]);
+    assert!(output.status.success(), "flag order must not matter");
+    let _ = std::fs::remove_dir_all(swe.join("swe-registry"));
+    let output = run(&["status", "--line"]);
+    assert!(output.status.success(), "empty status --line must exit 0");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "an empty registry prints no line"
+    );
+    assert!(!hub.join("hub.sock").exists(), "still no daemon must exist");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -259,12 +259,15 @@ fn reclaim_abandoned_worktree(dir: &Path) -> bool {
 /// unmerged, so the branch sweep preserves it. An orphan directory whose git
 /// metadata is already gone cannot be committed and is skipped (the status
 /// probe fails). Fallback credentials match `guard::commit_changes`.
-fn salvage_dirty_worktree(dir: &Path) {
+pub(crate) fn salvage_dirty_worktree(dir: &Path) -> bool {
     let Ok(status) = git(dir, "status --porcelain", &["status", "--porcelain"]) else {
-        return;
+        return false;
     };
-    if !status.status.success() || status.stdout.is_empty() {
-        return;
+    if !status.status.success() {
+        return false;
+    }
+    if status.stdout.is_empty() {
+        return true;
     }
     let id = dir
         .file_name()
@@ -272,7 +275,9 @@ fn salvage_dirty_worktree(dir: &Path) {
         .map(|n| n.strip_prefix("swe-wt-").unwrap_or(n))
         .unwrap_or("unknown");
     let msg = format!("worker({id}): salvaged uncommitted work before prune");
-    let _ = git(dir, "add -A", &["add", "-A"]);
+    if !git(dir, "add -A", &["add", "-A"]).is_ok_and(|out| out.status.success()) {
+        return false;
+    }
     let committed = git(
         dir,
         "commit",
@@ -289,8 +294,12 @@ fn salvage_dirty_worktree(dir: &Path) {
     match committed {
         Ok(out) if out.status.success() => {
             info!(path = %dir.display(), "Salvaged uncommitted worker changes before prune");
+            true
         }
-        _ => error!(path = %dir.display(), "Could not salvage uncommitted worker changes"),
+        _ => {
+            error!(path = %dir.display(), "Could not salvage uncommitted worker changes");
+            false
+        }
     }
 }
 

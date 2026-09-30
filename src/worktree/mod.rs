@@ -12,7 +12,7 @@
 //! The public surface stays flat: everything callers need is re-exported here.
 
 mod guard;
-mod prune;
+pub(crate) mod prune;
 
 pub use guard::{FileFingerprint, WorktreeGuard};
 pub use prune::{

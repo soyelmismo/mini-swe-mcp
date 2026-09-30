@@ -224,10 +224,9 @@ impl WorkerPool {
             )
             .await;
 
-        // The conversation is persisted on *every* exit path -- completion,
-        // error, cancellation -- because a terminal worker is exactly what the
-        // orchestrator reviews and then revises, and a revision without the
-        // history would restart the model from scratch.
+        // Completion and propagated errors save the final conversation.
+        // Aborted tasks cannot reach this tail; auto-checkpoints persist their
+        // most recent conversation for crash recovery instead.
         let history = WorkerHistory {
             task,
             group: meta.group.clone(),
@@ -309,6 +308,10 @@ impl WorkerPool {
                 status: RegistryStatus::Running,
                 model: &model,
                 max_turns: max_turns_for_config,
+                task: &task,
+                temperature,
+                review_after: review_after.as_deref(),
+                network_offline,
             };
             let mut engine = TurnEngine {
                 pool: self,
