@@ -21,7 +21,7 @@
 //! sentinel → record → next turn" is readable end to end in one place.
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
@@ -30,6 +30,7 @@ use crate::worktree::WorktreeGuard;
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::state::WorkerState;
 use super::steer::remove_steer_file;
+use super::revision::{WorkerHistory, save_worker_history};
 use super::{WorkerPool, unix_timestamp};
 use self::review::ReviewPhase;
 use self::turn::{
@@ -46,6 +47,20 @@ pub use self::sentinels::{
     summarize_command,
 };
 
+/// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
+/// the worktree and the conversation, so a failure anywhere still leaves both
+/// available for history persistence.
+pub struct RunConfig<'a> {
+    pub task: &'a str,
+    pub model: &'a str,
+    pub temperature: Option<f32>,
+    pub max_turns: usize,
+    pub review_after: Option<String>,
+    pub network_offline: bool,
+    pub verify: Option<&'a str>,
+    pub repo_path_str: &'a str,
+}
+
 /// Everything the execution loop needs to start one worker.
 pub struct WorkerLaunchConfig {
     pub task: String,
@@ -60,6 +75,14 @@ pub struct WorkerLaunchConfig {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<String>,
+    /// Conversation a revision continues: the finished worker's history plus
+    /// the orchestrator's revision request. `None` starts a fresh dispatch,
+    /// which builds its own system prompt and task message.
+    pub resume_messages: Option<Vec<ChatMessage>>,
+    /// Base commit of the run that produced `resume_messages`. `Some` makes the
+    /// worktree re-attach to the worker's preserved branch instead of creating
+    /// a fresh one, so a revision keeps its id, its branch and its checkpoints.
+    pub resume_base_commit: Option<String>,
 }
 
 /// Deletes a worker's steering mailbox when the worker exits.
@@ -124,29 +147,31 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            resume_messages,
+            resume_base_commit,
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
         let _permit = self.semaphore.acquire().await.context("Semaphore closed")?;
-        info!(worker = %worker_id, model = %model, "Starting worker execution");
+        let revision = resume_base_commit.is_some();
+        info!(worker = %worker_id, model = %model, revision, "Starting worker execution");
 
         // Dropped on *every* exit path -- completion, error, cancellation -- so
         // a finished worker never leaves a mailbox behind for a future worker
         // reusing the id to inherit as phantom guidance.
         let _steer_cleanup = SteerFileGuard::new(worker_id.clone());
 
-        let mut worktree = WorktreeGuard::new(&repo_path, &worker_id)?;
+        // A revision re-attaches to the branch the previous run committed to,
+        // so the worker keeps its id, its checkpoints and its diff base; a
+        // fresh dispatch creates the branch instead.
+        let mut worktree = match &resume_base_commit {
+            Some(base) => WorktreeGuard::reopen(&repo_path, &worker_id, base)?,
+            None => WorktreeGuard::new(&repo_path, &worker_id)?,
+        };
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
         self.register_worktree(&worker_id, worktree.path.clone()).await;
-        let runner = AgentRunner::new(
-            self.api_base.clone(),
-            self.api_key.clone(),
-            model.clone(),
-            temperature,
-        )
-        .with_network_offline(network_offline);
 
         // The system prompt carries this role's persistent memory
         // (`.agents/memory/<alias>.md`) when the repository provides any, so a
@@ -156,10 +181,106 @@ impl WorkerPool {
         let memory_alias = manifest.alias_for_model(&model);
         let system_prompt = build_system_prompt(&repo_path, &memory_alias);
 
-        let mut messages = vec![
-            ChatMessage::text(Role::System, system_prompt),
-            ChatMessage::text(Role::User, format!("TASK:\n{}\n\nBegin by exploring the repository.", task)),
-        ];
+        // A revision replays the finished worker's conversation (system prompt,
+        // task, every assistant turn with its reasoning and every tool result)
+        // and appends nothing here: the revision request is already its last
+        // user message, so the model continues exactly where it left off.
+        let mut messages = match resume_messages {
+            Some(replayed) => replayed,
+            None => vec![
+                ChatMessage::text(Role::System, system_prompt),
+                ChatMessage::text(
+                    Role::User,
+                    format!("TASK:\n{}\n\nBegin by exploring the repository.", task),
+                ),
+            ],
+        };
+
+        let result = self
+            .run_phases(
+                &worker_id,
+                &RunConfig {
+                    task: &task,
+                    model: &model,
+                    temperature,
+                    max_turns,
+                    review_after: review_after.clone(),
+                    network_offline,
+                    verify: verify.as_deref(),
+                    repo_path_str: &repo_path_str,
+                },
+                meta,
+                &mut worktree,
+                &mut messages,
+            )
+            .await;
+
+        // The conversation is persisted on *every* exit path -- completion,
+        // error, cancellation -- because a terminal worker is exactly what the
+        // orchestrator reviews and then revises, and a revision without the
+        // history would restart the model from scratch.
+        let history = WorkerHistory {
+            task,
+            group: meta.group.clone(),
+            model,
+            temperature,
+            repo_path: repo_path_str,
+            base_commit: worktree.base_commit.clone(),
+            branch: worktree.branch.clone(),
+            network_offline,
+            verify: verify.map(|v| v.to_string()),
+            max_turns,
+            review_after,
+            revision: self
+                .workers
+                .read()
+                .await
+                .get(&worker_id)
+                .map(|w| w.revision)
+                .unwrap_or(0),
+            owner: Some(meta.owner.clone()),
+            messages,
+        };
+        if let Err(e) = save_worker_history(&worker_id, &history) {
+            warn!(
+                worker = %worker_id,
+                error = %e,
+                "Could not persist the worker conversation; this worker can no longer be revised"
+            );
+        }
+        result
+    }
+
+    /// The implementer loop, the review phase and the completion payload.
+    ///
+    /// Split from [`WorkerPool::run_worker`] so the caller owns the worktree and
+    /// the conversation: whatever happens in here -- a completion sentinel, a
+    /// failed bash step, a cancelled task -- the caller still holds both and can
+    /// persist them.
+    async fn run_phases(
+        &self,
+        worker_id: &str,
+        config: &RunConfig<'_>,
+        meta: &mut WorkerMeta,
+        worktree: &mut WorktreeGuard,
+        messages: &mut Vec<ChatMessage>,
+    ) -> Result<()> {
+        let task = config.task.to_string();
+        let model = config.model.to_string();
+        let temperature = config.temperature;
+        let max_turns = config.max_turns;
+        let review_after = config.review_after.clone();
+        let network_offline = config.network_offline;
+        let verify = config.verify.map(|v| v.to_string());
+        let repo_path_str = config.repo_path_str.to_string();
+
+        let runner = AgentRunner::new(
+            self.api_base.clone(),
+            self.api_key.clone(),
+            model.clone(),
+            temperature,
+        )
+        .with_network_offline(network_offline);
 
         let mut step = 0;
         let mut current_max_turns = max_turns;
@@ -182,11 +303,11 @@ impl WorkerPool {
             };
             let mut engine = TurnEngine {
                 pool: self,
-                worktree: &mut worktree,
+                worktree,
                 runner: &runner,
-                worker_id: &worker_id,
+                worker_id,
                 meta,
-                messages: &mut messages,
+                messages,
                 step: &mut step,
                 current_max_turns: &mut current_max_turns,
                 last_assistant_text: &mut last_assistant_text,
@@ -211,9 +332,9 @@ impl WorkerPool {
         if let Some(reviewer_model) = review_after {
             step = self
                 .run_review_phase(
-                    &mut worktree,
+                    worktree,
                     ReviewPhase {
-                        worker_id: worker_id.clone(),
+                        worker_id: worker_id.to_string(),
                         reviewer_model,
                         temperature,
                         task: task.clone(),
@@ -306,6 +427,15 @@ impl WorkerPool {
         // The completion payload (diff/summary/artifacts/branch) is assembled
         // *before* the write-guard is taken: the critical section only performs
         // the O(1) move of the pre-built value into the record.
+        // The completion carries the revision that produced it: a fresh
+        // dispatch completes at zero, a revised worker at its attempt number.
+        let revision = self
+            .workers
+            .read()
+            .await
+            .get(worker_id)
+            .map(|w| w.revision)
+            .unwrap_or(0);
         let completed_state = WorkerState::Completed {
             turns: step,
             diff,
@@ -315,8 +445,9 @@ impl WorkerPool {
             branch,
             verified,
             metrics: meta.metrics,
+            revision,
         };
-        self.update_worker(&worker_id, |w| w.state = completed_state)
+        self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
 
         self.save_status(
@@ -329,7 +460,7 @@ impl WorkerPool {
             None,
         );
 
-        self.unregister_worktree(&worker_id).await;
+        self.unregister_worktree(worker_id).await;
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
         Ok(())
     }

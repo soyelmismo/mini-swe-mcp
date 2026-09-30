@@ -23,6 +23,7 @@ mod server;
 
 pub use events::{
     ChannelEvent, EventKind, Outcome, WorkerSnapshot, WorkerView, channel_frame, diff_events,
+    render_for_test,
 };
 pub use schema::{LIST_SCOPE_ALL, LIST_SCOPES, NETWORK_DEFAULT, NETWORK_MODES, WORKER_ACTIONS};
 pub use server::{

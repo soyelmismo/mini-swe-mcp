@@ -48,6 +48,12 @@ pub fn tool_args(action: &str, cli_args: &[String], api_key_present: bool) -> Re
                 if flag_index(cli_args, &["--wait", "-w"]).is_some() {
                     tool_args.insert("wait".into(), Value::Bool(true));
                 }
+                // `--max-turns <n>` on a steer is the fresh turn budget of a
+                // revision (steering a finished worker); the same tool
+                // argument `dispatch` uses, so the budget has one spelling.
+                if let Some(mut i) = flag_index(cli_args, &["--max-turns", "-t"]) {
+                    take_turns(cli_args, &mut i, &mut tool_args);
+                }
                 if let Some(mut i) = flag_index(cli_args, &["--timeout"]) {
                     take_timeout(cli_args, &mut i, &mut tool_args)?;
                 }
@@ -96,14 +102,7 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Res
             "--wait" | "-w" => {
                 tool_args.insert("wait".into(), Value::Bool(true));
             }
-            "--max-turns" | "-t" => {
-                if i + 1 < cli_args.len() {
-                    if let Ok(turns) = cli_args[i + 1].parse::<u64>() {
-                        tool_args.insert("max_turns".into(), Value::Number(turns.into()));
-                    }
-                    i += 1;
-                }
-            }
+            "--max-turns" | "-t" => take_turns(cli_args, &mut i, tool_args),
             "--group" | "-g" if i + 1 < cli_args.len() => {
                 tool_args.insert("group".into(), Value::String(cli_args[i + 1].clone()));
                 i += 1;
@@ -127,6 +126,21 @@ fn flag_index(cli_args: &[String], flags: &[&str]) -> Option<usize> {
     cli_args
         .iter()
         .position(|arg| flags.contains(&arg.as_str()))
+}
+
+/// Fold `--max-turns <n>` into the tool's `max_turns` argument.
+///
+/// Shared by `dispatch` and `steer`: the same budget argument, so a revision
+/// started by steering a finished worker is spelled exactly like the dispatch
+/// that preceded it. A malformed value is dropped rather than defaulted, which
+/// is what the dispatch path already does.
+fn take_turns(cli_args: &[String], i: &mut usize, tool_args: &mut Map<String, Value>) {
+    if *i + 1 < cli_args.len()
+        && let Ok(turns) = cli_args[*i + 1].parse::<u64>()
+    {
+        tool_args.insert("max_turns".into(), Value::Number(turns.into()));
+        *i += 1;
+    }
 }
 
 /// Fold `--timeout <secs>` into the tool's `timeout_secs` argument.
@@ -359,6 +373,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bare.len(), 1, "a workerless `wait` stays argument-free: {bare:?}");
+    }
+
+    /// `--max-turns <n>` on `steer` is the revision's fresh turn budget: the
+    /// same tool argument `dispatch` uses, so a revision is spelled exactly
+    /// like the dispatch that preceded it.
+    #[test]
+    fn test_steer_max_turns_flag_maps_to_the_budget_property() {
+        let plain = args(&["mini-swe-mcp", "steer", "w1", "fix the edge case"]);
+        let without = tool_args("steer", &plain, true).unwrap().unwrap();
+        assert!(
+            !without.contains_key("max_turns"),
+            "an omitted flag must not set a budget: {without:?}"
+        );
+
+        for flag in ["--max-turns", "-t"] {
+            let flagged = args(&["mini-swe-mcp", "steer", "w1", "fix the edge case", flag, "25"]);
+            let with = tool_args("steer", &flagged, true).unwrap().unwrap();
+            assert_eq!(with["max_turns"], 25, "flag {flag}");
+            assert_eq!(with["message"], "fix the edge case", "flag {flag}");
+        }
     }
 
     /// `--wait` on `steer` is the same `wait` property `dispatch` uses, so

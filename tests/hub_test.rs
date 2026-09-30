@@ -550,6 +550,7 @@ async fn a_hub_connection_only_controls_its_own_workers() {
         pending_steer: Vec::new(),
         resume_tx: None,
         handle: None,
+        revision: 0,
     })
     .await;
     let server = Arc::new(McpServer::new(pool, "test-model".to_string()));

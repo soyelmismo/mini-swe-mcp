@@ -357,6 +357,15 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     force_remove_dir(wt_path);
     let _ = std::fs::remove_file(&pid_file);
     remove_target_dirs(wt_path);
+    // The worker is gone past review: retire its saved conversation (and its
+    // steering mailbox, which the finished run's guard may never have dropped
+    // on a crash) from every scratch base.
+    if let Some(name) = wt_path.file_name().and_then(|n| n.to_str())
+        && let Some(id) = name.strip_prefix("swe-wt-")
+    {
+        crate::pool::remove_worker_history(id);
+        crate::pool::remove_steer_file(id);
+    }
 }
 
 /// True when `branch` has no commits missing from `HEAD`, i.e. deleting it

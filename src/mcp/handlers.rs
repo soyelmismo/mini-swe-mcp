@@ -386,9 +386,30 @@ impl McpServer {
     async fn handle_status(&self, args: &Value) -> Result<Value> {
         let wid = Self::get_worker_id(args, "status")?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
-            Ok(json!({ "worker_id": wid, "owner": self.owner_of(wid).await, "state": state }))
+            // A finished worker's status carries the same review guidance as
+            // the wait payload, so polling the status is enough to learn the
+            // loop exists.
+            let next_step = match &state {
+                crate::pool::WorkerState::Completed { .. }
+                | crate::pool::WorkerState::Failed { .. } => Some(crate::pool::next_step_for(
+                    crate::pool::terminal_branch(&state).as_deref(),
+                )),
+                _ => None,
+            };
+            Ok(json!({
+                "worker_id": wid,
+                "owner": self.owner_of(wid).await,
+                "state": state,
+                "next_step": next_step,
+            }))
         } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
             let state_name = entry.status.display_name();
+            // A registry-only terminal row (collected worker, restarted hub)
+            // carries the same review guidance as the live path.
+            let next_step = entry
+                .status
+                .is_terminal()
+                .then(|| crate::pool::next_step_for(None));
             Ok(json!({
                 "worker_id": wid,
                 "owner": crate::pool::registry_owner_label(&entry),
@@ -407,7 +428,8 @@ impl McpServer {
                         "started_at": entry.started_at,
                         "metrics": entry.metrics,
                     }
-                }
+                },
+                "next_step": next_step,
             }))
         } else {
             anyhow::bail!("Worker not found: {wid}")
@@ -485,10 +507,16 @@ impl McpServer {
                 logs_dropped: collected.logs_dropped,
                 logs_truncation_notice: collected.logs_truncation_notice,
             };
+            // Collect ends the worker's reviewable life, so the guidance is
+            // about the branch it leaves behind rather than a further steer.
+            let next_step = crate::pool::next_step_for(
+                crate::pool::terminal_branch(&collected.state).as_deref(),
+            );
             let mut result = json!({
                 "worker_id": wid,
                 "owner": collected.owner,
                 "state": collected.state,
+                "next_step": next_step,
             });
             if let serde_json::Value::Object(map) = &mut result {
                 map.extend(log_view.as_map());
@@ -604,6 +632,10 @@ impl McpServer {
 
     /// `steer` action: queue guidance, and with `wait: true` keep the call open
     /// until the worker produces its next event.
+    ///
+    /// Steering a finished worker starts a revision on its preserved branch
+    /// (same id, full context, fresh turn budget); `wait: true` then blocks
+    /// until that revision ends, exactly like a `dispatch --wait`.
     async fn handle_steer(
         &self,
         args: &Value,
@@ -614,13 +646,43 @@ impl McpServer {
         let wid = Self::get_worker_id(args, "steer")?;
         self.require_owner(wid, ctx).await?;
         let message = Self::required_string(args, "message", "steer")?.to_string();
-        self.pool.steer(wid, message).await?;
+        // An explicit `max_turns` on a steer is the revision's fresh budget;
+        // it is validated but otherwise ignored for live workers (whose loop
+        // keeps its own budget). A non-integer value is a hard error, like on
+        // dispatch, so a typo cannot silently become the default budget.
+        let revision_turns = match args.get("max_turns") {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("'max_turns' must be a non-negative integer for action 'steer'")
+            }).map(|v| v as usize).and_then(|v| {
+                if v == 0 {
+                    Err(anyhow::anyhow!(
+                        "'max_turns' must be at least 1 for action 'steer'"
+                    ))
+                } else {
+                    Ok(v.min(crate::manifest::MAX_TURNS_LIMIT))
+                }
+            })?),
+        };
+        // A revision restarts the turn budget, so a `steer --wait` on a
+        // finished worker must report the fresh budget as its denominator.
+        let was_terminal = self.pool.is_terminal(wid).await;
+        self.pool
+            .steer_with_budget(wid, message, revision_turns)
+            .await?;
         let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
         if wait {
+            // A finished worker's revision runs on a fresh budget: report that
+            // denominator, not the finished run's, so `Step 3/60` reads true.
+            let budget = if was_terminal {
+                self.revision_await_budget(revision_turns)
+            } else {
+                Self::awaited_max_turns(wid)
+            };
             return self
                 .await_worker_result_until(
                     wid,
-                    Self::awaited_max_turns(wid),
+                    budget,
                     Self::get_timeout(args, "steer")?,
                     token,
                     tx,
@@ -632,6 +694,16 @@ impl McpServer {
             "status": "steered",
             "message": "Steering instruction queued for next turn"
         }))
+    }
+
+    /// Fresh turn budget a `steer --wait` on a finished worker reports.
+    ///
+    /// A revision restarts the loop from the explicit `max_turns` (or the
+    /// default revision budget), so the progress denominator must be that
+    /// budget, not the finished run's. A steer on a live worker keeps the
+    /// dispatch budget from the registry row.
+    fn revision_await_budget(&self, explicit: Option<usize>) -> usize {
+        explicit.unwrap_or(crate::pool::DEFAULT_REVISION_TURNS)
     }
 
     async fn handle_prune(
@@ -651,6 +723,7 @@ impl McpServer {
         )
         .await;
         crate::worktree::prune_stale_worktrees(&repo_path);
+        crate::pool::prune_orphan_histories(&repo_path);
         Self::emit_progress(tx, token, 1, 1, "Prune complete").await;
         Ok(json!({
             "status": "pruned",

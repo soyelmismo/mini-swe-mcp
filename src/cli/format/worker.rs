@@ -190,6 +190,13 @@ pub fn format_status(val: &serde_json::Value) -> String {
         out.push_str(&health);
         out.push('\n');
     }
+    // A finished worker's status tells the orchestrator the loop exists: the
+    // branch is still there, and steering this worker resumes it in place.
+    if let Some(next) = val.get("next_step").and_then(|v| v.as_str())
+        && !next.trim().is_empty()
+    {
+        out.push_str(&format!("Next step: {next}\n"));
+    }
     out.trim_end().to_string()
 }
 
@@ -219,10 +226,16 @@ pub fn format_collect(val: &serde_json::Value) -> String {
 
     let counters = log_counters_line(val);
     let health = health_line(val).map(|h| format!("\n{h}")).unwrap_or_default();
+    let next = val
+        .get("next_step")
+        .and_then(|v| v.as_str())
+        .filter(|next| !next.trim().is_empty())
+        .map(|next| format!("\nNext step: {next}"))
+        .unwrap_or_default();
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.\n{counters}{health}")
+        format!("Worker {wid}: No git diff produced.\n{counters}{health}{next}")
     } else {
-        format!("{diff}\n{counters}{health}")
+        format!("{diff}\n{counters}{health}{next}")
     }
 }
 
@@ -323,6 +336,11 @@ pub fn format_dispatch(val: &serde_json::Value) -> String {
                     && !diff.trim().is_empty()
                 {
                     out.push_str(&format!("\nDiff:\n{diff}\n"));
+                }
+                if let Some(next) = val.get("next_step").and_then(|v| v.as_str())
+                    && !next.trim().is_empty()
+                {
+                    out.push_str(&format!("\nNext step: {next}\n"));
                 }
             } else if state_name == "Failed" || state.get("Failed").is_some() {
                 out.push_str("State: Failed\n");
@@ -592,6 +610,37 @@ mod tests {
         assert!(
             failed.ends_with("Health: 4 turns, +0/-0 ext, 0 repeats, 0 nudges"),
             "{failed}"
+        );
+    }
+
+    #[test]
+    fn test_finished_views_render_the_next_step_guidance() {
+        let next = "Review the diff (collect) and run the project's checks.";
+        let payload = serde_json::json!({
+            "worker_id": "w",
+            "state": {"state": "Completed", "details": {"turns": 3, "summary": "done"}},
+            "next_step": next,
+        })
+        .to_string();
+        assert!(
+            format_status(&v(&payload)).ends_with(&format!("Next step: {next}")),
+            "status must end with the guidance: {}",
+            format_status(&v(&payload))
+        );
+        assert!(
+            format_collect(&v(&payload)).ends_with(&format!("Next step: {next}")),
+            "collect must end with the guidance: {}",
+            format_collect(&v(&payload))
+        );
+        assert!(
+            format_dispatch(&v(&payload)).contains(&format!("Next step: {next}")),
+            "dispatch --wait must carry the guidance: {}",
+            format_dispatch(&v(&payload))
+        );
+        // A payload without guidance renders exactly as before.
+        assert!(
+            !format_status(&v(r#"{"worker_id":"w","state":"Running"}"#)).contains("Next step"),
+            "a running worker has no next step"
         );
     }
 

@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 mod buffer;
 mod clock;
 mod registry;
+pub(crate) mod revision;
 mod runner;
 mod state;
 mod steer;
@@ -48,6 +49,11 @@ pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
     parse_request_turns, summarize_command,
 };
+pub use self::revision::{
+    DEFAULT_REVISION_TURNS, REVISION_PREFIX, WorkerHistory, history_path, is_replayable,
+    load_worker_history, prune_orphan_histories, remove_worker_history, save_worker_history,
+};
+pub use self::runner::RunConfig;
 pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
@@ -57,6 +63,29 @@ pub use self::state::{
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
 use crate::worktree::WorktreeGuard;
+
+/// Guidance appended to every terminal payload and channel event.
+///
+/// Tells the orchestrator the review loop exists: the finished worker's branch
+/// is still there, and `steer` with corrections resumes it in place.
+pub fn next_step_for(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!(
+            "Review the diff (collect) and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes on branch {branch} with its full context. Merge only when it is right."
+        ),
+        None => "Review the result and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes with its full context. Merge only when it is right.".to_string(),
+    }
+}
+
+/// The branch a terminal [`WorkerState`] finished on, if it kept one.
+pub fn terminal_branch(state: &WorkerState) -> Option<String> {
+    match state {
+        WorkerState::Completed { branch, .. } => branch.clone(),
+        WorkerState::Running { .. } | WorkerState::Paused { .. } | WorkerState::Failed { .. } => {
+            None
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct WorkerPool {
@@ -291,6 +320,7 @@ impl WorkerPool {
             pending_steer: Vec::new(),
             resume_tx: None,
             handle: None,
+            revision: 0,
         };
 
         self.save_status(&meta, &model, RegistryStatus::Running, 0, max_turns, "initializing", None);
@@ -329,6 +359,8 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            resume_messages: None,
+            resume_base_commit: None,
         };
 
         let join_handle = tokio::spawn(async move {
@@ -364,6 +396,24 @@ impl WorkerPool {
     }
     pub async fn get_worker_state(&self, id: &str) -> Option<WorkerState> {
         self.workers.read().await.get(id).map(|w| w.state.clone())
+    }
+
+    /// Whether `id` is a finished worker: terminal in this process, or
+    /// terminal in the shared registry (e.g. after a hub restart).
+    ///
+    /// A cheap read used by `steer --wait` to pick the progress denominator of
+    /// a revision before the relaunch overwrites the record.
+    pub async fn is_terminal(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            if matches!(
+                state,
+                WorkerState::Completed { .. } | WorkerState::Failed { .. }
+            ) {
+                return true;
+            }
+            return false;
+        }
+        load_registry_entry(id).is_some_and(|e| e.status.is_terminal())
     }
 
     /// Cheap snapshot of a worker's step history.
@@ -494,55 +544,57 @@ impl WorkerPool {
     }
 
     /// The list payload, optionally narrowed to one owner.
+    ///
+    /// The union of this process's records (the live view, with log counters)
+    /// and the registry rows of every other worker (other processes, or rows
+    /// whose record was already reaped here).
     async fn list_workers_matching(&self, owner: Option<&str>) -> Vec<serde_json::Value> {
-        let registry = load_all_registry_entries();
-        if !registry.is_empty() {
-            registry
-                .into_iter()
-                .filter(|e| owner.is_none_or(|owner| e.owner.as_deref() == Some(owner)))
-                .map(|e| {
-                    serde_json::json!({
-                        "id": e.id,
-                        "task": e.task,
-                        "model": e.model,
-                        "owner": registry_owner_label(&e),
-                        "group": e.group.as_deref().unwrap_or("default"),
-                        "state": {
-                            "status": e.status.display_name(),
-                            "step": e.step,
-                            "turns": e.step,
-                            "last_command": e.last_command,
-                            "pid": e.pid,
-                            "started_at": e.started_at,
-                        },
-                        "total_steps": e.step,
-                        // Registry rows are cross-process and carry no in-memory
-                        // log buffer, so the retention counters are reported as
-                        // 0/0 rather than being silently absent (audit 07, R7).
-                        "logs_retained": 0,
-                        "logs_dropped": 0,
-                    })
-                })
-                .collect()
-        } else {
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        {
             let lock = self.workers.read().await;
-            lock.values()
-                .filter(|w| owner.is_none_or(|owner| w.owner == owner))
-                .map(|w| {
-                    let stats = w.log_stats();
-                    serde_json::json!({
-                        "id": w.id,
-                        "task": w.task,
-                        "model": w.model,
-                        "owner": w.owner,
-                        "state": w.state.to_summary(),
-                        "total_steps": stats.total_steps,
-                        "logs_retained": stats.logs_retained,
-                        "logs_dropped": stats.logs_dropped,
-                    })
-                })
-                .collect()
+            for w in lock.values().filter(|w| owner.is_none_or(|owner| w.owner == owner)) {
+                let stats = w.log_stats();
+                seen.insert(w.id.clone());
+                rows.push(serde_json::json!({
+                    "id": w.id,
+                    "task": w.task,
+                    "model": w.model,
+                    "owner": w.owner,
+                    "state": w.state.to_summary(),
+                    "total_steps": stats.total_steps,
+                    "logs_retained": stats.logs_retained,
+                    "logs_dropped": stats.logs_dropped,
+                }));
+            }
         }
+        let registry = load_all_registry_entries().into_iter().filter(|e| {
+            !seen.contains(&e.id) && owner.is_none_or(|owner| e.owner.as_deref() == Some(owner))
+        });
+        rows.extend(registry.map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "task": e.task,
+                "model": e.model,
+                "owner": registry_owner_label(&e),
+                "group": e.group.as_deref().unwrap_or("default"),
+                "state": {
+                    "status": e.status.display_name(),
+                    "step": e.step,
+                    "turns": e.step,
+                    "last_command": e.last_command,
+                    "pid": e.pid,
+                    "started_at": e.started_at,
+                },
+                "total_steps": e.step,
+                // Registry rows are cross-process and carry no in-memory log
+                // buffer, so the retention counters are reported as 0/0 rather
+                // than being silently absent (audit 07, R7).
+                "logs_retained": 0,
+                "logs_dropped": 0,
+            })
+        }));
+        rows
     }
 
     /// Who owns `id`, from the in-memory record or, for a worker that lives in
@@ -554,11 +606,13 @@ impl WorkerPool {
         if let Some(owner) = self.workers.read().await.get(id).map(|w| w.owner.clone()) {
             return Some(WorkerOwner::Agent(owner));
         }
-        let entry = load_registry_entry(id)?;
-        Some(match entry.owner {
-            Some(owner) => WorkerOwner::Agent(owner),
-            None => WorkerOwner::Unattributed,
-        })
+        // A finished worker the reaper dropped is still revisable, so its
+        // saved conversation still names who may steer it.
+        let owner = match load_registry_entry(id) {
+            Some(entry) => entry.owner,
+            None => load_worker_history(id).ok()?.owner,
+        };
+        Some(owner.map_or(WorkerOwner::Unattributed, WorkerOwner::Agent))
     }
 
     /// Ids of `owner`'s still-running workers, used to report a per-agent cap.
@@ -582,12 +636,15 @@ impl WorkerPool {
 
     /// Deliver an orchestrator message to a worker.
     ///
-    /// Two delivery paths, tried in order:
+    /// Three delivery paths, tried in order:
     ///
     /// 1. **In-process.** A `Running` worker queues the message on
     ///    `pending_steer` for its next turn; a `Paused` one is handed to its
     ///    resume channel.
-    /// 2. **Cross-process mailbox.** The worker is owned by a different
+    /// 2. **Revision.** A `Completed`/`Failed` worker (or a registry-only one,
+    ///    e.g. after a hub restart) is relaunched on its preserved branch with
+    ///    its saved conversation plus this message (see [`WorkerPool::revise`]).
+    /// 3. **Cross-process mailbox.** The worker is owned by a different
     ///    `mini-swe-mcp` process (the normal `dispatch … --wait` case): the
     ///    message is appended atomically to its mailbox (see [`steer_path`]),
     ///    which the owner drains on every step.
@@ -596,15 +653,37 @@ impl WorkerPool {
     /// and the guard is dropped *before* `send().await`: awaiting a full `mpsc`
     /// channel while holding the write-guard would serialise the whole pool.
     /// A missing sender is reported instead of silently dropping the guidance.
+    ///
+    /// `revision_turns` is the fresh turn budget of a revision (`None` takes
+    /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
     pub async fn steer(&self, id: &str, message: String) -> Result<()> {
+        self.steer_with_budget(id, message, None).await
+    }
+
+    /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
+    /// `max_turns` argument): a finished worker restarts its loop from this
+    /// many turns instead of [`DEFAULT_REVISION_TURNS`].
+    pub async fn steer_with_budget(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> Result<()> {
         let tx_opt = {
             let mut lock = self.workers.write().await;
             let Some(w) = lock.get_mut(id) else {
-                // Not ours: queue the guidance in the worker's on-disk
-                // mailbox so the process that owns it picks it up. The guard is
-                // released before the write, and the write is a blocking
-                // `std::fs` call, so it must happen outside the lock.
                 drop(lock);
+                // Not in this process. A finished worker (its record reaped,
+                // or the hub restarted) still has its history file: unless a
+                // live process owns the row, the message relaunches it here as
+                // a revision on the same id and branch.
+                let owned_elsewhere =
+                    load_registry_entry(id).is_some_and(|e| !e.status.is_terminal());
+                if !owned_elsewhere && revision::history_path(id).is_file() {
+                    return self.revise(id, message, revision_turns).await;
+                }
+                // Otherwise queue it in the on-disk mailbox for the owning
+                // process (a blocking write, so outside the lock).
                 let path = write_steer_message(id, &message).map_err(|e| {
                     anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
                 })?;
@@ -621,11 +700,12 @@ impl WorkerPool {
                     return Ok(());
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
-                _ => {
-                    anyhow::bail!(
-                        "Worker {} is not in a steerable state (running or paused)",
-                        id
-                    )
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
+                    // A finished worker cannot be resumed mid-turn -- it has no
+                    // turn left -- so the message becomes a revision below,
+                    // outside the guard.
+                    drop(lock);
+                    return self.revise(id, message, revision_turns).await;
                 }
             }
             // write-guard released here, before any `.await`
@@ -799,6 +879,9 @@ impl WorkerPool {
             record
         };
         self.worktrees.write().await.remove(id);
+        // The saved conversation stays: a collected worker is registry-only
+        // from here on, and steering it must still revise it (same id, same
+        // branch, full context). Only prune retires the history file.
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         let dropped = record.logs.dropped();
         let view = emit_view(&record.logs, self.log_policy.max_emitted);

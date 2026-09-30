@@ -116,17 +116,41 @@ pub enum Role {
 /// message with no `tool_call_id`, an `assistant` message with
 /// `tool_calls: Some(vec![])`) while keeping the per-field `skip_serializing_if`
 /// each role's wire shape needs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     role: Role,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+/// The history as it must go on the wire for a thinking-mode conversation.
+///
+/// Thinking-mode providers (DeepSeek) reject a request whose assistant turns
+/// lack `reasoning_content` ("must be passed back to the API"), yet the same
+/// model sometimes answers a turn with no reasoning at all, which is stored as
+/// `None`. Once any assistant turn carried reasoning the conversation is in
+/// thinking mode, and every assistant turn is sent with the field, empty where
+/// the model produced none. A conversation that never showed reasoning is sent
+/// unchanged, so providers that reject unknown message fields never see it.
+pub fn with_replayed_reasoning(messages: &[ChatMessage]) -> std::borrow::Cow<'_, [ChatMessage]> {
+    let is_bare_assistant = |m: &ChatMessage| m.role == Role::Assistant && m.reasoning_content.is_none();
+    let thinking = messages
+        .iter()
+        .any(|m| m.role == Role::Assistant && m.reasoning_content.is_some());
+    if !thinking || !messages.iter().any(is_bare_assistant) {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let mut owned = messages.to_vec();
+    for message in owned.iter_mut().filter(|m| is_bare_assistant(m)) {
+        message.reasoning_content = Some(String::new());
+    }
+    std::borrow::Cow::Owned(owned)
 }
 
 /// Outbound `tool_calls` entry of an assistant message.
@@ -204,6 +228,27 @@ impl ChatMessage {
     /// no caller can set an arbitrary one.
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Whether this message is a shape the provider accepts.
+    ///
+    /// The constructors above cannot build an invalid one, but a conversation
+    /// reloaded from disk ([`crate::pool::revision`]) is deserialized straight
+    /// into the fields, so the loader re-checks the two invariants that would
+    /// otherwise make the whole request fail: a `tool` turn must name the call
+    /// it answers, and an assistant turn must not advertise an empty call list.
+    pub(crate) fn is_wire_valid(&self) -> bool {
+        match self.role {
+            Role::Tool => self
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            Role::Assistant => match &self.tool_calls {
+                Some(calls) => !calls.is_empty(),
+                None => true,
+            },
+            Role::System | Role::User => true,
+        }
     }
 
     /// The message content, if any.
@@ -397,6 +442,30 @@ pub(crate) fn generate_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thinking mode: a turn the model answered without reasoning is replayed
+    /// with an empty `reasoning_content`; a conversation that never reasoned
+    /// is sent untouched.
+    #[test]
+    fn reasoning_is_replayed_on_every_assistant_turn_in_thinking_mode() {
+        let thought = ChatMessage::text(Role::Assistant, "a")
+            .with_reasoning_content(Some("because".into()));
+        let bare = ChatMessage::assistant_with_tool_calls(None, Vec::new());
+        let user = ChatMessage::text(Role::User, "u");
+
+        let history = vec![user.clone(), thought.clone(), user.clone(), bare.clone()];
+        let wire = super::with_replayed_reasoning(&history);
+        let json = serde_json::to_value(wire.as_ref()).expect("serialize");
+        assert_eq!(json[1]["reasoning_content"], "because");
+        assert_eq!(json[3]["reasoning_content"], "", "the bare turn gets an empty field");
+        assert!(json[0].get("reasoning_content").is_none(), "user turns are untouched");
+
+        let plain = vec![user, bare];
+        let wire = super::with_replayed_reasoning(&plain);
+        assert!(matches!(wire, std::borrow::Cow::Borrowed(_)));
+        let json = serde_json::to_value(wire.as_ref()).expect("serialize");
+        assert!(json[1].get("reasoning_content").is_none(), "no thinking mode, no field");
+    }
 
     #[test]
     fn test_chat_completion_request_tools_wire_shape() {

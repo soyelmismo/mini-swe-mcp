@@ -1153,6 +1153,7 @@ fn synthetic_worker(id: &str, state: WorkerState) -> WorkerRecord {
         pending_steer: Vec::new(),
         resume_tx: None,
         handle: None,
+        revision: 0,
     }
 }
 
@@ -1168,6 +1169,7 @@ fn completed_worker(id: &str) -> WorkerRecord {
             branch: Some("swe-wt-done".to_string()),
             verified: Some(true),
             metrics: WorkerMetrics::default(),
+            revision: 0,
         },
     )
 }
@@ -1855,4 +1857,86 @@ async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     assert!(message.contains("h3-cap"), "{message}");
     // The refusal happened before the dispatch, so no second worker was started.
     assert_eq!(pool.active_worker_count().await, 1);
+}
+
+// ----------
+// Revision loop (hub-H8): next_step guidance and steer-after-finish
+// ----------
+
+/// A completed payload carries the review guidance, naming the branch the
+/// revision resumes on.
+#[tokio::test]
+async fn completed_payloads_carry_the_review_guidance() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(completed_worker("guide-done")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    // `collect` evicts the record, so it goes last.
+    for action in ["wait", "status", "collect"] {
+        let result = server
+            .execute_tool("worker", json!({ "action": action, "worker_id": "guide-done" }))
+            .await
+            .unwrap_or_else(|e| panic!("{action} on a finished worker must answer: {e}"));
+        let next = result.get("next_step").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            next.contains("steer"),
+            "{action} must tell the orchestrator to steer for corrections: {result}"
+        );
+        assert!(
+            next.contains("swe-wt-done"),
+            "{action} must name the branch the revision resumes on: {result}"
+        );
+    }
+}
+
+/// A non-integer `max_turns` on a steer is a hard error, like on dispatch.
+#[tokio::test]
+async fn steer_with_a_malformed_budget_is_a_hard_error() {
+    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(running_worker("budget-bad")).await;
+    let server = McpServer::new(pool, "ninja".to_string());
+
+    let err = server
+        .execute_tool(
+            "worker",
+            json!({ "action": "steer", "worker_id": "budget-bad", "message": "go", "max_turns": "many" }),
+        )
+        .await
+        .expect_err("a string budget must not be accepted");
+    assert!(err.to_string().contains("max_turns"), "the error must name the argument: {err}");
+}
+
+/// The channel event for a finished worker carries the same guidance.
+#[test]
+fn completed_channel_event_carries_the_review_guidance() {
+    use mini_swe_mcp::mcp::{ChannelEvent, EventKind, WorkerView};
+    let view = WorkerView {
+        worker_id: "ev-done".to_string(),
+        event: Some(EventKind::Completed),
+        group: "backend".to_string(),
+        model: "ninja".to_string(),
+        status: "completed".to_string(),
+        question: None,
+        outcome: Default::default(),
+        branch: Some("worker-ev-done".to_string()),
+        revision: 0,
+    };
+    let event = ChannelEvent {
+        worker_id: view.worker_id.clone(),
+        kind: EventKind::Completed,
+        group: view.group.clone(),
+        model: view.model.clone(),
+        status: view.status.clone(),
+        content: mini_swe_mcp::mcp::render_for_test(&view, EventKind::Completed),
+    };
+    assert!(
+        event.content.contains("steer"),
+        "the completed event must point at steer: {}",
+        event.content
+    );
+    assert!(
+        event.content.contains("worker-ev-done"),
+        "the completed event must name the branch: {}",
+        event.content
+    );
 }
