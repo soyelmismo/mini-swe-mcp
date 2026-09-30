@@ -6,6 +6,8 @@ description = "High-throughput autonomous SWE subagent server over MCP stdio pro
 repository = "https://github.com/soyelmismo/mini-swe-mcp"
 license = "GPL-3.0-or-later"
 readme = "README.md"
+# Stamps the build id and timestamp the hub handshake compares (H4b).
+build = "build.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

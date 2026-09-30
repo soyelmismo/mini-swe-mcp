@@ -39,6 +39,9 @@ pub struct McpServer {
     hub_enabled: Arc<std::sync::atomic::AtomicBool>,
     shutdown: watch::Sender<bool>,
     daemon_version: Arc<str>,
+    /// `hub/hello` reply: this build's id and clock, stamped by `build.rs`, so a
+    /// client can tell a rebuilt binary from the daemon already serving.
+    daemon_build: Arc<Value>,
     hub_shutdown_gate: Arc<RwLock<bool>>,
 }
 
@@ -139,6 +142,15 @@ impl ConnectionContext {
     }
 }
 
+/// This binary's build identity in the shape `hub/hello` carries it: `id` names
+/// the exact build, `ts` is its comparable clock (`hub::client` sends the same).
+fn build_identity() -> Value {
+    json!({
+        "id": env!("MINI_SWE_BUILD_ID"),
+        "ts": env!("MINI_SWE_BUILD_TS").parse::<u64>().unwrap_or_default(),
+    })
+}
+
 impl McpServer {
     pub fn new(pool: WorkerPool, default_model: String) -> Self {
         // The pool owns the manifest (attached in `main.rs`); the server shares
@@ -155,6 +167,7 @@ impl McpServer {
             hub_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown: watch::channel(false).0,
             daemon_version: Arc::from(env!("CARGO_PKG_VERSION")),
+            daemon_build: Arc::new(build_identity()),
             hub_shutdown_gate: Arc::new(RwLock::new(false)),
         }
     }
@@ -277,6 +290,7 @@ impl McpServer {
                                 req.id_or_null().map(ToOwned::to_owned),
                                 json!({
                                     "version": &*self.daemon_version,
+                                    "build": &*self.daemon_build,
                                     "busy": self.pool.active_worker_count().await > 0,
                                 }),
                             )
