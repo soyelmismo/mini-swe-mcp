@@ -379,9 +379,18 @@ impl McpServer {
                     .await;
                     let state = self.pool.get_worker_state(wid).await;
                     let log_view = self.render_logs(wid).await;
+                    // The terminal payload tells the orchestrator what to do
+                    // next: review the branch, and steer this same worker when
+                    // it needs corrections.
+                    let next_step = state.as_ref().map(|state| {
+                        crate::pool::next_step_for(
+                            crate::pool::terminal_branch(state).as_deref(),
+                        )
+                    });
                     let mut result = json!({
                         "worker_id": wid,
                         "state": state,
+                        "next_step": next_step,
                     });
                     if let serde_json::Value::Object(map) = &mut result {
                         map.extend(log_view.as_map());

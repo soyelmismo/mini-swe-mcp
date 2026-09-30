@@ -64,6 +64,29 @@ use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
 use crate::worktree::WorktreeGuard;
 
+/// Guidance appended to every terminal payload and channel event.
+///
+/// Tells the orchestrator the review loop exists: the finished worker's branch
+/// is still there, and `steer` with corrections resumes it in place.
+pub fn next_step_for(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!(
+            "Review the diff (collect) and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes on branch {branch} with its full context. Merge only when it is right."
+        ),
+        None => "Review the result and run the project's checks. If anything is wrong or missing, call steer on this worker with the concrete corrections; it resumes with its full context. Merge only when it is right.".to_string(),
+    }
+}
+
+/// The branch a terminal [`WorkerState`] finished on, if it kept one.
+pub fn terminal_branch(state: &WorkerState) -> Option<String> {
+    match state {
+        WorkerState::Completed { branch, .. } => branch.clone(),
+        WorkerState::Running { .. } | WorkerState::Paused { .. } | WorkerState::Failed { .. } => {
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     semaphore: Arc<Semaphore>,
@@ -189,6 +212,9 @@ impl WorkerPool {
         for id in &expired {
             lock.remove(id);
             remove_registry_entry(id);
+            // The conversation outlives the record only for review; a reaped
+            // worker is past review, so its history file goes with it.
+            remove_worker_history(id);
         }
         if !expired.is_empty() {
             tracing::info!(
@@ -326,6 +352,24 @@ impl WorkerPool {
     }
     pub async fn get_worker_state(&self, id: &str) -> Option<WorkerState> {
         self.workers.read().await.get(id).map(|w| w.state.clone())
+    }
+
+    /// Whether `id` is a finished worker: terminal in this process, or
+    /// terminal in the shared registry (e.g. after a hub restart).
+    ///
+    /// A cheap read used by `steer --wait` to pick the progress denominator of
+    /// a revision before the relaunch overwrites the record.
+    pub async fn is_terminal(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            if matches!(
+                state,
+                WorkerState::Completed { .. } | WorkerState::Failed { .. }
+            ) {
+                return true;
+            }
+            return false;
+        }
+        load_registry_entry(id).is_some_and(|e| e.status.is_terminal())
     }
 
     /// Cheap snapshot of a worker's step history.
@@ -646,6 +690,9 @@ impl WorkerPool {
             record
         };
         self.worktrees.write().await.remove(id);
+        // Collection ends the worker's reviewable life: the terminal payload
+        // travels with the response, so the saved conversation is retired too.
+        remove_worker_history(id);
         tracing::info!(worker = %id, "Worker collected and evicted from pool");
         let dropped = record.logs.dropped();
         let view = emit_view(&record.logs, self.log_policy.max_emitted);
