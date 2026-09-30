@@ -19,16 +19,7 @@ use tokio::net::TcpListener;
 /// Shared counters handed to each accepted connection.
 #[derive(Clone)]
 struct FakeState {
-    arrivals: Arc<Mutex<Vec<String>>>,
-    in_flight: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-}
-
-/// A loopback server that answers every request with one SSE frame, after a
-/// delay, and records the order in which the requests arrive.
-struct FakeLlm {
-    base_url: String,
-    /// Arrival order, one entry per request.
+    /// One entry per request, in arrival order.
     arrivals: Arc<Mutex<Vec<String>>>,
     /// Requests being served right now.
     in_flight: Arc<AtomicUsize>,
@@ -36,24 +27,28 @@ struct FakeLlm {
     peak: Arc<AtomicUsize>,
 }
 
+/// A loopback server that answers every request with one SSE frame, after a
+/// delay, and records the order in which the requests arrive.
+struct FakeLlm {
+    base_url: String,
+    state: FakeState,
+}
+
 impl FakeLlm {
     async fn spawn(delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-        let arrivals = Arc::new(Mutex::new(Vec::new()));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
         let state = FakeState {
-            arrivals: arrivals.clone(),
-            in_flight: in_flight.clone(),
-            peak: peak.clone(),
+            arrivals: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
         };
+        let shared = state.clone();
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let fake = state.clone();
+                let shared = shared.clone();
                 tokio::spawn(async move {
-                    // Read the request head, then the JSON body it announces.
+                    // Read the request head, then the body it announces.
                     let mut head = Vec::new();
                     let mut probe = [0u8; 4096];
                     let mut body = Vec::new();
@@ -62,21 +57,21 @@ impl FakeLlm {
                             Ok(0) | Err(_) => return,
                             Ok(n) => {
                                 head.extend_from_slice(&probe[..n]);
-                                if let Some(split) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                                if let Some(split) =
+                                    head.windows(4).position(|w| w == b"\r\n\r\n")
+                                {
                                     body = head.split_off(split + 4);
                                     break;
                                 }
                             }
                         }
                     }
-                    let content_length = String::from_utf8_lossy(&head)
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        });
+                    let content_length = String::from_utf8_lossy(&head).lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
                     if let Some(content_length) = content_length {
                         while body.len() < content_length {
                             let mut chunk = vec![0u8; content_length - body.len()];
@@ -86,19 +81,20 @@ impl FakeLlm {
                             }
                         }
                     }
+                    // The dispatched task text carries the marker.
                     let text = String::from_utf8_lossy(&body).into_owned();
-                    // The task text carries the dispatch marker.
-                    let worker = ["a0", "a1", "a2", "a3", "b0", "b1"]
+                    let marker = ["a0", "a1", "a2", "a3", "b0", "b1"]
                         .iter()
                         .find(|marker| text.contains(&format!("fairness-marker-{marker}")))
                         .map(|marker| format!("marker-{marker}"))
                         .unwrap_or_else(|| "unknown".to_string());
-                    fake.arrivals.lock().expect("arrivals lock").push(worker);
+                    shared.arrivals.lock().expect("arrivals lock").push(marker);
 
-                    let now = fake.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    fake.peak.fetch_max(now, Ordering::SeqCst);
+                    let now = shared.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    shared.peak.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
-                    let payload = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                    let payload =
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         payload.len()
@@ -108,33 +104,38 @@ impl FakeLlm {
                     }
                     let _ = socket.write_all(payload).await;
                     let _ = socket.flush().await;
-                    fake.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    shared.in_flight.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
 
         Self {
             base_url: format!("http://{addr}"),
-            arrivals,
-            in_flight,
-            peak,
+            state,
         }
     }
 
-    /// Arrival order, one worker id per request.
-    async fn arrivals(&self) -> Vec<String> {
-        tokio::time::timeout(Duration::from_secs(10), async {
+    /// Wait until `count` requests have arrived, and return them in order.
+    async fn arrivals(&self, count: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let arrivals = self.arrivals.lock().expect("arrivals lock").clone();
-                if arrivals.len() >= 6 {
+                let arrivals = self.state.arrivals.lock().expect("arrivals lock").clone();
+                if arrivals.len() >= count {
                     return arrivals;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .map_err(|_| "every dispatched worker must reach the LLM")
-        .unwrap()
+        .unwrap_or_else(|_| panic!("only {} requests arrived", self.state.arrivals.lock().expect("arrivals lock").len()))
+    }
+
+    fn peak(&self) -> usize {
+        self.state.peak.load(Ordering::SeqCst)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.state.in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -159,7 +160,8 @@ fn scratch_repo(tag: &str) -> PathBuf {
     }
     std::fs::write(dir.join("README.md"), "# scratch\n").expect("write readme");
     assert!(
-        git(&["add", "-A"]).status.success() && git(&["commit", "--quiet", "-m", "init"]).status.success(),
+        git(&["add", "-A"]).status.success()
+            && git(&["commit", "--quiet", "-m", "init"]).status.success(),
         "seed commit"
     );
     dir
@@ -171,61 +173,72 @@ fn scratch_repo(tag: &str) -> PathBuf {
 /// B's workers are never stuck behind A's whole backlog.
 #[tokio::test]
 async fn worker_slots_alternate_between_owners_once_the_pool_is_full() {
-    let scheduler = mini_swe_mcp::pool::FairScheduler::new(2);
-    let held = [
-        scheduler.acquire("agent-a").await,
-        scheduler.acquire("agent-a").await,
-    ];
-    let mut queued = Vec::new();
-    for owner in ["agent-a", "agent-a", "agent-b", "agent-b"] {
-        queued.push(tokio::spawn({
-            let scheduler = scheduler.clone();
-            async move { scheduler.acquire(owner).await }
-        }));
+    let server = FakeLlm::spawn(Duration::from_millis(200)).await;
+    let repo = scratch_repo("slots");
+    let pool = WorkerPool::new(2, server.base_url.clone(), "test-key".to_string());
+
+    // A queues four workers first; its first two take both slots.
+    for index in 0..4 {
+        dispatch(&pool, "agent-a", &format!("fairness-marker-a{index}"), &repo).await;
     }
-    // A's first two workers hold both slots; the other four are queued.
-    while scheduler.waiting() < 4 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Then B queues two, behind A's whole backlog under the old FIFO gate.
+    for index in 0..2 {
+        dispatch(&pool, "agent-b", &format!("fairness-marker-b{index}"), &repo).await;
     }
 
-    // Freeing one slot at a time must hand them to the owners in turn, and
-    // never grant more than the pool allows.
-    let mut owners = Vec::new();
-    for slot in held {
-        drop(slot);
-        let next = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(handle) = queued.iter().position(|task| task.is_finished()) {
-                    break queued.remove(handle).await.expect("queued worker");
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+    // Every worker reaches the LLM exactly once (one turn, no review phase).
+    let arrivals = server.arrivals(6).await;
+    let owners: Vec<&str> = arrivals
+        .iter()
+        .map(|marker| {
+            if marker.starts_with("marker-b") {
+                "agent-b"
+            } else {
+                "agent-a"
             }
         })
-        .await
-        .expect("a freed slot must be granted");
-        owners.push(next);
-    }
+        .collect();
     assert_eq!(
         owners,
-        ["agent-b", "agent-a", "agent-b", "agent-a"],
+        ["agent-a", "agent-a", "agent-b", "agent-a", "agent-b", "agent-a"],
         "after the first slots the grants must interleave the owners"
     );
-    for task in queued {
-        task.abort();
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Dispatch one worker and return once its task is queued for a slot.
+async fn dispatch(pool: &WorkerPool, owner: &str, task: &str, repo: &Path) {
+    pool.dispatch(
+        owner.to_string(),
+        task.to_string(),
+        "test-model".to_string(),
+        None,
+        repo.to_path_buf(),
+        1,
+        None,
+        None,
+        true,
+        None,
+    )
+    .await
+    .expect("dispatch");
+    // The spawned task takes its queue position as soon as it is polled.
+    while pool.waiting_worker_slots() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+use std::path::Path;
 
 /// `HUB_LLM_CONCURRENCY` caps the chat-completion requests in flight across the
 /// whole process: the gate is taken around the HTTP request and its stream, so
 /// the fake server never sees more requests at once than the cap allows.
 #[tokio::test]
 async fn llm_concurrency_cap_limits_in_flight_requests() {
-    let server = FakeLlm::spawn(Duration::from_millis(250)).await;
-    let messages = vec![ChatMessage::text(Role::User, "hello")];
-
     for cap in [1usize, 2, 3] {
-        let server = FakeLlm::spawn(Duration::from_millis(250)).await;
-        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+        let server = FakeLlm::spawn(Duration::from_millis(200)).await;
+        // One shared gate, as the pool hands every worker's runner.
+        let gate = Arc::new(tokio::sync::Semaphore::new(cap));
         let runners: Vec<AgentRunner> = (0..cap + 3)
             .map(|_| {
                 AgentRunner::new(
@@ -238,6 +251,7 @@ async fn llm_concurrency_cap_limits_in_flight_requests() {
                 .with_llm_gate(Some(gate.clone()))
             })
             .collect();
+        let messages = vec![ChatMessage::text(Role::User, "hello")];
         let requests: Vec<_> = runners
             .iter()
             .map(|runner| {
@@ -252,16 +266,15 @@ async fn llm_concurrency_cap_limits_in_flight_requests() {
                 .expect("request task")
                 .expect("fake SSE step");
         }
-        assert!(
-            server.peak.load(Ordering::SeqCst) <= cap,
-            "cap {cap}: the gate must bound the requests in flight (peak {})",
-            server.peak.load(Ordering::SeqCst)
+        assert_eq!(
+            server.peak(),
+            cap,
+            "cap {cap}: the gate must bound the requests in flight"
         );
         assert_eq!(
-            server.in_flight.load(Ordering::SeqCst),
+            server.in_flight(),
             0,
             "cap {cap}: every permit is released"
         );
     }
 }
-

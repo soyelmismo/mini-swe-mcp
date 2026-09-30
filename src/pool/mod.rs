@@ -146,6 +146,7 @@ impl WorkerPool {
                 .unwrap_or(DEFAULT_TERMINAL_TTL_SECS),
         );
 
+        let llm_gate = crate::agent::llm_gate_from_env();
         info!(
             bash_slots,
             max_heavy = admission.max_heavy(),
@@ -154,11 +155,13 @@ impl WorkerPool {
             max_retained_logs = log_policy.max_retained,
             max_emitted_logs = log_policy.max_emitted,
             terminal_ttl_secs = terminal_ttl.as_secs(),
-            "Bash semaphore and heavy-command admission controller initialized"
+            worker_slots = max_concurrent,
+            llm_concurrency = llm_gate.as_ref().map_or(0, |gate| gate.available_permits()),
+            "Worker slots, bash semaphore and heavy-command admission controller initialized"
         );
         Self {
             worker_slots: fair::FairScheduler::new(max_concurrent),
-            llm_gate: crate::agent::llm_gate_from_env(),
+            llm_gate,
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
@@ -483,6 +486,11 @@ impl WorkerPool {
             .lock()
             .expect("registry lock poisoned")
             .reset_throttle(id);
+    }
+
+    /// Workers queued for a slot, oldest first.
+    pub fn waiting_worker_slots(&self) -> usize {
+        self.worker_slots.waiting()
     }
 
     /// Lightweight snapshot for progress waiters.
