@@ -378,3 +378,118 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
         "a branch that vanished unmerged must keep its row within the grace period"
     );
 }
+
+/// A worker revised *after* the consolidator integrated its earlier tip keeps
+/// its branch: its history file records the old tip as integrated, but the
+/// branch now carries commits the base does not have, and deleting it would
+/// destroy that work. The other member of the same round is still provably
+/// integrated and is retired.
+#[test]
+fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
+    let f = Fixture::new("retire-revised");
+    for id in ["r-ok", "r-new"] {
+        f.commit_on_worker_branch(id, &format!("{id}.txt"), &format!("{id}\n"));
+        f.record(id);
+    }
+    // The consolidator integrates both tips.
+    f.commit_on_worker_branch("rcons", "rcons.txt", "consolidated\n");
+    git(f.repo(), &["merge", "--no-ff", "-m", "integrate", "worker-r-ok"]);
+    git(f.repo(), &["merge", "--no-ff", "-m", "integrate", "worker-r-new"]);
+    f.record_with_verify("rcons", Some("true"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            task: "consolidate".to_string(),
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 1,
+            repo_path: Some(f.repo().to_string_lossy().into_owned()),
+            base_branch: Some("main".to_string()),
+            integrated: vec!["r-ok".to_string(), "r-new".to_string()],
+            ..WorkerRegistryEntry::test_row("rcons", "")
+        },
+    );
+
+    // `r-new` is revised *after* the round: a new commit lands on its own
+    // branch that nobody put into the consolidator's branch, so it is NOT in
+    // main and must survive.
+    git(f.repo(), &["checkout", "-q", "worker-r-new"]);
+    write(f.repo(), "r-new.txt", "revised work\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-m", "revision after integration"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+
+    f.merge("rcons").expect("the consolidator merge must succeed");
+
+    assert!(
+        !f.row_exists("r-ok"),
+        "a member whose whole branch is in main is retired"
+    );
+    assert!(
+        f.row_exists("r-new") && git_ref_exists(f.repo(), "worker-r-new"),
+        "a member revised after integration must keep its branch and row: its new work is not in main"
+    );
+}
+
+/// A consolidator's recorded round survives the status writes that follow it.
+///
+/// Every registry write passes through the pool's coalescing writer, and each
+/// status update rebuilds the row from the worker's metadata, which knows
+/// nothing about the round. Without the merge inside the writer, the very next
+/// step erases the round and the workers it names could never be retired.
+///
+/// Driven through the pool's own status write -- not the raw row helper -- so it
+/// covers the real path a consolidator's completion takes.
+#[test]
+fn a_consolidators_round_survives_its_later_status_writes() {
+    let f = Fixture::new("retire-round-survives");
+    f.record_with_verify("wcons", Some("true"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 3,
+            integrated: vec!["x1".to_string()],
+            ..WorkerRegistryEntry::test_row("wcons", "agent-a")
+        },
+    );
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    let meta = mini_swe_mcp::pool::WorkerMeta {
+        id: "wcons".to_string(),
+        task: "consolidate".to_string(),
+        owner: "agent-a".to_string(),
+        group: None,
+        role: Default::default(),
+        repo_path: Some(f.repo().to_string_lossy().into_owned()),
+        started_at: 0,
+        pid: std::process::id(),
+        revision: 0,
+        auto_continues: 0,
+        metrics: Default::default(),
+        report: None,
+        verified: None,
+    };
+    pool.__test_reset_registry_throttle("wcons");
+    pool.__test_save_status(
+        &meta,
+        "test",
+        mini_swe_mcp::pool::RegistryStatus::Completed,
+        9,
+        10,
+        "done",
+        None,
+    );
+
+    let row = mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "wcons")
+        .expect("the consolidator's row must survive its completion");
+    assert_eq!(
+        row.integrated,
+        vec!["x1".to_string()],
+        "the status write must not erase the round the consolidator integrated"
+    );
+}

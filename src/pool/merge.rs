@@ -745,8 +745,9 @@ fn cleanup(
             // integrated: its branch then holds work the base does not have, and
             // deleting it would destroy that work. Retire only what is provably
             // integrated now, and leave a re-revised worker alone.
-            let ok = branch_is_integrated_in(root, repo, id, branch);
-            if !ok {
+            // `base_branch`, not `branch`: the worker's commits must be in the
+            // branch the merge landed on, which is the whole round's base.
+            if !branch_is_integrated_in(root, repo, id, base_branch) {
                 continue;
             }
             retire_worker_with(root, id, &ctx);
@@ -802,7 +803,7 @@ fn branch_is_integrated_in(
     if !same_repo {
         return false;
     }
-    let r = crate::worktree::git(
+    crate::worktree::git(
         repo,
         "merge-base --is-ancestor",
         &[
@@ -811,9 +812,8 @@ fn branch_is_integrated_in(
             &format!("worker-{worker_id}"),
             base,
         ],
-    );
-    eprintln!("DBG probe {worker_id} base={base} ok={:?} success={:?}", r.is_ok(), r.as_ref().map(|o| o.status.success()));
-    r.is_ok_and(|out| out.status.success())
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 // ----------
