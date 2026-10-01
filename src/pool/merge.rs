@@ -92,6 +92,11 @@ pub struct MergeReport {
     pub branch_deleted: bool,
     /// Human-readable list of what the cleanup reclaimed.
     pub cleaned: Vec<String>,
+    /// Every worker actually retired by this merge, the merged worker first and
+    /// then the round a consolidator absorbed. The caller drops their
+    /// acknowledgements and live records, which is why the *actual* ids are
+    /// propagated rather than re-derived.
+    pub retired: Vec<String>,
 }
 
 /// [`merge_worker_in`] over the default scratch root.
@@ -220,7 +225,7 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
     })?;
     let commit = head_commit(repo);
 
-    let (branch_deleted, cleaned) = cleanup(
+    let (branch_deleted, cleaned, retired) = cleanup(
         root,
         worker_id,
         repo,
@@ -239,6 +244,7 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
         gate_command: if gate_ran { gate_command } else { None },
         branch_deleted,
         cleaned,
+        retired,
     })
 }
 
@@ -715,7 +721,7 @@ fn cleanup(
     branch: &str,
     base_branch: &str,
     keep_branch: bool,
-) -> (bool, Vec<String>) {
+) -> (bool, Vec<String>, Vec<String>) {
     let worktree = root.join(format!("swe-wt-{worker_id}"));
     let reclaimed = worktree.exists();
     // A consolidator carries the round it integrated on its own row, and that
@@ -737,8 +743,11 @@ fn cleanup(
 
     // Only a consolidator whose own ref is gone has its round retired: with
     // `--no-delete` the operator kept it, so the round stays a known round.
-    let mut retired_round = 0;
-    if outcome.branch_deleted && !keep_branch && !integrated.is_empty() {
+    // Every worker this merge actually retired, so the caller can drop the
+    // acknowledgements and live records those ids still hold. `--no-delete`
+    // retires nobody: the branch, row and history all stay.
+    let mut retired: Vec<String> = Vec::new();
+    if outcome.branch_deleted && !keep_branch {
         for id in &integrated {
             // A worker may have been revised after its earlier tip was
             // integrated: its branch then holds work the base does not have, and
@@ -750,8 +759,9 @@ fn cleanup(
                 continue;
             }
             retire_worker_with(root, id, &ctx);
-            retired_round += 1;
+            retired.push(id.clone());
         }
+        retired.push(worker_id.to_string());
     }
 
     let mut cleaned = Vec::new();
@@ -760,16 +770,17 @@ fn cleanup(
     } else if keep_branch {
         cleaned.push(format!("branch {branch} kept (--no-delete)"));
     }
-    if retired_round > 0 {
+    if retired.len() > 1 {
         cleaned.push(format!(
-            "{retired_round} integrated worker(s) retired with the round"
+            "{} other integrated worker(s) retired with the round",
+            retired.len() - 1
         ));
     }
     cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());
     if outcome.worktree_reclaimed || reclaimed {
         cleaned.push("worktree leftovers removed".to_string());
     }
-    (outcome.branch_deleted, cleaned)
+    (outcome.branch_deleted, cleaned, retired)
 }
 
 /// Whether `worker-<id>`'s current branch is proven contained in `base`.
@@ -863,6 +874,8 @@ pub struct MergeApprovedReport {
     pub repo_path: PathBuf,
     /// Human-readable list of what the per-worker cleanup reclaimed.
     pub cleaned: Vec<String>,
+    /// Every worker actually retired by the batch.
+    pub retired: Vec<String>,
 }
 
 /// [`merge_approved_in`] over the default scratch root.
@@ -1031,6 +1044,7 @@ pub fn merge_approved_in(
 
     let mut merged: Vec<MergedWorker> = Vec::new();
     let mut cleaned: Vec<String> = Vec::new();
+    let mut retired: Vec<String> = Vec::new();
     for (id, worker) in &included {
         let subject = merge_subject(&worker.task, id);
         git(
@@ -1052,8 +1066,10 @@ pub fn merge_approved_in(
             )
         })?;
         let commit = head_commit(repo);
-        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, &base_branch, false);
+        let (_, worker_cleaned, worker_retired) =
+            cleanup(root, id, repo, &worker.branch, &base_branch, false);
         cleaned.extend(worker_cleaned);
+        retired.extend(worker_retired);
         merged.push(MergedWorker {
             worker_id: id.clone(),
             commit,
@@ -1068,6 +1084,7 @@ pub fn merge_approved_in(
         base_branch,
         repo_path: repo.to_path_buf(),
         cleaned,
+        retired,
     })
 }
 
