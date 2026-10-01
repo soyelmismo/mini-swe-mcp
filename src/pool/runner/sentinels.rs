@@ -239,7 +239,9 @@ fn strip_markup(line: &str) -> String {
         }
         None => line,
     };
-    line.trim_matches(['*', '_', '`', '#', '>']).trim().to_string()
+    line.trim_matches(['*', '_', '`', '#', '>'])
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]

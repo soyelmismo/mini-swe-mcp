@@ -601,6 +601,7 @@ impl McpServer {
                         "step": entry.step,
                         "turns": entry.step,
                         "summary": entry.last_command.clone(),
+                        "report": entry.report,
                         "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                         "question": entry.question,
                         "pid": entry.pid,
@@ -701,7 +702,7 @@ impl McpServer {
                 logs_dropped: collected.logs_dropped,
                 logs_truncation_notice: collected.logs_truncation_notice,
             };
-            let (summary, verified, branch) = completed_fields(Some(&collected.state));
+            let (summary, verified, branch, report) = completed_fields(Some(&collected.state));
             // Collect ends the worker's reviewable life, so the guidance is
             // about the branch it leaves behind rather than a further steer.
             let next_step = crate::pool::next_step_for(branch.as_deref());
@@ -730,6 +731,7 @@ impl McpServer {
                 "summary": summary,
                 "verified": verified,
                 "branch": branch,
+                "report": report,
                 "diff_stat": diff_stat_value(&stats),
                 "next_step": next_step,
             });
@@ -763,7 +765,7 @@ impl McpServer {
         if state.is_none() && entry.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
-        let (summary, verified, state_branch) = completed_fields(state.as_ref());
+        let (summary, verified, state_branch, report) = completed_fields(state.as_ref());
         let branch = state_branch.unwrap_or_else(|| format!("worker-{wid}"));
         // The registry row is the only cross-process record of where the
         // worker's repository is and which branch it integrates with.
@@ -828,6 +830,7 @@ impl McpServer {
             "verify_tail": verify_tail,
             "diff_stat": diff_stat_value(&stats),
             "summary": summary,
+            "report": report,
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
@@ -1271,15 +1274,26 @@ const VERIFY_TAIL_STEPS: usize = 8;
 /// gate verified it, and the branch it leaves behind.
 fn completed_fields(
     state: Option<&crate::pool::WorkerState>,
-) -> (Option<String>, Option<bool>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+    Option<crate::pool::WorkerReport>,
+) {
     match state {
         Some(crate::pool::WorkerState::Completed {
             summary,
             verified,
             branch,
+            report,
             ..
-        }) => (Some(summary.clone()), *verified, branch.clone()),
-        _ => (None, None, None),
+        }) => (
+            Some(summary.clone()),
+            *verified,
+            branch.clone(),
+            report.clone(),
+        ),
+        _ => (None, None, None, None),
     }
 }
 
@@ -1485,114 +1499,16 @@ fn same_diff_path(requested: &str, actual: &str) -> bool {
             && actual[..actual.len() - requested.len()].ends_with('/'))
 }
 
-/// The path a `--- `/`+++ ` header names, or `None` for `/dev/null`.
-fn diff_header_path(header: &str) -> Option<String> {
-    let path = header.trim();
-    (path != "/dev/null").then(|| normalize_diff_path(path))
-}
-
-/// One file's section of a diff, while it is still being read.
-struct DiffSection {
-    /// The path as the "after" side spells it.
-    path: String,
-    /// The path as the "before" side spells it, for a file that was deleted.
-    minus: String,
-    body: String,
-}
-
-impl DiffSection {
-    /// The path the section is about: the "after" side when the file still
-    /// exists, the "before" side when it does not.
-    fn path(&self) -> &str {
-        if self.path.is_empty() {
-            &self.minus
-        } else {
-            &self.path
-        }
-    }
-}
-
-/// Split a unified diff into one `(path, section)` pair per file.
-///
-/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
-/// removed line that happens to start with `--` can never be mistaken for one.
-/// A section with neither header — a binary file, a mode-only change — falls
-/// back to the paths its `diff --git` line names.
-fn diff_sections(diff: &str) -> Vec<(String, String)> {
-    let mut sections: Vec<(String, String)> = Vec::new();
-    let mut current: Option<DiffSection> = None;
-    for line in diff.lines() {
-        if let Some(header) = line.strip_prefix("diff --git ") {
-            if let Some(section) = current.take() {
-                sections.push((section.path().to_string(), section.body));
-            }
-            current = Some(DiffSection {
-                path: diff_git_path(header).unwrap_or_default(),
-                minus: String::new(),
-                body: format!("{line}\n"),
-            });
-            continue;
-        }
-        let Some(section) = current.as_mut() else {
-            continue;
-        };
-        section.body.push_str(line);
-        section.body.push('\n');
-        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
-            section.minus = found;
-        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
-            section.path = found;
-        }
-    }
-    if let Some(section) = current.take() {
-        sections.push((section.path().to_string(), section.body));
-    }
-    sections
-        .into_iter()
-        .filter(|(path, _)| !path.is_empty())
-        .collect()
-}
-
-/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
-fn diff_git_path(header: &str) -> Option<String> {
-    let split = header.rfind(" b/")?;
-    let path = &header[..split];
-    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
-}
-
-/// Per-file `(path, insertions, deletions)` of a unified diff.
-///
-/// Only hunk lines are counted, and a hunk starts at its `@@` header, so the
-/// `---`/`+++` headers and an added line that itself starts with `+` are never
-/// mistaken for a change.
+/// Per-file `(path, insertions, deletions)` of a unified diff, read by the
+/// shared parser in [`crate::pool`] so a review payload and a completion event
+/// count the same hunks the same way.
 fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
-    diff_sections(diff)
-        .into_iter()
-        .map(|(path, section)| {
-            let mut insertions = 0;
-            let mut deletions = 0;
-            let mut in_hunks = false;
-            for line in section.lines() {
-                if line.starts_with("@@") {
-                    in_hunks = true;
-                } else if in_hunks && line.starts_with('+') {
-                    insertions += 1;
-                } else if in_hunks && line.starts_with('-') {
-                    deletions += 1;
-                }
-            }
-            DiffFileStat {
-                path,
-                insertions,
-                deletions,
-            }
-        })
-        .collect()
+    crate::pool::file_stats_of_diff(diff)
 }
 
 /// The sections of `diff` that touch any of `files`, rejoined.
 fn diff_of_files(diff: &str, files: &[String]) -> String {
-    diff_sections(diff)
+    crate::pool::diff_sections_of(diff)
         .into_iter()
         .filter(|(path, _)| files.iter().any(|file| same_diff_path(file, path)))
         .map(|(_, section)| section)

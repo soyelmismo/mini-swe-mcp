@@ -177,11 +177,13 @@ fn moved_counters_since(now: &WorkerMetrics, before: &WorkerMetrics) -> Vec<Stri
         .filter_map(|key| {
             let delta = match *key {
                 "repeat_blocks" => now.repeat_blocks.saturating_sub(before.repeat_blocks),
-                "stagnation_nudges" => now.stagnation_nudges.saturating_sub(before.stagnation_nudges),
+                "stagnation_nudges" => now
+                    .stagnation_nudges
+                    .saturating_sub(before.stagnation_nudges),
                 "loop_pauses" => now.loop_pauses.saturating_sub(before.loop_pauses),
-                "extensions_refused" => {
-                    now.extensions_refused.saturating_sub(before.extensions_refused)
-                }
+                "extensions_refused" => now
+                    .extensions_refused
+                    .saturating_sub(before.extensions_refused),
                 _ => now.verify_failures.saturating_sub(before.verify_failures),
             };
             (delta > 0).then(|| format!("{key}={delta}"))

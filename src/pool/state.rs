@@ -165,12 +165,7 @@ pub fn churn_line(stats: &[FileStat]) -> String {
     let shown = ordered.len().min(TOP_FILE_LIMIT);
     let mut line = ordered[..shown]
         .iter()
-        .map(|stat| {
-            format!(
-                "{} (+{} -{})",
-                stat.path, stat.insertions, stat.deletions
-            )
-        })
+        .map(|stat| format!("{} (+{} -{})", stat.path, stat.insertions, stat.deletions))
         .collect::<Vec<_>>()
         .join(", ");
     let more = ordered.len().saturating_sub(shown);

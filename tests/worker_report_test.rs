@@ -15,6 +15,9 @@ fn compact_completion_uses_done_files_and_risks() {
     let text = watch::render(&event);
     assert!(text.contains("Fix completion reporting"), "{text}");
     assert!(text.contains("files: src/a.rs (+3 -2)"), "{text}");
-    assert!(text.contains("risks: Changes completion feedback"), "{text}");
+    assert!(
+        text.contains("risks: Changes completion feedback"),
+        "{text}"
+    );
     assert!(text.lines().count() <= 5, "{text}");
 }

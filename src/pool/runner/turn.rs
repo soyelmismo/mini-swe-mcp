@@ -543,7 +543,9 @@ impl<'a> TurnEngine<'a> {
                 // orchestrator reads: the reviewer's sentinel approves the
                 // audit, and asking it for a report would cost a turn for a
                 // payload nobody stores.
-                return self.handle_completion(&llm_resp, config.apply_sentinels).await;
+                return self
+                    .handle_completion(&llm_resp, config.apply_sentinels)
+                    .await;
             }
             Some(ref cmd) => {
                 *self.consecutive_no_cmd = 0;

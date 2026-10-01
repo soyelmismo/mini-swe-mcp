@@ -248,10 +248,9 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
             // The report's `done:` line is the headline; the verification flag
             // rides on it so the body stays five lines even with a per-file
             // diff and a risk note.
-            let verified = view
-                .outcome
-                .verified
-                .map_or_else(String::new, |ok| format!(" | Verified: {}", if ok { "yes" } else { "no" }));
+            let verified = view.outcome.verified.map_or_else(String::new, |ok| {
+                format!(" | Verified: {}", if ok { "yes" } else { "no" })
+            });
             let headline = view
                 .outcome
                 .report

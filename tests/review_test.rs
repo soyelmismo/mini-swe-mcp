@@ -100,6 +100,7 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
@@ -134,6 +135,7 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         base_commit: None,
         revision,
         auto_continues: 0,
+        report: None,
     }
 }
 
@@ -379,6 +381,7 @@ async fn review_never_evicts_the_worker_it_reviewed() {
         verified: Some(false),
         metrics: WorkerMetrics::default(),
         revision: 1,
+        report: None,
     };
     record.logs.push(AgentStepLog {
         step: 3,

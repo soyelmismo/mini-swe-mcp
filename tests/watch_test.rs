@@ -231,6 +231,7 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     )])
     .await;
@@ -379,6 +380,7 @@ async fn an_interaction_marks_the_workers_events_seen() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     )])
     .await;
@@ -565,6 +567,7 @@ async fn the_binary_watches_through_the_hub() {
                 verified: Some(true),
                 metrics: WorkerMetrics::default(),
                 revision: 0,
+                report: None,
             },
         ),
         // Another agent's live worker: never watchable, never leaked.
@@ -738,6 +741,7 @@ async fn a_no_arg_watch_action_follows_late_dispatches() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     ))
     .await;
@@ -813,6 +817,7 @@ async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     ))
     .await;
@@ -1284,6 +1289,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        report: None,
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);
