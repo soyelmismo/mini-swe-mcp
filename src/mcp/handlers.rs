@@ -215,6 +215,7 @@ impl McpServer {
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args, ctx).await,
             "collect" => self.handle_collect(args, ctx).await,
+            "review" => self.handle_review(args, ctx).await,
             "logs" => self.handle_logs(args, ctx).await,
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
@@ -662,6 +663,13 @@ impl McpServer {
         }))
     }
 
+    /// `collect` action: the worker's final answer, with the diff summarised
+    /// unless the caller asks for it.
+    ///
+    /// The default reply is the compact one — summary, verified, per-file diff
+    /// stat and branch — because the full diff of a large task is what makes a
+    /// review expensive. `full: true` restores the whole diff, and
+    /// `files: [...]` narrows it to the named paths.
     async fn handle_collect(
         &self,
         args: &Value,
@@ -670,6 +678,8 @@ impl McpServer {
         let resolved = self.resolve_worker_id(args, "collect", ctx).await?;
         let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
+        let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+        let files = Self::get_diff_files(args, "collect")?;
         if let Some(collected) = self.pool.collect(wid).await {
             let log_view = LogView {
                 logs: collected.logs,
@@ -677,15 +687,36 @@ impl McpServer {
                 logs_dropped: collected.logs_dropped,
                 logs_truncation_notice: collected.logs_truncation_notice,
             };
+            let (summary, verified, branch) = completed_fields(Some(&collected.state));
             // Collect ends the worker's reviewable life, so the guidance is
             // about the branch it leaves behind rather than a further steer.
-            let next_step = crate::pool::next_step_for(
-                crate::pool::terminal_branch(&collected.state).as_deref(),
-            );
+            let next_step = crate::pool::next_step_for(branch.as_deref());
+            let mut state = serde_json::to_value(&collected.state).unwrap_or_default();
+            let diff = state
+                .pointer("/details/diff")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let stats = diff_file_stats(&diff);
+            // The diff is the one field that can be arbitrarily large, so it
+            // leaves the payload unless it was asked for — whole, or narrowed
+            // to the files that were named.
+            if let Some(details) = state.pointer_mut("/details").and_then(Value::as_object_mut) {
+                let scoped = diff_of_files(&diff, &files);
+                if !scoped.is_empty() {
+                    details.insert("diff".to_string(), json!(scoped));
+                } else if !full {
+                    details.remove("diff");
+                }
+            }
             let mut result = json!({
                 "worker_id": wid,
                 "owner": collected.owner,
-                "state": collected.state,
+                "state": state,
+                "summary": summary,
+                "verified": verified,
+                "branch": branch,
+                "diff_stat": diff_stat_value(&stats),
                 "next_step": next_step,
             });
             if let serde_json::Value::Object(map) = &mut result {
@@ -695,6 +726,125 @@ impl McpServer {
         } else {
             anyhow::bail!("Worker not found: {wid}")
         }
+    }
+
+    /// `review` action: one compact view of a worker's branch, ending with the
+    /// command that acts on it.
+    ///
+    /// Reviewing used to mean `status`, plus `collect` (the whole diff, however
+    /// large), plus `logs`, plus a hand-run `git merge-tree`. This is the same
+    /// answer in one bounded payload: the task's first line, what verification
+    /// said, the per-file diff stat, the revision, and whether the branch still
+    /// merges cleanly into the base branch tip. Read-only — unlike `collect` it
+    /// never evicts the worker.
+    async fn handle_review(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let wid = self.resolve_worker_id(args, "review", ctx).await?;
+        self.require_owner(&wid, ctx).await?;
+        let state = self.pool.get_worker_state(&wid).await;
+        let entry = crate::pool::load_registry_entry_in(self.pool.scratch_root(), &wid);
+        if state.is_none() && entry.is_none() {
+            anyhow::bail!("Worker not found: {wid}");
+        }
+        let (summary, verified, state_branch) = completed_fields(state.as_ref());
+        let branch = state_branch.unwrap_or_else(|| format!("worker-{wid}"));
+        // The registry row is the only cross-process record of where the
+        // worker's repository is and which branch it integrates with.
+        let repo = entry
+            .as_ref()
+            .and_then(|entry| entry.repo_path.as_deref())
+            .map(std::path::Path::new)
+            .filter(|path| path.is_dir())
+            .map(std::path::Path::to_path_buf);
+        let base_branch = entry
+            .as_ref()
+            .and_then(|entry| entry.base_branch.clone())
+            .or_else(|| {
+                repo.as_deref()
+                    .and_then(crate::pool::revision::detect_base_branch)
+            });
+        // A live worker's diff is the exact text it produced; a collected one
+        // has only its branch left, so its stat is measured from that.
+        let live_diff = match &state {
+            Some(crate::pool::WorkerState::Completed { diff, .. }) => Some(diff.clone()),
+            _ => None,
+        };
+        let probe = repo
+            .clone()
+            .zip(base_branch.clone())
+            .map(|(repo, base)| (repo, base, branch.clone()));
+        let (stats, merge) = match tokio::task::spawn_blocking(move || {
+            let Some((repo, base, branch)) = probe else {
+                return (Vec::new(), None);
+            };
+            let merge = merge_check(&repo, &base, &branch);
+            let stats = match &live_diff {
+                Some(diff) => diff_file_stats(diff),
+                None => branch_file_stats(&repo, &base, &branch),
+            };
+            (stats, merge)
+        })
+        .await
+        {
+            Ok(probed) => probed,
+            Err(err) => {
+                tracing::warn!("review probe for worker {wid} could not run: {err}");
+                (Vec::new(), None)
+            }
+        };
+        // A worker that never verified is exactly the one whose verify output
+        // the orchestrator needs; a verified one has nothing to show.
+        let verify_tail = if verified == Some(true) {
+            None
+        } else {
+            self.pool
+                .get_worker_logs(&wid)
+                .await
+                .and_then(|logs| super::events::verify_tail_of(&logs.tail(VERIFY_TAIL_STEPS)))
+        };
+        Ok(json!({
+            "worker_id": wid,
+            "owner": self.owner_of(&wid).await,
+            "task": first_line(entry.as_ref().map(|entry| entry.task.as_str()).unwrap_or_default()),
+            "state": state_name(state.as_ref(), entry.as_ref()),
+            "verified": verified,
+            "verify_tail": verify_tail,
+            "diff_stat": diff_stat_value(&stats),
+            "summary": summary,
+            "revision": revision_of(state.as_ref(), entry.as_ref()),
+            "branch": branch,
+            "merge": merge,
+            "next_command": next_command(&wid, &branch, merge.as_ref()),
+        }))
+    }
+
+    /// Parse the optional `files` argument: the paths whose diff the caller
+    /// wants.
+    ///
+    /// A non-array, or an array holding anything but a non-empty string, is a
+    /// hard error: silently dropping it would answer with a diff the caller
+    /// never asked for.
+    pub(super) fn get_diff_files(args: &Value, action: &str) -> Result<Vec<String>> {
+        let Some(value) = args.get("files") else {
+            return Ok(Vec::new());
+        };
+        let items = value.as_array().ok_or_else(|| {
+            anyhow::anyhow!("'files' must be an array of paths for action '{action}'")
+        })?;
+        items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'files' must be an array of paths for action '{action}'")
+                    })
+            })
+            .collect()
     }
 
     /// `list` is scoped to the caller's own workers; `scope: "all"` widens it
@@ -1100,6 +1250,374 @@ impl McpServer {
     }
 }
 
+/// How many step logs a review looks back through for a failed verify.
+const VERIFY_TAIL_STEPS: usize = 8;
+
+/// The three fields only a completed worker carries: its summary, whether the
+/// gate verified it, and the branch it leaves behind.
+fn completed_fields(
+    state: Option<&crate::pool::WorkerState>,
+) -> (Option<String>, Option<bool>, Option<String>) {
+    match state {
+        Some(crate::pool::WorkerState::Completed {
+            summary,
+            verified,
+            branch,
+            ..
+        }) => (Some(summary.clone()), *verified, branch.clone()),
+        _ => (None, None, None),
+    }
+}
+
+/// The first line of a task that says something: an agent writes a heading and
+/// a body, and only the heading belongs in a compact view.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The lifecycle name of a worker, from its live state when it still has one
+/// and from its registry row otherwise.
+fn state_name(
+    state: Option<&crate::pool::WorkerState>,
+    entry: Option<&crate::pool::WorkerRegistryEntry>,
+) -> &'static str {
+    match state {
+        Some(crate::pool::WorkerState::Running { .. }) => "Running",
+        Some(crate::pool::WorkerState::Paused { .. }) => "Paused",
+        Some(crate::pool::WorkerState::Completed { .. }) => "Completed",
+        Some(crate::pool::WorkerState::Failed { .. }) => "Failed",
+        None => entry.map_or("Unknown", |entry| entry.status.display_name()),
+    }
+}
+
+/// The revision a worker reached: the live state carries it, and a collected
+/// worker's registry row is the only other record of it.
+fn revision_of(
+    state: Option<&crate::pool::WorkerState>,
+    entry: Option<&crate::pool::WorkerRegistryEntry>,
+) -> usize {
+    match state {
+        Some(crate::pool::WorkerState::Completed { revision, .. })
+        | Some(crate::pool::WorkerState::Failed { revision, .. }) => *revision,
+        _ => entry.map_or(0, |entry| entry.revision),
+    }
+}
+
+/// The command that acts on this review: merge a clean branch, or send the
+/// conflicts back to the worker that owns them.
+fn next_command(wid: &str, branch: &str, merge: Option<&MergeCheck>) -> String {
+    let Some(merge) = merge else {
+        // No answer was possible, so the merge itself still has to be checked.
+        return format!("git merge-tree --write-tree <base-branch> {branch}");
+    };
+    if merge.clean == Some(true) {
+        return format!("git merge {branch}");
+    }
+    if !merge.conflicts.is_empty() {
+        return format!(
+            "mini-swe-mcp steer {wid} \"resolve the merge conflicts with {}: {}\"",
+            merge.base_branch,
+            merge.conflicts.join(", ")
+        );
+    }
+    format!("git merge {branch}")
+}
+
+/// Whether `branch` still merges cleanly into the tip of `base_branch`.
+///
+/// `git merge-tree --write-tree` (git >= 2.38) performs the merge in memory: it
+/// writes the resulting tree object and answers through its exit status, so the
+/// probe touches no worktree, no index and no lock — whichever way it answers,
+/// nothing on disk changes. Exit 0 is a clean merge; exit 1 lists the conflicted
+/// files after the tree oid; anything else means git refused (an unknown option
+/// on an older git, a ref that does not exist).
+fn merge_check(repo: &std::path::Path, base_branch: &str, branch: &str) -> Option<MergeCheck> {
+    let mut check = MergeCheck {
+        base_branch: base_branch.to_string(),
+        clean: None,
+        conflicts: Vec::new(),
+        error: None,
+    };
+    let output = match crate::worktree::git(
+        repo,
+        "merge-tree",
+        &["merge-tree", "--write-tree", base_branch, branch],
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            check.error = Some(err.to_string());
+            return Some(check);
+        }
+    };
+    match output.status.code() {
+        Some(0) => check.clean = Some(true),
+        Some(1) => {
+            check.clean = Some(false);
+            // The conflicted file list follows the tree oid, one
+            // `<mode> <oid> <stage>\t<path>` line per stage of a path, and
+            // stops at the blank line that introduces the informational
+            // messages. A path therefore appears once per stage it conflicts
+            // in, so the list is deduplicated in the order git reported it.
+            for path in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.rsplit('\t').next().map(str::to_string))
+            {
+                if !check.conflicts.contains(&path) {
+                    check.conflicts.push(path);
+                }
+            }
+        }
+        _ => {
+            check.error = Some(format!(
+                "git merge-tree --write-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Some(check)
+}
+
+/// The answer to "does this branch still merge into the base branch tip?".
+#[derive(Debug, serde::Serialize)]
+pub(super) struct MergeCheck {
+    pub(super) base_branch: String,
+    /// `None` when git could not answer at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) clean: Option<bool>,
+    pub(super) conflicts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
+}
+
+/// Per-file diff stat of `branch` against its merge-base with `base_branch`.
+///
+/// The branch is what the orchestrator merges, so it is measured against the
+/// base tip it will land on — the same range `git diff --shortstat` reports.
+fn branch_file_stats(repo: &std::path::Path, base_branch: &str, branch: &str) -> Vec<DiffFileStat> {
+    let Ok(merge_base) =
+        crate::worktree::git(repo, "merge-base", &["merge-base", base_branch, branch])
+    else {
+        return Vec::new();
+    };
+    if !merge_base.status.success() {
+        return Vec::new();
+    }
+    let base = String::from_utf8_lossy(&merge_base.stdout)
+        .trim()
+        .to_string();
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let range = format!("{base}...{branch}");
+    let Ok(output) = crate::worktree::git(repo, "diff --numstat", &["diff", "--numstat", &range])
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Read `git diff --numstat` output: `<added>\t<deleted>\t<path>` per line,
+/// with `-` for a binary file, which counts as neither added nor deleted.
+fn parse_numstat(text: &str) -> Vec<DiffFileStat> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let insertions = numstat_count(fields.next()?)?;
+            let deletions = numstat_count(fields.next()?)?;
+            let path = fields.next()?;
+            Some(DiffFileStat {
+                path: normalize_diff_path(path),
+                insertions,
+                deletions,
+            })
+        })
+        .collect()
+}
+
+/// One `--numstat` count: a number, or `0` for the `-` a binary file carries.
+fn numstat_count(field: &str) -> Option<usize> {
+    Some(if field == "-" {
+        0
+    } else {
+        field.parse::<usize>().ok()?
+    })
+}
+
+/// One file's share of a diff, as `git diff --numstat` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiffFileStat {
+    pub(super) path: String,
+    pub(super) insertions: usize,
+    pub(super) deletions: usize,
+}
+
+/// A path as git spells it in a diff header, without the `a/`/`b/` prefix or a
+/// leading `./`, so a caller's `--file src/a.rs` matches what git printed.
+fn normalize_diff_path(path: &str) -> String {
+    let path = path
+        .strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path)
+        .trim_matches('"');
+    path.strip_prefix("./").unwrap_or(path).to_string()
+}
+
+/// Whether a requested path names the file a diff section is about.
+///
+/// Exact after normalisation, or a whole-component suffix of it, so `--file
+/// a.rs` still finds `src/a.rs`.
+fn same_diff_path(requested: &str, actual: &str) -> bool {
+    let requested = normalize_diff_path(requested);
+    let actual = normalize_diff_path(actual);
+    actual == requested
+        || (!requested.is_empty()
+            && actual.len() > requested.len()
+            && actual.ends_with(&requested)
+            && actual[..actual.len() - requested.len()].ends_with('/'))
+}
+
+/// The path a `--- `/`+++ ` header names, or `None` for `/dev/null`.
+fn diff_header_path(header: &str) -> Option<String> {
+    let path = header.trim();
+    (path != "/dev/null").then(|| normalize_diff_path(path))
+}
+
+/// One file's section of a diff, while it is still being read.
+struct DiffSection {
+    /// The path as the "after" side spells it.
+    path: String,
+    /// The path as the "before" side spells it, for a file that was deleted.
+    minus: String,
+    body: String,
+}
+
+impl DiffSection {
+    /// The path the section is about: the "after" side when the file still
+    /// exists, the "before" side when it does not.
+    fn path(&self) -> &str {
+        if self.path.is_empty() {
+            &self.minus
+        } else {
+            &self.path
+        }
+    }
+}
+
+/// Split a unified diff into one `(path, section)` pair per file.
+///
+/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
+/// removed line that happens to start with `--` can never be mistaken for one.
+/// A section with neither header — a binary file, a mode-only change — falls
+/// back to the paths its `diff --git` line names.
+fn diff_sections(diff: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<DiffSection> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            if let Some(section) = current.take() {
+                sections.push((section.path().to_string(), section.body));
+            }
+            current = Some(DiffSection {
+                path: diff_git_path(header).unwrap_or_default(),
+                minus: String::new(),
+                body: format!("{line}\n"),
+            });
+            continue;
+        }
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        section.body.push_str(line);
+        section.body.push('\n');
+        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
+            section.minus = found;
+        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
+            section.path = found;
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push((section.path().to_string(), section.body));
+    }
+    sections
+        .into_iter()
+        .filter(|(path, _)| !path.is_empty())
+        .collect()
+}
+
+/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
+fn diff_git_path(header: &str) -> Option<String> {
+    let split = header.rfind(" b/")?;
+    let path = &header[..split];
+    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
+}
+
+/// Per-file `(path, insertions, deletions)` of a unified diff.
+///
+/// Only hunk lines are counted, and a hunk starts at its `@@` header, so the
+/// `---`/`+++` headers and an added line that itself starts with `+` are never
+/// mistaken for a change.
+fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
+    diff_sections(diff)
+        .into_iter()
+        .map(|(path, section)| {
+            let mut insertions = 0;
+            let mut deletions = 0;
+            let mut in_hunks = false;
+            for line in section.lines() {
+                if line.starts_with("@@") {
+                    in_hunks = true;
+                } else if in_hunks && line.starts_with('+') {
+                    insertions += 1;
+                } else if in_hunks && line.starts_with('-') {
+                    deletions += 1;
+                }
+            }
+            DiffFileStat {
+                path,
+                insertions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
+/// The sections of `diff` that touch any of `files`, rejoined.
+fn diff_of_files(diff: &str, files: &[String]) -> String {
+    diff_sections(diff)
+        .into_iter()
+        .filter(|(path, _)| files.iter().any(|file| same_diff_path(file, path)))
+        .map(|(_, section)| section)
+        .collect()
+}
+
+/// The `diff_stat` payload: the totals plus the per-file counts.
+fn diff_stat_value(stats: &[DiffFileStat]) -> Value {
+    let insertions: usize = stats.iter().map(|stat| stat.insertions).sum();
+    let deletions: usize = stats.iter().map(|stat| stat.deletions).sum();
+    json!({
+        "files": stats.len(),
+        "insertions": insertions,
+        "deletions": deletions,
+        "per_file": stats
+            .iter()
+            .map(|stat| json!({
+                "path": stat.path,
+                "insertions": stat.insertions,
+                "deletions": stat.deletions,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The four-field log view shared by `logs`, `collect` and `await_worker_result`.
 ///
 /// [`LogView::as_map`] flattens the keys into the top level of the enclosing
@@ -1134,6 +1652,7 @@ impl LogView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentStepLog;
 
     /// An omitted `timeout_secs` means "wait indefinitely"; a non-integer one
     /// is a hard error, because a dropped deadline is the unbounded hang the
@@ -1284,5 +1803,195 @@ mod tests {
             .expect("default must apply"),
             "an undeclared policy must fall back to allow"
         );
+    }
+
+    /// A diff split into sections keeps every file, and the counts come from the
+    /// hunks alone: an added line that itself starts with `+` and a removed line
+    /// that starts with `--` are content, not headers.
+    #[test]
+    fn diff_sections_count_hunk_lines_only() {
+        let diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "index 111..222 100644\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " context\n",
+            "-removed\n",
+            "++added line that starts with a plus\n",
+            "--removed line that starts with two dashes\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "new file mode 100644\n",
+            "index 000..333\n",
+            "--- /dev/null\n",
+            "+++ b/two.rs\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+first\n",
+            "+second\n",
+        );
+        let stats = diff_file_stats(diff);
+        assert_eq!(
+            stats,
+            vec![
+                DiffFileStat {
+                    path: "one.rs".to_string(),
+                    insertions: 1,
+                    deletions: 2,
+                },
+                DiffFileStat {
+                    path: "two.rs".to_string(),
+                    insertions: 2,
+                    deletions: 0,
+                },
+            ]
+        );
+        let stat = diff_stat_value(&stats);
+        assert_eq!(stat["files"], 2);
+        assert_eq!(stat["insertions"], 3);
+        assert_eq!(stat["deletions"], 2);
+        assert_eq!(stat["per_file"][1]["path"], "two.rs");
+    }
+
+    /// A binary file carries no line counts, but it is still a file that changed.
+    #[test]
+    fn a_binary_file_counts_as_a_file_with_no_lines() {
+        let diff = concat!(
+            "diff --git a/logo.png b/logo.png\n",
+            "index 111..222 100644\n",
+            "Binary files a/logo.png and b/logo.png differ\n",
+        );
+        assert_eq!(
+            diff_file_stats(diff),
+            vec![DiffFileStat {
+                path: "logo.png".to_string(),
+                insertions: 0,
+                deletions: 0,
+            }]
+        );
+    }
+
+    /// `files` selects sections by path, and a bare name still finds the file
+    /// inside a directory.
+    #[test]
+    fn diff_of_files_matches_a_path_or_a_component_suffix() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/b.rs b/b.rs\n",
+            "--- a/b.rs\n",
+            "+++ b/b.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        // Six lines: the `diff --git` header, the two path headers, the hunk
+        // header and the two changed lines.
+        assert_eq!(
+            diff_of_files(diff, &["src/a.rs".to_string()])
+                .lines()
+                .count(),
+            6
+        );
+        assert_eq!(
+            diff_of_files(diff, &["a.rs".to_string()]).lines().count(),
+            6
+        );
+        assert_eq!(
+            diff_of_files(diff, &["b.rs".to_string()]).lines().count(),
+            6
+        );
+        assert!(diff_of_files(diff, &["nope.rs".to_string()]).is_empty());
+    }
+
+    /// `git diff --numstat` is read as the same per-file stat the in-memory diff
+    /// produces, and a binary file (`-`) counts as neither.
+    #[test]
+    fn numstat_is_read_as_the_same_per_file_stat() {
+        assert_eq!(
+            parse_numstat("3\t1\tsrc/a.rs\n-\t-\tlogo.png\n"),
+            vec![
+                DiffFileStat {
+                    path: "src/a.rs".to_string(),
+                    insertions: 3,
+                    deletions: 1,
+                },
+                DiffFileStat {
+                    path: "logo.png".to_string(),
+                    insertions: 0,
+                    deletions: 0,
+                },
+            ]
+        );
+    }
+
+    /// The next command acts on the merge answer: merge a clean branch, send the
+    /// conflicts back to the worker that owns them.
+    #[test]
+    fn next_command_follows_the_merge_answer() {
+        let clean = MergeCheck {
+            base_branch: "master".to_string(),
+            clean: Some(true),
+            conflicts: Vec::new(),
+            error: None,
+        };
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&clean)),
+            "git merge worker-w1"
+        );
+
+        let mut conflicting = clean;
+        conflicting.clean = Some(false);
+        conflicting.conflicts = vec!["a.rs".to_string(), "b.rs".to_string()];
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&conflicting)),
+            "mini-swe-mcp steer w1 \"resolve the merge conflicts with master: a.rs, b.rs\""
+        );
+
+        let unknown = MergeCheck {
+            base_branch: "master".to_string(),
+            clean: None,
+            conflicts: Vec::new(),
+            error: Some("git merge-tree failed".to_string()),
+        };
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&unknown)),
+            "git merge worker-w1"
+        );
+        assert_eq!(
+            next_command("w1", "worker-w1", None),
+            "git merge-tree --write-tree <base-branch> worker-w1"
+        );
+    }
+
+    /// A review carries the first line of the task and the tail of the verify
+    /// that failed, never the whole log.
+    #[test]
+    fn the_review_view_is_bounded() {
+        assert_eq!(first_line("Fix the parser\nand its docs"), "Fix the parser");
+        assert_eq!(first_line("   \n  padded  "), "padded");
+        assert_eq!(first_line("  \n\n"), "");
+
+        let build = AgentStepLog {
+            step: 1,
+            command: "cargo build".to_string(),
+            output: "warning: unused".to_string(),
+            exit_code: Some(0),
+        };
+        let verify = AgentStepLog {
+            step: 2,
+            command: "[verify] cargo test".to_string(),
+            output: "test a ... FAILED\nassertion failed".to_string(),
+            exit_code: Some(101),
+        };
+        let logs = vec![&build, &verify];
+        assert_eq!(
+            crate::mcp::events::verify_tail_of(&logs).expect("a failed verify must be shown"),
+            "test a ... FAILED\nassertion failed"
+        );
+        assert_eq!(crate::mcp::events::verify_tail_of(&logs[..1]), None);
     }
 }

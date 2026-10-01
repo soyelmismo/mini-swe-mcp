@@ -626,7 +626,7 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
 /// `warning:`, `assertion`) win the budget: when none of the last 40 lines
 /// carries one, the most recent marked lines are shown instead of the oldest
 /// tail lines, and the byte cap drops unmarked lines first.
-fn verify_tail(output: &str) -> String {
+pub(super) fn verify_tail(output: &str) -> String {
     const MAX_LINES: usize = 40;
     const MAX_BYTES: usize = 4096;
     const MARKERS: [&str; 5] = ["FAILED", "panicked", "error", "warning:", "assertion"];
@@ -670,6 +670,15 @@ fn verify_tail(output: &str) -> String {
     text
 }
 
+/// The failure-focused tail of the newest `[verify]` step in `logs`, when the
+/// window holds one.
+pub(super) fn verify_tail_of(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
+    logs.iter()
+        .rev()
+        .find(|log| log.command.starts_with("[verify]"))
+        .map(|log| verify_tail(&log.output))
+}
+
 /// Attach the newest `[verify]` log tail to a view that is not verified.
 ///
 /// A worker whose earlier verify run failed can still pass its completion
@@ -677,13 +686,7 @@ fn verify_tail(output: &str) -> String {
 /// unverified worker (whose tail explains the live failure) carries a tail.
 fn attach_verify_tail(view: &mut serde_json::Value, logs: &LogBuffer) {
     if view["verified"] != true {
-        view["verify_output_tail"] = json!(
-            logs.tail(1000)
-                .iter()
-                .rev()
-                .find(|log| log.command.starts_with("[verify]"))
-                .map(|log| verify_tail(&log.output))
-        );
+        view["verify_output_tail"] = json!(verify_tail_of(&logs.tail(1000)));
     }
 }
 

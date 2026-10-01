@@ -12,8 +12,8 @@
 //!
 //! The renderers themselves are split by what they describe:
 //!
-//! * `worker` — the per-worker inspection verbs: `status`, `collect`, `logs`,
-//!   `dispatch`, `steer`, `watch`, `kill`, `reap`, `merge`, plus the shared
+//! * `worker` — the per-worker inspection verbs: `status`, `collect`, `review`,
+//!   `logs`, `dispatch`, `steer`, `watch`, `kill`, `reap`, `merge`, plus the shared
 //!   `log_counters_line` helper that keeps step-log truncation visible (audit 07, R7) and the
 //!   `health_line` that keeps a run's quality measurable.
 //! * `catalog` — the system-catalog verbs: `manifest`, `list`, `prune`.
@@ -28,7 +28,7 @@ mod worker;
 pub use self::catalog::{format_list, format_manifest, format_prune};
 pub use self::worker::{
     format_collect, format_dispatch, format_kill, format_logs, format_merge, format_reap,
-    format_status, format_steer, health_line, log_counters_line,
+    format_review, format_status, format_steer, health_line, log_counters_line,
 };
 
 /// Render `val` for `action`, falling back to pretty JSON for actions with no
@@ -40,6 +40,7 @@ pub fn format_output(action: &str, val: &serde_json::Value) -> String {
         "prune" => format_prune(val),
         "status" => format_status(val),
         "collect" => format_collect(val),
+        "review" => format_review(val),
         "logs" => format_logs(val),
         "reap" => format_reap(val),
         "dispatch" => format_dispatch(val),

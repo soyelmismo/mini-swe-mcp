@@ -19,7 +19,7 @@ pub const HELP_FLAGS: &str = concat!(
 /// here, one concern per topic, so an agent can fetch exactly what it needs
 /// without paying for all of it in every session's context.
 pub const TOPICS: &[&str] = &[
-    "workflow", "watch", "steer", "merge", "identity", "sandbox", "env",
+    "workflow", "watch", "steer", "review", "collect", "merge", "identity", "sandbox", "env",
 ];
 
 /// Text of one help topic, or `None` for an unknown topic.
@@ -28,6 +28,8 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "workflow" => WORKFLOW,
         "watch" => WATCH,
         "steer" => STEER,
+        "review" => REVIEW,
+        "collect" => COLLECT,
         "merge" => MERGE,
         "identity" => IDENTITY,
         "sandbox" => SANDBOX,
@@ -44,6 +46,12 @@ const WATCH: &str = "Run `mini-swe-mcp watch` in the background: it blocks until
 
 /// `steer`: correcting a live worker or continuing a stopped one.
 const STEER: &str = "Send every correction and merge conflict to the same worker with `mini-swe-mcp steer <worker_id> <message>` rather than editing its branch yourself. Steering corrects a completed worker or continues any stopped one (failed, interrupted, killed): it resumes on its own worker-<id> branch with the full conversation plus this message, on a fresh turn budget (optional --max-turns, default 60). Never dispatch a replacement for a stopped worker. Review the diff and merge only when it is right.";
+
+/// `review`: the one compact view of a finished worker's branch.
+const REVIEW: &str = "Run `mini-swe-mcp review <worker_id>` for everything needed to decide what to do next, in one bounded reply: the task's first line, whether the verify gate passed (and the tail of its output when it did not), the per-file diff stat, the summary, the revision, and whether the branch still merges cleanly into the base branch tip. The merge check runs `git merge-tree --write-tree`, so it touches no worktree, no index and no lock. A clean branch ends with the merge to run; a conflicting one ends with the `steer` that sends the conflicts back to the worker that owns them. Review is a read: unlike collect it never evicts the worker.";
+
+/// `collect`: the final message, with the diff summarised unless asked for.
+const COLLECT: &str = "Run `mini-swe-mcp collect <worker_id>` for a finished worker's final message. The default reply is compact - summary, verification outcome, per-file diff stat and branch - because the full diff of a large task is what makes a review expensive. Pass --full for the whole diff, or --file <path> (repeatable) for the diff of named files only. Collect ends the worker's reviewable life: prefer `review` while the worker is still live, and collect once it is done.";
 
 /// `merge`: land a reviewed worker's branch in one command.
 const MERGE: &str = "`mini-swe-mcp merge <worker_id>` lands a finished worker's branch on the base branch recorded for it: it trial-merges, runs the verify gate on the merge result in a throwaway worktree, merges with --no-ff and then deletes the branch, its history file and its worktree leftovers. It refuses - changing nothing - while the worker still runs, while the repository has another branch checked out, while a file the merge would touch has uncommitted changes (untracked and unrelated files are left alone), or while the branch conflicts, in which case it names the conflicting files and the steer that sends them back. The gate is skipped when the branch already contains the base tip and the worker's last verify passed. `--no-delete` keeps the branch. It never pushes.";
@@ -85,7 +93,7 @@ mod tests {
     /// not, so `help <topic>` can refuse it with the available list.
     #[test]
     fn every_topic_has_text_and_unknown_ones_do_not() {
-        assert_eq!(TOPICS.len(), 7);
+        assert_eq!(TOPICS.len(), 9);
         for topic in TOPICS {
             let text = topic_text(topic).unwrap_or_else(|| panic!("'{topic}' has no text"));
             assert!(!text.trim().is_empty(), "'{topic}' is empty");

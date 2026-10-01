@@ -14,8 +14,6 @@
 //! * [`clock`] — the shared wall-clock helper.
 //! * [`admission`] — resource-aware admission control for heavy commands,
 //!   replacing the fixed-width build semaphore.
-//! * [`merge`] — the one-command merge of a finished worker's branch into its
-//!   base branch, with the trial merge, the gate and the cleanup in one place.
 //!
 //! [`WorkerPool`] itself stays here: it owns the concurrency gates and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
@@ -52,7 +50,6 @@ pub use self::buffer::{
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
 };
 pub use self::clock::unix_timestamp;
-pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
@@ -69,6 +66,8 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
+
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
@@ -690,6 +689,16 @@ impl WorkerPool {
         self.update_worker(id, |worker| worker.state = state).await;
     }
 
+    /// Register a synthetic worker's worktree path (test support).
+    ///
+    /// The kill/shutdown checkpoint path only knows where to commit through
+    /// [`WorkerPool::register_worktree`], which a real dispatch calls; a test
+    /// that drives `kill` or `kill_all` without an LLM needs the same hook.
+    #[doc(hidden)]
+    pub async fn __test_register_worktree(&self, worker_id: &str, path: PathBuf) {
+        self.register_worktree(worker_id, path).await;
+    }
+
     /// Route one registry write through the coalescing writer (test support).
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -1279,7 +1288,8 @@ impl WorkerPool {
         Some(entry)
     }
 
-    /// Write the rows of workers killed in one pass, after the guard is gone.
+    /// Write the rows of the workers terminated in one pass, after the guard
+    /// is gone: the registry row of a `kill` or of a hub shutdown.
     fn persist_kills(&self, entries: Vec<WorkerRegistryEntry>) {
         if entries.is_empty() {
             return;
@@ -1310,11 +1320,33 @@ impl WorkerPool {
         true
     }
 
-    /// Terminate every worker currently tracked by the pool.
+    /// Interrupt every live worker tracked by the pool, saving its work first.
     ///
-    /// Walks the map once under a single write-guard with no `.await`, so the
-    /// critical section stays O(n) and is never prolonged in wall-clock time.
+    /// A hub shutdown is a *planned* exit, so a live worker ends `Interrupted`,
+    /// not `Failed`: its uncommitted changes are committed onto its branch and
+    /// the next daemon's recovery auto-continues it, exactly as it would after
+    /// a crash. The transition is bounded — no running command is awaited, and
+    /// each checkpoint commits once — and best effort, because a checkpoint
+    /// that cannot run must never hold up the exit.
     pub async fn kill_all(&self) -> usize {
+        // Commit each live worker's worktree before its abort drops the
+        // `WorktreeGuard`, the same window `kill` uses. The ids are read under
+        // a short guard so the checkpoints never run under a pool lock.
+        let live: Vec<String> = {
+            let lock = self.workers.read().await;
+            lock.values()
+                .filter(|worker| {
+                    matches!(
+                        worker.state,
+                        WorkerState::Running { .. } | WorkerState::Paused { .. }
+                    )
+                })
+                .map(|worker| worker.id.clone())
+                .collect()
+        };
+        for id in &live {
+            self.checkpoint_before_kill(id).await;
+        }
         let (count, entries) = {
             let mut lock = self.workers.write().await;
             let mut count = 0usize;
@@ -1329,8 +1361,8 @@ impl WorkerPool {
                 if let Some(handle) = worker.handle.take() {
                     handle.abort();
                 }
-                worker.fail("Server shutting down (received SIGINT)");
-                if let Some(entry) = self.killed_entry(worker) {
+                worker.fail(Self::shutdown_message(&worker.id));
+                if let Some(entry) = self.interrupted_entry(worker) {
                     entries.push(entry);
                 }
                 self.notify_change();
@@ -1340,6 +1372,36 @@ impl WorkerPool {
         };
         self.persist_kills(entries);
         count
+    }
+
+    /// The `last_command` a hub shutdown leaves on an interrupted worker's row.
+    ///
+    /// Names the branch holding the salvaged work, so an operator sees where it
+    /// went and why the worker can be continued.
+    fn shutdown_message(id: &str) -> String {
+        format!("hub stopped; work saved on branch worker-{id}")
+    }
+
+    /// The registry row a worker interrupted by a hub shutdown must end on.
+    ///
+    /// Like [`WorkerPool::killed_entry`], but a planned shutdown is not a
+    /// failure: the row is `Interrupted` so the next daemon's recovery
+    /// auto-continues it. `None` when the worker never wrote a row (a
+    /// synthetic record), so nothing is invented.
+    fn interrupted_entry(&self, worker: &WorkerRecord) -> Option<WorkerRegistryEntry> {
+        let mut entry = self
+            .registry
+            .lock()
+            .expect("registry lock poisoned")
+            .entry(&worker.id)
+            .cloned()?;
+        entry.status = RegistryStatus::Interrupted;
+        entry.step = worker.state.step();
+        entry.last_command = Self::shutdown_message(&worker.id);
+        entry.question = None;
+        entry.metrics = worker.metrics;
+        entry.updated_at = unix_timestamp();
+        Some(entry)
     }
 
     /// Collect a worker's final result and release its in-memory resources.
