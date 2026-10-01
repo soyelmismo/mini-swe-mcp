@@ -195,7 +195,7 @@ struct Daemon {
 impl Daemon {
     async fn start() -> Self {
         let dir = scratch_dir();
-        let socket = dir.join("hub.sock");
+        let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
         let server = server();
         let daemon = HubServer::new(
             server.clone(),

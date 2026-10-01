@@ -80,6 +80,22 @@ pub fn unique_suffix(tag: &str) -> String {
     )
 }
 
+/// A short, unique scratch directory name.
+///
+/// The leaf is deliberately short: a scratch directory can hold a Unix socket,
+/// whose path is bounded by `sockaddr_un::sun_path` (about 108 bytes) and is
+/// prefixed by the ambient `TMPDIR`. The divergent-verify gate re-runs the
+/// suite with `TMPDIR` inside the worktree, so a verbose name stops binding;
+/// the tag is truncated and uniquified by pid and the same counter instead.
+pub fn scratch_name(tag: &str) -> String {
+    let tag: String = tag.chars().take(8).collect();
+    format!(
+        "swe-{tag}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 // ----------
 // Isolated scratch roots
 // ----------
@@ -139,7 +155,7 @@ pub struct TempDir {
 impl TempDir {
     /// Create (clearing any stale entry first) a scratch directory under `base`.
     pub fn new(base: &Path, tag: &str) -> Self {
-        let path = base.join(format!("swe-test-{tag}-{}", unique_suffix("dir")));
+        let path = base.join(scratch_name(tag));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("failed to create temp dir {}: {e}", path.display()));

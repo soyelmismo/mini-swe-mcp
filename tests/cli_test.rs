@@ -549,7 +549,9 @@ fn test_cli_status_line_never_autostarts_the_hub() {
         "unexpected status line: {stdout:?}"
     );
     assert!(
-        !hub.join("hub.sock").exists(),
+        !mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf())
+            .socket()
+            .exists(),
         "status --line must never auto-start the daemon"
     );
 
@@ -563,6 +565,11 @@ fn test_cli_status_line_never_autostarts_the_hub() {
         String::from_utf8_lossy(&output.stdout).trim().is_empty(),
         "an empty registry prints no line"
     );
-    assert!(!hub.join("hub.sock").exists(), "still no daemon must exist");
+    assert!(
+        !mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf())
+            .socket()
+            .exists(),
+        "still no daemon must exist"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
