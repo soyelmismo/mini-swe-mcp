@@ -210,6 +210,7 @@ Defaults are what the code uses when the variable is unset.
 | `SWE_SHARED_CACHES` | — | Extra cache binds for the sandbox. |
 | `SWE_ALLOW_TOOLCHAIN_CREDENTIALS` | `0` | `1` exposes the credential files beside the shared caches (`~/.npmrc`, `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.cargo/credentials.toml`). |
 | `SWE_DISABLE_KACHE` / `KACHE_DISABLED` | unset | `1` disables the kache layer. |
+| `KACHE_CACHE_EXECUTABLES` | `0` | kache re-caches a worker's own test executables; worker builds disable it unless the operator sets the variable. |
 | `HUB_TARGET_TTL_HOURS` | `24` | Prune shared build slots older than this. |
 | `HUB_TARGET_MAX_GB` | `40` | Size cap on shared build slots. |
 | `MONITOR_WIDTH` | terminal size | Width used by `monitor` / `status`. |
