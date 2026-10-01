@@ -1585,20 +1585,6 @@ fn numstat_count(field: &str) -> Option<usize> {
 /// reading the same shape.
 pub(super) type DiffFileStat = crate::pool::FileStat;
 
-/// Whether a requested path names the file a diff section is about.
-///
-/// Exact after normalisation, or a whole-component suffix of it, so `--file
-/// a.rs` still finds `src/a.rs`.
-fn same_diff_path(requested: &str, actual: &str) -> bool {
-    let requested = normalize_diff_path(requested);
-    let actual = normalize_diff_path(actual);
-    actual == requested
-        || (!requested.is_empty()
-            && actual.len() > requested.len()
-            && actual.ends_with(&requested)
-            && actual[..actual.len() - requested.len()].ends_with('/'))
-}
-
 /// Per-file `(path, insertions, deletions)` of a unified diff, read by the
 /// shared parser in [`crate::pool`] so a review payload and a completion event
 /// count the same hunks the same way.
@@ -1610,7 +1596,11 @@ fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
 fn diff_of_files(diff: &str, files: &[String]) -> String {
     crate::pool::diff_sections_of(diff)
         .into_iter()
-        .filter(|(path, _)| files.iter().any(|file| same_diff_path(file, path)))
+        .filter(|(path, _)| {
+            files
+                .iter()
+                .any(|file| crate::pool::same_diff_path(file, path))
+        })
         .map(|(_, section)| section)
         .collect()
 }
