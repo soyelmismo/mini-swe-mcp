@@ -1402,15 +1402,22 @@ impl EventRouter {
                         .and_then(|v| v["sequence"].as_u64())
                         .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
             };
-            crate::cli::watch::round_event(&self.watch_current, &ids, group, now, fresh)
+            crate::cli::watch::round_event(
+                &self.watch_current,
+                &ids,
+                group,
+                now,
+                fresh,
+                &allowed,
+            )
         };
+        // Reserve the identity's one watch slot before the round is
+        // acknowledged: a second watch must be refused, never let a
+        // caller consume the events it was refused.
+        self.watches.claim(&owner, ctx.id, ctx.pid)?;
         if let Some(event) = event {
             self.ack_round(ctx, &ids, group);
-            self.watches.claim(&owner, ctx.id, ctx.pid)?;
             return Ok(json!({"watching":watching,"events":[event]}));
-        }
-        if !watching.is_empty() {
-            self.watches.claim(&owner, ctx.id, ctx.pid)?;
         }
         Ok(json!({"watching":watching,"events":[]}))
     }
@@ -1429,6 +1436,10 @@ impl EventRouter {
         let selected: std::collections::BTreeSet<String> = self
             .watch_current
             .values()
+            .filter(|v| {
+                ctx.is_admin()
+                    || (v["owner"] == owner && v["owner"] != "unattributed")
+            })
             .filter(|v| crate::cli::watch::matches(v, ids, group))
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
