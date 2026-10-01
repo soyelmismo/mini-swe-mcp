@@ -829,9 +829,20 @@ impl<'a> TurnEngine<'a> {
             });
         }
         let divergent_env = super::divergent::divergent_environment(&worktree_path, self.client_env);
+        tracing::info!(
+            worker = %self.worker_id,
+            names = ?super::divergent::divergent_names(&divergent_env),
+            "Running divergent verify variant B"
+        );
         let (output_b, code_b) = self
             .run_gated_with_env(verify, divergent_env.clone())
             .await?;
+        tracing::info!(
+            worker = %self.worker_id,
+            exit = ?code_b,
+            output = %crate::agent::sandbox::truncate_output(&output_b),
+            "Divergent verify variant B finished"
+        );
 
         // The audit covers both runs: variant B must clean up after itself too.
         let effects_b = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
@@ -1031,10 +1042,13 @@ impl<'a> TurnEngine<'a> {
             .acquire()
             .await
             .context("Bash semaphore closed")?;
-        let mut runner = self.runner.clone().with_extra_env(extra_env);
+        let mut runner = self.runner.clone();
         if let Some(permit) = &build_permit {
             runner = runner.with_build_jobs(permit.jobs());
         }
+        // The overlay is applied after the job count, so a divergent
+        // environment can never be dropped by a builder-chain reorder.
+        runner = runner.with_extra_env(extra_env);
         runner.build_target_dir = if heavy {
             self.worktree.build_dir().await
         } else {
