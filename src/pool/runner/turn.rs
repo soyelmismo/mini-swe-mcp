@@ -810,13 +810,6 @@ impl<'a> TurnEngine<'a> {
                     from_step = step,
                     "verify reused from step {step}"
                 );
-                // Disclose the reuse in the durable history so the model (and a
-                // reviewer replaying it) never reads a reused pass as a fresh
-                // one; the note is flushed at the completion boundary.
-                let note = format!(
-                    "verify reused from step {step}: canonical variant A was not rerun (identical command and tree). Variant B and the side-effect audit still apply."
-                );
-                self.push_message(ChatMessage::text(Role::User, note));
                 (String::new(), Some(0))
             }
             None => self.run_gated(verify).await?,
@@ -867,6 +860,20 @@ impl<'a> TurnEngine<'a> {
         Ok(TurnOutcome::Continue)
     }
 
+    /// Disclose a reused variant A to the model on a successful completion, so
+    /// it never reads a reused pass as a fresh one. Flushed at the completion
+    /// boundary; a refusal carries the same note in its message instead.
+    fn push_reuse_note(&mut self, reused_from: Option<usize>) {
+        if let Some(step) = reused_from {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!(
+                    "verify reused from step {step}: canonical variant A was not rerun (identical command and tree). Variant B and the side-effect audit still ran and passed."
+                ),
+            ));
+        }
+    }
+
     /// Finish a completion whose canonical verify passed -- freshly or reused:
     /// audit what it left behind, then re-run the same command in the
     /// divergent environment.
@@ -890,7 +897,7 @@ impl<'a> TurnEngine<'a> {
         // must not read a reused pass as a fresh one.
         let reuse_note = match reused_from {
             Some(step) => format!(
-                "Note: the canonical verify (variant A) was reused from step {step} (identical command on an unchanged tree); only variant B and the side-effect audit ran this time.\n\n"
+                "verify reused from step {step}: the canonical verify (variant A) was not rerun (identical command and tree); only variant B and the side-effect audit ran this time.\n\n"
             ),
             None => String::new(),
         };
@@ -920,6 +927,7 @@ impl<'a> TurnEngine<'a> {
         // Variant B: the same command in the divergent environment. Disabled
         // by the operator, or skipped when there is nothing to diverge on.
         if !super::divergent::enabled() {
+            self.push_reuse_note(reused_from);
             return Ok(TurnOutcome::Completed {
                 verified: Some(true),
             });
@@ -963,6 +971,7 @@ impl<'a> TurnEngine<'a> {
 
         let exit_b = code_b.unwrap_or(-1);
         if exit_b == 0 {
+            self.push_reuse_note(reused_from);
             return Ok(TurnOutcome::Completed {
                 verified: Some(true),
             });
