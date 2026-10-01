@@ -555,8 +555,9 @@ impl McpServer {
             // leaves the payload unless it was asked for — whole, or narrowed
             // to the files that were named.
             if let Some(details) = state.pointer_mut("/details").and_then(Value::as_object_mut) {
-                if !files.is_empty() {
-                    details.insert("diff".to_string(), json!(diff_of_files(&diff, &files)));
+                let scoped = diff_of_files(&diff, &files);
+                if !scoped.is_empty() {
+                    details.insert("diff".to_string(), json!(scoped));
                 } else if !full {
                     details.remove("diff");
                 }
