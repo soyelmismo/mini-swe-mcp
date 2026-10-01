@@ -89,6 +89,9 @@ async fn a_client_is_served_before_startup_recovery_finishes() {
     let root = common::TempDir::new_in_tmp("lsn-first");
     let hub = root.subdir("hub");
     let swe = root.subdir("swe");
+    // Own the short socket fallback directory a too-deep hub directory moves
+    // its socket to, so a daemon that outlives teardown leaves nothing behind.
+    let _fallback = common::fallback_socket_dir(&hub);
     {
         use std::os::unix::fs::PermissionsExt;
         for dir in [&hub, &swe] {
@@ -208,5 +211,17 @@ async fn a_client_is_served_before_startup_recovery_finishes() {
         "list must see the recovered row, not the pre-recovery one: {worker}"
     );
 
-    let _ = daemon.kill().await;
+    // A SIGTERM lets the daemon shut down and take a socket that moved to a
+    // short fallback directory along; SIGKILL would bypass that cleanup.
+    #[cfg(unix)]
+    if let Some(pid) = daemon.id() {
+        // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    if tokio::time::timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .is_err()
+    {
+        let _ = daemon.kill().await;
+    }
 }

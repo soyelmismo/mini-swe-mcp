@@ -361,6 +361,9 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("handover-proxy");
     let hub_dir = hub.path().to_path_buf();
+    // Own the short socket fallback directory a too-deep hub directory moves
+    // its socket to; a SIGKILLed daemon never runs its own cleanup.
+    let _fallback = common::fallback_socket_dir(&hub_dir);
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -508,6 +511,9 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("handover-watch");
     let hub_dir = hub.path().to_path_buf();
+    // Own the short socket fallback directory a too-deep hub directory moves
+    // its socket to; a SIGKILLed daemon never runs its own cleanup.
+    let _fallback = common::fallback_socket_dir(&hub_dir);
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -639,6 +645,9 @@ async fn daemon_respawns_itself_after_handover_without_a_client() {
     }
     let swe = hub.subdir("swe");
     let _reaper = Reaper(hub.path().to_path_buf());
+    // Own the short socket fallback directory a too-deep hub directory moves
+    // its socket to; a SIGKILLed daemon never runs its own cleanup.
+    let _fallback = common::fallback_socket_dir(hub.path());
     let mut command = tokio::process::Command::new(common::binary_path());
     command
         .arg("daemon")
