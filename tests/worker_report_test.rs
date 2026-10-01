@@ -110,6 +110,13 @@ impl ScriptedSseServer {
         )
     }
 
+    /// A turn whose prose carries `content` and no bash command.
+    fn content_only(content: &str) -> ScriptedTurn {
+        vec![frame(&json!({
+            "choices": [{ "delta": { "content": content } }]
+        }))]
+    }
+
     /// A completion turn whose prose carries a REPORT block.
     fn reported_completion(call_id: &str) -> ScriptedTurn {
         Self::turn(
@@ -273,6 +280,73 @@ async fn a_completion_without_a_report_is_asked_once() {
         follow_up.contains("REPORT") && follow_up.contains("completion sentinel"),
         "the follow-up must ask for the block and the sentinel, got {follow_up:?}"
     );
+}
+
+/// The exact losing sequence: a completion with no block, the one follow-up,
+/// and the block written in the prose of a turn that carries no command (the
+/// sentinel only arrives in the turn after it). The block must survive to the
+/// completed state.
+#[tokio::test]
+async fn a_report_in_a_follow_up_turn_before_the_sentinel_is_stored() {
+    let dir = common::TempDir::new_in_tmp("report-late");
+    let repo = repo(dir.path(), "late");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::bare_completion("call_1"),
+        ScriptedSseServer::content_only(
+            "REPORT\ndone: Fixed the parser\nfiles: src/a.rs, src/b.rs\ntests: cargo test: 4 passed\nrisks: none",
+        ),
+        ScriptedSseServer::turn(
+            "call_3",
+            "All gates pass. Final status and sentinel:",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
+    ])
+    .await;
+
+    let (_scratch, _pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
+
+    let WorkerState::Completed {
+        report, summary, ..
+    } = state
+    else {
+        panic!("the worker must complete, got {state:?}");
+    };
+    let report = report.expect("the follow-up turn's block must be stored");
+    assert_eq!(report.done, "Fixed the parser");
+    assert_eq!(report.files, "src/a.rs, src/b.rs");
+    assert_eq!(summary, "Fixed the parser");
+}
+
+/// A block written inside the bash command that also carries the sentinel,
+/// with the line breaks spelled as `\n` the way `printf` takes them, is the
+/// answer the harness must store.
+#[tokio::test]
+async fn a_report_delivered_inside_the_sentinel_command_is_stored() {
+    let dir = common::TempDir::new_in_tmp("report-command");
+    let repo = repo(dir.path(), "command");
+    let command = format!(
+        "printf 'REPORT\\ndone: From the command\\nfiles: src/x.rs\\ntests: cargo test: 4 passed\\nrisks: none\\n' && echo {COMPLETION_SENTINEL}"
+    );
+    let server = ScriptedSseServer::spawn(vec![ScriptedSseServer::turn(
+        "call_1",
+        "Now I'll make the edits.",
+        &command,
+    )])
+    .await;
+
+    let (_scratch, _pool, _id, state) = dispatch_and_wait(&server, &repo, 5).await;
+
+    let WorkerState::Completed {
+        report, summary, ..
+    } = state
+    else {
+        panic!("the worker must complete, got {state:?}");
+    };
+    let report = report.expect("the block inside the sentinel command must be stored");
+    assert_eq!(report.done, "From the command");
+    assert_eq!(report.files, "src/x.rs");
+    assert_eq!(report.risks, "none");
+    assert_eq!(summary, "From the command");
 }
 
 /// A worker that still writes no report after being asked completes anyway,

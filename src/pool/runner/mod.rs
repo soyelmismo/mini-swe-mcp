@@ -374,6 +374,7 @@ impl WorkerPool {
         // the worker already wrote must survive that replay.
         let mut report: Option<crate::pool::WorkerReport> = None;
         let mut report_asked = false;
+        let mut report_text = String::new();
 
         while step < current_max_turns {
             step += 1;
@@ -409,6 +410,7 @@ impl WorkerPool {
                 watch: &mut watch,
                 report: &mut report,
                 report_asked: &mut report_asked,
+                report_text: &mut report_text,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
