@@ -1057,12 +1057,7 @@ impl WorkerPool {
     /// is continued on its own id and branch. The consolidator's owner is the
     /// acting agent throughout, so the guidance can never arrive from -- or be
     /// aimed at -- another owner.
-    pub async fn consolidate_steer(
-        &self,
-        actor: &WorkerMeta,
-        id: &str,
-        message: String,
-    ) -> String {
+    pub async fn consolidate_steer(&self, actor: &WorkerMeta, id: &str, message: String) -> String {
         let target = match self.resolve_worker_id(id, &actor.owner).await {
             Ok(target) => target,
             Err(e) => return format!("{id} refused: {e}"),

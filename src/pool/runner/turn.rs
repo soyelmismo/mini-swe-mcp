@@ -658,6 +658,13 @@ impl<'a> TurnEngine<'a> {
                     .consolidator_reply(&label, observation, false, llm_resp)
                     .await);
             }
+            // A wait blocks until the group stops, spending no turn on it.
+            if let Some((ids, timeout)) = parse_consolidate_wait(&cmd_str) {
+                let observation = self.pool.consolidate_wait(self.meta, &ids, timeout).await;
+                return Ok(self
+                    .consolidator_reply(&label, observation, false, llm_resp)
+                    .await);
+            }
         }
 
         // --- Orchestrator control sentinels (implementer only) ---

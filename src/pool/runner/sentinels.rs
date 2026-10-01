@@ -291,7 +291,8 @@ mod tests {
         assert_eq!(ids, vec!["w1", "w2", "w3"]);
         assert_eq!(timeout, None);
 
-        let (ids, timeout) = parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 timeout=120").unwrap();
+        let (ids, timeout) =
+            parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 timeout=120").unwrap();
         assert_eq!(ids, vec!["w1", "w2"]);
         assert_eq!(timeout, Some(120));
 
