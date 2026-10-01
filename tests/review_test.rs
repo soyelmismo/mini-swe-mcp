@@ -115,30 +115,16 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
 /// coalescing writer would have left it.
 fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        id: id.to_string(),
-        pid: std::process::id(),
         task: "Fix the parser\nand its docs".to_string(),
         model: "test-model".to_string(),
         status: RegistryStatus::Completed,
         step: 3,
         max_turns: 60,
         last_command: "cargo test".to_string(),
-        question: None,
-        started_at: 0,
-        updated_at: 0,
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().into_owned()),
-        owner: Some(OWNER.to_string()),
-        metrics: WorkerMetrics::default(),
         base_branch: Some("master".to_string()),
-        base_commit: None,
-        head_commit: None,
         revision,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row(id, OWNER)
     }
 }
 

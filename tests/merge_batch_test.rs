@@ -94,30 +94,14 @@ impl Fixture {
     /// grouped and -- when `approved` is `Some` -- carrying an approval.
     fn record_status(&self, id: &str, owner: &str, group: Option<&str>, approved: Option<u64>) {
         let entry = WorkerRegistryEntry {
-            report: None,
             approved: approved.map(|at| mini_swe_mcp::pool::WorkerApproval { at, note: None }),
-            id: id.to_string(),
-            pid: std::process::id(),
             task: format!("do the {id} work"),
-            role: Default::default(),
-            model: "test".to_string(),
             status: RegistryStatus::Completed,
             step: 1,
-            max_turns: 10,
-            last_command: String::new(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
             group: group.map(str::to_string),
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
-            owner: Some(owner.to_string()),
-            metrics: Default::default(),
             base_branch: Some("main".to_string()),
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id, owner)
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -613,30 +597,13 @@ fn workers_of_two_repositories_are_refused() {
     .expect("history log must be writable");
     history.repo_path = other.path().to_string_lossy().into_owned();
     let entry = WorkerRegistryEntry {
-        report: None,
         approved: Some(mini_swe_mcp::pool::WorkerApproval { at: 1, note: None }),
-        id: "w2".to_string(),
-        pid: std::process::id(),
         task: "do the w2 work".to_string(),
-        role: Default::default(),
-        model: "test".to_string(),
         status: RegistryStatus::Completed,
         step: 1,
-        max_turns: 10,
-        last_command: String::new(),
-        question: None,
-        started_at: 0,
-        updated_at: 0,
-        group: None,
         repo_path: Some(other.path().to_string_lossy().into_owned()),
-        owner: Some("agent-a".to_string()),
-        metrics: Default::default(),
         base_branch: Some("main".to_string()),
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        verified: None,
+        ..WorkerRegistryEntry::test_row("w2", "agent-a")
     };
     save_registry_entry_in(&f.root(), &entry);
 

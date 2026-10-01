@@ -14,9 +14,9 @@ use std::time::Duration;
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRegistryEntry,
-    WorkerRole, WorkerState, append_history_message_in, load_registry_entry_in,
-    save_registry_entry_in, unix_timestamp,
+    RegistryStatus, WorkerHistory, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerRole,
+    WorkerState, append_history_message_in, load_registry_entry_in, save_registry_entry_in,
+    unix_timestamp,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
@@ -91,19 +91,11 @@ fn row(
     // Built through the same constructor a real write uses, so the fixture
     // picks up fields the current build adds to a row without a literal here.
     let meta = WorkerMeta {
-        id: id.to_string(),
         task: format!("task for {id}"),
         group: Some(GROUP.to_string()),
-        role: WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().into_owned()),
-        owner: OWNER.to_string(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        report: None,
         verified,
+        ..WorkerMeta::test_meta(id, OWNER)
     };
     let mut entry = meta.entry("test-model", status, 4, 10, "cargo test", None);
     entry.base_branch = Some("master".to_string());
