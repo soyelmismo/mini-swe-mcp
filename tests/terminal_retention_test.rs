@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
@@ -387,6 +387,21 @@ async fn a_worker_whose_branch_is_gone_is_kept_through_its_grace_then_retired() 
     drop(scratch);
 }
 
+/// Wait for `id` to reach a terminal state, so its worker task (and the
+/// worktree it owns) is finished before the test tears down the repo.
+async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
+    for _ in 0..600 {
+        if let Some(state) = pool.get_worker_state(id).await {
+            match state {
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
+                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("worker {id} never reached a terminal state");
+}
+
 /// A merge pruned the branch, but the row and conversation survive the grace,
 /// so a continuation recreates `worker-<id>` from the head commit the
 /// completion recorded instead of failing "branch no longer exists".
@@ -396,8 +411,17 @@ async fn a_continuation_recreates_a_pruned_branch_from_the_recorded_head() {
     let root = scratch.root();
     let repo = repo_with_branch("recreate", "rc1");
     let head = git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc1"]);
-    durable_state(&scratch, &repo, "rc1", RegistryStatus::Completed);
+    let base = git_stdout(&repo, &["rev-parse", "master"]);
+
+    // A saved conversation plus the row a completion leaves, naming the head
+    // of the branch it committed to.
+    let mut meta = history("rc1", &repo);
+    meta.base_commit = base.clone();
+    for message in &meta.messages {
+        append_history_message_in(&root, "rc1", &meta, message).expect("seed the history log");
+    }
     let mut recorded = row("rc1", &repo, RegistryStatus::Completed);
+    recorded.base_commit = Some(base);
     recorded.head_commit = Some(head.clone());
     save_registry_entry_in(&root, &recorded);
 
@@ -418,7 +442,9 @@ async fn a_continuation_recreates_a_pruned_branch_from_the_recorded_head() {
         "the grace keeps the pruned worker continuable"
     );
 
-    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
+    let llm = common::fake_llm::FakeLlm::spawn("ls -la", "ls -la").await;
+    let pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone());
     let outcome = pool
         .steer("rc1", "reapply the parser fix".into())
         .await
@@ -432,6 +458,7 @@ async fn a_continuation_recreates_a_pruned_branch_from_the_recorded_head() {
         head,
         "the continuation recreated the branch at the recorded head"
     );
+    wait_until_terminal(&pool, "rc1").await;
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);
 }
@@ -445,7 +472,9 @@ async fn a_cold_continuation_recreates_a_pruned_branch_from_the_recorded_head() 
     let root = scratch.root();
     let repo = repo_with_branch("recreatecold", "rc2");
     let head = git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc2"]);
+    let base = git_stdout(&repo, &["rev-parse", "master"]);
     let mut recorded = row("rc2", &repo, RegistryStatus::Completed);
+    recorded.base_commit = Some(base);
     recorded.head_commit = Some(head.clone());
     save_registry_entry_in(&root, &recorded);
 
@@ -466,7 +495,9 @@ async fn a_cold_continuation_recreates_a_pruned_branch_from_the_recorded_head() 
         "the grace keeps the cold worker's row"
     );
 
-    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
+    let llm = common::fake_llm::FakeLlm::spawn("ls -la", "ls -la").await;
+    let pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone());
     let outcome = pool
         .steer("rc2", "reapply the parser fix".into())
         .await
@@ -480,6 +511,7 @@ async fn a_cold_continuation_recreates_a_pruned_branch_from_the_recorded_head() 
         head,
         "the cold continuation recreated the branch at the recorded head"
     );
+    wait_until_terminal(&pool, "rc2").await;
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);
 }
