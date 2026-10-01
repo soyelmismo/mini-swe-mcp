@@ -613,7 +613,7 @@ impl SteerOutcome {
 }
 
 /// Revision counter of a [`SteerOutcome::Continuing`], for the reply.
-fn outcome_revision(outcome: &SteerOutcome) -> usize {
+pub(crate) fn outcome_revision(outcome: &SteerOutcome) -> usize {
     match outcome {
         SteerOutcome::Continuing { revision, .. } => *revision,
         _ => 0,

@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
+use crate::pool::round::first_line;
 use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
 
 /// Owner label used when neither the pool nor the registry has a row.
@@ -212,6 +213,7 @@ impl McpServer {
     ) -> Result<Value> {
         let result = match action {
             "manifest" => self.handle_manifest(),
+            "consolidate" => self.handle_consolidate(args, token, tx, ctx).await,
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args, ctx).await,
             "collect" => self.handle_collect(args, ctx).await,
@@ -434,6 +436,113 @@ impl McpServer {
             "message": "Workers are executing in isolated worktrees in background. Use 'watch' (or mini-swe-mcp watch) to wait for them.",
         });
         Self::with_watch_command(&mut payload, ctx);
+        Ok(payload)
+    }
+
+    /// How many not-ready workers a `consolidate` refusal names before it
+    /// truncates, so the message stays a line rather than a listing.
+    const MAX_REFUSED_WORKERS: usize = 8;
+
+    /// `consolidate` action: dispatch the round's consolidator.
+    ///
+    /// The glue that makes a consolidated round hard to run wrong: the caller
+    /// names a group, and the hub computes the round manifest (which of the
+    /// caller's workers in that group finished with an unmerged branch, what
+    /// each touched, and which files more than one of them touched), refuses
+    /// when there is nothing to integrate, and embeds the manifest plus
+    /// [`crate::agent::CONSOLIDATOR_INSTRUCTIONS`] in the consolidator's task.
+    ///
+    /// Defaults differ from a plain dispatch on purpose: the consolidator runs
+    /// on the manifest's strongest tier when one is marked, and its gate is the
+    /// project's *full* gate (the explicit `verify`, else the auto-detected
+    /// one), because it is the only worker that runs the whole suite.
+    ///
+    /// The dispatch itself is delegated to [`Self::dispatch_one`], so the
+    /// consolidator goes through exactly the validation, admission and launch
+    /// path every other worker does.
+    async fn handle_consolidate(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let group = Self::required_string(args, "group", "consolidate")?
+            .trim()
+            .to_string();
+        if group.is_empty() {
+            anyhow::bail!("'group' must not be empty for action 'consolidate'");
+        }
+        let agent = ctx.agent();
+        let repo_path = Self::get_repo_path(args, ctx);
+        let manifest = self.pool.round_manifest(&agent, &group, &repo_path).await;
+        if !manifest.has_ready() {
+            // Name what the group does hold: the usual cause is a worker that
+            // is still running, and the orchestrator needs to know which.
+            let waiting = if manifest.not_ready.is_empty() {
+                "every branch in it is already merged".to_string()
+            } else {
+                let listed: Vec<String> = manifest
+                    .not_ready
+                    .iter()
+                    .take(Self::MAX_REFUSED_WORKERS)
+                    .map(|worker| format!("{} ({})", worker.id, worker.state))
+                    .collect();
+                format!(
+                    "{} not ready: {}{}",
+                    manifest.not_ready.len(),
+                    listed.join(", "),
+                    if manifest.not_ready.len() > Self::MAX_REFUSED_WORKERS {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                )
+            };
+            anyhow::bail!(
+                "group '{group}' has no completed, unmerged worker of yours to consolidate: {waiting}"
+            );
+        }
+
+        // The strongest tier when the manifest marks one, else the dispatch
+        // default: integrating a round is the deepest job in the pool.
+        let requested_model = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .or_else(|| self.manifest.strongest_alias())
+            .unwrap_or(&self.default_model);
+
+        // The explicit gate wins; an absent one auto-detects, so a consolidator
+        // never runs a cheaper subset than the project's own gate.
+        let verify = match args.get("verify").and_then(|v| v.as_str()) {
+            // An explicit empty string disables the gate, exactly as on dispatch.
+            Some("") => None,
+            Some(cmd) => Some(cmd.to_string()),
+            None => crate::pool::detect_verify_command(&repo_path),
+        };
+
+        let mut dispatch = Map::new();
+        dispatch.insert("action".into(), Value::String("dispatch".into()));
+        dispatch.insert("role".into(), Value::String("consolidate".into()));
+        dispatch.insert("group".into(), Value::String(group.clone()));
+        dispatch.insert(
+            "task".into(),
+            Value::String(manifest.task_text(verify.as_deref())),
+        );
+        dispatch.insert("model".into(), Value::String(requested_model.to_string()));
+        if let Some(verify) = verify {
+            dispatch.insert("verify".into(), Value::String(verify));
+        }
+        if let Some(turns) = args.get("max_turns").and_then(|v| v.as_u64()) {
+            dispatch.insert("max_turns".into(), Value::Number(turns.into()));
+        }
+        let mut payload = self
+            .dispatch_one(&Value::Object(dispatch), token, tx, ctx)
+            .await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("group".into(), Value::String(group));
+            object.insert("round".into(), Value::String(manifest.render()));
+        }
         Ok(payload)
     }
 
@@ -1281,16 +1390,6 @@ fn completed_fields(
         }) => (Some(summary.clone()), *verified, branch.clone()),
         _ => (None, None, None),
     }
-}
-
-/// The first line of a task that says something: an agent writes a heading and
-/// a body, and only the heading belongs in a compact view.
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// The lifecycle name of a worker, from its live state when it still has one
