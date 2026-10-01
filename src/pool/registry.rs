@@ -526,7 +526,10 @@ pub fn save_registry_entry_in(root: &ScratchRoot, entry: &WorkerRegistryEntry) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.json", entry.id));
     if let Ok(json) = serde_json::to_string(entry) {
-        let _ = std::fs::write(path, json);
+        let _ = std::fs::write(&path, json);
+    }
+    if entry.id.starts_with("cr") {
+        eprintln!("SAVE_DEBUG id={} path={} exists_after={}", entry.id, path.display(), path.exists());
     }
 }
 
@@ -544,8 +547,12 @@ pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) -> bool {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         // A base dir this process never wrote to fails with `NotFound`, which
         // is not a removal; any other failure is likewise not a removal.
-        if std::fs::remove_file(path).is_ok() {
+        let existed = path.exists();
+        if std::fs::remove_file(&path).is_ok() {
             removed = true;
+        }
+        if worker_id.starts_with("cr") {
+            eprintln!("REMOVE_DEBUG id={worker_id} existed={existed} path={}", path.display());
         }
     }
     removed
@@ -772,6 +779,7 @@ pub fn load_all_registry_entries_in(root: &ScratchRoot) -> Vec<WorkerRegistryEnt
             && !worktree_exists_in(root, &item.id)
             && !branch_exists(&item, &mut branches_by_repo)
         {
+            eprintln!("PRUNE_DEBUG id={} repo={:?} path={}", item.id, item.repo_path, path.display());
             let _ = std::fs::remove_file(&path);
             continue;
         }
