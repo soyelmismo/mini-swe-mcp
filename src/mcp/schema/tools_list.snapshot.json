@@ -1,0 +1,186 @@
+{
+  "tools": [
+    {
+      "description": "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
+      "inputSchema": {
+        "properties": {
+          "action": {
+            "description": "Action to perform; the enum lists every verb.",
+            "enum": [
+              "dispatch",
+              "status",
+              "steer",
+              "watch",
+              "collect",
+              "review",
+              "approve",
+              "unapprove",
+              "logs",
+              "list",
+              "kill",
+              "reap",
+              "manifest",
+              "prune",
+              "merge",
+              "consolidate"
+            ],
+            "type": "string"
+          },
+          "approved": {
+            "description": "Merge every approved worker.",
+            "type": "boolean"
+          },
+          "diff": {
+            "default": "code",
+            "description": "Diff scope for 'review': 'code' (default) hides tests, 'all' shows everything, 'none' hides it.",
+            "enum": [
+              "code",
+              "all",
+              "none"
+            ],
+            "type": "string"
+          },
+          "files": {
+            "description": "Paths whose diff 'collect' returns.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "full": {
+            "description": "The whole diff for 'collect'.",
+            "type": "boolean"
+          },
+          "group": {
+            "description": "Only workers of this group. For 'watch' and 'merge --approved'.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Alias for worker_id.",
+            "type": "string"
+          },
+          "keep_branch": {
+            "description": "Keep the branch.",
+            "type": "boolean"
+          },
+          "max_turns": {
+            "description": "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "message": {
+            "description": "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Available model aliases and their roles:\n- `nerd` (id: `combo:nerd`): Deep reasoner. Use for hard debugging, complex architecture, and multi-file refactors.\n- `ninja` (id: `combo:ninja`): Fast executor. Use for exploration, test runs, syntax fixes, and focused edits.\n",
+            "type": "string"
+          },
+          "network": {
+            "default": "allow",
+            "description": "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.",
+            "enum": [
+              "offline",
+              "allow"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "description": "Alias for repo_path.",
+            "type": "string"
+          },
+          "repo_path": {
+            "description": "Absolute repository root (alias: 'path'). Required for 'dispatch'.",
+            "type": "string"
+          },
+          "review_after": {
+            "description": "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
+            "type": "string"
+          },
+          "role": {
+            "description": "'consolidate': integrate this group's completed workers (requires 'group')",
+            "type": "string"
+          },
+          "scope": {
+            "default": "mine",
+            "description": "'list' scope: 'mine' (default) or 'all' (admin).",
+            "enum": [
+              "mine",
+              "all"
+            ],
+            "type": "string"
+          },
+          "task": {
+            "description": "ONE focused concern: files in scope and the acceptance gate.",
+            "type": "string"
+          },
+          "tasks": {
+            "description": "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
+            "items": {
+              "properties": {
+                "group": {
+                  "type": "string"
+                },
+                "max_turns": {
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "network": {
+                  "type": "string"
+                },
+                "repo_path": {
+                  "type": "string"
+                },
+                "task": {
+                  "type": "string"
+                },
+                "verify": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "temperature": {
+            "description": "Model temperature (overrides the default).",
+            "maximum": 2.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "timeout_secs": {
+            "description": "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verify": {
+            "description": "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "type": "string"
+          },
+          "worker_id": {
+            "description": "Target worker (alias 'id'): a unique 3+ char prefix or 'last'; required for verbs that target one.",
+            "type": "string"
+          },
+          "worker_ids": {
+            "description": "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "worker"
+    }
+  ]
+}

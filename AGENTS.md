@@ -13,6 +13,10 @@ system prompt at dispatch time, so keep them short and actionable.
   every caller.
 - Integration tests under `tests/` use the public `pool`/`agent` APIs; update
   them when an API changes.
+- New verbs belong in action-family files under `src/mcp/handlers/`,
+  `src/cli/args/` and `src/cli/format/worker/`, with one dispatch-table arm.
+  Put property descriptions beside the handler and add one ordered row in
+  `src/mcp/schema.rs`; help topics get one file in `src/cli/help/` plus an index entry.
 
 ## Gates (all must pass)
 
