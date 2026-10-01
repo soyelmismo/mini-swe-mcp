@@ -51,7 +51,6 @@ const SANDBOX: &str = "Each dispatch runs in its own Git worktree on a worker-<i
 /// `env`: the startup environment variables.
 const ENV: &str = "Read at startup: OPENAI_API_KEY (required to dispatch), OPENAI_API_BASE (default https://api.openai.com/v1), DEFAULT_MODEL (the default model alias), MODELS_FILE (the models catalog), MINI_SWE_NO_DAEMON=1 (serve MCP in-process instead of through the hub), MINI_SWE_AGENT_ID (pin the session's agent identity), and MINI_SWE_WATCH_TOKEN (set by a dispatch so the watch its shell runs is attributed to your session). A .env file is loaded first.";
 
-
 #[cfg(test)]
 mod tests {
     use super::{HELP_FLAGS, TOPICS, topic_text};
@@ -143,5 +142,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 
 pub type Snapshot = BTreeMap<String, Value>;
 
-
 #[derive(Default)]
 pub struct Options {
     pub ids: BTreeSet<String>,

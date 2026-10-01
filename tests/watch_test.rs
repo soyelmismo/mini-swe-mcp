@@ -381,7 +381,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
 }
 
 #[test]
-fn tool_description_carries_the_orchestrator_guidelines() {
+fn tool_description_stays_short_and_points_at_the_help_topics() {
     let manifest = ModelManifest::default();
     let server = McpServer::new(
         WorkerPool::with_scratch(
@@ -397,20 +397,22 @@ fn tool_description_carries_the_orchestrator_guidelines() {
     );
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in [
-        "ONE focused concern",
-        "many workers at once is the intended use",
         "mini-swe-mcp watch",
-        "timeout_secs",
+        "mini-swe-mcp help <topic>",
+        "own workers",
         "no_event",
-        "push notifications",
         "steer",
-        "merge only when it is right",
     ] {
         assert!(
             text.contains(needle),
-            "tool schema must carry the guidelines ({needle} missing)"
+            "tool schema must carry the calling rules ({needle} missing)"
         );
     }
+    // The long orchestrator guidelines moved to `mini-swe-mcp help <topic>`.
+    assert!(
+        !text.contains("many workers at once is the intended use"),
+        "the payload must not carry the long-form guidelines: {text}"
+    );
 }
 
 /// The real binary against an in-process daemon: the immediate event, the
