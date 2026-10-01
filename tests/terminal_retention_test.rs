@@ -85,6 +85,7 @@ fn repo_with_branch(tag: &str, id: &str) -> PathBuf {
 /// The replayable conversation a finished worker leaves behind.
 fn history(worker_id: &str, repo: &Path) -> WorkerHistory {
     WorkerHistory {
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         task: "fix the parser".to_string(),
         group: None,
         model: "test-model".to_string(),
@@ -115,6 +116,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
     mini_swe_mcp::pool::WorkerRegistryEntry {
         id: id.to_string(),
         pid: std::process::id(),
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         task: "fix the parser".to_string(),
         group: None,
         model: "test-model".to_string(),
