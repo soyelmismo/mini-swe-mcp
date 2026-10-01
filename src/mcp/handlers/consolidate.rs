@@ -171,6 +171,9 @@ impl McpServer {
         }
         let round = store.amend(&ctx.agent(), group, model, verify)?;
         Ok(json!({
+            // `amended` distinguishes this answer from a dispatch, which shares
+            // the action; the formatter keys its view on it.
+            "amended": true,
             "group": round.group,
             "owner": round.owner,
             "model": round.model,

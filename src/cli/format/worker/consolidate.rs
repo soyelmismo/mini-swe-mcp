@@ -22,6 +22,11 @@ pub fn format_consolidate(val: &serde_json::Value) -> String {
         .filter(|g| !g.is_empty())
         .or_else(|| round_group(round))
         .unwrap_or("");
+    if let Some(amended) = val.get("amended").and_then(|v| v.as_bool()) {
+        if amended {
+            return format_amend(val);
+        }
+    }
     let manifest = RoundText::parse(round);
     let mut out = format!(
         "Consolidator {wid} dispatched for group {group}: {} ready, {} not ready, {} interaction points",
@@ -38,6 +43,27 @@ pub fn format_consolidate(val: &serde_json::Value) -> String {
     }
     out.push_str(&watch_command_line(val));
     out
+}
+
+/// The `consolidate --set` answer: what the round will now run, so the caller
+/// can see the setting it just changed instead of having to remember it.
+///
+/// The settings are quoted verbatim (including a cleared one, which is the
+/// empty string) because the whole point of the verb is that the value stored
+/// is the value that matters: an "unset" that used to look like the auto-detected
+/// gate is indistinguishable from a typo unless it is shown.
+fn format_amend(val: &serde_json::Value) -> String {
+    let group = val.get("group").and_then(|v| v.as_str()).unwrap_or("");
+    let gate = match val.get("verify").and_then(|v| v.as_str()) {
+        Some(cmd) if cmd.is_empty() => "none (auto-detect)".to_string(),
+        Some(cmd) => cmd.to_string(),
+        None => "unchanged".to_string(),
+    };
+    let model = match val.get("model").and_then(|v| v.as_str()) {
+        Some(alias) => alias.to_string(),
+        None => "unchanged".to_string(),
+    };
+    format!("Round {group} amended: consolidator model {model}, gate {gate}")
 }
 
 /// The group named by the manifest's header line, for a payload that carries
