@@ -52,7 +52,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
 const WORKFLOW: &str = "Write the task as ONE focused concern with files in scope and an acceptance gate. Dispatch independent tasks in parallel - many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time. To wait, run `mini-swe-mcp watch` in the background (see `mini-swe-mcp help watch`). After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer (see `mini-swe-mcp help steer`). Do not edit its branch yourself; merge only when it is right. Use `mini-swe-mcp merge <id>` to trial merge, verify the merge result, merge --no-ff and clean up; --no-delete keeps the branch. A running worker, a wrong checked-out branch, a dirty touched file or a conflict refuses the merge.";
 
 /// `watch`: the process that wakes the orchestrator when a worker needs it.
-const WATCH: &str = "Run `mini-swe-mcp watch` in the background: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
+const WATCH: &str = "Run `mini-swe-mcp watch` exactly as printed, using the host's own background mechanism (e.g. a background shell task) - no redirection, no trailing `&`, no wrapper: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, and the host wakes you with the finished task's output; missed events are replayed first. After every event, run it again. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
 
 /// `steer`: correcting a live worker or continuing a stopped one.
 const STEER: &str = "Send every correction and merge conflict to the same worker with `mini-swe-mcp steer <worker_id> <message>` rather than editing its branch yourself. Steering corrects a completed worker or continues any stopped one (failed, interrupted, killed): it resumes on its own worker-<id> branch with the full conversation plus this message, on a fresh turn budget (optional --max-turns, default 60). Never dispatch a replacement for a stopped worker. Review the diff and merge only when it is right.";
@@ -141,6 +141,9 @@ mod tests {
         let text = topic_text("watch").expect("watch topic");
         for needle in [
             "mini-swe-mcp watch",
+            "background shell task",
+            "no redirection",
+            "run it again",
             "timeout_secs",
             "no_event",
             "push notifications",

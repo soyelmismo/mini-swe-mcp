@@ -543,7 +543,9 @@ fn format_batch_dispatch(val: &serde_json::Value, workers: &[serde_json::Value])
 /// token, which is the in-process server's case.
 fn watch_command_line(val: &serde_json::Value) -> String {
     match val.get("watch_command").and_then(|v| v.as_str()) {
-        Some(command) => format!("\nTo wait for it: {command}"),
+        Some(command) => format!(
+            "\nTo wait for it: {command} (run it in the background as-is; run it again after each event)"
+        ),
         None => String::new(),
     }
 }
@@ -726,7 +728,9 @@ mod tests {
             r#"{"worker_id":"w","status":"dispatched","watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
         ));
         assert!(
-            with_token.contains("\nTo wait for it: MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"),
+            with_token.contains("\nTo wait for it: MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch")
+                && with_token
+                    .contains("run it in the background as-is; run it again after each event"),
             "{with_token}"
         );
         let without = format_dispatch(&v(r#"{"worker_id":"w","status":"dispatched"}"#));
