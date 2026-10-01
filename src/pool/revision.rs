@@ -785,12 +785,12 @@ fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {
 ///
 /// Ownership is shared across a worker's files: a history states the repository
 /// and branch, and the worker's `.steer`, `.steer-source` and `.round-base`
-/// companions inherit that ownership rather than being assumed branch-less. So a
-/// worker's files are removed only when its ownership was actually probed *and*
-/// none of its candidate branches exists. When nothing about a worker could be
-/// probed -- no history to name an owner, or an unprobeable repository -- its
-/// files are kept, because deleting a reachable conversation is unrecoverable
-/// while keeping an unreachable one only costs space.
+/// companions inherit that ownership rather than being assumed branch-less. A
+/// standalone ownerless companion -- one whose worker has no history and no row
+/// -- is still probed, against every repository the registry names, for its own
+/// `worker-<id>` branch; only when nothing could be probed at all is it kept,
+/// because deleting a reachable file is unrecoverable while keeping an
+/// unreachable one only costs space.
 ///
 /// Bounded: the branch set is read once per repository, not once per file, and
 /// only the metadata line of a history is read.
@@ -798,6 +798,12 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
     let live: std::collections::HashSet<String> = super::load_registry_entries_read_only_in(root)
         .into_iter()
         .map(|entry| entry.id)
+        .collect();
+    // Every repository the registry names, for the ownerless companions below.
+    let known_repos: Vec<PathBuf> = super::load_registry_entries_read_only_in(root)
+        .into_iter()
+        .filter_map(|entry| entry.repo_path)
+        .map(PathBuf::from)
         .collect();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let mut owners: std::collections::HashMap<String, Vec<OrphanOwner>> =
@@ -830,22 +836,36 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
         if live.contains(&id) {
             continue;
         }
-        let Some(candidates) = owners.get(&id) else {
-            // Nothing names this worker's repository: its reachability cannot be
-            // disproven, so the file stays.
+        // A history names the owner directly; a standalone companion has none,
+        // so it is probed against every known repository for its own branch.
+        let mut candidates: Vec<(PathBuf, String)> = owners
+            .get(&id)
+            .map(|list| {
+                list.iter()
+                    .map(|owner| (PathBuf::from(&owner.repo_path), owner.branch.clone()))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                known_repos
+                    .iter()
+                    .map(|repo| (repo.clone(), format!("worker-{id}")))
+                    .collect()
+            });
+        candidates.dedup();
+        if candidates.is_empty() {
+            // No repository is known at all: reachability cannot be disproven.
             continue;
-        };
+        }
         let mut probed = false;
         let mut live_branch = false;
-        for owner in candidates {
-            let repo = PathBuf::from(&owner.repo_path);
+        for (repo, branch) in candidates {
             let set = branches
                 .entry(repo.clone())
                 .or_insert_with(|| local_branches(&repo));
             match set {
                 Some(set) => {
                     probed = true;
-                    live_branch |= set.contains(&owner.branch);
+                    live_branch |= set.contains(&branch);
                 }
                 // An unprobeable repository proves nothing about this file.
                 None => live_branch = true,

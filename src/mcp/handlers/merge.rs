@@ -51,19 +51,12 @@ impl McpServer {
         // needs no exemption here: the retirement marked the row, and the sweep
         // skips a `keep_branch` row while its branch lives.
         let swept = self.pool.sweep_retired_workers().await;
-        // Every worker this merge actually retired -- the merged one *and* the
-        // round a consolidator absorbed -- plus whatever the sweep reached: a
-        // retired worker's events can never fire again, so its acknowledged
-        // positions go with it, in memory and on disk, under the router's lock,
-        // and its live record leaves `list`.
-        let mut retired = report.retired.clone();
-        retired.extend(swept.workers.clone());
-        retired.sort();
-        retired.dedup();
-        for id in &retired {
-            self.forget_retired_worker(id).await;
-        }
-        self.pool.forget_retired_workers(&retired).await;
+        // The merged worker and the round it absorbed, plus whatever the sweep
+        // reached: a retired worker's events can never fire again, so its
+        // acknowledged positions and replay state go with it and its live record
+        // leaves `list`.
+        self.retire_and_forget(report.retired.iter().chain(swept.workers.iter()).cloned())
+            .await;
         Ok(json!({
             "worker_id": report.worker_id,
             "branch": report.branch,
@@ -118,14 +111,8 @@ impl McpServer {
         // exemption. Both the merges' own retirements and the sweep's are
         // forgotten, so records and acknowledgements leave together.
         let swept = self.pool.sweep_retired_workers().await;
-        let mut retired = report.retired.clone();
-        retired.extend(swept.workers.clone());
-        retired.sort();
-        retired.dedup();
-        for id in &retired {
-            self.forget_retired_worker(id).await;
-        }
-        self.pool.forget_retired_workers(&retired).await;
+        self.retire_and_forget(report.retired.iter().chain(swept.workers.iter()).cloned())
+            .await;
         Ok(json!({
             "approved": true,
             "group": group_echo,

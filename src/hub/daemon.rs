@@ -445,10 +445,6 @@ impl HubServer {
             Err(e) => error!(error = %e, "Hub recovery task failed"),
         }
 
-        // Every interrupted worker with a surviving conversation is continued
-        // automatically: it stopped because the hub did, not because it could
-        // not go on. Capped per worker so a worker the hub keeps losing is left
-        // to the orchestrator instead of being restarted forever.
         // Every already-integrated worker leaves nothing behind: its branch is
         // in the base branch, so branch, row, history, mailbox, steer-source and
         // watch acknowledgements go now. Runs before the resumed workers are
@@ -488,6 +484,10 @@ impl HubServer {
             Err(e) => error!(error = %e, "Retirement sweep failed"),
         }
 
+        // Every interrupted worker with a surviving conversation is continued
+        // automatically: it stopped because the hub did, not because it could
+        // not go on. Capped per worker so a worker the hub keeps losing is left
+        // to the orchestrator instead of being restarted forever.
         let resumed = self.auto_resume_interrupted().await;
         if resumed > 0 {
             info!(workers = resumed, "Auto-continued interrupted workers");
