@@ -37,6 +37,7 @@ pub mod admission;
 mod buffer;
 mod clock;
 mod fair;
+pub mod merge;
 mod registry;
 pub mod revision;
 mod runner;
@@ -70,6 +71,8 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
+
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
@@ -340,6 +343,15 @@ impl WorkerPool {
     }
 
     /// The scratch root this pool resolves every per-worker path under.
+    /// The pool's heavy-command admission controller.
+    ///
+    /// Shared by clone, so a caller (the merge gate) reserves host budget from
+    /// the same controller every worker's heavy step does instead of starting
+    /// a second, unaware one.
+    pub fn admission(&self) -> AdmissionController {
+        self.admission.clone()
+    }
+
     pub fn scratch_root(&self) -> &ScratchRoot {
         &self.scratch
     }
