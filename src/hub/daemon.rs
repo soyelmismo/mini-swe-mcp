@@ -140,7 +140,6 @@ impl HubPaths {
             Ok(dir) => HubEndpoint::Path(dir.join("hub.sock")),
             Err(_) => HubEndpoint::Abstract(key),
         }
-        }
     }
 
     /// The lock file serialising daemons on this directory.
