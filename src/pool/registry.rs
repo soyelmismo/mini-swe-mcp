@@ -85,7 +85,8 @@ pub enum WorkerRole {
 ///
 /// Recorded in the worker's registry row so it outlives the in-memory record
 /// `collect` evicts; a new revision drops it, because a changed branch needs a
-/// fresh review.
+/// fresh review. The batch merge reads it too, and lands the workers in the
+/// order the stamps were recorded in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerApproval {
     /// Unix time the worker was approved.

@@ -193,6 +193,14 @@ Subagents execute exclusively inside isolated git worktrees rather than modifyin
   throwaway worktree under the scratch root. Only then does `git merge --no-ff` run, after
   which the branch, the history file and the worktree leftovers are reclaimed with the same
   helpers the prune sweep uses. It never moves `HEAD` and never pushes.
+- **Batch merge** (`pool::merge`, `merge --approved`): the same operation for a whole round. It
+  selects the caller's completed workers that carry an approval (optionally one group), composes
+  their branches in approval order with `git merge-tree` on top of the previous result, skips a
+  conflicting branch and reports it with the `steer` that sends it back, and runs the shared verify
+  gate **once** on the combined tree. Only a passing gate merges: one `--no-ff` merge commit per
+  worker, then the same per-worker cleanup. A failing gate merges nothing and attributes every
+  `path:line` the failure names to the worker whose branch touched it, flagging a file several
+  workers touched as an interaction point.
 
 ---
 
