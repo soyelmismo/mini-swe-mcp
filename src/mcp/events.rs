@@ -31,8 +31,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::pool::{
-    LogBuffer, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRegistryEntry,
-    WorkerState, clamp_string,
+    FileStat, LogBuffer, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool,
+    WorkerRegistryEntry, WorkerReport, WorkerState, clamp_string, file_stats_of_diff,
 };
 
 /// How often the event task re-reads the registry for workers it does not own.
@@ -94,6 +94,10 @@ pub struct Outcome {
     pub diff_stat: Option<String>,
     /// Why the run died.
     pub error: Option<String>,
+    /// The structured report of the completion turn, when the worker wrote one.
+    pub report: Option<WorkerReport>,
+    /// The completion diff split per file, biggest churn first.
+    pub per_file: Vec<FileStat>,
 }
 
 /// One worker's state as the event task sees it, reduced to what a notification
@@ -148,6 +152,9 @@ pub struct ChannelEvent {
     pub status: String,
     /// The rendered message.
     pub content: String,
+    /// Full completion report and per-file stats, independent of the text view.
+    pub report: Option<WorkerReport>,
+    pub per_file: Vec<FileStat>,
 }
 
 /// The events for the transitions between two snapshots, ordered by worker id.
@@ -171,6 +178,8 @@ pub fn diff_events(previous: &WorkerSnapshot, current: &WorkerSnapshot) -> Vec<C
                 model: view.model.clone(),
                 status: view.status.clone(),
                 content: render(view, kind),
+                report: view.outcome.report.clone(),
+                per_file: view.outcome.per_file.clone(),
             })
         })
         .collect()
@@ -187,6 +196,8 @@ pub fn channel_frame(event: &ChannelEvent) -> Option<String> {
         "method": CHANNEL_METHOD,
         "params": {
             "content": event.content.clone(),
+            "report": event.report,
+            "per_file": event.per_file,
             "meta": {
                 "event": event.kind.as_str(),
                 "worker_id": event.worker_id.clone(),
@@ -241,20 +252,41 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
         ),
         EventKind::Completed => {
             let mut body = String::new();
-            if let Some(summary) = &view.outcome.summary {
-                body.push_str(&format!("Summary: {summary}\n"));
-            }
-            if let Some(verified) = view.outcome.verified {
-                body.push_str(&format!(
-                    "Verified: {}\n",
-                    if verified { "yes" } else { "no" }
-                ));
+            // The report's `done:` line is the headline; the verification flag
+            // rides on it so the body stays five lines even with a per-file
+            // diff and a risk note.
+            let verified = view.outcome.verified.map_or_else(String::new, |ok| {
+                format!(" | Verified: {}", if ok { "yes" } else { "no" })
+            });
+            let headline = view
+                .outcome
+                .report
+                .as_ref()
+                .map(|report| report.done.trim())
+                .filter(|done| !done.is_empty())
+                .or(view.outcome.summary.as_deref());
+            match headline {
+                Some(done) => body.push_str(&format!("Done: {done}{verified}\n")),
+                None if verified.is_empty() => {
+                    body.push_str("Completed with no recorded summary.\n")
+                }
+                None => body.push_str(&format!("Completed{verified}\n")),
             }
             if let Some(diff) = &view.outcome.diff_stat {
                 body.push_str(&format!("Diff: {diff}\n"));
             }
-            if body.trim().is_empty() {
-                body.push_str("Completed with no recorded summary.\n");
+            let files = crate::pool::churn_line(&view.outcome.per_file);
+            if !files.is_empty() {
+                body.push_str(&format!("files: {files}\n"));
+            }
+            if let Some(risks) = view
+                .outcome
+                .report
+                .as_ref()
+                .map(|report| report.risks.trim())
+                .filter(|risks| !risks.is_empty() && !risks.eq_ignore_ascii_case("none"))
+            {
+                body.push_str(&format!("risks: {risks}\n"));
             }
             body.push_str(&crate::pool::next_step_for(view.branch.as_deref()));
             (
@@ -718,6 +750,14 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
                 let (files, insertions, deletions) = crate::cli::watch::branch_diff_stat(entry)?;
                 stat_text(files, insertions, deletions)
             }),
+            // The row carries the report so a worker whose in-memory record
+            // was already evicted still says what it did.
+            report: entry.report.clone(),
+            summary: entry
+                .report
+                .as_ref()
+                .and_then(|report| first_line(&report.done))
+                .or_else(|| first_line(&entry.last_command)),
             ..Outcome::default()
         },
         // A registry row names no branch, so the guidance falls back to the
@@ -748,12 +788,16 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             summary,
             verified,
             metrics,
+            diff,
+            report,
             ..
         } => Outcome {
             summary: first_line(summary),
             verified: *verified,
             diff_stat: diff_stat(metrics),
             error: None,
+            report: report.clone(),
+            per_file: file_stats_of_diff(diff),
         },
         WorkerState::Failed { error, metrics, .. } => Outcome {
             error: (!error.trim().is_empty()).then(|| quote(error)),
@@ -831,6 +875,8 @@ mod router_tests {
             model: "test".to_string(),
             status: kind.as_str().to_string(),
             content: "test".to_string(),
+            report: None,
+            per_file: Vec::new(),
         }
     }
 
@@ -968,7 +1014,8 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];
                 for key in [
-                    "summary", "verified", "branch", "revision", "metrics", "error",
+                    "summary", "verified", "branch", "revision", "metrics", "error", "report",
+                    "per_file",
                 ] {
                     if let Some(value) = details.get(key) {
                         view[key] = value

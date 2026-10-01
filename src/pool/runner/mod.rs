@@ -50,10 +50,10 @@ mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
     is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
-    parse_wait_job, summarize_command,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
@@ -369,6 +369,11 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
+        // The completion report and the one follow-up it may cost live across
+        // turns: a verify failure replays the completion turn, and the report
+        // the worker already wrote must survive that replay.
+        let mut report: Option<crate::pool::WorkerReport> = None;
+        let mut report_asked = false;
 
         while step < current_max_turns {
             step += 1;
@@ -402,6 +407,8 @@ impl WorkerPool {
                 client_env: &client_env,
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
+                report: &mut report,
+                report_asked: &mut report_asked,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
@@ -451,7 +458,14 @@ impl WorkerPool {
             .find(|l| !l.is_empty())
             .unwrap_or("completed task")
             .to_string();
-        let agent_summary = last_assistant_text.trim().to_string();
+        // The report's `done:` line is the summary every consumer reads; the
+        // last chat message stays the fallback for a worker that never wrote
+        // one, so the commit subject is never "Now I'll make the edits.".
+        let agent_summary = report
+            .as_ref()
+            .map(|r| r.done.trim().to_string())
+            .filter(|done| !done.is_empty())
+            .unwrap_or_else(|| last_assistant_text.trim().to_string());
         let path = worktree.path.clone();
         let repo_root = worktree.repo_root.clone();
         let base_commit = worktree.base_commit.clone();
@@ -531,10 +545,14 @@ impl WorkerPool {
             verified,
             metrics: meta.metrics,
             revision,
+            report: report.clone(),
         };
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
 
+        // The report travels with the meta so the terminal row carries it: the
+        // in-memory record is evicted after its TTL, the row is not.
+        meta.report = report;
         self.save_status(
             meta,
             &model,

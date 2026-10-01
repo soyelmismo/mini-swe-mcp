@@ -40,6 +40,7 @@ impl Harness {
     /// The consolidator's own metadata, as its dispatch wrote it.
     fn consolidator(&self, id: &str) -> WorkerMeta {
         WorkerMeta {
+            report: None,
             id: id.to_string(),
             task: "integrate the round".to_string(),
             group: Some(GROUP.to_string()),
@@ -58,6 +59,7 @@ impl Harness {
 /// The registry row a target worker leaves behind.
 fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
+        report: None,
         id: id.to_string(),
         pid: std::process::id(),
         task: "do the work".to_string(),
@@ -109,6 +111,7 @@ async fn insert_live_worker(pool: &WorkerPool, root: &ScratchRoot, id: &str, own
 /// line reports.
 fn completed(id: &str, verified: bool) -> WorkerState {
     WorkerState::Completed {
+        report: None,
         turns: 3,
         diff: String::new(),
         summary: "done".to_string(),

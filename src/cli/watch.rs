@@ -111,7 +111,8 @@ fn registry_snapshot_row(entry: &WorkerRegistryEntry, now: u64) -> Value {
         "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
         "metrics":entry.metrics, "branch":null, "revision":0, "summary":null,
         "task":clamp_string(entry.task.lines().next().unwrap_or(""), 500),
-        "verified":null, "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
+        "verified":null, "report":entry.report,
+        "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
 }
 
 pub fn enrich_state(view: &mut Value, state: &WorkerState) {
@@ -129,6 +130,8 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             branch,
             revision,
             metrics,
+            diff,
+            report,
             ..
         } => {
             view["status"] = json!("completed");
@@ -137,6 +140,11 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             view["branch"] = json!(branch);
             view["revision"] = json!(revision);
             view["metrics"] = json!(metrics);
+            // The report rides on the view so a `watch` event can name what
+            // changed, and the per-file split comes from the diff the state
+            // already holds rather than a second `git diff --stat`.
+            view["report"] = json!(report);
+            view["per_file"] = json!(crate::pool::file_stats_of_diff(diff));
         }
         WorkerState::Failed {
             error,
@@ -150,6 +158,37 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             view["metrics"] = json!(metrics);
         }
     }
+}
+
+/// The health counters that grew between two samples, as `key=delta`.
+///
+/// Only a counter that moved is named: a run that never nudged or blocked
+/// anything must not read as if it had.
+fn moved_counters_since(now: &WorkerMetrics, before: &WorkerMetrics) -> Vec<String> {
+    const COUNTERS: [&str; 5] = [
+        "repeat_blocks",
+        "stagnation_nudges",
+        "loop_pauses",
+        "extensions_refused",
+        "verify_failures",
+    ];
+    COUNTERS
+        .iter()
+        .filter_map(|key| {
+            let delta = match *key {
+                "repeat_blocks" => now.repeat_blocks.saturating_sub(before.repeat_blocks),
+                "stagnation_nudges" => now
+                    .stagnation_nudges
+                    .saturating_sub(before.stagnation_nudges),
+                "loop_pauses" => now.loop_pauses.saturating_sub(before.loop_pauses),
+                "extensions_refused" => now
+                    .extensions_refused
+                    .saturating_sub(before.extensions_refused),
+                _ => now.verify_failures.saturating_sub(before.verify_failures),
+            };
+            (delta > 0).then(|| format!("{key}={delta}"))
+        })
+        .collect()
 }
 
 /// Decide from state and the last reported health baseline, without I/O.
@@ -217,6 +256,9 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     payload["event"] = json!(event);
     payload["time_since_last_step"] = json!(idle);
     payload["diff_stat"] = json!({"files":metrics.diff_files,"insertions":metrics.diff_insertions,"deletions":metrics.diff_deletions});
+    // The counters that moved since the last snapshot, so a compact stall
+    // event can name why it fired instead of only how long it has been idle.
+    payload["moved_counters"] = json!(moved_counters_since(&metrics, &baseline));
     payload["next_step"] = json!(crate::pool::next_step_for(view["branch"].as_str()));
     payload["commands"] = json!(commands(&payload));
     Some(payload)
@@ -292,7 +334,7 @@ fn render_event(v: &Value, verbose: bool) -> String {
     let mut out = String::new();
     if let Some(dropped) = v["dropped_events"].as_u64().filter(|n| *n > 0) {
         out.push_str(&format!(
-            "{dropped} older events dropped (backlog limit 100).\n"
+            "{dropped} older events dropped (backlog limit 100). | "
         ));
     }
     // The headline carries what decides the next move: the outcome, its
@@ -306,13 +348,28 @@ fn render_event(v: &Value, verbose: bool) -> String {
             v["diff_stat"]["files"], v["diff_stat"]["insertions"], v["diff_stat"]["deletions"]
         )
     });
+    // A completed worker's headline is its report's `done:` line: the summary
+    // the harness derives from the last chat message is only the fallback.
     let summary = match event {
-        "completed" => one_line(v["summary"].as_str()).unwrap_or_else(|| "done".to_string()),
+        "completed" => report_done(v)
+            .or_else(|| one_line(v["summary"].as_str()))
+            .unwrap_or_else(|| "done".to_string()),
         "failed" => one_line(v["error"].as_str()).unwrap_or_else(|| "failed".to_string()),
         "needs_input" => {
             one_line(v["question"].as_str()).unwrap_or_else(|| "needs input".to_string())
         }
-        _ => format!("no step for {}s", v["time_since_last_step"]),
+        _ => {
+            let moved = moved_counters(v);
+            if moved.is_empty() {
+                format!("no step for {}s", v["time_since_last_step"])
+            } else {
+                format!(
+                    "no step for {}s | {}",
+                    v["time_since_last_step"],
+                    moved.join(", ")
+                )
+            }
+        }
     };
     out.push_str(&format!(
         "{} {}{}{} | {}\n",
@@ -322,6 +379,17 @@ fn render_event(v: &Value, verbose: bool) -> String {
         diff.as_deref().unwrap_or(""),
         summary
     ));
+    // The per-file split of the completion diff: the top files by churn, then
+    // how many were left out. One line, so the body stays within five.
+    if event == "completed" {
+        let files = crate::pool::churn_line(&per_file_stats(v));
+        if !files.is_empty() {
+            out.push_str(&format!("files: {files}\n"));
+        }
+        if let Some(risks) = report_risks(v) {
+            out.push_str(&format!("risks: {risks}\n"));
+        }
+    }
     out.push_str(&format!(
         "branch {} | step {}/{} | elapsed {}s | {}\n",
         branch,
@@ -334,6 +402,38 @@ fn render_event(v: &Value, verbose: bool) -> String {
         out.push_str(&format!("$ {command}\n"));
     }
     out.trim_end().to_string()
+}
+
+/// The per-file diff a payload carries, as [`crate::pool::FileStat`]s.
+fn per_file_stats(v: &Value) -> Vec<crate::pool::FileStat> {
+    serde_json::from_value(v["per_file"].clone()).unwrap_or_default()
+}
+
+/// The `done:` line of a payload's report, when it wrote one.
+fn report_done(v: &Value) -> Option<String> {
+    one_line(v["report"]["done"].as_str())
+}
+
+/// The report's `risks:` line, unless it says there are none.
+fn report_risks(v: &Value) -> Option<String> {
+    let risks = one_line(v["report"]["risks"].as_str())?;
+    (!risks.eq_ignore_ascii_case("none")).then_some(risks)
+}
+
+/// The health counters that moved since the previous snapshot, as `key=delta`.
+///
+/// A compact stall event has room for one line, so it names the counters that
+/// fired rather than every counter the run ever moved.
+fn moved_counters(v: &Value) -> Vec<String> {
+    v["moved_counters"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// First non-empty line of a payload text field, bounded for a one-line event.
@@ -378,6 +478,15 @@ fn render_event_verbose(v: &Value) -> String {
                 if let Some(value) = v[key].as_str() {
                     out.push_str(&format!("{key}: {value}\n"));
                 }
+            }
+            for key in ["done", "files", "tests", "risks"] {
+                if let Some(value) = one_line(v["report"][key].as_str()) {
+                    out.push_str(&format!("{key}: {value}\n"));
+                }
+            }
+            let files = crate::pool::churn_line(&per_file_stats(v));
+            if !files.is_empty() {
+                out.push_str(&format!("files_stat: {files}\n"));
             }
         }
         "needs_input" => out.push_str(&format!("Question: {}\n", text("question"))),

@@ -164,6 +164,10 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut consecutive_no_cmd = 0;
         let mut watch = ProgressWatch::default();
+        // The reviewer's completion approves the audit; it stores no report, so
+        // the engine's report state is a sink here.
+        let mut report = None;
+        let mut report_asked = false;
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -199,6 +203,8 @@ impl WorkerPool {
                 client_env: &[],
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
+                report: &mut report,
+                report_asked: &mut report_asked,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { .. } => {
