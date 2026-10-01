@@ -795,7 +795,16 @@ impl McpServer {
             .map(|(repo, base)| (repo, base, branch.clone()));
         let (stats, summaries, merge, raw_diff) = match tokio::task::spawn_blocking(move || {
             let Some((repo, base, branch)) = probe else {
-                return (Vec::new(), Vec::new(), None, String::new());
+                // No repository recorded: a live worker still carries its own
+                // diff, so the change can be classified even without git.
+                return match live_diff {
+                    Some(diff) => {
+                        let summaries = diff_file_summaries(&diff);
+                        let stats = diff_file_stats(&diff);
+                        (stats, summaries, None, diff)
+                    }
+                    None => (Vec::new(), Vec::new(), None, String::new()),
+                };
             };
             let merge = merge_check(&repo, &base, &branch);
             let text = match &live_diff {
@@ -2283,5 +2292,106 @@ mod tests {
             "test a ... FAILED\nassertion failed"
         );
         assert_eq!(crate::mcp::events::verify_tail_of(&logs[..1]), None);
+    }
+    /// The path classifier is one table: a test directory or a test-style name
+    /// beats a documentation extension, so `tests/README.md` is a test.
+    #[test]
+    fn classify_path_sorts_code_tests_and_docs() {
+        for (path, kind) in [
+            ("src/parser.rs", PathKind::Code),
+            ("src/main.py", PathKind::Code),
+            ("tests/integration.rs", PathKind::Test),
+            ("test/cli_test.go", PathKind::Test),
+            ("app/__tests__/x.js", PathKind::Test),
+            ("spec/models_spec.rb", PathKind::Test),
+            ("src/serde_test.rs", PathKind::Test),
+            ("scripts/test_smoke.py", PathKind::Test),
+            ("web/widget.spec.ts", PathKind::Test),
+            ("src/thing.test.ts", PathKind::Test),
+            ("README.md", PathKind::Doc),
+            ("docs/design.rst", PathKind::Doc),
+            ("notes.txt", PathKind::Doc),
+            ("tests/README.md", PathKind::Test),
+        ] {
+            assert_eq!(classify_path(path), kind, "wrong kind for {path}");
+        }
+    }
+
+    /// The counter is language-agnostic: every documented declaration earns one
+    /// case, and an identifier that merely contains a pattern earns none.
+    #[test]
+    fn count_test_cases_reads_every_declaration() {
+        for line in [
+            "#[test]",
+            "    #[tokio::test]",
+            "fn test_parses() {",
+            "def test_parses(self):",
+            "it(`adds`)",
+            "test('adds', () => {})",
+            "describe('parser', () => {",
+            "    @Test",
+            "func TestParse(t *testing.T) {",
+        ] {
+            assert_eq!(count_test_cases(line), 1, "missed a case in {line:?}");
+        }
+        for line in [
+            "// a comment about tests",
+            "fn parses() {",
+            "let unit = 1;",
+            "let submit = 2;",
+        ] {
+            assert_eq!(count_test_cases(line), 0, "false positive in {line:?}");
+        }
+    }
+
+    /// Test-case churn is measured from the changed hunk lines only, and each
+    /// summary keeps the path's classification.
+    #[test]
+    fn diff_summaries_count_cases_and_classify() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/tests/a_test.rs b/tests/a_test.rs\n",
+            "--- a/tests/a_test.rs\n",
+            "+++ b/tests/a_test.rs\n",
+            "@@ -1,2 +1,3 @@\n",
+            "-#[test]\n",
+            "-fn test_old() {}\n",
+            "+#[test]\n",
+            "+fn test_new() {}\n",
+            "+#[test]\n",
+        );
+        let summaries = diff_file_summaries(diff);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].kind, PathKind::Code);
+        assert_eq!(summaries[0].added_cases, 0);
+        let test = &summaries[1];
+        assert_eq!(test.kind, PathKind::Test);
+        assert_eq!(test.added_cases, 3);
+        assert_eq!(test.removed_cases, 2);
+        assert_eq!(diff_of_kind(diff, PathKind::Code).lines().count(), 6);
+    }
+
+    /// `review --diff` accepts exactly the three documented scopes and defaults
+    /// to the code diff.
+    #[test]
+    fn review_diff_scope_defaults_to_code_and_rejects_typos() {
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({})).expect("absent is the default"),
+            ReviewDiffScope::Code
+        );
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({ "diff": "all" })).unwrap(),
+            ReviewDiffScope::All
+        );
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({ "diff": "none" })).unwrap(),
+            ReviewDiffScope::None
+        );
+        assert!(McpServer::get_review_diff_scope(&json!({ "diff": "everything" })).is_err());
     }
 }

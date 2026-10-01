@@ -48,7 +48,7 @@ const WATCH: &str = "Run `mini-swe-mcp watch` in the background: it blocks until
 const STEER: &str = "Send every correction and merge conflict to the same worker with `mini-swe-mcp steer <worker_id> <message>` rather than editing its branch yourself. Steering corrects a completed worker or continues any stopped one (failed, interrupted, killed): it resumes on its own worker-<id> branch with the full conversation plus this message, on a fresh turn budget (optional --max-turns, default 60). Never dispatch a replacement for a stopped worker. Review the diff and merge only when it is right.";
 
 /// `review`: the one compact view of a finished worker's branch.
-const REVIEW: &str = "Run `mini-swe-mcp review <worker_id>` for everything needed to decide what to do next, in one bounded reply: the task's first line, whether the verify gate passed (and the tail of its output when it did not), the per-file diff stat, the summary, the revision, and whether the branch still merges cleanly into the base branch tip. The merge check runs `git merge-tree --write-tree`, so it touches no worktree, no index and no lock. A clean branch ends with the merge to run; a conflicting one ends with the `steer` that sends the conflicts back to the worker that owns them. Review is a read: unlike collect it never evicts the worker.";
+const REVIEW: &str = "Run `mini-swe-mcp review <worker_id>` for everything needed to decide what to do next, in one bounded reply: the task's first line, whether the verify gate passed (and the tail of its output when it did not), the diff of the code files, the per-file diff stat, the test files summarised by the cases added and removed, the docs touched with their +/- counts, the summary, the revision, and whether the branch still merges cleanly into the base branch tip. The diff is bounded, and a truncation says how many bytes it dropped. `--diff code|all|none` selects the code diff (the default), the whole diff, or none; test files are summarised instead of shown, so a change's test churn never dominates the reply. The merge check runs `git merge-tree --write-tree`, so it touches no worktree, no index and no lock. A clean branch ends with the merge to run; a conflicting one ends with the `steer` that sends the conflicts back to the worker that owns them. When the result is right, `mini-swe-mcp approve <worker_id> [\"note\"]` records your verdict on the completed worker (owner-only, and it survives collect; `mini-swe-mcp unapprove <worker_id>` withdraws it), while steering the worker into a new revision clears it because the branch changed. Review is a read: unlike collect it never evicts the worker.";
 
 /// `collect`: the final message, with the diff summarised unless asked for.
 const COLLECT: &str = "Run `mini-swe-mcp collect <worker_id>` for a finished worker's final message. The default reply is compact - summary, verification outcome, per-file diff stat and branch - because the full diff of a large task is what makes a review expensive. Pass --full for the whole diff, or --file <path> (repeatable) for the diff of named files only. Collect ends the worker's reviewable life: prefer `review` while the worker is still live, and collect once it is done.";
@@ -150,6 +150,9 @@ mod tests {
             "git merge-tree --write-tree",
             "never evicts",
             "steer",
+            "--diff code|all|none",
+            "test files",
+            "mini-swe-mcp approve",
         ] {
             assert!(
                 text.contains(needle),

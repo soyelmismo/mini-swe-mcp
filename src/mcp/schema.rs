@@ -555,4 +555,17 @@ mod tests {
         assert!(text.contains("own branch"), "{text}");
         assert!(text.contains("never dispatch a replacement"), "{text}");
     }
+    /// The `diff` property advertises the three documented review scopes, with
+    /// the default first so a client can read it off the schema.
+    #[test]
+    fn diff_property_advertises_the_review_scopes() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let diff = &schema["properties"]["diff"];
+
+        assert_eq!(diff["type"], json!("string"));
+        assert_eq!(diff["enum"], json!(["code", "all", "none"]));
+        assert_eq!(diff["default"], json!("code"));
+        assert!(REVIEW_DIFF_SCOPES.contains(&"none"));
+    }
 }

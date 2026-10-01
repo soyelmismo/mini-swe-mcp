@@ -258,9 +258,13 @@ fn print_help() {
     println!("  collect <worker_id> [--full] [--file <path>]");
     println!("           Final message with a per-file diff stat; --full adds the whole diff,");
     println!("           --file narrows it to one path (repeatable).");
-    println!("  review <worker_id>");
-    println!("           One compact view of a finished worker: task, verification, per-file");
-    println!("           diff stat, and whether its branch still merges into the base branch.");
+    println!("  review <worker_id> [--diff code|all|none]");
+    println!("           One compact view of a finished worker: task, verification, the code");
+    println!("           diff, per-file stat, tests summarised, and whether it still merges.");
+    println!("  approve <worker_id> [\"note\"]");
+    println!("           Record your verdict on a completed worker (owner-only).");
+    println!("  unapprove <worker_id>");
+    println!("           Withdraw that approval.");
     println!("  logs <worker_id>");
     println!("           Recent commands and their output.");
     println!("  steer <worker_id> <message> [--max-turns <n>]");

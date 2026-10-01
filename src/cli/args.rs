@@ -61,6 +61,9 @@ pub fn tool_args(
             if action == "collect" {
                 collect_diff_args(cli_args, &mut tool_args);
             }
+            if action == "review" {
+                review_diff_arg(cli_args, &mut tool_args);
+            }
             // `--no-delete` keeps the merged branch: the same tool argument
             // the MCP action reads, so the flag has one implementation.
             if flag_index(cli_args, &["--no-delete"]).is_some() {
@@ -77,6 +80,16 @@ pub fn tool_args(
                 if let Some(mut i) = flag_index(cli_args, &["--max-turns", "-t"]) {
                     take_turns(cli_args, &mut i, &mut tool_args);
                 }
+            }
+        }
+        "approve" | "unapprove" => {
+            if cli_args.len() > 2 {
+                tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
+            }
+            // `approve <id> ["note"]`: the note is the same `message` argument
+            // the MCP action reads.
+            if action == "approve" && cli_args.len() > 3 {
+                tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
             }
         }
         "list" => {
@@ -127,6 +140,16 @@ fn collect_diff_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
     }
     if !files.is_empty() {
         tool_args.insert("files".into(), Value::Array(files));
+    }
+}
+
+/// Fold `review --diff <scope>` into the tool arguments.
+///
+/// The scope is the same `diff` argument the MCP action reads, so the selector
+/// has one implementation and an unknown value is refused by the handler.
+fn review_diff_arg(cli_args: &[String], tool_args: &mut Map<String, Value>) {
+    if let Some(mut i) = flag_index(cli_args, &["--diff"]) {
+        take_value(cli_args, &mut i, tool_args, "diff");
     }
 }
 

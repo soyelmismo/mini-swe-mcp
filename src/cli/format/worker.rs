@@ -196,6 +196,10 @@ pub fn format_status(val: &serde_json::Value) -> String {
             }
         }
     }
+    if let Some(line) = approval_line(val) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     if let Some(health) = health_line(val) {
         out.push_str(&health);
         out.push('\n');
@@ -238,6 +242,10 @@ pub fn format_review(val: &serde_json::Value) -> String {
         .unwrap_or("Unknown");
     let revision = val.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
     let mut out = format!("Worker {wid} ({state}) revision {revision}\n");
+    if let Some(line) = approval_line(val) {
+        out.push_str(&line);
+        out.push('\n');
+    }
     if let Some(task) = val
         .get("task")
         .and_then(|v| v.as_str())
@@ -254,6 +262,19 @@ pub fn format_review(val: &serde_json::Value) -> String {
         out.push_str(&format!("Verify tail:\n{tail}\n"));
     }
     out.push_str(&format!("Diff: {}\n", diff_stat_line(val)));
+    if let Some(scope) = val
+        .get("diff_scope")
+        .and_then(|v| v.as_str())
+        .filter(|_| val.get("diff").is_some_and(|diff| !diff.is_null()))
+        && let Some(diff) = val
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .filter(|diff| !diff.is_empty())
+    {
+        out.push_str(&format!("\nDiff ({scope}):\n{diff}\n"));
+    }
+    push_test_files(&mut out, val);
+    push_docs(&mut out, val);
     if let Some(summary) = val
         .get("summary")
         .and_then(|v| v.as_str())
@@ -298,6 +319,69 @@ fn diff_stat_line(val: &serde_json::Value) -> String {
         }
     }
     line
+}
+
+/// The approval line for a payload carrying an `approved` object, if any.
+///
+/// The timestamp is the raw registry value; the note is appended when present.
+fn approval_line(val: &serde_json::Value) -> Option<String> {
+    let approved = val.get("approved").filter(|v| !v.is_null())?;
+    let at = approved
+        .get("at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    match approved.get("note").and_then(|v| v.as_str()) {
+        Some(note) if !note.is_empty() => Some(format!("Approved: {at} ({note})")),
+        _ => Some(format!("Approved: {at}")),
+    }
+}
+
+/// One line per test file: the test cases its added and removed lines declare.
+fn push_test_files(out: &mut String, val: &serde_json::Value) {
+    let Some(tests) = val
+        .get("test_files")
+        .and_then(|v| v.as_array())
+        .filter(|tests| !tests.is_empty())
+    else {
+        return;
+    };
+    out.push_str("Tests:\n");
+    for test in tests {
+        let path = test.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let added = test
+            .get("added_cases")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let removed = test
+            .get("removed_cases")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("  {path}  +{added} -{removed} cases\n"));
+    }
+}
+
+/// One line per documentation file: its +/- counts only.
+fn push_docs(out: &mut String, val: &serde_json::Value) {
+    let Some(docs) = val
+        .get("docs")
+        .and_then(|v| v.as_array())
+        .filter(|docs| !docs.is_empty())
+    else {
+        return;
+    };
+    out.push_str("Docs:\n");
+    for doc in docs {
+        let path = doc.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let added = doc
+            .get("insertions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let deleted = doc
+            .get("deletions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("  {path}  +{added} -{deleted}\n"));
+    }
 }
 
 /// The merge answer in one line: clean, conflicting (naming the files), or the
