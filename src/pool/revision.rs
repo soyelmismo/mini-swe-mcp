@@ -804,16 +804,16 @@ fn refs_of(repo: &Path, args: &[&str]) -> Option<std::collections::HashSet<Strin
 /// A row that names its base needs no help: the branch it was dispatched
 /// against is the branch its work must have landed in. A row that names none --
 /// every row written before base-branch tracking, on the host and here alike --
-/// is answered from the worker's own history, which states the base it worked
-/// against. Both are per-worker facts, so neither the proof nor the group key
-/// can mix two workers' bases.
+/// is answered from the worker's own saved conversation, the same file a
+/// revision reloads, whose metadata records the base branch before the worker's
+/// first turn. Both sources are per-worker facts, so neither the proof nor the
+/// group key can mix two workers' bases.
 ///
-/// A row with neither (a history lost, or never written) names no base at all:
-/// the sweep has nothing positive to compare against and must keep the worker,
-/// which is the conservative rule the rest of this function follows. The
-/// repository's currently checked-out branch is *not* a substitute -- it moves
-/// with whoever dispatches next, so proving integration against it would retire
-/// a merged worker and an unintegrated one alike.
+/// A row with neither -- a conversation lost, or never written -- names no base
+/// at all, and the sweep must keep the worker: nothing positive can be proved.
+/// The repository's currently checked-out branch is deliberately *not* the
+/// substitute, because it moves with whoever dispatches next; proving against
+/// it would retire a merged worker and an unintegrated one alike.
 fn base_branch_proof(
     root: &ScratchRoot,
     entry: &super::WorkerRegistryEntry,
