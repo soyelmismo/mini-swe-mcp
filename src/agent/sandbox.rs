@@ -601,6 +601,29 @@ const READ_ONLY_SYSTEM_PATHS: &[&str] =
 /// is testable rather than emergent.
 const DENIED_HOME_SUBDIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".gpg", ".kube", ".docker"];
 
+/// Credential files that live *next to* a shared cache and must stay
+/// unreadable even when the cache beside them is granted.
+///
+/// The shared caches point at `SWE_CACHE_DIR`, never at the operator's home,
+/// so these are unreachable by omission; the explicit list keeps that property
+/// testable and stops a future broad rule from granting them by accident.
+/// `SWE_ALLOW_TOOLCHAIN_CREDENTIALS=1` is the operator's opt-in.
+const DENIED_CREDENTIAL_FILES: &[&str] = &[
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".netrc",
+    ".pypirc",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+];
+
+/// Environment variable that opts an operator into exposing the credential
+/// files listed in [`DENIED_CREDENTIAL_FILES`].
+const ALLOW_CREDENTIALS_ENV: &str = "SWE_ALLOW_TOOLCHAIN_CREDENTIALS";
+
 /// Absolute system paths that must never be reachable, even read-only.
 const DENIED_ABSOLUTE_PATHS: &[&str] = &["/root", "/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
@@ -856,10 +879,16 @@ fn home_dir() -> Option<PathBuf> {
 /// handled rights deny them. An explicit, testable list stops a broad prefix
 /// rule from silently granting them by accident.
 fn denied_paths() -> Vec<PathBuf> {
-    let mut denied = Vec::with_capacity(DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len());
+    let mut denied = Vec::with_capacity(
+        DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len() + DENIED_CREDENTIAL_FILES.len(),
+    );
     denied.extend(DENIED_ABSOLUTE_PATHS.iter().map(PathBuf::from));
     if let Some(home) = home_dir() {
         denied.extend(DENIED_HOME_SUBDIRS.iter().map(|d| home.join(d)));
+        // Credential files stay denied unless the operator opted in.
+        if std::env::var_os(ALLOW_CREDENTIALS_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            denied.extend(DENIED_CREDENTIAL_FILES.iter().map(|f| home.join(f)));
+        }
     }
     denied
 }
@@ -1002,8 +1031,11 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     }
 
     // Shared compiler/package caches, writable like the bubblewrap backend
-    // binds them: `GOCACHE`, the JS/Python caches and friends live here and
-    // must accept writes for builds to succeed.
+    // binds them: `GOCACHE`, `GOMODCACHE`, the JS/Python caches, the Maven
+    // local repository and the Gradle user home all live here and must accept
+    // writes for builds to succeed. Every one of them sits under the shared
+    // cache root, so one rule covers them all and a cache directory is never
+    // granted next to a credential file.
     for cache in writable_cache_paths() {
         push(cache, WRITE_RIGHTS);
     }

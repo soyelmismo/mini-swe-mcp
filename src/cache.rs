@@ -180,6 +180,15 @@ pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
     cmd.env("GOCACHE", &dirs.go_build);
     cmd.env("GOMODCACHE", &dirs.go_mod);
 
+    // JVM. `MAVEN_OPTS` carries the local repository because `MAVEN_ARGS` is
+    // not read by every launcher, and `GRADLE_USER_HOME` relocates the whole
+    // Gradle user home, caches and wrapper dists included.
+    cmd.env(
+        "MAVEN_OPTS",
+        format!("-Dmaven.repo.local={}", dirs.maven.display()),
+    );
+    cmd.env("GRADLE_USER_HOME", &dirs.gradle);
+
     // Ensure toolchain paths (~/.local/bin, ~/.cargo/bin) are in PATH
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let current_path = std::env::var("PATH").unwrap_or_default();
