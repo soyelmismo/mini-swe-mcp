@@ -27,14 +27,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-static TAG: AtomicU64 = AtomicU64::new(0);
-
 /// One host process, as the identity names it.
 const HOST: &str = "host:opencode:730:12";
 
 /// The two sessions of that one host process.
 const TAB_A: &str = "host:opencode:730:12/session:tab-a";
 const TAB_B: &str = "host:opencode:730:12/session:tab-b";
+
+static TAG: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch hub directory, removed when the test ends.
 ///
