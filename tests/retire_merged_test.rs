@@ -246,10 +246,8 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
     save_registry_entry_in(&f.root(), &row);
     f.write_steer_source("cons");
 
-    eprintln!("DBG cons row integrated={:?}", mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "cons").map(|r| r.integrated));
     f.merge("cons")
         .expect("a clean consolidator merge must succeed");
-    eprintln!("DBG branch c-a exists={}", git_ref_exists(f.repo(), "worker-c-a"));
 
     for id in ["cons", "c-a", "c-b"] {
         assert!(
