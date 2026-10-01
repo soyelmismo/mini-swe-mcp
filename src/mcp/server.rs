@@ -664,9 +664,19 @@ impl McpServer {
     }
 
     /// Start the daemon's single watcher before accepting any connections.
-    pub async fn start_hub_events(&self) -> tokio::task::JoinHandle<()> {
+    ///
+    /// `store_dir` is the hub directory whose persisted acknowledged watch
+    /// positions are loaded first, so a restarted daemon does not replay events
+    /// the owner already acknowledged. `None` (stdio) keeps the store in memory.
+    pub async fn start_hub_events(
+        &self,
+        store_dir: Option<&std::path::Path>,
+    ) -> tokio::task::JoinHandle<()> {
         self.hub_enabled
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(dir) = store_dir {
+            self.hub_events.lock().await.load_ack_store(dir);
+        }
         super::events::spawn_hub_events((*self.pool).clone(), self.hub_events.clone()).await
     }
 
