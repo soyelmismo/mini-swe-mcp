@@ -316,6 +316,7 @@ async fn an_older_client_cannot_ask_for_a_handover() {
 #[tokio::test]
 async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+    use tokio::process::{ChildStdin, ChildStdout};
 
     let exe = common::binary_path();
     let hub = common::TempDir::new_in_tmp("handover-proxy");
@@ -343,39 +344,8 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = TokioBufReader::new(child.stdout.take().unwrap());
 
-    /// One request, one reply, over the proxy's stdio.
-    async fn call(
-        stdin: &mut tokio::process::ChildStdin,
-        stdout: &mut TokioBufReader<tokio::process::ChildStdout>,
-        id: u64,
-        method: &str,
-    ) -> Value {
-        stdin
-            .write_all(
-                format!("{}\n", json!({"jsonrpc": "2.0", "id": id, "method": method})).as_bytes(),
-            )
-            .await
-            .unwrap();
-        stdin.flush().await.unwrap();
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
-            .await
-            .expect("the proxy answers")
-            .expect("read the reply");
-        assert!(!line.is_empty(), "the proxy closed its stdout");
-        let frame: Value = serde_json::from_str(line.trim()).expect("reply is JSON");
-        assert_eq!(frame["id"], json!(id), "{frame}");
-        frame
-    }
-
-    /// One request with arguments, one reply, over the proxy's stdio.
-    async fn call_with(
-        stdin: &mut tokio::process::ChildStdin,
-        stdout: &mut TokioBufReader<tokio::process::ChildStdout>,
-        id: u64,
-        method: &str,
-        params: Value,
-    ) -> Value {
+    /// Write one request frame to the proxy's stdin.
+    async fn send(stdin: &mut ChildStdin, id: u64, method: &str, params: Value) {
         stdin
             .write_all(
                 format!(
@@ -385,12 +355,16 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
                 .as_bytes(),
             )
             .await
-            .unwrap();
-        stdin.flush().await.unwrap();
+            .expect("write the request");
+        stdin.flush().await.expect("flush the request");
+    }
+
+    /// Read the reply carrying `id`, whatever else the proxy forwards meanwhile.
+    async fn read_reply(stdout: &mut TokioBufReader<ChildStdout>, id: u64) -> Value {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
             .await
-            .expect("the proxy answers")
+            .unwrap_or_else(|_| panic!("the proxy did not answer id {id}"))
             .expect("read the reply");
         assert!(!line.is_empty(), "the proxy closed its stdout");
         let frame: Value = serde_json::from_str(line.trim()).expect("reply is JSON");
@@ -398,44 +372,43 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         frame
     }
 
-    // The first call auto-starts the daemon through the proxy.
-    let initialize = call(&mut stdin, &mut stdout, 1, "initialize").await;
+    // The first request auto-starts the daemon through the proxy.
+    send(&mut stdin, 1, "initialize", json!({})).await;
+    let initialize = read_reply(&mut stdout, 1).await;
     assert_eq!(
         initialize["result"]["protocolVersion"], "2024-11-05",
         "{initialize}"
     );
-    let tools = call(&mut stdin, &mut stdout, 2, "tools/list").await;
+    send(&mut stdin, 2, "tools/list", json!({})).await;
+    let tools = read_reply(&mut stdout, 2).await;
     assert!(tools["result"]["tools"].is_array(), "{tools}");
 
     // A watch with nothing to watch blocks until its own deadline, so it is
     // still in flight when the daemon is killed underneath it.
-    let watching = tokio::spawn(call_with(
-        {
-            let mut stdin = stdin_handle(&mut child);
-            stdin
-        },
-        &mut stdout,
+    send(
+        &mut stdin,
         3,
         "tools/call",
         json!({"name": "worker", "arguments": {"action": "watch", "timeout_secs": 30}}),
-    ));
-    let _ = &watching;
-    // Wait until the daemon has the watch open before cutting the connection.
-    wait_for_log(&hub_dir, "Serving MCP connection", 2).await;
+    )
+    .await;
+    // Wait until the daemon is serving the proxy before cutting the connection,
+    // so the watch really is in flight rather than still on the wire.
+    wait_for_log(&hub_dir, "Serving MCP connection", 1).await;
 
     // Kill the daemon the proxy is talking to: the socket goes stale and the
     // proxy's connection is cut, exactly as a handover cuts it.
     let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
     // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the daemon");
-    wait_for_socket_gone(&HubPaths::new(hub_dir.clone()).socket()).await;
 
     // The request that was in flight at the cut is answered once, with an error
     // that says to retry it: its reply died with the old daemon.
-    let cut = tokio::time::timeout(Duration::from_secs(10), watching)
-        .await
-        .expect("the cut is answered")
-        .expect("the reader task joins");
+    eprintln!(
+        "LOG BEFORE CUT READ:\n{}",
+        std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default()
+    );
+    let cut = read_reply(&mut stdout, 3).await;
     assert_eq!(cut["error"]["code"], -32000, "{cut}");
     assert!(
         cut["error"]["message"]
@@ -446,7 +419,8 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
 
     // The proxy reconnects — auto-starting the replacement daemon itself — and
     // keeps serving the same MCP client.
-    let replayed = call(&mut stdin, &mut stdout, 4, "tools/list").await;
+    send(&mut stdin, 4, "tools/list", json!({})).await;
+    let replayed = read_reply(&mut stdout, 4).await;
     assert!(
         replayed["result"]["tools"].is_array(),
         "the proxy must answer after the daemon went away: {replayed}"
@@ -461,6 +435,21 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     );
 }
 
+/// Wait until the hub log holds at least `count` lines mentioning `event`.
+async fn wait_for_log(hub_dir: &std::path::Path, event: &str, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = std::fs::read_to_string(hub_dir.join("hub.log"))
+            .map(|log| log.lines().filter(|line| line.contains(event)).count())
+            .unwrap_or(0);
+        if seen >= count || std::time::Instant::now() >= deadline {
+            assert!(seen >= count, "hub.log never showed {count} x {event}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// The pid of the daemon the hub log last reported listening.
 fn daemon_pid(hub_dir: &std::path::Path) -> Option<i32> {
     let log = std::fs::read_to_string(hub_dir.join("hub.log")).ok()?;
@@ -471,20 +460,6 @@ fn daemon_pid(hub_dir: &std::path::Path) -> Option<i32> {
                 .find_map(|word| word.strip_prefix("pid=")?.parse().ok())
         })
         .next_back()
-}
-
-/// Wait until nothing accepts connections on `socket`, or panic.
-async fn wait_for_socket_gone(socket: &std::path::Path) {
-    for _ in 0..100 {
-        if mini_swe_mcp::hub::connect_endpoint(&HubEndpoint::Path(socket.to_path_buf()))
-        .await
-        .is_err()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("hub socket {} never went away", socket.display());
 }
 
 /// Kill every daemon the hub log names, so a test leaves none behind.

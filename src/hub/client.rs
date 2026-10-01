@@ -434,10 +434,15 @@ async fn pump_stdin(
             Ok(0) | Err(_) => return,
             Ok(count) => count,
         };
-        carry.extend_from_slice(&chunk[..count]);
-        while let Some(end) = carry.iter().position(|byte| *byte == b'\n') {
-            let frame: Vec<u8> = carry.drain(..=end).collect();
-            if let Some(id) = request_id(&frame) {
+        // Everything read is forwarded, partial frame included: the daemon
+        // reassembles its own frames, and a reconnect must not reorder bytes.
+        // Only the trailing partial frame is held back, for the next read.
+        let mut out = std::mem::take(&mut carry);
+        out.extend_from_slice(&chunk[..count]);
+        let mut scanned = 0;
+        while let Some(end) = out[scanned..].iter().position(|byte| *byte == b'\n') {
+            let end = scanned + end + 1;
+            if let Some(id) = request_id(&out[scanned..end]) {
                 let mut pending = in_flight
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
@@ -446,8 +451,10 @@ async fn pump_stdin(
                 }
                 pending.push_back(id);
             }
+            scanned = end;
         }
-        if !carry.is_empty() && tx.send(std::mem::take(&mut carry)).await.is_err() {
+        carry = out.split_off(scanned);
+        if tx.send(out).await.is_err() {
             return;
         }
     }
@@ -539,12 +546,14 @@ pub async fn proxy_stdio() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         };
         let from_daemon = forward_daemon(reader, &mut stdout, &in_flight);
+        eprintln!("DBG entering select");
         tokio::select! {
             // The client closed its input: nothing left to serve.
-            result = to_daemon => return result,
+            result = to_daemon => { eprintln!("DBG to_daemon ended"); return result; }
             // The daemon went away: answer what it took, then dial again.
-            result = from_daemon => result?,
+            result = from_daemon => { eprintln!("DBG from_daemon ended: {:?}", result.as_ref().err().map(|e| e.to_string())); result?; }
         }
+        eprintln!("DBG answering cut");
         answer_cut_requests(&mut stdout, &in_flight).await?;
         reconnects += 1;
         anyhow::ensure!(
