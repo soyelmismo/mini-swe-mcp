@@ -63,7 +63,9 @@ pub use self::revision::{
     history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
+    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
+    retire_expired_terminal_workers_in, retire_worker_in, save_worker_history,
+    save_worker_history_in,
 };
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
@@ -72,8 +74,9 @@ pub use self::runner::{
     parse_request_turns, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerState,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics,
+    WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerState, retention_expired,
+    terminal_retention_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -427,15 +430,36 @@ impl WorkerPool {
         self.log_policy
     }
 
-    /// Evict terminal worker records whose TTL expired, plus their registry
-    /// entries. Fresh terminal records are deliberately kept so a subsequent
-    /// `collect` / `wait: true` still finds them (audit 07, R3).
+    /// Evict terminal worker records whose TTL expired, and retire the durable
+    /// state of the workers whose retention ran out.
+    ///
+    /// The in-memory eviction bounds *memory* only: a reaped record leaves its
+    /// registry row and its saved conversation in place, so a finished worker
+    /// stays steerable for as long as its branch does (audit 07, R3). Fresh
+    /// terminal records are deliberately kept so a subsequent `collect` /
+    /// `wait: true` still finds them.
     pub async fn reap(&self) -> Vec<String> {
         let expired = {
             let mut lock = self.workers.write().await;
             self.reap_locked(&mut lock)
         };
         self.forget_worktrees(&expired).await;
+        // Age-based, and independent of the in-memory records: a worker whose
+        // branch remains keeps its row and history until this retention ends.
+        let root = self.scratch.clone();
+        let retention = terminal_retention_secs();
+        let retired = tokio::task::spawn_blocking(move || {
+            revision::retire_expired_terminal_workers_in(&root, retention)
+        })
+        .await
+        .unwrap_or(0);
+        if retired > 0 {
+            tracing::info!(
+                retired,
+                retention_secs = retention,
+                "Retired terminal workers past their retention"
+            );
+        }
         expired
     }
 
@@ -454,12 +478,18 @@ impl WorkerPool {
     }
 
     /// Shared eviction helper: removes expired terminal records from `lock`.
+    ///
+    /// Only the record goes. The registry row and the saved conversation are
+    /// what make a finished worker continuable hours later, so they outlive the
+    /// eviction and are retired by the retention sweep (or by `prune`, once the
+    /// branch is gone) instead.
     fn reap_locked(&self, lock: &mut HashMap<String, WorkerRecord>) -> Vec<String> {
         let ttl = self.terminal_ttl.as_secs();
         let expired = expired_terminal_ids(lock, ttl);
         for id in &expired {
             lock.remove(id);
-            remove_registry_entry_in(&self.scratch, id);
+            // The writer's last-row cache is dropped with the record so the map
+            // stays bounded by the live workers; the on-disk row is untouched.
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -1402,7 +1432,12 @@ impl WorkerPool {
         // worktree path is retired, so no `.await` runs under the guard.
         let record = {
             let mut lock = self.workers.write().await;
-            let record = lock.remove(id)?;
+            let Some(record) = lock.remove(id) else {
+                // No record here: the worker may still be a terminal registry
+                // row, which is what a reaped or cross-process worker leaves.
+                drop(lock);
+                return self.collect_from_registry(id).await;
+            };
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -1428,6 +1463,55 @@ impl WorkerPool {
             logs_omitted: view.logs_omitted,
             logs_dropped: dropped,
             logs_truncation_notice: view.logs_truncation_notice,
+        })
+    }
+
+    /// [`WorkerPool::collect`] for a worker this pool holds no record for.
+    ///
+    /// A terminal record is evicted from memory after its TTL, but its registry
+    /// row outlives the eviction, so `collect` still answers from the row: the
+    /// branch is what the caller acts on, and the summary is the row's own
+    /// `last_command`. The step-log window left with the record, so the
+    /// counters report what the row knows and the notice says so. A row that is
+    /// still live belongs to another process and is not collectible here.
+    async fn collect_from_registry(&self, id: &str) -> Option<CollectedWorker> {
+        let entry = load_registry_entry_in(&self.scratch, id)?;
+        if !entry.status.is_terminal() {
+            return None;
+        }
+        let state = match entry.status {
+            RegistryStatus::Completed => WorkerState::Completed {
+                turns: entry.step,
+                diff: String::new(),
+                summary: entry.last_command.clone(),
+                completed_at: entry.updated_at,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
+                verified: None,
+                metrics: entry.metrics,
+                revision: entry.revision,
+            },
+            _ => WorkerState::Failed {
+                error: entry.last_command.clone(),
+                step: entry.step,
+                failed_at: entry.updated_at,
+                metrics: entry.metrics,
+                revision: entry.revision,
+            },
+        };
+        let owner = registry_owner_label(&entry).to_string();
+        Some(CollectedWorker {
+            id: entry.id,
+            task: entry.task,
+            model: entry.model,
+            owner,
+            state,
+            logs: Vec::new(),
+            logs_omitted: 0,
+            logs_dropped: 0,
+            logs_truncation_notice: Some(
+                "the step log left with the evicted in-memory record".to_string(),
+            ),
         })
     }
 }
