@@ -32,6 +32,15 @@ Claude Code (`claude mcp add` writes the same block):
 
 Any other stdio MCP client is configured the same way (`command` plus `args`). The CLI verbs below are the same calls the `worker` MCP tool exposes, for shells and scripts.
 
+## Repository instructions
+
+A dispatched worker reads the target repository's own agent rules from its root
+and appends them to its system prompt: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
+`.github/copilot-instructions.md` and `.cursorrules`. Each existing file is
+included once, deduplicated by content. The injected block is bounded (16 KB,
+marked when truncated) and only regular files inside the repository are read, so
+a symlink pointing outside the repo is ignored.
+
 ## Workflow
 
 Dispatch, watch, review, steer, merge — one worker per focused concern.

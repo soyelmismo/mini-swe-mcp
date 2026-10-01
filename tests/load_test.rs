@@ -430,7 +430,7 @@ async fn hub_handles_five_agents_of_twenty_workers() {
     let token = common::unique_suffix("heavy");
     let llm = FakeLlm::spawn("ls -la", &heavy_command(&token, shape.heavy_secs)).await;
     let mut daemon = spawn_daemon(&hub, &swe, llm.base_url(), &shape);
-    let socket = hub.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf()).socket();
     wait_for_socket(&socket).await;
 
     // The observer is connected before anything is dispatched, so no terminal
