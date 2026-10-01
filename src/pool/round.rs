@@ -235,7 +235,10 @@ pub async fn build(
         };
         if exists && row.status == RegistryStatus::Completed {
             for file in &files {
-                by_file.entry(file.clone()).or_default().push(row.id.clone());
+                by_file
+                    .entry(file.clone())
+                    .or_default()
+                    .push(row.id.clone());
             }
             manifest.ready.push(worker);
         } else {
@@ -294,6 +297,5 @@ fn touched_files(repo: &Path, base: &str, branch: &str) -> Vec<String> {
 
 /// Run a git probe that answers with its exit status alone.
 fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    crate::worktree::git(repo, args[0], args)
-        .is_ok_and(|output| output.status.success())
+    crate::worktree::git(repo, args[0], args).is_ok_and(|output| output.status.success())
 }

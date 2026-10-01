@@ -490,7 +490,8 @@ impl McpServer {
         // The explicit gate wins; an absent one auto-detects, so a consolidator
         // never runs a cheaper subset than the project's own gate.
         let verify = match args.get("verify").and_then(|v| v.as_str()) {
-            Some(cmd) if cmd.is_empty() => None,
+            // An explicit empty string disables the gate, exactly as on dispatch.
+            Some("") => None,
             Some(cmd) => Some(cmd.to_string()),
             None => crate::pool::detect_verify_command(&repo_path),
         };
@@ -516,10 +517,7 @@ impl McpServer {
         let mut payload = payload;
         if let Some(object) = payload.as_object_mut() {
             object.insert("group".into(), Value::String(group));
-            object.insert(
-                "round".into(),
-                Value::String(manifest.render()),
-            );
+            object.insert("round".into(), Value::String(manifest.render()));
         }
         Ok(payload)
     }

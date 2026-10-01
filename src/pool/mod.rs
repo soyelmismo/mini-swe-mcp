@@ -63,7 +63,6 @@ pub use self::registry::{
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
     save_registry_entry, save_registry_entry_in,
 };
-pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
     WorkerHistory, append_history_message, append_history_message_in, ensure_base_branch,
@@ -72,6 +71,7 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
+pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
@@ -968,25 +968,19 @@ impl WorkerPool {
     ///
     /// `repo` is the repository the dispatch will run in, used when the rows
     /// name none.
-    pub async fn round_manifest(
-        &self,
-        owner: &str,
-        group: &str,
-        repo: &Path,
-    ) -> RoundManifest {
+    pub async fn round_manifest(&self, owner: &str, group: &str, repo: &Path) -> RoundManifest {
         let mut rows: Vec<RoundRow> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut repo_hint: Option<PathBuf> = None;
         let mut base_hint: Option<String> = None;
-        let mut entries: Vec<WorkerRegistryEntry> =
-            load_all_registry_entries_in(&self.scratch)
-                .into_iter()
-                .filter(|entry| {
-                    entry.owner.as_deref() == Some(owner)
-                        && entry.group.as_deref() == Some(group)
-                        && entry.role == WorkerRole::Worker
-                })
-                .collect();
+        let mut entries: Vec<WorkerRegistryEntry> = load_all_registry_entries_in(&self.scratch)
+            .into_iter()
+            .filter(|entry| {
+                entry.owner.as_deref() == Some(owner)
+                    && entry.group.as_deref() == Some(group)
+                    && entry.role == WorkerRole::Worker
+            })
+            .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
         for entry in entries {
             if !seen.insert(entry.id.clone()) {

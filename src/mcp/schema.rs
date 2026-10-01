@@ -15,8 +15,19 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
-    "manifest", "prune", "consolidate",
+    "dispatch",
+    "status",
+    "steer",
+    "watch",
+    "collect",
+    "review",
+    "logs",
+    "list",
+    "kill",
+    "reap",
+    "manifest",
+    "prune",
+    "consolidate",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -68,9 +79,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static(
-            "Action to perform; the enum lists every verb.",
-        ),
+        DescriptionSource::Static("Action to perform; the enum lists every verb."),
     ),
     (
         "task",

@@ -11,7 +11,8 @@ use serde_json::{Map, Value};
 pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
 
 /// Consolidate usage line, shared by `--help` and the missing-group error.
-pub const CONSOLIDATE_USAGE: &str = "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>]";
+pub const CONSOLIDATE_USAGE: &str =
+    "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>]";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
