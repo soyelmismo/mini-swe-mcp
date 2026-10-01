@@ -224,6 +224,112 @@ fn push_verified_line(out: &mut String, verified: Option<&serde_json::Value>) {
     }
 }
 
+/// Render the `review` action: the compact view of one worker's branch.
+///
+/// Everything the orchestrator needs to decide what to do next, in the order it
+/// decides it: what the task was, whether it verified, how big the change is
+/// per file, the summary and revision, whether the branch still merges into the
+/// base tip, and the command that acts on that answer.
+pub fn format_review(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let state = val
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    let revision = val.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut out = format!("Worker {wid} ({state}) revision {revision}\n");
+    if let Some(task) = val
+        .get("task")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
+        out.push_str(&format!("Task: {task}\n"));
+    }
+    push_verified_line(&mut out, val.get("verified"));
+    if let Some(tail) = val
+        .get("verify_tail")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
+        out.push_str(&format!("Verify tail:\n{tail}\n"));
+    }
+    out.push_str(&format!("Diff: {}\n", diff_stat_line(val)));
+    if let Some(summary) = val
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("Summary: {summary}\n"));
+    }
+    if let Some(branch) = val.get("branch").and_then(|v| v.as_str()) {
+        out.push_str(&format!("Branch: {branch}\n"));
+    }
+    if let Some(merge) = val.get("merge") {
+        out.push_str(&format!("Merge: {}\n", merge_line(merge)));
+    }
+    if let Some(next) = val
+        .get("next_command")
+        .and_then(|v| v.as_str())
+        .filter(|next| !next.is_empty())
+    {
+        out.push_str(&format!("Next: {next}\n"));
+    }
+    out
+}
+
+/// `3 files, +40 -12` from a `diff_stat` object, with each file's own counts
+/// indented under it.
+fn diff_stat_line(val: &serde_json::Value) -> String {
+    let Some(stat) = val.get("diff_stat") else {
+        return "no diff measured".to_string();
+    };
+    let count = |key: &str| stat.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let (files, insertions, deletions) = (count("files"), count("insertions"), count("deletions"));
+    let mut line = format!(
+        "{files} file{}, +{insertions} -{deletions}",
+        if files == 1 { "" } else { "s" }
+    );
+    if let Some(per_file) = stat.get("per_file").and_then(|v| v.as_array()) {
+        for file in per_file {
+            let path = file.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let added = file.get("insertions").and_then(|v| v.as_u64()).unwrap_or(0);
+            let deleted = file.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
+            line.push_str(&format!("\n  {path}  +{added} -{deleted}"));
+        }
+    }
+    line
+}
+
+/// The merge answer in one line: clean, conflicting (naming the files), or the
+/// reason no answer was possible.
+fn merge_line(merge: &serde_json::Value) -> String {
+    let base = merge
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("the base branch");
+    match merge.get("clean").and_then(|v| v.as_bool()) {
+        Some(true) => format!("clean into {base}"),
+        Some(false) => {
+            let conflicts = merge
+                .get("conflicts")
+                .and_then(|v| v.as_array())
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("conflicts with {base}: {conflicts}")
+        }
+        None => match merge.get("error").and_then(|v| v.as_str()) {
+            Some(error) => format!("unknown ({error})"),
+            None => "unknown".to_string(),
+        },
+    }
+}
+
 pub fn format_collect(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let diff = val
@@ -245,7 +351,12 @@ pub fn format_collect(val: &serde_json::Value) -> String {
         .map(|next| format!("\nNext step: {next}"))
         .unwrap_or_default();
     if diff.trim().is_empty() {
-        format!("Worker {wid}: No git diff produced.\n{counters}{health}{next}")
+        // No diff was asked for (or none was produced), so the per-file stat is
+        // what stands in for it.
+        format!(
+            "Worker {wid}: {}\n{counters}{health}{next}",
+            diff_stat_line(val)
+        )
     } else {
         format!("{diff}\n{counters}{health}{next}")
     }
@@ -494,8 +605,20 @@ mod tests {
         assert!(with_diff.starts_with("--- a\n+++ b\n"));
         assert!(with_diff.ends_with("total_steps: 2"));
 
+        // The default collect withholds the diff, so the per-file stat is what
+        // the view reports in its place.
+        let stat_only = format_collect(&v(
+            r#"{"worker_id":"w","diff_stat":{"files":2,"insertions":3,"deletions":1,
+                 "per_file":[{"path":"a.rs","insertions":3,"deletions":0},
+                             {"path":"b.rs","insertions":0,"deletions":1}]}}"#,
+        ));
+        assert_eq!(
+            stat_only,
+            "Worker w: 2 files, +3 -1\n  a.rs  +3 -0\n  b.rs  +0 -1\nno step logs"
+        );
+
         let without = format_collect(&v(r#"{"worker_id":"w","diff":"  "}"#));
-        assert_eq!(without, "Worker w: No git diff produced.\nno step logs");
+        assert_eq!(without, "Worker w: no diff measured\nno step logs");
     }
 
     #[test]

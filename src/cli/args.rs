@@ -54,9 +54,12 @@ pub fn tool_args(
                 }
             }
         }
-        "status" | "collect" | "logs" | "kill" => {
+        "status" | "collect" | "logs" | "kill" | "review" => {
             if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
+            }
+            if action == "collect" {
+                collect_diff_args(cli_args, &mut tool_args);
             }
         }
         "steer" => {
@@ -97,6 +100,29 @@ pub fn tool_args(
     }
 
     Ok(Some(tool_args))
+}
+
+/// Fold the `collect` diff selectors into the tool arguments.
+///
+/// `--full` asks for the whole diff and `--file <path>` (repeatable) narrows it
+/// to the named files: the same tool arguments the MCP path sends, so the diff
+/// scope has exactly one implementation.
+fn collect_diff_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
+    if cli_args.iter().any(|arg| arg == "--full") {
+        tool_args.insert("full".into(), Value::Bool(true));
+    }
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < cli_args.len() {
+        if cli_args[i] == "--file" && i + 1 < cli_args.len() {
+            files.push(Value::String(cli_args[i + 1].clone()));
+            i += 1;
+        }
+        i += 1;
+    }
+    if !files.is_empty() {
+        tool_args.insert("files".into(), Value::Array(files));
+    }
 }
 
 /// Fold the `dispatch` flags after the task into the tool arguments.
@@ -263,6 +289,7 @@ pub fn action_of(cli_args: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -332,6 +359,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.len(), 1);
+    }
+
+    /// `review <id>` is a read like `status`: one positional, no flags.
+    #[test]
+    fn test_review_maps_its_positional_worker_id() {
+        let out = tool_args("review", &args(&["mini-swe-mcp", "review", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["action"], "review");
+        assert_eq!(out["worker_id"], "w1");
+    }
+
+    /// `--full` and `--file` are the CLI spelling of the `collect` tool
+    /// arguments, so the diff scope has exactly one implementation.
+    #[test]
+    fn test_collect_flags_map_to_the_diff_scope_arguments() {
+        let plain = tool_args("collect", &args(&["mini-swe-mcp", "collect", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert!(!plain.contains_key("full"), "{plain:?}");
+        assert!(!plain.contains_key("files"), "{plain:?}");
+
+        let full = tool_args(
+            "collect",
+            &args(&["mini-swe-mcp", "collect", "w1", "--full"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(full["full"], true);
+
+        let files = tool_args(
+            "collect",
+            &args(&[
+                "mini-swe-mcp",
+                "collect",
+                "w1",
+                "--file",
+                "src/a.rs",
+                "--file",
+                "b.rs",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(files["files"], json!(["src/a.rs", "b.rs"]));
     }
 
     #[test]

@@ -8,16 +8,15 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
+use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, connect_endpoint};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::{CLI_CLIENT_NAME, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 static TAG: AtomicU64 = AtomicU64::new(0);
 
@@ -54,15 +53,19 @@ fn server() -> Arc<McpServer> {
     Arc::new(McpServer::new(pool, "test-model".to_string()))
 }
 
-/// Wait until `path` accepts a connection, or panic.
-async fn wait_for_socket(path: &Path) {
+/// Wait until `endpoint` accepts a connection, or panic.
+///
+/// The endpoint is derived the way the product derives it, so the wait holds
+/// whether the daemon bound a filesystem socket, moved it to a short private
+/// directory, or fell back to an abstract one.
+async fn wait_for_endpoint(endpoint: &HubEndpoint) {
     for _ in 0..100 {
-        if UnixStream::connect(path).await.is_ok() {
+        if connect_endpoint(endpoint).await.is_ok() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("hub socket {} never came up", path.display());
+    panic!("hub socket {endpoint} never came up");
 }
 
 /// A synthetic running worker owned by `owner`, as if that agent had
@@ -95,8 +98,8 @@ struct Client {
 }
 
 impl Client {
-    async fn connect(socket: &Path) -> Self {
-        let stream = UnixStream::connect(socket)
+    async fn connect(endpoint: &HubEndpoint) -> Self {
+        let stream = connect_endpoint(endpoint)
             .await
             .expect("connect to hub socket");
         let (reader, writer) = stream.into_split();
@@ -190,7 +193,7 @@ impl Client {
 
 /// A daemon on a scratch directory, stopped and removed when it drops.
 struct Daemon {
-    socket: PathBuf,
+    endpoint: HubEndpoint,
     server: Arc<McpServer>,
     task: tokio::task::JoinHandle<()>,
     dir: PathBuf,
@@ -199,7 +202,10 @@ struct Daemon {
 impl Daemon {
     async fn start() -> Self {
         let dir = scratch_dir();
-        let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
+        // Where the daemon will listen, derived exactly as the product derives
+        // it: a filesystem socket when one fits, otherwise the short private
+        // directory or the abstract socket it falls back to.
+        let endpoint = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).endpoint();
         let server = server();
         let daemon = HubServer::new(
             server.clone(),
@@ -208,9 +214,9 @@ impl Daemon {
         let task = tokio::spawn(async move {
             let _ = daemon.run().await;
         });
-        wait_for_socket(&socket).await;
+        wait_for_endpoint(&endpoint).await;
         Self {
-            socket,
+            endpoint,
             server,
             task,
             dir,
@@ -301,10 +307,10 @@ async fn an_mcp_connection_and_a_cli_call_of_one_host_share_workers() {
         .await;
 
     // The agent's MCP connection: it dispatched the worker.
-    let mut connection = Client::connect(&daemon.socket).await;
+    let mut connection = Client::connect(&daemon.endpoint).await;
     connection.handshake("claude-code", None, Some(host)).await;
     // The agent's shell: the same host, announced by the CLI's own hello.
-    let mut shell = Client::connect(&daemon.socket).await;
+    let mut shell = Client::connect(&daemon.endpoint).await;
     shell.handshake(CLI_CLIENT_NAME, None, Some(host)).await;
 
     for caller in [&mut connection, &mut shell] {
@@ -349,10 +355,10 @@ async fn two_host_identities_cannot_see_each_others_workers() {
     pool.__test_insert_worker(owned_worker("theirs-1", "host:opencode:5253:9182735"))
         .await;
 
-    let mut mine = Client::connect(&daemon.socket).await;
+    let mut mine = Client::connect(&daemon.endpoint).await;
     mine.handshake("claude-code", None, Some("host:claude:4242:9182734"))
         .await;
-    let mut theirs = Client::connect(&daemon.socket).await;
+    let mut theirs = Client::connect(&daemon.endpoint).await;
     theirs
         .handshake("claude-code", None, Some("host:opencode:5253:9182735"))
         .await;
@@ -393,11 +399,11 @@ async fn an_explicit_agent_id_outranks_the_host_identity() {
     pool.__test_insert_worker(owned_worker("pinned-1", "orchestrator-7"))
         .await;
 
-    let mut pinned = Client::connect(&daemon.socket).await;
+    let mut pinned = Client::connect(&daemon.endpoint).await;
     pinned
         .handshake("claude-code", Some("orchestrator-7"), Some(host))
         .await;
-    let mut host_named = Client::connect(&daemon.socket).await;
+    let mut host_named = Client::connect(&daemon.endpoint).await;
     host_named.handshake("claude-code", None, Some(host)).await;
 
     pinned

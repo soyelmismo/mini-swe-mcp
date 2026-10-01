@@ -15,8 +15,8 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "logs", "list", "kill", "reap", "manifest",
-    "prune",
+    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
+    "manifest", "prune",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -47,7 +47,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, identity, sandbox, env.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, identity, sandbox, env.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -69,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
+            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
         ),
     ),
     (
@@ -108,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted; the response always names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -127,19 +127,19 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own (running or paused).",
+            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only watch workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
     ),
     (
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely. Prefer running `mini-swe-mcp watch` in the background.",
+            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely.",
         ),
     ),
     (
@@ -158,28 +158,38 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation, with a fresh context.",
+            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) is the calling agent's workers, 'all' is every agent's and needs the admin override.",
+            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
         ),
+    ),
+    (
+        "full",
+        "boolean",
+        DescriptionSource::Static("The whole diff. Optional for 'collect'."),
+    ),
+    (
+        "files",
+        "array",
+        DescriptionSource::Static("Paths whose diff to return. Optional for 'collect'."),
     ),
     (
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' runs every bash step in an isolated network namespace with no egress, 'allow' (default) keeps connectivity.",
+            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
         ),
     ),
 ];
@@ -243,7 +253,7 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "timeout_secs" {
         schema.insert("minimum".to_string(), Value::from(0));
     }
-    if name == "worker_ids" {
+    if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
     if name == "tasks" {
