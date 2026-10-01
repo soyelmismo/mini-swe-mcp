@@ -1318,7 +1318,7 @@ impl McpServer {
             "skipped": report
                 .skipped
                 .iter()
-                .map(|s| json!({"worker_id": s.worker_id, "files": s.files}))
+                .map(|s| json!({"worker_id": s.worker_id, "files": s.files, "steer": s.steer}))
                 .collect::<Vec<_>>(),
             "gate_command": report.gate_command,
             "gate_duration_ms": report.gate_duration_ms,

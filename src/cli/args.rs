@@ -358,6 +358,43 @@ mod tests {
         assert!(!mine.contains_key("scope"), "{mine:?}");
     }
 
+    /// `merge --approved [--group <g>]` is the batch form: no worker id, the
+    /// whole round's approved workers instead.
+    #[test]
+    fn test_merge_approved_flag_maps_to_the_batch_arguments() {
+        let batch = tool_args(
+            "merge",
+            &args(&["mini-swe-mcp", "merge", "--approved", "--group", "round-1"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(batch["action"], "merge");
+        assert_eq!(batch["approved"], true);
+        assert_eq!(batch["group"], "round-1");
+        assert!(
+            !batch.contains_key("worker_id"),
+            "a batch names no single worker: {batch:?}"
+        );
+
+        let every_group = tool_args(
+            "merge",
+            &args(&["mini-swe-mcp", "merge", "--approved"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(every_group["approved"], true);
+        assert!(!every_group.contains_key("group"), "{every_group:?}");
+
+        // The single-worker form is unchanged.
+        let one = tool_args("merge", &args(&["mini-swe-mcp", "merge", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(one["worker_id"], "w1");
+        assert!(!one.contains_key("approved"), "{one:?}");
+    }
+
     #[test]
     fn test_tool_args_maps_positional_arguments_for_simple_verbs() {
         let a = args(&["mini-swe-mcp", "status", "w1"]);

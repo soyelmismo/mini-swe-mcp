@@ -738,6 +738,8 @@ pub struct SkippedWorker {
     pub worker_id: String,
     /// The files that conflict, in the order git reported them.
     pub files: Vec<String>,
+    /// The steer that sends those conflicts back to the worker that owns them.
+    pub steer: String,
 }
 
 /// What a batch merge did, in the words the CLI prints.
@@ -856,10 +858,14 @@ pub fn merge_approved_in(
             // branch forked from the base as the merge base: the same three-way
             // merge a sequential `git merge` would compute.
             Some(tree) => {
-                let forked = merge_base_of(repo, &base_branch, branch)
-                    .or_else(|| base_tree.clone())
-                    .unwrap_or_else(|| tree.clone());
-                merge_tree_with(repo, &["--merge-base", &forked], tree, branch)?
+                // The point the branch forked from the base is the merge base;
+                // with no common history at all git decides on its own.
+                match merge_base_of(repo, &base_branch, branch).or_else(|| base_tree.clone()) {
+                    Some(forked) => {
+                        merge_tree_with(repo, &["--merge-base", &forked], tree, branch)?
+                    }
+                    None => merge_tree_with(repo, &[], tree, branch)?,
+                }
             }
         };
         match trial {
@@ -869,12 +875,13 @@ pub fn merge_approved_in(
             }
             MergeTree::Conflicts(files) => skipped.push(SkippedWorker {
                 worker_id: worker.0.clone(),
+                steer: steer_hint(&worker.0, &files),
                 files,
             }),
         }
     }
     if included.is_empty() {
-        let hints: Vec<String> = skipped.iter().map(steer_hint).collect();
+        let hints: Vec<String> = skipped.iter().map(|s| s.steer.clone()).collect();
         anyhow::bail!(
             "no approved worker's branch composes into {}: {}",
             base_branch,
@@ -893,12 +900,14 @@ pub fn merge_approved_in(
     // The gate replays the dispatcher's filtered environment; a round's workers
     // share it, so the first included worker's copy is the batch's.
     let client_env = included[0].1.client_env.clone();
+    // `included` is not empty here, so the composition produced a tree.
+    let composed = composed.as_deref().unwrap_or_default();
     let started = std::time::Instant::now();
     let (code, text) = run_gate_result(
         root,
         "approved",
         repo,
-        composed.as_deref().unwrap_or_default(),
+        composed,
         &gate_command,
         &gate_req,
         &client_env,
@@ -1045,13 +1054,10 @@ fn shared_gate_command(repo: &Path, included: &[&(String, Resolved)]) -> Result<
 }
 
 /// The steer that sends a skipped worker's conflicts back to it.
-fn steer_hint(skipped: &SkippedWorker) -> String {
+fn steer_hint(worker_id: &str, files: &[String]) -> String {
     format!(
-        "{} skipped (conflicts in {}); steer {} \"merge conflicts in {}\"",
-        skipped.worker_id,
-        skipped.files.join(", "),
-        skipped.worker_id,
-        skipped.files.join(", ")
+        "steer {worker_id} \"merge conflicts in {}\"",
+        files.join(", ")
     )
 }
 

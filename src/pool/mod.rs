@@ -56,8 +56,8 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
-    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole,
-    check_consolidate_delegation, extract_group, load_all_registry_entries,
+    RegistryStatus, UNATTRIBUTED_OWNER, WorkerApproval, WorkerMeta, WorkerRegistryEntry,
+    WorkerRole, check_consolidate_delegation, extract_group, load_all_registry_entries,
     load_all_registry_entries_in, load_registry_entries_read_only,
     load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in, registry_dir,
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,

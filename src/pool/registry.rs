@@ -84,7 +84,9 @@ pub enum WorkerRole {
 /// A recorded approval, shared with the approve action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerApproval {
+    /// Unix seconds the approval was recorded at; the batch merges in this order.
     pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 

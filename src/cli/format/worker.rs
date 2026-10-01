@@ -632,7 +632,12 @@ fn format_merge_approved(val: &serde_json::Value) -> String {
                     Some(if files.is_empty() {
                         id.to_string()
                     } else {
-                        format!("{id} (conflicts in {files})")
+                        let steer = s.get("steer").and_then(|v| v.as_str()).unwrap_or_default();
+                        if steer.is_empty() {
+                            format!("{id} (conflicts in {files})")
+                        } else {
+                            format!("{id} (conflicts in {files}; {steer})")
+                        }
                     })
                 })
                 .collect()
@@ -690,6 +695,25 @@ mod tests {
 
     fn v(s: &str) -> serde_json::Value {
         serde_json::from_str(s).expect("fixture must be valid JSON")
+    }
+
+    /// `merge --approved` renders the merged ids, the skipped ones with their
+    /// steer, the one gate and its duration.
+    #[test]
+    fn test_format_merge_renders_a_batch() {
+        let out = format_merge(&v(
+            r#"{"approved":true,"base_branch":"main","merged":[{"worker_id":"w1","commit":"abc1234"},{"worker_id":"w3","commit":"def5678"}],"skipped":[{"worker_id":"w2","files":["shared.txt"],"steer":"steer w2 \"merge conflicts in shared.txt\""}],"gate_command":"cargo test","gate_duration_ms":420,"cleaned":["branch worker-w1 deleted"]}"#,
+        ));
+        assert!(
+            out.contains("Merged w1 as abc1234, w3 as def5678 into main"),
+            "{out}"
+        );
+        assert!(out.contains("gate cargo test passed in 420ms"), "{out}");
+        assert!(
+            out.contains("Skipped: w2 (conflicts in shared.txt; steer w2"),
+            "{out}"
+        );
+        assert!(out.contains("Cleaned: branch worker-w1 deleted"), "{out}");
     }
 
     /// A batch dispatch renders one line per entry, including the entries that
