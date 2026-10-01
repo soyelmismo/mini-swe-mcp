@@ -602,10 +602,14 @@ impl AckStore {
                 .positions
                 .iter()
                 .map(|(owner, workers)| {
-                    let oldest = workers.values().map(|e| e.recency).min().unwrap_or(0);
-                    (owner.clone(), oldest)
+                    // The owner's latest acknowledgment, not its
+                    // oldest single entry: an owner that keeps
+                    // acknowledging new workers is recent even if
+                    // it also holds a very old position.
+                    let latest = workers.values().map(|e| e.recency).max().unwrap_or(0);
+                    (owner.clone(), latest)
                 })
-                .min_by_key(|(owner, oldest)| (*oldest, owner.clone()))
+                .min_by_key(|(owner, latest)| (*latest, owner.clone()))
                 .map(|(owner, _)| owner)
             else {
                 break;
@@ -1240,7 +1244,7 @@ struct WatchHistory {
 /// process failed to run, the path is not a repository (exit `128`), or the
 /// base ref cannot be resolved -- is *not* suppression: a terminal event that
 /// could not be verified stays visible, never silently dropped.
-pub fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
+fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
     /// `git` exit code for "the ref is not there", the one outcome that
     /// proves absence. Every other code means the probe itself failed.
     const REF_NOT_FOUND: i32 = 1;
@@ -1285,6 +1289,52 @@ pub fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
         ),
         Ok(output) if output.status.success()
     )
+}
+
+#[cfg(test)]
+mod branch_replay_suppression_tests {
+    use super::*;
+
+    /// Removes a temporary directory when it goes out of scope, so
+    /// a failing assertion still cleans up the scratch it created.
+    struct CleanupDir<'a>(&'a Path);
+
+    impl Drop for CleanupDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+
+    /// A terminal worker whose repository cannot be probed is never
+    /// suppressed: the suppression contract requires *proof* that the
+    /// branch is gone or merged, so a failed probe (here `128`, not a
+    /// repository) leaves the event visible. This is the regression
+    /// guard against treating any git failure as "branch gone".
+    #[test]
+    fn completed_worker_with_unprobeable_repo_is_not_suppressed() {
+        // A completed worker whose `repo_path` is a directory that is
+        // deterministically not a repository: an invalid `.git` file
+        // makes every git probe exit `128` regardless of any parent
+        // repository a `TMPDIR` inside the worktree might otherwise
+        // discover. The collision-free name is cleaned up even when
+        // an assertion fails.
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-events-unprobeable-{}-{}",
+            std::process::id(),
+            crate::pool::unix_timestamp()
+        ));
+        let _cleanup = CleanupDir(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        std::fs::write(dir.join(".git"), "not a gitdir\n").expect("write invalid .git marker");
+        let mut row = crate::pool::WorkerRegistryEntry::test_row("w-unprobe", "owner");
+        row.status = RegistryStatus::Completed;
+        row.repo_path = Some(dir.to_string_lossy().into_owned());
+        row.base_branch = Some("main".into());
+        assert!(
+            !branch_replay_suppressed(&row),
+            "an unprobeable repository must not suppress the event"
+        );
+    }
 }
 
 /// Read bounded watch facts in the daemon, without collecting the worker.
@@ -1784,27 +1834,36 @@ mod watch_stall_regression_tests {
     /// went quiet is dropped.
     #[test]
     fn ack_store_evicts_least_recently_acknowledged_owner() {
-        // `quiet` acknowledges two workers and then goes silent;
-        // `chatty` keeps acknowledging afterwards, so `quiet`'s
-        // *latest* stamp is the oldest even though it was created
-        // first. The filler owners fill the store to the bound so
-        // the eviction is actually exercised.
+        // `chatty`'s OLDEST worker (w-a) is acknowledged first,
+        // then `quiet` acknowledges its two workers, then the
+        // store is filled to the bound with filler owners, and
+        // finally `chatty` acknowledges a FRESH worker (w-b).
+        // Under the owner's *latest* acknowledgment `chatty` is
+        // the most recent (w-b) and `quiet` is the least recent,
+        // so the one eviction the final record triggers drops
+        // `quiet`. Ranking each owner by its *oldest* single
+        // entry would instead see `chatty`'s w-a and wrongly
+        // evict `chatty` -- which is exactly what this ordering
+        // distinguishes.
         let mut store = AckStore::default();
+        store.record("chatty", "w-a", 1, "completed");
         store.record("quiet", "w-a", 1, "completed");
         store.record("quiet", "w-b", 1, "completed");
-        for i in 0..(MAX_ACK_OWNERS - 1) {
+        for i in 0..(MAX_ACK_OWNERS - 2) {
             store.record(&format!("filler-{i:05}"), "w", 1, "completed");
         }
-        store.record("chatty", "w-a", 1, "completed");
+        // At the bound: chatty, quiet and the fillers all present.
+        assert_eq!(store.positions.len(), MAX_ACK_OWNERS);
+        // The fresh w-b makes chatty the most recently
+        // acknowledged owner and pushes the store one past the
+        // bound, so exactly the least recent owner is evicted.
         store.record("chatty", "w-b", 1, "completed");
+        eprintln!("after final: len={}, quiet={}, chatty={}", store.positions.len(), store.positions.contains_key("quiet"), store.positions.contains_key("chatty"));
         assert_eq!(
             store.positions.len(),
             MAX_ACK_OWNERS,
             "the owner store must stay bounded"
         );
-        // `quiet`'s latest acknowledgment is the oldest, so it is
-        // evicted; `chatty`, whose newest stamp is the most recent,
-        // survives together with the rest of its workers.
         assert!(!store.positions.contains_key("quiet"));
         assert!(store.positions.contains_key("chatty"));
         assert!(store.acknowledged("chatty", "w-a", 1, "completed"));

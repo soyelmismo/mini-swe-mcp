@@ -6,7 +6,7 @@ mod common;
 
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
-use mini_swe_mcp::mcp::{McpServer, branch_replay_suppressed};
+use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerMetrics, WorkerPool, WorkerRecord, WorkerRegistryEntry,
     WorkerState, save_registry_entry_in,
@@ -18,16 +18,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-
-/// Removes a temporary directory when it goes out of scope, so a
-/// failing assertion still cleans up the scratch it created.
-struct CleanupDir<'a>(&'a Path);
-
-impl Drop for CleanupDir<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.0);
-    }
-}
 
 fn paths(dir: &Path) -> HubPaths {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
@@ -321,38 +311,4 @@ async fn merged_or_gone_worker_event_is_not_replayed() {
     );
     task.abort();
     let _ = task.await;
-}
-
-/// A terminal worker whose repository cannot be probed is never
-/// suppressed: the suppression contract requires *proof* that the
-/// branch is gone or merged, so a failed probe (here `128`, not a
-/// repository) leaves the event visible. This is the regression
-/// guard against treating any git failure as "branch gone".
-#[test]
-fn completed_worker_with_unprobeable_repo_is_not_suppressed() {
-    // A completed worker whose `repo_path` is a directory that is
-    // deterministically not a repository: an invalid `.git` file
-    // makes every git probe exit `128` regardless of any parent
-    // repository a `TMPDIR` inside the worktree might otherwise
-    // discover. The collision-free name is cleaned up even when an
-    // assertion fails.
-    let dir = std::env::temp_dir().join(format!(
-        "mcp-events-unprobeable-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let _cleanup = CleanupDir(&dir);
-    std::fs::create_dir_all(&dir).expect("create probe dir");
-    std::fs::write(dir.join(".git"), "not a gitdir\n").expect("write invalid .git marker");
-    let mut row = WorkerRegistryEntry::test_row("w-unprobe", "owner");
-    row.status = RegistryStatus::Completed;
-    row.repo_path = Some(dir.to_string_lossy().into_owned());
-    row.base_branch = Some("main".into());
-    assert!(
-        !branch_replay_suppressed(&row),
-        "an unprobeable repository must not suppress the event"
-    );
 }
