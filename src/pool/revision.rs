@@ -502,8 +502,8 @@ pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u6
 /// branch survives is kept unless its retention expired, so a finished worker
 /// stays continuable for as long as its branch does. One whose branch is gone
 /// is kept through its retired grace period (see
-/// [`DEFAULT_WORKER_RETIRED_GRACE_SECS`]) so an orchestrator that reverts the
-/// merge can still continue it.
+/// [`super::state::DEFAULT_WORKER_RETIRED_GRACE_SECS`]) so an orchestrator that
+/// reverts the merge can still continue it.
 pub fn prune_orphan_histories(repo_root: &Path) -> usize {
     prune_orphan_histories_in(&ScratchRoot::from_env(), repo_root)
 }
