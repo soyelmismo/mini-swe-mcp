@@ -128,6 +128,10 @@ pub struct ConsolidateMerge {
     /// Whether any branch was merged, so the caller preserves the
     /// consolidator's branch instead of letting the guard delete it.
     pub integrated: bool,
+    /// The workers whose branches actually landed, in merge order. Recorded on
+    /// the consolidator's row (see [`WorkerRegistryEntry::integrated`]) so that
+    /// retiring the consolidator retires the round it absorbed.
+    pub integrated_ids: Vec<String>,
 }
 
 /// Whether `id`'s registry row is live in a process other than this one.
@@ -582,6 +586,21 @@ impl WorkerPool {
             );
         }
         retired
+    }
+
+    /// Retire every already-integrated worker and delete the orphan leftovers
+    /// no row and no branch can claim again.
+    ///
+    /// The backstop behind the immediate retirements: it runs at daemon start
+    /// and after every merge, so a worker merged by any other path (another
+    /// session, a previous run, a consolidator this process never dispatched)
+    /// still leaves nothing behind. Cheap and bounded by the number of terminal
+    /// rows plus one directory read per scratch base.
+    pub async fn sweep_retired_workers(&self) -> RetireSweep {
+        let root = self.scratch.clone();
+        tokio::task::spawn_blocking(move || revision::sweep_retired_workers_in(&root, None))
+            .await
+            .unwrap_or_default()
     }
 
     /// Drop the worktree paths of workers whose records are gone.
@@ -1261,6 +1280,7 @@ impl WorkerPool {
     ) -> ConsolidateMerge {
         let mut lines = Vec::new();
         let mut integrated = false;
+        let mut integrated_ids: Vec<String> = Vec::new();
         let mut conflicted = false;
         for id in ids {
             if conflicted {
@@ -1290,13 +1310,21 @@ impl WorkerPool {
             let repo_root = worktree.repo_root.clone();
             let branch = worktree.branch.clone();
             let base_commit = worktree.base_commit.clone();
+            let for_merge = target.clone();
             let merged = tokio::task::spawn_blocking(move || {
-                WorktreeGuard::merge_branch_at(&path, &repo_root, &branch, &base_commit, &target)
+                WorktreeGuard::merge_branch_at(
+                    &path,
+                    &repo_root,
+                    &branch,
+                    &base_commit,
+                    &for_merge,
+                )
             })
             .await;
             match merged {
                 Ok(Ok(BranchMerge::Merged { files })) => {
                     integrated = true;
+                    integrated_ids.push(target.clone());
                     lines.push(format!("{id} merged ({files} files)"));
                 }
                 Ok(Ok(BranchMerge::Conflicts { files })) => {
@@ -1310,10 +1338,43 @@ impl WorkerPool {
                 Err(e) => lines.push(format!("{id} refused: {e}")),
             }
         }
+        if !integrated_ids.is_empty() {
+            self.record_consolidator_round(actor, &integrated_ids).await;
+        }
         ConsolidateMerge {
             observation: lines.join("\n"),
             integrated,
+            integrated_ids,
         }
+    }
+
+    /// Record the round a consolidator integrated on its own registry row.
+    ///
+    /// The list is the only durable record of which branches the consolidator
+    /// absorbed, and it is what makes the whole round retirable at the moment
+    /// the consolidator itself lands. Appended to whatever the row already
+    /// carried, so a consolidator that integrates in several `CONSOLIDATE_MERGE`
+    /// calls still retires every worker it touched.
+    async fn record_consolidator_round(&self, actor: &WorkerMeta, ids: &[String]) {
+        let root = self.scratch.clone();
+        let consolidator = actor.id.clone();
+        let ids = ids.to_vec();
+        // Off the runtime: a read-modify-write of one JSON row, the same shape
+        // as the approval write above. A consolidator whose row is already gone
+        // has nothing to record, and the sweep proves the round anyway.
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut row) = load_registry_entry_in(&root, &consolidator) else {
+                return;
+            };
+            for id in &ids {
+                if !row.integrated.contains(id) {
+                    row.integrated.push(id.clone());
+                }
+            }
+            row.updated_at = unix_timestamp();
+            save_registry_entry_in(&root, &row);
+        })
+        .await;
     }
 
     /// Route a failure or a conflict back to the worker that owns it.

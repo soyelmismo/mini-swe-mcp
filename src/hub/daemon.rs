@@ -449,6 +449,37 @@ impl HubServer {
         // automatically: it stopped because the hub did, not because it could
         // not go on. Capped per worker so a worker the hub keeps losing is left
         // to the orchestrator instead of being restarted forever.
+        // Every already-integrated worker leaves nothing behind: its branch is
+        // in the base branch, so branch, row, history, mailbox, steer-source and
+        // watch acknowledgements go now. Runs before the resumed workers are
+        // listed, so a worker that is still awaiting integration stays visible
+        // while an integrated one is gone.
+        let root = self.server.pool().scratch_root().clone();
+        let ack_dir = self.config.paths().dir().to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir))
+        })
+        .await
+        {
+            Ok(sweep) if !sweep.workers.is_empty() || sweep.orphans > 0 => {
+                info!(
+                    workers = sweep.workers.len(),
+                    orphans = sweep.orphans,
+                    "Retired integrated workers and orphan leftovers"
+                );
+                append_log(
+                    &self.config.paths().log(),
+                    &format!(
+                        "retired {} integrated worker(s) and {} orphan file(s)",
+                        sweep.workers.len(),
+                        sweep.orphans
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => error!(error = %e, "Retirement sweep failed"),
+        }
+
         let resumed = self.auto_resume_interrupted().await;
         if resumed > 0 {
             info!(workers = resumed, "Auto-continued interrupted workers");

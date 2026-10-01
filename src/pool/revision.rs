@@ -540,6 +540,11 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     }
 }
 
+/// [`sweep_retired_workers_in`] under the default scratch root.
+pub fn sweep_retired_workers() -> RetireSweep {
+    sweep_retired_workers_in(&ScratchRoot::from_env(), None)
+}
+
 /// What one retirement sweep reclaimed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetireSweep {
@@ -1327,6 +1332,7 @@ impl super::WorkerPool {
             // applies: drop any approval this row carried.
             approved: None,
             verified: None,
+            integrated: Vec::new(),
         };
 
         let pool = self.clone();

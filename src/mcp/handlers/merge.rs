@@ -46,6 +46,9 @@ impl McpServer {
         })
         .await
         .map_err(|e| anyhow::anyhow!("merge task for worker {wid} failed: {e}"))??;
+        // The backstop sweep, so a worker integrated by any other path (an older
+        // merge, another session, a consolidator) is retired too.
+        self.pool.sweep_retired_workers().await;
         Ok(json!({
             "worker_id": report.worker_id,
             "branch": report.branch,
@@ -96,6 +99,7 @@ impl McpServer {
         })
         .await
         .map_err(|e| anyhow::anyhow!("batch merge task failed: {e}"))??;
+        self.pool.sweep_retired_workers().await;
         Ok(json!({
             "approved": true,
             "group": group_echo,

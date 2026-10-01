@@ -167,6 +167,17 @@ pub struct WorkerRegistryEntry {
     /// written before the flag was recorded readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// Workers whose branches a consolidator merged into its own branch, in
+    /// merge order. Recorded on the consolidator's row because that row is the
+    /// only durable record of the round it integrated: when the consolidator
+    /// itself is merged, every worker it absorbed is fully integrated too and
+    /// is retired with it.
+    ///
+    /// `#[serde(default)]` keeps a row written before consolidators recorded
+    /// their round readable; such a consolidator falls back to the sweep, which
+    /// proves each worker's branch is merged by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrated: Vec<String>,
 }
 
 impl WorkerRegistryEntry {
@@ -204,6 +215,7 @@ impl WorkerRegistryEntry {
             report: None,
             approved: None,
             verified: None,
+            integrated: Vec::new(),
         }
     }
 }
@@ -306,6 +318,7 @@ impl WorkerMeta {
             report: self.report.clone(),
             approved: None,
             verified: self.verified,
+            integrated: Vec::new(),
         }
     }
 

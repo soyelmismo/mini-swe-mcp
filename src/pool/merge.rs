@@ -710,22 +710,38 @@ fn cleanup(
 ) -> (bool, Vec<String>) {
     let worktree = root.join(format!("swe-wt-{worker_id}"));
     let reclaimed = worktree.exists();
+    // A consolidator carries the round it integrated on its own row, and that
+    // round is now fully in the base branch too. Read the list before the row
+    // goes, so each worker it absorbed is retired with it.
+    let integrated = load_registry_entry_in(root, worker_id)
+        .map(|row| row.integrated)
+        .unwrap_or_default();
     let branch_deleted = !keep_branch
         && git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
-    retire_worker_with(
-        root,
-        worker_id,
-        &RetireContext {
-            repo: Some(repo),
-            ack_dir: None,
-        },
-    );
+    let ctx = RetireContext {
+        repo: Some(repo),
+        ack_dir: None,
+    };
+    // Only when the branch really went: with `--no-delete` the worker stays a
+    // known, steerable worker, so its round stays a known round.
+    if branch_deleted && !integrated.is_empty() {
+        for id in &integrated {
+            retire_worker_with(root, id, &ctx);
+        }
+    }
+    retire_worker_with(root, worker_id, &ctx);
 
     let mut cleaned = Vec::new();
     if branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
     } else if keep_branch {
         cleaned.push(format!("branch {branch} kept (--no-delete)"));
+    }
+    if branch_deleted && !integrated.is_empty() {
+        cleaned.push(format!(
+            "{} integrated worker(s) retired with the round",
+            integrated.len()
+        ));
     }
     cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());
     if reclaimed {
