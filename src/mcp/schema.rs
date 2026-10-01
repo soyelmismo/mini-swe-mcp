@@ -77,6 +77,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         ),
     ),
     (
+        "tasks",
+        "array",
+        DescriptionSource::Static(
+            "Batch dispatch: a list of task objects dispatched together, one worker each. Each entry is {task, model?, repo_path?, max_turns?, verify?, group?, network?}; any dispatch property given at the top level is the default for every entry. A bad entry reports only its own error, so the rest still start. Use instead of 'task' for parallel work; optional for 'dispatch'.",
+        ),
+    ),
+    (
         "repo_path",
         "string",
         DescriptionSource::Static(
@@ -236,6 +243,28 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "worker_ids" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
+    if name == "tasks" {
+        schema.insert(
+            "items".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "model": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "max_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::manifest::MAX_TURNS_LIMIT,
+                    },
+                    "verify": { "type": "string" },
+                    "group": { "type": "string" },
+                    "network": { "type": "string", "enum": NETWORK_MODES },
+                },
+                "required": ["task"],
+            }),
+        );
+    }
     if name == "temperature" {
         schema.insert(
             "minimum".to_string(),
@@ -390,6 +419,34 @@ mod tests {
                 .any(|entry| entry == "network"),
             "network must stay optional so existing callers are unaffected"
         );
+    }
+
+    /// Batch dispatch is advertised: `tasks` is an array of task objects, each
+    /// requiring `task`, and it stays optional like every other dispatch
+    /// property.
+    #[test]
+    fn tasks_property_advertises_the_batch_contract() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let tasks = &schema["properties"]["tasks"];
+
+        assert_eq!(tasks["type"], json!("array"));
+        assert_eq!(tasks["items"]["type"], json!("object"));
+        assert_eq!(tasks["items"]["required"], json!(["task"]));
+        for key in [
+            "task",
+            "model",
+            "repo_path",
+            "max_turns",
+            "verify",
+            "group",
+            "network",
+        ] {
+            assert!(
+                tasks["items"]["properties"].get(key).is_some(),
+                "the items schema must document '{key}': {tasks}"
+            );
+        }
     }
 
     /// The tool description teaches the transport-neutral wait: the `watch`
