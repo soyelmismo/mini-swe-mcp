@@ -98,7 +98,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted; the response always names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -117,7 +117,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch. Optional for 'watch': omitted watches every one of your own running or paused workers.",
+            "Worker IDs to watch, each accepting the same prefixes and 'last' as 'worker_id'. Optional for 'watch': omitted watches every one of your own running or paused workers.",
         ),
     ),
     (
