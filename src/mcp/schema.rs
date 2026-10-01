@@ -69,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform. 'dispatch': spawn a subagent. 'status': check step and progress. 'steer': correct a completed worker or continue any stopped one (failed, interrupted, killed) on its own branch with full context; never dispatch a replacement. 'watch': block for an event (for shell-less agents; prefer `mini-swe-mcp watch` in the background). 'collect': final diff. 'logs': a live worker's step history. 'list': your workers. 'kill': terminate a worker. 'reap': evict expired terminal records. 'manifest': models catalog. 'prune': clean stale worktrees. Run `mini-swe-mcp help <topic>` for the details.",
+            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
         ),
     ),
     (
@@ -77,6 +77,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
+        ),
+    ),
+    (
+        "tasks",
+        "array",
+        DescriptionSource::Static(
+            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
@@ -113,7 +120,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker (failed, interrupted, killed): never dispatch a replacement.",
         ),
     ),
     (
@@ -238,6 +245,24 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     }
     if name == "worker_ids" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
+    }
+    if name == "tasks" {
+        schema.insert(
+            "items".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "model": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "max_turns": { "type": "integer" },
+                    "verify": { "type": "string" },
+                    "group": { "type": "string" },
+                    "network": { "type": "string" },
+                },
+                "required": ["task"],
+            }),
+        );
     }
     if name == "temperature" {
         schema.insert(
@@ -400,6 +425,34 @@ mod tests {
         );
     }
 
+    /// Batch dispatch is advertised: `tasks` is an array of task objects, each
+    /// requiring `task`, and it stays optional like every other dispatch
+    /// property.
+    #[test]
+    fn tasks_property_advertises_the_batch_contract() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let tasks = &schema["properties"]["tasks"];
+
+        assert_eq!(tasks["type"], json!("array"));
+        assert_eq!(tasks["items"]["type"], json!("object"));
+        assert_eq!(tasks["items"]["required"], json!(["task"]));
+        for key in [
+            "task",
+            "model",
+            "repo_path",
+            "max_turns",
+            "verify",
+            "group",
+            "network",
+        ] {
+            assert!(
+                tasks["items"]["properties"].get(key).is_some(),
+                "the items schema must document '{key}': {tasks}"
+            );
+        }
+    }
+
     /// The tool description stays a calling contract: the waiting rule, the
     /// ownership rule, and a one-line pointer to the long-form topics.
     #[test]
@@ -455,5 +508,6 @@ mod tests {
 
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
+        assert!(text.contains("never dispatch a replacement"), "{text}");
     }
 }

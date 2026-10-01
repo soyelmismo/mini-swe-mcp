@@ -298,6 +298,9 @@ fn is_awaited_result(val: &serde_json::Value) -> bool {
 }
 
 pub fn format_dispatch(val: &serde_json::Value) -> String {
+    if let Some(workers) = val.get("workers").and_then(|v| v.as_array()) {
+        return format_batch_dispatch(val, workers);
+    }
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     if val.get("status").and_then(|v| v.as_str()) == Some("dispatched") {
         let mut out = format!(
@@ -401,6 +404,26 @@ pub fn format_steer(val: &serde_json::Value) -> String {
     format!("✓ Worker {wid}: {msg}{}", watch_command_line(val))
 }
 
+/// `dispatch` with `tasks`: one line per entry, including the error an entry
+/// that never started reported, so a batch never hides a partial failure.
+fn format_batch_dispatch(val: &serde_json::Value, workers: &[serde_json::Value]) -> String {
+    let dispatched = val.get("dispatched").and_then(|v| v.as_u64()).unwrap_or(0);
+    let failed = val.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut out = format!("✓ Batch dispatch: {dispatched} started, {failed} failed.");
+    for worker in workers {
+        let index = worker.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+        if let Some(wid) = worker.get("worker_id").and_then(|v| v.as_str()) {
+            out.push_str(&format!(
+                "\n  - Task {index}: worker {wid} dispatched in background."
+            ));
+        } else if let Some(error) = worker.get("error").and_then(|v| v.as_str()) {
+            out.push_str(&format!("\n  - Task {index} failed: {error}"));
+        }
+    }
+    out.push_str(&watch_command_line(val));
+    out
+}
+
 /// The `watch_command` a dispatch or steer answer carried, as one line to run.
 ///
 /// A shell cannot know its session, so the token in that command is what binds
@@ -430,6 +453,18 @@ mod tests {
 
     fn v(s: &str) -> serde_json::Value {
         serde_json::from_str(s).expect("fixture must be valid JSON")
+    }
+
+    /// A batch dispatch renders one line per entry, including the entries that
+    /// failed, so a partial failure is visible at a glance.
+    #[test]
+    fn test_format_dispatch_renders_a_batch() {
+        let out = format_dispatch(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1","network":"allow"},{"index":1,"error":"'task' is required"}],"dispatched":1,"failed":1}"#,
+        ));
+        assert!(out.contains("Batch dispatch: 1 started, 1 failed"), "{out}");
+        assert!(out.contains("Task 0: worker w1 dispatched"), "{out}");
+        assert!(out.contains("Task 1 failed: 'task' is required"), "{out}");
     }
 
     #[test]
