@@ -380,3 +380,73 @@ async fn the_mcp_watch_action_returns_the_round_with_all_true() {
         "{result}"
     );
 }
+
+/// The CLI `--all` flag reaches the same round through the no-daemon polling
+/// path, over a group whose workers have already stopped.
+#[test]
+fn the_cli_all_flag_reports_a_stopped_group() {
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("watch-all-cli-hub");
+    let swe = common::TempDir::new_in_tmp("watch-all-cli-swe");
+    std::fs::create_dir_all(swe.path().join("swe-registry")).expect("registry dir");
+    let owner = OWNER;
+    for id in ["w-1", "w-2", "w-3"] {
+        let row = format!(
+            r#"{{"id":"{id}","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"{owner}","group":"{GROUP}"}}"#,
+            std::process::id()
+        );
+        std::fs::write(
+            swe.path().join("swe-registry").join(format!("{id}.json")),
+            row,
+        )
+        .expect("row");
+    }
+
+    let output = common::binary_command(&exe)
+        .args(["watch", "--group", GROUP, "--all", "--json"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", swe.path())
+        .env("TMPDIR", swe.path())
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("MINI_SWE_AGENT_ID", OWNER)
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .output()
+        .expect("run the CLI watch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let event: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().unwrap_or_default()).expect("round JSON");
+    assert_eq!(event["event"], "round", "{stdout}");
+    assert_eq!(
+        event["workers"].as_array().map(Vec::len),
+        Some(3),
+        "{stdout}"
+    );
+}
+
+/// `--all` without a group or ids is refused instead of silently watching
+/// every worker the caller owns.
+#[test]
+fn the_cli_all_flag_needs_a_group_or_ids() {
+    let args = ["mini-swe-mcp".to_string(), "watch".to_string(), "--all".to_string()];
+    let error = mini_swe_mcp::cli::watch::Options::parse(&args)
+        .err()
+        .expect("an unselective --all must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("--all needs --group or explicit worker ids"),
+        "{error}"
+    );
+}

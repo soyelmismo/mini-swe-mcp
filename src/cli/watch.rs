@@ -52,6 +52,10 @@ impl Options {
             }
             i += 1;
         }
+        anyhow::ensure!(
+            !out.all || out.group.is_some() || !out.ids.is_empty(),
+            "--all needs --group or explicit worker ids"
+        );
         Ok(out)
     }
 }
@@ -1056,8 +1060,9 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                 }
             }
             // A worker already terminal when the watch began is not a late
-            // dispatch: a no-arg watch must not replay it.
-            if !explicit {
+            // dispatch: a no-arg watch must not replay it. A `--all` round
+            // must still report such a worker: it is the round's result.
+            if !explicit && !opts.all {
                 ignored = current
                     .iter()
                     .filter(|(_, v)| {
