@@ -40,7 +40,7 @@ use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_request_turns, summarize_command,
+    parse_consolidate_steer, parse_consolidate_wait, parse_request_turns, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -633,39 +633,38 @@ impl<'a> TurnEngine<'a> {
             .run_gated(&cmd_str, AdmissionClass::Exploratory)
             .await?;
 
-        // --- Consolidator merge request (harness side, never bash) ---
-        // The sandbox holds no git credentials, so the merge runs here, on the
-        // harness, through the same machinery the base sync uses. Only a
-        // consolidator sees this verb; an ordinary worker's identical command
-        // stays plain bash.
-        if self.meta.role == WorkerRole::Consolidate
-            && let Some(ids) = parse_consolidate_merge(&cmd_str)
-        {
-            let merged = self
-                .pool
-                .consolidate_merge(self.meta, self.worktree, &ids)
-                .await;
-            if merged.integrated {
-                // The branch now carries other workers' commits, so it must
-                // survive this guard's cleanup.
-                self.worktree.preserve_branch = true;
+        // --- Consolidator verbs (harness side, never bash) ---
+        // The sandbox holds no git credentials, so these run here, on the
+        // harness, through the same machinery the orchestrator uses. Only a
+        // consolidator sees them; an ordinary worker's identical command stays
+        // plain bash.
+        if self.meta.role == WorkerRole::Consolidate {
+            // A merge integrates the group's finished branches into this
+            // worktree, so the branch must survive the guard's cleanup.
+            if let Some(ids) = parse_consolidate_merge(&cmd_str) {
+                let merged = self
+                    .pool
+                    .consolidate_merge(self.meta, self.worktree, &ids)
+                    .await;
+                return Ok(self
+                    .consolidator_reply(&label, merged.observation, merged.integrated, llm_resp)
+                    .await);
             }
-            let observation = merged.observation;
-            let output_text = format!("{COMMAND_OUTPUT_PREFIX}0):\n```\n{observation}\n```");
-            let step_log = build_step_log(*self.step, &label, observation, Some(0));
-            {
-                let mut lock = self.pool.workers.write().await;
-                if let Some(w) = lock.get_mut(self.worker_id) {
-                    w.logs.push(step_log);
-                }
+            // A steer routes a failure or a conflict back to the worker that
+            // owns it, exactly as the orchestrator's own steer would.
+            if let Some((id, message)) = parse_consolidate_steer(&cmd_str) {
+                let observation = self.pool.consolidate_steer(self.meta, &id, message).await;
+                return Ok(self
+                    .consolidator_reply(&label, observation, false, llm_resp)
+                    .await);
             }
-            self.push_exchange(
-                llm_resp.content,
-                llm_resp.reasoning_content,
-                llm_resp.tool_calls.zip(llm_resp.tool_call_id),
-                output_text,
-            );
-            return Ok(TurnOutcome::Continue);
+            // A wait blocks until the group stops, spending no turn on it.
+            if let Some((ids, timeout)) = parse_consolidate_wait(&cmd_str) {
+                let observation = self.pool.consolidate_wait(self.meta, &ids, timeout).await;
+                return Ok(self
+                    .consolidator_reply(&label, observation, false, llm_resp)
+                    .await);
+            }
         }
 
         // --- Orchestrator control sentinels (implementer only) ---
@@ -774,6 +773,39 @@ impl<'a> TurnEngine<'a> {
         );
 
         Ok(TurnOutcome::Continue)
+    }
+
+    /// Answer a harness-mediated consolidator verb: the observation stands in
+    /// for the bash output, the step is logged as an ordinary exit-0 step, and
+    /// the loop continues without spending a sandbox turn on it.
+    ///
+    /// `preserve` keeps the consolidator's branch past this guard's cleanup,
+    /// which only a merge that landed other workers' commits needs.
+    async fn consolidator_reply(
+        &mut self,
+        label: &str,
+        observation: String,
+        preserve: bool,
+        llm_resp: LlmResponse,
+    ) -> TurnOutcome {
+        if preserve {
+            self.worktree.preserve_branch = true;
+        }
+        let output_text = format!("{COMMAND_OUTPUT_PREFIX}0):\n```\n{observation}\n```");
+        let step_log = build_step_log(*self.step, label, observation, Some(0));
+        {
+            let mut lock = self.pool.workers.write().await;
+            if let Some(w) = lock.get_mut(self.worker_id) {
+                w.logs.push(step_log);
+            }
+        }
+        self.push_exchange(
+            llm_resp.content,
+            llm_resp.reasoning_content,
+            llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+            output_text,
+        );
+        TurnOutcome::Continue
     }
 
     /// Handle a completion sentinel: run the verify gate (if any) and either
