@@ -384,6 +384,7 @@ fn tool_description_carries_the_orchestrator_guidelines() {
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in [
         "ONE focused concern",
+        "many workers at once is the intended use",
         "mini-swe-mcp watch",
         "timeout_secs",
         "no_event",
