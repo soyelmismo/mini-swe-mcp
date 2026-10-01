@@ -67,7 +67,8 @@ fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
-    }
+        approved: None,
+}
 }
 
 /// A pool plus server over it, with no LLM anywhere in sight.

@@ -968,7 +968,10 @@ impl super::WorkerPool {
             revision,
             auto_continues: history.auto_continues,
             owner: Some(owner.clone()),
-        };
+            // A revision changes the branch, so the previous review no longer
+            // applies: drop any approval this row carried.
+                approved: None,
+};
 
         let pool = self.clone();
         let wid = id.to_string();

@@ -81,6 +81,20 @@ pub enum WorkerRole {
     Consolidate,
 }
 
+/// The orchestrator's verdict on a completed worker.
+///
+/// Recorded in the worker's registry row so it outlives the in-memory record
+/// `collect` evicts; a new revision drops it, because a changed branch needs a
+/// fresh review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerApproval {
+    /// Unix time the worker was approved.
+    pub at: u64,
+    /// Optional note the orchestrator left with the approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
     pub id: String,
@@ -126,6 +140,10 @@ pub struct WorkerRegistryEntry {
     /// worker, capped at [`super::MAX_AUTO_CONTINUES`].
     #[serde(default)]
     pub auto_continues: usize,
+    /// The orchestrator's approval of the completed worker, or `None` while it
+    /// is unreviewed. Persisted so it survives the in-memory eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<WorkerApproval>,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -195,7 +213,8 @@ impl WorkerMeta {
             base_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
-        }
+                approved: None,
+}
     }
 
     /// Persist one status update for this worker, unconditionally.
@@ -671,7 +690,8 @@ mod recovery_cleanup_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
-        }
+                approved: None,
+}
     }
 
     /// The sweep releases the worktree registration so `steer` can reattach to

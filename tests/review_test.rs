@@ -134,7 +134,8 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         base_commit: None,
         revision,
         auto_continues: 0,
-    }
+        approved: None,
+}
 }
 
 /// A repository whose `master` moved on after two worker branches forked from
