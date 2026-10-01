@@ -2,6 +2,10 @@
 //! subagent, hand it its artifact directories, report and preserve its work,
 //! and reclaim it on `Drop`.
 //!
+//! Both harness-mediated integrations go through
+//! [`WorktreeGuard::merge_reference_at`]: the pre-completion base sync and a
+//! consolidator's `CONSOLIDATE_MERGE` of a finished worker's branch.
+//!
 //! Lease bookkeeping (writing the `.pid` marker) and the sweep that consumes
 //! those markers live in the sibling [`prune`](super::prune) module; this file
 //! only owns one worktree at a time.
@@ -156,6 +160,20 @@ pub enum BaseSync {
     Unchanged,
     Merged { branch: String },
     Conflicts { branch: String, files: Vec<String> },
+}
+
+/// What an unfinished merge in a checkout is waiting for.
+enum PendingMerge {
+    None,
+    Conflicts(Vec<String>),
+    Concluded,
+}
+
+/// Result of merging one worker branch into a consolidator's worktree.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BranchMerge {
+    Merged { files: usize },
+    Conflicts { files: Vec<String> },
 }
 
 /// RAII guard around one subagent's `git` worktree.
@@ -445,52 +463,30 @@ impl WorktreeGuard {
         }) else {
             return Ok(BaseSync::Unchanged);
         };
+        Self::sync_base_inner(path, repo_root, branch, base_commit, base_branch)
+    }
+
+    /// Integrate the dispatch's base branch before verification, on the harness.
+    /// Conflicts remain in place for the model; only a later completion may commit them.
+    fn sync_base_inner(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        base_branch: &str,
+    ) -> Result<BaseSync> {
         let mut merged = false;
-        if Self::merge_in_progress_at(path)? {
-            // Git searches working-tree content even when the index is unmerged.
-            let markers = git(
-                path,
-                "grep conflict markers",
-                &[
-                    "grep",
-                    "--no-textconv",
-                    "--untracked",
-                    "--exclude-standard",
-                    "-a",
-                    "-l",
-                    "-z",
-                    "-e",
-                    "^<<<<<<<",
-                    "--",
-                ],
-            )?;
-            match markers.status.code() {
-                Some(0) => {
-                    return Ok(BaseSync::Conflicts {
-                        branch: base_branch.to_string(),
-                        files: nul_paths(&markers.stdout),
-                    });
-                }
-                Some(1) => {}
-                _ => anyhow::bail!(
-                    "Could not check conflict markers: {}",
-                    String::from_utf8_lossy(&markers.stderr).trim()
-                ),
+        match Self::pending_merge_at(path)? {
+            PendingMerge::Conflicts(files) => {
+                return Ok(BaseSync::Conflicts {
+                    branch: base_branch.to_string(),
+                    files,
+                });
             }
-            checked_git(path, "add resolved merge", &["add", "-A"])?;
-            checked_git(
-                path,
-                "commit resolved merge",
-                &[
-                    "-c",
-                    "user.name=mini-swe",
-                    "-c",
-                    "user.email=mini-swe@localhost",
-                    "commit",
-                    "--no-edit",
-                ],
-            )?;
-            merged = true;
+            // A merge the harness started and the model has since resolved is
+            // concluded here, and counts as this call's integration.
+            PendingMerge::Concluded => merged = true,
+            PendingMerge::None => {}
         }
 
         let reference = format!("refs/heads/{base_branch}");
@@ -510,26 +506,104 @@ impl WorktreeGuard {
             });
         }
 
+        // The base sync may fast-forward: a worker with nothing of its own yet
+        // simply moves to the base tip.
+        match Self::merge_reference_at(path, repo_root, branch, base_commit, &reference, false)? {
+            BranchMerge::Merged { .. } => Ok(BaseSync::Merged {
+                branch: base_branch.to_string(),
+            }),
+            BranchMerge::Conflicts { files } => Ok(BaseSync::Conflicts {
+                branch: base_branch.to_string(),
+                files,
+            }),
+        }
+    }
+
+    /// What an unfinished merge in the checkout is waiting for.
+    fn pending_merge_at(path: &Path) -> Result<PendingMerge> {
+        if !Self::merge_in_progress_at(path)? {
+            return Ok(PendingMerge::None);
+        }
+        // Git searches working-tree content even when the index is unmerged.
+        let markers = git(
+            path,
+            "grep conflict markers",
+            &[
+                "grep",
+                "--no-textconv",
+                "--untracked",
+                "--exclude-standard",
+                "-a",
+                "-l",
+                "-z",
+                "-e",
+                "^<<<<<<<",
+                "--",
+            ],
+        )?;
+        match markers.status.code() {
+            Some(0) => Ok(PendingMerge::Conflicts(nul_paths(&markers.stdout))),
+            Some(1) => {
+                // The model resolved the markers: the harness concludes the
+                // merge it started, exactly as a completion does.
+                checked_git(path, "add resolved merge", &["add", "-A"])?;
+                checked_git(
+                    path,
+                    "commit resolved merge",
+                    &[
+                        "-c",
+                        "user.name=mini-swe",
+                        "-c",
+                        "user.email=mini-swe@localhost",
+                        "commit",
+                        "--no-edit",
+                    ],
+                )?;
+                Ok(PendingMerge::Concluded)
+            }
+            _ => anyhow::bail!(
+                "Could not check conflict markers: {}",
+                String::from_utf8_lossy(&markers.stderr).trim()
+            ),
+        }
+    }
+
+    /// Merge `reference` into the checkout at `path`, on the harness.
+    ///
+    /// The core both harness integrations share: uncommitted work is
+    /// checkpointed first, no editor is opened, and a conflict is left in the
+    /// worktree for the model to resolve. `no_ff` forces a merge commit, which
+    /// a consolidator's integration needs so every merged worker stays visible
+    /// on its branch.
+    fn merge_reference_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        reference: &str,
+        no_ff: bool,
+    ) -> Result<BranchMerge> {
         Self::commit_changes_at(
             path,
             repo_root,
             branch,
             base_commit,
-            "worker: checkpoint before base integration",
+            "worker: checkpoint before merge",
         )?;
-        let output = git(
-            path,
-            "merge base",
-            &[
-                "-c",
-                "user.name=mini-swe",
-                "-c",
-                "user.email=mini-swe@localhost",
-                "merge",
-                "--no-edit",
-                &reference,
-            ],
-        )?;
+        let before = checked_git(path, "record merge base", &["rev-parse", "HEAD"])?;
+        let before = String::from_utf8_lossy(&before.stdout).trim().to_string();
+        let mut args = vec![
+            "-c",
+            "user.name=mini-swe",
+            "-c",
+            "user.email=mini-swe@localhost",
+            "merge",
+        ];
+        if no_ff {
+            args.push("--no-ff");
+        }
+        args.extend(["--no-edit", reference]);
+        let output = git(path, "merge branch", &args)?;
         if !output.status.success() {
             let conflicts = checked_git(
                 path,
@@ -538,19 +612,61 @@ impl WorktreeGuard {
             )?;
             let files = nul_paths(&conflicts.stdout);
             if Self::merge_in_progress_at(path)? && !files.is_empty() {
-                return Ok(BaseSync::Conflicts {
-                    branch: base_branch.to_string(),
-                    files,
-                });
+                return Ok(BranchMerge::Conflicts { files });
             }
             anyhow::bail!(
-                "git merge base {base_branch} failed: {}",
+                "git merge {reference} failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(BaseSync::Merged {
-            branch: base_branch.to_string(),
-        })
+        let after = checked_git(path, "record merge head", &["rev-parse", "HEAD"])?;
+        let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
+        let files = if after == before {
+            0
+        } else {
+            let changed = checked_git(
+                path,
+                "count merged files",
+                &["diff", "--name-only", &format!("{before}..{after}")],
+            )?;
+            String::from_utf8_lossy(&changed.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        };
+        Ok(BranchMerge::Merged { files })
+    }
+
+    /// Merge `worker-<id>` into the checkout at `path`, on the harness.
+    ///
+    /// The consolidator's `CONSOLIDATE_MERGE` verb: the same machinery as the
+    /// base sync, always as a merge commit, plus the file count its observation
+    /// reports so the model sees what each merge brought in without running git
+    /// itself. A branch the repository no longer carries is an error the caller
+    /// reports as a refusal, not a silent skip.
+    pub fn merge_branch_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        worker_id: &str,
+    ) -> Result<BranchMerge> {
+        let worker_branch = format!("worker-{worker_id}");
+        if branch_ref(repo_root, &worker_branch).is_none() {
+            anyhow::bail!("branch {worker_branch} does not exist");
+        }
+        match Self::pending_merge_at(path)? {
+            PendingMerge::Conflicts(files) => return Ok(BranchMerge::Conflicts { files }),
+            PendingMerge::Concluded | PendingMerge::None => {}
+        }
+        Self::merge_reference_at(
+            path,
+            repo_root,
+            branch,
+            base_commit,
+            &format!("refs/heads/{worker_branch}"),
+            true,
+        )
     }
 
     /// Sync report and audit directories (audits, reports, .agents, artifacts)

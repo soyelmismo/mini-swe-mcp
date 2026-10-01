@@ -35,6 +35,10 @@
 //! runs the command unconfined with a warning.
 
 use anyhow::{Context, Result};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -354,6 +358,74 @@ impl AgentRunner {
             Some(TIMEOUT_EXIT_CODE),
         )
     }
+}
+
+/// Fingerprint the worktree content from git's view, so a step can report
+/// the exact tree it ran on.
+///
+/// The fingerprint is the `HEAD` commit, the binary diff of every tracked
+/// change, and the untracked non-ignored files each hashed with its bytes.
+/// It changes whenever any file a suite could observe changes -- a tracked
+/// edit, a new commit, or a created or edited untracked file -- and stays
+/// identical otherwise, which is what lets the completion gate reuse a
+/// verify run on an unchanged tree. `None` when git could not answer, so a
+/// fingerprint that could not be taken is never read as "unchanged".
+pub(crate) fn tree_fingerprint(dir: &Path) -> Option<String> {
+    let head = crate::worktree::git(dir, "rev-parse HEAD", &["rev-parse", "HEAD"]).ok()?;
+    let diff = crate::worktree::git(
+        dir,
+        "diff HEAD --binary",
+        &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary"],
+    )
+    .ok()?;
+    let others = crate::worktree::git(
+        dir,
+        "ls-files --others --exclude-standard",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .ok()?;
+    if !head.status.success() || !diff.status.success() || !others.status.success() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    head.stdout.hash(&mut hasher);
+    diff.stdout.hash(&mut hasher);
+    let mut names: Vec<_> = others
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    names.sort_unstable();
+    let mut buffer = [0; 8192];
+    for name in names {
+        name.hash(&mut hasher);
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        metadata.permissions().mode().hash(&mut hasher);
+        if metadata.file_type().is_symlink() {
+            std::fs::read_link(&path)
+                .ok()?
+                .as_os_str()
+                .as_bytes()
+                .hash(&mut hasher);
+        } else if metadata.is_file() {
+            // Stream large untracked files rather than allocating their contents.
+            let mut file = std::fs::File::open(path).ok()?;
+            let mut size = 0u64;
+            loop {
+                let count = file.read(&mut buffer).ok()?;
+                if count == 0 {
+                    break;
+                }
+                hasher.write(&buffer[..count]);
+                size += count as u64;
+            }
+            size.hash(&mut hasher);
+        } else {
+            return None;
+        }
+    }
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 /// Message shown to the model when an interceptor blocks a command.
@@ -1647,8 +1719,8 @@ mod tests {
     /// bubblewrap backend keeps the `unshare -n` wrapper instead.
     #[tokio::test]
     async fn an_offline_worker_has_no_egress_and_still_runs_local_commands() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-offline-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-offline");
+        let tmp = scratch.path().to_path_buf();
         let offline = runner().with_network_offline(true);
 
         let (out, code) = offline
@@ -2013,15 +2085,8 @@ mod tests {
     }
 
     async fn extra_env_probe() {
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "extra-env-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("extra-env");
+        let tmp = scratch.path().to_path_buf();
         let runner = runner().with_extra_env(vec![
             ("SWE_EXTRA_ENV_PROBE".to_string(), "present".to_string()),
             ("HOME".to_string(), "/tmp".to_string()),
@@ -2061,13 +2126,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_bash_sandbox_runs_and_blocks_write() {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir()
-            .join(format!("bwrap-test-{}-{unique_id}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("bwrap-test");
+        let tmp = scratch.path().to_path_buf();
         let r = runner();
 
         // 1. Basic command within worktree succeeds
@@ -2095,18 +2155,13 @@ mod tests {
             );
         }
 
-        let target_dir = crate::worktree::swe_base_dir().join(format!(
-            "swe-target-bwrap-test-{}-{unique_id}",
-            std::process::id()
-        ));
         let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&target_dir);
     }
 
     #[tokio::test]
     async fn execute_bash_runs_unsandboxed_when_disabled() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-path-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-path");
+        let tmp = scratch.path().to_path_buf();
         let (out, code) = runner()
             .execute_bash(&tmp, "printf 'plain\\n'")
             .await
@@ -2295,8 +2350,8 @@ mod tests {
     /// *actually* printed, not the size of the buffer we kept.
     #[tokio::test]
     async fn a_huge_output_reports_its_true_size_without_being_buffered() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-flood-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-flood");
+        let tmp = scratch.path().to_path_buf();
 
         // ~2 MiB: two orders of magnitude past the 16 KiB budget, and well
         // past any pipe buffer, so the drain has to keep up to avoid a stall.
@@ -2343,8 +2398,8 @@ mod tests {
     /// `rustc` children of an interrupted build running.
     #[tokio::test]
     async fn dropping_the_future_kills_the_whole_process_group() {
-        let dir = crate::worktree::swe_base_dir().join("exec-cancel-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let scratch = crate::test_support::TestScratch::new("exec-cancel");
+        let dir = scratch.path().to_path_buf();
         let pid_file = dir.join("grandchild.pid");
         let mut cmd = Command::new("bash");
         cmd.args([
@@ -2417,8 +2472,8 @@ mod tests {
     /// the model still sees the last diagnostics.
     #[tokio::test]
     async fn timed_out_command_still_reports_the_output_it_produced() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-drain-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-drain");
+        let tmp = scratch.path().to_path_buf();
 
         let (out, code) = runner()
             .with_command_timeout(1)
@@ -2450,8 +2505,8 @@ mod tests {
     /// the drain is abandoned at its deadline instead of hanging the worker.
     #[tokio::test]
     async fn a_leaked_pipe_does_not_hang_the_timeout_path() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-leak-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-leak");
+        let tmp = scratch.path().to_path_buf();
 
         // `setsid` detaches the sleeper from the killed process group, so it
         // keeps the inherited stdout open past the SIGKILL.
@@ -2502,15 +2557,8 @@ mod tests {
     /// called, is invisible to unit tests of `build_clean_environment` alone.
     #[tokio::test]
     async fn a_spawned_command_cannot_read_the_operators_secrets() {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "env-sanitize-test-{}-{unique_id}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
+        let tmp = scratch.path().to_path_buf();
 
         // Export a secret the way an operator's shell would.
         // SAFETY: the test binary runs its tests single-threaded, and no other
@@ -2585,15 +2633,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("build a current-thread runtime");
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "env-toolchain-test-{}-{unique_id}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("env-toolchain-test");
+        let tmp = scratch.path().to_path_buf();
 
         // A host cache this test controls, so the expectation does not depend on
         // whatever layout the machine running the suite happens to have, and so
@@ -2634,8 +2675,8 @@ mod tests {
     /// never blocks in `write`.
     #[tokio::test]
     async fn a_large_output_does_not_deadlock_the_collector() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-chatty-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-chatty");
+        let tmp = scratch.path().to_path_buf();
 
         // 20k lines is well past the 64 KiB pipe buffer.
         let (out, code) = runner()
@@ -2786,8 +2827,8 @@ mod tests {
     /// sandbox lets it write, whichever backend confines it.
     #[tokio::test]
     async fn a_step_gets_a_writable_private_scratch_dir() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-scratch-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-scratch");
+        let tmp = scratch.path().to_path_buf();
         let (out, code) = runner()
             .execute_bash(
                 &tmp,
@@ -2808,9 +2849,8 @@ mod tests {
             eprintln!("skipping: the kernel backend is not in use on this host");
             return;
         }
-        let gone =
-            crate::worktree::swe_base_dir().join(format!("exec-gone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&gone);
+        let scratch = crate::test_support::TestScratch::missing("exec-gone");
+        let gone = scratch.path().to_path_buf();
         let marker = std::env::temp_dir().join(format!("exec-gone-marker-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let (out, code) = runner()
@@ -3154,5 +3194,82 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             rendered.iter().any(|a| a == "bwrap"),
             "bwrap must still lead the argv: {rendered:?}"
         );
+    }
+
+    /// The tree fingerprint the completion gate reuses a verify run on.
+    mod fingerprint {
+        use crate::agent::exec::tree_fingerprint;
+        use crate::test_support::TestScratch;
+        use std::path::Path;
+
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        /// A fresh git repository in `scratch`, with one baseline commit.
+        fn init_repo(scratch: &TestScratch) {
+            let dir = scratch.path();
+            git(dir, &["init", "-b", "master"]);
+            git(dir, &["config", "user.name", "t"]);
+            git(dir, &["config", "user.email", "t@localhost"]);
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            git(dir, &["add", "seed.txt"]);
+            git(dir, &["commit", "-m", "baseline"]);
+        }
+
+        #[test]
+        fn an_unchanged_tree_fingerprints_identically() {
+            let scratch = TestScratch::new("exec-fp-stable");
+            init_repo(&scratch);
+            let a = tree_fingerprint(scratch.path()).expect("fingerprint");
+            let b = tree_fingerprint(scratch.path()).expect("fingerprint");
+            assert_eq!(a, b, "an unchanged tree must fingerprint identically");
+        }
+
+        /// An untracked file is part of the tree's content even though git
+        /// tracks no prior version of it to diff, so both creating one and
+        /// editing it must move the fingerprint.
+        #[test]
+        fn an_untracked_file_moves_the_fingerprint() {
+            let scratch = TestScratch::new("exec-fp-untracked");
+            init_repo(&scratch);
+            let dir = scratch.path();
+            let before = tree_fingerprint(dir).expect("fingerprint before");
+
+            std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
+            let after_new = tree_fingerprint(dir).expect("fingerprint after new file");
+            assert_ne!(
+                before, after_new,
+                "a new untracked file must move the fingerprint"
+            );
+
+            std::fs::write(dir.join("new.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+            let after_edit = tree_fingerprint(dir).expect("fingerprint after edit");
+            assert_ne!(
+                after_new, after_edit,
+                "editing an untracked file must move the fingerprint"
+            );
+        }
+
+        /// A directory git cannot read as a repository yields no
+        /// fingerprint, so the gate re-runs rather than reusing an unknown.
+        #[test]
+        fn a_directory_that_is_not_a_repository_has_no_fingerprint() {
+            let scratch = TestScratch::new("exec-fp-nonrepo");
+            assert_eq!(
+                tree_fingerprint(scratch.path()),
+                None,
+                "a non-repository must yield no fingerprint, never a stable one"
+            );
+        }
     }
 }

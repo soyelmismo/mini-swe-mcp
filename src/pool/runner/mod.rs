@@ -50,8 +50,8 @@ mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_kill_job,
-    parse_request_turns, parse_wait_job, summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_kill_job, parse_request_turns, parse_wait_job, summarize_command,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
@@ -258,6 +258,7 @@ impl WorkerPool {
         let opening_meta = WorkerHistory {
             task: task.clone(),
             group: meta.group.clone(),
+            role: meta.role,
             model: model.clone(),
             temperature,
             repo_path: repo_path_str.clone(),
@@ -402,6 +403,9 @@ impl WorkerPool {
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
+                    // Flush the completion turn too: a reused verify pushes its
+                    // disclosure note here, and a crash must not lose it.
+                    engine.flush_history_log(&turn_config).await;
                     verified = v;
                     break;
                 }

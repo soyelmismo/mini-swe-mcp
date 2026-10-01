@@ -5,7 +5,9 @@
 //! parsers here are the single place that decides whether that command carries
 //! a control signal ([`parse_request_turns`] for a turn-budget extension,
 //! [`parse_ask_orchestrator`] for a blocking question, [`parse_wait_job`] and
-//! [`parse_kill_job`] for a background job) or is just work.
+//! [`parse_kill_job`] for a background job,
+//! [`parse_consolidate_merge`] for a consolidator's branch integration) or is
+//! just work.
 //!
 //! [`summarize_command`] lives here too because it is the same "read a bash
 //! command" concern: it renders the bounded one-line label the registry, the
@@ -164,12 +166,65 @@ fn parse_job_id(cmd: &str, keyword: &str) -> Option<u64> {
     None
 }
 
+/// `echo/printf "CONSOLIDATE_MERGE <id> ..."` → the workers to integrate.
+///
+/// Only a consolidator interprets this sentinel: for an ordinary worker the
+/// identical command stays plain bash. Ids are whatever the pool's id resolver
+/// accepts (a full id or a unique prefix); they are validated here only as
+/// tokens, so a grep of the sentinel or a sentence that merely contains it is
+/// never a request.
+pub fn parse_consolidate_merge(cmd: &str) -> Option<Vec<String>> {
+    let trimmed = cmd.trim();
+    let arg = trimmed
+        .strip_prefix("echo ")
+        .or_else(|| trimmed.strip_prefix("printf "))?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches("\\n");
+    let mut words = arg.split_whitespace();
+    if words.next()? != "CONSOLIDATE_MERGE" {
+        return None;
+    }
+    let ids: Vec<String> = words.map(str::to_string).collect();
+    let tokens = !ids.is_empty()
+        && ids.iter().all(|id| {
+            id.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    tokens.then_some(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_completion_request, parse_ask_orchestrator, parse_kill_job, parse_request_turns,
-        parse_wait_job, summarize_command,
+        is_completion_request, parse_ask_orchestrator, parse_consolidate_merge, parse_kill_job,
+        parse_request_turns, parse_wait_job, summarize_command,
     };
+
+    #[test]
+    fn consolidate_merge_requires_an_echo_of_the_sentinel() {
+        for yes in [
+            "echo CONSOLIDATE_MERGE abc abcdef12",
+            "printf 'CONSOLIDATE_MERGE abc abcdef12\n'",
+            "  echo \"CONSOLIDATE_MERGE abc\"  ",
+        ] {
+            let ids = parse_consolidate_merge(yes);
+            assert!(ids.is_some(), "{yes:?} must request a merge");
+            assert!(
+                ids.as_deref().unwrap_or(&[]).contains(&"abc".to_string()),
+                "{yes:?} must name the worker: {ids:?}"
+            );
+        }
+        for no in [
+            "echo ordinary text",
+            "grep -rn CONSOLIDATE_MERGE src/",
+            "echo CONSOLIDATE_MERGE",
+            "echo other CONSOLIDATE_MERGE abc",
+            "",
+        ] {
+            assert_eq!(parse_consolidate_merge(no), None, "{no:?} is not a request");
+        }
+    }
 
     #[test]
     fn test_summarize_command_utf8() {

@@ -223,6 +223,7 @@ impl McpServer {
             "steer" => self.handle_steer(args, token, tx, ctx).await,
             "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
+            "merge" => self.handle_merge(args, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         };
         // Looking at or acting on a worker is the owner having seen it: drop
@@ -480,6 +481,19 @@ impl McpServer {
             .get("group")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let role = match args.get("role") {
+            None => crate::pool::WorkerRole::Worker,
+            Some(Value::String(role)) if role == "worker" => crate::pool::WorkerRole::Worker,
+            Some(Value::String(role)) if role == "consolidate" => {
+                crate::pool::WorkerRole::Consolidate
+            }
+            _ => anyhow::bail!("role must be 'worker' or 'consolidate'"),
+        };
+        if role == crate::pool::WorkerRole::Consolidate
+            && group.as_deref().is_none_or(|g| g.trim().is_empty())
+        {
+            anyhow::bail!("role 'consolidate' requires 'group'");
+        }
         let review_after = args.get("review_after").and_then(|v| v.as_str()).map(|s| {
             let (resolved, _, _) = self.manifest.resolve_model(s);
             resolved
@@ -498,7 +512,7 @@ impl McpServer {
         let admission = self.admit_worker().await?;
         let wid = self
             .pool
-            .dispatch(
+            .dispatch_with_role(
                 agent.clone(),
                 task,
                 resolved_model,
@@ -510,6 +524,7 @@ impl McpServer {
                 network_offline,
                 verify,
                 ctx.client_env.clone(),
+                role,
             )
             .await?;
         drop(admission);
@@ -799,10 +814,10 @@ impl McpServer {
         let verify_tail = if verified == Some(true) {
             None
         } else {
-            match self.pool.get_worker_logs(&wid).await {
-                Some(logs) => verify_tail(&logs.tail(VERIFY_TAIL_STEPS)),
-                None => None,
-            }
+            self.pool
+                .get_worker_logs(&wid)
+                .await
+                .and_then(|logs| super::events::verify_tail_of(&logs.tail(VERIFY_TAIL_STEPS)))
         };
         Ok(json!({
             "worker_id": wid,
@@ -1194,16 +1209,63 @@ impl McpServer {
             "message": "Stale worktrees and dead worker branches cleaned up"
         }))
     }
+
+    /// `merge` action: land one finished worker's branch on its base branch.
+    ///
+    /// Owner-only, like every other per-worker verb. The whole sequence --
+    /// trial merge, dirty check, gate, real merge, cleanup -- is one blocking
+    /// unit in [`crate::pool::merge`], so it runs off the runtime thread and
+    /// answers with a single payload the CLI renders as one line.
+    async fn handle_merge(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "merge")?;
+        self.require_owner(wid, ctx).await?;
+        // A worker this process owns carries its verify verdict in memory; a
+        // cross-process caller has only the on-disk row, which names none, and
+        // therefore re-runs the gate.
+        let verified = match self.pool.get_worker_state(wid).await {
+            Some(crate::pool::WorkerState::Completed { verified, .. }) => verified,
+            _ => None,
+        };
+        let keep_branch = args
+            .get("keep_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let root = self.pool.scratch_root().clone();
+        let admission = self.pool.admission();
+        let worker_id = wid.to_string();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::pool::merge_worker_in(
+                &root,
+                &crate::pool::MergeRequest {
+                    worker_id: &worker_id,
+                    verified,
+                    keep_branch,
+                    admission: Some(admission),
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("merge task for worker {wid} failed: {e}"))??;
+        Ok(json!({
+            "worker_id": report.worker_id,
+            "branch": report.branch,
+            "base_branch": report.base_branch,
+            "repo_path": report.repo_path,
+            "commit": report.commit,
+            "gate": if report.gate_ran { "ran" } else { "skipped" },
+            "gate_command": report.gate_command,
+            "branch_deleted": report.branch_deleted,
+            "cleaned": report.cleaned,
+        }))
+    }
 }
 
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
-
-/// How many lines of a failed verify a review carries.
-const VERIFY_TAIL_LINES: usize = 20;
-
-/// Hard cap on the verify tail, so one enormous test log cannot bloat the view.
-const VERIFY_TAIL_MAX_CHARS: usize = 4_000;
 
 /// The three fields only a completed worker carries: its summary, whether the
 /// gate verified it, and the branch it leaves behind.
@@ -1257,26 +1319,6 @@ fn revision_of(
         | Some(crate::pool::WorkerState::Failed { revision, .. }) => *revision,
         _ => entry.map_or(0, |entry| entry.revision),
     }
-}
-
-/// The bounded tail of the last failed verify run, when there was one.
-///
-/// The gate pushes its output back to the model as a `[verify]` step log, so
-/// the tail of the last such entry is what the worker itself was told to fix.
-fn verify_tail(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
-    let entry = logs
-        .iter()
-        .rev()
-        .find(|entry| entry.command.starts_with("[verify]"))?;
-    let mut lines: Vec<&str> = entry.output.lines().rev().take(VERIFY_TAIL_LINES).collect();
-    lines.reverse();
-    Some(
-        lines
-            .join("\n")
-            .chars()
-            .take(VERIFY_TAIL_MAX_CHARS)
-            .collect(),
-    )
 }
 
 /// The command that acts on this review: merge a clean branch, or send the
@@ -1961,9 +2003,9 @@ mod tests {
         };
         let logs = vec![&build, &verify];
         assert_eq!(
-            verify_tail(&logs).expect("a failed verify must be shown"),
+            crate::mcp::events::verify_tail_of(&logs).expect("a failed verify must be shown"),
             "test a ... FAILED\nassertion failed"
         );
-        assert_eq!(verify_tail(&logs[..1]), None);
+        assert_eq!(crate::mcp::events::verify_tail_of(&logs[..1]), None);
     }
 }

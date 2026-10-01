@@ -59,6 +59,7 @@ fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
         started_at,
         updated_at: started_at,
         group: None,
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: None,
         owner: Some(owner.to_string()),
         metrics: WorkerMetrics::default(),

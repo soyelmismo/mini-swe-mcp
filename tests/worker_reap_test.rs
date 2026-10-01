@@ -13,7 +13,7 @@ use mini_swe_mcp::agent::reap::processes_in_dirs;
 use mini_swe_mcp::worktree::{WorktreeGuard, swe_base_dir};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A scratch directory under the same base the crate's worktrees use, so a
 /// test's paths are shaped like a real worker's.
@@ -89,25 +89,36 @@ impl Drop for TestRepo {
     }
 }
 
-/// Wait until at least one process runs with `dir` as its working directory.
-fn await_process_in(dir: &Path) {
-    for _ in 0..200 {
-        if !processes_in_dirs(&[dir.to_path_buf()]).is_empty() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("no process ever appeared in {}", dir.display());
-}
+/// How long a process wait may take before it gives up. Generous enough that a
+/// loaded host cannot starve the poller into a false failure; the wait still
+/// returns as soon as its condition holds.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Wait until no process is left with `dir` as its working directory.
-async fn await_empty(dir: &Path) {
-    for _ in 0..200 {
-        if processes_in_dirs(&[dir.to_path_buf()]).is_empty() {
-            return;
+/// Poll `cond` every 20 ms until it holds or [`SETTLE_TIMEOUT`] elapses,
+/// returning whether it held. Both process waits below share this deadline.
+async fn await_condition(cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Wait until at least one process runs with `dir` as its working directory.
+async fn await_process_in(dir: &Path) {
+    let appeared = await_condition(|| !processes_in_dirs(&[dir.to_path_buf()]).is_empty()).await;
+    assert!(appeared, "no process ever appeared in {}", dir.display());
+}
+
+/// Wait until no process is left with `dir` as its working directory. The
+/// caller asserts the emptiness, so this only bounds the wait.
+async fn await_empty(dir: &Path) {
+    let _ = await_condition(|| processes_in_dirs(&[dir.to_path_buf()]).is_empty()).await;
 }
 
 /// A job the shell backgrounded with `&` is still a member of the step's
@@ -152,7 +163,7 @@ async fn a_detached_job_survives_the_step_and_dies_at_worker_end() {
         assert_eq!(code, Some(0), "{out:?}");
         assert!(out.contains("started"), "{out:?}");
         let worktree_dirs = [guard.path.clone()];
-        await_process_in(&guard.path);
+        await_process_in(&guard.path).await;
         assert!(
             !processes_in_dirs(&worktree_dirs).is_empty(),
             "a detached job must survive the step that started it"
@@ -181,7 +192,7 @@ async fn the_worker_end_sweep_never_signals_a_process_outside_the_workers_direct
         .current_dir(&outside)
         .spawn()
         .expect("setsid must spawn");
-    await_process_in(&outside);
+    await_process_in(&outside).await;
 
     let worktree = {
         let guard = WorktreeGuard::new(repo.path(), &id).expect("worktree must be created");

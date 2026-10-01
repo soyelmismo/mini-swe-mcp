@@ -18,6 +18,10 @@
 //! [`WorkerPool`] itself stays here: it owns the concurrency gates and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
 //! reap) must stay in one place to keep the lock discipline auditable.
+//!
+//! A consolidator's reach is bounded by
+//! [`check_consolidate_delegation`](registry::check_consolidate_delegation):
+//! its owner's own workers, in its own group, and nothing else.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -33,6 +37,7 @@ pub mod admission;
 mod buffer;
 mod clock;
 mod fair;
+pub mod merge;
 mod registry;
 pub mod revision;
 mod runner;
@@ -51,8 +56,9 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
-    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
-    load_all_registry_entries, load_all_registry_entries_in, load_registry_entries_read_only,
+    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole,
+    check_consolidate_delegation, extract_group, load_all_registry_entries,
+    load_all_registry_entries_in, load_registry_entries_read_only,
     load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in, registry_dir,
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
     save_registry_entry, save_registry_entry_in,
@@ -65,11 +71,14 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
+
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_kill_job, parse_request_turns, parse_wait_job, summarize_command,
+    parse_consolidate_merge, parse_kill_job, parse_request_turns, parse_wait_job,
+    summarize_command,
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
@@ -83,7 +92,7 @@ pub use self::steer::{
 use self::state::expired_terminal_ids;
 use crate::agent::jobs::{JobHandle, JobTable};
 use crate::manifest::ModelManifest;
-use crate::worktree::{ScratchRoot, WorktreeGuard};
+use crate::worktree::{BranchMerge, ScratchRoot, WorktreeGuard};
 
 /// Rebuild the conversation a request sends: compaction applied on top of the
 /// append-only log.
@@ -97,6 +106,15 @@ pub fn compact_for_request(
     let mut messages = messages.to_vec();
     crate::pool::runner::history::compact_history(&mut messages);
     messages
+}
+
+/// The observation one `CONSOLIDATE_MERGE` request returns to the model.
+pub struct ConsolidateMerge {
+    /// One compact line per requested id.
+    pub observation: String,
+    /// Whether any branch was merged, so the caller preserves the
+    /// consolidator's branch instead of letting the guard delete it.
+    pub integrated: bool,
 }
 
 /// Whether `id`'s registry row is live in a process other than this one.
@@ -346,6 +364,15 @@ impl WorkerPool {
     }
 
     /// The scratch root this pool resolves every per-worker path under.
+    /// The pool's heavy-command admission controller.
+    ///
+    /// Shared by clone, so a caller (the merge gate) reserves host budget from
+    /// the same controller every worker's heavy step does instead of starting
+    /// a second, unaware one.
+    pub fn admission(&self) -> AdmissionController {
+        self.admission.clone()
+    }
+
     pub fn scratch_root(&self) -> &ScratchRoot {
         &self.scratch
     }
@@ -521,6 +548,43 @@ impl WorkerPool {
         verify: Option<String>,
         client_env: Vec<(String, String)>,
     ) -> Result<String> {
+        self.dispatch_with_role(
+            owner,
+            task,
+            model,
+            temperature,
+            repo_path,
+            max_turns,
+            group,
+            review_after,
+            network_offline,
+            verify,
+            client_env,
+            WorkerRole::Worker,
+        )
+        .await
+    }
+
+    /// Dispatch with explicit authority; consolidators require an explicit group.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_with_role(
+        &self,
+        owner: String,
+        task: String,
+        model: String,
+        temperature: Option<f32>,
+        repo_path: PathBuf,
+        max_turns: usize,
+        group: Option<String>,
+        review_after: Option<String>,
+        network_offline: bool,
+        verify: Option<String>,
+        client_env: Vec<(String, String)>,
+        role: WorkerRole,
+    ) -> Result<String> {
+        if role == WorkerRole::Consolidate && group.as_deref().is_none_or(|g| g.trim().is_empty()) {
+            anyhow::bail!("role 'consolidate' requires 'group'");
+        }
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
         let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
@@ -535,6 +599,7 @@ impl WorkerPool {
             id: worker_id.clone(),
             task: task.clone(),
             group: Some(resolved_group.clone()),
+            role,
             repo_path: Some(repo_path_str.clone()),
             owner: owner.clone(),
             started_at: now,
@@ -904,6 +969,104 @@ impl WorkerPool {
             None => load_worker_history_in(&self.scratch, id).ok()?.owner,
         };
         Some(owner.map_or(WorkerOwner::Unattributed, WorkerOwner::Agent))
+    }
+
+    /// The registry row of `id`, from this process's records or the shared
+    /// registry.
+    ///
+    /// The delegation check reads a target's owner, group and role from here:
+    /// the row is written at dispatch and rewritten on every status change, so
+    /// it is the one place all three facts are current together.
+    pub async fn worker_row(&self, id: &str) -> Option<WorkerRegistryEntry> {
+        load_registry_entry_in(&self.scratch, id)
+    }
+
+    /// Whether `id` finished as `completed`, here or in the shared registry.
+    ///
+    /// A consolidator may only integrate a worker that passed its own gate: a
+    /// running or failed worker's branch is not a round contribution.
+    pub async fn is_completed(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            return matches!(state, WorkerState::Completed { .. });
+        }
+        load_registry_entry_in(&self.scratch, id)
+            .is_some_and(|entry| entry.status == RegistryStatus::Completed)
+    }
+
+    /// Integrate the named workers' branches into a consolidator's worktree.
+    ///
+    /// One `CONSOLIDATE_MERGE` request: each id is resolved, checked against
+    /// [`check_consolidate_delegation`] and merged in order. The first conflict
+    /// stops the run and leaves the rest skipped, so the model resolves one
+    /// merge at a time, and the merges run on the harness through
+    /// [`WorktreeGuard::merge_branch_at`] -- the sandbox holds no git
+    /// credentials.
+    ///
+    /// Lives on the pool rather than in the turn engine because every fact it
+    /// needs (the id resolver, the registry row, the completion status) is
+    /// already here, and an integration test can then drive the whole loop
+    /// without an LLM.
+    pub async fn consolidate_merge(
+        &self,
+        actor: &WorkerMeta,
+        worktree: &WorktreeGuard,
+        ids: &[String],
+    ) -> ConsolidateMerge {
+        let mut lines = Vec::new();
+        let mut integrated = false;
+        let mut conflicted = false;
+        for id in ids {
+            if conflicted {
+                lines.push(format!("{id} skipped (an earlier merge conflicted)"));
+                continue;
+            }
+            let target = match self.resolve_worker_id(id, &actor.owner).await {
+                Ok(target) => target,
+                Err(e) => {
+                    lines.push(format!("{id} refused: {e}"));
+                    continue;
+                }
+            };
+            let Some(entry) = self.worker_row(&target).await else {
+                lines.push(format!("{id} refused: no such worker"));
+                continue;
+            };
+            if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+                lines.push(format!("{id} refused: {reason}"));
+                continue;
+            }
+            if !self.is_completed(&target).await {
+                lines.push(format!("{id} refused: the worker is not completed"));
+                continue;
+            }
+            let path = worktree.path.clone();
+            let repo_root = worktree.repo_root.clone();
+            let branch = worktree.branch.clone();
+            let base_commit = worktree.base_commit.clone();
+            let merged = tokio::task::spawn_blocking(move || {
+                WorktreeGuard::merge_branch_at(&path, &repo_root, &branch, &base_commit, &target)
+            })
+            .await;
+            match merged {
+                Ok(Ok(BranchMerge::Merged { files })) => {
+                    integrated = true;
+                    lines.push(format!("{id} merged ({files} files)"));
+                }
+                Ok(Ok(BranchMerge::Conflicts { files })) => {
+                    conflicted = true;
+                    lines.push(format!(
+                        "{id} conflict: {} (resolve the markers, then continue)",
+                        files.join(", ")
+                    ));
+                }
+                Ok(Err(e)) => lines.push(format!("{id} refused: {e}")),
+                Err(e) => lines.push(format!("{id} refused: {e}")),
+            }
+        }
+        ConsolidateMerge {
+            observation: lines.join("\n"),
+            integrated,
+        }
     }
 
     /// Resolve a caller-supplied worker reference among `owner`'s own workers.
@@ -1654,5 +1817,138 @@ mod verify_detection_tests {
             "the python manifest is probed before go, and the order is fixed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod consolidate_delegation_tests {
+    use super::registry::{
+        WorkerMeta, WorkerRegistryEntry, WorkerRole, check_consolidate_delegation,
+    };
+    use super::{RegistryStatus, WorkerMetrics};
+
+    /// A consolidator's registry row, as its dispatch wrote it.
+    fn consolidator(id: &str, owner: &str, group: &str) -> WorkerMeta {
+        WorkerMeta {
+            id: id.to_string(),
+            task: "integrate the round".to_string(),
+            group: Some(group.to_string()),
+            role: WorkerRole::Consolidate,
+            repo_path: None,
+            owner: owner.to_string(),
+            started_at: 0,
+            pid: std::process::id(),
+            revision: 0,
+            auto_continues: 0,
+            metrics: WorkerMetrics::default(),
+        }
+    }
+
+    /// A target worker's registry row, as its own dispatch wrote it.
+    fn target(id: &str, owner: &str, group: &str, role: WorkerRole) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
+            id: id.to_string(),
+            pid: std::process::id(),
+            task: "do the work".to_string(),
+            model: "test".to_string(),
+            status: RegistryStatus::Completed,
+            step: 3,
+            max_turns: 10,
+            last_command: "completed".to_string(),
+            question: None,
+            started_at: 0,
+            updated_at: 0,
+            group: Some(group.to_string()),
+            role,
+            repo_path: None,
+            owner: Some(owner.to_string()),
+            metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            revision: 0,
+            auto_continues: 0,
+        }
+    }
+
+    #[test]
+    fn a_consolidator_integrates_its_owners_workers_in_its_group() {
+        let actor = consolidator("c1", "agent-a", "round-1");
+        assert_eq!(
+            check_consolidate_delegation(
+                &actor,
+                &target("w1", "agent-a", "round-1", WorkerRole::Worker)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn everything_outside_the_owner_and_group_is_refused_with_a_reason() {
+        let actor = consolidator("c1", "agent-a", "round-1");
+        for (label, entry) in [
+            (
+                "another agent's worker",
+                target("w2", "agent-b", "round-1", WorkerRole::Worker),
+            ),
+            (
+                "another group's worker",
+                target("w3", "agent-a", "round-2", WorkerRole::Worker),
+            ),
+            (
+                "itself",
+                target("c1", "agent-a", "round-1", WorkerRole::Worker),
+            ),
+            (
+                "another consolidator",
+                target("c2", "agent-a", "round-1", WorkerRole::Consolidate),
+            ),
+            (
+                "a row with no owner",
+                target("w4", "agent-a", "round-1", WorkerRole::Worker).with_owner(None),
+            ),
+            (
+                "a row with no group",
+                target("w5", "agent-a", "round-1", WorkerRole::Worker).with_group(None),
+            ),
+        ] {
+            let refused = check_consolidate_delegation(&actor, &entry);
+            assert!(refused.is_err(), "{label} must be refused");
+            assert!(
+                refused.err().is_some_and(|reason| !reason.is_empty()),
+                "{label} must be refused with a reason"
+            );
+        }
+    }
+
+    /// An ordinary worker holds no delegation at all, consolidator or not.
+    #[test]
+    fn an_ordinary_worker_may_not_integrate_anything() {
+        let actor = consolidator("w6", "agent-a", "round-1").with_role(WorkerRole::Worker);
+        assert_eq!(
+            check_consolidate_delegation(
+                &actor,
+                &target("w1", "agent-a", "round-1", WorkerRole::Worker)
+            ),
+            Err("the caller is not a consolidator".to_string())
+        );
+    }
+
+    impl WorkerRegistryEntry {
+        fn with_owner(mut self, owner: Option<&str>) -> Self {
+            self.owner = owner.map(str::to_string);
+            self
+        }
+
+        fn with_group(mut self, group: Option<&str>) -> Self {
+            self.group = group.map(str::to_string);
+            self
+        }
+    }
+
+    impl WorkerMeta {
+        fn with_role(mut self, role: WorkerRole) -> Self {
+            self.role = role;
+            self
+        }
     }
 }
