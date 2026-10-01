@@ -108,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'kill'.",
         ),
     ),
     (
@@ -120,14 +120,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker (failed, interrupted, killed): never dispatch a replacement.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own.",
+            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own.",
         ),
     ),
     (
@@ -136,10 +136,17 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
     ),
     (
+        "role",
+        "string",
+        DescriptionSource::Static(
+            "'consolidate': integrate this group's completed workers (requires 'group')",
+        ),
+    ),
+    (
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely.",
+            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely.",
         ),
     ),
     (
@@ -165,7 +172,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
         ),
     ),
     (
