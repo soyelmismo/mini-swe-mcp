@@ -15,8 +15,8 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
-    "manifest", "prune", "merge",
+    "dispatch", "status", "steer", "watch", "collect", "review", "approve", "unapprove", "logs",
+    "list", "kill", "reap", "manifest", "prune", "merge",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -36,6 +36,9 @@ pub const LIST_SCOPES: &[&str] = &["mine", "all"];
 
 /// `scope` value that lists every agent's workers.
 pub const LIST_SCOPE_ALL: &str = "all";
+
+/// Accepted values of the `review` `diff` property, default first.
+pub const REVIEW_DIFF_SCOPES: &[&str] = &["code", "all", "none"];
 
 /// Policy applied when a `tools/call` omits the optional `network` property.
 ///
@@ -74,21 +77,21 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "task",
         "string",
         DescriptionSource::Static(
-            "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
+            "ONE focused concern: files in scope and the acceptance gate. Required for 'dispatch'.",
         ),
     ),
     (
         "tasks",
         "array",
         DescriptionSource::Static(
-            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
+            "Batch dispatch: {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
         "repo_path",
         "string",
         DescriptionSource::Static(
-            "Absolute path to repository root (alias: 'path'). Required for 'dispatch'.",
+            "Absolute repository root (alias: 'path'). Required for 'dispatch'.",
         ),
     ),
     (
@@ -106,7 +109,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'kill'.",
+            "Target worker ID (alias: 'id'): a unique 3+ char prefix or 'last'. Required for 'status', 'steer', 'watch', 'collect', 'review', 'approve', 'unapprove', 'logs', 'kill'.",
         ),
     ),
     (
@@ -125,13 +128,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own.",
+            "Worker IDs to watch (prefixes and 'last' as for 'worker_id'); omitted watches every worker you own.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static("Only workers of this group."),
     ),
     (
         "role",
@@ -144,57 +147,64 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely.",
+            "Deadline in seconds for the blocking 'watch'; on expiry it returns {status:'no_event'}. Omit to wait indefinitely.",
         ),
     ),
     (
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash exploration turns (overrides the manifest default). On 'steer', the fresh budget when continuing a stopped worker.",
+            "Maximum bash turns (overrides the manifest default); on 'steer' the fresh budget when continuing a stopped worker.",
         ),
     ),
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model sampling temperature (overrides the manifest default)."),
+        DescriptionSource::Static("Model sampling temperature (overrides the default)."),
     ),
     (
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation.",
+            "Reviewer model that audits and finalizes the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
+            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass '' to disable.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
+            "Listing scope for 'list': 'mine' (default) or 'all' (needs the admin override).",
         ),
     ),
     (
         "full",
         "boolean",
-        DescriptionSource::Static("The whole diff. Optional for 'collect'."),
+        DescriptionSource::Static("The whole diff for 'collect'."),
     ),
     (
         "files",
         "array",
-        DescriptionSource::Static("Paths whose diff to return. Optional for 'collect'."),
+        DescriptionSource::Static("Paths whose diff 'collect' returns."),
+    ),
+    (
+        "diff",
+        "string",
+        DescriptionSource::Static(
+            "Diff scope for 'review': 'code' (default) hides test files, 'all' shows everything, 'none' withholds it.",
+        ),
     ),
     (
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
+            "Network policy: 'offline' isolates every bash step (no egress), 'allow' (default) keeps connectivity.",
         ),
     ),
     (
@@ -236,6 +246,21 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
         schema.insert(
             "default".to_string(),
             Value::String(NETWORK_DEFAULT.to_string()),
+        );
+    }
+    if name == "diff" {
+        schema.insert(
+            "enum".to_string(),
+            Value::Array(
+                REVIEW_DIFF_SCOPES
+                    .iter()
+                    .map(|scope| Value::String((*scope).to_string()))
+                    .collect(),
+            ),
+        );
+        schema.insert(
+            "default".to_string(),
+            Value::String(REVIEW_DIFF_SCOPES[0].to_string()),
         );
     }
     if name == "scope" {
