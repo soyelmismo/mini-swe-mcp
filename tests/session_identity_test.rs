@@ -41,7 +41,11 @@ const TAB_B: &str = "host:opencode:730:12/session:tab-b";
 /// Mode 0700: the client side resolves a watch token through `hub_dir()`, which
 /// refuses a directory that is group or world accessible.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    // Base the hub dir on the daemon's short scratch root, not the raw
+    // `TMPDIR`: a long `TMPDIR` pushes `<dir>/hub.sock` past the Unix socket
+    // limit, where the daemon falls back to an abstract-namespace socket that
+    // a filesystem path cannot reach.
+    let dir = mini_swe_mcp::worktree::swe_base_dir().join(format!(
         "swe-session-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
