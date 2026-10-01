@@ -42,9 +42,10 @@ use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
-    parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
-    parse_report, parse_request_turns, parse_wait_job, summarize_command,
+    COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
+    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+    parse_consolidate_wait, parse_kill_job, parse_report, parse_request_turns, parse_wait_job,
+    summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -60,6 +61,12 @@ pub(super) const NO_COMMAND_NUDGE: &str =
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
 const AUTO_CHECKPOINT_TURNS: usize = 20;
+
+/// Cap on the assistant text scanned for a REPORT block. A block is at most the
+/// four [`REPORT_FIELD_BYTES`] fields plus the command that carries it, so the
+/// newest slice always holds a whole block while a worker that never writes one
+/// cannot grow the scan buffer past this bound.
+const REPORT_SCAN_BYTES: usize = REPORT_FIELD_BYTES * 5;
 
 /// Turns between repository samples of the stagnation detector.
 const STAGNATION_SAMPLE_TURNS: usize = 10;
@@ -558,10 +565,11 @@ pub(super) struct TurnEngine<'a> {
     /// One ask per run: a second would let a confused model trade turns for
     /// completions that never carry one.
     pub report_asked: &'a mut bool,
-    /// The assistant texts of the completion sequence: the completion turn,
-    /// the one follow-up it may cost, and every later replay. The REPORT block
-    /// can be split across them -- the prose of one turn and the bash command
-    /// of another -- so they are scanned together rather than one by one.
+    /// The newest [`REPORT_SCAN_BYTES`] of the completion sequence's assistant
+    /// texts: the completion turn, the one follow-up it may cost, and later
+    /// replays. The REPORT block can be split across them -- the prose of one
+    /// turn and the bash command of another -- so they are scanned together
+    /// rather than one by one, but the buffer never grows past its bound.
     pub report_text: &'a mut String,
 }
 
@@ -569,7 +577,7 @@ pub(super) struct TurnEngine<'a> {
 /// its bash command with `\n` escapes unfolded. A block written as
 /// `printf 'REPORT\ndone: ...'` carries its line breaks as that two-character
 /// escape, so unfolding lets the same parser see it.
-fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) {
+fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) -> Option<WorkerReport> {
     buffer.push_str(&llm_resp.content);
     buffer.push('\n');
     if let Some(command) = &llm_resp.command {
@@ -577,6 +585,16 @@ fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) {
         buffer.push_str(&command);
         buffer.push('\n');
     }
+    // Parse before trimming: a block that arrives just before an oversized
+    // command is still seen. Then keep only the newest slice, at a character
+    // boundary, so a worker that never writes a block cannot grow this second
+    // conversation buffer without bound.
+    let parsed = parse_report(buffer);
+    if buffer.len() > REPORT_SCAN_BYTES {
+        let cut = buffer.ceil_char_boundary(buffer.len() - REPORT_SCAN_BYTES);
+        buffer.drain(..cut);
+    }
+    parsed
 }
 
 impl<'a> TurnEngine<'a> {
@@ -747,13 +765,19 @@ impl<'a> TurnEngine<'a> {
         // into the bash command that requests completion. Every assistant
         // text from the completion sequence onward is scanned together.
         if config.apply_sentinels
+            && self.report.is_none()
             && (*self.report_asked
                 || llm_resp
                     .command
                     .as_deref()
                     .is_some_and(is_completion_request))
         {
-            append_report_text(self.report_text, &llm_resp);
+            // The scan returns the block the moment it appears, before the
+            // buffer trims, so a block seen before a long stretch of
+            // sentinel-less turns cannot be lost to the bound.
+            if let Some(parsed) = append_report_text(self.report_text, &llm_resp) {
+                *self.report = Some(parsed);
+            }
         }
 
         // --- Command extraction ---
@@ -1120,12 +1144,13 @@ impl<'a> TurnEngine<'a> {
             *self.last_assistant_text = llm_resp.content.clone();
         }
 
-        // The completion turn must carry a REPORT block. A worker that omits
-        // one is asked exactly once, before any git work: the answer is what
-        // the orchestrator reads, so it is worth one turn and never more.
-        match (require_report, parse_report(self.report_text)) {
-            (true, Some(parsed)) => *self.report = Some(parsed),
-            (true, None) if !*self.report_asked => {
+        // The completion turn must carry a REPORT block, which the response
+        // scanner stores the moment it appears. A worker that omitted one is
+        // asked exactly once, before any git work: the answer is what the
+        // orchestrator reads, so it is worth one turn and never more.
+        match (require_report, self.report.is_some()) {
+            (true, true) => {}
+            (true, false) if !*self.report_asked => {
                 *self.report_asked = true;
                 info!(
                     worker = %self.worker_id,
@@ -1859,11 +1884,65 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, ReadOnlyNudge,
+        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, extension_budget,
-        named_file_defaults, parse_shortstat, parse_threshold, read_only_escalation_text,
+        append_report_text, named_file_defaults, parse_shortstat, parse_threshold, read_only_escalation_text,
         read_only_nudge_text, read_only_thresholds, task_names_files,
     };
+
+    /// A response with no tool call and no reasoning, for scan-buffer tests.
+    fn scanned(content: &str, command: Option<&str>) -> LlmResponse {
+        LlmResponse {
+            content: content.to_string(),
+            reasoning_content: None,
+            command: command.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+            invalid_utf8_lines: 0,
+        }
+    }
+
+    #[test]
+    fn the_report_scan_buffer_is_bounded_to_its_newest_bytes() {
+        let long = "界".repeat(4096);
+        let mut buffer = String::new();
+        for _ in 0..64 {
+            append_report_text(&mut buffer, &scanned(&long, Some(&"y".repeat(4096))));
+            assert!(
+                buffer.len() <= REPORT_SCAN_BYTES,
+                "the scan buffer grew past its bound: {}",
+                buffer.len()
+            );
+        }
+        // The newest message is what the scan returns, however much bounded
+        // text came before it.
+        let report = append_report_text(
+            &mut buffer,
+            &scanned(
+                "REPORT\ndone: bounded scan\nfiles: src/a.rs\ntests: cargo test: passed\nrisks: none\n",
+                None,
+            ),
+        )
+        .expect("the newest block must survive the bound");
+        assert_eq!(report.done, "bounded scan");
+        assert!(buffer.len() <= REPORT_SCAN_BYTES);
+    }
+
+    #[test]
+    fn a_report_block_split_across_messages_still_parses() {
+        let mut buffer = String::new();
+        assert_eq!(
+            append_report_text(&mut buffer, &scanned("REPORT\n", None)),
+            None
+        );
+        let report = append_report_text(
+            &mut buffer,
+            &scanned("done: split capture\nfiles: src/a.rs\n", None),
+        )
+        .expect("a block split across turns must parse");
+        assert_eq!(report.done, "split capture");
+        assert_eq!(report.files, "src/a.rs");
+    }
 
     #[test]
     fn self_grant_budget_is_half_the_dispatch_budget() {
