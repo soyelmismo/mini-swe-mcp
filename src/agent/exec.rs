@@ -1337,9 +1337,8 @@ mod tests {
     /// operator did not set, so debug info and backtraces stay complete.
     #[test]
     fn worker_build_debug_suppresses_the_diet_defaults() {
-        let keep_debug = |name: &str| {
-            (name == WORKER_BUILD_DEBUG_VAR).then(|| std::ffi::OsString::from("1"))
-        };
+        let keep_debug =
+            |name: &str| (name == WORKER_BUILD_DEBUG_VAR).then(|| std::ffi::OsString::from("1"));
         assert!(cargo_artifact_diet(&keep_debug).is_empty());
 
         // Only `1` is the opt-out; any other value keeps the diet.
