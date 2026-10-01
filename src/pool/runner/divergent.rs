@@ -152,9 +152,14 @@ pub fn divergent_environment(
     last
 }
 
-/// A fresh per-worktree directory for variant B, beside the canonical one.
+/// A fresh per-worktree directory for variant B, inside the worker's private
+/// scratch (writable in the sandbox, removed at teardown).
+///
+/// It is kept SHORT on purpose: suites create Unix sockets under `TMPDIR`, and
+/// a socket path must fit in 108 bytes, so a deep variant-B `TMPDIR` made
+/// otherwise hermetic suites fail for a reason that is not theirs.
 fn divergent_dir(worktree: &Path, name: &str) -> PathBuf {
-    worktree.join("target").join("divergent").join(name)
+    crate::worktree::scratch_dir(worktree).join(format!("vb-{name}"))
 }
 
 /// The names variant B changes relative to the canonical environment.
@@ -640,8 +645,8 @@ mod tests {
             .map(|(_, value)| value.clone())
             .expect("HOME is always set");
         assert!(
-            Path::new(&home).starts_with(&worktree),
-            "the divergent HOME must stay inside the worktree, got {home:?}"
+            Path::new(&home).starts_with(crate::worktree::scratch_dir(&worktree)),
+            "the divergent HOME must stay inside the worker's private scratch, got {home:?}"
         );
         let _ = std::fs::remove_dir_all(&worktree);
     }
