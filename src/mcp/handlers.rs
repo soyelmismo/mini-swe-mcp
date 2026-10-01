@@ -715,6 +715,7 @@ impl McpServer {
                         "step": entry.step,
                         "turns": entry.step,
                         "summary": entry.last_command.clone(),
+                        "verified": entry.verified,
                         "report": entry.report,
                         "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                         "question": entry.question,

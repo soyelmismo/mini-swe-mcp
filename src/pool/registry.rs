@@ -151,6 +151,12 @@ pub struct WorkerRegistryEntry {
     /// is unreviewed. Persisted so it survives the in-memory eviction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<WorkerApproval>,
+    /// Whether the completion passed its verify gate. Written with the terminal
+    /// row and cleared when a revision restarts the worker, so a view built
+    /// from the row alone still reports it. `#[serde(default)]` keeps a row
+    /// written before the flag was recorded readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -185,6 +191,9 @@ pub struct WorkerMeta {
     /// The completion report, set by the phase loop once the worker has
     /// finished and written with the terminal row.
     pub report: Option<WorkerReport>,
+    /// Whether the completion passed its verify gate, written with the
+    /// terminal row so the row carries the same verdict as the report.
+    pub verified: Option<bool>,
 }
 
 impl WorkerMeta {
@@ -225,6 +234,7 @@ impl WorkerMeta {
             auto_continues: self.auto_continues,
             report: self.report.clone(),
             approved: None,
+            verified: self.verified,
         }
     }
 
@@ -703,6 +713,7 @@ mod recovery_cleanup_tests {
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         }
     }
 

@@ -550,9 +550,11 @@ impl WorkerPool {
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
 
-        // The report travels with the meta so the terminal row carries it: the
-        // in-memory record is evicted after its TTL, the row is not.
+        // The report and its verification verdict travel with the meta so the
+        // terminal row carries them: the in-memory record is evicted after its
+        // TTL, the row is not.
         meta.report = report;
+        meta.verified = verified;
         self.save_status(
             meta,
             &model,

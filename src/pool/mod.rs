@@ -682,6 +682,7 @@ impl WorkerPool {
             revision: 0,
             auto_continues: 0,
             report: None,
+            verified: None,
         };
 
         let initial_record = WorkerRecord {
@@ -1023,6 +1024,7 @@ impl WorkerPool {
                     "started_at": e.started_at,
                 },
                 "total_steps": e.step,
+                "verified": e.verified,
                 "approved": e.approved,
                 // Registry rows are cross-process and carry no in-memory log
                 // buffer, so the retention counters are reported as 0/0 rather
@@ -1132,8 +1134,8 @@ impl WorkerPool {
     /// [`round::build`] probes the repository with. The registry is the only
     /// cross-process record of a group, so a worker this process never
     /// dispatched (a hub restart, another connection) is still listed; the
-    /// in-process state is consulted only for the verification outcome, which
-    /// no registry row carries.
+    /// verification outcome comes from the in-process state when this process
+    /// still holds it and from the row's persisted copy otherwise.
     ///
     /// `repo` is the repository the dispatch will run in, used when the rows
     /// name none.
@@ -1161,9 +1163,11 @@ impl WorkerPool {
             if base_hint.is_none() {
                 base_hint = entry.base_branch.clone();
             }
+            // The completion write persists the verdict on the row, so a
+            // worker whose record this process no longer holds still says it.
             let verified = match self.get_worker_state(&entry.id).await {
-                Some(WorkerState::Completed { verified, .. }) => verified,
-                _ => None,
+                Some(WorkerState::Completed { verified, .. }) => verified.or(entry.verified),
+                _ => entry.verified,
             };
             rows.push(RoundRow {
                 id: entry.id,
@@ -2001,7 +2005,7 @@ impl WorkerPool {
                 completed_at: entry.updated_at,
                 artifacts: Vec::new(),
                 branch: Some(format!("worker-{id}")),
-                verified: None,
+                verified: entry.verified,
                 metrics: entry.metrics,
                 revision: entry.revision,
                 report: entry.report.clone(),
@@ -2264,6 +2268,7 @@ mod consolidate_delegation_tests {
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
             report: None,
+            verified: None,
         }
     }
 
@@ -2292,6 +2297,7 @@ mod consolidate_delegation_tests {
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         }
     }
 

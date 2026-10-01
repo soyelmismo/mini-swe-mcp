@@ -1290,6 +1290,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);

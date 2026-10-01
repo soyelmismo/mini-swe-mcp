@@ -137,6 +137,7 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

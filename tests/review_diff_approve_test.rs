@@ -155,6 +155,7 @@ fn registry_row(
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

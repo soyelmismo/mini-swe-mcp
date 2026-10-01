@@ -720,5 +720,6 @@ fn meta(id: &str) -> mini_swe_mcp::pool::WorkerMeta {
         auto_continues: 0,
         metrics: mini_swe_mcp::pool::WorkerMetrics::default(),
         report: None,
+        verified: None,
     }
 }

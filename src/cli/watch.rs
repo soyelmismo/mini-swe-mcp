@@ -111,7 +111,7 @@ fn registry_snapshot_row(entry: &WorkerRegistryEntry, now: u64) -> Value {
         "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
         "metrics":entry.metrics, "branch":null, "revision":0, "summary":null,
         "task":clamp_string(entry.task.lines().next().unwrap_or(""), 500),
-        "verified":null, "report":entry.report,
+        "verified":entry.verified, "report":entry.report,
         "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
 }
 

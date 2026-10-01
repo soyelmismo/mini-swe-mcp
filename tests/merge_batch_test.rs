@@ -116,6 +116,7 @@ impl Fixture {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -620,6 +621,7 @@ fn workers_of_two_repositories_are_refused() {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        verified: None,
     };
     save_registry_entry_in(&f.root(), &entry);
 

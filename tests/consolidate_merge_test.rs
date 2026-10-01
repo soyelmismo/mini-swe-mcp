@@ -97,6 +97,7 @@ impl Harness {
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -116,6 +117,7 @@ impl Harness {
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
             report: None,
+            verified: None,
         }
     }
 
