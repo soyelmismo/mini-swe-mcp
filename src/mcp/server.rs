@@ -688,6 +688,27 @@ impl McpServer {
         self.shutdown.subscribe()
     }
 
+    /// Retire a set of already-landed workers from every long-lived view.
+    ///
+    /// The one place the two halves of a retirement meet: each id is forgotten
+    /// through the event router (so its queued events can never replay and its
+    /// acknowledged positions leave memory and disk together) and its live
+    /// record is dropped from the pool (so `list` stops showing it). Ids are
+    /// de-duplicated first, because a merge reports its own round *and* the
+    /// sweep reports what it reached, which overlap.
+    pub(crate) async fn retire_and_forget<I>(&self, ids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            self.forget_retired_worker(id).await;
+        }
+        self.pool.forget_retired_workers(&ids).await;
+    }
+
     /// Drop the watch acknowledgements of a retired `worker_id`.
     ///
     /// On the router's own lock, so the in-memory ack store and the file it

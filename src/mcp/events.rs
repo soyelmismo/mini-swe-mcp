@@ -770,15 +770,26 @@ impl EventRouter {
         self.connections.insert(ctx.id, (agent, ctx.is_admin(), tx));
     }
 
-    /// Forget every acknowledged position of a retired `worker_id`.
+    /// Forget every trace of a retired `worker_id`.
     ///
     /// Called on the router's own lock, so the in-memory store and its file
     /// cannot drift: the edit happens between two `persist` calls rather than
-    /// racing one.
+    /// racing one. It drops the *whole* replay state, not only the acknowledged
+    /// positions: a queued or already-reported event for a retired worker would
+    /// otherwise be delivered to a session that starts after the retirement,
+    /// telling its owner to review work that is already in the base branch.
     pub(super) fn forget_worker(&mut self, worker_id: &str) {
         self.acks.forget(worker_id);
         self.seen.remove(worker_id);
         self.watch_reported.remove(worker_id);
+        self.watch_current.remove(worker_id);
+        self.latest
+            .retain(|(_, event)| event.worker_id != worker_id);
+        for history in self.watch_history.values_mut() {
+            history
+                .pending
+                .retain(|event| event["worker_id"] != worker_id);
+        }
     }
 
     pub(super) fn remove(&mut self, id: u64) {

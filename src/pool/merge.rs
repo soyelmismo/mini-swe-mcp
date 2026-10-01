@@ -33,7 +33,6 @@ use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
 use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
-    retire_worker_with,
 };
 use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
@@ -708,12 +707,13 @@ fn merge_subject(task: &str, worker_id: &str) -> String {
 /// any hiding logic.
 ///
 /// `--no-delete` is the one exception: the operator asked to keep the branch, so
-/// the branch stays and only the scratch traces are reclaimed. A sweep does not
-/// see a branch that outlived its merge and therefore leaves that worker alone
-/// until the branch itself goes.
+/// the branch and its registry row stay and only the scratch traces are
+/// reclaimed. The row is marked [`keep_branch`](super::WorkerRegistryEntry::keep_branch),
+/// so the sweep skips that worker for as long as the branch lives -- a durable
+/// decision, not a one-off exemption.
 ///
-/// Returns whether the branch was deleted and what was reclaimed, in the words
-/// the CLI prints.
+/// Returns whether the branch was deleted, what was reclaimed and every worker
+/// actually retired, in the words the CLI prints.
 fn cleanup(
     root: &ScratchRoot,
     worker_id: &str,
@@ -741,13 +741,18 @@ fn cleanup(
     // would then skip the round below for a merge that did land.
     let outcome = retire_worker_reporting(root, worker_id, &ctx);
 
-    // Only a consolidator whose own ref is gone has its round retired: with
-    // `--no-delete` the operator kept it, so the round stays a known round.
     // Every worker this merge actually retired, so the caller can drop the
     // acknowledgements and live records those ids still hold. `--no-delete`
     // retires nobody: the branch, row and history all stay.
+    //
+    // The *row* result gates this, not the branch result. `git branch -D`
+    // legitimately fails when another worktree still has the branch checked out,
+    // yet the row, history and mailbox are removed regardless -- so gating on
+    // the branch would leak exactly the records and acknowledgements this
+    // propagation exists to clean.
     let mut retired: Vec<String> = Vec::new();
-    if outcome.branch_deleted && !keep_branch {
+    let mut round_retired = 0;
+    if !keep_branch {
         for id in &integrated {
             // A worker may have been revised after its earlier tip was
             // integrated: its branch then holds work the base does not have, and
@@ -758,10 +763,14 @@ fn cleanup(
             if !branch_is_integrated_in(root, repo, id, base_branch) {
                 continue;
             }
-            retire_worker_with(root, id, &ctx);
-            retired.push(id.clone());
+            if retire_worker_reporting(root, id, &ctx).row_removed {
+                retired.push(id.clone());
+                round_retired += 1;
+            }
         }
-        retired.push(worker_id.to_string());
+        if outcome.row_removed {
+            retired.push(worker_id.to_string());
+        }
     }
 
     let mut cleaned = Vec::new();
@@ -770,10 +779,9 @@ fn cleanup(
     } else if keep_branch {
         cleaned.push(format!("branch {branch} kept (--no-delete)"));
     }
-    if retired.len() > 1 {
+    if round_retired > 0 {
         cleaned.push(format!(
-            "{} other integrated worker(s) retired with the round",
-            retired.len() - 1
+            "{round_retired} integrated worker(s) retired with the round"
         ));
     }
     cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());

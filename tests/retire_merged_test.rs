@@ -168,6 +168,20 @@ impl Fixture {
         .map(|_| ())
     }
 
+    /// `merge <id>` returning the full report, for tests that inspect what the
+    /// merge retired.
+    fn merge_report(&self, id: &str) -> anyhow::Result<mini_swe_mcp::pool::MergeReport> {
+        merge_worker_in(
+            &self.root(),
+            &MergeRequest {
+                worker_id: id,
+                verified: Some(true),
+                keep_branch: false,
+                admission: None,
+            },
+        )
+    }
+
     /// One sweep pass over this fixture's scratch root.
     fn sweep(&self) -> mini_swe_mcp::pool::RetireSweep {
         sweep_retired_workers_in(&self.root(), None)
@@ -353,12 +367,27 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
         ),
     );
 
-    // 6. A history the sweep cannot place at all (unreadable first line): its
-    //    unreachability is unproven, so it must survive.
+    // 6. A standalone ownerless companion: no history, no row. Its branch is
+    //    probed against every repository the registry names, and none has it, so
+    //    it is an orphan and goes -- the whole point of the sweep.
+    write(f.scratch.path(), "swe-wt-s1.steer", "guidance for nobody\n");
     write(
         f.scratch.path(),
-        "swe-wt-k2.history.jsonl",
-        "not json at all\n",
+        "swe-wt-s2.steer-source",
+        "{\"consolidator\":\"gone\",\"base\":\"abc\"}\n",
+    );
+
+    // 7. A rowless companion whose branch STILL LIVES: its file must survive,
+    //    because the branch makes it reachable even with no row.
+    f.commit_on_worker_branch("s3", "s3.txt", "s3\n");
+    write(f.scratch.path(), "swe-wt-s3.steer", "live guidance\n");
+    write(
+        f.scratch.path(),
+        "swe-wt-s3.history.jsonl",
+        &format!(
+            "{{\"repo_path\":\"{}\",\"branch\":\"worker-s3\"}}\n",
+            f.repo().display()
+        ),
     );
 
     let sweep = f.sweep();
@@ -387,8 +416,13 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
         "a rowless history whose branch still exists must be kept: it is the only record of work still in git"
     );
     assert!(
-        f.history_exists("k2"),
-        "a history whose repository cannot be read must be kept: unreachability is unproven"
+        !f.scratch.path().join("swe-wt-s1.steer").exists()
+            && !f.scratch.path().join("swe-wt-s2.steer-source").exists(),
+        "standalone ownerless companions whose branch no known repository has must be deleted"
+    );
+    assert!(
+        f.scratch.path().join("swe-wt-s3.steer").exists(),
+        "a rowless companion whose branch still lives must be kept"
     );
 
     // The unmerged completed worker is untouched: still listed, still
@@ -804,5 +838,168 @@ async fn the_mcp_merge_path_forgets_the_retired_workers_acknowledgements() {
         "the retired worker's acknowledgement must be gone from the store: {acked}"
     );
 
+    events.abort();
+}
+
+/// A failed branch deletion still retires the row, history and acknowledgements.
+///
+/// `git branch -D` legitimately fails when another worktree still has the branch
+/// checked out, but the row and history are removed regardless. The merge
+/// report must therefore name the worker as retired on the *row* result, or
+/// those removals leak a live record and stale acknowledgements.
+#[test]
+fn a_failed_branch_deletion_still_reports_the_worker_as_retired() {
+    let f = Fixture::new("retire-external-worktree");
+    f.commit_on_worker_branch("ew1", "ew1.txt", "ew1\n");
+    f.record_with_verify("ew1", Some("true"));
+
+    // An external worktree pins `worker-ew1`, so its deletion must fail.
+    let external = f.scratch.path().join("external-wt");
+    let created = git(
+        f.repo(),
+        &["worktree", "add", external.to_str().unwrap(), "worker-ew1"],
+    );
+    assert!(
+        git_ref_exists(f.repo(), "worker-ew1"),
+        "the external worktree must pin the branch: {created}"
+    );
+
+    let report = f
+        .merge_report("ew1")
+        .expect("the merge itself must succeed");
+    assert!(
+        !report.branch_deleted,
+        "the branch cannot be deleted while a worktree holds it: {report:?}"
+    );
+    assert!(
+        report.retired.contains(&"ew1".to_string()),
+        "the worker is still retired (row, history, acks) and must be reported: {report:?}"
+    );
+    assert!(
+        !f.row_exists("ew1"),
+        "the row is removed even when the branch deletion fails"
+    );
+    assert!(
+        !f.history_exists("ew1"),
+        "the history is removed even when the branch deletion fails"
+    );
+}
+
+/// The real MCP consolidator path retires the whole round from every view: no
+/// live records in `list`, and no acknowledgements in memory or on disk.
+#[tokio::test]
+async fn the_mcp_consolidator_merge_retires_its_round_from_every_view() {
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
+
+    let f = Fixture::new("retire-mcp-round");
+    for id in ["cr-a", "cr-b"] {
+        f.commit_on_worker_branch(id, &format!("{id}.txt"), &format!("{id}\n"));
+        f.record(id);
+    }
+    f.commit_on_worker_branch("crcons", "crcons.txt", "consolidated\n");
+    git(f.repo(), &["checkout", "-q", "worker-crcons"]);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate a", "worker-cr-a"],
+    );
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate b", "worker-cr-b"],
+    );
+    git(f.repo(), &["checkout", "-q", "main"]);
+    f.record_with_verify("crcons", Some("true"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            task: "consolidate".to_string(),
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 1,
+            owner: Some("agent-a".to_string()),
+            repo_path: Some(f.repo().to_string_lossy().into_owned()),
+            base_branch: Some("main".to_string()),
+            integrated: vec!["cr-a".to_string(), "cr-b".to_string()],
+            ..WorkerRegistryEntry::test_row("crcons", "agent-a")
+        },
+    );
+
+    let hub = f.scratch.path().join("hub");
+    std::fs::create_dir_all(&hub).unwrap();
+    std::fs::write(
+        hub.join("watch_acks.json"),
+        r#"{"agent-a":{"crcons":{"revision":1,"event":"completed"},"cr-a":{"revision":1,"event":"completed"},"cr-b":{"revision":1,"event":"completed"}}}"#,
+    )
+    .unwrap();
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    // Every worker is a live, verified completion owned by the merge caller.
+    for id in ["crcons", "cr-a", "cr-b"] {
+        pool.__test_insert_worker(WorkerRecord {
+            id: id.to_string(),
+            task: "do the work".to_string(),
+            model: "test".to_string(),
+            owner: "agent-a".to_string(),
+            state: WorkerState::Completed {
+                turns: 3,
+                diff: "1 file changed".to_string(),
+                summary: "done".to_string(),
+                completed_at: 1,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
+                verified: Some(true),
+                metrics: WorkerMetrics::default(),
+                report: None,
+                revision: 0,
+            },
+            metrics: WorkerMetrics::default(),
+            logs: mini_swe_mcp::pool::LogBuffer::new(),
+            pending_steer: Vec::new(),
+            resume_tx: None,
+            handle: None,
+            revision: 0,
+        })
+        .await;
+    }
+
+    let server = mini_swe_mcp::mcp::McpServer::new(pool.clone(), "agent-a".to_string());
+    let events = server.start_hub_events(Some(&hub)).await;
+    let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
+    ctx.agent_id = Some("agent-a".to_string());
+    let result = server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "merge", "worker_id": "crcons"}),
+            &ctx,
+        )
+        .await
+        .expect("the consolidator merge must succeed");
+    assert!(result.get("worker_id").is_some(), "{result}");
+
+    // Persisted acknowledgements: none of the round survives.
+    let acked: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.join("watch_acks.json")).unwrap()).unwrap();
+    for id in ["crcons", "cr-a", "cr-b"] {
+        assert!(
+            acked.get("agent-a").and_then(|a| a.get(id)).is_none(),
+            "{id} must not keep an acknowledgement: {acked}"
+        );
+    }
+    // Live records: `list` no longer shows any of them.
+    let listed: Vec<String> = pool
+        .list_workers()
+        .await
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    for id in ["crcons", "cr-a", "cr-b"] {
+        assert!(
+            !listed.iter().any(|seen| seen == id),
+            "{id} must leave the live list: {listed:?}"
+        );
+    }
     events.abort();
 }
