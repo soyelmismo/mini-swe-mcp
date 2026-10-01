@@ -190,7 +190,8 @@ async fn collect_defaults_to_the_stat_and_withholds_the_diff() {
     assert_eq!(payload["verified"], true);
     assert_eq!(payload["branch"], "worker-col-default");
     assert_eq!(
-        payload["state"]["details"]["diff"], Value::Null,
+        payload["state"]["details"]["diff"],
+        Value::Null,
         "the default collect must not carry the diff: {payload}"
     );
     let stat = &payload["diff_stat"];
@@ -256,7 +257,10 @@ async fn collect_files_returns_only_those_paths() {
     let diff = payload["state"]["details"]["diff"]
         .as_str()
         .expect("a named file must still return its diff");
-    assert!(diff.contains("diff --git a/README.md b/README.md"), "{diff}");
+    assert!(
+        diff.contains("diff --git a/README.md b/README.md"),
+        "{diff}"
+    );
     assert!(
         !diff.contains("src/parser.rs"),
         "a file that was not named must not be returned: {diff}"
@@ -284,7 +288,10 @@ async fn collect_refuses_a_stranger() {
         )
         .await
         .expect_err("another agent's worker must be refused");
-    assert_eq!(error.to_string(), "worker col-owner belongs to agent review-agent");
+    assert_eq!(
+        error.to_string(),
+        "worker col-owner belongs to agent review-agent"
+    );
 }
 
 /// A `review` of a branch that still merges says so, and names the merge.
@@ -294,10 +301,7 @@ async fn review_reports_a_clean_merge() {
     let repo = branch_repo(&scratch);
     let owned = IsolatedPool::new(4, "review-clean-pool");
     let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
-    save_registry_entry_in(
-        &owned.root(),
-        &registry_row("rev-clean", &repo, 2),
-    );
+    save_registry_entry_in(&owned.root(), &registry_row("rev-clean", &repo, 2));
 
     let payload = server
         .execute_tool_for(
@@ -316,7 +320,9 @@ async fn review_reports_a_clean_merge() {
     assert_eq!(payload["merge"]["conflicts"], json!([]));
     assert_eq!(payload["next_command"], "git merge worker-rev-clean");
     // The stat is measured from the branch the orchestrator would merge.
-    let per_file = payload["diff_stat"]["per_file"].as_array().expect("per-file");
+    let per_file = payload["diff_stat"]["per_file"]
+        .as_array()
+        .expect("per-file");
     assert_eq!(per_file.len(), 1);
     assert_eq!(per_file[0]["path"], "added.txt");
     assert_eq!(per_file[0]["insertions"], 1);
@@ -330,10 +336,7 @@ async fn review_reports_a_conflicting_merge() {
     let repo = branch_repo(&scratch);
     let owned = IsolatedPool::new(4, "review-conflict-pool");
     let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
-    save_registry_entry_in(
-        &owned.root(),
-        &registry_row("rev-conflict", &repo, 0),
-    );
+    save_registry_entry_in(&owned.root(), &registry_row("rev-conflict", &repo, 0));
 
     let payload = server
         .execute_tool_for(

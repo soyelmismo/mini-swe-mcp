@@ -614,7 +614,10 @@ impl McpServer {
         let base_branch = entry
             .as_ref()
             .and_then(|entry| entry.base_branch.clone())
-            .or_else(|| repo.as_deref().and_then(crate::pool::revision::detect_base_branch));
+            .or_else(|| {
+                repo.as_deref()
+                    .and_then(crate::pool::revision::detect_base_branch)
+            });
         // A live worker's diff is the exact text it produced; a collected one
         // has only its branch left, so its stat is measured from that.
         let live_diff = match &state {
@@ -1068,10 +1071,14 @@ fn completed_fields(
     }
 }
 
-/// The first line of a task: an agent writes a heading and a body, and only the
-/// heading belongs in a compact view.
+/// The first line of a task that says something: an agent writes a heading and
+/// a body, and only the heading belongs in a compact view.
 fn first_line(text: &str) -> String {
-    text.lines().next().unwrap_or_default().trim().to_string()
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The lifecycle name of a worker, from its live state when it still has one
@@ -1111,12 +1118,7 @@ fn verify_tail(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
         .iter()
         .rev()
         .find(|entry| entry.command.starts_with("[verify]"))?;
-    let mut lines: Vec<&str> = entry
-        .output
-        .lines()
-        .rev()
-        .take(VERIFY_TAIL_LINES)
-        .collect();
+    let mut lines: Vec<&str> = entry.output.lines().rev().take(VERIFY_TAIL_LINES).collect();
     lines.reverse();
     Some(
         lines
@@ -1228,7 +1230,9 @@ fn branch_file_stats(repo: &std::path::Path, base_branch: &str, branch: &str) ->
     if !merge_base.status.success() {
         return Vec::new();
     }
-    let base = String::from_utf8_lossy(&merge_base.stdout).trim().to_string();
+    let base = String::from_utf8_lossy(&merge_base.stdout)
+        .trim()
+        .to_string();
     if base.is_empty() {
         return Vec::new();
     }
@@ -1249,8 +1253,8 @@ fn parse_numstat(text: &str) -> Vec<DiffFileStat> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
-            let insertions = fields.next()?.parse::<usize>().ok()?;
-            let deletions = fields.next()?.parse::<usize>().ok()?;
+            let insertions = numstat_count(fields.next()?)?;
+            let deletions = numstat_count(fields.next()?)?;
             let path = fields.next()?;
             Some(DiffFileStat {
                 path: normalize_diff_path(path),
@@ -1259,6 +1263,15 @@ fn parse_numstat(text: &str) -> Vec<DiffFileStat> {
             })
         })
         .collect()
+}
+
+/// One `--numstat` count: a number, or `0` for the `-` a binary file carries.
+fn numstat_count(field: &str) -> Option<usize> {
+    Some(if field == "-" {
+        0
+    } else {
+        field.parse::<usize>().ok()?
+    })
 }
 
 /// One file's share of a diff, as `git diff --numstat` reports it.
@@ -1300,37 +1313,73 @@ fn diff_header_path(header: &str) -> Option<String> {
     (path != "/dev/null").then(|| normalize_diff_path(path))
 }
 
-/// Split a unified diff into one `(path, section)` pair per file.
-///
-/// The path comes from the `---`/`+++` headers, which precede every hunk, so a
-/// removed line that happens to start with `--` can never be mistaken for one.
-fn diff_sections(diff: &str) -> Vec<(String, String)> {
-    let mut sections: Vec<(String, String)> = Vec::new();
-    let mut current: Option<(String, String)> = None;
-    for line in diff.lines() {
-        if line.starts_with("diff --") {
-            sections.extend(current.take());
-            current = Some((String::new(), format!("{line}\n")));
-            continue;
-        }
-        let Some((path, body)) = current.as_mut() else {
-            continue;
-        };
-        body.push_str(line);
-        body.push('\n');
-        if path.is_empty() {
-            if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
-                *path = found;
-            } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
-                *path = found;
-            }
+/// One file's section of a diff, while it is still being read.
+struct DiffSection {
+    /// The path as the "after" side spells it.
+    path: String,
+    /// The path as the "before" side spells it, for a file that was deleted.
+    minus: String,
+    body: String,
+}
+
+impl DiffSection {
+    /// The path the section is about: the "after" side when the file still
+    /// exists, the "before" side when it does not.
+    fn path(&self) -> &str {
+        if self.path.is_empty() {
+            &self.minus
+        } else {
+            &self.path
         }
     }
-    sections.extend(current);
+}
+
+/// Split a unified diff into one `(path, section)` pair per file.
+///
+/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
+/// removed line that happens to start with `--` can never be mistaken for one.
+/// A section with neither header — a binary file, a mode-only change — falls
+/// back to the paths its `diff --git` line names.
+fn diff_sections(diff: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<DiffSection> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            if let Some(section) = current.take() {
+                sections.push((section.path().to_string(), section.body));
+            }
+            current = Some(DiffSection {
+                path: diff_git_path(header).unwrap_or_default(),
+                minus: String::new(),
+                body: format!("{line}\n"),
+            });
+            continue;
+        }
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        section.body.push_str(line);
+        section.body.push('\n');
+        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
+            section.minus = found;
+        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
+            section.path = found;
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push((section.path().to_string(), section.body));
+    }
     sections
         .into_iter()
         .filter(|(path, _)| !path.is_empty())
         .collect()
+}
+
+/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
+fn diff_git_path(header: &str) -> Option<String> {
+    let split = header.rfind(" b/")?;
+    let path = &header[..split];
+    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
 }
 
 /// Per-file `(path, insertions, deletions)` of a unified diff.
@@ -1661,9 +1710,22 @@ mod tests {
             "-old\n",
             "+new\n",
         );
-        assert_eq!(diff_of_files(diff, &["src/a.rs".to_string()]).lines().count(), 5);
-        assert_eq!(diff_of_files(diff, &["a.rs".to_string()]).lines().count(), 5);
-        assert_eq!(diff_of_files(diff, &["b.rs".to_string()]).lines().count(), 5);
+        // Six lines: the `diff --git` header, the two path headers, the hunk
+        // header and the two changed lines.
+        assert_eq!(
+            diff_of_files(diff, &["src/a.rs".to_string()])
+                .lines()
+                .count(),
+            6
+        );
+        assert_eq!(
+            diff_of_files(diff, &["a.rs".to_string()]).lines().count(),
+            6
+        );
+        assert_eq!(
+            diff_of_files(diff, &["b.rs".to_string()]).lines().count(),
+            6
+        );
         assert!(diff_of_files(diff, &["nope.rs".to_string()]).is_empty());
     }
 
@@ -1698,7 +1760,10 @@ mod tests {
             conflicts: Vec::new(),
             error: None,
         };
-        assert_eq!(next_command("w1", "worker-w1", Some(&clean)), "git merge worker-w1");
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&clean)),
+            "git merge worker-w1"
+        );
 
         let mut conflicting = clean;
         conflicting.clean = Some(false);
@@ -1730,6 +1795,7 @@ mod tests {
     fn the_review_view_is_bounded() {
         assert_eq!(first_line("Fix the parser\nand its docs"), "Fix the parser");
         assert_eq!(first_line("   \n  padded  "), "padded");
+        assert_eq!(first_line("  \n\n"), "");
 
         let build = AgentStepLog {
             step: 1,

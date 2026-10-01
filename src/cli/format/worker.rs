@@ -232,10 +232,17 @@ fn push_verified_line(out: &mut String, verified: Option<&serde_json::Value>) {
 /// base tip, and the command that acts on that answer.
 pub fn format_review(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
-    let state = val.get("state").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let state = val
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
     let revision = val.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
     let mut out = format!("Worker {wid} ({state}) revision {revision}\n");
-    if let Some(task) = val.get("task").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
+    if let Some(task) = val
+        .get("task")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
         out.push_str(&format!("Task: {task}\n"));
     }
     push_verified_line(&mut out, val.get("verified"));

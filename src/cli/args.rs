@@ -5,7 +5,7 @@
 //! callers share one validation and rendering implementation.
 
 use anyhow::Result;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
 pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate)";
@@ -218,6 +218,7 @@ pub fn action_of(cli_args: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
