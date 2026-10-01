@@ -618,7 +618,8 @@ mod tests {
 
     #[test]
     fn the_divergent_environment_shifts_home_tmpdir_and_tz() {
-        let worktree = scratch("env");
+        let guard = crate::test_support::TestScratch::own(scratch("env"));
+        let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
             &[("SWE_DIVERGENT_PROBE".to_string(), "set".to_string())],
@@ -653,7 +654,8 @@ mod tests {
 
     #[test]
     fn a_dispatcher_variable_cannot_override_the_deliberate_divergence() {
-        let worktree = scratch("override");
+        let guard = crate::test_support::TestScratch::own(scratch("override"));
+        let worktree = guard.path().to_path_buf();
         let env = divergent_environment(
             &worktree,
             &[

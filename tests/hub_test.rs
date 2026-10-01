@@ -10,7 +10,7 @@ use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -19,11 +19,8 @@ use tokio::net::{TcpListener, UnixStream};
 ///
 /// The name stays short (see [`common::scratch_name`]) because the daemon binds
 /// a Unix socket inside it and `sun_path` is length-bounded.
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(common::scratch_name("hub"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch hub dir");
-    dir
+fn scratch_dir() -> common::TempDir {
+    common::TempDir::new(&std::env::temp_dir(), "test-hub")
 }
 
 /// A server backed by a pool that can answer handshake verbs without an LLM.

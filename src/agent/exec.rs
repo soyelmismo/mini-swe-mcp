@@ -1452,8 +1452,8 @@ mod tests {
     /// bubblewrap backend keeps the `unshare -n` wrapper instead.
     #[tokio::test]
     async fn an_offline_worker_has_no_egress_and_still_runs_local_commands() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-offline-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-offline");
+        let tmp = scratch.path().to_path_buf();
         let offline = runner().with_network_offline(true);
 
         let (out, code) = offline
@@ -1818,15 +1818,8 @@ mod tests {
     }
 
     async fn extra_env_probe() {
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "extra-env-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("extra-env");
+        let tmp = scratch.path().to_path_buf();
         let runner = runner().with_extra_env(vec![
             ("SWE_EXTRA_ENV_PROBE".to_string(), "present".to_string()),
             ("HOME".to_string(), "/tmp".to_string()),
@@ -1866,13 +1859,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_bash_sandbox_runs_and_blocks_write() {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir()
-            .join(format!("bwrap-test-{}-{unique_id}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("bwrap-test");
+        let tmp = scratch.path().to_path_buf();
         let r = runner();
 
         // 1. Basic command within worktree succeeds
@@ -1900,18 +1888,13 @@ mod tests {
             );
         }
 
-        let target_dir = crate::worktree::swe_base_dir().join(format!(
-            "swe-target-bwrap-test-{}-{unique_id}",
-            std::process::id()
-        ));
         let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&target_dir);
     }
 
     #[tokio::test]
     async fn execute_bash_runs_unsandboxed_when_disabled() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-path-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-path");
+        let tmp = scratch.path().to_path_buf();
         let (out, code) = runner()
             .execute_bash(&tmp, "printf 'plain\\n'")
             .await
@@ -2100,8 +2083,8 @@ mod tests {
     /// *actually* printed, not the size of the buffer we kept.
     #[tokio::test]
     async fn a_huge_output_reports_its_true_size_without_being_buffered() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-flood-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-flood");
+        let tmp = scratch.path().to_path_buf();
 
         // ~2 MiB: two orders of magnitude past the 16 KiB budget, and well
         // past any pipe buffer, so the drain has to keep up to avoid a stall.
@@ -2148,8 +2131,8 @@ mod tests {
     /// `rustc` children of an interrupted build running.
     #[tokio::test]
     async fn dropping_the_future_kills_the_whole_process_group() {
-        let dir = crate::worktree::swe_base_dir().join("exec-cancel-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let scratch = crate::test_support::TestScratch::new("exec-cancel");
+        let dir = scratch.path().to_path_buf();
         let pid_file = dir.join("grandchild.pid");
         let mut cmd = Command::new("bash");
         cmd.args([
@@ -2219,8 +2202,8 @@ mod tests {
     /// the model still sees the last diagnostics.
     #[tokio::test]
     async fn timed_out_command_still_reports_the_output_it_produced() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-drain-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-drain");
+        let tmp = scratch.path().to_path_buf();
 
         let (out, code) = runner()
             .with_command_timeout(1)
@@ -2252,8 +2235,8 @@ mod tests {
     /// the drain is abandoned at its deadline instead of hanging the worker.
     #[tokio::test]
     async fn a_leaked_pipe_does_not_hang_the_timeout_path() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-leak-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-leak");
+        let tmp = scratch.path().to_path_buf();
 
         // `setsid` detaches the sleeper from the killed process group, so it
         // keeps the inherited stdout open past the SIGKILL.
@@ -2304,15 +2287,8 @@ mod tests {
     /// called, is invisible to unit tests of `build_clean_environment` alone.
     #[tokio::test]
     async fn a_spawned_command_cannot_read_the_operators_secrets() {
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "env-sanitize-test-{}-{unique_id}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
+        let tmp = scratch.path().to_path_buf();
 
         // Export a secret the way an operator's shell would.
         // SAFETY: the test binary runs its tests single-threaded, and no other
@@ -2387,15 +2363,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("build a current-thread runtime");
-        let unique_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp = crate::worktree::swe_base_dir().join(format!(
-            "env-toolchain-test-{}-{unique_id}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("env-toolchain-test");
+        let tmp = scratch.path().to_path_buf();
 
         // A host cache this test controls, so the expectation does not depend on
         // whatever layout the machine running the suite happens to have, and so
@@ -2436,8 +2405,8 @@ mod tests {
     /// never blocks in `write`.
     #[tokio::test]
     async fn a_large_output_does_not_deadlock_the_collector() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-chatty-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-chatty");
+        let tmp = scratch.path().to_path_buf();
 
         // 20k lines is well past the 64 KiB pipe buffer.
         let (out, code) = runner()
@@ -2588,8 +2557,8 @@ mod tests {
     /// sandbox lets it write, whichever backend confines it.
     #[tokio::test]
     async fn a_step_gets_a_writable_private_scratch_dir() {
-        let tmp = crate::worktree::swe_base_dir().join("exec-scratch-test");
-        let _ = std::fs::create_dir_all(&tmp);
+        let scratch = crate::test_support::TestScratch::new("exec-scratch");
+        let tmp = scratch.path().to_path_buf();
         let (out, code) = runner()
             .execute_bash(
                 &tmp,
@@ -2610,9 +2579,8 @@ mod tests {
             eprintln!("skipping: the kernel backend is not in use on this host");
             return;
         }
-        let gone =
-            crate::worktree::swe_base_dir().join(format!("exec-gone-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&gone);
+        let scratch = crate::test_support::TestScratch::missing("exec-gone");
+        let gone = scratch.path().to_path_buf();
         let marker = std::env::temp_dir().join(format!("exec-gone-marker-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let (out, code) = runner()

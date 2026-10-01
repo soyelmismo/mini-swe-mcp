@@ -14,4 +14,6 @@ pub mod mcp;
 pub mod monitor;
 pub mod pool;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod worktree;

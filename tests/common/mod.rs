@@ -192,6 +192,26 @@ impl Drop for TempDir {
     }
 }
 
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
 // ----------
 // Running the crate's binary
 // ----------
