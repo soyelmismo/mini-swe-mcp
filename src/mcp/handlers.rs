@@ -956,6 +956,7 @@ impl McpServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let root = self.pool.scratch_root().clone();
+        let admission = self.pool.admission();
         let worker_id = wid.to_string();
         let report = tokio::task::spawn_blocking(move || {
             crate::pool::merge_worker_in(
@@ -964,6 +965,7 @@ impl McpServer {
                     worker_id: &worker_id,
                     verified,
                     keep_branch,
+                    admission: Some(admission),
                 },
             )
         })

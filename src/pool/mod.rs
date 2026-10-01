@@ -330,6 +330,15 @@ impl WorkerPool {
     }
 
     /// The scratch root this pool resolves every per-worker path under.
+    /// The pool's heavy-command admission controller.
+    ///
+    /// Shared by clone, so a caller (the merge gate) reserves host budget from
+    /// the same controller every worker's heavy step does instead of starting
+    /// a second, unaware one.
+    pub fn admission(&self) -> AdmissionController {
+        self.admission.clone()
+    }
+
     pub fn scratch_root(&self) -> &ScratchRoot {
         &self.scratch
     }

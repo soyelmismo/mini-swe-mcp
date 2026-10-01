@@ -25,23 +25,15 @@
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
 //! here assumes a language or a test runner.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use super::admission::AdmissionController;
 use super::registry::load_registry_entry_in;
 use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
-use crate::agent::sandbox::truncate_with_dropped;
+use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
-
-/// Bytes kept per stream of a gate run before the rest is counted and dropped.
-///
-/// A verify command's output is untrusted in size: the gate must not buffer a
-/// gigabyte of build log to decide whether it passed. The remainder is counted
-/// rather than kept, so the elision the refusal reports stays honest.
-const GATE_OUTPUT_LIMIT: usize = crate::agent::sandbox::TRUNCATE_LIMIT;
 
 /// How many trailing lines of a failed gate a refusal carries.
 ///
@@ -66,6 +58,11 @@ pub struct MergeRequest<'a> {
     pub verified: Option<bool>,
     /// Keep the worker branch after merging (the CLI's `--no-delete`).
     pub keep_branch: bool,
+    /// The pool's admission controller, so the gate's build competes for the
+    /// host's heavy-command budget like any worker's. `None` for a caller with
+    /// no pool (tests, one-shot tools): the gate still runs confined, only the
+    /// host budget is not reserved.
+    pub admission: Option<AdmissionController>,
 }
 
 /// What a successful merge did, in the words the CLI prints.
@@ -98,6 +95,7 @@ pub fn merge_worker(worker_id: &str) -> Result<MergeReport> {
             worker_id,
             verified: None,
             keep_branch: false,
+            admission: None,
         },
     )
 }
@@ -183,7 +181,15 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
                 repo.display()
             )
         })?;
-        run_gate(root, worker_id, repo, &tree, command)?;
+        run_gate(
+            root,
+            worker_id,
+            repo,
+            &tree,
+            command,
+            req,
+            &resolved.client_env,
+        )?;
     }
 
     let subject = merge_subject(&resolved.task, worker_id);
@@ -234,6 +240,9 @@ struct Resolved {
     branch: String,
     task: String,
     verify: Option<String>,
+    /// The dispatcher's filtered ambient environment, replayed into the gate so
+    /// it sees what the worker's own verify run saw.
+    client_env: Vec<(String, String)>,
 }
 
 /// Resolve the worker's repository, base branch, branch, task and gate.
@@ -283,6 +292,10 @@ fn resolve(root: &ScratchRoot, worker_id: &str) -> Result<Resolved> {
             .as_ref()
             .and_then(|h| h.verify.clone())
             .filter(|v| !v.trim().is_empty()),
+        client_env: history
+            .as_ref()
+            .map(|h| h.client_env.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -450,12 +463,22 @@ fn blocked_by_dirty_tree(repo: &Path, base: &str, branch: &str) -> Result<Vec<St
 /// byte-for-byte what the merge would produce. The worktree lives under the
 /// scratch root, never inside the operator's checkout, and is removed whatever
 /// the command does.
+///
+/// The command itself is model-written code, so it goes through the very
+/// executor a worker's bash step uses: kernel confinement (Landlock + seccomp,
+/// or bubblewrap), a cleared and allow-listed environment, the heavy-command
+/// timeout and a build directory leased from the repository's pool rather than
+/// a fresh `target/` inside the throwaway worktree. A merge is a rare,
+/// one-command operation, so the gate drives its own current-thread runtime
+/// instead of forcing every caller of this module to be async.
 fn run_gate(
     root: &ScratchRoot,
     worker_id: &str,
     repo: &Path,
     tree: &str,
     command: &str,
+    req: &MergeRequest<'_>,
+    client_env: &[(String, String)],
 ) -> Result<()> {
     let gate_dir = root.join(format!("swe-merge-{worker_id}"));
     force_remove_dir(&gate_dir);
@@ -482,7 +505,13 @@ fn run_gate(
     let materialised = git(&gate_dir, "read-tree", &["read-tree", tree])
         .and_then(|_| git(&gate_dir, "checkout-index", &["checkout-index", "-a", "-f"]));
     let gate = match materialised {
-        Ok(_) => run_gate_command(&gate_dir, command),
+        Ok(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("could not start the verify gate's runtime")?;
+            runtime.block_on(run_gate_confined(repo, &gate_dir, command, req, client_env))
+        }
         Err(e) => Err(e).with_context(|| {
             format!("could not materialise the merge result for worker {worker_id}")
         }),
@@ -500,74 +529,42 @@ fn run_gate(
     );
 }
 
-/// Run `command` in `dir`, returning its exit status and its bounded output.
+/// Run the gate command confined, admitted and with a leased build directory.
 ///
-/// Both streams are drained concurrently on their own threads: a child that
-/// fills one pipe while the parent blocks reading the other would otherwise
-/// deadlock, and the gate is the one place a merge waits on untrusted output.
-fn run_gate_command(dir: &Path, command: &str) -> Result<(Option<i32>, String)> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("could not run the verify gate: {command}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("the gate's stdout was not captured"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("the gate's stderr was not captured"))?;
-    let (out, err) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| read_bounded(&mut stdout, GATE_OUTPUT_LIMIT));
-        let b = scope.spawn(|| read_bounded(&mut stderr, GATE_OUTPUT_LIMIT));
-        (a.join(), b.join())
-    });
-    let status = child
-        .wait()
-        .with_context(|| format!("the verify gate {command} could not be reaped"))?;
-    let (stdout, stdout_dropped) =
-        out.map_err(|_| anyhow::anyhow!("the gate's stdout reader panicked"))??;
-    let (stderr, stderr_dropped) =
-        err.map_err(|_| anyhow::anyhow!("the gate's stderr reader panicked"))??;
+/// The executor's own truncation keeps the head *and* the tail of the output,
+/// which is what a failing suite needs: the panic and the summary are at the
+/// end, so nothing here re-buffers the streams.
+async fn run_gate_confined(
+    repo: &Path,
+    gate_dir: &Path,
+    command: &str,
+    req: &MergeRequest<'_>,
+    client_env: &[(String, String)],
+) -> Result<(Option<i32>, String)> {
+    // A build directory leased from the repository's pool: warm for the next
+    // build, and never a fresh multi-gigabyte `target/` inside a worktree that
+    // is about to be deleted.
+    let repo_owned = repo.to_path_buf();
+    let lease =
+        tokio::task::spawn_blocking(move || crate::cache::BuildDirLease::acquire(&repo_owned))
+            .await
+            .context("the build-directory lease task for the verify gate failed")??;
+    let build_dir = lease.dir().to_path_buf();
 
-    let mut text = String::from_utf8_lossy(&stdout).into_owned();
-    if !stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&stderr));
-    }
-    Ok((
-        status.code(),
-        truncate_with_dropped(&text, stdout_dropped + stderr_dropped),
-    ))
-}
+    // The heavy slot is held for the whole gate run and released on every exit
+    // path, including a refusal, because the permit is a guard.
+    let _permit = match &req.admission {
+        Some(controller) => Some(controller.acquire().await),
+        None => None,
+    };
 
-/// Read at most `limit` bytes from `reader`, plus how many bytes followed them.
-///
-/// The tail is what a failing gate has to show, so the head is kept and the
-/// overflow counted; the caller hands both to the crate's shared truncation.
-fn read_bounded<R: std::io::Read>(
-    reader: &mut R,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, usize)> {
-    let mut kept = Vec::new();
-    (&mut *reader).take(limit as u64).read_to_end(&mut kept)?;
-    let mut dropped = 0usize;
-    let mut sink = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut sink)?;
-        if read == 0 {
-            break;
-        }
-        dropped += read;
-    }
-    Ok((kept, dropped))
+    // The bash path never dials the API, so the transport fields are unused;
+    // only the confinement, environment and build directory matter here.
+    let mut runner = AgentRunner::new(String::new(), String::new(), String::new(), None)
+        .with_extra_env(client_env.to_vec());
+    runner.build_target_dir = Some(build_dir);
+    let (text, code) = runner.execute_bash(gate_dir, command).await?;
+    Ok((code, text))
 }
 
 /// The ref the gate worktree is created at: the base branch tip.

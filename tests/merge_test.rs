@@ -132,6 +132,7 @@ impl Fixture {
                 worker_id: id,
                 verified,
                 keep_branch,
+                admission: None,
             },
         )
         .map(|_| ())
@@ -288,6 +289,47 @@ fn a_flooding_gate_is_refused_with_a_bounded_report() {
         msg.len()
     );
     assert!(git_ref_exists(f.repo(), "worker-w12"), "nothing was merged");
+}
+
+/// The gate command runs *confined*: it cannot write outside the gate worktree.
+///
+/// The verify command is model-written code, so it goes through the same
+/// sandboxed executor a worker's bash step uses. Writing one directory above
+/// the throwaway worktree -- inside the scratch root, outside every granted
+/// root -- must fail, and the merge must be refused rather than landing work
+/// whose gate escaped its sandbox.
+#[test]
+fn the_gate_command_runs_confined_and_cannot_write_outside_its_worktree() {
+    let f = Fixture::new("merge-confined");
+    f.commit_on_worker_branch("w13", "worker.txt", "from the worker\n");
+    f.commit_on_base("base.txt", "from the base\n");
+    // Stale, so the gate actually runs.
+    f.record_worker("w13", Some("touch ../swe-merge-escape.txt"));
+    let escape = f.scratch.path().join("swe-merge-escape.txt");
+
+    let err = f
+        .merge("w13", None, false)
+        .expect_err("a gate that cannot write outside its worktree must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("verify gate failed"),
+        "the gate must have run and been denied, not been blocked before it ran: {msg}"
+    );
+    assert!(
+        !msg.contains("BLOCKED BY"),
+        "a guardrail block is not proof of confinement: {msg}"
+    );
+    assert!(
+        !escape.exists(),
+        "the gate command wrote outside its worktree: {}",
+        escape.display()
+    );
+    // Nothing was merged and the throwaway worktree is gone.
+    assert!(git_ref_exists(f.repo(), "worker-w13"));
+    assert!(
+        !f.scratch.path().join("swe-merge-w13").exists(),
+        "the gate worktree must be reclaimed"
+    );
 }
 
 /// A conflicting branch is refused with the steer hint that fixes it.
