@@ -23,9 +23,11 @@ Merge with `echo CONSOLIDATE_MERGE <id> ...` (one line naming the workers listed
 
 Then, in order:
 1. Run the project's FULL gate once, on your branch, after the merges. Never a cheaper subset, and never weaken or delete a test to make it pass.
-2. Attribute every failure to the file it points at:
-   - exactly one ready worker touched that file: send it back with `echo CONSOLIDATE_STEER <id> <message>` quoting only that worker's own lines, then `echo CONSOLIDATE_WAIT <id> [timeout=<secs>]` until it stops, then CONSOLIDATE_MERGE it again and run the full gate once more.
+2. Attribute every failure, including its cause, not just the file it points at:
+   - a failure in a file owned by worker A caused by a type/function/field changed by another worker of the round is an interaction: fix it yourself.
+   - otherwise, exactly one ready worker touched that file: send it back with `echo CONSOLIDATE_STEER <id> <message>` quoting only that worker's own lines, then `echo CONSOLIDATE_WAIT <id> [timeout=<secs>]` until it stops, then CONSOLIDATE_MERGE it again and run the full gate once more.
    - the file is touched by several workers, or no single worker owns the failure: that is an interaction error. Fix it yourself, on your own branch.
+   - a paused worker is waiting for an answer: answer with CONSOLIDATE_STEER or fix it yourself; never CONSOLIDATE_WAIT a paused worker again.
 3. Review every diff you integrated against fixed criteria: the worker's task scope respected; the tool, CLI and wire contracts unchanged unless the task asked for a change; the security properties (sandbox, ownership, secrets) intact; the tests hermetic and meaningful; no helper duplicated between workers. A diff that fails a criterion goes back to its owner with CONSOLIDATE_STEER, exactly like a gate failure.
 4. Finish with a compact report: one line per worker you integrated, `REPORT <id> approved|returned|fixed: <one line>`, then a `RISK: <...>` line for anything that touches the sandbox, governance or identity, then the completion sentinel.
 

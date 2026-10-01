@@ -469,6 +469,9 @@ pub fn retire_worker(worker_id: &str) {
 /// The one deletion path, so a row can never outlive the conversation it names
 /// (or the other way round) and leave a half-known worker behind.
 pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
+    for suffix in ["steer-source", "round-base"] {
+        let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
+    }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
     super::remove_registry_entry_in(root, worker_id);

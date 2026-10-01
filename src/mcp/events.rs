@@ -647,6 +647,11 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             };
         }
     }
+    for (id, view) in &mut current {
+        if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id) {
+            view.event = None;
+        }
+    }
     current
 }
 
@@ -1049,6 +1054,11 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             attach_verify_tail(view, &logs);
         }
     }
+    for (id, view) in &mut views {
+        if pool.question_for_consolidator(id) {
+            view["question_for_consolidator"] = json!(true);
+        }
+    }
     views
 }
 
@@ -1079,6 +1089,15 @@ impl EventRouter {
             {
                 self.watch_reported.remove(id);
                 self.seen.remove(id);
+            }
+            if view["status"] == "paused" && view["question_for_consolidator"] == true {
+                self.watch_reported.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| {
+                        !(event["worker_id"] == *id && event["event"] == "needs_input")
+                    });
+                }
+                continue;
             }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
