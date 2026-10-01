@@ -87,7 +87,7 @@ pub use self::steer::{
 
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
-use crate::worktree::{ScratchRoot, WorktreeGuard};
+use crate::worktree::{BranchMerge, ScratchRoot, WorktreeGuard};
 
 /// Rebuild the conversation a request sends: compaction applied on top of the
 /// append-only log.
@@ -101,6 +101,15 @@ pub fn compact_for_request(
     let mut messages = messages.to_vec();
     crate::pool::runner::history::compact_history(&mut messages);
     messages
+}
+
+/// The observation one `CONSOLIDATE_MERGE` request returns to the model.
+pub struct ConsolidateMerge {
+    /// One compact line per requested id.
+    pub observation: String,
+    /// Whether any branch was merged, so the caller preserves the
+    /// consolidator's branch instead of letting the guard delete it.
+    pub integrated: bool,
 }
 
 /// Whether `id`'s registry row is live in a process other than this one.
@@ -939,6 +948,82 @@ impl WorkerPool {
         }
         load_registry_entry_in(&self.scratch, id)
             .is_some_and(|entry| entry.status == RegistryStatus::Completed)
+    }
+
+    /// Integrate the named workers' branches into a consolidator's worktree.
+    ///
+    /// One `CONSOLIDATE_MERGE` request: each id is resolved, checked against
+    /// [`check_consolidate_delegation`] and merged in order. The first conflict
+    /// stops the run and leaves the rest skipped, so the model resolves one
+    /// merge at a time, and the merges run on the harness through
+    /// [`WorktreeGuard::merge_branch_at`] -- the sandbox holds no git
+    /// credentials.
+    ///
+    /// Lives on the pool rather than in the turn engine because every fact it
+    /// needs (the id resolver, the registry row, the completion status) is
+    /// already here, and an integration test can then drive the whole loop
+    /// without an LLM.
+    pub async fn consolidate_merge(
+        &self,
+        actor: &WorkerMeta,
+        worktree: &WorktreeGuard,
+        ids: &[String],
+    ) -> ConsolidateMerge {
+        let mut lines = Vec::new();
+        let mut integrated = false;
+        let mut conflicted = false;
+        for id in ids {
+            if conflicted {
+                lines.push(format!("{id} skipped (an earlier merge conflicted)"));
+                continue;
+            }
+            let target = match self.resolve_worker_id(id, &actor.owner).await {
+                Ok(target) => target,
+                Err(e) => {
+                    lines.push(format!("{id} refused: {e}"));
+                    continue;
+                }
+            };
+            let Some(entry) = self.worker_row(&target).await else {
+                lines.push(format!("{id} refused: no such worker"));
+                continue;
+            };
+            if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+                lines.push(format!("{id} refused: {reason}"));
+                continue;
+            }
+            if !self.is_completed(&target).await {
+                lines.push(format!("{id} refused: the worker is not completed"));
+                continue;
+            }
+            let path = worktree.path.clone();
+            let repo_root = worktree.repo_root.clone();
+            let branch = worktree.branch.clone();
+            let base_commit = worktree.base_commit.clone();
+            let merged = tokio::task::spawn_blocking(move || {
+                WorktreeGuard::merge_branch_at(&path, &repo_root, &branch, &base_commit, &target)
+            })
+            .await;
+            match merged {
+                Ok(Ok(BranchMerge::Merged { files })) => {
+                    integrated = true;
+                    lines.push(format!("{id} merged ({files} files)"));
+                }
+                Ok(Ok(BranchMerge::Conflicts { files })) => {
+                    conflicted = true;
+                    lines.push(format!(
+                        "{id} conflict: {} (resolve the markers, then continue)",
+                        files.join(", ")
+                    ));
+                }
+                Ok(Err(e)) => lines.push(format!("{id} refused: {e}")),
+                Err(e) => lines.push(format!("{id} refused: {e}")),
+            }
+        }
+        ConsolidateMerge {
+            observation: lines.join("\n"),
+            integrated,
+        }
     }
 
     /// Resolve a caller-supplied worker reference among `owner`'s own workers.

@@ -205,8 +205,7 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
         );
     }
     if name == "role" {
-        schema.insert("enum".into(), json!(["worker", "consolidate"]));
-        schema.insert("default".into(), json!("worker"));
+        schema.insert("enum".to_string(), json!(["worker", "consolidate"]));
     }
     if name == "network" {
         schema.insert(

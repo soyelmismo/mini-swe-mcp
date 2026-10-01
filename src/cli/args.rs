@@ -335,6 +335,41 @@ mod tests {
         assert_eq!(with["verify"], "cargo test --all-targets");
     }
 
+    /// `--role <role>` is the CLI spelling of the tool's `role` property, and an
+    /// omitted flag leaves the ordinary worker default in place.
+    #[test]
+    fn test_dispatch_role_flag_maps_to_the_role_property() {
+        let without = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "tidy docs"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !without.contains_key("role"),
+            "an omitted flag must leave the worker default in place"
+        );
+
+        let with = tool_args(
+            "dispatch",
+            &args(&[
+                "mini-swe-mcp",
+                "dispatch",
+                "integrate the round",
+                "--group",
+                "round-1",
+                "--role",
+                "consolidate",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["role"], "consolidate");
+        assert_eq!(with["group"], "round-1");
+    }
+
     /// `--max-turns <n>` on `steer` is the revision's fresh turn budget: the
     /// same tool argument `dispatch` uses, so a revision is spelled exactly
     /// like the dispatch that preceded it.
