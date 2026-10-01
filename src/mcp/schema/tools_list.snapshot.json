@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
+      "description": "Manage SWE mini-agents in Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see your own workers; admin excepted. `mini-swe-mcp help <topic>`: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -173,6 +173,10 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "all": {
+            "type": "boolean",
+            "description": "Watch the whole round as one event."
           }
         },
         "required": [

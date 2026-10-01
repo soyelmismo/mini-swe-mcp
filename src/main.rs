@@ -284,7 +284,9 @@ fn print_help() {
     println!("\nActions:");
     println!("  {DISPATCH_USAGE}");
     println!("           Start a worker on its own branch; always detaches.");
-    println!("  watch [<worker_id>...] [--group <g>] [--follow] [--json] [--timeout <secs>]");
+    println!(
+        "  watch [<worker_id>...] [--group <g>] [--all] [--follow] [--json] [--timeout <secs>]"
+    );
     println!(
         "           Block until the next worker event (replaying missed ones), print it and exit;"
     );

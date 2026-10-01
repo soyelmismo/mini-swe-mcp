@@ -63,6 +63,7 @@ impl McpServer {
         // explicit id set stays fixed for the whole call.
         let explicit = !ids.is_empty();
         let group = args.get("group").and_then(Value::as_str);
+        let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
         let timeout = Self::get_timeout(args, "watch")?;
         // A named worker must exist and be the caller's own: watching a
         // foreign id is refused with its owner, never with its task or state.
@@ -82,7 +83,7 @@ impl McpServer {
         let mut initial = true;
         let mut watched_any = false;
         loop {
-            let reply = self.watch_poll(ctx, &ids, group, initial).await?;
+            let reply = self.watch_poll(ctx, &ids, group, initial, all).await?;
             let events = reply["events"].as_array().cloned().unwrap_or_default();
             if !events.is_empty() {
                 // Acknowledge what was delivered: the router's per-agent
@@ -102,7 +103,9 @@ impl McpServer {
             if !watching.is_empty() {
                 watched_any = true;
             }
-            if initial && explicit {
+            // A `--all` round keeps every selected id until it reports, so its
+            // terminal workers are never pruned away mid-round.
+            if initial && explicit && !all {
                 ids = watching
                     .iter()
                     .filter_map(|id| id.as_str().map(str::to_string))
@@ -156,11 +159,13 @@ impl McpServer {
         ids: &std::collections::BTreeSet<String>,
         group: Option<&str>,
         initial: bool,
+        all: bool,
     ) -> Result<Value> {
         let params = json!({
             "worker_ids": ids.iter().collect::<Vec<_>>(),
             "group": group,
             "initial": initial,
+            "all": all,
         });
         crate::mcp::events::watch_request(&self.pool, &self.hub_events, ctx, params, false).await
     }
@@ -190,3 +195,5 @@ pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str =
     "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.";
+
+pub(in crate::mcp) const ALL_DESCRIPTION: &str = "Watch the whole round as one event.";

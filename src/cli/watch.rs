@@ -18,6 +18,9 @@ pub struct Options {
     /// `--json` stays complete regardless of this flag.
     pub verbose: bool,
     pub timeout: Option<Duration>,
+    /// Wait for a whole round: one event when every selected worker stopped,
+    /// or as soon as one needs input or fails. Requires a group or ids.
+    pub all: bool,
 }
 impl Options {
     pub fn parse(args: &[String]) -> Result<Self> {
@@ -27,6 +30,7 @@ impl Options {
             match args[i].as_str() {
                 "--follow" => out.follow = true,
                 "--verbose" => out.verbose = true,
+                "--all" => out.all = true,
                 "--group" | "--timeout" => {
                     let flag = &args[i];
                     i += 1;
@@ -48,6 +52,10 @@ impl Options {
             }
             i += 1;
         }
+        anyhow::ensure!(
+            !out.all || out.group.is_some() || !out.ids.is_empty(),
+            "--all needs --group or explicit worker ids"
+        );
         Ok(out)
     }
 }
@@ -357,6 +365,23 @@ pub fn render_with(v: &Value, verbose: bool) -> String {
 
 /// One event body, without the heading a whole missed batch shares.
 fn render_event(v: &Value, verbose: bool) -> String {
+    if v["event"] == ROUND_EVENT {
+        return v["content"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                v["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(render_round_line)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            });
+    }
     if verbose {
         return render_event_verbose(v);
     }
@@ -647,6 +672,158 @@ pub fn matches(view: &Value, ids: &BTreeSet<String>, group: Option<&str>) -> boo
         && group.is_none_or(|g| view["group"] == g)
 }
 
+/// The event kind a `--all` round emits: one consolidated event per round.
+pub const ROUND_EVENT: &str = "round";
+
+/// How long a `--all` round tolerates no step before one worker's stall is
+/// worth the orchestrator's attention. A round is the consolidator's business,
+/// so ordinary stalls stay out of its events.
+pub const ROUND_STALL_SECS: u64 = 1200;
+
+/// How many seconds a `--all` round worker has gone without a step.
+///
+/// A worker waiting for a build slot, or running a command, is not inactive:
+/// same rules as [`select_event`], so a long gate never reads as a stall.
+fn round_idle(v: &Value, now: u64) -> u64 {
+    if v["waiting_for_slot"].is_number() || v["command_started_at"].is_number() {
+        return 0;
+    }
+    now.saturating_sub(v["last_step_at"].as_u64().unwrap_or(now))
+}
+
+/// The outcome label one worker carries in a `--all` round line.
+fn round_outcome(v: &Value, now: u64) -> &'static str {
+    match v["status"].as_str() {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some("exhausted") => "exhausted",
+        Some("stopped") => "stopped",
+        Some("interrupted") => "interrupted",
+        Some("paused") => "needs_input",
+        Some("running" | "reviewing") if round_idle(v, now) >= ROUND_STALL_SECS => "stalled",
+        _ => "running",
+    }
+}
+
+/// The `done:` headline a round line shows: the report's line, a summary, the
+/// failure reason, or the escalated question.
+fn round_done(v: &Value) -> Option<String> {
+    match v["status"].as_str() {
+        Some("completed") => report_done(v).or_else(|| one_line(v["summary"].as_str())),
+        Some("failed") => one_line(v["error"].as_str()),
+        Some("exhausted") => one_line(v["summary"].as_str()),
+        Some("paused") => one_line(v["question"].as_str()),
+        _ => None,
+    }
+}
+
+/// One worker as a structured line of the consolidated round event.
+fn round_line(v: &Value, now: u64) -> Value {
+    json!({
+        "worker_id": v["worker_id"].clone(),
+        "outcome": round_outcome(v, now),
+        "status": v["status"].clone(),
+        "verified": v["verified"].clone(),
+        "done": round_done(v),
+        "question": v["question"].clone(),
+        "branch": v["branch"].clone(),
+        "time_since_last_step": round_idle(v, now),
+    })
+}
+
+/// One worker's compact line in a `--all` round: id, outcome, verification and
+/// the report's `done:` line (or the reason it needs the orchestrator).
+pub fn render_round_line(w: &Value) -> String {
+    let id = w["worker_id"].as_str().unwrap_or("?");
+    let outcome = w["outcome"].as_str().unwrap_or("?");
+    let verified = match w["verified"].as_bool() {
+        Some(true) => "verified:yes",
+        Some(false) => "verified:no",
+        None => "verified:-",
+    };
+    match w["done"].as_str().filter(|done| !done.is_empty()) {
+        Some(done) => format!("{id} {outcome} {verified} {done}"),
+        None if outcome == "stalled" => format!(
+            "{id} {outcome} {verified} no step for {}s",
+            w["time_since_last_step"]
+        ),
+        None => format!("{id} {outcome} {verified}"),
+    }
+}
+
+/// The consolidated `--all` event for one round, or `None` while it waits.
+///
+/// A group watch keeps waiting until every selected worker has stopped
+/// (completed, failed, exhausted, killed or interrupted). It returns early
+/// when one needs input, has failed, or (only past [`ROUND_STALL_SECS`]) has
+/// gone quiet long enough to matter. `fresh` reports whether a worker has an
+/// event the caller has not acknowledged, so a reported round never replays.
+pub fn round_event(
+    current: &Snapshot,
+    ids: &BTreeSet<String>,
+    group: Option<&str>,
+    now: u64,
+    fresh: impl Fn(&str) -> bool,
+) -> Option<Value> {
+    let selected: Vec<&Value> = current
+        .values()
+        .filter(|v| {
+            matches(v, ids, group)
+                && v["steered_by_consolidator"] != true
+                && v["question_for_consolidator"] != true
+        })
+        .collect();
+    if selected.is_empty() {
+        return None;
+    }
+    let mut all_stopped = true;
+    let mut attention = false;
+    let mut fresh_any = false;
+    for v in &selected {
+        let id = v["worker_id"].as_str().unwrap_or("");
+        let is_fresh = fresh(id);
+        fresh_any |= is_fresh;
+        match v["status"].as_str() {
+            Some("completed" | "exhausted" | "stopped" | "interrupted") => {}
+            Some("failed") => attention |= is_fresh,
+            Some("paused") => {
+                all_stopped = false;
+                attention |= is_fresh;
+            }
+            Some("running" | "reviewing") => {
+                all_stopped = false;
+                if is_fresh && round_idle(v, now) >= ROUND_STALL_SECS {
+                    attention = true;
+                }
+            }
+            _ => all_stopped = false,
+        }
+    }
+    if !fresh_any || (!attention && !all_stopped) {
+        return None;
+    }
+    Some(round_payload(&selected, group, now, all_stopped))
+}
+
+/// Assemble the round event from the selected worker views.
+fn round_payload(selected: &[&Value], group: Option<&str>, now: u64, all_stopped: bool) -> Value {
+    let mut workers: Vec<Value> = selected.iter().map(|v| round_line(v, now)).collect();
+    workers.sort_by(|a, b| a["worker_id"].as_str().cmp(&b["worker_id"].as_str()));
+    let content = workers
+        .iter()
+        .map(render_round_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    json!({
+        "worker_id": group.unwrap_or(ROUND_EVENT),
+        "event": ROUND_EVENT,
+        "status": if all_stopped { "stopped" } else { "attention" },
+        "group": group,
+        "workers": workers,
+        "content": content,
+    })
+}
+
 /// A hub that predates `hub/watch` cannot stream events at all.
 const NO_WATCH_NOTICE: &str =
     "[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.";
@@ -737,7 +914,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut reconnects = 0usize;
     'watch: loop {
         let response = match client
-            .watch_snapshot(&ids, opts.group.as_deref(), initial)
+            .watch_snapshot(&ids, opts.group.as_deref(), initial, opts.all)
             .await
         {
             Ok(value) => value,
@@ -771,7 +948,9 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        if explicit {
+        // A `--all` round must keep every selected id until it reports, so its
+        // terminal workers are never pruned away mid-round.
+        if explicit && !opts.all {
             ids = watching.clone();
         }
         if !watching.is_empty() {
@@ -855,6 +1034,9 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
     let mut reported = Snapshot::new();
     let mut ids = opts.ids.clone();
     let mut ignored: BTreeSet<String> = BTreeSet::new();
+    // One signature per worker already folded into a `--all` round, so the
+    // same round is never emitted twice.
+    let mut round_reported = Snapshot::new();
     let mut initial = true;
     let mut watched_any = false;
     let mut printed_event = false;
@@ -879,8 +1061,9 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                 }
             }
             // A worker already terminal when the watch began is not a late
-            // dispatch: a no-arg watch must not replay it.
-            if !explicit {
+            // dispatch: a no-arg watch must not replay it. A `--all` round
+            // must still report such a worker: it is the round's result.
+            if !explicit && !opts.all {
                 ignored = current
                     .iter()
                     .filter(|(_, v)| {
@@ -910,6 +1093,56 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                 && (admin || v["owner"] == owner)
                 && matches(v, &opts.ids, opts.group.as_deref())
         });
+        if opts.all {
+            let signature = |v: &Value| {
+                json!({
+                    "status": v["status"].clone(),
+                    "revision": v["revision"].clone(),
+                    "step": v["step"].clone(),
+                    "question": v["question"].clone(),
+                })
+            };
+            let event = round_event(&current, &ids, opts.group.as_deref(), now, |id| {
+                current
+                    .get(id)
+                    .is_some_and(|v| round_reported.get(id) != Some(&signature(v)))
+            });
+            if let Some(event) = event {
+                for (id, view) in &current {
+                    if matches(view, &ids, opts.group.as_deref()) {
+                        round_reported.insert(id.clone(), signature(view));
+                    }
+                }
+                print_events(&[event], json_output, opts.follow, opts.verbose)?;
+                printed_event = true;
+                if !opts.follow {
+                    return Ok(0);
+                }
+            }
+            if !current.is_empty() {
+                watched_any = true;
+            }
+            previous = current;
+            if previous.is_empty() && (explicit || watched_any) {
+                return Ok(end_watch(printed_event, watched_any));
+            }
+            if opts
+                .timeout
+                .is_some_and(|timeout| started.elapsed() >= timeout)
+            {
+                return Ok(end_watch(printed_event, watched_any));
+            }
+            tokio::time::sleep(
+                opts.timeout
+                    .map(|t| {
+                        t.saturating_sub(started.elapsed())
+                            .min(Duration::from_secs(1))
+                    })
+                    .unwrap_or(Duration::from_secs(1)),
+            )
+            .await;
+            continue;
+        }
         let mut events = Vec::new();
         for (id, view) in &mut current {
             progress_clock(view, previous.get(id), now);
