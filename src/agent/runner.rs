@@ -6,10 +6,11 @@
 //! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::jobs::{JobHandle, JobWait};
 use super::retry;
 use super::stream::{FrameOutcome, SseAccumulator};
 use super::types::{
@@ -82,6 +83,12 @@ impl AgentRunner {
     }
 }
 
+/// Lock the runner's last-job slot, recovering from a poisoned lock: the id
+/// behind it is still the truth about the last command.
+fn lock_last_job(slot: &Mutex<Option<u64>>) -> std::sync::MutexGuard<'_, Option<u64>> {
+    slot.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[derive(Clone)]
 pub struct AgentRunner {
     pub http_client: reqwest::Client,
@@ -110,6 +117,15 @@ pub struct AgentRunner {
     /// command in the dispatcher's ambient environment; ordinary steps leave
     /// it empty.
     pub extra_env: Vec<(String, String)>,
+    /// The worker's background jobs. `None` for a runner no worker owns, in
+    /// which case a command that outlives its budget is simply killed.
+    pub(crate) jobs: Option<JobHandle>,
+    /// Job number the last `execute_bash` call backgrounded, taken by the
+    /// caller so it is reported exactly once.
+    pub(crate) last_job: Arc<Mutex<Option<u64>>>,
+    /// Set for a run the harness owns rather than the model: a command that
+    /// outlives its budget is stopped instead of becoming a background job.
+    pub(crate) jobs_disabled: bool,
 }
 
 impl AgentRunner {
@@ -130,6 +146,9 @@ impl AgentRunner {
             build_jobs: None,
             build_target_dir: None,
             extra_env: Vec::new(),
+            jobs: None,
+            last_job: Arc::new(Mutex::new(None)),
+            jobs_disabled: false,
         }
     }
 
@@ -145,6 +164,76 @@ impl AgentRunner {
     pub fn with_extra_env(mut self, vars: Vec<(String, String)>) -> Self {
         self.extra_env = vars;
         self
+    }
+
+    /// Refuse to turn a command that outlives its budget into a job.
+    ///
+    /// For a run the harness owns -- the completion verify, its divergent
+    /// variant, the merge gate -- and not the model: a job nobody waits on
+    /// would hold a build slot for its whole ceiling, and a gate must be
+    /// decided by the command's real exit code. Such a command is stopped and
+    /// reported as the timeout it is.
+    pub fn without_job_conversion(mut self) -> Self {
+        self.jobs_disabled = true;
+        self
+    }
+
+    /// The job table a command may background into, if this run allows one.
+    pub(crate) fn job_handle(&self) -> Option<&JobHandle> {
+        if self.jobs_disabled {
+            None
+        } else {
+            self.jobs.as_ref()
+        }
+    }
+
+    /// Attach the worker's background jobs to this runner.
+    ///
+    /// A runner without them has nowhere to register a command that outlived
+    /// its budget, so such a command is killed instead of continued.
+    pub fn with_jobs(mut self, jobs: JobHandle) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    /// Wait for background job `id`, up to `limit`.
+    ///
+    /// `None` when this runner has no job `id`, which is how the caller tells
+    /// "no such job" from "the job is still running".
+    pub async fn wait_job(&self, id: u64, limit: Duration) -> Option<JobWait> {
+        self.jobs.as_ref()?.wait(id, limit).await
+    }
+
+    /// Stop background job `id`; `false` when this runner has no such job.
+    pub fn kill_job(&self, id: u64) -> bool {
+        self.jobs.as_ref().is_some_and(|handle| handle.kill(id))
+    }
+
+    /// Keep `guard` alive exactly as long as background job `id`.
+    ///
+    /// The admission permit a heavy command was granted under is moved into the
+    /// job it became, so a job never outlives the build slot it was admitted
+    /// with. A job that has already been reaped drops it immediately.
+    pub fn attach_job_guard(&self, id: u64, guard: Box<dyn std::any::Any + Send>) -> bool {
+        let Some(job) = self.jobs.as_ref().and_then(|handle| handle.job(id)) else {
+            return false;
+        };
+        job.retain(guard);
+        true
+    }
+
+    /// The job the last `execute_bash` call backgrounded, taken so it is
+    /// reported once.
+    ///
+    /// The turn loop runs one command at a time, so the id cannot belong to any
+    /// other command's job.
+    pub fn take_last_job_id(&self) -> Option<u64> {
+        lock_last_job(&self.last_job).take()
+    }
+
+    /// Record that `execute_bash` backgrounded job `id`.
+    pub(crate) fn set_last_job_id(&self, id: u64) {
+        *lock_last_job(&self.last_job) = Some(id);
     }
 
     /// Carry the admission controller's granted job count into the next
