@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use super::protocol::{
     FrameRejection, INITIALIZE_RESULT, INTERNAL_ERROR_FRAME, JsonRpcRequest, JsonRpcResponse,
@@ -47,7 +47,13 @@ pub struct McpServer {
     /// Closed by the hub daemon while startup recovery runs; see
     /// [`RecoveryGate`].
     recovery: Arc<RecoveryGate>,
+    /// Set while a newer client has asked this daemon to hand over: the
+    /// instant the graceful stop is due, quiet moment or deadline.
+    handover: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
+
+/// How often a pending handover looks for a quiet moment.
+const HANDOVER_POLL: Duration = Duration::from_millis(200);
 
 /// A one-way readiness gate for hub startup recovery.
 ///
@@ -138,6 +144,9 @@ pub struct ConnectionContext {
     pub local: bool,
     pub pid: Option<u32>,
     pub version: Option<String>,
+    /// The client's build identity from `hub/hello`, which is what tells a
+    /// rebuilt client from the daemon it dialed at the same release version.
+    pub build: Option<Value>,
     pub cwd: Option<std::path::PathBuf>,
     /// The daemon's watch-token store, so a dispatch answer can carry the
     /// `watch_command` that binds a shell to this identity. `None` for the
@@ -164,6 +173,7 @@ impl ConnectionContext {
             local: true,
             pid: None,
             version: None,
+            build: None,
             cwd: None,
             watch_tokens: None,
             client_env: Vec::new(),
@@ -183,6 +193,7 @@ impl ConnectionContext {
             local: false,
             pid: None,
             version: None,
+            build: None,
             cwd: None,
             watch_tokens: None,
             client_env: Vec::new(),
@@ -273,6 +284,7 @@ impl McpServer {
             daemon_build: Arc::new(build_identity()),
             hub_shutdown_gate: Arc::new(RwLock::new(false)),
             recovery: Arc::new(RecoveryGate::open()),
+            handover: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -394,6 +406,7 @@ impl McpServer {
                         .as_u64()
                         .and_then(|pid| u32::try_from(pid).ok());
                     ctx.version = params["version"].as_str().map(str::to_owned);
+                    ctx.build = params.get("build").cloned().filter(Value::is_object);
                     ctx.cwd = params["cwd"]
                         .as_str()
                         .map(std::path::PathBuf::from)
@@ -467,6 +480,42 @@ impl McpServer {
                         requested_shutdown = true;
                         break;
                     }
+                    let _ = out_tx.send(response.to_frame()?).await;
+                    continue;
+                }
+                if hub && req.method == "hub/handover" {
+                    // A newer client asks a busy daemon to step aside. The
+                    // daemon keeps serving and stops at the first quiet
+                    // moment, so nothing in flight is cut off; the deadline
+                    // bounds a daemon that never goes quiet.
+                    let id = req.id_or_null().map(ToOwned::to_owned);
+                    let requested = req
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["deadline_secs"].as_u64());
+                    let deadline = crate::hub::client::handover_deadline(requested);
+                    let response = if !crate::hub::client::supersedes(
+                        ctx.version.as_deref().unwrap_or(""),
+                        ctx.build.as_ref().unwrap_or(&Value::Null),
+                        &self.daemon_version,
+                        &self.daemon_build,
+                    ) {
+                        JsonRpcResponse::err(
+                            id,
+                            code::SERVER_ERROR,
+                            Cow::Borrowed("Client is not newer than hub"),
+                        )
+                    } else {
+                        self.begin_handover(deadline);
+                        JsonRpcResponse::ok(
+                            id,
+                            json!({
+                                "version": &*self.daemon_version,
+                                "busy": self.pool.active_worker_count().await > 0,
+                                "deadline_secs": deadline.as_secs(),
+                            }),
+                        )
+                    };
                     let _ = out_tx.send(response.to_frame()?).await;
                     continue;
                 }
@@ -703,6 +752,78 @@ impl McpServer {
             ctx,
         )
         .await
+    }
+
+    /// Whether a newer client has asked this daemon to hand over.
+    ///
+    /// The daemon reads it after teardown: a handover leaves the hub unserved
+    /// until something dials it again, so the daemon that stepped aside starts
+    /// its replacement itself instead of waiting for a client.
+    pub fn handover_requested(&self) -> bool {
+        self.handover
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+    }
+
+    /// Ask this daemon to hand over at the first quiet moment.
+    ///
+    /// Idempotent: a repeated request keeps the deadline the first one set and
+    /// arms no second watcher. Returns whether this call armed the handover.
+    fn begin_handover(&self, deadline: Duration) -> bool {
+        let mut pending = self
+            .handover
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if pending.is_some() {
+            return false;
+        }
+        *pending = Some(std::time::Instant::now() + deadline);
+        drop(pending);
+        let server = self.clone();
+        tokio::spawn(async move { server.watch_handover().await });
+        true
+    }
+
+    /// Whether the pool is at a quiet moment: no worker executing a command and
+    /// no heavy admission permit held.
+    ///
+    /// A command in flight is work the graceful stop would interrupt, while a
+    /// live worker between commands is what that stop checkpoints and the next
+    /// daemon continues.
+    fn handover_quiet(&self) -> bool {
+        self.pool.commands_running() == 0 && self.pool.admission().running_heavy() == 0
+    }
+
+    /// Stop the daemon at the first quiet moment, or at the deadline.
+    ///
+    /// The deadline path hands over with a command still running: the graceful
+    /// shutdown still checkpoints every live worker, it only interrupts work
+    /// that never got its quiet moment.
+    async fn watch_handover(&self) {
+        let deadline = self
+            .handover
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .expect("the deadline is set before the watcher starts");
+        loop {
+            tokio::time::sleep(HANDOVER_POLL).await;
+            if self.handover_quiet() || std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if !self.handover_quiet() {
+            warn!("Hub handover deadline reached with a command still running; handing over anyway");
+        }
+        info!("Hub handover: stopping for the newer build");
+        // The same admission gate `hub/shutdown` takes, so a dispatch that
+        // arrives while the daemon finishes is refused rather than interrupted.
+        // `try_write` because a dispatch in flight holds the read side for its
+        // whole turn, and waiting for it would outlast the deadline.
+        if let Ok(mut stopping) = self.hub_shutdown_gate.try_write() {
+            *stopping = true;
+        }
+        self.shutdown.send_replace(true);
     }
 
     pub(super) async fn admit_worker(&self) -> Result<tokio::sync::RwLockReadGuard<'_, bool>> {

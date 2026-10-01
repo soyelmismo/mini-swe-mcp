@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -584,6 +585,13 @@ impl HubServer {
         }
         append_log(&paths.log(), "stopped");
         drop(lock);
+        // A handover leaves the hub unserved until a client dials it again, and
+        // the workers it just interrupted are auto-continued by whichever
+        // daemon binds the socket next, so the daemon that stepped aside starts
+        // that daemon itself rather than waiting for one.
+        if self.server.handover_requested() {
+            respawn_daemon(paths);
+        }
         debug!("Hub daemon stopped");
         Ok(true)
     }
@@ -645,6 +653,72 @@ impl HubServer {
             }
         });
     }
+}
+
+/// Start a replacement daemon from this executable, detached exactly the way a
+/// client auto-starts one (see [`crate::hub::client::connect_or_spawn`]).
+///
+/// `cargo` replaces the binary in place, so the running daemon's
+/// `/proc/self/exe` reads `<path> (deleted)` while `path` itself already holds
+/// the newer build: respawning the path is what makes the replacement the new
+/// binary instead of another copy of this one.
+fn respawn_daemon(paths: &HubPaths) {
+    let Some(exe) = current_exe_path() else {
+        warn!("No executable to hand over to; the next client will start the hub");
+        return;
+    };
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(paths.log())
+    {
+        Ok(log) => log,
+        Err(e) => {
+            warn!(error = %e, "Could not open the hub log for the replacement daemon");
+            return;
+        }
+    };
+    let mut command = std::process::Command::new(&exe);
+    command
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log);
+    // SAFETY: setsid is async-signal-safe and touches no Rust state after fork.
+    // SAFETY: setsid is async-signal-safe and touches no Rust state after fork.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match tokio::process::Command::from(command).spawn() {
+        Ok(mut child) => {
+            info!(exe = %exe.display(), "Started the replacement hub daemon");
+            append_log(&paths.log(), &format!("handover to {}", exe.display()));
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+        Err(e) => {
+            warn!(error = %e, exe = %exe.display(), "Could not start the replacement hub daemon")
+        }
+    }
+}
+
+/// This executable's path with the kernel's ` (deleted)` suffix removed.
+///
+/// `None` when the path no longer exists, which means there is nothing to
+/// respawn and the next client starts the hub instead.
+fn current_exe_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let text = exe.to_string_lossy();
+    let path = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text));
+    path.is_file().then_some(path)
 }
 
 /// Append one timestamped line to the hub log; failures are traced, never fatal.

@@ -361,6 +361,18 @@ impl WorkerPool {
         self.changes.subscribe()
     }
 
+    /// How many workers are executing a bash command right now.
+    ///
+    /// A planned handover reads it: a command in flight is work a stop must not
+    /// interrupt, while a live worker between commands is exactly what the
+    /// graceful shutdown checkpoints and the next daemon continues.
+    pub fn commands_running(&self) -> usize {
+        self.command_running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
     /// Mark `id` as queued for a heavy build slot behind `queued` requests.
     /// The returned guard clears the state when the slot is granted or the
     /// wait is abandoned, so a killed worker leaves no stale wait behind.

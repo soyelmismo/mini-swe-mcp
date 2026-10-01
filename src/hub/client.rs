@@ -215,7 +215,7 @@ fn newer(client: &str, daemon: &str) -> bool {
 /// decide, so a rebuilt binary replaces an idle hub built before it. A daemon
 /// that reports no `build` predates the build handshake and is judged on the
 /// release alone.
-fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) -> bool {
+pub(crate) fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) -> bool {
     if version != daemon && newer(version, daemon) {
         return true;
     }
@@ -228,6 +228,31 @@ fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) 
         (Some(id), Some(ts), Some(daemon_id), Some(daemon_ts)) => id != daemon_id && ts > daemon_ts,
         _ => false,
     }
+}
+
+/// Env var overriding how long a busy daemon waits for a quiet moment before
+/// it hands over anyway.
+pub const HANDOVER_DEADLINE_ENV: &str = "HUB_HANDOVER_SECS";
+
+/// Default handover deadline: long enough for a build to finish, short enough
+/// that a daemon busy all day still picks up the newer build.
+pub const DEFAULT_HANDOVER_SECS: u64 = 15 * 60;
+
+/// Bounds on the handover deadline, so a request can neither cut a running
+/// command off nor park the daemon forever.
+const MIN_HANDOVER_SECS: u64 = 1;
+const MAX_HANDOVER_SECS: u64 = 24 * 60 * 60;
+
+/// How long a handover waits for a quiet moment before it happens anyway.
+///
+/// The env var is the operator's default; a `hub/handover` request may name its
+/// own, clamped to [`MIN_HANDOVER_SECS`]..=[`MAX_HANDOVER_SECS`].
+pub(crate) fn handover_deadline(requested: Option<u64>) -> Duration {
+    let secs = requested
+        .or_else(|| crate::config::env_parse(HANDOVER_DEADLINE_ENV))
+        .unwrap_or(DEFAULT_HANDOVER_SECS)
+        .clamp(MIN_HANDOVER_SECS, MAX_HANDOVER_SECS);
+    Duration::from_secs(secs)
 }
 
 /// File in the hub directory remembering which (client build, hub build)
