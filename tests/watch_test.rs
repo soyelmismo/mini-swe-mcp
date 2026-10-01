@@ -302,6 +302,58 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
     let _ = task.await;
 }
 
+/// The command-in-flight mark follows `execute_bash`: published while the
+/// command runs and cleared when it returns, so the stall detector can trust
+/// that a long command is not worker inactivity.
+#[tokio::test]
+async fn a_running_bash_command_is_published_and_then_cleared() {
+    let scratch = common::TempDir::new_in_tmp("cmd-run-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-cmd",
+        "agent-a",
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    assert_eq!(
+        pool.worker_progress("w-cmd")
+            .await
+            .unwrap()
+            .command_started_at,
+        None,
+        "no command is in flight yet"
+    );
+    {
+        let _running = pool.command_running("w-cmd");
+        assert!(
+            pool.worker_progress("w-cmd")
+                .await
+                .unwrap()
+                .command_started_at
+                .is_some(),
+            "a command in flight must be published"
+        );
+    }
+    assert_eq!(
+        pool.worker_progress("w-cmd")
+            .await
+            .unwrap()
+            .command_started_at,
+        None,
+        "the mark must clear when the command returns"
+    );
+}
+
 /// An interactive verb (here `status`) is the owner having seen the worker:
 /// the event it queued must not replay on the next watch.
 #[tokio::test]

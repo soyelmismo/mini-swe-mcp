@@ -928,6 +928,11 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             view["question"] = json!(progress.question);
             // A queued build slot is shown as its own state, never as a stall.
             view["waiting_for_slot"] = json!(progress.waiting_for_slot);
+            // A command in flight keeps the worker out of the stall detector;
+            // publish the mark only while there is one.
+            if let Some(started) = progress.command_started_at {
+                view["command_started_at"] = json!(started);
+            }
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];

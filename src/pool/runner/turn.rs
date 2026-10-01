@@ -1054,6 +1054,7 @@ impl<'a> TurnEngine<'a> {
         } else {
             self.worktree.leased_build_dir().map(Path::to_path_buf)
         };
+        let _running = self.pool.command_running(self.worker_id);
         runner.execute_bash(&self.worktree.path, command).await
     }
 
@@ -1089,6 +1090,7 @@ impl<'a> TurnEngine<'a> {
         } else {
             self.worktree.leased_build_dir().map(Path::to_path_buf)
         };
+        let _running = self.pool.command_running(self.worker_id);
         runner.execute_bash(&self.worktree.path, command).await
     }
 

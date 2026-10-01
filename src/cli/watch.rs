@@ -163,6 +163,11 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     if view["waiting_for_slot"].is_number() && matches!(status, "running" | "reviewing") {
         return None;
     }
+    // A command that is still executing is work in flight, not inactivity: a
+    // long `cargo test` or verify gate must never read as a stall.
+    if view["command_started_at"].is_number() && matches!(status, "running" | "reviewing") {
+        return None;
+    }
     let metrics: WorkerMetrics =
         serde_json::from_value(view["metrics"].clone()).unwrap_or_default();
     let baseline: WorkerMetrics = previous
@@ -840,6 +845,28 @@ mod tests {
         assert!(verbose.contains("Review the diff"), "{verbose}");
         assert!(verbose.contains("git diff HEAD...'worker-w'"), "{verbose}");
         assert!(verbose.contains("Diff: 0 files, +0 -0"), "{verbose}");
+    }
+
+    /// A step whose command is still executing is not a stall: a long build
+    /// or test gate past the idle threshold produces no event at all.
+    #[test]
+    fn a_command_still_running_is_not_a_stall() {
+        let mut running = state("running", 2, WorkerMetrics::default(), 100, 10);
+        running["command_started_at"] = json!(1150);
+        assert!(
+            select_event(&running, None, 1200).is_none(),
+            "a command in flight must not be reported as stalled"
+        );
+        // Once the command returns, the idle clock decides again.
+        assert_eq!(
+            select_event(
+                &state("running", 2, WorkerMetrics::default(), 100, 10),
+                None,
+                1200
+            )
+            .unwrap()["event"],
+            "stalled"
+        );
     }
 
     /// `--json` is the complete machine-readable contract: it must not shrink
