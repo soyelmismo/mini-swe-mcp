@@ -200,6 +200,16 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // The batch gate runs in `<scratch>/swe-merge-approved`, and the
+        // executor files its private scratch beside the short scratch root as
+        // `swe-tmp-swe-merge-approved`; reclaiming under the injected scratch
+        // root alone never sees it, so remove it with the product helper.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.scratch.path().join("swe-merge-approved"));
+    }
+}
+
 fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).expect("fixture file must be writable");
 }

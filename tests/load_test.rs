@@ -100,8 +100,19 @@ struct Daemon {
 
 impl Daemon {
     async fn stop(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        // A SIGTERM lets the daemon shut down and take a socket that moved to a
+        // short fallback directory along; SIGKILL would bypass that cleanup.
+        #[cfg(unix)]
+        {
+            // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+            unsafe { libc::kill(self.pid as i32, libc::SIGTERM) };
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(10), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+        }
     }
 }
 
@@ -421,6 +432,9 @@ async fn hub_handles_five_agents_of_twenty_workers() {
     let total = shape.total();
     let root = TempDir::new_in_tmp("load");
     let hub = root.subdir("hub");
+    // Own the short socket fallback directory a too-deep hub directory moves
+    // its socket to, so a hard-killed daemon at teardown leaves nothing behind.
+    let _fallback = common::fallback_socket_dir(&hub);
     let swe = root.subdir("swe");
     let repo = root.subdir("repo");
     private_dir(&hub);
