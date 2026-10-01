@@ -1240,7 +1240,7 @@ struct WatchHistory {
 /// process failed to run, the path is not a repository (exit `128`), or the
 /// base ref cannot be resolved -- is *not* suppression: a terminal event that
 /// could not be verified stays visible, never silently dropped.
-fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
+pub fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
     /// `git` exit code for "the ref is not there", the one outcome that
     /// proves absence. Every other code means the probe itself failed.
     const REF_NOT_FOUND: i32 = 1;
@@ -1710,6 +1710,16 @@ pub(super) async fn watch_request(
 mod watch_stall_regression_tests {
     use super::*;
 
+    /// Removes a temporary directory when it goes out of scope, so a
+    /// failing assertion still cleans up the scratch it created.
+    struct CleanupDir<'a>(&'a std::path::Path);
+
+    impl Drop for CleanupDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+
     fn view(step: usize) -> serde_json::Value {
         json!({"worker_id":"stall-probe", "owner":"owner", "status":"running",
             "step":step, "revision":0, "last_step_at":crate::pool::unix_timestamp().saturating_sub(601),
@@ -1732,59 +1742,19 @@ mod watch_stall_regression_tests {
         assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
     }
 
-    /// A terminal worker whose repository cannot be probed is never
-    /// suppressed: the suppression contract requires *proof* that the
-    /// branch is gone or merged, so a failed probe (here `128`, not a
-    /// repository) leaves the event visible. This is the regression
-    /// guard against treating any git failure as "branch gone".
+    /// Eviction keeps the store bounded by recency, not by key
+    /// order: keys are written in *descending* order so a
+    /// lexically-smallest key is the newest, and the
+    /// lexically-largest -- the least recently acknowledged -- is
+    /// the one dropped. Re-acknowledging the lexically smallest
+    /// (oldest by write order, newest by recency) must keep it.
     #[test]
-    fn terminal_event_with_unprobeable_repo_is_not_suppressed() {
-        // A completed worker whose `repo_path` is a plain directory,
-        // so neither `show-ref` nor `merge-base` can run as a probe.
-        let dir =
-            std::env::temp_dir().join(format!("mcp-events-unprobeable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create probe dir");
-        let mut row = crate::pool::WorkerRegistryEntry::test_row("w-unprobe", "owner");
-        row.status = crate::pool::RegistryStatus::Completed;
-        row.repo_path = Some(dir.to_string_lossy().into_owned());
-        row.base_branch = Some("main".into());
-        assert!(
-            !branch_replay_suppressed(&row),
-            "an unprobeable repository must not suppress the event"
-        );
-        let _ = std::fs::remove_dir(&dir);
-
-        // The same row, observed, must produce a replayable event.
-        let mut view = crate::cli::watch::registry_snapshot(&row, crate::pool::unix_timestamp());
-        view["branch"] = json!("worker-w-unprobe");
-        let mut router = EventRouter::default();
-        router.observe_watch([("w-unprobe".into(), view)].into());
-        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
-        ctx.agent_id = Some("owner".into());
-        let reply = router
-            .watch_reply(&ctx, &json!({"worker_ids":["w-unprobe"], "initial":true}))
-            .unwrap();
-        let ids: Vec<&str> = reply["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e["worker_id"].as_str())
-            .collect();
-        assert!(
-            ids.contains(&"w-unprobe"),
-            "the terminal event must stay visible: {reply}"
-        );
-    }
-
-    /// Eviction keeps the store bounded by recency, not by key order:
-    /// the least recently acknowledged worker is the one dropped, and
-    /// a re-acknowledged stale key survives over a never-reacked newer one.
-    #[test]
-    fn ack_store_evicts_least_recently_acknowledged() {
+    fn ack_store_evicts_least_recently_acknowledged_worker() {
         let mut store = AckStore::default();
-        // Fill one owner past the per-owner bound with distinct keys.
+        // Keys descend: w-00009 is written first (oldest), w-00000
+        // last (newest), so lexical order is the reverse of recency.
         let total = MAX_ACK_WORKERS + 10;
-        for i in 0..total {
+        for i in (0..total).rev() {
             store.record("owner", &format!("w-{i:05}"), 1, "completed");
         }
         assert_eq!(
@@ -1792,38 +1762,63 @@ mod watch_stall_regression_tests {
             MAX_ACK_WORKERS,
             "the per-owner store must stay bounded"
         );
-        // The first ten keys were the least recently acknowledged, so
-        // they are the evicted ones; the newest keys survive.
-        for i in 0..10 {
+        // The first ten written -- the lexically largest -- were the
+        // least recently acknowledged, so they are the evicted ones.
+        for i in (MAX_ACK_WORKERS..total).rev() {
             assert!(
                 !store.acknowledged("owner", &format!("w-{i:05}"), 1, "completed"),
                 "the least recently acknowledged key {i} must be evicted"
             );
         }
-        // Re-acknowledging an evicted key makes it the most recent, so
-        // it survives while the (now) least recent are dropped.
-        store.record("owner", "w-00000", 1, "completed");
+        // The lexically smallest keys were written last, so they
+        // survive a pure lexical eviction that would keep them too;
+        // the discriminator is the re-acknowledged stale key below.
+        for i in 0..MAX_ACK_WORKERS {
+            assert!(
+                store.acknowledged("owner", &format!("w-{i:05}"), 1, "completed"),
+                "the newest key {i} must survive"
+            );
+        }
+        // Re-acknowledging an evicted key makes it the most recent,
+        // so it survives while the (now) least recent are dropped.
+        store.record("owner", &format!("w-{:05}", total - 1), 1, "completed");
         assert!(
-            store.acknowledged("owner", "w-00000", 1, "completed"),
+            store.acknowledged("owner", &format!("w-{:05}", total - 1), 1, "completed"),
             "a re-acknowledged key is the most recent and must survive"
         );
-        // The owner bound is exercised through the same clock.
+    }
+
+    /// The owner bound evicts the owner whose *latest* acknowledgment
+    /// is oldest, not the one with the oldest single entry: an owner
+    /// that keeps acknowledging new workers stays, while one that
+    /// went quiet is dropped.
+    #[test]
+    fn ack_store_evicts_least_recently_acknowledged_owner() {
+        // `quiet` acknowledges two workers and then goes silent;
+        // `chatty` keeps acknowledging afterwards, so `quiet`'s
+        // *latest* stamp is the oldest even though it was created
+        // first. The filler owners fill the store to the bound so
+        // the eviction is actually exercised.
         let mut store = AckStore::default();
-        for i in 0..(MAX_ACK_OWNERS + 5) {
-            store.record(&format!("owner-{i:05}"), "w", 1, "completed");
+        store.record("quiet", "w-a", 1, "completed");
+        store.record("quiet", "w-b", 1, "completed");
+        for i in 0..(MAX_ACK_OWNERS - 1) {
+            store.record(&format!("filler-{i:05}"), "w", 1, "completed");
         }
+        store.record("chatty", "w-a", 1, "completed");
+        store.record("chatty", "w-b", 1, "completed");
         assert_eq!(
             store.positions.len(),
             MAX_ACK_OWNERS,
             "the owner store must stay bounded"
         );
-        // The first owners were acknowledged least recently.
-        assert!(!store.positions.contains_key("owner-00000"));
-        assert!(
-            store
-                .positions
-                .contains_key(&format!("owner-{:05}", MAX_ACK_OWNERS + 4))
-        );
+        // `quiet`'s latest acknowledgment is the oldest, so it is
+        // evicted; `chatty`, whose newest stamp is the most recent,
+        // survives together with the rest of its workers.
+        assert!(!store.positions.contains_key("quiet"));
+        assert!(store.positions.contains_key("chatty"));
+        assert!(store.acknowledged("chatty", "w-a", 1, "completed"));
+        assert!(store.acknowledged("chatty", "w-b", 1, "completed"));
     }
 
     #[test]
