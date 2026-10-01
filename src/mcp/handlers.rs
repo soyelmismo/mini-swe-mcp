@@ -855,9 +855,10 @@ impl McpServer {
         .await;
         // Both sweeps walk directories, shell out to git and salvage dead
         // worktrees, so they run off the runtime thread.
+        let root = self.pool.scratch_root().clone();
         let pruned = tokio::task::spawn_blocking(move || {
-            crate::worktree::prune_stale_worktrees(&repo_path);
-            crate::pool::prune_orphan_histories(&repo_path);
+            crate::worktree::prune_stale_worktrees_in(&repo_path, &root.base_dirs());
+            crate::pool::prune_orphan_histories_in(&root, &repo_path);
         })
         .await;
         if pruned.is_err() {

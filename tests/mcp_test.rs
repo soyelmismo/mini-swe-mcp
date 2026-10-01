@@ -14,6 +14,7 @@
 //! missing response fails fast instead of hanging the suite.
 
 mod common;
+use common::IsolatedPool;
 
 use mini_swe_mcp::agent::wrap_network_command;
 use mini_swe_mcp::mcp::{
@@ -22,7 +23,7 @@ use mini_swe_mcp::mcp::{
 };
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerRegistryEntry, remove_registry_entry, save_registry_entry,
+    RegistryStatus, WorkerRegistryEntry, remove_registry_entry_in, save_registry_entry_in,
 };
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -1643,19 +1644,29 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
 #[test]
 fn a_worker_transition_reaches_the_session_over_stdio() {
     let worker_id = format!("chan-smoke-{}", std::process::id());
-    save_registry_entry(&synthetic_registry_row(&worker_id, RegistryStatus::Running));
+    // A private scratch root, so the row this test writes never lands in the
+    // real registry: the server child sees it through `SWE_TEMP_DIR`.
+    let scratch = common::TempDir::new_in_tmp("mcp-channel");
+    let swe = scratch.path().to_string_lossy().into_owned();
+    save_registry_entry_in(
+        &mini_swe_mcp::worktree::ScratchRoot::new(&swe),
+        &synthetic_registry_row(&worker_id, RegistryStatus::Running),
+    );
 
-    let mut server = McpProcess::spawn();
+    let mut server = McpProcess::spawn_with_env(&[("SWE_TEMP_DIR", &swe)]);
     server.send(&json!({"jsonrpc": "2.0", "method": "hub/hello",
         "params": {"agent_id": "registry-owner"}}));
     server.initialize();
     let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
     paused.question = Some(String::from("Ship the migration or roll it back?"));
-    save_registry_entry(&paused);
+    save_registry_entry_in(
+        &mini_swe_mcp::worktree::ScratchRoot::new(&swe),
+        &paused,
+    );
     // The row belongs to another process, so the server only discovers it on
     // its coarse cross-process fallback tick.
     let event = server.expect_channel_event_within("the paused worker", Duration::from_secs(45));
-    remove_registry_entry(&worker_id);
+    remove_registry_entry_in(&mini_swe_mcp::worktree::ScratchRoot::new(&swe), &worker_id);
 
     let meta = &event["params"]["meta"];
     assert_eq!(event["jsonrpc"], json!("2.0"));
@@ -1710,10 +1721,13 @@ fn owned_worker(id: &str, owner: &str) -> WorkerRecord {
 }
 
 /// A pool plus server over it, with no LLM anywhere in sight.
-fn owned_server() -> (WorkerPool, McpServer) {
-    let pool = WorkerPool::new(8, "http://localhost:1".to_string(), "test-key".to_string());
-    let server = McpServer::new(pool.clone(), "ninja".to_string());
-    (pool, server)
+///
+/// The pool owns a temporary scratch root, so the registry rows these tests
+/// write never land in the real registry under `swe_base_dir()`.
+fn owned_server() -> (IsolatedPool, McpServer) {
+    let owned = IsolatedPool::new(8, "mcp-owned");
+    let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
+    (owned, server)
 }
 
 /// One agent controls its own workers and nobody else's: `steer`, `kill`,
@@ -1722,7 +1736,7 @@ fn owned_server() -> (WorkerPool, McpServer) {
 #[tokio::test]
 async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
+    owned.pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
         .await;
     let agent_b = agent_context("agent-b");
 
@@ -1749,7 +1763,7 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     // The refusals changed nothing: the worker is still running and still owned
     // by agent A, and A can steer it.
     assert!(
-        pool.worker_progress("h3-foreign").await.is_some(),
+        owned.pool.worker_progress("h3-foreign").await.is_some(),
         "a refused verb must not evict the worker"
     );
     let steered = server
@@ -1765,7 +1779,7 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     // The refusals changed nothing: the worker is still running and still owned
     // by agent A, and A can steer it.
     assert!(
-        pool.worker_progress("h3-foreign").await.is_some(),
+        owned.pool.worker_progress("h3-foreign").await.is_some(),
         "a refused verb must not evict the worker"
     );
     let steered = server
@@ -1805,7 +1819,7 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
 #[tokio::test]
 async fn an_admin_connection_bypasses_the_ownership_check() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-admin", "agent-a"))
+    owned.pool.__test_insert_worker(owned_worker("h3-admin", "agent-a"))
         .await;
 
     let steered = server
@@ -1845,17 +1859,18 @@ fn owned_registry_row(worker_id: &str, owner: &str) -> WorkerRegistryEntry {
 /// worker of another *connection* is: the pool itself only knows its own.
 #[tokio::test]
 async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
-    let (_pool, server) = owned_server();
-    save_registry_entry(&owned_registry_row("h3-mine", "agent-a"));
-    save_registry_entry(&owned_registry_row("h3-theirs", "agent-b"));
+    let (owned, server) = owned_server();
+    let root = owned.root();
+    save_registry_entry_in(&root, &owned_registry_row("h3-mine", "agent-a"));
+    save_registry_entry_in(&root, &owned_registry_row("h3-theirs", "agent-b"));
     let agent_a = agent_context("agent-a");
 
     let mine = server
         .execute_tool_for("worker", json!({ "action": "list" }), &agent_a)
         .await
         .expect("list answers");
-    remove_registry_entry("h3-mine");
-    remove_registry_entry("h3-theirs");
+    remove_registry_entry_in(&root, "h3-mine");
+    remove_registry_entry_in(&root, "h3-theirs");
     let ids = |payload: &serde_json::Value| -> Vec<String> {
         payload["workers"]
             .as_array()
@@ -1875,8 +1890,8 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
     assert!(!ids(&mine).contains(&"h3-theirs".to_string()), "{mine}");
     assert!(owners.iter().all(|owner| owner == "agent-a"), "{mine}");
 
-    save_registry_entry(&owned_registry_row("h3-mine", "agent-a"));
-    save_registry_entry(&owned_registry_row("h3-theirs", "agent-b"));
+    save_registry_entry_in(&root, &owned_registry_row("h3-mine", "agent-a"));
+    save_registry_entry_in(&root, &owned_registry_row("h3-theirs", "agent-b"));
     let all = server
         .execute_tool_for(
             "worker",
@@ -1885,8 +1900,8 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
         )
         .await
         .expect("scope=all answers for the admin override");
-    remove_registry_entry("h3-mine");
-    remove_registry_entry("h3-theirs");
+    remove_registry_entry_in(&root, "h3-mine");
+    remove_registry_entry_in(&root, "h3-theirs");
     assert!(ids(&all).contains(&"h3-mine".to_string()), "{all}");
     assert!(ids(&all).contains(&"h3-theirs".to_string()), "{all}");
     let owner_of = |worker_id: &str| -> String {
@@ -1922,7 +1937,7 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 #[tokio::test]
 async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
+    owned.pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
         .await;
     let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
     let capped = agent_context("cap-agent");
@@ -2186,10 +2201,9 @@ fn kill_worker(server: &mut McpProcess, id: u64, worker_id: &str) {
 #[tokio::test]
 async fn dispatch_returns_immediately_with_a_watch_hint() {
     let scratch = DispatchScratch::new("dispatch-watch");
-    let _swe = ScopedEnv::set("SWE_TEMP_DIR", &scratch.base());
     let crate_branches = CrateBranchGuard::new();
-    let pool = WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string());
-    let server = McpServer::new(pool.clone(), "ninja".to_string());
+    let owned = IsolatedPool::new(1, "mcp-dispatch");
+    let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
 
     let result = tokio::time::timeout(
         Duration::from_secs(3),
@@ -2234,8 +2248,8 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
     .await
     .expect("the dispatched worker must create its worktree");
 
-    pool.kill(&wid).await;
-    remove_registry_entry(&wid);
+    owned.pool.kill(&wid).await;
+    remove_registry_entry_in(&owned.root(), &wid);
     crate_branches.assert_untouched();
 }
 
