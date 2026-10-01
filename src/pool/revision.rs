@@ -102,6 +102,9 @@ pub const DEFAULT_REVISION_TURNS: usize = 60;
 /// The metadata a finished run leaves behind so a later steer can relaunch it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerHistory {
+    /// Dispatch authority, preserved across warm and cold continuations.
+    #[serde(default)]
+    pub role: super::WorkerRole,
     pub task: String,
     /// Owning group of the original dispatch, preserved across revisions.
     #[serde(default)]
@@ -764,6 +767,7 @@ impl super::WorkerPool {
         let history = WorkerHistory {
             task,
             group: entry.group.clone(),
+            role: entry.role,
             model: entry.model.clone(),
             temperature: None,
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -1016,6 +1020,7 @@ impl super::WorkerPool {
             started_at: now,
             updated_at: now,
             group: history.group.clone(),
+            role: history.role,
             repo_path: Some(history.repo_path.clone()),
             metrics: super::WorkerMetrics::default(),
             base_branch: history.base_branch.clone(),
@@ -1033,6 +1038,7 @@ impl super::WorkerPool {
             id: wid.clone(),
             task: history.task.clone(),
             group: history.group.clone(),
+            role: history.role,
             repo_path: Some(history.repo_path.clone()),
             started_at: now,
             pid: std::process::id(),

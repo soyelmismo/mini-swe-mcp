@@ -185,6 +185,14 @@ Subagents execute exclusively inside isolated git worktrees rather than modifyin
   its uncommitted changes are committed onto the `worker-<id>` branch, so a crashed worker
   loses nothing — and only then removed. Branches with commits missing from `HEAD` are
   preserved rather than deleted.
+- **Merge** (`pool::merge`): the one-command landing of a finished worker's branch on the
+  base branch recorded for it. Every refusal is taken before anything is written — the
+  worker must be terminal, the repository must already have the base branch checked out
+  (`git merge-tree --write-tree` decides cleanliness, and only a file the merge would write
+  is a reason to refuse a dirty tree), and the verify gate runs on the merge result in a
+  throwaway worktree under the scratch root. Only then does `git merge --no-ff` run, after
+  which the branch, the history file and the worktree leftovers are reclaimed with the same
+  helpers the prune sweep uses. It never moves `HEAD` and never pushes.
 
 ---
 

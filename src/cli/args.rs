@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
+pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
@@ -54,12 +54,17 @@ pub fn tool_args(
                 }
             }
         }
-        "status" | "collect" | "logs" | "kill" | "review" => {
+        "collect" | "kill" | "logs" | "review" | "status" | "merge" => {
             if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
             }
             if action == "collect" {
                 collect_diff_args(cli_args, &mut tool_args);
+            }
+            // `--no-delete` keeps the merged branch: the same tool argument
+            // the MCP action reads, so the flag has one implementation.
+            if flag_index(cli_args, &["--no-delete"]).is_some() {
+                tool_args.insert("keep_branch".into(), Value::Bool(true));
             }
         }
         "steer" => {
@@ -167,6 +172,9 @@ fn collect_dispatch_flags(
                 tool_args.insert("network".into(), Value::String("offline".into()));
             }
             "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
+            // `--role <role>` selects the dispatch authority: the default
+            // worker, or the round's consolidator.
+            "--role" => take_value(cli_args, &mut i, tool_args, "role"),
             _ => {}
         }
         i += 1;
@@ -477,6 +485,41 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(with["verify"], "cargo test --all-targets");
+    }
+
+    /// `--role <role>` is the CLI spelling of the tool's `role` property, and an
+    /// omitted flag leaves the ordinary worker default in place.
+    #[test]
+    fn test_dispatch_role_flag_maps_to_the_role_property() {
+        let without = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "tidy docs"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !without.contains_key("role"),
+            "an omitted flag must leave the worker default in place"
+        );
+
+        let with = tool_args(
+            "dispatch",
+            &args(&[
+                "mini-swe-mcp",
+                "dispatch",
+                "integrate the round",
+                "--group",
+                "round-1",
+                "--role",
+                "consolidate",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["role"], "consolidate");
+        assert_eq!(with["group"], "round-1");
     }
 
     /// `--max-turns <n>` on `steer` is the revision's fresh turn budget: the

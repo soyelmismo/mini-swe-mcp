@@ -50,8 +50,8 @@ mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
-    summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_request_turns, summarize_command,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
@@ -233,6 +233,7 @@ impl WorkerPool {
         let opening_meta = WorkerHistory {
             task: task.clone(),
             group: meta.group.clone(),
+            role: meta.role,
             model: model.clone(),
             temperature,
             repo_path: repo_path_str.clone(),
