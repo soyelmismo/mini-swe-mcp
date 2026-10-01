@@ -364,13 +364,11 @@ fn steer_mailbox_uses_the_documented_path_and_json_lines() {
         assert_eq!(v["pid"], json!(std::process::id() as u32));
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn steer_mailbox_drain_returns_messages_in_order_and_empties_the_file() {
     let scratch = ScratchRootGuard::new("steer-drain");
-    let dir = scratch.path().to_path_buf();
 
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "d1", "one").unwrap();
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "d1", "two").unwrap();
@@ -388,13 +386,11 @@ fn steer_mailbox_drain_returns_messages_in_order_and_empties_the_file() {
     // A worker nobody ever steered drains empty rather than erroring.
     assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "never-steered").is_empty());
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
     let scratch = ScratchRootGuard::new("steer-multiline");
-    let dir = scratch.path().to_path_buf();
 
     // The real reason the format is JSON lines rather than raw text: a pasted
     // stack trace or a diff hunk contains newlines, and a line-oriented plain
@@ -409,13 +405,11 @@ fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
         vec![patch.to_string(), unicode.to_string()]
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
     let scratch = ScratchRootGuard::new("steer-corrupt");
-    let dir = scratch.path().to_path_buf();
 
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "c1", "good one").unwrap();
     // A truncated write, or a hand-edited file, leaves an unparsable line.
@@ -434,7 +428,6 @@ fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
         vec!["good one", "good two"]
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -463,13 +456,11 @@ fn steer_mailbox_drain_claims_the_file_so_two_readers_never_both_win() {
         .collect();
     assert!(leftovers.is_empty(), "claim file leaked: {leftovers:?}");
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
     let scratch = ScratchRootGuard::new("steer-late");
-    let dir = scratch.path().to_path_buf();
 
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "l1", "early").unwrap();
     assert_eq!(
@@ -482,13 +473,11 @@ fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "l1", "late").unwrap();
     assert_eq!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "l1"), vec!["late"]);
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn removing_the_steer_file_clears_the_mailbox_and_its_claim() {
     let scratch = ScratchRootGuard::new("steer-remove");
-    let dir = scratch.path().to_path_buf();
 
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "x1", "guidance").unwrap();
     assert!(mini_swe_mcp::pool::steer_path_in(&scratch.root(), "x1").is_file());
@@ -505,7 +494,6 @@ fn removing_the_steer_file_clears_the_mailbox_and_its_claim() {
     // Removing a mailbox that was never created is a no-op, not an error.
     mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "never-existed");
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -515,9 +503,8 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
     // must reach the turn -- dropping either would make cross-process steering
     // unreliable exactly when the local path is also in use.
     let scratch = ScratchRootGuard::new("steer-merge");
-    let dir = scratch.path().to_path_buf();
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(running_worker("m1")).await;
 
     // Local guidance (this process) and remote guidance (another process).
@@ -541,7 +528,6 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
     again.extend(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"));
     assert!(again.is_empty(), "guidance was re-delivered: {again:?}");
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -549,12 +535,10 @@ async fn draining_the_mailbox_for_an_unknown_worker_is_a_no_op() {
     // The loop drains on every turn of a worker that may never have been
     // steered; that must be silent, and must not create a mailbox either.
     let scratch = ScratchRootGuard::new("steer-drain-unknown");
-    let dir = scratch.path().to_path_buf();
 
     assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "ghost").is_empty());
     assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "ghost").exists());
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ----------
@@ -595,7 +579,8 @@ fn paused_worker(id: &str, tx: tokio::sync::mpsc::Sender<String>) -> WorkerRecor
 
 #[tokio::test]
 async fn steer_on_running_worker_queues_without_lock_convoy() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("steer-convoy");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(running_worker("w1")).await;
 
     pool.steer("w1", "please focus".into()).await.unwrap();
@@ -608,13 +593,14 @@ async fn steer_on_running_worker_queues_without_lock_convoy() {
 
 #[tokio::test]
 async fn steer_does_not_hold_write_guard_across_send() {
+    let scratch = ScratchRootGuard::new("steer-no-convoy");
     // Fill the capacity-1 resume channel *before* handing the sender to the
     // record, so the `send()` performed by `steer` has to await a full buffer
     // (nobody is receiving). If `steer` still held the write-guard across that
     // await -- the pre-fix behaviour -- every other pool operation (including
     // reads) would convoy behind it, and the `worker_progress` call below would
     // time out.
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     tx.send("occupying the single buffer slot".into())
         .await
@@ -664,10 +650,11 @@ async fn steer_does_not_hold_write_guard_across_send() {
 
 #[tokio::test]
 async fn steer_reports_missing_resume_channel_instead_of_dropping_message() {
+    let scratch = ScratchRootGuard::new("steer-no-channel");
     // A paused worker whose sender was already taken (e.g. it has been resumed
     // concurrently) must surface an error rather than silently swallow the
     // orchestrator guidance and return Ok(()).
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let mut w = paused_worker("w3", tx);
     w.resume_tx = None;
@@ -686,7 +673,6 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
     // process: an id with no live row is continued here instead, and a mailbox
     // nobody reads is never written.
     let scratch = ScratchRootGuard::new("steer-live-row-mailbox");
-    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::with_scratch(
         1,
         "http://x".into(),
@@ -729,9 +715,6 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
     pool.__test_insert_worker(running_worker("local")).await;
     pool.steer("local", "in memory".into()).await.unwrap();
     assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "local").exists());
-
-    drop(guard);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -739,8 +722,7 @@ async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
     // A finished worker with no saved conversation cannot be revised: the
     // error names the missing history file, not just the worker.
     let scratch = ScratchRootGuard::new("steer-finished-no-history");
-    let dir = scratch.path().to_path_buf();
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
 
     let mut done = running_worker("w4");
     done.state = WorkerState::Completed {
@@ -760,7 +742,6 @@ async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
         err.to_string().contains("history") || err.to_string().contains("conversation"),
         "the error must name the missing history file, got: {err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ----------
@@ -769,7 +750,8 @@ async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
 
 #[tokio::test]
 async fn worker_progress_reports_phase_step_and_command() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("progress-phase");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(running_worker("p1")).await;
 
     let p = pool.worker_progress("p1").await.unwrap();
@@ -782,9 +764,10 @@ async fn worker_progress_reports_phase_step_and_command() {
 
 #[tokio::test]
 async fn worker_progress_never_clones_the_terminal_payload() {
+    let scratch = ScratchRootGuard::new("progress-terminal");
     // A completed worker carries a large `diff`. Polling progress must report
     // the terminal phase without pulling that payload out of the record.
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut w = running_worker("p2");
     w.state = WorkerState::Completed {
         turns: 7,
@@ -814,7 +797,8 @@ async fn worker_progress_never_clones_the_terminal_payload() {
 
 #[tokio::test]
 async fn worker_progress_reports_paused_questions() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("progress-paused");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     pool.__test_insert_worker(paused_worker("p3", tx)).await;
 
@@ -826,7 +810,8 @@ async fn worker_progress_reports_paused_questions() {
 
 #[tokio::test]
 async fn worker_progress_reports_failed_workers() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("progress-failed");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut w = running_worker("p4");
     w.state = WorkerState::Failed {
         error: "boom".into(),
@@ -844,7 +829,8 @@ async fn worker_progress_reports_failed_workers() {
 
 #[tokio::test]
 async fn collect_evicts_and_returns_the_full_record() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("collect-evicts");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(running_worker("c1")).await;
 
     let collected = pool.collect("c1").await.unwrap();
@@ -1062,6 +1048,8 @@ fn test_high_turn_high_output_worker_stays_bounded() {
 
 #[test]
 fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
+    let scratch = ScratchRootGuard::new("exit-guard");
+    let dir = scratch.path().to_path_buf();
     // Requirement 3 of the feature: the worker removes its mailbox on exit.
     // The loop returns from many places (completion, bash failure, cancellation,
     // a propagated error) and a `remove_steer_file` call in each is exactly the
@@ -1069,7 +1057,6 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
     // contract that guard depends on: a mailbox left behind is always reclaimed,
     // whether the worker succeeded or failed, and never leaks a claim file.
     let scratch = ScratchRootGuard::new("steer-exit-guard");
-    let dir = scratch.path().to_path_buf();
 
     // A worker that ran, got steered from another process, and finished.
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "g1", "guidance").unwrap();
@@ -1099,7 +1086,6 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
         "worker exit leaked files: {leftovers:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ----------
@@ -1234,9 +1220,10 @@ fn test_a_completed_state_serializes_its_health_counters() {
 
 #[tokio::test]
 async fn test_a_killed_worker_reports_what_the_run_had_measured() {
+    let scratch = ScratchRootGuard::new("killed-metrics");
     // The record caches the phase loop's counters, so a kill racing the loop
     // still reports the measurements the run had made.
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut record = running_worker("f1");
     record.metrics.repeat_blocks = 2;
     record.metrics.turns_used = 9;
@@ -1308,7 +1295,6 @@ fn scratch_repo(tag: &str) -> std::path::PathBuf {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch repo");
     let run = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -1334,7 +1320,6 @@ fn scratch_repo(tag: &str) -> std::path::PathBuf {
 #[test]
 fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     let scratch = ScratchRootGuard::new("history-roundtrip");
-    let dir = scratch.path().to_path_buf();
 
     let repo = scratch_repo("history-roundtrip");
     let history = sample_history(&repo, "abc123", "worker-rev1");
@@ -1377,7 +1362,6 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
 
     mini_swe_mcp::pool::remove_worker_history("rev1");
     assert!(!path.exists(), "removal must delete the history file");
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1386,7 +1370,6 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
 #[test]
 fn prune_retires_histories_whose_branch_is_gone() {
     let scratch = ScratchRootGuard::new("history-orphans");
-    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("history-orphans");
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -1416,7 +1399,6 @@ fn prune_retires_histories_whose_branch_is_gone() {
     );
 
     mini_swe_mcp::pool::remove_worker_history("alive");
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1425,13 +1407,12 @@ fn prune_retires_histories_whose_branch_is_gone() {
 #[tokio::test]
 async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
     let scratch = ScratchRootGuard::new("history-owner");
-    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("history-owner");
     let mut history = sample_history(&repo, "abc", "worker-reaped");
     history.owner = Some("agent-x".to_string());
     mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "reaped", &history).expect("save history");
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     assert_eq!(
         pool.worker_owner("reaped").await,
         Some(mini_swe_mcp::pool::WorkerOwner::Agent(
@@ -1440,7 +1421,6 @@ async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
     );
 
     mini_swe_mcp::pool::remove_worker_history("reaped");
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1449,7 +1429,6 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // A finished worker steered with corrections restarts on its preserved
     // branch with the revision message appended to the reloaded history.
     let scratch = ScratchRootGuard::new("steer-revision");
-    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("steer-revision");
 
     // Create the preserved branch the finished run left behind.
@@ -1478,7 +1457,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     let base = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
     run(&["checkout", "master"]);
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("revwork");
     done.state = WorkerState::Completed {
         turns: 2,
@@ -1554,7 +1533,6 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     );
 
     pool.kill("revwork").await;
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1564,9 +1542,8 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     // unrevisable: the history file must survive it (only prune retires
     // it), so a later steer can still revise the same id and branch.
     let scratch = ScratchRootGuard::new("collect-keeps-history");
-    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("collect-keeps-history");
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("keep1");
     done.state = WorkerState::Completed {
         turns: 1,
@@ -1588,7 +1565,6 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
         "collect must not delete the history file; only prune retires it"
     );
     mini_swe_mcp::pool::remove_worker_history("keep1");
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1597,10 +1573,9 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     // The branch the orchestrator reviewed is gone: the error names the
     // branch, not just the worker.
     let scratch = ScratchRootGuard::new("steer-missing-branch");
-    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("steer-missing-branch");
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("gonework");
     done.state = WorkerState::Completed {
         turns: 1,
@@ -1623,7 +1598,6 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
         err.to_string().contains("worker-gonework"),
         "the error must name the missing branch, got: {err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1634,7 +1608,8 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
 /// A synthetic state change wakes a subscribed waiter without any tick.
 #[tokio::test]
 async fn change_subscription_fires_on_every_state_change() {
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("h5a-sub");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(running_worker("h5a-sub")).await;
     let mut changes = pool.subscribe_changes();
     // The subscription starts at the current generation, so only the state
@@ -1660,7 +1635,8 @@ async fn change_subscription_fires_on_every_state_change() {
 async fn step_only_registry_updates_coalesce_to_one_write() {
     let scratch = ScratchRootGuard::new("h5a-reg");
     let dir = scratch.path().to_path_buf();
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let scratch = ScratchRootGuard::new("h5a-reg");
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let meta = mini_swe_mcp::pool::WorkerMeta {
         id: "h5a-reg".into(),
         task: "t".into(),
@@ -1726,7 +1702,6 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         "a status transition must write immediately"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every runner reuses the single process-wide HTTP client.
@@ -1921,8 +1896,7 @@ fn owned_worker(id: &str, owner: &str) -> WorkerRecord {
 #[tokio::test]
 async fn listing_is_scoped_to_the_owning_agent() {
     let scratch = ScratchRootGuard::new("h3-list-inmemory");
-    let dir = scratch.path().to_path_buf();
-    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(4, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(owned_worker("h3-mine", "agent-a"))
         .await;
     pool.__test_insert_worker(owned_worker("h3-theirs", "agent-b"))
@@ -1952,13 +1926,12 @@ async fn listing_is_scoped_to_the_owning_agent() {
 #[tokio::test]
 async fn listing_is_scoped_across_processes_through_the_registry() {
     let scratch = ScratchRootGuard::new("h3-list-registry");
-    let dir = scratch.path().to_path_buf();
     let mut row = measured_entry();
     row.id = "h3-reg".to_string();
     row.status = RegistryStatus::Running;
     row.owner = Some("agent-a".to_string());
     mini_swe_mcp::pool::save_registry_entry_in(&scratch.root(), &row);
-    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(4, "http://x".into(), "k".into(), scratch.root());
 
     let mine = pool.list_workers_of("agent-a").await;
     assert_eq!(mine.len(), 1, "the owner's own row: {mine:?}");
@@ -1978,8 +1951,7 @@ async fn listing_is_scoped_across_processes_through_the_registry() {
 #[tokio::test]
 async fn worker_ownership_falls_back_to_the_registry_row() {
     let scratch = ScratchRootGuard::new("h3-owner-fallback");
-    let dir = scratch.path().to_path_buf();
-    let pool = WorkerPool::new(4, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(4, "http://x".into(), "k".into(), scratch.root());
 
     assert_eq!(pool.worker_owner("h3-nobody").await, None);
 
@@ -2027,8 +1999,7 @@ fn a_registry_row_without_an_owner_still_parses() {
 #[tokio::test]
 async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
     let scratch = ScratchRootGuard::new("h3-cap-count");
-    let dir = scratch.path().to_path_buf();
-    let pool = WorkerPool::new(8, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(8, "http://x".into(), "k".into(), scratch.root());
     pool.__test_insert_worker(owned_worker("h3-a1", "agent-a"))
         .await;
     pool.__test_insert_worker(owned_worker("h3-a2", "agent-a"))
