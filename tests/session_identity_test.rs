@@ -252,7 +252,7 @@ impl Daemon {
     /// Start a daemon on `dir`: the seam a restart is tested through, since the
     /// tokens must survive it.
     async fn start_in(dir: PathBuf) -> Self {
-        let socket = dir.join("hub.sock");
+        let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
         let server = server();
         let daemon = HubServer::new(
             server.clone(),
