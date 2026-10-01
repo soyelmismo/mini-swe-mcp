@@ -623,7 +623,17 @@ fn apply_build_env(
         .env("OMP_NUM_THREADS", parallelism)
         .env("OPENBLAS_NUM_THREADS", parallelism)
         .env("MKL_NUM_THREADS", parallelism)
-        .env("GOMAXPROCS", parallelism);
+        .env("GOMAXPROCS", parallelism)
+        // JVM: Maven's `-T` thread count and Gradle's worker cap. Both are
+        // read as JVM/system properties, so the same granted job count as
+        // Cargo's `CARGO_BUILD_JOBS` applies without touching the command.
+        .env("MAVEN_OPTS", format!("-T{parallelism}"))
+        .env(
+            "GRADLE_OPTS",
+            format!("-Dorg.gradle.workers.max={parallelism}"),
+        )
+        // Python: pytest-xdist sizes its worker pool from this variable.
+        .env("PYTEST_XDIST_AUTO_NUM_WORKERS", parallelism);
 }
 
 /// Wall-clock budget (seconds) for `command`: heavy commands get a longer
@@ -1178,6 +1188,28 @@ mod tests {
                 .get_envs()
                 .any(|(key, _)| key == "CARGO_TARGET_DIR")
         );
+    }
+
+    /// The per-ecosystem parallelism caps all carry the granted job count, so
+    /// a Go, JVM or pytest-xdist build is dosed exactly like a Cargo one.
+    #[test]
+    fn build_env_carries_the_per_ecosystem_parallelism_caps() {
+        let mut cmd = Command::new("true");
+        apply_build_env(&mut cmd, None, Path::new("/tmp/private"), "3");
+        let value = |name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| panic!("{name} must be set"))
+        };
+        assert_eq!(value("GOMAXPROCS"), "3");
+        assert_eq!(value("MAVEN_OPTS"), "-T3");
+        assert_eq!(value("GRADLE_OPTS"), "-Dorg.gradle.workers.max=3");
+        assert_eq!(value("PYTEST_XDIST_AUTO_NUM_WORKERS"), "3");
+        // Cargo's own caps are unchanged.
+        assert_eq!(value("CARGO_BUILD_JOBS"), "3");
+        assert_eq!(value("MAKEFLAGS"), "-j3");
     }
 
     #[test]

@@ -162,6 +162,27 @@ pub fn append_bwrap_cache_args(cmd: &mut tokio::process::Command, home: Option<&
     }
 }
 
+/// Append `extra` to the whitespace-separated value of `name` on `cmd`.
+///
+/// Two layers configure the same variables: `exec::apply_build_env` sets the
+/// granted job count (`MAVEN_OPTS=-T4`) and this module adds the shared cache
+/// location. Overwriting either would silently drop the other, so the value is
+/// read back from the command and concatenated in call order.
+fn append_env_value(cmd: &mut tokio::process::Command, name: &str, extra: &str) {
+    let existing = cmd
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+        .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let joined = if existing.is_empty() {
+        extra.to_string()
+    } else {
+        format!("{existing} {extra}")
+    };
+    cmd.env(name, joined);
+}
+
 /// Apply universal cache environment variables to the child command.
 pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
     let dirs = cache_dirs();
@@ -182,10 +203,13 @@ pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
 
     // JVM. `MAVEN_OPTS` carries the local repository because `MAVEN_ARGS` is
     // not read by every launcher, and `GRADLE_USER_HOME` relocates the whole
-    // Gradle user home, caches and wrapper dists included.
-    cmd.env(
+    // Gradle user home, caches and wrapper dists included. The repository is
+    // appended to whatever `apply_build_env` already put in `MAVEN_OPTS`
+    // (its `-T` job cap), so neither setting is lost.
+    append_env_value(
+        cmd,
         "MAVEN_OPTS",
-        format!("-Dmaven.repo.local={}", dirs.maven.display()),
+        &format!("-Dmaven.repo.local={}", dirs.maven.display()),
     );
     cmd.env("GRADLE_USER_HOME", &dirs.gradle);
 
@@ -717,5 +741,63 @@ mod tests {
     fn test_apply_shared_cache_env() {
         let mut cmd = tokio::process::Command::new("true");
         apply_shared_cache_env(&mut cmd);
+    }
+
+    /// Every ecosystem cache the child is pointed at lives under the shared
+    /// cache root, so one Landlock/bwrap grant covers them all and no cache
+    /// directory is ever granted beside a credential file.
+    #[test]
+    fn test_every_ecosystem_cache_lives_under_the_shared_root() {
+        let dirs = cache_dirs();
+        for cache in [
+            &dirs.kache,
+            &dirs.uv,
+            &dirs.pip,
+            &dirs.npm,
+            &dirs.yarn,
+            &dirs.pnpm_home,
+            &dirs.pnpm_store,
+            &dirs.go_build,
+            &dirs.go_mod,
+            &dirs.maven,
+            &dirs.gradle,
+        ] {
+            assert!(
+                cache.starts_with(&dirs.root),
+                "{} must live under the shared cache root",
+                cache.display()
+            );
+        }
+        assert!(dirs.maven.is_dir(), "the Maven cache must be created");
+        assert!(dirs.gradle.is_dir(), "the Gradle cache must be created");
+    }
+
+    /// The JVM caches are redirected through their own variables, and the
+    /// Maven repository is *appended* to the job cap `apply_build_env` sets
+    /// rather than replacing it.
+    #[test]
+    fn test_shared_cache_env_points_the_jvm_tools_at_the_shared_caches() {
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env("MAVEN_OPTS", "-T4");
+        apply_shared_cache_env(&mut cmd);
+
+        let dirs = cache_dirs();
+        let env = |name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .expect("the variable must be set")
+        };
+        assert_eq!(env("GRADLE_USER_HOME"), dirs.gradle.to_string_lossy());
+        let maven_opts = env("MAVEN_OPTS");
+        assert!(
+            maven_opts.contains("-T4"),
+            "the granted job cap must survive: {maven_opts}"
+        );
+        assert!(
+            maven_opts.contains(&format!("-Dmaven.repo.local={}", dirs.maven.display())),
+            "the shared local repository must be added: {maven_opts}"
+        );
     }
 }

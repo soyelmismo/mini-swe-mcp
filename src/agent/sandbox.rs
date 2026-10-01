@@ -1684,6 +1684,72 @@ mod tests {
         assert!(!is_heavy_command("   "));
     }
 
+    /// Every shared ecosystem cache the child environment points at is
+    /// writable in the Landlock plan, and no rule covers a credential file
+    /// that lives beside one of them.
+    #[test]
+    fn the_plan_grants_the_shared_caches_and_denies_their_credentials() {
+        let worktree = std::env::temp_dir().join("swe-plan-cache-test-worktree");
+        let target = std::env::temp_dir().join("swe-plan-cache-test-target");
+        let _ = std::fs::create_dir_all(&worktree);
+        let _ = std::fs::create_dir_all(&target);
+        let rules = build_path_rules(&worktree, &target);
+
+        // Each ecosystem cache is writable: some granted rule is a prefix of
+        // it, which is what a shared cache root grant provides.
+        let dirs = crate::cache::CacheDirs::new();
+        for cache in [
+            &dirs.npm,
+            &dirs.yarn,
+            &dirs.pnpm_home,
+            &dirs.pnpm_store,
+            &dirs.pip,
+            &dirs.uv,
+            &dirs.go_build,
+            &dirs.go_mod,
+            &dirs.maven,
+            &dirs.gradle,
+        ] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| rule.allowed & ACCESS_FS_WRITE_FILE != 0
+                        && cache.starts_with(&rule.path)),
+                "{} must be writable in the plan",
+                cache.display()
+            );
+        }
+
+        // The credential files that live next to those caches stay denied.
+        let denied = denied_paths();
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+        for credential in [
+            ".npmrc",
+            ".yarnrc",
+            ".netrc",
+            ".pypirc",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".cargo/credentials.toml",
+        ] {
+            let path = home.join(credential);
+            assert!(
+                denied.contains(&path),
+                "{} must be on the deny list",
+                path.display()
+            );
+            assert!(
+                !rules
+                    .iter()
+                    .any(|rule| rule.path == path || rule.path.starts_with(&path)),
+                "{} must never be granted",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&worktree);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
     #[test]
     fn test_has_bwrap_returns_boolean() {
         let _ = has_bwrap();
@@ -2290,9 +2356,16 @@ mod tests {
             out.status.success(),
             "enforcement mode failed\nstdout: {stdout}\nstderr: {stderr}"
         );
+        // The child's own `println!` lands after libtest's unterminated
+        // "test <name> ... " prefix, so the marker is searched for inside the
+        // line rather than anchored at its start.
         for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix("RESULT ") {
-                assert_eq!(rest, "OK", "landlock enforcement check reported: {rest}");
+            if let Some(rest) = line.split("RESULT ").nth(1) {
+                assert_eq!(
+                    rest.trim_end(),
+                    "OK",
+                    "landlock enforcement check reported: {rest}"
+                );
                 return;
             }
         }
