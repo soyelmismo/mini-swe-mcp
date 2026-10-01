@@ -457,11 +457,19 @@ impl HubServer {
         let root = self.server.pool().scratch_root().clone();
         let ack_dir = self.config.paths().dir().to_path_buf();
         match tokio::task::spawn_blocking(move || {
-            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir), &[])
+            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir))
         })
         .await
         {
             Ok(sweep) if !sweep.workers.is_empty() || sweep.orphans > 0 => {
+                // The file edit above is not enough on its own: the event
+                // router may already hold the store in memory, and its next
+                // `persist` would rewrite the very entries just removed. Forget
+                // them through the router, on its own lock, so memory and file
+                // agree whichever was loaded first.
+                for id in &sweep.workers {
+                    self.server.forget_retired_worker(id).await;
+                }
                 info!(
                     workers = sweep.workers.len(),
                     orphans = sweep.orphans,

@@ -178,6 +178,16 @@ pub struct WorkerRegistryEntry {
     /// proves each worker's branch is merged by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integrated: Vec<String>,
+    /// The operator asked to keep this worker's branch (`merge --no-delete`).
+    ///
+    /// Durable, unlike a one-off sweep exemption: the retirement sweep skips a
+    /// row that carries it while the branch still exists, so the explicit
+    /// decision survives the sweep that runs seconds after the merge and every
+    /// later pass. Once the branch is gone -- deleted by hand, or merged again
+    /// without `--no-delete` -- the flag protects nothing and the worker retires
+    /// normally.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_branch: bool,
 }
 
 impl WorkerRegistryEntry {
@@ -216,6 +226,7 @@ impl WorkerRegistryEntry {
             approved: None,
             verified: None,
             integrated: Vec::new(),
+            keep_branch: false,
         }
     }
 }
@@ -319,6 +330,7 @@ impl WorkerMeta {
             approved: None,
             verified: self.verified,
             integrated: Vec::new(),
+            keep_branch: false,
         }
     }
 
@@ -396,18 +408,25 @@ impl RegistryWriter {
         // registry write passes through, so this is the one place that has to
         // know.
         let mut entry = entry;
-        if entry.integrated.is_empty() {
-            // The writer's own cache first (no I/O on the common path), then the
-            // row on disk, so a round recorded by an earlier process or before
-            // this writer started also survives.
-            let known = self
-                .rows
-                .get(&entry.id)
-                .cloned()
-                .or_else(|| super::load_registry_entry_in(&self.root, &entry.id));
-            if let Some(known) = known.filter(|known| !known.integrated.is_empty()) {
-                entry.integrated = known.integrated;
+        // Merge, never replace: a status write rebuilds the row from
+        // `WorkerMeta`, which knows nothing about the round or the operator's
+        // keep decision. The *union* of the writer's cache and the row on disk
+        // is used, not the cache alone, so a round (or a second merge) recorded
+        // by another process while this one held its own stale cache is not
+        // lost -- preferring the cache would silently drop it.
+        // *Both* sources are unioned, not just the first that answers: the cache
+        // holds what this writer wrote, and the disk holds what another process
+        // wrote meanwhile (a later `CONSOLIDATE_MERGE`, an operator's keep). A
+        // cache-first fallback would drop the disk-only additions.
+        let cached = self.rows.get(&entry.id).cloned();
+        let on_disk = super::load_registry_entry_in(&self.root, &entry.id);
+        for known in [cached, on_disk].into_iter().flatten() {
+            for id in known.integrated {
+                if !entry.integrated.contains(&id) {
+                    entry.integrated.push(id);
+                }
             }
+            entry.keep_branch |= known.keep_branch;
         }
         let now = Instant::now();
         let transition = self

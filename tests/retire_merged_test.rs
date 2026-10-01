@@ -147,8 +147,9 @@ impl Fixture {
                 admission: None,
             },
         )?;
-        // The handler exempts a `--no-delete` worker from this pass.
-        Ok(self.sweep_exempting(std::slice::from_ref(&id.to_string())))
+        // No exemption list: the retirement marked the row, and the sweep
+        // skips a `keep_branch` row while its branch lives.
+        Ok(self.sweep())
     }
 
     /// Merge `id` through the same entry point the MCP handler uses.
@@ -167,13 +168,9 @@ impl Fixture {
         .map(|_| ())
     }
 
-    /// One sweep pass, with the workers a `--no-delete` merge protected.
+    /// One sweep pass over this fixture's scratch root.
     fn sweep(&self) -> mini_swe_mcp::pool::RetireSweep {
-        self.sweep_exempting(&[])
-    }
-
-    fn sweep_exempting(&self, exempt: &[String]) -> mini_swe_mcp::pool::RetireSweep {
-        sweep_retired_workers_in(&self.root(), None, exempt)
+        sweep_retired_workers_in(&self.root(), None)
     }
 }
 
@@ -239,8 +236,11 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
         f.commit_on_worker_branch(id, &format!("{id}.txt"), &format!("{id}\n"));
         f.record(id);
     }
-    // The consolidator integrates both, so its branch carries their commits.
+    // The consolidator integrates both branches into ITS OWN branch: checkout
+    // `worker-cons` first, or the merges would land on `main` and never exercise
+    // the consolidator path this test exists for.
     f.commit_on_worker_branch("cons", "cons.txt", "consolidated\n");
+    git(f.repo(), &["checkout", "-q", "worker-cons"]);
     git(
         f.repo(),
         &["merge", "--no-ff", "-m", "integrate a", "worker-c-a"],
@@ -248,6 +248,18 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
     git(
         f.repo(),
         &["merge", "--no-ff", "-m", "integrate b", "worker-c-b"],
+    );
+    git(f.repo(), &["checkout", "-q", "main"]);
+    // Proof the fixture is realistic: the consolidator's branch exists and
+    // carries the round, while `main` does not have it yet -- so the members'
+    // retirement below can only come from the consolidator's round.
+    assert!(
+        git_ref_exists(f.repo(), "worker-cons"),
+        "the consolidator's branch must carry the round"
+    );
+    assert!(
+        !f.repo().join("c-a.txt").exists(),
+        "the round must not already be in main"
     );
 
     // Its row records the round it integrated, and its history names a gate so
@@ -416,6 +428,9 @@ fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
     }
     // The consolidator integrates both tips.
     f.commit_on_worker_branch("rcons", "rcons.txt", "consolidated\n");
+    // Integrate both members into the consolidator's own branch, so this
+    // exercises the consolidator path rather than a direct merge into main.
+    git(f.repo(), &["checkout", "-q", "worker-rcons"]);
     git(
         f.repo(),
         &["merge", "--no-ff", "-m", "integrate", "worker-r-ok"],
@@ -424,6 +439,7 @@ fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
         f.repo(),
         &["merge", "--no-ff", "-m", "integrate", "worker-r-new"],
     );
+    git(f.repo(), &["checkout", "-q", "main"]);
     f.record_with_verify("rcons", Some("true"));
     save_registry_entry_in(
         &f.root(),
@@ -536,6 +552,13 @@ fn a_no_delete_merge_survives_the_post_merge_sweep() {
 
     f.merge_keeping_branch_then_sweep("nd1")
         .expect("a --no-delete merge must succeed");
+    // Durable, not a one-off exemption: a *later* sweep must also leave it be.
+    let later = f.sweep();
+    assert!(
+        !later.workers.iter().any(|id| id == "nd1"),
+        "a keep_branch worker must survive every later sweep too: {:?}",
+        later.workers
+    );
 
     assert!(
         git_ref_exists(f.repo(), "worker-nd1"),
@@ -620,4 +643,166 @@ async fn a_retired_worker_leaves_the_live_list() {
         !f.row_exists("lv1"),
         "and must leave no registry row either"
     );
+}
+
+/// Two `CONSOLIDATE_MERGE` recordings separated by status writes both survive.
+///
+/// A consolidator integrates its round in several calls, and each call appends
+/// to the row's list while the pool keeps writing status updates. The writer
+/// must *union* what the caller supplies with what is on disk -- preferring its
+/// own cache would silently drop a round another process recorded, and replacing
+/// outright would drop the second call's additions.
+#[test]
+fn successive_round_recordings_survive_status_writes_between_them() {
+    let f = Fixture::new("retire-round-union");
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    f.record_with_verify("wunion", Some("true"));
+    let meta = mini_swe_mcp::pool::WorkerMeta {
+        id: "wunion".to_string(),
+        task: "consolidate".to_string(),
+        owner: "agent-a".to_string(),
+        group: None,
+        role: Default::default(),
+        repo_path: Some(f.repo().to_string_lossy().into_owned()),
+        started_at: 0,
+        pid: std::process::id(),
+        revision: 0,
+        auto_continues: 0,
+        metrics: Default::default(),
+        report: None,
+        verified: None,
+    };
+    let status = |pool: &mini_swe_mcp::pool::WorkerPool| {
+        pool.__test_reset_registry_throttle("wunion");
+        pool.__test_save_status(
+            &meta,
+            "test",
+            mini_swe_mcp::pool::RegistryStatus::Completed,
+            5,
+            10,
+            "integrating",
+            None,
+        );
+    };
+
+    // First merge call records x1, then a status write follows.
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 1,
+            integrated: vec!["x1".to_string()],
+            ..WorkerRegistryEntry::test_row("wunion", "agent-a")
+        },
+    );
+    status(&pool);
+    // Second merge call records x2; the status write must not have erased x1.
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 2,
+            integrated: vec!["x1".to_string(), "x2".to_string()],
+            ..WorkerRegistryEntry::test_row("wunion", "agent-a")
+        },
+    );
+    status(&pool);
+
+    let row = mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "wunion")
+        .expect("the consolidator's row must survive");
+    assert_eq!(
+        row.integrated,
+        vec!["x1".to_string(), "x2".to_string()],
+        "both recorded merges must survive every intervening status write"
+    );
+}
+
+/// The real MCP `merge` path drops a retired worker's acknowledgements, in
+/// memory and on disk, and a later write cannot resurrect them.
+///
+/// The event router may already hold the ack store in memory when a merge runs,
+/// so editing the file alone would be undone by the router's next `persist`.
+/// This drives the tool exactly as an orchestrator does, with the ack store
+/// already loaded, and checks the entry is gone afterwards.
+#[tokio::test]
+async fn the_mcp_merge_path_forgets_the_retired_workers_acknowledgements() {
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
+
+    let f = Fixture::new("retire-mcp-ack");
+    f.commit_on_worker_branch("ac1", "ac1.txt", "ac1\n");
+    f.record_with_verify("ac1", Some("true"));
+
+    // The hub directory the event router loads its ack store from.
+    let hub = f.scratch.path().join("hub");
+    std::fs::create_dir_all(&hub).unwrap();
+    std::fs::write(
+        hub.join("watch_acks.json"),
+        r#"{"agent-a":{"ac1":{"revision":1,"event":"completed"}}}"#,
+    )
+    .unwrap();
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    // The worker is a live, verified completion, so the merge skips its gate.
+    pool.__test_insert_worker(WorkerRecord {
+        id: "ac1".to_string(),
+        task: "do the work".to_string(),
+        model: "test".to_string(),
+        owner: "agent-a".to_string(),
+        state: WorkerState::Completed {
+            turns: 3,
+            diff: "1 file changed".to_string(),
+            summary: "done".to_string(),
+            completed_at: 1,
+            artifacts: Vec::new(),
+            branch: Some("worker-ac1".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            report: None,
+            revision: 0,
+        },
+        metrics: WorkerMetrics::default(),
+        logs: mini_swe_mcp::pool::LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    })
+    .await;
+
+    let server = mini_swe_mcp::mcp::McpServer::new(pool.clone(), "agent-a".to_string());
+    let events = server.start_hub_events(Some(&hub)).await;
+
+    let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
+    ctx.agent_id = Some("agent-a".to_string());
+    let result = server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "merge", "worker_id": "ac1"}),
+            &ctx,
+        )
+        .await
+        .expect("the merge tool must succeed");
+    assert!(
+        result.get("worker_id").is_some(),
+        "the merge must report the worker it landed: {result}"
+    );
+
+    let acked: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.join("watch_acks.json")).unwrap()).unwrap();
+    assert!(
+        acked.get("agent-a").and_then(|a| a.get("ac1")).is_none(),
+        "the retired worker's acknowledgement must be gone from the store: {acked}"
+    );
+
+    events.abort();
 }

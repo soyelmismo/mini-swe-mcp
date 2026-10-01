@@ -27,7 +27,6 @@ use tracing::{debug, warn};
 
 use crate::agent::{ChatMessage, Role};
 
-use super::registry::WorkerRegistryEntry;
 use super::state::{retention_expired, within_retired_grace};
 use super::steer::remove_steer_file_in;
 
@@ -583,6 +582,15 @@ pub fn retire_worker_reporting(
         if let Some(dir) = ctx.ack_dir {
             crate::mcp::events::forget_watch_acks(dir, worker_id);
         }
+    } else if let Some(mut row) = super::load_registry_entry_in(root, worker_id)
+        && !row.keep_branch
+    {
+        // Durable `--no-delete`: mark the row so every later sweep skips this
+        // worker while its branch lives, instead of only the one pass that
+        // happens to follow the merge.
+        row.keep_branch = true;
+        row.updated_at = super::unix_timestamp();
+        super::save_registry_entry_in(root, &row);
     }
     if reclaimed {
         debug!(worker = %worker_id, "Reclaimed retired worker leftovers");
@@ -596,7 +604,7 @@ pub fn retire_worker_reporting(
 
 /// [`sweep_retired_workers_in`] under the default scratch root.
 pub fn sweep_retired_workers() -> RetireSweep {
-    sweep_retired_workers_in(&ScratchRoot::from_env(), None, &[])
+    sweep_retired_workers_in(&ScratchRoot::from_env(), None)
 }
 
 /// What one retirement sweep reclaimed.
@@ -633,15 +641,12 @@ pub struct RetireSweep {
 /// Every git probe is read-only and every step is best effort, so an
 /// unprobeable repository retires nothing rather than retiring the wrong
 /// worker.
-pub fn sweep_retired_workers_in(
-    root: &ScratchRoot,
-    ack_dir: Option<&Path>,
-    exempt: &[String],
-) -> RetireSweep {
+pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> RetireSweep {
     let mut sweep = RetireSweep::default();
-    // Grouped by repository: the two git probes per worker run once per repo
-    // instead of once per row.
-    let mut repos: std::collections::BTreeMap<PathBuf, Vec<WorkerRegistryEntry>> =
+    // Grouped by (repository, base): one `for-each-ref` per group answers the
+    // merged-branch question for every row of that group, instead of one git
+    // process per row.
+    let mut groups: std::collections::BTreeMap<(PathBuf, String), Vec<String>> =
         std::collections::BTreeMap::new();
     for entry in super::load_registry_entries_read_only_in(root) {
         if entry.status.is_live() {
@@ -650,119 +655,153 @@ pub fn sweep_retired_workers_in(
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
             continue;
         };
-        repos.entry(repo.to_path_buf()).or_default().push(entry);
+        let Some(base) = entry.base_branch.clone().filter(|base| !base.is_empty()) else {
+            continue;
+        };
+        // A kept branch is a durable operator instruction, not a one-off pass:
+        // leave the whole worker alone while its branch still lives.
+        if entry.keep_branch
+            && local_branches(repo).is_some_and(|set| set.contains(&format!("worker-{}", entry.id)))
+        {
+            continue;
+        }
+        groups
+            .entry((repo.to_path_buf(), base))
+            .or_default()
+            .push(entry.id);
     }
-    for (repo, entries) in &repos {
+    for ((repo, base), ids) in &groups {
+        // The probe failed: retire nothing, and never guess a repository.
+        let Some(merged) = merged_branches(repo, base) else {
+            continue;
+        };
         let ctx = RetireContext {
             repo: Some(repo.as_path()),
             ack_dir,
             keep_branch: false,
         };
-        for entry in entries {
-            if exempt.iter().any(|id| id == &entry.id) {
+        for id in ids {
+            if !merged.contains(&format!("worker-{id}")) {
                 continue;
             }
-            let branch = format!("worker-{}", entry.id);
-            if !is_merged_branch(repo, &branch, entry.base_branch.as_deref()) {
-                continue;
-            }
-            retire_worker_with(root, &entry.id, &ctx);
-            sweep.workers.push(entry.id.clone());
+            retire_worker_with(root, id, &ctx);
+            sweep.workers.push(id.clone());
         }
     }
-    sweep.orphans = remove_orphan_worker_files(root, exempt);
+    sweep.orphans = remove_orphan_worker_files(root);
     sweep
 }
 
-/// Whether `branch` is proven to be contained in its recorded base branch.
+/// Every local branch of `repo`.
 ///
-/// Every failure is "not proven": an unknown base, a missing repository or a
-/// git that could not run all leave the worker alone.
-fn is_merged_branch(repo: &Path, branch: &str, base_branch: Option<&str>) -> bool {
-    if !repo.is_dir() {
-        return false;
-    }
-    let Some(base) = base_branch.filter(|base| !base.is_empty()) else {
-        return false;
-    };
-    crate::worktree::git(
+/// `None` means the probe itself failed, which is different from an empty set:
+/// an empty set proves no branch exists, while `None` proves nothing and must
+/// never authorise a retirement or a deletion.
+fn local_branches(repo: &Path) -> Option<std::collections::HashSet<String>> {
+    refs_of(
         repo,
-        "merge-base --is-ancestor",
-        &["merge-base", "--is-ancestor", branch, base],
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     )
-    .is_ok_and(|output| output.status.success())
 }
 
-/// The fields the orphan branch probe needs, without parsing the conversation.
+/// The local branches of `repo` already contained in `base`.
+fn merged_branches(repo: &Path, base: &str) -> Option<std::collections::HashSet<String>> {
+    refs_of(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            &format!("--merged={base}"),
+            "refs/heads/",
+        ],
+    )
+}
+
+/// Run one `git for-each-ref` and parse its branch lines, or `None` on failure.
+fn refs_of(repo: &Path, args: &[&str]) -> Option<std::collections::HashSet<String>> {
+    if !repo.is_dir() {
+        return Some(std::collections::HashSet::new());
+    }
+    let out = crate::worktree::git(repo, "for-each-ref", args).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// The metadata line of a history file: the repository and branch its worker
+/// worked on.
 #[derive(Deserialize)]
 struct OrphanOwner {
     repo_path: String,
     branch: String,
 }
 
-/// Whether `path` names a worker whose branch still exists, so the file must
-/// be kept even though its registry row is gone.
+/// Cap on the metadata line read, so the scan never pulls a whole conversation
+/// into memory to decide whether one file is reachable. The line is one small
+/// JSON object; the cap only guards against a corrupt file.
+const ORPHAN_METADATA_MAX_BYTES: u64 = 64 * 1024;
+
+/// The worker id encoded in a scratch companion's name, if this name is one.
+fn worker_id_from_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("swe-wt-")?;
+    [
+        ".history.jsonl",
+        ".history.json",
+        ".steer",
+        ".steer-source",
+        ".round-base",
+    ]
+    .iter()
+    .find_map(|suffix| rest.strip_suffix(suffix))
+}
+
+/// The ownership a history file states, read from its first line only.
 ///
-/// Proven or not proven, never guessed: a `.steer` or `.steer-source` file
-/// carries no repository of its own, so those keep only when a row named them --
-/// which the caller already checked. A history file's first line carries the
-/// repository and branch; if it cannot be read or parsed, or the repository
-/// cannot be probed, the answer is `true` (keep), because deleting a reachable
-/// conversation is unrecoverable while keeping an unreachable one only costs
-/// space.
-fn file_has_live_branch(path: &Path) -> bool {
+/// A `.steer`, `.steer-source` or `.round-base` names no repository of its own
+/// and yields `None`; the caller shares the ownership of the same worker's
+/// history instead of assuming the file is unreachable.
+fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {
+    use std::io::{BufRead, BufReader, Read};
     let name = path.to_string_lossy();
     if !(name.ends_with(".history.jsonl") || name.ends_with(".history.json")) {
-        return false;
+        return None;
     }
-    let Some(raw) = std::fs::read_to_string(path).ok() else {
-        return true;
-    };
-    let Some(owner) = raw
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|first| serde_json::from_str::<OrphanOwner>(first).ok())
-    else {
-        return true;
-    };
-    let repo = Path::new(&owner.repo_path);
-    if !repo.is_dir() {
-        // The repository itself is gone: nothing can read that branch, and the
-        // file is genuinely unreachable.
-        return false;
-    }
-    match crate::worktree::git(
-        repo,
-        "rev-parse",
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{}", owner.branch),
-        ],
-    ) {
-        Ok(out) if out.status.success() => true,
-        // `git` exit 1 is the "ref is not there" code and is the only outcome
-        // that proves absence; anything else (128, a failed spawn) is not proof.
-        Ok(out) if out.status.code() == Some(1) => false,
-        Ok(_) => true,
-        Err(_) => true,
-    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file.take(ORPHAN_METADATA_MAX_BYTES));
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    serde_json::from_str(line.trim()).ok()
 }
 
 /// Delete the per-worker files no row and no branch can ever claim again.
 ///
-/// The three companions of a retired worker: its conversation (`*.history.jsonl`
-/// and the legacy `*.history.json`), its steering mailbox (`*.steer`) and its
-/// steer-source marker. A file with neither a registry row nor an existing
-/// branch is unreachable: nothing can dispatch, steer, revise or collect it, so
-/// it is space nobody will ever read.
-fn remove_orphan_worker_files(root: &ScratchRoot, exempt: &[String]) -> usize {
+/// Ownership is shared across a worker's files: a history states the repository
+/// and branch, and the worker's `.steer`, `.steer-source` and `.round-base`
+/// companions inherit that ownership rather than being assumed branch-less. So a
+/// worker's files are removed only when its ownership was actually probed *and*
+/// none of its candidate branches exists. When nothing about a worker could be
+/// probed -- no history to name an owner, or an unprobeable repository -- its
+/// files are kept, because deleting a reachable conversation is unrecoverable
+/// while keeping an unreachable one only costs space.
+///
+/// Bounded: the branch set is read once per repository, not once per file, and
+/// only the metadata line of a history is read.
+fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
     let live: std::collections::HashSet<String> = super::load_registry_entries_read_only_in(root)
         .into_iter()
         .map(|entry| entry.id)
         .collect();
-    let mut removed = 0;
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let mut owners: std::collections::HashMap<String, Vec<OrphanOwner>> =
+        std::collections::HashMap::new();
     for base in root.base_dirs() {
         let Ok(entries) = std::fs::read_dir(&base) else {
             continue;
@@ -772,39 +811,57 @@ fn remove_orphan_worker_files(root: &ScratchRoot, exempt: &[String]) -> usize {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let Some(id) = name.strip_prefix("swe-wt-").and_then(|rest| {
-                rest.strip_suffix(".history.jsonl")
-                    .or_else(|| rest.strip_suffix(".history.json"))
-                    .or_else(|| rest.strip_suffix(".steer"))
-                    .or_else(|| rest.strip_suffix(".steer-source"))
-                    .or_else(|| rest.strip_suffix(".round-base"))
-            }) else {
+            let Some(id) = worker_id_from_name(name) else {
                 continue;
             };
-            // A live row keeps its files, whether or not its branch survives,
-            // and so does a worker this sweep was told to leave alone.
-            if live.contains(id) || exempt.iter().any(|kept| kept == id) {
-                continue;
+            let path = entry.path();
+            if let Some(owner) = read_orphan_owner(&path) {
+                owners.entry(id.to_string()).or_default().push(owner);
             }
-            // A history file names the repository and branch its worker worked
-            // on, and that branch is what makes the file reachable: a row can be
-            // deleted (or never written) while the branch lives, and the
-            // conversation is then the only record of work that is still in
-            // git. So the branch is probed before the file goes, and the file
-            // survives whenever its absence cannot be *proven*: an unreadable
-            // file, an unprobeable repository or a git failure all keep it.
-            if file_has_live_branch(&entry.path()) {
-                continue;
+            files.push((id.to_string(), path));
+        }
+    }
+    let mut branches: std::collections::HashMap<
+        PathBuf,
+        Option<std::collections::HashSet<String>>,
+    > = std::collections::HashMap::new();
+    let mut removed = 0;
+    for (id, path) in files {
+        if live.contains(&id) {
+            continue;
+        }
+        let Some(candidates) = owners.get(&id) else {
+            // Nothing names this worker's repository: its reachability cannot be
+            // disproven, so the file stays.
+            continue;
+        };
+        let mut probed = false;
+        let mut live_branch = false;
+        for owner in candidates {
+            let repo = PathBuf::from(&owner.repo_path);
+            let set = branches
+                .entry(repo.clone())
+                .or_insert_with(|| local_branches(&repo));
+            match set {
+                Some(set) => {
+                    probed = true;
+                    live_branch |= set.contains(&owner.branch);
+                }
+                // An unprobeable repository proves nothing about this file.
+                None => live_branch = true,
             }
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!(
-                    path = %entry.path().display(),
-                    error = %e,
-                    "Failed to remove orphan worker file"
-                ),
-            }
+        }
+        if !probed || live_branch {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to remove orphan worker file"
+            ),
         }
     }
     removed
@@ -1456,6 +1513,7 @@ impl super::WorkerPool {
             approved: None,
             verified: None,
             integrated: Vec::new(),
+            keep_branch: false,
         };
 
         let pool = self.clone();

@@ -638,16 +638,18 @@ impl WorkerPool {
     /// The backstop behind the immediate retirements: it runs at daemon start
     /// and after every merge, so a worker merged by any other path (another
     /// session, a previous run, a consolidator this process never dispatched)
-    /// still leaves nothing behind. Cheap and bounded by the number of terminal
-    /// rows plus one directory read per scratch base.
-    pub async fn sweep_retired_workers(&self, exempt: &[String]) -> RetireSweep {
+    /// still leaves nothing behind. Cheap and bounded: branches are listed once
+    /// per repository and base, and the orphan scan reads only history metadata.
+    ///
+    /// Returns the ids it retired, so the caller can also drop the acknowledgements
+    /// and live records those ids still have. An operator's `keep_branch` row is
+    /// skipped by the sweep itself, so no per-call exemption list is needed.
+    pub async fn sweep_retired_workers(&self) -> RetireSweep {
         let root = self.scratch.clone();
-        let exempt = exempt.to_vec();
-        let sweep = tokio::task::spawn_blocking(move || {
-            revision::sweep_retired_workers_in(&root, None, &exempt)
-        })
-        .await
-        .unwrap_or_default();
+        let sweep =
+            tokio::task::spawn_blocking(move || revision::sweep_retired_workers_in(&root, None))
+                .await
+                .unwrap_or_default();
         // A worker this process still holds a record for is just as retired as
         // one only the registry knew, so it leaves the live view here too --
         // otherwise `list` keeps showing an integrated worker as "Completed".
