@@ -545,8 +545,8 @@ fn the_full_task_section_is_bounded_overall() {
     };
     let section = manifest.render_full_tasks();
     assert!(
-        section.len() < 20 * 1024,
-        "eight 8 KiB tasks must not all be embedded: {} bytes",
+        section.len() <= 16 * 1024,
+        "the section budget is a hard cap, footer included: {} bytes",
         section.len()
     );
     assert!(
