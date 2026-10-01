@@ -682,6 +682,13 @@ impl McpServer {
                 | crate::pool::WorkerState::Failed { .. } => Some(crate::pool::next_step_for(
                     crate::pool::terminal_branch(&state).as_deref(),
                 )),
+                crate::pool::WorkerState::Exhausted { turns, .. } => {
+                    Some(crate::pool::exhausted_next_step(
+                        wid,
+                        *turns,
+                        crate::pool::terminal_branch(&state).as_deref(),
+                    ))
+                }
                 _ => None,
             };
             let approved = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
@@ -699,10 +706,16 @@ impl McpServer {
             let state_name = entry.status.display_name();
             // A registry-only terminal row (collected worker, restarted hub)
             // carries the same review guidance as the live path.
-            let next_step = entry
-                .status
-                .is_terminal()
-                .then(|| crate::pool::next_step_for(None));
+            let branch = format!("worker-{wid}");
+            let next_step = match entry.status {
+                crate::pool::RegistryStatus::Exhausted => Some(crate::pool::exhausted_next_step(
+                    wid,
+                    entry.step,
+                    Some(branch.as_str()),
+                )),
+                status if status.is_terminal() => Some(crate::pool::next_step_for(None)),
+                _ => None,
+            };
             Ok(json!({
                 "worker_id": wid,
                 "owner": crate::pool::registry_owner_label(&entry),
@@ -902,7 +915,8 @@ impl McpServer {
         // A live worker's diff is the exact text it produced; a collected one
         // has only its branch left, so its change is measured from that.
         let live_diff = match &state {
-            Some(crate::pool::WorkerState::Completed { diff, .. }) => Some(diff.clone()),
+            Some(crate::pool::WorkerState::Completed { diff, .. })
+            | Some(crate::pool::WorkerState::Exhausted { diff, .. }) => Some(diff.clone()),
             _ => None,
         };
         let probe = repo
@@ -981,7 +995,11 @@ impl McpServer {
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
-            "next_command": next_command(&wid, &branch, merge.as_ref()),
+            "next_command": if let Some(turns) = exhausted_turns(state.as_ref(), entry.as_ref()) {
+                exhausted_continue_command(&wid, turns)
+            } else {
+                next_command(&wid, &branch, merge.as_ref())
+            },
         }))
     }
 
@@ -1559,8 +1577,9 @@ impl ReviewDiffScope {
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
 
-/// The three fields only a completed worker carries: its summary, whether the
-/// gate verified it, and the branch it leaves behind.
+/// The fields a finished worker carries: its summary, whether the gate
+/// verified it (always `None` for an exhausted worker, which never verified),
+/// and the branch it leaves behind.
 fn completed_fields(
     state: Option<&crate::pool::WorkerState>,
 ) -> (
@@ -1582,8 +1601,36 @@ fn completed_fields(
             branch.clone(),
             report.clone(),
         ),
+        Some(crate::pool::WorkerState::Exhausted {
+            summary,
+            branch,
+            report,
+            ..
+        }) => (Some(summary.clone()), None, branch.clone(), report.clone()),
         _ => (None, None, None, None),
     }
+}
+
+/// The turn count of an exhausted worker, from its live state or its registry
+/// row; `None` for a worker that did not stop on its turn budget.
+fn exhausted_turns(
+    state: Option<&crate::pool::WorkerState>,
+    entry: Option<&crate::pool::WorkerRegistryEntry>,
+) -> Option<usize> {
+    match state {
+        Some(crate::pool::WorkerState::Exhausted { turns, .. }) => Some(*turns),
+        _ => entry
+            .filter(|entry| entry.status == crate::pool::RegistryStatus::Exhausted)
+            .map(|entry| entry.step),
+    }
+}
+
+/// The command that continues an exhausted worker with a fresh turn budget.
+fn exhausted_continue_command(wid: &str, turns: usize) -> String {
+    format!(
+        "mini-swe-mcp steer {wid} \"continue\" --max-turns {}",
+        turns.max(1)
+    )
 }
 
 /// The lifecycle name of a worker, from its live state when it still has one
@@ -1597,6 +1644,7 @@ fn state_name(
         Some(crate::pool::WorkerState::Paused { .. }) => "Paused",
         Some(crate::pool::WorkerState::Completed { .. }) => "Completed",
         Some(crate::pool::WorkerState::Failed { .. }) => "Failed",
+        Some(crate::pool::WorkerState::Exhausted { .. }) => "Exhausted",
         None => entry.map_or("Unknown", |entry| entry.status.display_name()),
     }
 }
@@ -1609,7 +1657,8 @@ fn revision_of(
 ) -> usize {
     match state {
         Some(crate::pool::WorkerState::Completed { revision, .. })
-        | Some(crate::pool::WorkerState::Failed { revision, .. }) => *revision,
+        | Some(crate::pool::WorkerState::Failed { revision, .. })
+        | Some(crate::pool::WorkerState::Exhausted { revision, .. }) => *revision,
         _ => entry.map_or(0, |entry| entry.revision),
     }
 }

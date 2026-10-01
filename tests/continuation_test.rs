@@ -473,7 +473,9 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(id).await {
             match state {
-                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
+                WorkerState::Completed { .. }
+                | WorkerState::Failed { .. }
+                | WorkerState::Exhausted { .. } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
