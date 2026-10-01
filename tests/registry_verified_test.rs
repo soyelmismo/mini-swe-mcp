@@ -270,6 +270,9 @@ async fn the_watch_view_reads_the_verdict_from_the_row() {
     let scratch = common::TempDir::new_in_tmp("regver-watch");
     let root = ScratchRoot::new(scratch.path());
     let id = "regver-watch";
+    // A terminal row is pruned from the whole-registry scan without a branch
+    // or worktree to point at, so leave the branch a finished run would.
+    repo.with_worker_branch(id);
     save_registry_entry_in(
         &root,
         &row(id, repo.path(), RegistryStatus::Completed, Some(true)),
@@ -286,12 +289,10 @@ async fn the_watch_view_reads_the_verdict_from_the_row() {
     assert_eq!(events.len(), 1, "one event per terminal worker: {result}");
     assert_eq!(events[0]["event"], json!("completed"));
     assert_eq!(events[0]["verified"], json!(true), "{result}");
+    let compact = mini_swe_mcp::cli::watch::render(&events[0]);
     assert!(
-        events[0]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Verified: true"),
-        "the rendered event must show the verdict: {result}"
+        compact.contains("Verified: true"),
+        "the compact event must show the verdict: {compact}"
     );
 }
 
