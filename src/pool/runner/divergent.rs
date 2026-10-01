@@ -139,10 +139,17 @@ pub fn divergent_environment(
     env.push(("TZ".to_string(), shifted_timezone()));
     // The deliberate divergences are appended last, so a dispatcher's own
     // HOME/TMPDIR/TZ is shadowed rather than honoured: the point of the second
-    // run is that these three differ.
-    let mut seen = std::collections::HashSet::new();
-    env.retain(|(name, _)| seen.insert(name.clone()));
-    env
+    // run is that these three differ. The last occurrence wins, which is what
+    // the export sequence below produces.
+    let mut last: Vec<(String, String)> = Vec::with_capacity(env.len());
+    for (name, value) in env {
+        if let Some(slot) = last.iter_mut().find(|(existing, _)| *existing == name) {
+            slot.1 = value;
+        } else {
+            last.push((name, value));
+        }
+    }
+    last
 }
 
 /// A fresh per-worktree directory for variant B, beside the canonical one.
