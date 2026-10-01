@@ -54,6 +54,7 @@ impl Fixture {
     fn record_worker(&self, id: &str, verify: Option<&str>) {
         let history = WorkerHistory {
             task: format!("do the {id} work"),
+            role: Default::default(),
             group: None,
             model: "test".to_string(),
             temperature: None,
@@ -88,6 +89,7 @@ impl Fixture {
             id: id.to_string(),
             pid: std::process::id(),
             task: format!("do the {id} work"),
+            role: Default::default(),
             model: "test".to_string(),
             status,
             step: 1,
