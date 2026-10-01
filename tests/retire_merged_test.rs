@@ -106,7 +106,8 @@ impl Fixture {
     }
 
     /// Record a registry row that names no base branch, the way a build from
-    /// before base-branch tracking wrote one.
+    /// before base-branch tracking wrote one. The saved conversation is then the
+    /// row's only remaining evidence of which branch it was based on.
     fn record_row_without_base_branch(&self, id: &str) {
         self.record(id);
         let mut row = load_registry_entry_in(&self.root(), id).expect("the row was just written");
@@ -130,6 +131,14 @@ impl Fixture {
             .path()
             .join(format!("swe-wt-{id}.history.jsonl"))
             .exists()
+    }
+
+    /// Path of a worker's saved conversation log, the one that carries its
+    /// base branch on its metadata line.
+    fn history_path(&self, id: &str) -> PathBuf {
+        self.scratch
+            .path()
+            .join(format!("swe-wt-{id}.history.jsonl"))
     }
 
     fn steer_source_exists(&self, id: &str) -> bool {
@@ -200,14 +209,14 @@ impl Fixture {
 }
 
 /// A row written before base-branch tracking names no base, so the sweep has to
-/// read the base out of the repository the row points at -- otherwise a worker
-/// whose branch *is* merged stays on the books forever, which is exactly what a
+/// take it from the worker's own saved conversation -- otherwise a worker whose
+/// branch *is* merged stays on the books forever, which is exactly what a
 /// daemon-start sweep once reported as `workers=0` over a pool of merged
-/// workers. The fallback is still a positive proof: nothing is retired until the
-/// branch is an ancestor of the repository's own base.
+/// workers. The fallback is still a positive proof: nothing is retired until
+/// `worker-<id>` is an ancestor of the base the worker recorded.
 #[test]
 fn the_sweep_retires_a_merged_worker_whose_row_names_no_base_branch() {
-    let f = Fixture::new("retire-sweep-detected-base");
+    let f = Fixture::new("retire-sweep-historical-base");
 
     // 1. The row that needs the fallback: completed, no base branch recorded,
     //    and its branch already merged into `main`.
@@ -227,12 +236,23 @@ fn the_sweep_retires_a_merged_worker_whose_row_names_no_base_branch() {
     f.commit_on_worker_branch("nb2", "nb2.txt", "nb2\n");
     f.record_row_without_base_branch("nb2");
 
+    // 3. A third such row with no saved conversation left to name its base:
+    //    nothing positive can be proved, so it must survive even though the
+    //    repository's checked-out branch is exactly the branch it merged into.
+    f.commit_on_worker_branch("nb3", "nb3.txt", "nb3\n");
+    f.record_row_without_base_branch("nb3");
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate nb3", "worker-nb3"],
+    );
+    std::fs::remove_file(f.history_path("nb3")).expect("drop the conversation");
+
     let sweep = f.sweep();
 
     assert_eq!(
         sweep.workers,
         vec!["nb1".to_string()],
-        "only the branch that is an ancestor of the detected base may be retired"
+        "only the branch with a recorded base and a positive ancestry proof may be retired"
     );
     assert!(
         !f.row_exists("nb1"),
@@ -247,6 +267,10 @@ fn the_sweep_retires_a_merged_worker_whose_row_names_no_base_branch() {
     assert!(
         git_ref_exists(f.repo(), "worker-nb2"),
         "an unmerged branch must survive"
+    );
+    assert!(
+        f.row_exists("nb3"),
+        "a worker with no provable base must survive even though its branch merged"
     );
 }
 

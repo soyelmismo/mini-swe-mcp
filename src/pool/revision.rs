@@ -703,14 +703,20 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
             continue;
         };
+        // The path as resolved now: a row records the path as it was resolved
+        // and every probe below resolves it again.
+        let Some(canonical_repo) = repo.canonicalize().ok() else {
+            continue;
+        };
         // A row written before base-branch tracking names no base, and without
-        // one the sweep could not prove the worker integrated -- which is how a
-        // whole pool of merged workers stayed on the books. The repository's own
-        // checked-out branch is the base such a row was dispatched against, so
-        // detect it and group by it. Detection is the same positive proof the
-        // ancestry test itself is: it reads git, never assumes a branch name,
-        // and a repository that cannot answer retires nothing.
-        let Some(base) = base_branch_proof(&entry, repo) else {
+        // one the sweep cannot prove the worker integrated -- which is how a
+        // whole pool of merged workers stayed on the books. The base such a row
+        // was dispatched against is in the worker's own saved conversation, so
+        // the fallback reads it there. It is the same positive proof the
+        // ancestry test itself is: what the worker recorded, never a guessed
+        // branch name, and a row whose base cannot be established retires
+        // nothing.
+        let Some(base) = base_branch_proof(root, &entry, &canonical_repo) else {
             continue;
         };
         // A kept branch is a durable operator instruction, not a one-off pass:
@@ -808,7 +814,11 @@ fn refs_of(repo: &Path, args: &[&str]) -> Option<std::collections::HashSet<Strin
 /// repository's currently checked-out branch is *not* a substitute -- it moves
 /// with whoever dispatches next, so proving integration against it would retire
 /// a merged worker and an unintegrated one alike.
-fn base_branch_proof(entry: &super::WorkerRegistryEntry, repo: &Path) -> Option<String> {
+fn base_branch_proof(
+    root: &ScratchRoot,
+    entry: &super::WorkerRegistryEntry,
+    canonical_repo: &Path,
+) -> Option<String> {
     if let Some(base) = entry
         .base_branch
         .as_deref()
@@ -817,14 +827,22 @@ fn base_branch_proof(entry: &super::WorkerRegistryEntry, repo: &Path) -> Option<
     {
         return Some(base.to_string());
     }
-    // The worker's own history file, whose metadata line the orphan scan below
-    // reads the same way: a repository and a branch. Beside the worktree, not
-    // in the registry directory.
-    let Some(base) = repo.parent() else {
+    let history = load_worker_history_in(root, &entry.id).ok()?;
+    if !Path::new(&history.repo_path)
+        .canonicalize()
+        .ok()
+        .is_some_and(|repo| repo == canonical_repo)
+    {
+        // The conversation names a different repository than the row, so it
+        // cannot say which branch *this* row's work was based on.
         return None;
-    };
-    let read = read_orphan_owner(&base.join(format!("swe-wt-{}.history.json", entry.id)))?;
-    (read.branch != format!("worker-{}", entry.id)).then_some(read.branch)
+    }
+    let base = history
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())?;
+    (base != format!("worker-{}", entry.id)).then(|| base.to_string())
 }
 
 /// The metadata line of a history file: the repository and branch its worker
