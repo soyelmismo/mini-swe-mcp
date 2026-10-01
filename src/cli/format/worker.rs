@@ -450,7 +450,6 @@ pub fn format_merge(val: &serde_json::Value) -> String {
     } else if !cleaned.is_empty() {
         out.push_str(&format!(" Cleaned: {cleaned}."));
     }
-    out.push_str(&format!(" Worker {wid} merged."));
     out
 }
 
