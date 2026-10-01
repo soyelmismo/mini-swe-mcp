@@ -99,6 +99,12 @@ pub fn format_list(val: &serde_json::Value) -> String {
         {
             details.push(format!("error: {err}"));
         }
+        if let Some(approved) = w.get("approved").filter(|v| !v.is_null()) {
+            match approved.get("note").and_then(|v| v.as_str()) {
+                Some(note) if !note.is_empty() => details.push(format!("approved: {note}")),
+                _ => details.push("approved".to_string()),
+            }
+        }
 
         let detail_str = if details.is_empty() {
             String::new()

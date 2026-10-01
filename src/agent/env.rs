@@ -183,6 +183,23 @@ pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Optio
 /// need it to exist (command spawning) create it explicitly, which keeps this
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
+    build_clean_environment_with(
+        repo_path,
+        worktree_path,
+        std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
+    )
+}
+
+/// [`build_clean_environment`] with the host `HOME` and `CARGO_HOME` supplied by
+/// the caller, so tests can exercise toolchain-cache resolution without
+/// mutating process-global state.
+fn build_clean_environment_with(
+    repo_path: &Path,
+    worktree_path: &Path,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) -> Vec<(String, String)> {
     // Sized up front for the worst case (every allow-listed name set, every
     // toolchain cache resolved) plus `HOME`, so the vector never reallocates.
     let mut env: Vec<(String, String)> =
@@ -205,7 +222,7 @@ pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(S
     //
     for name in TOOLCHAIN_VARS {
         let resolved = if *name == CARGO_HOME_VAR {
-            host_cargo_home()
+            resolve_cargo_home(explicit_cargo_home, host_home)
         } else {
             // No `~/.rustup` fallback: a host with no rustup has no toolchain
             // directory to share, and an invented path would be a silent lie.
@@ -487,24 +504,12 @@ pub(crate) fn with_env_lock<T>(body: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
 
     /// Acquire the environment lock for the duration of a mutating test.
     fn env_guard() -> MutexGuard<'static, ()> {
         ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The process-wide real `HOME`, captured once on first use so a test that
-    /// overrides it can put it back without depending on when it ran.
-    static ORIGINAL_HOME_VALUE: OnceLock<String> = OnceLock::new();
-
-    /// The real `HOME`, captured before any test overrides it.
-    fn original_home() -> String {
-        ORIGINAL_HOME_VALUE
-            .get_or_init(|| std::env::var("HOME").unwrap_or_default())
-            .clone()
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
@@ -715,28 +720,16 @@ mod tests {
     /// the empty isolated `HOME`.
     #[test]
     fn cargo_home_falls_back_to_the_host_dot_cargo() {
-        let _guard = env_guard();
         let dir = unique_dir("cargo-home-fallback");
         let fake_home = dir.join("fake-home");
         std::fs::create_dir_all(fake_home.join(".cargo")).expect("create fake ~/.cargo");
-        // The parent has no `CARGO_HOME`, so the fallback is the only thing that
-        // can populate the variable. `HOME` is remapped independently, so this
-        // synthetic layout is the *host's*, not the child's.
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe {
-            std::env::remove_var("CARGO_HOME");
-            std::env::set_var("HOME", &fake_home);
-        }
-
-        let env = build_clean_environment(&dir, &dir);
+        // The caller's `CARGO_HOME` is unset and the host `HOME` is synthetic, so
+        // only the `~/.cargo` fallback can populate the variable.
+        let env = build_clean_environment_with(&dir, &dir, Some(&fake_home), None);
         let cargo_home = env
             .iter()
             .find(|(k, _)| k == CARGO_HOME_VAR)
             .map(|(_, v)| v.clone());
-        // SAFETY: as above; restore before asserting so a failure cannot leak.
-        unsafe { std::env::set_var("HOME", original_home()) };
-
         let cargo_home = cargo_home.expect("CARGO_HOME must be forwarded from the host ~/.cargo");
         assert_eq!(cargo_home, fake_home.join(".cargo").to_string_lossy());
         // The whole point: the cache is the host's, not the sandbox's HOME.
@@ -753,20 +746,10 @@ mod tests {
     /// own default resolution.
     #[test]
     fn cargo_home_is_omitted_when_the_host_has_none() {
-        let _guard = env_guard();
         let dir = unique_dir("cargo-home-absent");
         let fake_home = dir.join("fake-home");
         std::fs::create_dir_all(&fake_home).expect("create empty fake home");
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe {
-            std::env::remove_var("CARGO_HOME");
-            std::env::set_var("HOME", &fake_home);
-        }
-
-        let env = build_clean_environment(&dir, &dir);
-        // SAFETY: as above; restore before asserting.
-        unsafe { std::env::set_var("HOME", original_home()) };
+        let env = build_clean_environment_with(&dir, &dir, Some(&fake_home), None);
 
         assert!(
             !env.iter().any(|(k, _)| k == CARGO_HOME_VAR),
