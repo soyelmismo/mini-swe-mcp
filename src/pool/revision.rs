@@ -480,6 +480,13 @@ pub struct RetireContext<'a> {
     pub repo: Option<&'a Path>,
     /// Hub directory holding `watch_acks.json`. `None` skips the ack store.
     pub ack_dir: Option<&'a Path>,
+    /// Whether the `worker-<id>` branch itself survives.
+    ///
+    /// `merge --no-delete` sets this: the operator asked to keep the branch, so
+    /// the scratch traces still go but the ref stays. Everything else retires
+    /// the branch too, because a branch whose commits are already in the base is
+    /// exactly what the sweep would delete on its next pass.
+    pub keep_branch: bool,
 }
 
 /// Retire every trace of `worker_id`: its branch, its registry row, its saved
@@ -513,7 +520,10 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
         crate::worktree::force_remove_dir(&worktree);
     }
     crate::worktree::remove_target_dirs_in(root, &worktree);
-    if let Some(repo) = ctx.repo.filter(|repo| repo.is_dir()) {
+    if let Some(repo) = ctx
+        .repo
+        .filter(|repo| repo.is_dir() && !ctx.keep_branch)
+    {
         let _ = crate::worktree::git(repo, "worktree prune", &["worktree", "prune"]);
         // `git branch -D` refuses a branch a worktree still has checked out;
         // the prune above just released it. An already-absent branch is not an
@@ -531,9 +541,15 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
-    super::remove_registry_entry_in(root, worker_id);
-    if let Some(dir) = ctx.ack_dir {
-        crate::mcp::events::forget_watch_acks(dir, worker_id);
+    // A branch that was deliberately kept leaves a worker that is still known:
+    // `status`, `list` and a later `merge` all read its row. Its branch is what
+    // keeps it meaningful, and the row is retired with the branch the moment
+    // that goes -- by the sweep, or by the next merge.
+    if !ctx.keep_branch {
+        super::remove_registry_entry_in(root, worker_id);
+        if let Some(dir) = ctx.ack_dir {
+            crate::mcp::events::forget_watch_acks(dir, worker_id);
+        }
     }
     if reclaimed {
         debug!(worker = %worker_id, "Reclaimed retired worker leftovers");
@@ -601,6 +617,7 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let ctx = RetireContext {
             repo: Some(repo.as_path()),
             ack_dir,
+            keep_branch: false,
         };
         for entry in entries {
             let branch = format!("worker-{}", entry.id);

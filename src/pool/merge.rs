@@ -721,6 +721,7 @@ fn cleanup(
     let ctx = RetireContext {
         repo: Some(repo),
         ack_dir: None,
+        keep_branch,
     };
     // Only when the branch really went: with `--no-delete` the worker stays a
     // known, steerable worker, so its round stays a known round.
