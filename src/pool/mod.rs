@@ -33,7 +33,7 @@ mod buffer;
 mod clock;
 mod fair;
 mod registry;
-pub(crate) mod revision;
+pub mod revision;
 mod runner;
 mod state;
 mod steer;
@@ -1122,7 +1122,7 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
             return Some("npm test".to_string());
         }
     }
-    for manifest in ["setup.py", "setup.cfg", "tox.ini"] {
+    for manifest in ["setup.py", "setup.cfg", "tox.ini", "requirements.txt"] {
         if repo_path.join(manifest).is_file() {
             return Some("pytest -q".to_string());
         }
@@ -1200,6 +1200,64 @@ mod verify_detection_tests {
     fn a_bare_repository_is_not_gated() {
         let dir = scratch("bare");
         assert_eq!(detect_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate is language-agnostic: every common ecosystem resolves to that
+    /// ecosystem's own test command, and none of them assumes Rust.
+    #[test]
+    fn every_common_ecosystem_is_detected() {
+        for (file, expected) in [
+            ("go.mod", "go test ./..."),
+            ("pom.xml", "mvn -q test"),
+            ("build.gradle", "gradle test"),
+            ("build.gradle.kts", "gradle test"),
+            ("Makefile", "make test"),
+            ("makefile", "make test"),
+            ("setup.py", "pytest -q"),
+            ("tox.ini", "pytest -q"),
+            ("requirements.txt", "pytest -q"),
+            ("package-lock.json", "npm test"),
+            ("pnpm-lock.yaml", "npm test"),
+            ("yarn.lock", "npm test"),
+        ] {
+            let dir = scratch(file);
+            std::fs::write(dir.join(file), "{}\n").unwrap();
+            assert_eq!(
+                detect_verify_command(&dir).as_deref(),
+                Some(expected),
+                "{file} must select {expected}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_dotnet_project_is_detected() {
+        let dir = scratch("dotnet");
+        std::fs::write(dir.join("app.csproj"), "<Project/>\n").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("dotnet test"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("dotnet-global");
+        std::fs::write(dir.join("global.json"), "{}\n").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("dotnet test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository that carries several ecosystems is gated on the first the
+    /// detector recognises, so the choice is deterministic rather than
+    /// dependent on directory iteration order.
+    #[test]
+    fn detection_is_deterministic_for_a_polyglot_repository() {
+        let dir = scratch("polyglot");
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(
+            detect_verify_command(&dir).as_deref(),
+            Some("pytest -q"),
+            "the python manifest is probed before go, and the order is fixed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

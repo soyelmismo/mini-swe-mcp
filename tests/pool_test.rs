@@ -1279,6 +1279,7 @@ fn sample_history(
         branch: branch.to_string(),
         network_offline: false,
         verify: None,
+        client_env: Vec::new(),
         max_turns: 10,
         review_after: None,
         revision: 0,

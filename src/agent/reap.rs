@@ -480,7 +480,7 @@ mod tests {
         let dirs = [dir.clone()];
         let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
 
-        assert_eq!(killed, 1, "the detached sleeper must be signalled");
+        assert_eq!(killed.len(), 1, "the detached sleeper must be signalled");
         // Reaped through `try_wait`, because a killed child of this test stays
         // a zombie until it is waited on and a zombie still answers `kill -0`.
         let mut gone = false;
@@ -537,7 +537,7 @@ mod tests {
         let dirs = [dir.clone()];
         let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
 
-        assert_eq!(killed, 1, "the reparented orphan must be signalled");
+        assert_eq!(killed.len(), 1, "the reparented orphan must be signalled");
         for _ in 0..100 {
             if !pid_is_alive(orphan) {
                 break;
@@ -566,7 +566,8 @@ mod tests {
         let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
 
         assert_eq!(
-            killed, 0,
+            killed.len(),
+            0,
             "nothing outside the worker's directories may be killed"
         );
         assert!(
@@ -625,7 +626,8 @@ mod tests {
         let killed = sweep_owned_processes("worker-test", &dirs, child_pid + 1);
 
         assert_eq!(
-            killed, 0,
+            killed.len(),
+            0,
             "a process whose ancestry is an unrelated session must survive \
              (shell {shell_pid}, child {child_pid})"
         );
