@@ -588,6 +588,11 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     // The watch follows the daemon: it reconnects to the replacement the hub
     // auto-starts, rather than ending with the connection it lost.
     wait_for_log(&hub_dir, "listening", 2).await;
+    // Listening only means the socket is bound; recovery is what puts the
+    // salvaged worker back in the pool. Writing the terminal status before
+    // the replacement daemon has recovered the row would leave the watch
+    // nothing owned to watch, and it would rightly end with no event.
+    wait_for_log(&hub_dir, "recovered", 2).await;
     assert!(
         watch.try_wait().expect("poll the watch").is_none(),
         "the watch must survive the daemon going away"

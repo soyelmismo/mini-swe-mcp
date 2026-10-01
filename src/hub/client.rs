@@ -379,14 +379,12 @@ async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
                     }
                     Err(_) => {
                         // A dispatch may have made the daemon busy since hello.
-                        eprintln!("DBG shutdown failed, offering handover");
                         offer_handover = true;
                     }
                 }
             }
             // Older hubs may not implement planned handover; keep their warning.
             if offer_handover {
-                eprintln!("DBG offering handover attempt={attempt} busy={}", reply["busy"]);
                 let _ = client.request("hub/handover", json!({})).await;
             }
             warn_newer_once(
