@@ -219,11 +219,21 @@ impl McpServer {
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
         // Optional verify gate: an explicit string (possibly empty to disable)
-        // is passed through; an absent argument lets the pool auto-detect.
-        let verify = args
-            .get("verify")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // is passed through; an absent argument lets the pool auto-detect. A
+        // non-string is refused here rather than dropped, so a caller who
+        // meant a gate never silently gets the auto-detected one.
+        let verify = match args.get("verify") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("'verify' must be a string for action 'dispatch'"))?
+                    .to_string(),
+            ),
+        };
+        if let Some(gate) = &verify {
+            crate::pool::validate_verify_command(gate, "verify")?;
+        }
 
         self.validate_auto_consolidate(args)?;
         let admission = self.admit_worker().await?;

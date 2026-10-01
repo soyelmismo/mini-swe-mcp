@@ -32,10 +32,18 @@ impl McpServer {
             }
             _ => anyhow::bail!("consolidate must be a boolean or model alias"),
         }
+        let verify = args.get("consolidate_verify");
         anyhow::ensure!(
-            args.get("consolidate_verify").is_none_or(Value::is_string),
+            verify.is_none_or(Value::is_string),
             "consolidate_verify must be a string"
         );
+        // The gate is stored verbatim on the round and run much later by the
+        // auto-dispatched consolidator, with no one left to notice that a
+        // mangled quote left it unrunnable. Parse-check it here, while the
+        // caller is still in the loop that can fix the argument.
+        if let Some(cmd) = verify.and_then(Value::as_str) {
+            crate::pool::validate_verify_command(cmd, "consolidate_verify")?;
+        }
         Ok(())
     }
 

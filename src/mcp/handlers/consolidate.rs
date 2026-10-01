@@ -31,6 +31,12 @@ impl McpServer {
         if group.is_empty() {
             anyhow::bail!("'group' must not be empty for action 'consolidate'");
         }
+        if args.get("set").is_some_and(Value::is_boolean == false) {
+            anyhow::bail!("'set' must be a boolean for action 'consolidate'");
+        }
+        if args.get("set").is_some_and(Value::is_boolean) {
+            return self.amend_round(args, &group, ctx).await;
+        }
         let agent = ctx.agent();
         let repo_path = Self::get_repo_path(args, ctx);
         let manifest = self.pool.round_manifest(&agent, &group, &repo_path).await;
