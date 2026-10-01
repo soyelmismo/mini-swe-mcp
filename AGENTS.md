@@ -45,9 +45,6 @@ system prompt at dispatch time, so keep them short and actionable.
   copying a block of logic into a second place.
 - Keep the diff to the task's scope; put new tests in a file dedicated to the
   change rather than at the end of a large shared test file.
-- A command that reaches its timeout is not killed: it keeps running as job <n>.
-  Wait for it with `echo WAIT_JOB <n>` instead of `sleep`-polling, and stop it
-  with `echo KILL_JOB <n>`.
 - Preserve the MCP tool contract, CLI output, wire formats and security
   properties unless the task says otherwise.
 - Never run `git commit`, `git stash` or `git checkout` in the sandbox: the

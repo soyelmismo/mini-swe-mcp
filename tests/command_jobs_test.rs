@@ -256,6 +256,47 @@ async fn a_job_dies_with_its_worker() {
     );
 }
 
+/// A harness gate run past the step timeout is not converted into a job: the
+/// command is stopped and its real exit code decides, so no job is left holding
+/// a build slot nobody waits on.
+#[tokio::test]
+async fn a_gate_run_past_its_budget_is_not_converted_into_a_job() {
+    let work = TempDir::new_in_tmp("cmdjob");
+    let table = JobTable::new();
+    let (runner, handle) = runner("w-gate", &table);
+    // What the completion verify, its divergent variant and the merge gate all
+    // do to the runner they execute with.
+    let runner = runner.without_job_conversion();
+    let pid_file = work.path().join("gate.pid");
+
+    let (output, code) = runner
+        .execute_bash(
+            work.path(),
+            &format!("echo $$ > {}; sleep 30", pid_file.display()),
+        )
+        .await
+        .expect("a gate that outlives its budget must still be spawned");
+
+    assert!(
+        output.contains("timed out after 1s"),
+        "a gate run must report the timeout it hit: {output}"
+    );
+    assert!(!output.contains("job 1"), "{output}");
+    assert_eq!(code, Some(124), "{output}");
+    assert!(
+        handle.summaries().is_empty(),
+        "a gate run must not create a job: {:?}",
+        handle.summaries()
+    );
+
+    // The command really was stopped rather than left running behind the gate.
+    let pid = job_pid(&pid_file).await;
+    assert!(
+        wait_for_exit(pid).await,
+        "a gate run must be stopped, not backgrounded"
+    );
+}
+
 /// The two job sentinels are recognised in `echo`/`printf` form only, and never
 /// confuse each other or the turn-budget sentinel.
 #[test]

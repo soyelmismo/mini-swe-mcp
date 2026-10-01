@@ -300,7 +300,7 @@ impl AgentRunner {
         // job, so its output needs a log to stream to. The worker's private
         // scratch is where the step's own scratch already lives, and it is
         // deleted with the worktree.
-        let job_log_dir = self.jobs.as_ref().map(|_| tmp_dir.clone());
+        let job_log_dir = self.job_handle().map(|_| tmp_dir.clone());
         match run_with_timeout(&mut cmd, timeout_secs, job_log_dir.as_deref()).await? {
             RunOutcome::Finished { output, code } => Ok((output, code)),
             RunOutcome::Backgrounded(backgrounded) => {
@@ -328,7 +328,7 @@ impl AgentRunner {
             log,
             mut guard,
         } = backgrounded;
-        let Some(handle) = self.jobs.as_ref() else {
+        let Some(handle) = self.job_handle() else {
             // Nobody owns this runner's jobs, so there is nobody to wait on the
             // command: stop it and report the timeout it is.
             terminate_process_group(pid, &mut child, TERM_GRACE).await;

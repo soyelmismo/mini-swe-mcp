@@ -123,6 +123,9 @@ pub struct AgentRunner {
     /// Job number the last `execute_bash` call backgrounded, taken by the
     /// caller so it is reported exactly once.
     pub(crate) last_job: Arc<Mutex<Option<u64>>>,
+    /// Set for a run the harness owns rather than the model: a command that
+    /// outlives its budget is stopped instead of becoming a background job.
+    pub(crate) jobs_disabled: bool,
 }
 
 impl AgentRunner {
@@ -145,6 +148,7 @@ impl AgentRunner {
             extra_env: Vec::new(),
             jobs: None,
             last_job: Arc::new(Mutex::new(None)),
+            jobs_disabled: false,
         }
     }
 
@@ -160,6 +164,27 @@ impl AgentRunner {
     pub fn with_extra_env(mut self, vars: Vec<(String, String)>) -> Self {
         self.extra_env = vars;
         self
+    }
+
+    /// Refuse to turn a command that outlives its budget into a job.
+    ///
+    /// For a run the harness owns -- the completion verify, its divergent
+    /// variant, the merge gate -- and not the model: a job nobody waits on
+    /// would hold a build slot for its whole ceiling, and a gate must be
+    /// decided by the command's real exit code. Such a command is stopped and
+    /// reported as the timeout it is.
+    pub fn without_job_conversion(mut self) -> Self {
+        self.jobs_disabled = true;
+        self
+    }
+
+    /// The job table a command may background into, if this run allows one.
+    pub(crate) fn job_handle(&self) -> Option<&JobHandle> {
+        if self.jobs_disabled {
+            None
+        } else {
+            self.jobs.as_ref()
+        }
     }
 
     /// Attach the worker's background jobs to this runner.

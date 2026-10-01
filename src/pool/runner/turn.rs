@@ -1272,6 +1272,12 @@ impl<'a> TurnEngine<'a> {
         extra_env: Vec<(String, String)>,
     ) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
+        // A completion-class command is a harness gate -- the completion verify
+        // or its divergent variant -- not the model's own work. It must never
+        // become a background job nobody waits on, and its budget is the
+        // absolute job ceiling rather than the step timeout, so a slow gate
+        // simply takes longer and its real exit code decides.
+        let gate = matches!(class, AdmissionClass::Completion);
         let build_permit = if heavy {
             // A queued command is not inactivity, including completion gates.
             let _waiting = self
@@ -1288,6 +1294,11 @@ impl<'a> TurnEngine<'a> {
             .await
             .context("Bash semaphore closed")?;
         let mut runner = self.runner.clone();
+        if gate {
+            runner = runner
+                .without_job_conversion()
+                .with_command_timeout(crate::agent::jobs::job_max_secs());
+        }
         if let Some(permit) = &build_permit {
             runner = runner.with_build_jobs(permit.jobs());
         }
