@@ -69,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'. `mini-swe-mcp help <topic>` has the details.",
+            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
         ),
     ),
     (
@@ -83,7 +83,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "tasks",
         "array",
         DescriptionSource::Static(
-            "Batch dispatch: {task, model?, repo_path?, max_turns?, verify?, group?, network?} objects, one worker each; top-level dispatch values are defaults.",
+            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
@@ -120,7 +120,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker (failed, interrupted, killed): never dispatch a replacement.",
         ),
     ),
     (
@@ -508,5 +508,6 @@ mod tests {
 
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
+        assert!(text.contains("never dispatch a replacement"), "{text}");
     }
 }
