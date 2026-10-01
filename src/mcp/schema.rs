@@ -15,8 +15,8 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "logs", "list", "kill", "reap", "manifest",
-    "prune",
+    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
+    "manifest", "prune",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -66,7 +66,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent; the reply carries 'watch_command', the exact shell command that waits on YOUR workers -- run it in the background, since a shell cannot know your session), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
+            "Action to perform: 'dispatch' (spawn subagent; the reply carries 'watch_command', the exact shell command that waits on YOUR workers -- run it in the background, since a shell cannot know your session), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (final message plus a per-file diff stat; add 'full' for the whole diff, or 'files' for named paths only), 'review' (one compact view of a finished worker: task, verification, per-file diff stat, and whether its branch still merges cleanly into the base branch tip, ending with the command that acts on it), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'review', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
         ),
     ),
     (
@@ -98,7 +98,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -163,6 +163,20 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "Listing scope for 'list': omitted or 'mine' returns only the calling agent's workers, 'all' returns every agent's and requires the admin override. Optional for 'list' (default: 'mine').",
+        ),
+    ),
+    (
+        "full",
+        "boolean",
+        DescriptionSource::Static(
+            "Return the whole diff instead of the default per-file diff stat. Optional for 'collect' (default: false); ignored when 'files' is given.",
+        ),
+    ),
+    (
+        "files",
+        "array",
+        DescriptionSource::Static(
+            "Paths whose diff to return, so a review of one file never carries the rest. Optional for 'collect': omitted returns no diff at all, and 'full' overrides it.",
         ),
     ),
     (
@@ -233,7 +247,7 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "timeout_secs" {
         schema.insert("minimum".to_string(), Value::from(0));
     }
-    if name == "worker_ids" {
+    if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
     if name == "temperature" {

@@ -237,8 +237,12 @@ fn print_help() {
     println!("           run it in the background and the host CLI wakes you when it ends.");
     println!("  status <worker_id> | status --line");
     println!("           Final status/diff, or a one-line pool summary for statusLine.");
-    println!("  collect <worker_id>");
-    println!("           Full transcript and final message.");
+    println!("  collect <worker_id> [--full] [--file <path>]");
+    println!("           Final message with a per-file diff stat; --full adds the whole diff,");
+    println!("           --file narrows it to one path (repeatable).");
+    println!("  review <worker_id>");
+    println!("           One compact view of a finished worker: task, verification, per-file");
+    println!("           diff stat, and whether its branch still merges into the base branch.");
     println!("  logs <worker_id>");
     println!("           Recent commands and their output.");
     println!("  steer <worker_id> <message> [--max-turns <n>]");
