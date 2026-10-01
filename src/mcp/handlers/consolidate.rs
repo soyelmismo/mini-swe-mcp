@@ -18,7 +18,7 @@ impl McpServer {
     /// The dispatch itself is delegated to [`Self::dispatch_one`], so the
     /// consolidator goes through exactly the validation, admission and launch
     /// path every other worker does.
-    pub(super) async fn handle_consolidate(
+    pub(in crate::mcp) async fn handle_consolidate(
         &self,
         args: &Value,
         token: Option<&Value>,
@@ -88,9 +88,9 @@ impl McpServer {
             Value::String(manifest.task_text(verify.as_deref())),
         );
         dispatch.insert("model".into(), Value::String(requested_model.to_string()));
-        if let Some(verify) = verify {
-            dispatch.insert("verify".into(), Value::String(verify));
-        }
+        dispatch.insert("repo_path".into(), json!(repo_path));
+        // Preserve an explicitly disabled gate rather than auto-detecting again.
+        dispatch.insert("verify".into(), Value::String(verify.unwrap_or_default()));
         if let Some(turns) = args.get("max_turns").and_then(|v| v.as_u64()) {
             dispatch.insert("max_turns".into(), Value::Number(turns.into()));
         }

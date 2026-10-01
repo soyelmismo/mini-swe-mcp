@@ -30,6 +30,17 @@
             "description": "Merge every approved worker.",
             "type": "boolean"
           },
+          "consolidate": {
+            "description": "Auto-consolidate this owner's group once stopped; true uses strongest/default, string pins model. See help consolidate.",
+            "type": [
+              "boolean",
+              "string"
+            ]
+          },
+          "consolidate_verify": {
+            "description": "Full gate for the automatic consolidator; omitted means auto-detect.",
+            "type": "string"
+          },
           "diff": {
             "default": "code",
             "description": "Diff scope for 'review': 'code' (default) hides tests, 'all' shows everything, 'none' hides it.",
@@ -119,6 +130,15 @@
             "description": "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
             "items": {
               "properties": {
+                "consolidate": {
+                  "type": [
+                    "boolean",
+                    "string"
+                  ]
+                },
+                "consolidate_verify": {
+                  "type": "string"
+                },
                 "group": {
                   "type": "string"
                 },

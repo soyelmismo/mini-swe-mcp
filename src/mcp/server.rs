@@ -30,6 +30,8 @@ use crate::pool::WorkerPool;
 #[derive(Clone)]
 pub struct McpServer {
     pub(super) pool: Arc<WorkerPool>,
+    pub(super) auto_consolidate:
+        Arc<std::sync::Mutex<Option<Arc<crate::hub::auto_consolidate::AutoConsolidate>>>>,
     pub(super) default_model: String,
     pub(super) manifest: Arc<ModelManifest>,
     /// Precomputed, immutable `tools/list` result. The manifest is never
@@ -274,6 +276,7 @@ impl McpServer {
         let tools_list = Arc::new(build_tools_list(&manifest));
         Self {
             pool: Arc::new(pool),
+            auto_consolidate: Arc::new(std::sync::Mutex::new(None)),
             default_model,
             manifest,
             tools_list,
@@ -679,6 +682,10 @@ impl McpServer {
     /// [`RecoveryGate`].
     pub fn begin_recovery(&self) {
         self.recovery.begin();
+    }
+
+    pub(super) async fn recovery_wait(&self) {
+        self.recovery.wait().await;
     }
 
     /// Open the recovery gate, releasing the worker-state requests that
