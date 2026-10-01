@@ -46,6 +46,24 @@ impl McpServer {
             })
     }
 
+    /// Resolve the `worker_id`/`id` argument to the full id of one of the
+    /// caller's own workers.
+    ///
+    /// Accepts the full id, `last` (the caller's most recently dispatched
+    /// worker) and any unique prefix of at least three characters. An id
+    /// nothing of the caller's matches is passed through so the verb answers
+    /// with its own "not found"; an ambiguous prefix is refused here, listing
+    /// only the caller's matching ids. The response always carries the full id.
+    pub(super) async fn resolve_worker_id(
+        &self,
+        args: &Value,
+        action: &str,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<String> {
+        let needle = Self::get_worker_id(args, action)?;
+        self.pool.resolve_worker_id(needle, &ctx.agent()).await
+    }
+
     /// Parse the optional `timeout_secs` deadline of a blocking call.
     ///
     /// Clients disagree wildly on how long a tool call may run, so a caller
@@ -515,7 +533,8 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "status")?;
+        let resolved = self.resolve_worker_id(args, "status", ctx).await?;
+        let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
         if let Some(state) = self.pool.get_worker_state(wid).await {
             // A finished worker's status carries the same review guidance as
@@ -592,7 +611,8 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "logs")?;
+        let resolved = self.resolve_worker_id(args, "logs", ctx).await?;
+        let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
         let Some(buffer) = self.pool.get_worker_logs(wid).await else {
             anyhow::bail!("Worker not found: {wid}")
@@ -636,7 +656,8 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "collect")?;
+        let resolved = self.resolve_worker_id(args, "collect", ctx).await?;
+        let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
         if let Some(collected) = self.pool.collect(wid).await {
             let log_view = LogView {
@@ -710,7 +731,8 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "kill")?;
+        let resolved = self.resolve_worker_id(args, "kill", ctx).await?;
+        let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
         let killed = self.pool.kill(wid).await;
         if killed {
@@ -747,14 +769,15 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let mut ids: std::collections::BTreeSet<String> = args["worker_ids"]
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let needles = args["worker_ids"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        if let Some(id) = args.get("worker_id").and_then(Value::as_str) {
-            ids.insert(id.to_string());
+            .filter_map(Value::as_str)
+            .chain(args.get("worker_id").and_then(Value::as_str));
+        for needle in needles {
+            ids.insert(self.pool.resolve_worker_id(needle, &ctx.agent()).await?);
         }
         // Without explicit ids the watch follows every worker the caller owns,
         // re-checked on each poll, so a later dispatch joins automatically. An
@@ -891,7 +914,8 @@ impl McpServer {
         _tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "steer")?;
+        let resolved = self.resolve_worker_id(args, "steer", ctx).await?;
+        let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
         let message = Self::required_string(args, "message", "steer")?.to_string();
         // An explicit `max_turns` on a steer is the revision's fresh budget;

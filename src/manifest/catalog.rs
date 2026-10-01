@@ -7,9 +7,10 @@
 //! the catalog itself: it reads no environment variable, no file, and no user
 //! configuration.
 //!
-//! It also owns [`build_system_prompt`], the one place where a role's persistent
-//! memory ([`super::memory`]) is spliced into the system prompt a worker starts
-//! with, so the implementer and the reviewer build their prompts identically.
+//! It also owns [`build_system_prompt`], the one place where a repository's own
+//! instruction files ([`super::instructions`]) and a role's persistent memory
+//! ([`super::memory`]) are spliced into the system prompt a worker starts with,
+//! so the implementer and the reviewer build their prompts identically.
 //!
 //! The render itself is deliberately plain: one header constant plus one
 //! `writeln!` per model. It runs once per process (the MCP server precomputes
@@ -27,6 +28,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::DEFAULT_ROLE;
+use super::instructions::instructions_prompt_section;
 use super::memory::memory_prompt_section;
 use super::types::ModelManifest;
 
@@ -50,20 +52,26 @@ impl ModelManifest {
 
 /// Build the effective system prompt for a worker of `model_alias` running in
 /// `repo_path`: the crate-wide [`SYSTEM_PROMPT`](crate::agent::SYSTEM_PROMPT)
-/// followed by that role's persistent memory, when the repository provides any.
+/// followed by the repository's instruction files and that role's persistent
+/// memory, when the repository provides either.
 ///
-/// This is the single point where role memory enters a conversation, so both the
-/// implementer loop and the review phase get identical treatment (they previously
-/// both passed the static prompt straight to `ChatMessage::text`). Memory is read
-/// from disk on every build — never memoized, see [`super::memory`] — so a note
-/// appended by a previous run is visible to the very next dispatch.
+/// This is the single point where repository- and role-scoped text enters a
+/// conversation, so both the implementer loop and the review phase get identical
+/// treatment (they previously both passed the static prompt straight to
+/// `ChatMessage::text`). Both sources are read from disk on every build — never
+/// memoized, see [`super::instructions`] and [`super::memory`] — so an edit made
+/// between dispatches is visible to the very next one.
 ///
-/// Returns the static prompt **unchanged** when the role has no memory file, so a
-/// repository that has not opted in sees byte-identical behaviour to before
-/// persistent memory existed.
+/// Returns the static prompt **unchanged** when the repository has no
+/// instruction files and the role has no memory file, so an unadorned repository
+/// sees byte-identical behaviour to before these injections existed.
 pub fn build_system_prompt(repo_path: &Path, model_alias: &str) -> String {
-    match memory_prompt_section(repo_path, model_alias) {
-        Some(section) => format!("{}{section}", crate::agent::SYSTEM_PROMPT),
-        None => crate::agent::SYSTEM_PROMPT.to_string(),
+    let mut prompt = String::from(crate::agent::SYSTEM_PROMPT);
+    if let Some(section) = instructions_prompt_section(repo_path) {
+        prompt.push_str(&section);
     }
+    if let Some(section) = memory_prompt_section(repo_path, model_alias) {
+        prompt.push_str(&section);
+    }
+    prompt
 }
