@@ -1,4 +1,5 @@
 use super::*;
+use crate::pool::WorkerState;
 use std::path::PathBuf;
 
 impl McpServer {

@@ -50,7 +50,7 @@ pub fn tool_args(
         "collect" => collect::build(cli_args, &mut tool_args),
         "review" => review::build_view(cli_args, &mut tool_args),
         "merge" => merge::build(cli_args, &mut tool_args)?,
-        "kill" | "logs" | "status" => target::build(cli_args, &mut tool_args),
+        "kill" | "discard" | "logs" | "status" => target::build(cli_args, &mut tool_args),
         "consolidate" => consolidate::build(cli_args, &mut tool_args)?,
         "steer" => steer::build(cli_args, &mut tool_args)?,
         "approve" | "unapprove" => review::build(action, cli_args, &mut tool_args)?,

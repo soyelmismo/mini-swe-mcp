@@ -75,9 +75,10 @@ pub use self::revision::{
     is_replayable, load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
-    remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
-    retire_worker, retire_worker_in, retire_worker_with, save_worker_history,
-    save_worker_history_in, sweep_retired_workers, sweep_retired_workers_in,
+    RetireOutcome, remove_worker_history, remove_worker_history_in,
+    retire_expired_terminal_workers_in, retire_worker, retire_worker_in,
+    retire_worker_reporting, retire_worker_with, save_worker_history, save_worker_history_in,
+    sweep_retired_workers, sweep_retired_workers_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;

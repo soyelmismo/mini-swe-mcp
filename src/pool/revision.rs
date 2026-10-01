@@ -567,8 +567,15 @@ pub fn retire_worker_reporting(
             branch_deleted = true;
         }
     }
-    for suffix in ["steer-source", "round-base"] {
-        let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
+    // Every base directory the root sweeps, not just its own: a `.round-base`
+    // is written next to the root that dispatched the consolidator, and a
+    // retirement that only looked at one would leave the pinned base of a
+    // discarded round behind -- exactly the leftover a discard exists to
+    // remove.
+    for base in root.base_dirs() {
+        for suffix in ["steer-source", "round-base"] {
+            let _ = std::fs::remove_file(base.join(format!("swe-wt-{worker_id}.{suffix}")));
+        }
     }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
