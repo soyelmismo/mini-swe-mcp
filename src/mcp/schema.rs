@@ -300,6 +300,12 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
+    // Several rounds running at once are named in one call: a single group name
+    // still works, and `watch --all` reads the omitted value as every group.
+    if name == "group" {
+        schema.insert("type".to_string(), json!(["string", "array"]));
+        schema.insert("items".to_string(), json!({ "type": "string" }));
+    }
     if name == "tasks" {
         schema.insert(
             "items".to_string(),

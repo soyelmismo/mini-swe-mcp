@@ -12,14 +12,19 @@ pub type Snapshot = BTreeMap<String, Value>;
 #[derive(Default)]
 pub struct Options {
     pub ids: BTreeSet<String>,
-    pub group: Option<String>,
+    /// The rounds this watch follows: several `--group` flags are one watch,
+    /// not several. An empty set means "every live group of the caller", which
+    /// only `--all` may read that way.
+    pub groups: BTreeSet<String>,
     pub follow: bool,
     /// Print the full event body (long next-step guidance, every command).
     /// `--json` stays complete regardless of this flag.
     pub verbose: bool,
     pub timeout: Option<Duration>,
-    /// Wait for a whole round: one event when every selected worker stopped,
-    /// or as soon as one needs input or fails. Requires a group or ids.
+    /// Wait for whole rounds: one event as soon as any selected round has
+    /// fully stopped (that round's per-worker lines), or as soon as one worker
+    /// needs input or fails. Without a group or ids it covers every live group
+    /// of the caller.
     pub all: bool,
 }
 impl Options {
@@ -38,7 +43,7 @@ impl Options {
                         .get(i)
                         .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))?;
                     if flag == "--group" {
-                        out.group = Some(value.clone());
+                        out.groups.insert(value.clone());
                     } else {
                         out.timeout = Some(Duration::from_secs(value.parse().map_err(|_| {
                             anyhow::anyhow!("--timeout expects a whole number of seconds")
@@ -52,10 +57,8 @@ impl Options {
             }
             i += 1;
         }
-        anyhow::ensure!(
-            !out.all || out.group.is_some() || !out.ids.is_empty(),
-            "--all needs --group or explicit worker ids"
-        );
+        // `--all` without a group or ids is not a refusal any more: it covers
+        // every live group the caller owns.
         Ok(out)
     }
 }
@@ -664,12 +667,23 @@ fn terminal(view: &Value) -> bool {
     )
 }
 
-pub fn matches(view: &Value, ids: &BTreeSet<String>, group: Option<&str>) -> bool {
+/// Whether `view` names a group of `groups`; an empty selection is every
+/// group, which is what an `--all` watch without a `--group` flag selects.
+fn in_groups(view: &Value, groups: &BTreeSet<String>) -> bool {
+    groups.is_empty()
+        || view["group"]
+            .as_str()
+            .is_some_and(|group| groups.contains(group))
+}
+
+/// Whether `view` is one of the workers this watch follows: its ids, when the
+/// caller named any, and its group, when the caller named any.
+pub fn matches(view: &Value, ids: &BTreeSet<String>, groups: &BTreeSet<String>) -> bool {
     (ids.is_empty()
         || view["worker_id"]
             .as_str()
             .is_some_and(|id| ids.contains(id)))
-        && group.is_none_or(|g| view["group"] == g)
+        && in_groups(view, groups)
 }
 
 /// The event kind a `--all` round emits: one consolidated event per round.
@@ -751,37 +765,101 @@ pub fn render_round_line(w: &Value) -> String {
     }
 }
 
-/// The consolidated `--all` event for one round, or `None` while it waits.
+/// The consolidated `--all` event for the first round worth reporting, or
+/// `None` while every round keeps waiting.
 ///
-/// A group watch keeps waiting until every selected worker has stopped
-/// (completed, failed, exhausted, killed or interrupted). It returns early
-/// when one needs input, has failed, or (only past [`ROUND_STALL_SECS`]) has
-/// gone quiet long enough to matter. `fresh` reports whether a worker has an
-/// event the caller has not acknowledged, so a reported round never replays.
+/// Each round is its own unit: it keeps waiting until all of its workers have
+/// stopped (completed, failed, exhausted, killed or interrupted), and returns
+/// early when one needs input, has failed, or (only past [`ROUND_STALL_SECS`])
+/// has gone quiet long enough to matter. `fresh` reports whether a worker has
+/// an event the caller has not acknowledged, so a reported round never replays.
+///
+/// Rounds are ranked, not merged: a stopped round outranks one that only needs
+/// attention, and ties go to the first group by name so the answer is the same
+/// on every poll. The event carries that one round's workers, which is what
+/// lets an orchestrator with several rounds running read the result of the
+/// first one to land.
 pub fn round_event(
     current: &Snapshot,
     ids: &BTreeSet<String>,
-    group: Option<&str>,
+    groups: &BTreeSet<String>,
     now: u64,
     fresh: impl Fn(&str) -> bool,
     allowed: impl Fn(&Value) -> bool,
 ) -> Option<Value> {
-    let selected: Vec<&Value> = current
-        .values()
-        .filter(|v| {
-            allowed(v)
-                && matches(v, ids, group)
-                && v["steered_by_consolidator"] != true
-                && v["question_for_consolidator"] != true
-        })
-        .collect();
+    let mut best: Option<(bool, String, Vec<&Value>)> = None;
+    for (group, selected) in rounds(current, ids, groups, &allowed) {
+        let Some(all_stopped) = round_outcome(&selected, now, &fresh) else {
+            continue;
+        };
+        // A finished round outranks an early return: it is the answer, while a
+        // question only interrupts the wait when nothing else finished. Ties go
+        // to the first group by name, so every poll ranks the rounds alike.
+        let outranks = match &best {
+            None => true,
+            Some((stopped, best_group, _)) => {
+                all_stopped && !*stopped || *best_group > group
+            }
+        };
+        if outranks {
+            best = Some((all_stopped, group, selected));
+        }
+    }
+    let (all_stopped, group, selected) = best?;
+    Some(round_payload(&selected, &group, now, all_stopped))
+}
+
+/// The caller's rounds, each one name and the workers of that group alone.
+///
+/// Grouping is what keeps the rounds apart: a stopped round can never be held
+/// back by a sibling round that is still running. An empty group selection
+/// means every live group of the caller, which is what `--all` without a
+/// `--group` flag asks for.
+fn rounds(
+    current: &Snapshot,
+    ids: &BTreeSet<String>,
+    groups: &BTreeSet<String>,
+    allowed: &impl Fn(&Value) -> bool,
+) -> Vec<(String, Vec<&Value>)> {
+    let selected = |v: &Value| {
+        allowed(v)
+            && matches(v, ids, groups)
+            && v["steered_by_consolidator"] != true
+            && v["question_for_consolidator"] != true
+    };
+    let mut by_group: std::collections::BTreeMap<String, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    for view in current.values().filter(|v| selected(v)) {
+        if let Some(group) = view["group"].as_str() {
+            by_group.entry(group.to_string()).or_default().push(view);
+        }
+    }
+    // A named group that holds no worker of the caller is not a round: it would
+    // otherwise answer as an empty one that is instantly stopped.
+    if !groups.is_empty() {
+        by_group.retain(|group, workers| {
+            !workers.is_empty()
+                || current.values().any(|v| {
+                    allowed(v) && v["group"].as_str().is_some_and(|name| name == group)
+                })
+        });
+    }
+    by_group.into_iter().collect()
+}
+
+/// Whether the round is over, or `None` while it keeps waiting.
+fn round_outcome(
+    selected: &[&Value],
+    now: u64,
+    fresh: &impl Fn(&str) -> bool,
+) -> Option<bool> {
     if selected.is_empty() {
         return None;
     }
     let mut all_stopped = true;
     let mut attention = false;
     let mut fresh_any = false;
-    for v in &selected {
+    for v in selected {
         let id = v["worker_id"].as_str().unwrap_or("");
         let is_fresh = fresh(id);
         fresh_any |= is_fresh;
@@ -804,11 +882,11 @@ pub fn round_event(
     if !fresh_any || (!attention && !all_stopped) {
         return None;
     }
-    Some(round_payload(&selected, group, now, all_stopped))
+    Some(all_stopped)
 }
 
 /// Assemble the round event from the selected worker views.
-fn round_payload(selected: &[&Value], group: Option<&str>, now: u64, all_stopped: bool) -> Value {
+fn round_payload(selected: &[&Value], group: &str, now: u64, all_stopped: bool) -> Value {
     let mut workers: Vec<Value> = selected.iter().map(|v| round_line(v, now)).collect();
     workers.sort_by(|a, b| a["worker_id"].as_str().cmp(&b["worker_id"].as_str()));
     let content = workers
@@ -817,7 +895,7 @@ fn round_payload(selected: &[&Value], group: Option<&str>, now: u64, all_stopped
         .collect::<Vec<_>>()
         .join("\n");
     json!({
-        "worker_id": group.unwrap_or(ROUND_EVENT),
+        "worker_id": group,
         "event": ROUND_EVENT,
         "status": if all_stopped { "stopped" } else { "attention" },
         "group": group,
@@ -916,7 +994,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut reconnects = 0usize;
     'watch: loop {
         let response = match client
-            .watch_snapshot(&ids, opts.group.as_deref(), initial, opts.all)
+            .watch_snapshot(&ids, &opts.groups, initial, opts.all)
             .await
         {
             Ok(value) => value,
@@ -1070,7 +1148,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                     .iter()
                     .filter(|(_, v)| {
                         (admin || v["owner"] == owner)
-                            && matches(v, &opts.ids, opts.group.as_deref())
+                            && matches(v, &opts.ids, &opts.groups)
                             && terminal(v)
                     })
                     .map(|(id, _)| id.clone())
@@ -1084,7 +1162,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             for (id, v) in &current {
                 if !ignored.contains(id)
                     && (admin || v["owner"] == owner)
-                    && matches(v, &opts.ids, opts.group.as_deref())
+                    && matches(v, &opts.ids, &opts.groups)
                 {
                     ids.insert(id.clone());
                 }
@@ -1093,7 +1171,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
         current.retain(|id, v| {
             ids.contains(id)
                 && (admin || v["owner"] == owner)
-                && matches(v, &opts.ids, opts.group.as_deref())
+                && matches(v, &opts.ids, &opts.groups)
         });
         if opts.all {
             let signature = |v: &Value| {
@@ -1109,7 +1187,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             let event = round_event(
                 &current,
                 &ids,
-                opts.group.as_deref(),
+                &opts.groups,
                 now,
                 |id| {
                     current
@@ -1120,7 +1198,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             );
             if let Some(event) = event {
                 for (id, view) in &current {
-                    if matches(view, &ids, opts.group.as_deref()) {
+                    if matches(view, &ids, &opts.groups) {
                         round_reported.insert(id.clone(), signature(view));
                     }
                 }
