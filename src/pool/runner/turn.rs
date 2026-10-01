@@ -234,65 +234,72 @@ struct EditPlanEntry {
 /// and backticked identifiers it happens to carry.
 fn edit_plan(task: &str) -> Vec<EditPlanEntry> {
     let mut entries: Vec<EditPlanEntry> = Vec::new();
-    let mut current: Option<usize> = None;
-    let mut tokens = task.split_whitespace().peekable();
-    while let Some(raw) = tokens.next() {
-        let Some((head, quoted)) = raw.split_once('`') else {
-            if is_path_token(raw)
-                && entries.len() < EDIT_PLAN_FILES
-                && !entries.iter().any(|e| e.path == raw)
-            {
-                entries.push(EditPlanEntry {
-                    path: raw.to_string(),
-                    identifiers: Vec::new(),
-                });
-                current = Some(entries.len() - 1);
+    // The file a backticked identifier belongs to: the last one the task named
+    // before it, so `fn foo` attaches to the file it was written next to.
+    let mut owner: Option<usize> = None;
+    // Alternating prose and quoted spans: a backticked name may carry spaces
+    // (`fn check_read_only`), so it is read between the backticks rather than
+    // token by token.
+    let mut quoted = false;
+    for span in task.split('`') {
+        if quoted {
+            quoted = false;
+            let span = span.trim();
+            // Without a file there is nothing to point at, so a task that names
+            // only identifiers has no plan to hand back.
+            let Some(index) = owner.filter(|_| !entries.is_empty()) else {
+                continue;
+            };
+            let entry = entries.get_mut(index).expect("owner is in range");
+            if entry.identifiers.len() < EDIT_PLAN_IDENTIFIERS && is_identifier(span) {
+                entry.identifiers.push(span.to_string());
             }
             continue;
-        };
-        // A backticked identifier belongs to the file named before it on the
-        // same sentence, and to the first file named when none precedes it.
-        let index = match entries.iter().position(|e| e.path == head) {
-            Some(index) if is_path_token(head) => index,
-            _ => current.unwrap_or(0),
-        };
-        let mut identifier = quoted.to_string();
-        // An identifier wrapped across backticks carries its tail as the next
-        // whitespace token, so `edit plan` reads as one name.
-        while identifier.split_whitespace().count() > EDIT_PLAN_IDENTIFIER_WORDS
-            && let Some(next) = tokens.peek()
-        {
-            identifier.push(' ');
-            identifier.push_str(next);
-            tokens.next();
         }
-        if entries.is_empty() {
-            // Nothing to attach the name to: the task names identifiers but no
-            // file, so there is no plan to hand back.
-            continue;
-        }
-        let Some(entry) = entries.get_mut(index) else { continue };
-        if entry.identifiers.len() < EDIT_PLAN_IDENTIFIERS && is_identifier(&identifier) {
-            entry.identifiers.push(identifier);
+        quoted = true;
+        // Prose is scanned in the order it is written, so the plan lists the
+        // files as the task listed them.
+        for token in span.split_whitespace() {
+            let Some(path) = path_of(token) else { continue };
+            if entries.len() < EDIT_PLAN_FILES
+                && !entries.iter().any(|e| e.path == path)
+            {
+                entries.push(EditPlanEntry {
+                    path: path.clone(),
+                    identifiers: Vec::new(),
+                });
+            }
+            owner = entries.iter().position(|e| e.path == path);
         }
     }
     entries
 }
 
+/// The path a whitespace token names, or `None` when it names none. Sentence
+/// punctuation around the token is not part of the path, so `src/a.rs,` and
+/// `src/a.rs.` are both read as `src/a.rs`.
+fn path_of(token: &str) -> Option<String> {
+    let token = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
+        .trim_end_matches('.');
+    is_path_token(token).then(|| token.to_string())
+}
+
 /// Whether a backticked span reads as an identifier -- `fn x`, a type name, a
-/// command -- rather than as a sentence of prose: every word is short and made
-/// of the characters an identifier, a call or a flag is written with.
+/// command -- rather than as a sentence of prose: it is at most a few words
+/// long and every character is one an identifier, a call or a flag is written
+/// with, so a quoted sentence of the dispatch stays out of the plan.
 fn is_identifier(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() || text.len() > EDIT_PLAN_IDENTIFIER_BYTES {
         return false;
     }
-    text.split_whitespace().all(|word| {
-        word.len() <= EDIT_PLAN_IDENTIFIER_BYTES
-            && word.chars().all(|c| {
-                c.is_ascii_alphanumeric() || "_-.:,()[]<>*&'!/=+".contains(c)
-            })
-    })
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.len() <= EDIT_PLAN_IDENTIFIER_WORDS
+        && words.iter().all(|word| {
+            word.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.:,()[]<>*&'!/=+".contains(c))
+        })
 }
 
 /// The plan half of the second nudge: the files and identifiers the task itself
