@@ -6,11 +6,11 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir};
+use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, hub_dir};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -19,11 +19,8 @@ use tokio::net::{TcpListener, UnixStream};
 ///
 /// The name stays short (see [`common::scratch_name`]) because the daemon binds
 /// a Unix socket inside it and `sun_path` is length-bounded.
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(common::scratch_name("hub"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch hub dir");
-    dir
+fn scratch_dir() -> common::TempDir {
+    common::TempDir::new(&std::env::temp_dir(), "test-hub")
 }
 
 /// A server backed by a pool that can answer handshake verbs without an LLM.
@@ -587,11 +584,23 @@ impl Drop for DaemonReaper {
             .split_whitespace()
             .filter_map(|word| word.strip_prefix("pid=")?.parse().ok())
             .collect();
-        for pid in pids {
+        for pid in &pids {
             // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            unsafe { libc::kill(*pid, libc::SIGTERM) };
+        }
+        // Wait for them to finish writing before the sibling `TempDir` removes
+        // the hub dir: a daemon killed mid-shutdown would recreate it through
+        // its registry and log writes, leaving the directory behind.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && pids.iter().any(|pid| process_alive(*pid)) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+}
+
+/// True while `pid` names a live process. Signal 0 only probes for existence.
+fn process_alive(pid: i32) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
 }
 
 /// Two clients with different working directories and no `repo_path` each get
@@ -2057,4 +2066,15 @@ fn a_deep_hub_dir_still_gets_a_working_socket() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // The daemon files its socket in a short fallback directory when the hub
+    // dir is too deep for `sun_path`. Own that directory so it is gone at test
+    // end even if the detached daemon was killed rather than shut down.
+    let _fallback = match mini_swe_mcp::hub::HubPaths::new(deep.clone()).endpoint() {
+        HubEndpoint::Path(path) => path
+            .parent()
+            .filter(|parent| *parent != deep.as_path())
+            .map(|parent| common::TempDir::own(parent.to_path_buf())),
+        HubEndpoint::Abstract(_) => None,
+    };
 }

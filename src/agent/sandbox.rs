@@ -1769,35 +1769,28 @@ mod tests {
         rules.iter().rev().find(|r| path == r.path)
     }
 
-    /// Scratch directory unique to the calling test, removed on drop.
-    struct Scratch(PathBuf);
+    /// Scratch directory unique to the calling test, removed on drop together
+    /// with the private scratch the runner derives from it.
+    struct Scratch(crate::test_support::TestScratch);
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let dir = crate::worktree::swe_base_dir()
-                .join("landlock-test")
-                .join(format!("{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("create scratch dir");
-            Self(dir)
+            Self(crate::test_support::TestScratch::new(&format!(
+                "landlock-{tag}"
+            )))
+        }
+
+        /// The scratch root, for paths that must stay inside it.
+        fn dir(&self) -> &Path {
+            self.0.path()
         }
 
         fn worktree(&self) -> PathBuf {
-            let w = self.0.join("worktree");
-            std::fs::create_dir_all(&w).expect("create worktree");
-            w
+            self.0.subdir("worktree")
         }
 
         fn target(&self) -> PathBuf {
-            let t = self.0.join("target");
-            std::fs::create_dir_all(&t).expect("create target dir");
-            t
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.subdir("target")
         }
     }
 
@@ -1837,7 +1830,7 @@ mod tests {
     #[test]
     fn a_missing_root_is_reported_even_where_landlock_is_unavailable() {
         let scratch = Scratch::new("noplan-missing");
-        let missing = scratch.0.join("does-not-exist");
+        let missing = scratch.dir().join("does-not-exist");
 
         let err = build_plan_with_abi(&missing, &scratch.target(), None, false).unwrap_err();
         assert!(
@@ -2140,7 +2133,7 @@ mod tests {
 
         // Ordinary-looking scratch space that is really a symlink onto the
         // operator's key material.
-        let link = scratch.0.join("looks-innocent");
+        let link = scratch.dir().join("looks-innocent");
         std::os::unix::fs::symlink(&secret_dir, &link).expect("create the symlink");
 
         // Without canonicalisation the lexical deny-check would pass and the rule
