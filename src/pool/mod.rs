@@ -654,7 +654,11 @@ impl WorkerPool {
         // A worker this process still holds a record for is just as retired as
         // one only the registry knew, so it leaves the live view here too --
         // otherwise `list` keeps showing an integrated worker as "Completed".
-        self.forget_retired_workers(&sweep.workers).await;
+        // The reclaimed orphan ids come along: those workers had no row left to
+        // be found through, so their record must leave here or it lingers.
+        let mut retired = sweep.workers.clone();
+        retired.extend(sweep.orphan_workers.iter().cloned());
+        self.forget_retired_workers(&retired).await;
         sweep
     }
 
