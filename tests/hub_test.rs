@@ -1284,7 +1284,14 @@ async fn next_event(client: &mut Client) -> serde_json::Value {
 #[tokio::test]
 async fn events_are_owner_scoped_and_replayed_after_hello() {
     use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("hub-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     pool.__test_insert_worker(event_worker("h4-live", "h4-a"))
         .await;
     pool.__test_insert_worker(event_worker("h4-late", "h4-late-owner"))
@@ -1389,7 +1396,14 @@ async fn events_are_owner_scoped_and_replayed_after_hello() {
 #[tokio::test]
 async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
     use mini_swe_mcp::pool::{WorkerMetrics, WorkerState};
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("hub-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     pool.__test_insert_worker(event_worker("h4-busy", "h4-owner"))
         .await;
     let dir = scratch_dir();
@@ -1646,7 +1660,14 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
     let dir = scratch_dir();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("hub-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     pool.__test_insert_worker(event_worker("h4-version-busy", "owner"))
         .await;
     let daemon = HubServer::new(
@@ -1724,7 +1745,14 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
 #[tokio::test]
 async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
     use mini_swe_mcp::pool::WorkerState;
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("hub-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     pool.__test_insert_worker(event_worker("h4-blocked", "h4-owner"))
         .await;
     let dir = scratch_dir();

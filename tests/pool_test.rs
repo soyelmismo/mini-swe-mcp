@@ -297,13 +297,16 @@ fn test_summarize_command_short_multibyte_is_untouched() {
 /// directory is removed when the returned guard drops, so the suite leaves
 /// nothing behind in the real registry.
 struct ScratchRootGuard {
+    /// Owns the directory: dropping the guard removes the whole root.
+    _dir: common::TempDir,
     path: std::path::PathBuf,
 }
 
 impl ScratchRootGuard {
     fn new(tag: &str) -> Self {
-        let path = common::TempDir::new_in_tmp(tag).path().to_path_buf();
-        Self { path }
+        let dir = common::TempDir::new_in_tmp(tag);
+        let path = dir.path().to_path_buf();
+        Self { _dir: dir, path }
     }
 
     /// The root, as the `*_in` registry, history and steer helpers want it.
@@ -1360,7 +1363,7 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     assert!(!mini_swe_mcp::pool::is_replayable(&broken));
     assert!(!mini_swe_mcp::pool::is_replayable(&[]));
 
-    mini_swe_mcp::pool::remove_worker_history("rev1");
+    mini_swe_mcp::pool::remove_worker_history_in(&scratch.root(), "rev1");
     assert!(!path.exists(), "removal must delete the history file");
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -1388,7 +1391,10 @@ fn prune_retires_histories_whose_branch_is_gone() {
     )
     .expect("save the orphaned history");
 
-    assert_eq!(mini_swe_mcp::pool::prune_orphan_histories(&repo), 1);
+    assert_eq!(
+        mini_swe_mcp::pool::prune_orphan_histories_in(&scratch.root(), &repo),
+        1
+    );
     assert!(
         mini_swe_mcp::pool::history_path_in(&scratch.root(), "alive").is_file(),
         "a live branch keeps its history"
@@ -1502,7 +1508,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // worker (no LLM is running in this test) and inspect the file the next
     // revision would read -- i.e. the messages the loop started with. The
     // loop owns them now, so assert on the registry row + branch instead.
-    let wt_path = mini_swe_mcp::worktree::swe_base_dir().join("swe-wt-revwork");
+    let wt_path = scratch.path().join("swe-wt-revwork");
     // Give the spawned revision task a moment to check out the branch.
     // The directory appears before `git worktree add` writes its `.git` link,
     // so wait for the link: only then does the checkout name its branch.
@@ -1635,7 +1641,6 @@ async fn change_subscription_fires_on_every_state_change() {
 async fn step_only_registry_updates_coalesce_to_one_write() {
     let scratch = ScratchRootGuard::new("h5a-reg");
     let dir = scratch.path().to_path_buf();
-    let scratch = ScratchRootGuard::new("h5a-reg");
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let meta = mini_swe_mcp::pool::WorkerMeta {
         id: "h5a-reg".into(),

@@ -379,7 +379,14 @@ async fn dispatch_and_wait(
     review_after: Option<String>,
     verify: Option<String>,
 ) -> (WorkerPool, String, WorkerState) {
-    let pool = WorkerPool::new(1, base_url.to_string(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("loop-pool");
+    let pool = WorkerPool::with_scratch(
+        1,
+        base_url.to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -886,7 +893,14 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
     script.push(ScriptedSseServer::completion_turn("call_done"));
     let server = ScriptedSseServer::spawn(script).await;
 
-    let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("loop-pool");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url.clone(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -1088,7 +1102,14 @@ async fn killing_a_worker_checkpoints_its_uncommitted_work() {
     ])
     .await;
 
-    let pool = WorkerPool::new(1, server.base_url.clone(), "test-key".to_string());
+    let scratch = common::TempDir::new_in_tmp("loop-pool");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url.clone(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    );
+    let _scratch = scratch;
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
