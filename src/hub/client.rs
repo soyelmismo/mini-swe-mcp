@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::daemon::hub_lock_held;
 use super::identity;
@@ -546,14 +546,18 @@ pub async fn proxy_stdio() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         };
         let from_daemon = forward_daemon(reader, &mut stdout, &in_flight);
-        eprintln!("DBG entering select");
         tokio::select! {
             // The client closed its input: nothing left to serve.
-            result = to_daemon => { eprintln!("DBG to_daemon ended"); return result; }
-            // The daemon went away: answer what it took, then dial again.
-            result = from_daemon => { eprintln!("DBG from_daemon ended: {:?}", result.as_ref().err().map(|e| e.to_string())); result?; }
+            result = to_daemon => return result,
+            // The daemon went away. A reset is as final as an EOF — a killed
+            // or replaced daemon closes the socket either way — so both are
+            // followed rather than reported to the MCP client.
+            result = from_daemon => {
+                if let Err(e) = &result {
+                    debug!(error = %e, "Hub connection ended");
+                }
+            }
         }
-        eprintln!("DBG answering cut");
         answer_cut_requests(&mut stdout, &in_flight).await?;
         reconnects += 1;
         anyhow::ensure!(

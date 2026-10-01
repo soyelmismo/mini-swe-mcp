@@ -14,7 +14,7 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer};
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 use serde_json::{Value, json};
@@ -404,10 +404,6 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
 
     // The request that was in flight at the cut is answered once, with an error
     // that says to retry it: its reply died with the old daemon.
-    eprintln!(
-        "LOG BEFORE CUT READ:\n{}",
-        std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default()
-    );
     let cut = read_reply(&mut stdout, 3).await;
     assert_eq!(cut["error"]["code"], -32000, "{cut}");
     assert!(
@@ -448,6 +444,124 @@ async fn wait_for_log(hub_dir: &std::path::Path, event: &str, count: usize) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// The CLI `watch` follows a daemon that goes away instead of ending: it
+/// reconnects to the replacement and keeps reporting the workers it watches.
+#[tokio::test]
+async fn the_cli_watch_survives_a_daemon_restart() {
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("handover-watch");
+    let hub_dir = hub.path().to_path_buf();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let isolated = common::IsolatedPool::new(2, "handover-watch");
+    let swe = isolated.root().path().to_path_buf();
+    let _reaper = Reaper(hub_dir.clone());
+
+    // A live worker owned by the watching agent, standing in for one the
+    // orchestrator dispatched: its pid is a real sleeper, so the daemon's
+    // recovery leaves it running rather than interrupting it.
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn the stand-in worker process");
+    let mut meta = meta("handover-watch");
+    meta.pid = sleeper.id();
+    isolated
+        .pool
+        .__test_save_status(
+            &meta,
+            "test",
+            mini_swe_mcp::pool::RegistryStatus::Running,
+            1,
+            10,
+            "probe",
+            None,
+        );
+
+    let mut daemon = common::binary_command(&exe);
+    daemon
+        .arg("daemon")
+        .env("SWE_HUB_DIR", &hub_dir)
+        .env("SWE_TEMP_DIR", &swe)
+        .env("HUB_AUTO_RESUME", "0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env("OPENAI_API_KEY", "test-key-not-used-by-the-handover-test")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut daemon = tokio::process::Command::from(daemon)
+        .spawn()
+        .expect("start the daemon");
+    wait_for_log(&hub_dir, "listening", 1).await;
+
+    let mut watch = common::binary_command(&exe);
+    watch
+        .args(["watch", "--json"])
+        .env("SWE_HUB_DIR", &hub_dir)
+        .env("SWE_TEMP_DIR", &swe)
+        .env("MINI_SWE_AGENT_ID", "handover-test")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env("OPENAI_API_KEY", "test-key-not-used-by-the-handover-test")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut watch = tokio::process::Command::from(watch)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the watch");
+    // The watch is watching once the daemon serves its second connection.
+    wait_for_log(&hub_dir, "Serving MCP connection", 1).await;
+
+    // Kill the daemon the watch is talking to, exactly as a handover cuts it.
+    let pid = daemon_pid(&hub_dir).expect("the daemon logged its pid");
+    // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the daemon");
+    let _ = daemon.wait().await;
+
+    // The watch follows the daemon: it reconnects to the replacement the hub
+    // auto-starts, rather than ending with the connection it lost.
+    wait_for_log(&hub_dir, "listening", 2).await;
+    assert!(
+        watch.try_wait().expect("poll the watch").is_none(),
+        "the watch must survive the daemon going away"
+    );
+
+    // And it is still watching: an event the replacement daemon reports reaches
+    // the same CLI process.
+    let mut client = Client::connect(&HubPaths::new(hub_dir.clone()).socket()).await;
+    client
+        .notify(
+            "hub/hello",
+            json!({"agent_id": "handover-test", "admin": true}),
+        )
+        .await;
+    let killed = client
+        .request(
+            "tools/call",
+            json!({"name": "worker",
+                   "arguments": {"action": "kill", "worker_id": "handover-watch"}}),
+        )
+        .await;
+    assert!(
+        killed["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("kill")),
+        "{killed}"
+    );
+    let output = tokio::time::timeout(Duration::from_secs(15), watch.wait_with_output())
+        .await
+        .expect("the watch ends once its worker is terminal")
+        .expect("the watch exits");
+    assert!(output.status.success(), "the watch reported its last event: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("handover-watch"),
+        "the reconnected watch must still print events: {stdout}"
+    );
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
 }
 
 /// The pid of the daemon the hub log last reported listening.
