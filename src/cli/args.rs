@@ -10,6 +10,10 @@ use serde_json::{Map, Value};
 /// Dispatch usage line, shared by `--help` and the missing-task error.
 pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
 
+/// Consolidate usage line, shared by `--help` and the missing-group error.
+pub const CONSOLIDATE_USAGE: &str =
+    "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>]";
+
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
 ///
@@ -70,6 +74,9 @@ pub fn tool_args(
                 tool_args.insert("keep_branch".into(), Value::Bool(true));
             }
         }
+        "consolidate" => {
+            consolidate_args(cli_args, &mut tool_args)?;
+        }
         "steer" => {
             if cli_args.len() > 3 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
@@ -118,6 +125,31 @@ pub fn tool_args(
     }
 
     Ok(Some(tool_args))
+}
+
+/// Fold the `consolidate` flags into the tool arguments.
+///
+/// `--group` is the one required flag: a consolidator integrates exactly one
+/// group's round, so a missing one is a hard error instead of a dispatch that
+/// would have to guess. The rest are the defaults that differ from a plain
+/// dispatch -- the model, the full gate and the turn budget -- and every one of
+/// them is optional because the hub computes a sensible value.
+fn consolidate_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Result<()> {
+    let mut i = 2;
+    while i < cli_args.len() {
+        match cli_args[i].as_str() {
+            "--group" | "-g" => take_value(cli_args, &mut i, tool_args, "group"),
+            "--model" | "-m" => take_value(cli_args, &mut i, tool_args, "model"),
+            "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
+            "--max-turns" | "-t" => take_turns(cli_args, &mut i, tool_args),
+            _ => {}
+        }
+        i += 1;
+    }
+    if !tool_args.contains_key("group") {
+        anyhow::bail!("Usage: mini-swe-mcp {CONSOLIDATE_USAGE}");
+    }
+    Ok(())
 }
 
 /// Fold the `collect` diff selectors into the tool arguments.

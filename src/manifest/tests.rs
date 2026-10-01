@@ -16,6 +16,7 @@ fn single(definition: ModelDefinition) -> ModelManifest {
     models.insert("solo".to_string(), definition);
     ModelManifest {
         default: Some("solo".to_string()),
+        strongest: None,
         models,
     }
 }
@@ -90,6 +91,7 @@ fn test_resolve_model() {
     );
     let sparse = ModelManifest {
         default: None,
+        strongest: None,
         models,
     };
     assert_eq!(
@@ -140,6 +142,7 @@ fn test_tool_description_role_fallback() {
     );
     let manifest = ModelManifest {
         default: None,
+        strongest: None,
         models,
     };
 
@@ -234,6 +237,7 @@ fn test_normalize_repairs_every_fixable_warning() {
     );
     let manifest = ModelManifest {
         default: Some("ghost".to_string()),
+        strongest: None,
         models,
     };
 
@@ -309,6 +313,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
     );
     let manifest = ModelManifest {
         default: Some("  ghost  ".to_string()),
+        strongest: None,
         models,
     };
 
@@ -336,6 +341,7 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
         }
         ModelManifest {
             default: None,
+            strongest: None,
             models,
         }
         .validate()
@@ -385,6 +391,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
     );
     let manifest = ModelManifest {
         default: None,
+        strongest: None,
         models,
     };
 
@@ -420,6 +427,7 @@ fn test_validate_flags_duplicate_model_ids() {
     }
     let manifest = ModelManifest {
         default: None,
+        strongest: None,
         models,
     };
 
@@ -449,6 +457,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
     }
     let manifest = ModelManifest {
         default: None,
+        strongest: None,
         models,
     };
 
@@ -769,6 +778,7 @@ fn test_every_declared_network_policy_value_is_accepted_verbatim() {
     };
     let manifest = ModelManifest {
         default: None,
+        strongest: None,
         models: [
             ("a".to_string(), def("combo:a", NetworkPolicy::Offline)),
             ("b".to_string(), def("combo:b", NetworkPolicy::Allow)),

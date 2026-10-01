@@ -30,6 +30,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "manifest",
     "prune",
     "merge",
+    "consolidate",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -63,7 +64,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs'. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -84,7 +85,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static("Action to perform; see `mini-swe-mcp help <topic>`."),
+        DescriptionSource::Static("Action to perform; the enum lists every verb."),
     ),
     (
         "task",
@@ -122,7 +123,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'): a unique 3+ char prefix or 'last'. Required for 'status', 'steer', 'watch', 'collect', 'review', 'approve', 'unapprove', 'logs', 'kill'.",
+            "Target worker ID (alias: 'id'): a unique 3+ char prefix or 'last'. Required for every verb that targets one worker.",
         ),
     ),
     (
@@ -179,14 +180,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Reviewer model that audits and finalizes the worktree after implementation.",
+            "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass an empty string to disable.",
+            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
         ),
     ),
     (
@@ -210,7 +211,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "diff",
         "string",
         DescriptionSource::Static(
-            "Diff scope for 'review': 'code' (default) hides test files, 'all' shows everything, 'none' withholds it.",
+            "Diff scope for 'review': 'code' (default) hides tests, 'all' shows everything, 'none' hides it.",
         ),
     ),
     (
