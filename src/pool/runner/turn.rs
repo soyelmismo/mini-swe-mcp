@@ -34,13 +34,13 @@ use super::super::admission::AdmissionClass;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::super::revision::{WorkerHistory, append_history_message_in};
-use super::super::state::WorkerState;
+use super::super::state::{WorkerReport, WorkerState};
 use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_request_turns, summarize_command,
+    COMPLETION_SENTINEL, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
+    parse_consolidate_merge, parse_report, parse_request_turns, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -364,6 +364,14 @@ pub(super) struct TurnEngine<'a> {
     pub dispatch_max_turns: usize,
     /// Loop and stagnation detector state, shared across turns.
     pub watch: &'a mut ProgressWatch,
+    /// The structured report of the completion turn, once one has been parsed.
+    /// Written here rather than returned so a completion that is refused (a
+    /// verify failure, a base merge) keeps the report it already gave.
+    pub report: &'a mut Option<WorkerReport>,
+    /// Whether the worker has already been asked once for a missing report.
+    /// One ask per run: a second would let a confused model trade turns for
+    /// completions that never carry one.
+    pub report_asked: &'a mut bool,
 }
 
 impl<'a> TurnEngine<'a> {
@@ -531,7 +539,11 @@ impl<'a> TurnEngine<'a> {
         // --- Command extraction ---
         let cmd_str = match llm_resp.command {
             Some(ref cmd) if is_completion_request(cmd) => {
-                return self.handle_completion(&llm_resp).await;
+                // Only the implementer's completion carries the report the
+                // orchestrator reads: the reviewer's sentinel approves the
+                // audit, and asking it for a report would cost a turn for a
+                // payload nobody stores.
+                return self.handle_completion(&llm_resp, config.apply_sentinels).await;
             }
             Some(ref cmd) => {
                 *self.consecutive_no_cmd = 0;
@@ -782,7 +794,11 @@ impl<'a> TurnEngine<'a> {
     /// A verify command whose last run passed on the current tree is reused
     /// instead of re-run: variant A is skipped and the reuse is disclosed to
     /// the model, while variant B and the side-effect audit still run.
-    async fn handle_completion(&mut self, llm_resp: &LlmResponse) -> Result<TurnOutcome> {
+    async fn handle_completion(
+        &mut self,
+        llm_resp: &LlmResponse,
+        require_report: bool,
+    ) -> Result<TurnOutcome> {
         info!(
             worker = %self.worker_id,
             step = *self.step,
@@ -790,6 +806,35 @@ impl<'a> TurnEngine<'a> {
         );
         if !llm_resp.content.trim().is_empty() {
             *self.last_assistant_text = llm_resp.content.clone();
+        }
+
+        // The completion turn must carry a REPORT block. A worker that omits
+        // one is asked exactly once, before any git work: the answer is what
+        // the orchestrator reads, so it is worth one turn and never more.
+        match (require_report, parse_report(&llm_resp.content)) {
+            (true, Some(parsed)) => *self.report = Some(parsed),
+            (true, None) if !*self.report_asked => {
+                *self.report_asked = true;
+                info!(
+                    worker = %self.worker_id,
+                    step = *self.step,
+                    "Completion carried no REPORT block; asking once"
+                );
+                self.push_exchange(
+                    llm_resp.content.clone(),
+                    llm_resp.reasoning_content.clone(),
+                    llm_resp
+                        .tool_calls
+                        .clone()
+                        .zip(llm_resp.tool_call_id.clone()),
+                    REPORT_FOLLOWUP.to_string(),
+                );
+                return Ok(TurnOutcome::Continue);
+            }
+            // Already asked once, or a phase whose completion carries no
+            // report: accept it and fall back to the summary the harness has
+            // always derived from the last message.
+            _ => {}
         }
 
         let merged = match sync_base_for_completion(self.worktree).await? {

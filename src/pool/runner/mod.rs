@@ -335,6 +335,11 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
+        // The completion report and the one follow-up it may cost live across
+        // turns: a verify failure replays the completion turn, and the report
+        // the worker already wrote must survive that replay.
+        let mut report: Option<crate::pool::WorkerReport> = None;
+        let mut report_asked = false;
 
         while step < current_max_turns {
             step += 1;
@@ -368,6 +373,8 @@ impl WorkerPool {
                 client_env: &client_env,
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
+                report: &mut report,
+                report_asked: &mut report_asked,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
@@ -497,10 +504,14 @@ impl WorkerPool {
             verified,
             metrics: meta.metrics,
             revision,
+            report: report.clone(),
         };
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
 
+        // The report travels with the meta so the terminal row carries it: the
+        // in-memory record is evicted after its TTL, the row is not.
+        meta.report = report;
         self.save_status(
             meta,
             &model,

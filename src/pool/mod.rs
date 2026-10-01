@@ -81,8 +81,9 @@ pub use self::runner::{
     summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerReport, WorkerState,
+    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics, WorkerOwner, WorkerPhase,
+    WorkerProgress, WorkerRecord, WorkerReport, WorkerState, file_stats_of_diff,
+    normalize_diff_path,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -588,6 +589,7 @@ impl WorkerPool {
             metrics: WorkerMetrics::default(),
             revision: 0,
             auto_continues: 0,
+            report: None,
         };
 
         let initial_record = WorkerRecord {
@@ -1816,6 +1818,7 @@ mod consolidate_delegation_tests {
             revision: 0,
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
+            report: None,
         }
     }
 

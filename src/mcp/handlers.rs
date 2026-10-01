@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
-use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
+use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view, normalize_diff_path};
 
 /// Owner label used when neither the pool nor the registry has a row.
 const UNKNOWN_OWNER: &str = "unknown";
@@ -1466,24 +1466,10 @@ fn numstat_count(field: &str) -> Option<usize> {
     })
 }
 
-/// One file's share of a diff, as `git diff --numstat` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DiffFileStat {
-    pub(super) path: String,
-    pub(super) insertions: usize,
-    pub(super) deletions: usize,
-}
-
-/// A path as git spells it in a diff header, without the `a/`/`b/` prefix or a
-/// leading `./`, so a caller's `--file src/a.rs` matches what git printed.
-fn normalize_diff_path(path: &str) -> String {
-    let path = path
-        .strip_prefix("b/")
-        .or_else(|| path.strip_prefix("a/"))
-        .unwrap_or(path)
-        .trim_matches('"');
-    path.strip_prefix("./").unwrap_or(path).to_string()
-}
+/// One file's share of a diff, as `git diff --numstat` reports it. The shared
+/// [`crate::pool::FileStat`] keeps the review payload and the completion event
+/// reading the same shape.
+pub(super) type DiffFileStat = crate::pool::FileStat;
 
 /// Whether a requested path names the file a diff section is about.
 ///

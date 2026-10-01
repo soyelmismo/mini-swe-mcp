@@ -120,6 +120,78 @@ impl WorkerReport {
     }
 }
 
+/// One file's share of a diff: the path, the lines added and the lines removed.
+///
+/// The completion diff is already in memory when a worker finishes, so the
+/// per-file split is read out of it once and carried next to the totals: a
+/// consumer that wants to know *what* changed should not have to shell out to
+/// `git diff --stat` to find out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+impl FileStat {
+    /// Lines this file accounts for, the churn the top-N ordering sorts on.
+    pub fn churn(&self) -> usize {
+        self.insertions + self.deletions
+    }
+}
+
+/// A path as git spells it in a diff header, without the `a/`/`b/` prefix or a
+/// leading `./`, so a caller's `--file src/a.rs` matches what git printed.
+pub fn normalize_diff_path(path: &str) -> String {
+    let path = path
+        .strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path)
+        .trim_matches('"');
+    path.strip_prefix("./").unwrap_or(path).to_string()
+}
+
+/// Read a unified diff into its per-file stats.
+///
+/// Pure and bounded by the diff's own size: one pass over the lines, counting
+/// the `+`/`-` body lines of each `diff --git` section. A section with no
+/// header path (a truncated diff) is skipped rather than guessed at, and a
+/// binary file — which has no body lines at all — reports zero and zero, the
+/// same thing `git diff --numstat` prints for it.
+pub fn file_stats_of_diff(diff: &str) -> Vec<FileStat> {
+    let mut stats: Vec<FileStat> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `a/<path> b/<path>`; a quoted path may contain a space, so the
+            // split is on the ` b/` separator rather than on whitespace.
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, tail)| tail)
+                .unwrap_or(rest)
+                .to_string();
+            stats.push(FileStat {
+                path: normalize_diff_path(&path),
+                ..FileStat::default()
+            });
+            current = Some(stats.len() - 1);
+            continue;
+        }
+        let Some(index) = current else { continue };
+        // The `+++`/`---` header lines are not body lines.
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        let stat = &mut stats[index];
+        if line.starts_with('+') {
+            stat.insertions += 1;
+        } else if line.starts_with('-') {
+            stat.deletions += 1;
+        }
+    }
+    stats
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
