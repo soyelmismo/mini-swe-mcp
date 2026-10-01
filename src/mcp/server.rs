@@ -986,10 +986,15 @@ mod tests {
         for action in WORKER_ACTIONS {
             // Arguments are deliberately missing, so most verbs fail their own
             // validation; what matters is that the verb itself is recognised.
-            let unknown = match server
-                .execute_tool("worker", json!({ "action": action }))
-                .await
-            {
+            // A no-arg `watch` with no timeout would wait for the next
+            // dispatch, so it gets a zero deadline to stay a recognisability
+            // probe.
+            let arguments = if *action == "watch" {
+                json!({ "action": action, "timeout_secs": 0 })
+            } else {
+                json!({ "action": action })
+            };
+            let unknown = match server.execute_tool("worker", arguments).await {
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             };

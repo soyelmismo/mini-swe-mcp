@@ -1018,6 +1018,90 @@ async fn a_second_cli_watch_for_one_session_exits_five() {
     let _ = task.await;
 }
 
+/// A worker queued for a heavy build slot is not stalled, however long the
+/// wait: the admission wait is its own state, and the stall detector skips it.
+#[test]
+fn a_queued_build_slot_is_never_a_stall() {
+    let mut view = serde_json::json!({
+        "worker_id": "w-slot",
+        "owner": "local",
+        "status": "running",
+        "step": 4,
+        "turns": 4,
+        "revision": 0,
+        "question": null,
+        "branch": null,
+        "metrics": {},
+        "last_step_at": 400u64,
+        "waiting_for_slot": 3,
+    });
+    let now = 1001; // 601 s since the last step, well past the stall threshold.
+    assert!(
+        watch::select_event(&view, None, now).is_none(),
+        "a queued build slot must never be reported as stalled"
+    );
+
+    // Without the admission wait the same idle is a stall.
+    view["waiting_for_slot"] = serde_json::json!(null);
+    let event = watch::select_event(&view, None, now).expect("idle with no wait is a stall");
+    assert_eq!(event["event"], "stalled");
+}
+
+/// Waiting for a build slot keeps the idle clock at zero, so granting the slot
+/// starts a fresh episode instead of a stall the moment admission succeeds.
+#[test]
+fn a_build_slot_wait_keeps_the_idle_clock_at_zero() {
+    let mut view = serde_json::json!({
+        "step": 1,
+        "revision": 0,
+        "last_step_at": 10u64,
+        "waiting_for_slot": 2,
+    });
+    let old = serde_json::json!({"step": 1, "revision": 0, "last_step_at": 10u64});
+    watch::progress_clock(&mut view, Some(&old), 5000);
+    assert_eq!(view["last_step_at"], serde_json::json!(5000));
+}
+
+/// The pool publishes a worker's queued build slot and clears it as soon as the
+/// wait ends, so the exposed state tracks admission exactly.
+#[tokio::test]
+async fn the_pool_exposes_then_clears_a_build_slot_wait() {
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(record(
+        "w-slot-pool",
+        "local",
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo build".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        None
+    );
+    let wait = pool.wait_for_build_slot("w-slot-pool", 4);
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        Some(4)
+    );
+    drop(wait);
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        None
+    );
+}
+
 #[test]
 fn torn_down_worker_diff_stat_comes_from_its_branch() {
     let dir = common::TempDir::new_in_tmp("watch-branch");

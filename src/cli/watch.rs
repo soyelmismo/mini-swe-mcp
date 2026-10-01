@@ -154,6 +154,11 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
 /// Decide from state and the last reported health baseline, without I/O.
 pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<Value> {
     let status = view["status"].as_str()?;
+    // A worker queued for a heavy build slot is not idle in the worker sense:
+    // the time is spent waiting on admission, so it can never be a stall.
+    if view["waiting_for_slot"].is_number() && matches!(status, "running" | "reviewing") {
+        return None;
+    }
     let metrics: WorkerMetrics =
         serde_json::from_value(view["metrics"].clone()).unwrap_or_default();
     let baseline: WorkerMetrics = previous
@@ -373,6 +378,13 @@ fn print_events_to(
 
 /// Update the progress clock only when the turn changes, not on health writes.
 pub fn progress_clock(view: &mut Value, old: Option<&Value>, now: u64) {
+    // Time queued for a heavy build slot is not inactivity: keep the worker's
+    // idle clock at zero while it waits, so granting the slot starts a fresh
+    // episode instead of an immediate stall.
+    if view["waiting_for_slot"].is_number() {
+        view["last_step_at"] = json!(now);
+        return;
+    }
     if let Some(old) = old {
         view["last_step_at"] = if old["step"] == view["step"] && old["revision"] == view["revision"]
         {

@@ -921,6 +921,8 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             view["turns"] = json!(progress.step);
             view["status"] = json!(phase_status(progress.phase));
             view["question"] = json!(progress.question);
+            // A queued build slot is shown as its own state, never as a stall.
+            view["waiting_for_slot"] = json!(progress.waiting_for_slot);
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];
