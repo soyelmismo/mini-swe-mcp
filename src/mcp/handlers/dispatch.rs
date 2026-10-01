@@ -70,6 +70,11 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
+        let store = self.auto_store();
+        let _round_dispatch = match store {
+            Some(store) => Some(store.dispatch_guard().await),
+            None => None,
+        };
         let tasks = args
             .get("tasks")
             .and_then(Value::as_array)
@@ -131,6 +136,13 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
+        let store = self.auto_store();
+        let _round_dispatch = match store {
+            Some(store) if args.get("role").and_then(Value::as_str) != Some("consolidate") => {
+                Some(store.dispatch_guard().await)
+            }
+            _ => None,
+        };
         let task = Self::required_string(args, "task", "dispatch")?.to_string();
         let agent = ctx.agent();
         // Fairness gate: one agent may not fill the pool, so its dispatches
@@ -192,6 +204,7 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        self.validate_auto_consolidate(args)?;
         let admission = self.admit_worker().await?;
         let wid = self
             .pool
@@ -211,6 +224,10 @@ impl McpServer {
             )
             .await?;
         drop(admission);
+
+        if role == crate::pool::WorkerRole::Worker {
+            self.record_auto_dispatch(args, &agent, &wid).await?;
+        }
 
         Self::emit_progress(
             tx,
@@ -246,6 +263,8 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
 
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.";
+
+pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str = "Auto-consolidate this owner's group once stopped; true uses strongest/default, string pins model. See help consolidate.";
 
 pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.";
 

@@ -174,6 +174,18 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static(super::handlers::dispatch::VERIFY_DESCRIPTION),
     ),
     (
+        "consolidate",
+        "boolean",
+        DescriptionSource::Static(super::handlers::dispatch::AUTO_CONSOLIDATE_DESCRIPTION),
+    ),
+    (
+        "consolidate_verify",
+        "string",
+        DescriptionSource::Static(
+            "Full gate for the automatic consolidator; omitted means auto-detect.",
+        ),
+    ),
+    (
         "scope",
         "string",
         DescriptionSource::Static("'list' scope: 'mine' (default) or 'all' (admin)."),
@@ -274,6 +286,9 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
             Value::String(LIST_SCOPES[0].to_string()),
         );
     }
+    if name == "consolidate" {
+        schema.insert("type".to_string(), json!(["boolean", "string"]));
+    }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));
         schema.insert(
@@ -298,6 +313,8 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     "repo_path": { "type": "string" },
                     "max_turns": { "type": "integer" },
                     "verify": { "type": "string" },
+                    "consolidate": { "type": ["boolean", "string"] },
+                    "consolidate_verify": { "type": "string" },
                     "group": { "type": "string" },
                     "network": { "type": "string" },
                 },
@@ -400,7 +417,12 @@ mod tests {
         assert_eq!(properties.len(), WORKER_PROPERTIES.len());
         for (name, json_type, _) in WORKER_PROPERTIES {
             let property = &properties[*name];
-            assert_eq!(property["type"], *json_type, "wrong type for '{name}'");
+            let expected = if *name == "consolidate" {
+                json!(["boolean", "string"])
+            } else {
+                json!(json_type)
+            };
+            assert_eq!(property["type"], expected, "wrong type for '{name}'");
             assert!(
                 property["description"]
                     .as_str()
@@ -525,7 +547,8 @@ mod tests {
     }
 
     /// Regression budget: this payload is context every MCP agent pays on
-    /// every session, so it must stay at least 40% below the pre-trim size.
+    /// every session. Retain the pre-trim reduction plus a 350-byte allowance
+    /// for the two automatic-consolidation properties and their batch entries.
     #[test]
     fn tools_list_stays_within_its_context_budget() {
         let tools_list = build_tools_list(&ModelManifest::default());
@@ -533,8 +556,8 @@ mod tests {
             .expect("tools/list serialises")
             .len();
         assert!(
-            bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
-            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload"
+            bytes <= TOOLS_LIST_BASELINE_BYTES * 6 / 10 + 350,
+            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload plus 350 bytes"
         );
     }
 

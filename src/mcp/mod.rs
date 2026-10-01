@@ -29,3 +29,5 @@ pub use schema::{LIST_SCOPE_ALL, LIST_SCOPES, NETWORK_DEFAULT, NETWORK_MODES, WO
 pub use server::{
     ANONYMOUS_AGENT_PREFIX, CLI_AGENT, CLI_CLIENT_NAME, ConnectionContext, LOCAL_AGENT, McpServer,
 };
+
+mod auto_consolidate;
