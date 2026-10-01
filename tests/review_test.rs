@@ -126,6 +126,7 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         started_at: 0,
         updated_at: 0,
         group: None,
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().into_owned()),
         owner: Some(OWNER.to_string()),
         metrics: WorkerMetrics::default(),

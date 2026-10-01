@@ -1276,6 +1276,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         started_at: 0,
         updated_at: 0,
         group: None,
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().to_string()),
         owner: Some("agent-a".to_string()),
         metrics: WorkerMetrics::default(),

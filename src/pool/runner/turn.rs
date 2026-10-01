@@ -32,15 +32,15 @@ use crate::worktree::{BaseSync, WorktreeGuard, git};
 use super::super::WorkerPool;
 use super::super::admission::AdmissionClass;
 use super::super::buffer::build_step_log;
-use super::super::registry::{RegistryStatus, WorkerMeta};
+use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::super::revision::{WorkerHistory, append_history_message_in};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
-    summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_request_turns, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -632,6 +632,41 @@ impl<'a> TurnEngine<'a> {
         let (output, code) = self
             .run_gated(&cmd_str, AdmissionClass::Exploratory)
             .await?;
+
+        // --- Consolidator merge request (harness side, never bash) ---
+        // The sandbox holds no git credentials, so the merge runs here, on the
+        // harness, through the same machinery the base sync uses. Only a
+        // consolidator sees this verb; an ordinary worker's identical command
+        // stays plain bash.
+        if self.meta.role == WorkerRole::Consolidate
+            && let Some(ids) = parse_consolidate_merge(&cmd_str)
+        {
+            let merged = self
+                .pool
+                .consolidate_merge(self.meta, self.worktree, &ids)
+                .await;
+            if merged.integrated {
+                // The branch now carries other workers' commits, so it must
+                // survive this guard's cleanup.
+                self.worktree.preserve_branch = true;
+            }
+            let observation = merged.observation;
+            let output_text = format!("{COMMAND_OUTPUT_PREFIX}0):\n```\n{observation}\n```");
+            let step_log = build_step_log(*self.step, &label, observation, Some(0));
+            {
+                let mut lock = self.pool.workers.write().await;
+                if let Some(w) = lock.get_mut(self.worker_id) {
+                    w.logs.push(step_log);
+                }
+            }
+            self.push_exchange(
+                llm_resp.content,
+                llm_resp.reasoning_content,
+                llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+                output_text,
+            );
+            return Ok(TurnOutcome::Continue);
+        }
 
         // --- Orchestrator control sentinels (implementer only) ---
         if config.apply_sentinels {
@@ -1312,6 +1347,7 @@ impl<'a> TurnEngine<'a> {
         WorkerHistory {
             task: config.task.to_string(),
             group: self.meta.group.clone(),
+            role: self.meta.role,
             model: config.model.to_string(),
             temperature: config.temperature,
             repo_path: self
