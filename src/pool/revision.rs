@@ -710,12 +710,8 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         // detect it and group by it. Detection is the same positive proof the
         // ancestry test itself is: it reads git, never assumes a branch name,
         // and a repository that cannot answer retires nothing.
-        let base = match entry.base_branch.clone().filter(|base| !base.is_empty()) {
-            Some(base) => base,
-            None => match detect_base_branch(repo) {
-                Some(base) if !base.is_empty() => base,
-                _ => continue,
-            },
+        let Some(base) = base_branch_proof(&entry, repo) else {
+            continue;
         };
         // A kept branch is a durable operator instruction, not a one-off pass:
         // leave the whole worker alone while its branch still lives.
@@ -795,6 +791,40 @@ fn refs_of(repo: &Path, args: &[&str]) -> Option<std::collections::HashSet<Strin
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// The base branch an ancestry proof may compare `worker-<id>` against.
+///
+/// A row that names its base needs no help: the branch it was dispatched
+/// against is the branch its work must have landed in. A row that names none --
+/// every row written before base-branch tracking, on the host and here alike --
+/// is answered from the worker's own history, which states the base it worked
+/// against. Both are per-worker facts, so neither the proof nor the group key
+/// can mix two workers' bases.
+///
+/// A row with neither (a history lost, or never written) names no base at all:
+/// the sweep has nothing positive to compare against and must keep the worker,
+/// which is the conservative rule the rest of this function follows. The
+/// repository's currently checked-out branch is *not* a substitute -- it moves
+/// with whoever dispatches next, so proving integration against it would retire
+/// a merged worker and an unintegrated one alike.
+fn base_branch_proof(entry: &super::WorkerRegistryEntry, repo: &Path) -> Option<String> {
+    if let Some(base) = entry
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        return Some(base.to_string());
+    }
+    // The worker's own history file, whose metadata line the orphan scan below
+    // reads the same way: a repository and a branch. Beside the worktree, not
+    // in the registry directory.
+    let Some(base) = repo.parent() else {
+        return None;
+    };
+    let read = read_orphan_owner(&base.join(format!("swe-wt-{}.history.json", entry.id)))?;
+    (read.branch != format!("worker-{}", entry.id)).then_some(read.branch)
 }
 
 /// The metadata line of a history file: the repository and branch its worker
