@@ -52,6 +52,9 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
+        // A worker leases build directories keyed by this repo's hash; they are
+        // filed next to the scratch base, so removing the repo has to take them.
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

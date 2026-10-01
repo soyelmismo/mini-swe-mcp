@@ -104,4 +104,26 @@ mod tests {
         let out = format_output("not-an-action", &v(r#"{"a":1}"#));
         assert_eq!(out, "{\n  \"a\": 1\n}");
     }
+    /// A review renders the approval, the bounded diff, the per-test-file case
+    /// counts and the docs, so the CLI shows what the payload carries.
+    #[test]
+    fn test_format_output_renders_review_approval_and_summaries() {
+        let out = format_output(
+            "review",
+            &v(r#"{"worker_id":"w","state":"Completed",
+                    "approved":{"at":1700000000,"note":"good"},
+                    "diff_scope":"code",
+                    "diff":"--- a/src/a.rs\n+++ b/src/a.rs\n+x",
+                    "test_files":[{"path":"tests/a_test.rs","added_cases":2,"removed_cases":1}],
+                    "docs":[{"path":"README.md","insertions":3,"deletions":1}]}"#),
+        );
+        for needle in [
+            "Approved: 1700000000 (good)",
+            "Diff (code):",
+            "tests/a_test.rs  +2 -1 cases",
+            "README.md  +3 -1",
+        ] {
+            assert!(out.contains(needle), "missing {needle}: {out}");
+        }
+    }
 }

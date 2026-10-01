@@ -78,6 +78,7 @@ fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEn
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     }
 }
 

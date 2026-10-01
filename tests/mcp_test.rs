@@ -1655,6 +1655,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     }
 }
 

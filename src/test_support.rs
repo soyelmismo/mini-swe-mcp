@@ -77,6 +77,7 @@ impl Drop for TestScratch {
         // the worktree's leaf name, so removing the worktree alone is not
         // enough. `remove_target_dirs` also tolerates a path that is absent.
         crate::worktree::remove_target_dirs(&self.path);
+        crate::cache::remove_build_dir_leases(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

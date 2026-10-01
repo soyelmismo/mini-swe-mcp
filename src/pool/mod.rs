@@ -58,8 +58,8 @@ pub use self::clock::unix_timestamp;
 pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
-    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole,
-    check_consolidate_delegation, extract_group, load_all_registry_entries,
+    RegistryStatus, UNATTRIBUTED_OWNER, WorkerApproval, WorkerMeta, WorkerRegistryEntry,
+    WorkerRole, check_consolidate_delegation, extract_group, load_all_registry_entries,
     load_all_registry_entries_in, load_registry_entries_read_only,
     load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in, registry_dir,
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
@@ -979,6 +979,11 @@ impl WorkerPool {
             {
                 let stats = w.log_stats();
                 seen.insert(w.id.clone());
+                // The approval lives on the registry row, not in the record:
+                // read it back so a completed worker reads the same here as
+                // after it is collected.
+                let approved =
+                    load_registry_entry_in(&self.scratch, &w.id).and_then(|e| e.approved);
                 rows.push(serde_json::json!({
                     "id": w.id,
                     "task": w.task,
@@ -988,6 +993,7 @@ impl WorkerPool {
                     "total_steps": stats.total_steps,
                     "logs_retained": stats.logs_retained,
                     "logs_dropped": stats.logs_dropped,
+                    "approved": approved,
                 }));
             }
         }
@@ -1012,6 +1018,7 @@ impl WorkerPool {
                     "started_at": e.started_at,
                 },
                 "total_steps": e.step,
+                "approved": e.approved,
                 // Registry rows are cross-process and carry no in-memory log
                 // buffer, so the retention counters are reported as 0/0 rather
                 // than being silently absent (audit 07, R7).
@@ -1048,6 +1055,58 @@ impl WorkerPool {
     /// it is the one place all three facts are current together.
     pub async fn worker_row(&self, id: &str) -> Option<WorkerRegistryEntry> {
         load_registry_entry_in(&self.scratch, id)
+    }
+
+    /// Record the orchestrator's approval of a completed worker.
+    ///
+    /// The verdict is written to the *registry row*, not the in-memory record:
+    /// that is what `collect` evicts, so the row is the only copy that survives
+    /// it. Only a completed worker may be approved — a running one has no
+    /// finished result to sign off and a new revision drops the approval.
+    pub async fn approve(&self, id: &str, note: Option<String>) -> anyhow::Result<WorkerApproval> {
+        let completed = match self.get_worker_state(id).await {
+            Some(state) => matches!(state, WorkerState::Completed { .. }),
+            None => load_registry_entry_in(&self.scratch, id)
+                .is_some_and(|entry| entry.status == RegistryStatus::Completed),
+        };
+        if !completed {
+            anyhow::bail!("worker {id} is not completed; only a completed worker can be approved");
+        }
+        let root = self.scratch.clone();
+        let id_owned = id.to_string();
+        let approval = WorkerApproval {
+            at: unix_timestamp(),
+            note,
+        };
+        let write = approval.clone();
+        let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let Some(mut entry) = load_registry_entry_in(&root, &id_owned) else {
+                anyhow::bail!("Worker not found: {id_owned}");
+            };
+            entry.approved = Some(write);
+            save_registry_entry_in(&root, &entry);
+            Ok(())
+        })
+        .await?;
+        saved?;
+        Ok(approval)
+    }
+
+    /// Drop a completed worker's approval, so it reads as unreviewed again.
+    pub async fn unapprove(&self, id: &str) -> anyhow::Result<()> {
+        let root = self.scratch.clone();
+        let id_owned = id.to_string();
+        let cleared = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let Some(mut entry) = load_registry_entry_in(&root, &id_owned) else {
+                anyhow::bail!("Worker not found: {id_owned}");
+            };
+            entry.approved = None;
+            save_registry_entry_in(&root, &entry);
+            Ok(())
+        })
+        .await?;
+        cleared?;
+        Ok(())
     }
 
     /// Whether `id` finished as `completed`, here or in the shared registry.
@@ -2224,6 +2283,7 @@ mod consolidate_delegation_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            approved: None,
         }
     }
 

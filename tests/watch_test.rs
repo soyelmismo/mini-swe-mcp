@@ -24,10 +24,9 @@ fn isolate_registry() -> PathBuf {
     REGISTRY
         .get_or_init(|| {
             // The directory must outlive the test that created it: the daemon
-            // keeps reading it for as long as the test binary runs.
-            let dir = common::TempDir::new_in_tmp("watch-registry");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
+            // keeps reading it for as long as the test binary runs, so it is
+            // removed at process exit rather than by a single test's guard.
+            let path = common::process_temp_dir("watch-registry");
             // SAFETY: `OnceLock` runs this closure exactly once and blocks every
             // other caller until it returns, so no thread observes a half-set
             // environment.
@@ -1284,6 +1283,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);
