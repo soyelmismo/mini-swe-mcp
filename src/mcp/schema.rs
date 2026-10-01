@@ -2,8 +2,7 @@
 //!
 //! Everything an MCP client sees in `tools/list` derives from the tables below,
 //! so the schema can never drift from what the dispatcher in
-//! [`crate::mcp::handlers`] actually implements. The optional consolidate role
-//! delegates integration within the dispatch group.
+//! [`crate::mcp::handlers`] actually implements.
 
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
@@ -16,8 +15,8 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "logs", "list", "kill", "reap", "manifest",
-    "prune",
+    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
+    "manifest", "prune",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -48,7 +47,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, identity, sandbox, env.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, identity, sandbox, env.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -70,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform. 'dispatch': spawn a subagent. 'status': check step and progress. 'steer': correct a completed worker or continue any stopped one (failed, interrupted, killed) on its own branch with full context; never dispatch a replacement. 'watch': block for an event (for shell-less agents; prefer `mini-swe-mcp watch` in the background). 'collect': final diff. 'logs': a live worker's step history. 'list': your workers. 'kill': terminate a worker. 'reap': evict expired terminal records. 'manifest': models catalog. 'prune': clean stale worktrees. Run `mini-swe-mcp help <topic>` for the details.",
+            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
         ),
     ),
     (
@@ -78,6 +77,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
+        ),
+    ),
+    (
+        "tasks",
+        "array",
+        DescriptionSource::Static(
+            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
@@ -102,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works, and the reply names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'logs', 'kill'.",
+            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'kill'.",
         ),
     ),
     (
@@ -114,20 +120,20 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own (running or paused).",
+            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only watch workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
     ),
     (
         "role",
@@ -140,7 +146,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely. Prefer `mini-swe-mcp watch` in the background.",
+            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely.",
         ),
     ),
     (
@@ -159,28 +165,38 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation, with a fresh context.",
+            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) is the calling agent's workers, 'all' is every agent's and needs the admin override.",
+            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
         ),
+    ),
+    (
+        "full",
+        "boolean",
+        DescriptionSource::Static("The whole diff. Optional for 'collect'."),
+    ),
+    (
+        "files",
+        "array",
+        DescriptionSource::Static("Paths whose diff to return. Optional for 'collect'."),
     ),
     (
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' runs every bash step in an isolated network namespace with no egress, 'allow' (default) keeps connectivity.",
+            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
         ),
     ),
 ];
@@ -244,8 +260,26 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "timeout_secs" {
         schema.insert("minimum".to_string(), Value::from(0));
     }
-    if name == "worker_ids" {
+    if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
+    }
+    if name == "tasks" {
+        schema.insert(
+            "items".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "model": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "max_turns": { "type": "integer" },
+                    "verify": { "type": "string" },
+                    "group": { "type": "string" },
+                    "network": { "type": "string" },
+                },
+                "required": ["task"],
+            }),
+        );
     }
     if name == "temperature" {
         schema.insert(
@@ -408,6 +442,34 @@ mod tests {
         );
     }
 
+    /// Batch dispatch is advertised: `tasks` is an array of task objects, each
+    /// requiring `task`, and it stays optional like every other dispatch
+    /// property.
+    #[test]
+    fn tasks_property_advertises_the_batch_contract() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let tasks = &schema["properties"]["tasks"];
+
+        assert_eq!(tasks["type"], json!("array"));
+        assert_eq!(tasks["items"]["type"], json!("object"));
+        assert_eq!(tasks["items"]["required"], json!(["task"]));
+        for key in [
+            "task",
+            "model",
+            "repo_path",
+            "max_turns",
+            "verify",
+            "group",
+            "network",
+        ] {
+            assert!(
+                tasks["items"]["properties"].get(key).is_some(),
+                "the items schema must document '{key}': {tasks}"
+            );
+        }
+    }
+
     /// The tool description stays a calling contract: the waiting rule, the
     /// ownership rule, and a one-line pointer to the long-form topics.
     #[test]
@@ -463,5 +525,6 @@ mod tests {
 
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
+        assert!(text.contains("never dispatch a replacement"), "{text}");
     }
 }

@@ -930,11 +930,6 @@ impl WorkerPool {
     /// the row is written at dispatch and rewritten on every status change, so
     /// it is the one place all three facts are current together.
     pub async fn worker_row(&self, id: &str) -> Option<WorkerRegistryEntry> {
-        if self.workers.read().await.contains_key(id)
-            && let Some(entry) = load_registry_entry_in(&self.scratch, id)
-        {
-            return Some(entry);
-        }
         load_registry_entry_in(&self.scratch, id)
     }
 

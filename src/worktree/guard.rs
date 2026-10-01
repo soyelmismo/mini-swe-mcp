@@ -3,7 +3,7 @@
 //! and reclaim it on `Drop`.
 //!
 //! Both harness-mediated integrations go through
-//! [`WorktreeGuard::sync_branch_at`]: the pre-completion base sync and a
+//! [`WorktreeGuard::merge_reference_at`]: the pre-completion base sync and a
 //! consolidator's `CONSOLIDATE_MERGE` of a finished worker's branch.
 //!
 //! Lease bookkeeping (writing the `.pid` marker) and the sweep that consumes

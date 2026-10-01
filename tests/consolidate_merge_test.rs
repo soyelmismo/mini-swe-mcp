@@ -264,7 +264,7 @@ fn a_worker_that_is_not_completed_is_refused() {
 
     let meta = h.consolidator_meta(&consolidator);
     let guard = h.consolidator_worktree(&consolidator);
-    let result = merge(&h.pool.pool, &meta, &guard, &[running.clone()]);
+    let result = merge(&h.pool.pool, &meta, &guard, std::slice::from_ref(&running));
 
     assert!(
         line(&result.observation, &running).contains("not completed"),
@@ -288,7 +288,7 @@ fn another_consolidator_of_the_same_group_is_refused() {
 
     let meta = h.consolidator_meta(&consolidator);
     let guard = h.consolidator_worktree(&consolidator);
-    let result = merge(&h.pool.pool, &meta, &guard, &[other.clone()]);
+    let result = merge(&h.pool.pool, &meta, &guard, std::slice::from_ref(&other));
 
     let refused = line(&result.observation, &other);
     assert!(refused.contains("consolidator"), "{refused}");

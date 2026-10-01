@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate)";
+pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
@@ -33,15 +33,33 @@ pub fn tool_args(
                     "Missing OPENAI_API_KEY. Please provide it via environment variable or .env file."
                 );
             }
-            if cli_args.len() < 3 {
-                eprintln!("Usage: mini-swe-mcp {DISPATCH_USAGE}");
-                return Ok(None);
+            match batch_tasks(cli_args)? {
+                Some((file_index, tasks)) => {
+                    tool_args.insert("tasks".into(), tasks);
+                    // Flags after the file are shared defaults for every entry;
+                    // the file flag and its path are skipped, never parsed.
+                    collect_dispatch_flags(
+                        cli_args,
+                        3,
+                        &[file_index, file_index + 1],
+                        &mut tool_args,
+                    );
+                }
+                None => {
+                    if cli_args.len() < 3 {
+                        eprintln!("Usage: mini-swe-mcp {DISPATCH_USAGE}");
+                        return Ok(None);
+                    }
+                    dispatch_args(cli_args, &mut tool_args)?;
+                }
             }
-            dispatch_args(cli_args, &mut tool_args)?;
         }
-        "status" | "collect" | "logs" | "kill" => {
+        "status" | "collect" | "logs" | "kill" | "review" => {
             if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
+            }
+            if action == "collect" {
+                collect_diff_args(cli_args, &mut tool_args);
             }
         }
         "steer" => {
@@ -84,14 +102,56 @@ pub fn tool_args(
     Ok(Some(tool_args))
 }
 
+/// Fold the `collect` diff selectors into the tool arguments.
+///
+/// `--full` asks for the whole diff and `--file <path>` (repeatable) narrows it
+/// to the named files: the same tool arguments the MCP path sends, so the diff
+/// scope has exactly one implementation.
+fn collect_diff_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
+    if cli_args.iter().any(|arg| arg == "--full") {
+        tool_args.insert("full".into(), Value::Bool(true));
+    }
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < cli_args.len() {
+        if cli_args[i] == "--file" && i + 1 < cli_args.len() {
+            files.push(Value::String(cli_args[i + 1].clone()));
+            i += 1;
+        }
+        i += 1;
+    }
+    if !files.is_empty() {
+        tool_args.insert("files".into(), Value::Array(files));
+    }
+}
+
 /// Fold the `dispatch` flags after the task into the tool arguments.
 ///
 /// A value flag consumes the next word verbatim; one with nothing after it is
 /// dropped rather than defaulted to an empty string.
 fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Result<()> {
     tool_args.insert("task".into(), Value::String(cli_args[2].clone()));
-    let mut i = 3;
+    collect_dispatch_flags(cli_args, 3, &[], tool_args);
+    Ok(())
+}
+
+/// Fold the `dispatch` flags from `start` on into the tool arguments.
+///
+/// The flag table lives here once, so the single-task and batch forms cannot
+/// drift apart. Positions in `skip` are left alone: batch dispatch uses it for
+/// the `-f <file>` flag and its path, so neither is parsed as a flag or a task.
+fn collect_dispatch_flags(
+    cli_args: &[String],
+    start: usize,
+    skip: &[usize],
+    tool_args: &mut Map<String, Value>,
+) {
+    let mut i = start;
     while i < cli_args.len() {
+        if skip.contains(&i) {
+            i += 1;
+            continue;
+        }
         match cli_args[i].as_str() {
             "--model" | "-m" => take_value(cli_args, &mut i, tool_args, "model"),
             "--review-after" => take_value(cli_args, &mut i, tool_args, "review_after"),
@@ -107,12 +167,51 @@ fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Res
                 tool_args.insert("network".into(), Value::String("offline".into()));
             }
             "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
+            // `--role <role>` selects the dispatch authority: the default
+            // worker, or the round's consolidator.
             "--role" => take_value(cli_args, &mut i, tool_args, "role"),
             _ => {}
         }
         i += 1;
     }
-    Ok(())
+}
+
+/// Read the batch list named by `-f`/`--file`, returning the flag's position
+/// and the parsed `tasks` array. `Ok(None)` means the flag was not passed.
+///
+/// `-` reads standard input, so `mini-swe-mcp dispatch -f - < tasks.yaml` works.
+fn batch_tasks(cli_args: &[String]) -> Result<Option<(usize, Value)>> {
+    let Some(index) = flag_index(cli_args, &["-f", "--file"]) else {
+        return Ok(None);
+    };
+    let path = cli_args.get(index + 1).ok_or_else(|| {
+        anyhow::anyhow!("-f/--file needs a path (use '-' to read the list from stdin)")
+    })?;
+    let text = if path == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .map_err(|e| anyhow::anyhow!("could not read the task list from stdin: {e}"))?;
+        text
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read the task list {path}: {e}"))?
+    };
+    Ok(Some((index, parse_batch_tasks(&text)?)))
+}
+
+/// Parse a YAML or JSON task list into the `tasks` array of the `worker` tool.
+///
+/// YAML is a superset of JSON, so one parser reads both spellings.
+pub fn parse_batch_tasks(text: &str) -> Result<Value> {
+    let value: Value = serde_yaml::from_str(text)
+        .map_err(|e| anyhow::anyhow!("task list is not valid YAML or JSON: {e}"))?;
+    let Value::Array(tasks) = value else {
+        anyhow::bail!("task list must be a YAML or JSON list of task objects");
+    };
+    if tasks.is_empty() {
+        anyhow::bail!("task list must contain at least one task");
+    }
+    Ok(Value::Array(tasks))
 }
 
 /// Position of the first of `flags` in `cli_args`, if the operator passed one.
@@ -193,6 +292,7 @@ pub fn action_of(cli_args: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -262,6 +362,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.len(), 1);
+    }
+
+    /// `review <id>` is a read like `status`: one positional, no flags.
+    #[test]
+    fn test_review_maps_its_positional_worker_id() {
+        let out = tool_args("review", &args(&["mini-swe-mcp", "review", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["action"], "review");
+        assert_eq!(out["worker_id"], "w1");
+    }
+
+    /// `--full` and `--file` are the CLI spelling of the `collect` tool
+    /// arguments, so the diff scope has exactly one implementation.
+    #[test]
+    fn test_collect_flags_map_to_the_diff_scope_arguments() {
+        let plain = tool_args("collect", &args(&["mini-swe-mcp", "collect", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert!(!plain.contains_key("full"), "{plain:?}");
+        assert!(!plain.contains_key("files"), "{plain:?}");
+
+        let full = tool_args(
+            "collect",
+            &args(&["mini-swe-mcp", "collect", "w1", "--full"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(full["full"], true);
+
+        let files = tool_args(
+            "collect",
+            &args(&[
+                "mini-swe-mcp",
+                "collect",
+                "w1",
+                "--file",
+                "src/a.rs",
+                "--file",
+                "b.rs",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(files["files"], json!(["src/a.rs", "b.rs"]));
     }
 
     #[test]
@@ -473,5 +620,92 @@ mod tests {
         let mut tool_args = Map::new();
         dispatch_args(&trailing, &mut tool_args).expect("valid flags");
         assert_eq!(tool_args.len(), 1, "{tool_args:?}");
+    }
+
+    /// `dispatch -f <file>` turns the file's YAML list into the tool's `tasks`
+    /// argument and leaves the single-task positional form untouched.
+    #[test]
+    fn test_dispatch_file_flag_builds_the_tasks_argument() {
+        let dir = std::env::temp_dir().join(format!("mini-swe-batch-yaml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("tasks.yaml");
+        std::fs::write(
+            &path,
+            "- task: first\n  model: ninja\n- task: second\n  network: offline\n",
+        )
+        .expect("write batch file");
+
+        let argv = args(&[
+            "mini-swe-mcp",
+            "dispatch",
+            "-f",
+            path.to_str().expect("utf8"),
+        ]);
+        let out = tool_args("dispatch", &argv, true).unwrap().unwrap();
+        assert_eq!(out["action"], "dispatch");
+        assert!(
+            !out.contains_key("task"),
+            "the batch form sets no positional task: {out:?}"
+        );
+        let tasks = out["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["task"], "first");
+        assert_eq!(tasks[0]["model"], "ninja");
+        assert_eq!(tasks[1]["task"], "second");
+        assert_eq!(tasks[1]["network"], "offline");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A JSON list is the same batch, and dispatch flags after the file are
+    /// shared top-level defaults the file's own keys override.
+    #[test]
+    fn test_dispatch_file_flag_accepts_json_and_shared_defaults() {
+        let dir = std::env::temp_dir().join(format!("mini-swe-batch-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("tasks.json");
+        std::fs::write(&path, r#"[{"task":"a"},{"task":"b","network":"allow"}]"#)
+            .expect("write batch file");
+
+        let argv = args(&[
+            "mini-swe-mcp",
+            "dispatch",
+            "-f",
+            path.to_str().expect("utf8"),
+            "--model",
+            "nerd",
+            "--offline",
+        ]);
+        let out = tool_args("dispatch", &argv, true).unwrap().unwrap();
+        assert_eq!(
+            out["model"], "nerd",
+            "top-level flags are shared defaults: {out:?}"
+        );
+        assert_eq!(out["network"], "offline");
+        let tasks = out["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["task"], "a");
+        assert_eq!(tasks[1]["network"], "allow");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing file, a non-list document and an empty list are hard errors,
+    /// never a silent empty dispatch.
+    #[test]
+    fn test_dispatch_file_flag_rejects_bad_lists() {
+        assert!(parse_batch_tasks("task: only-one\n").is_err());
+        assert!(parse_batch_tasks("[]").is_err());
+        assert!(parse_batch_tasks("not: [valid").is_err());
+
+        let missing = tool_args(
+            "dispatch",
+            &args(&["mini-swe-mcp", "dispatch", "-f", "/nonexistent/tasks.yaml"]),
+            true,
+        );
+        assert!(missing.is_err());
+
+        let no_value = tool_args("dispatch", &args(&["mini-swe-mcp", "dispatch", "-f"]), true);
+        assert!(no_value.is_err());
     }
 }
