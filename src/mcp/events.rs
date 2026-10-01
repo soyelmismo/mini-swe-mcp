@@ -1752,3 +1752,5 @@ mod registry_verified_tests {
 }
 #[cfg(test)]
 mod event_dedup_tests;
+#[cfg(test)]
+mod watch_round_slot_tests;
