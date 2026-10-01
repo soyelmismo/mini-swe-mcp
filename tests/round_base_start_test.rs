@@ -67,9 +67,21 @@ async fn revision_start_does_not_integrate_the_moving_master_tip() {
         report: None,
         verified: None,
     };
-    let mut target = actor.clone();
-    target.id = "pinned".into();
-    target.role = mini_swe_mcp::pool::WorkerRole::Worker;
+    let target = WorkerMeta {
+        id: "pinned".into(),
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
+        task: "integrate".into(),
+        group: Some("round".into()),
+        repo_path: Some(history.repo_path.clone()),
+        owner: "owner".into(),
+        started_at: 0,
+        pid: std::process::id(),
+        revision: 0,
+        auto_continues: 0,
+        metrics: WorkerMetrics::default(),
+        report: None,
+        verified: None,
+    };
     mini_swe_mcp::pool::save_registry_entry_in(
         &root,
         &target.entry(
@@ -85,7 +97,7 @@ async fn revision_start_does_not_integrate_the_moving_master_tip() {
     let observation = pool
         .consolidate_steer(&actor, "pinned", "continue".into())
         .await;
-    assert!(observation.contains("revising"), "{observation}");
+    assert!(observation.contains("continuing"), "{observation}");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(
