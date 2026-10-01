@@ -59,8 +59,14 @@ fn scratch_dir() -> PathBuf {
 
 /// A server backed by a pool that answers handshake verbs without an LLM.
 fn server() -> Arc<McpServer> {
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let _scratch = common::TempDir::new_in_tmp("iso-session-1");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    )
+    .with_manifest(Arc::new(ModelManifest::default()));
     Arc::new(McpServer::new(pool, "test-model".to_string()))
 }
 

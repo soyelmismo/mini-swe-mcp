@@ -273,6 +273,30 @@ fn build_dir_repo(path: &Path) -> Option<&str> {
     .then_some(repo)
 }
 
+/// Directories left by the retired pool naming `swe-target-<repo-key>-slot<k>`.
+/// No worker leases them any more, so the sweep reclaims an idle one at once.
+fn is_legacy_slot_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(name) = name.strip_prefix("swe-target-") else {
+        return false;
+    };
+    let Some((repo, slot)) = name.split_once("-slot") else {
+        return false;
+    };
+    repo.len() == 16
+        && repo.bytes().all(|b| b.is_ascii_hexdigit())
+        && !slot.is_empty()
+        && slot.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A build directory the sweep may reclaim: a leased pool dir or a legacy slot
+/// dir.
+fn is_sweepable_dir(path: &Path) -> bool {
+    build_dir_repo(path).is_some() || is_legacy_slot_dir(path)
+}
+
 #[derive(Debug, Clone)]
 struct TargetEntry {
     dir: PathBuf,
@@ -282,7 +306,8 @@ struct TargetEntry {
 }
 
 /// TTL is repository-wide; the size cap evicts idle dirs in deterministic LRU
-/// order. Active bytes count toward the cap but can never be evicted.
+/// order. Active bytes count toward the cap but can never be evicted. A legacy
+/// slot dir is never leased again, so an idle one goes regardless of the TTL.
 fn target_evictions(
     entries: &[TargetEntry],
     now: std::time::SystemTime,
@@ -300,16 +325,25 @@ fn target_evictions(
             }
         }
     }
-    let mut ordered: Vec<_> = entries.iter().filter(|e| e.idle).collect();
+    let mut total = entries
+        .iter()
+        .fold(0u64, |sum, e| sum.saturating_add(e.size));
+    let mut removed = Vec::new();
+    for entry in entries {
+        if entry.idle && is_legacy_slot_dir(&entry.dir) {
+            removed.push(entry.dir.clone());
+            total = total.saturating_sub(entry.size);
+        }
+    }
+    let mut ordered: Vec<_> = entries
+        .iter()
+        .filter(|e| e.idle && !is_legacy_slot_dir(&e.dir))
+        .collect();
     ordered.sort_by(|a, b| {
         a.last_used
             .cmp(&b.last_used)
             .then_with(|| a.dir.cmp(&b.dir))
     });
-    let mut total = entries
-        .iter()
-        .fold(0u64, |sum, e| sum.saturating_add(e.size));
-    let mut removed = Vec::new();
     for entry in &ordered {
         let expired = build_dir_repo(&entry.dir)
             .and_then(|repo| latest.get(repo))
@@ -458,7 +492,7 @@ fn sweep_targets(base: &Path, ttl: std::time::Duration, max_bytes: u64) -> std::
     let mut entries = Vec::new();
     let mut idle_leases = Vec::new();
     for dir in std::fs::read_dir(base)?.flatten() {
-        if !dir.file_type()?.is_dir() || build_dir_repo(&dir.path()).is_none() {
+        if !dir.file_type()?.is_dir() || !is_sweepable_dir(&dir.path()) {
             continue;
         }
         let path = dir.path();
@@ -702,6 +736,43 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(base);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_evicts_legacy_slot_dirs_regardless_of_ttl() {
+        let base = crate::worktree::swe_base_dir()
+            .join(format!("swe-legacy-slot-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let key = "0123456789abcdef";
+        let legacy = base.join(format!("swe-target-{key}-slot3"));
+        let current = base.join(format!("swe-target-{key}-0"));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(legacy.join("artifact"), b"stale").unwrap();
+        std::fs::write(current.join("artifact"), b"warm").unwrap();
+        assert!(is_legacy_slot_dir(&legacy) && !is_legacy_slot_dir(&current));
+        assert!(is_sweepable_dir(&legacy) && is_sweepable_dir(&current));
+        // Hold the current dir's lease so the sweep must keep it even under a
+        // cap of zero bytes.
+        let lease = lock_file(&build_dir_lock_path(&current)).unwrap();
+        flock(&lease, true, true).unwrap();
+        sweep_targets(&base, std::time::Duration::from_secs(24 * 3600), 0).unwrap();
+        assert!(
+            !legacy.exists(),
+            "A legacy slot dir must be evicted without waiting for the TTL"
+        );
+        assert!(
+            current.join("artifact").exists(),
+            "A leased current dir must be kept"
+        );
+        drop(lease);
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        assert!(
+            !current.exists(),
+            "A released current dir must still follow the usual rules"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

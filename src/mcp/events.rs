@@ -555,7 +555,7 @@ pub(super) async fn spawn_hub_events(
 /// here too instead of taking the loop down.
 async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapshot {
     let mut current = WorkerSnapshot::new();
-    for entry in crate::pool::load_all_registry_entries() {
+    for entry in crate::pool::load_all_registry_entries_in(pool.scratch_root()) {
         current.insert(entry.id.clone(), registry_view(&entry));
     }
 
@@ -901,10 +901,11 @@ struct WatchHistory {
 async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     use crate::cli::watch::{enrich_state, registry_snapshot};
     let now = crate::pool::unix_timestamp();
-    let mut views: crate::cli::watch::Snapshot = crate::pool::load_all_registry_entries()
-        .iter()
-        .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
-        .collect();
+    let mut views: crate::cli::watch::Snapshot =
+        crate::pool::load_all_registry_entries_in(pool.scratch_root())
+            .iter()
+            .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
+            .collect();
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
             continue;
