@@ -365,6 +365,7 @@ impl McpServer {
                 review_after,
                 network_offline,
                 verify,
+                ctx.client_env.clone(),
             )
             .await?;
         drop(admission);

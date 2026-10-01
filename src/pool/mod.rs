@@ -314,6 +314,11 @@ impl WorkerPool {
     /// The owner is the agent identity of the connection that dispatched it
     /// and is recorded on both the in-memory record and the registry row, so
     /// ownership survives a process restart (H-3).
+    ///
+    /// `client_env` is the dispatcher's ambient environment, already filtered
+    /// by the sandbox's secret filter: it is layered on top of the canonical
+    /// sandbox environment by the differential verify gate, so a suite that
+    /// only passes in the orchestrator's shell is caught by the worker itself.
     #[allow(clippy::too_many_arguments)]
     pub async fn dispatch(
         &self,
@@ -327,6 +332,7 @@ impl WorkerPool {
         review_after: Option<String>,
         network_offline: bool,
         verify: Option<String>,
+        client_env: Vec<(String, String)>,
     ) -> Result<String> {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
@@ -415,6 +421,7 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            client_env,
             resume_messages: None,
             resume_base_commit: None,
             resume_base_branch: None,

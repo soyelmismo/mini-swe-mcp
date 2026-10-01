@@ -104,6 +104,11 @@ pub struct ConnectionContext {
     /// `watch_command` that binds a shell to this identity. `None` for the
     /// in-process stdio server, which has no hub directory to keep tokens in.
     pub watch_tokens: Option<Arc<WatchTokens>>,
+    /// The dispatcher's ambient environment, filtered by the sandbox's secret
+    /// filter on the client and again here. It is what the differential verify
+    /// gate layers on top of the canonical sandbox environment, so a suite that
+    /// only passes in the orchestrator's shell is caught by the worker itself.
+    pub client_env: Vec<(String, String)>,
 }
 
 impl ConnectionContext {
@@ -122,6 +127,7 @@ impl ConnectionContext {
             version: None,
             cwd: None,
             watch_tokens: None,
+            client_env: Vec::new(),
         }
     }
 
@@ -140,6 +146,7 @@ impl ConnectionContext {
             version: None,
             cwd: None,
             watch_tokens: None,
+            client_env: Vec::new(),
         }
     }
 
@@ -237,11 +244,15 @@ impl McpServer {
         let reaper = crate::pool::spawn_reaper((*self.pool).clone());
 
         info!("Mini-SWE-MCP server listening on stdio");
+        // The stdio transport has no `hub/hello` handshake, so the ambient
+        // snapshot is taken here, from this process, with the same filter.
+        let mut stdio_ctx = ConnectionContext::stdio();
+        stdio_ctx.client_env = crate::agent::env::ambient_environment_snapshot();
         let served = self
             .serve_connection(
                 BufReader::new(tokio::io::stdin()),
                 tokio::io::stdout(),
-                ConnectionContext::stdio(),
+                stdio_ctx,
             )
             .await;
         reaper.abort();
@@ -347,6 +358,12 @@ impl McpServer {
                         .as_str()
                         .map(std::path::PathBuf::from)
                         .filter(|cwd| cwd.is_absolute());
+                    // The dispatcher's ambient environment, re-filtered here:
+                    // the client already dropped credential-bearing names, and
+                    // the daemon never trusts a handshake to have done it.
+                    ctx.client_env = crate::hub::client::decode_ambient_env(
+                        params.get("ambient_env").unwrap_or(&Value::Null),
+                    );
                 } else if req.method == "initialize" {
                     ctx.client_name = req
                         .params

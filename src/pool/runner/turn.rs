@@ -300,6 +300,11 @@ pub(super) struct TurnEngine<'a> {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<&'a str>,
+    /// The dispatcher's ambient environment, filtered by the sandbox's secret
+    /// filter. Layered on top of the canonical sandbox environment for the
+    /// differential verify run, so a suite that only passes in the
+    /// orchestrator's shell is caught by the worker itself.
+    pub client_env: &'a [(String, String)],
     /// The budget the dispatch was given, the base the self-grant cap is
     /// measured from (`current_max_turns` moves as the worker extends it).
     pub dispatch_max_turns: usize,
