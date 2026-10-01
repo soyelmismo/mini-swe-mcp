@@ -83,9 +83,9 @@ pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
-    WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
-    parse_request_turns, parse_wait_job, summarize_command,
+    WorkerLaunchConfig, is_completion_request, opening_task_message, parse_ask_orchestrator,
+    parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
+    parse_report, parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
