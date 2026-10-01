@@ -1617,23 +1617,16 @@ impl EventRouter {
             .filter(|v| crate::cli::watch::matches(v, ids, group))
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
-        for (agent, history) in &mut self.watch_history {
-            if !ctx.is_admin() && *agent != owner {
-                continue;
-            }
-            history.pending.retain(|v| {
-                v["worker_id"]
-                    .as_str()
-                    .is_none_or(|id| !selected.contains(id))
-            });
-        }
-        for id in &selected {
-            if let Some(sequence) = self
-                .watch_reported
-                .get(id)
-                .and_then(|v| v["sequence"].as_u64())
+        for id in selected {
+            if let Some(agent) = self
+                .watch_current
+                .get(&id)
+                .and_then(|v| v["owner"].as_str())
+                .map(str::to_string)
+                && (ctx.is_admin() || agent == owner)
             {
-                self.seen.insert(id.clone(), sequence);
+                // Round delivery is an acknowledgment too, including after restart.
+                self.mark_seen(&agent, &id);
             }
         }
     }
