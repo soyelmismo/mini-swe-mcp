@@ -59,7 +59,11 @@ impl Fixture {
     fn worker_branch(&self, id: &str) {
         let branch = format!("worker-{id}");
         git(self.repo(), &["checkout", "-q", "-b", &branch]);
-        write(self.repo(), &format!("{id}.txt"), &format!("work by {id}\n"));
+        write(
+            self.repo(),
+            &format!("{id}.txt"),
+            &format!("work by {id}\n"),
+        );
         git(self.repo(), &["add", "."]);
         git(self.repo(), &["commit", "-m", &format!("worker {id}")]);
         git(self.repo(), &["checkout", "-q", "main"]);
@@ -143,7 +147,8 @@ impl Fixture {
     }
 
     fn history_exists(&self, id: &str) -> bool {
-        self.scratch_file(&format!("swe-wt-{id}.history.jsonl")).exists()
+        self.scratch_file(&format!("swe-wt-{id}.history.jsonl"))
+            .exists()
     }
 
     fn row_exists(&self, id: &str) -> bool {
@@ -263,7 +268,10 @@ async fn discard_removes_the_round_base_from_every_swept_directory() {
     // A second base directory, the one `ScratchRoot::from_env` sweeps
     // alongside its own: a `.round-base` written there must still go.
     let extra = TempDir::new_in_tmp("discard-round-base-extra");
-    let root = ScratchRoot::from_dirs(&[f.pool.scratch.path().to_path_buf(), extra.path().to_path_buf()]);
+    let root = ScratchRoot::from_dirs(&[
+        f.pool.scratch.path().to_path_buf(),
+        extra.path().to_path_buf(),
+    ]);
     write(extra.path(), "swe-wt-cons2.round-base", "def456\n");
     assert!(extra.path().join("swe-wt-cons2.round-base").exists());
 

@@ -259,8 +259,7 @@ impl McpServer {
         if matches!(
             action,
             "status" | "logs" | "collect" | "kill" | "discard" | "steer"
-        )
-            && result.is_ok()
+        ) && result.is_ok()
             && let Ok(wid) = Self::get_worker_id(args, action)
         {
             self.hub_events.lock().await.mark_seen(&ctx.agent(), wid);

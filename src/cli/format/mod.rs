@@ -27,9 +27,9 @@ mod worker;
 
 pub use self::catalog::{format_list, format_manifest, format_prune};
 pub use self::worker::{
-    format_collect, format_consolidate, format_discard, format_dispatch,
-    format_dispatch_quiet, format_kill, format_logs, format_merge, format_reap, format_review,
-    format_status, format_steer, health_line, log_counters_line,
+    format_collect, format_consolidate, format_discard, format_dispatch, format_dispatch_quiet,
+    format_kill, format_logs, format_merge, format_reap, format_review, format_status,
+    format_steer, health_line, log_counters_line,
 };
 
 /// Render `val` for `action`, falling back to pretty JSON for actions with no

@@ -52,9 +52,11 @@ impl McpServer {
                 &crate::pool::RetireContext {
                     repo: repo.as_deref(),
                     // The persisted watch acknowledgements live in the hub
-                    // directory, which only the hub daemon knows; the daemon's
-                    // own sweep passes it, and `retire_and_forget` below drops
-                    // the in-memory half from the router either way.
+                    // directory, which only the hub daemon knows, and
+                    // `retire_and_forget` below drops them through the event
+                    // router instead: the router owns that file whenever it
+                    // exists and rewrites it on the spot, so the file and its
+                    // memory can never disagree.
                     ack_dir: None,
                     keep_branch: false,
                 },
@@ -65,7 +67,8 @@ impl McpServer {
         // Its files are gone, so its live record, its event replay state and its
         // acknowledged watch positions go with them: `list` stops showing it and
         // a retired worker can never fire an event again.
-        self.retire_and_forget(std::iter::once(wid.to_string())).await;
+        self.retire_and_forget(std::iter::once(wid.to_string()))
+            .await;
         Ok(json!({
             "worker_id": wid,
             "discarded": true,
