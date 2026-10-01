@@ -90,21 +90,17 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "task",
         "string",
-        DescriptionSource::Static("ONE focused concern: files in scope and the acceptance gate."),
+        DescriptionSource::Static(super::handlers::dispatch::TASK_DESCRIPTION),
     ),
     (
         "tasks",
         "array",
-        DescriptionSource::Static(
-            "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
-        ),
+        DescriptionSource::Static(super::handlers::dispatch::TASKS_DESCRIPTION),
     ),
     (
         "repo_path",
         "string",
-        DescriptionSource::Static(
-            "Absolute repository root (alias: 'path'). Required for 'dispatch'.",
-        ),
+        DescriptionSource::Static(super::handlers::dispatch::REPO_PATH_DESCRIPTION),
     ),
     (
         "path",
@@ -120,9 +116,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "worker_id",
         "string",
-        DescriptionSource::Static(
-            "Target worker (alias 'id'): a unique 3+ char prefix or 'last'; required for verbs that target one.",
-        ),
+        DescriptionSource::Static(super::handlers::status_list::WORKER_ID_DESCRIPTION),
     ),
     (
         "id",
@@ -132,44 +126,32 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "message",
         "string",
-        DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
-        ),
+        DescriptionSource::Static(super::handlers::steer::MESSAGE_DESCRIPTION),
     ),
     (
         "worker_ids",
         "array",
-        DescriptionSource::Static(
-            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
-        ),
+        DescriptionSource::Static(super::handlers::watch::WORKER_IDS_DESCRIPTION),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static(
-            "Only workers of this group. For 'watch' and 'merge --approved'.",
-        ),
+        DescriptionSource::Static(super::handlers::watch::GROUP_DESCRIPTION),
     ),
     (
         "role",
         "string",
-        DescriptionSource::Static(
-            "'consolidate': integrate this group's completed workers (requires 'group')",
-        ),
+        DescriptionSource::Static(super::handlers::consolidate::ROLE_DESCRIPTION),
     ),
     (
         "timeout_secs",
         "integer",
-        DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
-        ),
+        DescriptionSource::Static(super::handlers::watch::TIMEOUT_SECS_DESCRIPTION),
     ),
     (
         "max_turns",
         "integer",
-        DescriptionSource::Static(
-            "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.",
-        ),
+        DescriptionSource::Static(super::handlers::steer::MAX_TURNS_DESCRIPTION),
     ),
     (
         "temperature",
@@ -179,16 +161,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "review_after",
         "string",
-        DescriptionSource::Static(
-            "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
-        ),
+        DescriptionSource::Static(super::handlers::dispatch::REVIEW_AFTER_DESCRIPTION),
     ),
     (
         "verify",
         "string",
-        DescriptionSource::Static(
-            "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
-        ),
+        DescriptionSource::Static(super::handlers::dispatch::VERIFY_DESCRIPTION),
     ),
     (
         "scope",
@@ -208,16 +186,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "diff",
         "string",
-        DescriptionSource::Static(
-            "Diff scope for 'review': 'code' (default) hides tests, 'all' shows everything, 'none' hides it.",
-        ),
+        DescriptionSource::Static(super::handlers::review::DIFF_DESCRIPTION),
     ),
     (
         "network",
         "string",
-        DescriptionSource::Static(
-            "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.",
-        ),
+        DescriptionSource::Static(super::handlers::dispatch::NETWORK_DESCRIPTION),
     ),
     (
         "approved",
@@ -587,3 +561,7 @@ mod tests {
         assert!(REVIEW_DIFF_SCOPES.contains(&"none"));
     }
 }
+
+#[cfg(test)]
+#[path = "schema/snapshot_tests.rs"]
+mod snapshot_tests;
