@@ -131,7 +131,9 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "group",
         "string",
-        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static(
+            "Only workers of this group. Optional for 'watch' and 'merge --approved'.",
+        ),
     ),
     (
         "role",
@@ -195,6 +197,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
+        ),
+    ),
+    (
+        "approved",
+        "boolean",
+        DescriptionSource::Static(
+            "Merge every approved worker of the caller (optionally narrowed by 'group') with one              verify gate on the combined result. Optional for 'merge'.",
         ),
     ),
     (

@@ -58,7 +58,9 @@ pub fn tool_args(
             if action == "merge" && flag_index(cli_args, &["--approved"]).is_some() {
                 tool_args.insert("approved".into(), Value::Bool(true));
                 if let Some(i) = flag_index(cli_args, &["--group", "-g"]) {
-                    let group = cli_args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--group needs a value"))?;
+                    let group = cli_args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--group needs a value"))?;
                     tool_args.insert("group".into(), Value::String(group.clone()));
                 }
             } else if cli_args.len() > 2 {

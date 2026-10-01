@@ -533,9 +533,7 @@ fn run_gate_result(
     if let Err(e) = created {
         force_remove_dir(&gate_dir);
         return Err(e).with_context(|| {
-            format!(
-                "could not create a gate worktree for {label} under the scratch root"
-            )
+            format!("could not create a gate worktree for {label} under the scratch root")
         });
     }
     let materialised = git(&gate_dir, "read-tree", &["read-tree", tree])
@@ -546,12 +544,13 @@ fn run_gate_result(
                 .enable_all()
                 .build()
                 .context("could not start the verify gate's runtime");
-            runtime
-                .and_then(|runtime| runtime.block_on(run_gate_confined(repo, &gate_dir, command, req, client_env)))
+            runtime.and_then(|runtime| {
+                runtime.block_on(run_gate_confined(repo, &gate_dir, command, req, client_env))
+            })
         }
-        Err(e) => Err(e).with_context(|| {
-            format!("could not materialise the merge result for {label}")
-        }),
+        Err(e) => {
+            Err(e).with_context(|| format!("could not materialise the merge result for {label}"))
+        }
     };
     reclaim_gate_worktree(root, repo, &gate_dir);
     gate
@@ -860,12 +859,7 @@ pub fn merge_approved_in(
                 let forked = merge_base_of(repo, &base_branch, branch)
                     .or_else(|| base_tree.clone())
                     .unwrap_or_else(|| tree.clone());
-                merge_tree_with(
-                    repo,
-                    &["--merge-base", &forked],
-                    tree,
-                    branch,
-                )?
+                merge_tree_with(repo, &["--merge-base", &forked], tree, branch)?
             }
         };
         match trial {
@@ -975,8 +969,14 @@ fn approved_workers(root: &ScratchRoot, req: &MergeApprovedRequest<'_>) -> Resul
         .into_iter()
         .filter(|entry| entry.status == RegistryStatus::Completed)
         .filter(|entry| entry.approved.is_some())
-        .filter(|entry| req.owner.is_none_or(|owner| entry.owner.as_deref() == Some(owner)))
-        .filter(|entry| req.group.is_none_or(|group| entry.group.as_deref() == Some(group)))
+        .filter(|entry| {
+            req.owner
+                .is_none_or(|owner| entry.owner.as_deref() == Some(owner))
+        })
+        .filter(|entry| {
+            req.group
+                .is_none_or(|group| entry.group.as_deref() == Some(group))
+        })
         .map(|entry| {
             (
                 entry.approved.as_ref().map(|a| a.at).unwrap_or_default(),
@@ -998,10 +998,14 @@ fn group_clause(group: Option<&str>) -> String {
 
 /// The tree `branch` points at, when it resolves.
 fn tree_of(repo: &Path, branch: &str) -> Option<String> {
-    git(repo, "rev-parse", &["rev-parse", &format!("{branch}^{{tree}}")])
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    git(
+        repo,
+        "rev-parse",
+        &["rev-parse", &format!("{branch}^{{tree}}")],
+    )
+    .ok()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty())
 }
 
 /// The commit `branch` forked from `base` at, when they share history.
@@ -1084,7 +1088,8 @@ fn attribute_failures(
     if named.is_empty() {
         return "no file the failure names was touched by a worker in this batch".to_string();
     }
-    let mut lines = vec!["the failing files and the workers whose branch touched them:".to_string()];
+    let mut lines =
+        vec!["the failing files and the workers whose branch touched them:".to_string()];
     for path in named {
         let ids = &owners
             .iter()
@@ -1115,8 +1120,21 @@ fn files_named_in(text: &str, known: &[String]) -> Vec<String> {
         let token = token.trim_matches(|c: char| {
             matches!(
                 c,
-                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | '`' | ',' | ';'
-                    | '*' | '=' | '|'
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '\''
+                    | '"'
+                    | '`'
+                    | ','
+                    | ';'
+                    | '*'
+                    | '='
+                    | '|'
             )
         });
         let token = token.trim_start_matches(['-', '>']);

@@ -72,7 +72,10 @@ pub use self::revision::{
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
 
-pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
+pub use self::merge::{
+    MergeApprovedReport, MergeApprovedRequest, MergeReport, MergeRequest, MergedWorker,
+    SkippedWorker, merge_approved, merge_approved_in, merge_worker, merge_worker_in,
+};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
