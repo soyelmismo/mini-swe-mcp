@@ -20,7 +20,7 @@ models:
     id: combo:ninja
     role: "Fast subagent. Best for repo exploration, running tests, syntax bugfixes, and focused edits."
     temperature: 0.2
-    max_turns: 150
+    max_turns: 250
     policy:
       # The fast executor runs the toolchain and test suites, so it needs both
       # egress (dependency fetches) and the full writable set of its worktree.
@@ -31,7 +31,7 @@ models:
     id: combo:nerd
     role: "Deep reasoning subagent. Best for root-cause debugging, complex multi-file logic, and architecture changes."
     temperature: 0.6
-    max_turns: 200
+    max_turns: 250
     policy:
       # The deep reasoner reads broadly and refactors across files: same
       # capabilities as `ninja`, declared explicitly rather than by omission.
