@@ -285,34 +285,31 @@ fn worktrees_of(repo_root: &Path) -> Vec<String> {
     }
 }
 
-/// Every file in the repository's main checkout, repository-relative.
+/// The untracked, non-ignored files of the repository's main checkout,
+/// repository-relative - what a suite could have left behind there.
 ///
-/// `.git` is skipped: it is where refs and worktrees already live, and it is
-/// audited separately above. The walk is depth-first and bounded, so a suite that
-/// writes a deep or very large tree cannot stall the gate.
+/// Ignored paths (build output such as `target/`, caches) are excluded: other
+/// processes - the operator's own builds, compiler caches - write there all
+/// the time, so they say nothing about the worker. Asking git also keeps the
+/// audit bounded and independent of the language's build layout.
 fn checkout_files(repo_root: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    let mut stack = vec![repo_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if files.len() >= CHECKOUT_WALK_LIMIT {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            if name == ".git" {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(relative) = path.strip_prefix(repo_root) {
-                files.push(relative.to_string_lossy().into_owned());
-            }
-        }
+    let Ok(output) = crate::worktree::git(
+        repo_root,
+        "status untracked",
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    ) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
     }
+    let mut files: Vec<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"?? "))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .take(CHECKOUT_WALK_LIMIT)
+        .collect();
     files.sort();
     files
 }
@@ -403,6 +400,54 @@ The harness removed what it could; make the suite leave the repository, its refs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only what git would show as new counts: ignored build output written by
+    /// other processes (the operator's builds, compiler caches) is not a leak.
+    #[test]
+    fn the_checkout_audit_ignores_ignored_paths() {
+        let repo = std::env::temp_dir().join(format!("audit-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(repo.join(".gitignore"), "target/\n").expect("write .gitignore");
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "add",
+            ".gitignore",
+        ]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+        let before = checkout_files(&repo);
+
+        std::fs::create_dir_all(repo.join("target/debug")).expect("create target");
+        std::fs::write(repo.join("target/debug/artifact"), "x").expect("write ignored file");
+        std::fs::write(repo.join("left-behind.txt"), "x").expect("write untracked file");
+
+        assert_eq!(
+            added(&before, &checkout_files(&repo)),
+            vec!["left-behind.txt".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
