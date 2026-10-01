@@ -282,6 +282,9 @@ pub struct WorkerProgress {
     /// executing; `None` when no command is in flight. A step whose command is
     /// still running is not worker inactivity.
     pub command_started_at: Option<u64>,
+    /// Background jobs this worker still has running: commands that outlived
+    /// their budget and were continued instead of killed.
+    pub jobs: Vec<JobStatus>,
 }
 
 /// Who a worker belongs to, as the pool and the registry record it.

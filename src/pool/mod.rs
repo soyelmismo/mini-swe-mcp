@@ -81,6 +81,7 @@ pub use self::steer::{
 };
 
 use self::state::expired_terminal_ids;
+use crate::agent::jobs::{JobHandle, JobStatus, JobTable};
 use crate::manifest::ModelManifest;
 use crate::worktree::{ScratchRoot, WorktreeGuard};
 
@@ -226,6 +227,10 @@ pub struct WorkerPool {
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
     command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Background jobs of every live worker: a command that outlived its
+    /// budget keeps running here, confined exactly as the command was, until
+    /// it ends or its worker does.
+    jobs: Arc<JobTable>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -310,6 +315,7 @@ impl WorkerPool {
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            jobs: JobTable::new(),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry,
@@ -323,6 +329,25 @@ impl WorkerPool {
             next_dispatch_seq: Arc::new(AtomicU64::new(1)),
             scratch,
         }
+    }
+
+    /// A handle on `worker_id`'s background jobs, for the runner that executes
+    /// its commands.
+    pub fn job_handle(&self, worker_id: &str) -> JobHandle {
+        JobHandle::new(Arc::clone(&self.jobs), worker_id)
+    }
+
+    /// The background jobs `worker_id` still has running, oldest first.
+    pub async fn worker_jobs(&self, worker_id: &str) -> Vec<JobStatus> {
+        self.jobs.summaries(worker_id)
+    }
+
+    /// Stop every background job of `worker_id`.
+    ///
+    /// Called when the worker ends, however it ends: a job is confined exactly
+    /// like the command that started it, so it must not outlive the worker.
+    pub fn end_worker_jobs(&self, worker_id: &str) -> usize {
+        self.jobs.kill_all(worker_id)
     }
 
     /// The scratch root this pool resolves every per-worker path under.
@@ -732,6 +757,7 @@ impl WorkerPool {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(id)
             .copied();
+        let jobs = self.jobs.summaries(id);
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
         let progress = match &w.state {
@@ -744,6 +770,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot,
                 command_started_at,
+                jobs,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
@@ -752,6 +779,7 @@ impl WorkerPool {
                 question: Some(question.clone()),
                 waiting_for_slot,
                 command_started_at: None,
+                jobs,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
@@ -760,6 +788,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
@@ -768,6 +797,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
         };
         drop(lock);

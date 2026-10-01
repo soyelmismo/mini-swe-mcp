@@ -44,7 +44,7 @@ use tracing::{info, warn};
 
 use super::AgentRunner;
 use super::intercept::{check_command, strip_data_heredocs};
-use super::jobs::{JobHandle, JobState};
+use super::jobs::JobState;
 use super::sandbox::{
     KernelConfinement, TRUNCATE_HEAD, TRUNCATE_TAIL, find_git_common_dir, find_git_dirs, has_bwrap,
     is_heavy_command, truncate_with_dropped, validate_bash_command,
@@ -292,7 +292,57 @@ impl AgentRunner {
             cmd.env(name, value);
         }
 
-        run_with_timeout(&mut cmd, timeout_secs).await
+        // A command that outlives its budget keeps running as a background
+        // job, so its output needs a log to stream to. The worker's private
+        // scratch is where the step's own scratch already lives, and it is
+        // deleted with the worktree.
+        let job_log_dir = self.jobs.as_ref().map(|_| tmp_dir.clone());
+        match run_with_timeout(&mut cmd, timeout_secs, job_log_dir.as_deref()).await? {
+            RunOutcome::Finished { output, code } => Ok((output, code)),
+            RunOutcome::Backgrounded(backgrounded) => {
+                Ok(self.continue_as_job(backgrounded, command).await)
+            }
+        }
+    }
+
+    /// Report a command that outlived its budget.
+    ///
+    /// With a job table the command keeps running as job `<n>`, which the
+    /// worker can wait on or stop; without one there is nobody to wait on it,
+    /// so it is stopped here and reported as the timeout it is.
+    async fn continue_as_job(&self, backgrounded: Backgrounded, command: &str) -> (String, Option<i32>) {
+        let Backgrounded {
+            pid,
+            mut child,
+            out,
+            err,
+            timeout_secs,
+            log,
+            mut guard,
+        } = backgrounded;
+        let Some(handle) = self.jobs.as_ref() else {
+            // Nobody owns this runner's jobs, so there is nobody to wait on the
+            // command: stop it and report the timeout it is.
+            terminate_process_group(pid, &mut child, TERM_GRACE).await;
+            let (out, err) = tokio::join!(out.finish(), err.finish());
+            let mut output = combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped);
+            output.push_str(&format!(
+                "\nCommand timed out after {timeout_secs}s and was terminated."
+            ));
+            return (output, Some(TIMEOUT_EXIT_CODE));
+        };
+        let job = JobState::new(pid, child, out, err, job_label(command), log.clone());
+        let id = handle.spawn(job);
+        // The job owns the group now, so the guard must not signal it on drop.
+        guard.disarm();
+        self.set_last_job_id(id);
+        info!(
+            job = id,
+            timeout_secs,
+            log = %log.display(),
+            "Command outlived its budget; continuing as a background job"
+        );
+        (backgrounded_message(id, timeout_secs, &log), Some(0))
     }
 }
 
@@ -987,15 +1037,47 @@ fn command_timeout_secs(heavy: bool) -> u64 {
     crate::config::env_parse("COMMAND_TIMEOUT_SECS").unwrap_or(default_timeout)
 }
 
+/// What became of a command that ran under [`run_with_timeout`].
+enum RunOutcome {
+    /// The command ended within its budget.
+    Finished { output: String, code: Option<i32> },
+    /// The command outlived its budget and is still running in its own group.
+    Backgrounded(Backgrounded),
+}
+
+/// A command that outlived its budget, still running in its own process group.
+struct Backgrounded {
+    /// Group leader, for whoever takes the group over.
+    pid: Option<u32>,
+    child: Child,
+    out: PipeBuffer,
+    err: PipeBuffer,
+    /// The budget the command just exhausted.
+    timeout_secs: u64,
+    /// Where its output streams to, inside the worker's private scratch.
+    log: PathBuf,
+    /// Still armed: whoever takes the group over disarms it, so a cancellation
+    /// in between cannot leave the process running.
+    guard: ProcessGroupGuard,
+}
+
 /// Spawn `cmd`, wait up to `timeout_secs`, and collect the combined output.
 ///
-/// On timeout the whole process group gets a graceful `SIGTERM`, escalated to
-/// `SIGKILL` only if it refuses to stop within [`TERM_GRACE_MS`] (a lingering
-/// compiler or test runner would otherwise outlive its budget). Whatever the
-/// command printed before the budget expired is still reported, so the model
-/// sees the last diagnostics instead of a bare "timed out". The timeout is
-/// reported as ordinary output with exit code [`TIMEOUT_EXIT_CODE`].
-async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(String, Option<i32>)> {
+/// A command that ends within its budget has its whole process group taken
+/// down with it -- a job the shell backgrounded with `&` is still a member, and
+/// leaving it running would outlive the worker that started it -- and its
+/// output is reported with the real exit code.
+///
+/// A command that *outlives* its budget is not killed: it is handed back as
+/// [`RunOutcome::Backgrounded`], still running in its own group with its pipes
+/// still draining, for the caller to turn into a background job. `log_dir` is
+/// where that job's output streams to; `None` keeps the in-memory drain only,
+/// which is all a command that is not going to outlive its budget needs.
+async fn run_with_timeout(
+    cmd: &mut Command,
+    timeout_secs: u64,
+    log_dir: Option<&Path>,
+) -> Result<RunOutcome> {
     let mut child = cmd.spawn().context("Failed to spawn bash process")?;
     let child_pid = child.id();
 
@@ -1014,8 +1096,11 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
         .stderr
         .take()
         .context("stderr pipe was not captured")?;
-    let out_buf = PipeBuffer::spawn(stdout);
-    let err_buf = PipeBuffer::spawn(stderr);
+    // Named after the process, which is unique per job and known before the
+    // job number is.
+    let job_log = log_dir.map(|dir| dir.join(format!("job-{}.log", child_pid.unwrap_or(0))));
+    let out_buf = PipeBuffer::spawn(stdout, job_log.clone());
+    let err_buf = PipeBuffer::spawn(stderr, job_log.clone());
 
     match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
         // Clean exit: the write ends are closed now that the child is gone, so
@@ -1028,10 +1113,10 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
             // The group is already reaped; the guard must not signal it again.
             group_guard.disarm();
             let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
-            Ok((
-                combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped),
-                status.code(),
-            ))
+            Ok(RunOutcome::Finished {
+                output: combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped),
+                code: status.code(),
+            })
         }
         // A `wait` error leaves the child's fate unknown, so the guard stays
         // armed: killing the group is the only cleanup that cannot leave a
@@ -1044,22 +1129,49 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
             terminate_process_group(child_pid, &mut child, STEP_TERM_GRACE).await;
             Err(e).context("Failed waiting for bash process")
         }
-        // The child outlived its budget: stop it, then report what it printed.
-        Err(_elapsed) => {
-            terminate_process_group(child_pid, &mut child, TERM_GRACE).await;
-            // `terminate_process_group` reaped the group (or gave up after the
-            // SIGKILL), so the drop guard has nothing left to do.
-            group_guard.disarm();
-            // The group is gone, so the readers are released and the drain
-            // converges instead of waiting out the whole drain budget.
-            let (out, err) = tokio::join!(out_buf.finish(), err_buf.finish());
-            let mut output = combine_streams(&out.bytes, &err.bytes, out.dropped + err.dropped);
-            output.push_str(&format!(
-                "\nCommand timed out after {timeout_secs}s and was terminated."
-            ));
-            Ok((output, Some(TIMEOUT_EXIT_CODE)))
-        }
+        // The child outlived its budget. It is *not* stopped here: the caller
+        // turns it into a background job, so the group guard stands down only
+        // once someone has taken the group over, and the pipes keep draining
+        // into the job's log.
+        Err(_elapsed) => Ok(RunOutcome::Backgrounded(Backgrounded {
+            pid: child_pid,
+            child,
+            out: out_buf,
+            err: err_buf,
+            timeout_secs,
+            log: job_log.unwrap_or_else(|| PathBuf::from("job.log")),
+            guard: group_guard,
+        })),
     }
+}
+
+/// The tool result a command that outlived its budget produces.
+///
+/// The command is still running, so nothing about its outcome is reported: the
+/// worker is told the job number, how to wait on it and how to stop it.
+fn backgrounded_message(id: u64, timeout_secs: u64, log: &Path) -> String {
+    format!(
+        "Command is still running after {timeout_secs}s as job {id}; it was not killed.\n\
+         `echo WAIT_JOB {id}` waits for it (up to {}s per call) and then reports its exit code and the tail of its output.\n\
+         `echo KILL_JOB {id}` stops it. It is also stopped after {}s or when this worker ends.\n\
+         Its output is streaming to {}.",
+        super::jobs::wait_job_secs(),
+        super::jobs::job_max_secs(),
+        log.display()
+    )
+}
+
+/// Bounded one-line label for a background job, from the command that started
+/// it. Local to the agent layer, which does not depend on the pool that drives
+/// it, and bounded so one long command can never blow up a status view.
+fn job_label(command: &str) -> String {
+    let first = command.lines().next().unwrap_or("").trim();
+    let cut = first.len().min(60);
+    let mut label = first[..first.floor_char_boundary(cut)].to_string();
+    if label.len() < first.len() {
+        label.push_str("...");
+    }
+    label
 }
 
 /// Head and tail of a command's output stream, bounded to exactly the bytes
@@ -1169,6 +1281,38 @@ impl Drop for PipeBuffer {
     }
 }
 
+/// Open (creating if needed) the log a background job streams to.
+async fn open_job_log(path: &Path) -> Option<tokio::fs::File> {
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(file) => Some(file),
+        Err(e) => {
+            tracing::debug!(error = %e, path = %path.display(), "could not open a job log");
+            None
+        }
+    }
+}
+
+/// Append `chunk` to a job's log, keeping the file within [`JOB_LOG_MAX_BYTES`].
+///
+/// Returns the new byte count. Past the cap the log restarts, so what survives
+/// is the most recent window of a stream that has no natural end.
+async fn append_job_log(file: &mut tokio::fs::File, chunk: &[u8], written: u64) -> u64 {
+    let mut written = written;
+    if written + chunk.len() as u64 > JOB_LOG_MAX_BYTES {
+        let _ = file.set_len(0).await;
+        written = 0;
+    }
+    if file.write_all(chunk).await.is_err() {
+        return written;
+    }
+    written + chunk.len() as u64
+}
+
 /// One drained pipe: the bytes worth showing, plus how many were elided.
 ///
 /// `dropped` lets [`combine_streams`] tell "the child printed 20 KB" from "the
@@ -1179,14 +1323,26 @@ pub(super) struct Stream {
 }
 
 impl PipeBuffer {
-    /// Start draining `pipe` into a fresh bounded buffer.
-    fn spawn<R>(mut pipe: R) -> Self
+    /// Start draining `pipe` into a fresh bounded buffer, appending the raw
+    /// stream to `log` when one is given.
+    ///
+    /// The log is where a background job's output streams while the worker
+    /// waits on it: the bytes the command printed, capped so a chatty build
+    /// cannot fill the worker's scratch. A log that cannot be written is
+    /// dropped rather than failing the drain -- the pipe must keep being read
+    /// either way, or the child wedges in `write`.
+    fn spawn<R>(mut pipe: R, log: Option<PathBuf>) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
         let bytes = Arc::new(Mutex::new(Captured::new()));
         let sink = Arc::clone(&bytes);
         let reader = tokio::spawn(async move {
+            let mut log = match log {
+                Some(path) => open_job_log(&path).await,
+                None => None,
+            };
+            let mut written = 0u64;
             let mut buf = [0u8; DRAIN_CHUNK_BYTES];
             loop {
                 // A read failure means the child is gone; whatever arrived is
@@ -1194,16 +1350,29 @@ impl PipeBuffer {
                 // and the buffer is flushed either way.
                 match pipe.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => match sink.lock() {
-                        Ok(mut sink) => sink.push(&buf[..n]),
-                        // The owning task panicked while holding the lock; a
-                        // poisoned mutex still holds what was captured so far.
-                        Err(poisoned) => poisoned.into_inner().push(&buf[..n]),
-                    },
+                    Ok(n) => {
+                        match sink.lock() {
+                            Ok(mut sink) => sink.push(&buf[..n]),
+                            // The owning task panicked while holding the lock; a
+                            // poisoned mutex still holds what was captured so far.
+                            Err(poisoned) => poisoned.into_inner().push(&buf[..n]),
+                        }
+                        if let Some(file) = log.as_mut() {
+                            written = append_job_log(file, &buf[..n], written).await;
+                        }
+                    }
                 }
             }
         });
         Self { bytes, reader }
+    }
+
+    /// The buffer this pipe drains into, shared with its reader task.
+    ///
+    /// A background job reads its tail through this while the job is still
+    /// running, long before [`finish`](Self::finish) collects the drain.
+    pub(super) fn shared(&self) -> Arc<Mutex<Captured>> {
+        Arc::clone(&self.bytes)
     }
 
     /// Stop waiting for the reader and return the bytes worth reporting.
@@ -1246,7 +1415,11 @@ impl PipeBuffer {
 ///
 /// Best-effort at every step: the group may already be gone (the sandbox
 /// wrapper carries `--die-with-parent` and takes its children with it).
-async fn terminate_process_group(pid: Option<u32>, child: &mut Child, term_grace: Duration) {
+pub(super) async fn terminate_process_group(
+    pid: Option<u32>,
+    child: &mut Child,
+    term_grace: Duration,
+) {
     signal_process_group(pid, libc::SIGTERM);
 
     // The members are snapshotted once and the snapshot is what the grace
@@ -1308,7 +1481,7 @@ async fn await_group_gone(members: &[u32], child: &mut Child, grace: Duration) -
 /// `--die-with-parent` and routinely takes its children down before the timeout
 /// fires -- which is a success, not an error.
 #[cfg(unix)]
-fn signal_process_group(pid: Option<u32>, sig: libc::c_int) {
+pub(super) fn signal_process_group(pid: Option<u32>, sig: libc::c_int) {
     let Some(pid) = pid.map(|p| p as libc::pid_t) else {
         return;
     };
@@ -1328,7 +1501,7 @@ fn signal_process_group(pid: Option<u32>, sig: libc::c_int) {
 /// Non-unix stub: no process group signalling outside unix; the `Child`
 /// guard's `SIGKILL` is the only cleanup there.
 #[cfg(not(unix))]
-fn signal_process_group(_pid: Option<u32>, _sig: i32) {}
+pub(super) fn signal_process_group(_pid: Option<u32>, _sig: i32) {}
 
 /// Kill a command's whole process group unless explicitly disarmed.
 ///
@@ -1386,7 +1559,7 @@ impl Drop for ProcessGroupGuard {
 /// `\n` yields a blank line between the streams. That is pre-existing behaviour
 /// the model sees verbatim in the tool result, so it is preserved as-is rather
 /// than quietly changing the transcripts this crate already produced.
-fn combine_streams(stdout: &[u8], stderr: &[u8], dropped: usize) -> String {
+pub(super) fn combine_streams(stdout: &[u8], stderr: &[u8], dropped: usize) -> String {
     let mut combined = String::new();
     if !stdout.is_empty() {
         combined.push_str(&String::from_utf8_lossy(stdout));
@@ -2167,7 +2340,10 @@ mod tests {
         ]);
         configure_process(&mut cmd);
         cmd.current_dir(&dir);
-        let task = tokio::spawn(async move { run_with_timeout(&mut cmd, 300).await });
+        // The command outlives its budget here, so it comes back as a
+        // `Backgrounded` rather than as output: dropping that future must still
+        // take the group down, which is what the guard it carries is for.
+        let task = tokio::spawn(async move { run_with_timeout(&mut cmd, 300, None).await });
         let grandchild = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&pid_file) {

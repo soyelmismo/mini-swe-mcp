@@ -28,7 +28,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,9 +91,8 @@ impl JobTable {
 
     /// Add `job` as the worker's next job number.
     fn register(&self, worker: &str, job: Arc<JobState>) -> u64 {
-        let entry = lock(&self.workers)
-            .entry(worker.to_string())
-            .or_default();
+        let mut workers = lock(&self.workers);
+        let entry = workers.entry(worker.to_string()).or_default();
         entry.next_id += 1;
         let id = entry.next_id;
         entry.jobs.insert(id, job);
@@ -172,7 +171,7 @@ impl JobHandle {
     /// Register `job` as this worker's next job and start supervising it.
     pub fn spawn(&self, job: Arc<JobState>) -> u64 {
         let id = self.table.register(&self.worker, Arc::clone(&job));
-        job.supervise(job_max_secs());
+        job.supervise(Duration::from_secs(job_max_secs()));
         id
     }
 
@@ -233,7 +232,10 @@ struct JobInner {
 
 impl JobState {
     /// A job for a command that just outlived its budget.
-    pub fn new(
+    ///
+    /// Crate-private: a job is built by the executor that ran the command, and
+    /// the pipes it hands over are the executor's own bounded drain.
+    pub(super) fn new(
         pid: Option<u32>,
         child: tokio::process::Child,
         out: PipeBuffer,
@@ -345,7 +347,7 @@ impl JobState {
     pub async fn wait(&self, limit: Duration) -> JobWait {
         // The notification is registered *before* the outcome is read, so a job
         // reaped in between cannot leave this waiter asleep until the limit.
-        let notified = std::pin::pin!(self.done.notified());
+        let mut notified = std::pin::pin!(self.done.notified());
         notified.as_mut().enable();
         if self.outcome().is_none() {
             let _ = tokio::time::timeout(limit, notified).await;
@@ -376,8 +378,8 @@ impl JobState {
     }
 
     /// Where the job's output streams to.
-    pub fn log(&self) -> &Path {
-        &lock(&self.inner).log
+    pub fn log(&self) -> PathBuf {
+        lock(&self.inner).log.clone()
     }
 
     /// How this job appears in the worker's status.
