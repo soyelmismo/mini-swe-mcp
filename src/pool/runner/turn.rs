@@ -2449,10 +2449,7 @@ mod tests {
             pause: 6,
         };
         let mut streak = ReadOnlyStreak::default();
-        assert_eq!(
-            streak.record(Some("a".to_string()), limits),
-            None
-        );
+        assert_eq!(streak.record(Some("a".to_string()), limits), None);
         assert_eq!(streak.record(None, limits), None);
         assert_eq!(
             streak.record(Some("a".to_string()), limits),
@@ -2494,6 +2491,11 @@ mod tests {
             edit_plan(many_names)[0].identifiers,
             ["one", "two", "three"]
         );
+        // A task names the function before the file it lives in as often as the
+        // other way round, so a leading identifier attaches to the file after it.
+        let leading = edit_plan("add the plan to `fn check_read_only` in src/lib.rs.");
+        assert_eq!(leading[0].path, "src/lib.rs");
+        assert_eq!(leading[0].identifiers, ["fn check_read_only"]);
         // A quoted sentence of prose is not an identifier.
         let prose = "fix a.rs: `the parser drops the last token when it sees one`";
         assert!(

@@ -92,7 +92,10 @@ struct ScriptedServer {
 }
 
 impl ScriptedServer {
-    async fn spawn(turns: Vec<String>) -> Self {
+    /// Answer each turn with the next scripted body, and once the script runs
+    /// out keep answering `fallback`: a worker steered past its script must
+    /// still get an answer every turn instead of hanging on a silent socket.
+    async fn spawn(turns: Vec<String>, fallback: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the scripted server on loopback");
@@ -100,13 +103,17 @@ impl ScriptedServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         tokio::spawn(async move {
+            let fallback = fallback;
             let mut next = 0usize;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
                 let requests = captured.clone();
-                let turn = turns.get(next).cloned();
+                let turn = match turns.get(next) {
+                    Some(turn) => turn.clone(),
+                    None => fallback.clone(),
+                };
                 next += 1;
                 tokio::spawn(async move {
                     if let Some(body) = read_request(&mut socket).await
@@ -114,7 +121,7 @@ impl ScriptedServer {
                     {
                         requests.lock().await.push(value);
                     }
-                    write_sse(&mut socket, turn.as_deref()).await;
+                    write_sse(&mut socket, &turn).await;
                 });
             }
         });
@@ -154,18 +161,16 @@ fn completion_turn(call_id: &str) -> String {
     bash_turn(call_id, &format!("echo {COMPLETION_SENTINEL}"))
 }
 
-async fn write_sse(socket: &mut TcpStream, turn: Option<&str>) {
+async fn write_sse(socket: &mut TcpStream, turn: &str) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if socket.write_all(head.as_bytes()).await.is_err() {
         return;
     }
-    if let Some(turn) = turn {
-        if socket.write_all(turn.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = socket.flush().await;
-        let _ = socket.write_all(b"data: [DONE]\n\n").await;
+    if socket.write_all(turn.as_bytes()).await.is_err() {
+        return;
     }
+    let _ = socket.flush().await;
+    let _ = socket.write_all(b"data: [DONE]\n\n").await;
     let _ = socket.flush().await;
     let _ = socket.shutdown().await;
 }
@@ -268,18 +273,27 @@ async fn wait_for_paused(pool: &WorkerPool, worker_id: &str) -> Option<String> {
 }
 
 async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
-    for _ in 0..600 {
+    wait_for_terminal_inner(pool, worker_id, 600).await
+}
+
+async fn wait_for_terminal_inner(
+    pool: &WorkerPool,
+    worker_id: &str,
+    tries: usize,
+) -> WorkerState {
+    let mut last = None;
+    for _ in 0..tries {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
                 WorkerState::Completed { .. }
                 | WorkerState::Failed { .. }
                 | WorkerState::Exhausted { .. } => return state,
-                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
+                other => last = Some(format!("{other:?}")),
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("worker {worker_id} did not reach a terminal state");
+    panic!("worker {worker_id} did not reach a terminal state; last: {last:?}");
 }
 
 fn metrics_of(state: &WorkerState) -> WorkerMetrics {
@@ -325,11 +339,13 @@ async fn dispatch(pool: &WorkerPool, repo: &Path, max_turns: usize) -> String {
 async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
     let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("escalate");
-    let mut turns: Vec<String> = (1..=8)
+    // More read turns than the pause threshold, so the worker is still reading
+    // when it parks and has turns left to answer the orchestrator.
+    let mut turns: Vec<String> = (1..=14)
         .map(|n| bash_turn(&format!("call_{n}"), &read_turn(n)))
         .collect();
     turns.push(completion_turn("call_done"));
-    let server = ScriptedServer::spawn(turns).await;
+    let server = ScriptedServer::spawn(turns, bash_turn("call_tail", "cat README.md")).await;
 
     let scratch = common::TempDir::new_in_tmp("read-only-pool");
     let pool = WorkerPool::with_scratch(
@@ -369,14 +385,10 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
             .iter()
             .any(|m| m.contains("Edit now.") && m.contains("src/lib.rs (fn check_read_only)"))
     });
-    if !plan_seen {
-        let all: Vec<String> = requests
-            .iter()
-            .flat_map(|r| user_messages(r))
-            .filter(|m| m.contains("read-only") || m.contains("Edit now"))
-            .collect();
-        panic!("plan missing; relevant user messages: {all:#?}");
-    }
+    assert!(
+        plan_seen,
+        "the second nudge must carry the plan the task names"
+    );
 
     // The orchestrator decides, and the worker carries on from its answer.
     pool.steer(&worker_id, "write the edit in lib.rs now".to_string())
@@ -404,12 +416,16 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
 async fn a_worker_that_edits_after_the_nudge_never_reaches_the_pause() {
     let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("edits");
-    let server = ScriptedServer::spawn(vec![
-        bash_turn("call_1", &read_turn(1)),
-        bash_turn("call_2", &read_turn(2)),
-        bash_turn("call_3", "printf 'x\\n' >> lib.rs"),
-        completion_turn("call_done"),
-    ])
+    let server = ScriptedServer::spawn(
+        vec![
+            bash_turn("call_1", &read_turn(1)),
+            bash_turn("call_2", &read_turn(2)),
+            bash_turn("call_3", "printf 'x\\n' >> lib.rs"),
+            bash_turn("call_4", &read_turn(4)),
+            completion_turn("call_done"),
+        ],
+        bash_turn("call_tail", "cat README.md"),
+    )
     .await;
 
     let scratch = common::TempDir::new_in_tmp("read-only-pool");
@@ -423,7 +439,10 @@ async fn a_worker_that_edits_after_the_nudge_never_reaches_the_pause() {
     let worker_id = dispatch(&pool, repo.path(), 20).await;
 
     let state = wait_for_terminal(&pool, &worker_id).await;
-    let metrics = metrics_of(&state);
+    let metrics = match &state {
+        WorkerState::Completed { metrics, .. } => *metrics,
+        other => panic!("a worker that edits must finish, got {other:?}"),
+    };
     assert_eq!(
         metrics.loop_pauses, 0,
         "a worker that edits is never parked, got {metrics:?}"
