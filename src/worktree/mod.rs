@@ -164,7 +164,7 @@ pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
 }
 
 /// Delete private scratch and legacy targets, never shared build dirs.
-pub(crate) fn remove_target_dirs(wt_path: &Path) {
+pub fn remove_target_dirs(wt_path: &Path) {
     remove_target_dirs_in(&ScratchRoot::from_env(), wt_path)
 }
 
