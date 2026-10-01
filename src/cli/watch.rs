@@ -764,11 +764,13 @@ pub fn round_event(
     group: Option<&str>,
     now: u64,
     fresh: impl Fn(&str) -> bool,
+    allowed: impl Fn(&Value) -> bool,
 ) -> Option<Value> {
     let selected: Vec<&Value> = current
         .values()
         .filter(|v| {
-            matches(v, ids, group)
+            allowed(v)
+                && matches(v, ids, group)
                 && v["steered_by_consolidator"] != true
                 && v["question_for_consolidator"] != true
         })
@@ -1102,11 +1104,20 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                     "question": v["question"].clone(),
                 })
             };
-            let event = round_event(&current, &ids, opts.group.as_deref(), now, |id| {
-                current
-                    .get(id)
-                    .is_some_and(|v| round_reported.get(id) != Some(&signature(v)))
-            });
+            // The polling set is already ownership-filtered, so every
+            // view here is the caller's own.
+            let event = round_event(
+                &current,
+                &ids,
+                opts.group.as_deref(),
+                now,
+                |id| {
+                    current
+                        .get(id)
+                        .is_some_and(|v| round_reported.get(id) != Some(&signature(v)))
+                },
+                |_| true,
+            );
             if let Some(event) = event {
                 for (id, view) in &current {
                     if matches(view, &ids, opts.group.as_deref()) {

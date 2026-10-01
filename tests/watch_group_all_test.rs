@@ -458,3 +458,97 @@ fn the_cli_all_flag_needs_a_group_or_ids() {
         "{error}"
     );
 }
+
+/// Two agents, one group: a round must never report — or
+/// acknowledge — a worker that belongs to the other agent.
+#[tokio::test]
+async fn a_round_stays_inside_its_caller_ownership() {
+    let isolated = common::IsolatedPool::new(4, "watch-all-own");
+    for id in ["own-1", "other-1"] {
+        let owner = if id.starts_with("own-") {
+            OWNER
+        } else {
+            "agent-b"
+        };
+        pool_add_running_owned(&isolated.pool, id, owner).await;
+        set_completed_owned(&isolated.pool, id, owner).await;
+    }
+    let server = McpServer::new(isolated.pool.clone(), "test".to_string());
+    let ctx = mini_swe_mcp::mcp::ConnectionContext {
+        agent_id: Some(OWNER.to_string()),
+        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(3)
+    };
+
+    let result = server
+        .execute_tool_for(
+            "worker",
+            json!({"action": "watch", "all": true, "group": GROUP, "timeout_secs": 5}),
+            &ctx,
+        )
+        .await
+        .expect("the round watch must answer");
+
+    assert_eq!(result["status"], "event", "{result}");
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "{result}");
+    let workers = events[0]["workers"].as_array().expect("workers");
+    assert_eq!(
+        workers
+            .iter()
+            .map(|w| w["worker_id"].as_str())
+            .collect::<Vec<_>>(),
+        vec![Some("own-1")],
+        "only the caller's worker is listed: {result}"
+    );
+
+    // The round must not consume the other agent's event: agent-b's
+    // plain watch still replays its own worker's completion.
+    let other_ctx = mini_swe_mcp::mcp::ConnectionContext {
+        agent_id: Some("agent-b".to_string()),
+        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(4)
+    };
+    let replay = server
+        .execute_tool_for(
+            "worker",
+            json!({"action": "watch", "worker_id": "other-1", "timeout_secs": 5}),
+            &other_ctx,
+        )
+        .await
+        .expect("agent-b's watch must answer");
+    assert_eq!(replay["status"], "event", "{replay}");
+    assert_eq!(
+        replay["events"][0]["worker_id"], "other-1",
+        "the round must not mark the other agent's worker seen: {replay}"
+    );
+}
+
+/// Insert `id` as a running worker of `owner` (the harness helper
+/// fixes the owner to `OWNER`).
+async fn pool_add_running_owned(pool: &WorkerPool, id: &str, owner: &str) {
+    let mut meta = meta(id);
+    meta.owner = owner.to_string();
+    let mut record = record(id, running());
+    record.owner = owner.to_string();
+    pool.__test_insert_worker(record).await;
+    pool.__test_save_status(&meta, "test", RegistryStatus::Running, 1, 10, "ls", None);
+}
+
+/// Move `id` — owned by `owner` — to completed, preserving the row.
+async fn set_completed_owned(pool: &WorkerPool, id: &str, owner: &str) {
+    let mut state = WorkerState::Completed {
+        turns: 2,
+        diff: String::new(),
+        summary: "Owned.".to_string(),
+        completed_at: 0,
+        artifacts: Vec::new(),
+        branch: Some(format!("worker-{id}")),
+        verified: Some(false),
+        metrics: WorkerMetrics::default(),
+        revision: 0,
+        report: None,
+    };
+    if let WorkerState::Completed { summary, .. } = &mut state {
+        *summary = format!("Owned by {owner}.");
+    }
+    pool.__test_set_worker_state(id, state).await;
+}
