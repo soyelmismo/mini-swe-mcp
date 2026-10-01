@@ -228,7 +228,7 @@ async fn an_ambient_variable_failure_is_refused_with_the_variable_named() {
             && refusal.contains("SWE_DIVERGENT_PROBE_VAR"),
         "the refusal must name the differing variable, got {refusal:?}"
     );
-    pool.kill(&worker_id).await.ok();
+    let _ = pool.kill(&worker_id).await;
 }
 
 /// A suite that depends on `TZ` is refused.
@@ -250,7 +250,7 @@ async fn a_timezone_dependent_suite_is_refused() {
         refusal.contains("clean environment") && refusal.contains("HOME/TMPDIR/TZ differ"),
         "the refusal must state that HOME/TMPDIR/TZ differ, got {refusal:?}"
     );
-    pool.kill(&worker_id).await.ok();
+    let _ = pool.kill(&worker_id).await;
 }
 
 /// A hermetic suite passes both variants and completes verified.
@@ -301,7 +301,7 @@ async fn a_suite_that_creates_a_branch_is_refused_and_cleaned_up() {
         !refs.contains("refs/heads/worker-leftover-branch"),
         "the harness must remove the branch the suite created: {refs}"
     );
-    pool.kill(&worker_id).await.ok();
+    let _ = pool.kill(&worker_id).await;
 }
 
 /// `WORKER_DIVERGENT_VERIFY=0` skips variant B: the same ambient-dependent
@@ -343,13 +343,13 @@ async fn secrets_never_reach_variant_b() {
         "the ambient snapshot must never carry a secret name"
     );
     let decoded = mini_swe_mcp::hub::decode_ambient_env(&serde_json::json!([
-        {"name": "SWE_DIVERGENT_PLAIN_SECRET_CHECK", "value": "yes"},
+        {"name": "SWE_DIVERGENT_PLAIN_CHECK", "value": "yes"},
         {"name": "SWE_DIVERGENT_API_TOKEN_CHECK", "value": "must-not-travel"},
     ]));
     assert!(
         decoded
             .iter()
-            .any(|(name, _)| name == "SWE_DIVERGENT_PLAIN_SECRET_CHECK"),
+            .any(|(name, _)| name == "SWE_DIVERGENT_PLAIN_CHECK"),
         "plain variables must survive the handshake decode"
     );
     assert!(

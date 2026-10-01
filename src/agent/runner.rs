@@ -105,6 +105,11 @@ pub struct AgentRunner {
     pub build_jobs: Option<usize>,
     /// Shared target selected by the pool; absent until the first heavy step.
     pub(crate) build_target_dir: Option<std::path::PathBuf>,
+    /// Extra variables layered on top of the sanitized environment for one
+    /// command. The differential verify gate uses it to replay the same
+    /// command in the dispatcher's ambient environment; ordinary steps leave
+    /// it empty.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl AgentRunner {
@@ -124,12 +129,21 @@ impl AgentRunner {
             initial_retry_delay: Duration::from_millis(retry::INITIAL_RETRY_DELAY_MS),
             build_jobs: None,
             build_target_dir: None,
+            extra_env: Vec::new(),
         }
     }
 
     /// Confine every bash step to an isolated network namespace (`unshare -n`).
     pub fn with_network_offline(mut self, offline: bool) -> Self {
         self.network_offline = offline;
+        self
+    }
+
+    /// Layer `vars` on top of the sanitized environment of the next
+    /// `execute_bash` call. The caller clones per command, so the overlay
+    /// never leaks into an unrelated step.
+    pub fn with_extra_env(mut self, vars: Vec<(String, String)>) -> Self {
+        self.extra_env = vars;
         self
     }
 

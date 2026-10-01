@@ -829,8 +829,9 @@ impl<'a> TurnEngine<'a> {
             });
         }
         let divergent_env = super::divergent::divergent_environment(&worktree_path, self.client_env);
-        let wrapped = super::divergent::divergent_command(verify, &divergent_env);
-        let (output_b, code_b) = self.run_gated(&wrapped).await?;
+        let (output_b, code_b) = self
+            .run_gated_with_env(verify, divergent_env.clone())
+            .await?;
 
         // The audit covers both runs: variant B must clean up after itself too.
         let effects_b = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
@@ -1011,6 +1012,37 @@ impl<'a> TurnEngine<'a> {
     /// A granted heavy command also carries the job count the controller
     /// divided over the builds already running, which rides on a runner clone
     /// for this one command; a light command keeps the default parallelism.
+    /// [`run_gated`] with an environment overlay layered on top of the
+    /// sanitized environment (see [`AgentRunner::with_extra_env`]).
+    async fn run_gated_with_env(
+        &mut self,
+        command: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<(String, Option<i32>)> {
+        let heavy = crate::agent::is_heavy_command(command);
+        let build_permit = if heavy {
+            Some(self.pool.admission.acquire().await)
+        } else {
+            None
+        };
+        let _bash_permit = self
+            .pool
+            .bash_semaphore
+            .acquire()
+            .await
+            .context("Bash semaphore closed")?;
+        let mut runner = self.runner.clone().with_extra_env(extra_env);
+        if let Some(permit) = &build_permit {
+            runner = runner.with_build_jobs(permit.jobs());
+        }
+        runner.build_target_dir = if heavy {
+            self.worktree.build_dir().await
+        } else {
+            self.worktree.leased_build_dir().map(Path::to_path_buf)
+        };
+        runner.execute_bash(&self.worktree.path, command).await
+    }
+
     async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {

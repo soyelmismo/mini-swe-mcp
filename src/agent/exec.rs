@@ -195,10 +195,21 @@ impl AgentRunner {
 
         // Cleared environment + strict allow-list first, so no ambient
         // credential from the operator's shell reaches the model. Build/cache
-        // variables are layered on top afterwards.
+        // variables are layered on top afterwards, then the per-command
+        // overlay (the differential verify gate's divergent environment), so
+        // the divergent values win over every default.
         apply_sanitized_environment(&mut cmd, dir);
         apply_build_env(&mut cmd, target_dir.as_deref(), &tmp_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
+        for (name, value) in &self.extra_env {
+            // The overlay is the variant-B environment: credential-bearing
+            // names are refused here as well, so a tampered snapshot can never
+            // ride the extra env into a child.
+            if crate::agent::env::is_secret_name(name) {
+                continue;
+            }
+            cmd.env(name, value);
+        }
 
         run_with_timeout(&mut cmd, timeout_secs).await
     }
