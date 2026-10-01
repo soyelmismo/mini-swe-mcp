@@ -345,3 +345,38 @@ async fn a_reported_round_never_replays() {
     drop(harness.hub);
 }
 
+
+/// The MCP `watch` action reaches the same consolidated round through
+/// `all: true`, with no hub in between.
+#[tokio::test]
+async fn the_mcp_watch_action_returns_the_round_with_all_true() {
+    let isolated = common::IsolatedPool::new(4, "watch-all-mcp");
+    for id in ["w-1", "w-2", "w-3"] {
+        add_running(&isolated.pool, id).await;
+        set_completed(&isolated.pool, id).await;
+    }
+    let server = McpServer::new(isolated.pool.clone(), "test".to_string());
+    let ctx = mini_swe_mcp::mcp::ConnectionContext {
+        agent_id: Some(OWNER.to_string()),
+        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(3)
+    };
+
+    let result = server
+        .execute_tool_for(
+            "worker",
+            json!({"action": "watch", "all": true, "group": GROUP, "timeout_secs": 5}),
+            &ctx,
+        )
+        .await
+        .expect("the round watch must answer");
+
+    assert_eq!(result["status"], "event", "{result}");
+    let events = result["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1, "one event for the round: {result}");
+    assert_eq!(events[0]["event"], "round", "{result}");
+    assert_eq!(
+        events[0]["workers"].as_array().map(Vec::len),
+        Some(3),
+        "{result}"
+    );
+}
