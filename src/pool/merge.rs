@@ -25,6 +25,7 @@
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
 //! here assumes a language or a test runner.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -32,7 +33,15 @@ use anyhow::{Context, Result};
 
 use super::registry::load_registry_entry_in;
 use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
+use crate::agent::sandbox::truncate_with_dropped;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
+
+/// Bytes kept per stream of a gate run before the rest is counted and dropped.
+///
+/// A verify command's output is untrusted in size: the gate must not buffer a
+/// gigabyte of build log to decide whether it passed. The remainder is counted
+/// rather than kept, so the elision the refusal reports stays honest.
+const GATE_OUTPUT_LIMIT: usize = crate::agent::sandbox::TRUNCATE_LIMIT;
 
 /// How many trailing lines of a failed gate a refusal carries.
 ///
@@ -491,22 +500,74 @@ fn run_gate(
     );
 }
 
-/// Run `command` in `dir`, returning its exit status and its combined output.
+/// Run `command` in `dir`, returning its exit status and its bounded output.
+///
+/// Both streams are drained concurrently on their own threads: a child that
+/// fills one pipe while the parent blocks reading the other would otherwise
+/// deadlock, and the gate is the one place a merge waits on untrusted output.
 fn run_gate_command(dir: &Path, command: &str) -> Result<(Option<i32>, String)> {
-    let output = Command::new("sh")
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("could not run the verify gate: {command}"))?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("the gate's stdout was not captured"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("the gate's stderr was not captured"))?;
+    let (out, err) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| read_bounded(&mut stdout, GATE_OUTPUT_LIMIT));
+        let b = scope.spawn(|| read_bounded(&mut stderr, GATE_OUTPUT_LIMIT));
+        (a.join(), b.join())
+    });
+    let status = child
+        .wait()
+        .with_context(|| format!("the verify gate {command} could not be reaped"))?;
+    let (stdout, stdout_dropped) =
+        out.map_err(|_| anyhow::anyhow!("the gate's stdout reader panicked"))??;
+    let (stderr, stderr_dropped) =
+        err.map_err(|_| anyhow::anyhow!("the gate's stderr reader panicked"))??;
+
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+    if !stderr.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        text.push_str(&String::from_utf8_lossy(&stderr));
     }
-    Ok((output.status.code(), text))
+    Ok((
+        status.code(),
+        truncate_with_dropped(&text, stdout_dropped + stderr_dropped),
+    ))
+}
+
+/// Read at most `limit` bytes from `reader`, plus how many bytes followed them.
+///
+/// The tail is what a failing gate has to show, so the head is kept and the
+/// overflow counted; the caller hands both to the crate's shared truncation.
+fn read_bounded<R: std::io::Read>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut kept = Vec::new();
+    (&mut *reader).take(limit as u64).read_to_end(&mut kept)?;
+    let mut dropped = 0usize;
+    let mut sink = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut sink)?;
+        if read == 0 {
+            break;
+        }
+        dropped += read;
+    }
+    Ok((kept, dropped))
 }
 
 /// The ref the gate worktree is created at: the base branch tip.

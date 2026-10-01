@@ -250,6 +250,46 @@ fn failing_gate_refuses_and_reports_the_tail() {
     assert!(f.history_exists("w3"), "a refused merge keeps the history");
 }
 
+/// A gate that prints far more than the budget is refused with a *bounded*
+/// report: the head and the failing tail survive, the overflow is counted.
+///
+/// The gate must not buffer an arbitrary command's output to decide whether it
+/// passed, so this also proves the capture is bounded rather than merely
+/// truncated after the fact.
+#[test]
+fn a_flooding_gate_is_refused_with_a_bounded_report() {
+    let f = Fixture::new("merge-flood");
+    f.commit_on_worker_branch("w12", "worker.txt", "from the worker\n");
+    f.commit_on_base("base.txt", "from the base\n");
+    // 200 KiB of noise, then the line that actually says what failed.
+    f.record_worker(
+        "w12",
+        Some("head -c 204800 /dev/zero | tr '\\0' x; echo; echo THE-FINAL-FAILURE; exit 1"),
+    );
+
+    let err = f
+        .merge("w12", None, false)
+        .expect_err("a failing gate must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("THE-FINAL-FAILURE"),
+        "the failing tail must survive: {}",
+        msg.len()
+    );
+    assert!(
+        msg.contains("[Truncated "),
+        "the elided bytes must be reported: {}",
+        msg.len()
+    );
+    // Far below the 200 KiB the command printed.
+    assert!(
+        msg.len() < 65_536,
+        "the refusal must stay bounded, was {} bytes",
+        msg.len()
+    );
+    assert!(git_ref_exists(f.repo(), "worker-w12"), "nothing was merged");
+}
+
 /// A conflicting branch is refused with the steer hint that fixes it.
 #[test]
 fn conflict_is_refused_with_the_steer_hint() {
