@@ -69,14 +69,49 @@ pub(crate) fn sweep_worker_processes_named(
     worker_id: &str,
     dirs: &[PathBuf],
 ) -> Vec<ReapedProcess> {
-    let targets = sweep_owned_processes(worker_id, dirs, std::process::id());
-    targets
-        .iter()
+    let hub_pid = std::process::id();
+    // A command that just returned can still have children on their way out
+    // (test binaries, build helpers, zombies awaiting their parent): only a
+    // process that is still there after a short settle, and not a zombie, was
+    // left behind. Its name is read before any signal, so it is never empty.
+    let first = owned_processes_in_dirs(dirs, hub_pid);
+    if first.is_empty() {
+        return Vec::new();
+    }
+    std::thread::sleep(SETTLE);
+    let lingering: Vec<ReapedProcess> = owned_processes_in_dirs(dirs, hub_pid)
+        .into_iter()
+        .filter(|pid| first.contains(pid) && !is_zombie(*pid))
         .map(|pid| ReapedProcess {
-            pid: *pid,
-            command: comm_of(*pid),
+            pid,
+            command: comm_of(pid),
         })
-        .collect()
+        .filter(|process| !process.command.is_empty())
+        .collect();
+    if lingering.is_empty() {
+        return lingering;
+    }
+    sweep_owned_processes(worker_id, dirs, hub_pid);
+    lingering
+}
+
+/// How long the audit lets a just-finished command's children exit on their
+/// own before it counts them as left behind.
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether `pid` is a zombie (state `Z` in `/proc/<pid>/stat`): it already
+/// exited and only waits to be reaped by its parent.
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let after_comm = stat.rsplit_once(')')?.1;
+            after_comm
+                .split_whitespace()
+                .next()
+                .map(|state| state == "Z")
+        })
+        .unwrap_or(true)
 }
 
 /// `/proc/<pid>/comm`, or the empty string when it is no longer readable.
@@ -401,6 +436,44 @@ fn signal_pid(_pid: u32, _sig: i32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audit only names processes that really stay: a child that exits on
+    /// its own during the settle and a zombie are not "left behind", and a
+    /// lingering one is reported with its name (read before it is killed).
+    #[test]
+    fn the_named_sweep_ignores_exiting_children_and_zombies() {
+        let dir = std::env::temp_dir().join(format!("reap-settle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let dirs = vec![dir.clone()];
+
+        let mut quick = std::process::Command::new("sleep")
+            .arg("0.1")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn a short-lived child");
+        let zombie = std::process::Command::new("true")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn a child left unreaped");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            sweep_worker_processes_named("settle-test", &dirs).is_empty(),
+            "exiting children and zombies are not leftovers"
+        );
+        let _ = quick.wait();
+        drop(zombie);
+
+        let mut lingering = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .expect("spawn a lingering child");
+        let reaped = sweep_worker_processes_named("settle-test", &dirs);
+        let _ = lingering.wait();
+        assert_eq!(reaped.len(), 1, "{reaped:?}");
+        assert_eq!(reaped[0].command, "sleep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::process::{Command, Stdio};
 
     /// A scratch directory under the same base the crate's worktrees use, so a
