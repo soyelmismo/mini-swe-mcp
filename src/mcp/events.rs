@@ -22,6 +22,7 @@
 //! the polling loop are kept apart so the decision is testable on its own.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -481,6 +482,107 @@ impl Drop for WatchGuard {
     }
 }
 
+/// File name of the persisted per-owner acknowledged watch positions.
+const WATCH_ACKS_FILE: &str = "watch_acks.json";
+/// How many owners the persisted store keeps, oldest evicted first.
+const MAX_ACK_OWNERS: usize = 1024;
+/// How many workers one owner's persisted store keeps.
+const MAX_ACK_WORKERS: usize = 4096;
+/// Snapshot key marking a terminal worker whose branch is merged into its base
+/// or no longer exists, so its event must never be replayed.
+const BRANCH_GONE_OR_MERGED: &str = "branch_gone_or_merged";
+
+/// The revision and kind of the last event an owner acknowledged for a worker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AckPosition {
+    revision: u64,
+    event: String,
+}
+
+/// Per-owner acknowledged watch positions, persisted so the first watch after a
+/// daemon restart does not replay events the owner already saw.
+///
+/// `path` is `None` for the stdio router and for unit tests, which keeps the
+/// store entirely in memory; the hub daemon points it at
+/// `<hub dir>/watch_acks.json`.
+#[derive(Default)]
+struct AckStore {
+    path: Option<PathBuf>,
+    positions: BTreeMap<String, BTreeMap<String, AckPosition>>,
+}
+
+impl AckStore {
+    /// Load the store under `dir`. A missing or unreadable file is an empty
+    /// store, never an error: losing the cache costs a replay, not correctness.
+    fn load(&mut self, dir: &Path) {
+        let path = dir.join(WATCH_ACKS_FILE);
+        self.positions = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        self.trim();
+        self.path = Some(path);
+    }
+
+    /// Whether `owner` already acknowledged exactly this `(revision, kind)` for
+    /// `wid`, so it must not be replayed.
+    fn acknowledged(&self, owner: &str, wid: &str, revision: u64, event: &str) -> bool {
+        self.positions
+            .get(owner)
+            .and_then(|workers| workers.get(wid))
+            .is_some_and(|p| p.revision == revision && p.event == event)
+    }
+
+    /// Remember `owner`'s newest acknowledged position for `wid` and persist it.
+    fn record(&mut self, owner: &str, wid: &str, revision: u64, event: &str) {
+        self.positions.entry(owner.to_string()).or_default().insert(
+            wid.to_string(),
+            AckPosition {
+                revision,
+                event: event.to_string(),
+            },
+        );
+        self.trim();
+        self.persist();
+    }
+
+    /// Keep the store bounded: owners and per-owner workers oldest-first.
+    fn trim(&mut self) {
+        while self.positions.len() > MAX_ACK_OWNERS {
+            let Some(oldest) = self.positions.keys().next().cloned() else {
+                break;
+            };
+            self.positions.remove(&oldest);
+        }
+        for workers in self.positions.values_mut() {
+            while workers.len() > MAX_ACK_WORKERS {
+                let Some(oldest) = workers.keys().next().cloned() else {
+                    break;
+                };
+                workers.remove(&oldest);
+            }
+        }
+    }
+
+    /// Write the store atomically at 0600. A failure is logged, never fatal.
+    fn persist(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string(&self.positions) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text.as_bytes()).is_ok() {
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct EventRouter {
     latest: VecDeque<(Option<String>, ChannelEvent)>,
@@ -492,6 +594,8 @@ pub(super) struct EventRouter {
     /// published and JSON event shapes are unchanged.
     seen: BTreeMap<String, u64>,
     watch_history: BTreeMap<String, WatchHistory>,
+    /// Per-owner acknowledged positions, persisted across a daemon restart.
+    acks: AckStore,
     watches: Arc<WatchRegistry>,
     sequence: u64,
 }
@@ -554,6 +658,12 @@ impl EventRouter {
     /// answer can drop the "start this" line the caller has already acted on.
     pub(super) fn has_watch(&self, identity: &str) -> bool {
         self.watches.has(identity)
+    }
+
+    /// Load the persisted acknowledged positions from the hub directory. Called
+    /// once at daemon start, before the watcher observes any worker.
+    pub(super) fn load_ack_store(&mut self, dir: &Path) {
+        self.acks.load(dir);
     }
 
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
@@ -1041,6 +1151,53 @@ struct WatchHistory {
     last_sequence: u64,
 }
 
+/// Whether a terminal worker's branch is merged into its base or no longer
+/// exists, so its event must never be replayed.
+///
+/// A merge deletes the worker branch and keeps the registry row, so after a
+/// daemon restart the row still reads `completed` and would otherwise replay.
+/// An unreadable or unknown repository is not suppression: only a branch we can
+/// prove gone or merged counts.
+fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
+    if !matches!(
+        entry.status,
+        RegistryStatus::Completed | RegistryStatus::Failed | RegistryStatus::Exhausted
+    ) {
+        return false;
+    }
+    let Some(repo) = entry
+        .repo_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.is_dir())
+    else {
+        return false;
+    };
+    let branch = format!("worker-{}", entry.id);
+    if !crate::worktree::git(
+        repo,
+        "rev-parse --verify --quiet",
+        &["rev-parse", "--verify", "--quiet", &branch],
+    )
+    .is_ok_and(|o| o.status.success())
+    {
+        // The ref is gone: merged with branch cleanup, pruned, or reclaimed.
+        return true;
+    }
+    entry
+        .base_branch
+        .as_deref()
+        .filter(|base| !base.is_empty())
+        .is_some_and(|base| {
+            crate::worktree::git(
+                repo,
+                "merge-base --is-ancestor",
+                &["merge-base", "--is-ancestor", &branch, base],
+            )
+            .is_ok_and(|o| o.status.success())
+        })
+}
+
 /// Read bounded watch facts in the daemon, without collecting the worker.
 async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     use crate::cli::watch::{enrich_state, registry_snapshot};
@@ -1048,7 +1205,13 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     let mut views: crate::cli::watch::Snapshot =
         crate::pool::load_all_registry_entries_in(pool.scratch_root())
             .iter()
-            .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
+            .map(|entry| {
+                let mut view = registry_snapshot(entry, now);
+                if branch_replay_suppressed(entry) {
+                    view[BRANCH_GONE_OR_MERGED] = json!(true);
+                }
+                (entry.id.clone(), view)
+            })
             .collect();
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
@@ -1181,9 +1344,31 @@ impl EventRouter {
                 }
                 continue;
             }
+            // A terminal worker whose branch is merged into its base or already
+            // gone has no work left to report: replaying it after a restart
+            // would tell the owner to review work that is already landed.
+            if view[BRANCH_GONE_OR_MERGED] == true {
+                self.watch_reported.remove(id);
+                self.seen.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| event["worker_id"] != *id);
+                }
+                continue;
+            }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
             {
+                // The owner already acknowledged this exact transition before
+                // this daemon started, so a restart must not replay it as a
+                // missed event.
+                if self.acks.acknowledged(
+                    event["owner"].as_str().unwrap_or("unattributed"),
+                    id,
+                    event["revision"].as_u64().unwrap_or(0),
+                    event["event"].as_str().unwrap_or(""),
+                ) {
+                    continue;
+                }
                 // One transition is one event, whichever view describes it:
                 // the live snapshot and the registry row of the same revision
                 // share the key `(worker id, revision, kind)` and must not be
@@ -1348,32 +1533,51 @@ impl EventRouter {
         if let Some(history) = self.watch_history.get_mut(owner) {
             history.pending.retain(|v| v["worker_id"] != wid);
         }
-        if let Some(sequence) = self
-            .watch_reported
-            .get(wid)
-            .and_then(|v| v["sequence"].as_u64())
-        {
-            self.seen.insert(wid.to_string(), sequence);
+        if let Some(event) = self.watch_reported.get(wid) {
+            if let Some(sequence) = event["sequence"].as_u64() {
+                self.seen.insert(wid.to_string(), sequence);
+            }
+            // An interaction is the owner looking at the worker directly, so
+            // persist the position: a restart must not replay it either.
+            self.acks.record(
+                owner,
+                wid,
+                event["revision"].as_u64().unwrap_or(0),
+                event["event"].as_str().unwrap_or(""),
+            );
         }
     }
 
     fn acknowledge_watch(&mut self, ctx: &super::server::ConnectionContext, sequence: u64) {
         let owner = ctx.agent();
+        // Collect first: the pending deque is borrowed mutably below, while the
+        // acknowledged positions are recorded on `self` afterwards.
+        let mut acknowledged = Vec::new();
         for (agent, history) in &mut self.watch_history {
             if !ctx.is_admin() && *agent != owner {
                 continue;
             }
-            if history
-                .pending
-                .iter()
-                .any(|v| v["sequence"].as_u64() == Some(sequence))
-            {
-                history
-                    .pending
-                    .retain(|v| v["sequence"].as_u64() != Some(sequence));
+            let mut matched = false;
+            history.pending.retain(|v| {
+                if v["sequence"].as_u64() != Some(sequence) {
+                    return true;
+                }
+                matched = true;
+                acknowledged.push((
+                    agent.clone(),
+                    v["worker_id"].as_str().unwrap_or("").to_string(),
+                    v["revision"].as_u64().unwrap_or(0),
+                    v["event"].as_str().unwrap_or("").to_string(),
+                ));
+                false
+            });
+            if matched {
                 history.cursor = history.cursor.max(sequence);
                 history.dropped = 0;
             }
+        }
+        for (agent, wid, revision, event) in acknowledged {
+            self.acks.record(&agent, &wid, revision, &event);
         }
     }
 }
