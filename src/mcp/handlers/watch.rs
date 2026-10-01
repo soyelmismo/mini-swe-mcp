@@ -62,10 +62,7 @@ impl McpServer {
         // re-checked on each poll, so a later dispatch joins automatically. An
         // explicit id set stays fixed for the whole call.
         let explicit = !ids.is_empty();
-        // One name or several: an orchestrator with rounds running at the same
-        // time names them all in the same call, and `--all` without any group
-        // covers every live group of the caller.
-        let groups = crate::mcp::events::watch_groups(args);
+        let group = args.get("group").and_then(Value::as_str);
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
         let timeout = Self::get_timeout(args, "watch")?;
         // A named worker must exist and be the caller's own: watching a
@@ -86,7 +83,7 @@ impl McpServer {
         let mut initial = true;
         let mut watched_any = false;
         loop {
-            let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
+            let reply = self.watch_poll(ctx, &ids, group, initial, all).await?;
             let events = reply["events"].as_array().cloned().unwrap_or_default();
             if !events.is_empty() {
                 // Acknowledge what was delivered: the router's per-agent
@@ -160,13 +157,13 @@ impl McpServer {
         &self,
         ctx: &crate::mcp::server::ConnectionContext,
         ids: &std::collections::BTreeSet<String>,
-        groups: &std::collections::BTreeSet<String>,
+        group: Option<&str>,
         initial: bool,
         all: bool,
     ) -> Result<Value> {
         let params = json!({
             "worker_ids": ids.iter().collect::<Vec<_>>(),
-            "group": groups,
+            "group": group,
             "initial": initial,
             "all": all,
         });
@@ -193,9 +190,11 @@ impl McpServer {
 pub(in crate::mcp) const WORKER_IDS_DESCRIPTION: &str =
     "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.";
 
-pub(in crate::mcp) const GROUP_DESCRIPTION: &str = "Only workers of this group, or of several groups as an array (one watch covers them all). For 'watch' and 'merge --approved'.";
+pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
+    "Only workers of this group, or of several as an array (one watch covers all). For 'watch' and 'merge --approved'.";
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str =
     "Watch deadline seconds; expiry: no_event.";
 
-pub(in crate::mcp) const ALL_DESCRIPTION: &str = "Watch whole rounds as one event each, listing the round that stops or needs input; without 'group' or worker_ids, every live group of yours.";
+pub(in crate::mcp) const ALL_DESCRIPTION: &str =
+    "Watch whole rounds as one event each, naming the round that stops; with no 'group', every live group of yours.";
