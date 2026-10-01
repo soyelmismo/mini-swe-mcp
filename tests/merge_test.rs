@@ -451,6 +451,46 @@ fn merge_never_pushes() {
     );
 }
 
+/// A leftover worktree that is still *registered* on the worker branch must not
+/// block the branch deletion: the sweep runs before `git branch -D`.
+#[test]
+fn a_registered_leftover_worktree_does_not_block_the_branch_deletion() {
+    let f = Fixture::new("merge-registered-leftover");
+    f.commit_on_worker_branch("w11", "worker.txt", "from the worker\n");
+    f.record_worker("w11", None);
+    f.record_status("w11", RegistryStatus::Completed);
+    let registered = f.scratch.path().join("swe-wt-w11");
+    git(
+        f.repo(),
+        &[
+            "worktree",
+            "add",
+            &registered.to_string_lossy(),
+            "worker-w11",
+        ],
+    );
+    assert!(
+        common::worktree_is_registered(f.repo(), &registered),
+        "the fixture must leave a registered worktree behind"
+    );
+
+    f.merge("w11", Some(true), false)
+        .expect("a registered leftover must not block the merge");
+
+    assert!(
+        !git_ref_exists(f.repo(), "worker-w11"),
+        "the branch must be deleted even with a leftover worktree"
+    );
+    assert!(
+        !registered.exists(),
+        "the leftover worktree must be reclaimed"
+    );
+    assert!(
+        !common::worktree_is_registered(f.repo(), &registered),
+        "the leftover worktree must be unregistered"
+    );
+}
+
 fn msg_names(err: &anyhow::Error, needle: &str) -> bool {
     err.to_string().contains(needle)
 }

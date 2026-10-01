@@ -565,7 +565,7 @@ fn merge_subject(task: &str, worker_id: &str) -> String {
     format!("{subject} (worker {worker_id})")
 }
 
-/// Post-merge cleanup: the branch, the history file and the worktree leftovers.
+/// Post-merge cleanup: the worktree leftovers, the branch and the history file.
 ///
 /// Reuses the same helpers the prune sweep uses, so a merged worker leaves
 /// exactly what a pruned one does. The registry row survives: `status` and
@@ -577,27 +577,26 @@ fn cleanup(
     branch: &str,
     keep_branch: bool,
 ) -> (bool, Vec<String>) {
-    let mut cleaned = Vec::new();
-    let branch_deleted = if keep_branch {
-        false
-    } else {
-        let deleted =
-            git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
-        if deleted {
-            cleaned.push(format!("branch {branch} deleted"));
-        }
-        deleted
-    };
-    remove_worker_history_in(root, worker_id);
-    cleaned.push("history file removed".to_string());
-
-    // A finished worker's worktree is gone already; reclaim whatever a crashed
-    // run left, plus its private scratch and target directories.
+    // The worktree goes first: a leftover that is still registered would make
+    // the branch undeletable, and `git worktree prune` clears the registration
+    // once its directory is gone.
     let worktree = root.join(format!("swe-wt-{worker_id}"));
-    if worktree.exists() {
+    let reclaimed = worktree.exists();
+    if reclaimed {
         force_remove_dir(&worktree);
         remove_target_dirs_in(root, &worktree);
         let _ = git(repo, "worktree prune", &["worktree", "prune"]);
+    }
+    let branch_deleted = !keep_branch
+        && git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
+    remove_worker_history_in(root, worker_id);
+
+    let mut cleaned = Vec::new();
+    if branch_deleted {
+        cleaned.push(format!("branch {branch} deleted"));
+    }
+    cleaned.push("history file removed".to_string());
+    if reclaimed {
         cleaned.push("worktree leftovers removed".to_string());
     }
     (branch_deleted, cleaned)
