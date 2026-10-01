@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 pub type Snapshot = BTreeMap<String, Value>;
 
 /// The workflow shared by CLI help and the MCP tool description.
-pub const WORKFLOW: &str = "Write task as ONE focused concern with files in scope and an acceptance gate. Avoid parallel workers whose scopes share files. To wait, run `mini-swe-mcp watch` in the background: it blocks until an actionable event, prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event. After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer: it resumes on its branch with full context. Do not edit its branch yourself; merge only when it is right.";
+pub const WORKFLOW: &str = "Write task as ONE focused concern with files in scope and an acceptance gate. Avoid parallel workers whose scopes share files. To wait, run `mini-swe-mcp watch` in the background: it blocks until an actionable event, prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event. After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer: it resumes on its branch with full context. Do not edit its branch yourself; merge only when it is right.";
 
 #[derive(Default)]
 pub struct Options {
@@ -430,6 +430,10 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             .await
         {
             Ok(value) => value,
+            Err(error) if error.to_string().contains("a watch is already running") => {
+                println!("{error}");
+                return Ok(5);
+            }
             Err(error) if error.to_string().contains("belongs to agent") => {
                 println!("{error}");
                 return Ok(4);

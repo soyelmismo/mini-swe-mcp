@@ -648,6 +648,14 @@ impl McpServer {
         for id in &ids {
             self.require_owner(id, ctx).await?;
         }
+        // One watch per identity: reserve this call's slot up front and hold it
+        // until the call returns (or is cancelled), so a second watch is
+        // refused instead of silently competing for the same events.
+        let _slot = self
+            .hub_events
+            .lock()
+            .await
+            .begin_watch(&ctx.agent(), ctx.id, ctx.pid)?;
         let started = tokio::time::Instant::now();
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;

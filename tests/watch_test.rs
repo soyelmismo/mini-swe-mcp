@@ -776,6 +776,248 @@ fn a_no_arg_polling_watch_follows_late_dispatches_under_a_group() {
     assert!(!reported.contains(&"w-other".to_string()), "{stdout}");
 }
 
+/// One watch per identity: a second connection of the same agent is refused
+/// and named the first, another agent watches at the same time, and the slot
+/// frees when the holder disconnects.
+#[tokio::test]
+async fn the_daemon_allows_one_watch_per_identity() {
+    isolate_registry();
+    let dir = common::TempDir::new_in_tmp("wg-one-daemon");
+    let server = pool_with(vec![
+        record(
+            "w-one-a",
+            "agent-a",
+            WorkerState::Running {
+                step: 1,
+                last_command: "t".to_string(),
+                started_at: 0,
+            },
+        ),
+        record(
+            "w-one-b",
+            "agent-b",
+            WorkerState::Running {
+                step: 1,
+                last_command: "t".to_string(),
+                started_at: 0,
+            },
+        ),
+    ])
+    .await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.path().join("hub.sock");
+    wait_for_socket(&socket).await;
+    let watch = serde_json::json!({"worker_ids": [], "group": null, "initial": true});
+
+    let mut a1 = Raw::connect(&socket).await;
+    a1.request(
+        "hub/hello",
+        serde_json::json!({"agent_id": "agent-a", "pid": 1111}),
+    )
+    .await;
+    let reply = a1.request("hub/watch", watch.clone()).await;
+    assert!(reply.get("error").is_none(), "{reply:?}");
+
+    // A second connection of the same identity is refused, naming the first.
+    let mut a2 = Raw::connect(&socket).await;
+    a2.request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
+    let reply = a2.request("hub/watch", watch.clone()).await;
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("a watch is already running"), "{reply:?}");
+    assert!(message.contains("pid 1111"), "{reply:?}");
+
+    // A different identity watches at the same time.
+    let mut b = Raw::connect(&socket).await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
+        .await;
+    let reply = b.request("hub/watch", watch.clone()).await;
+    assert!(reply.get("error").is_none(), "{reply:?}");
+    assert!(
+        reply["result"]["watching"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&serde_json::json!("w-one-b"))),
+        "{reply:?}"
+    );
+
+    // Closing the holder frees the slot for the identity's next watch.
+    drop(a1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let a3 = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot must free when its connection closes"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut candidate = Raw::connect(&socket).await;
+        candidate
+            .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+            .await;
+        let reply = candidate.request("hub/watch", watch.clone()).await;
+        if reply.get("error").is_none() {
+            break candidate;
+        }
+    };
+    let _ = a3; // Keep the reconnected watch alive until the daemon stops.
+
+    task.abort();
+    let _ = task.await;
+}
+
+/// The MCP `watch` action obeys the same one-watch-per-identity rule.
+#[tokio::test]
+async fn the_mcp_watch_action_allows_one_watch_per_identity() {
+    isolate_registry();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-mcp-one",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool, "test".to_string()));
+
+    let first = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .execute_tool(
+                    "worker",
+                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
+                )
+                .await
+        }
+    });
+    // Let the first watch reserve the identity's slot.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let error = server
+        .execute_tool(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 10}),
+        )
+        .await
+        .expect_err("a second watch for the same identity must be refused");
+    assert!(
+        error.to_string().contains("a watch is already running"),
+        "{error}"
+    );
+
+    // A different identity may watch at the same time.
+    let other = mini_swe_mcp::mcp::ConnectionContext {
+        agent_id: Some("agent-other".to_string()),
+        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(9)
+    };
+    let reply = server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 0}),
+            &other,
+        )
+        .await
+        .expect("a different identity watches concurrently");
+    assert_eq!(reply["status"], "no_event", "{reply}");
+
+    // Cancelling the holder frees its slot.
+    first.abort();
+    let _ = first.await;
+    let reply = server
+        .execute_tool(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 0}),
+        )
+        .await
+        .expect("the freed slot accepts a new watch");
+    assert_eq!(reply["status"], "no_event", "{reply}");
+}
+
+/// The CLI maps a refused second watch of one session to exit code 5 and
+/// accepts a fresh watch once the holder has exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_cli_watch_for_one_session_exits_five() {
+    isolate_registry();
+    let hub = common::TempDir::new_in_tmp("wg-cli-hub");
+    let swe = common::TempDir::new_in_tmp("wg-cli-swe");
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    let owner = common::host_of_this_process();
+    pool.__test_insert_worker(record(
+        "w-cli-one",
+        &owner,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool, "test".to_string()));
+    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&hub.path().join("hub.sock")).await;
+
+    let spawn_watch = |timeout: &str| {
+        common::binary_command(&common::binary_path())
+            .args(["--json", "watch", "--timeout", timeout])
+            .env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", swe.path())
+            .env("TMPDIR", swe.path())
+            .env("OPENAI_API_KEY", "test-key-not-used")
+            .env("ENV_FILE", "/nonexistent-mini-swe-env")
+            .env(
+                "MODELS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn watch")
+    };
+    let mut first = spawn_watch("30");
+    // Let the first watch reserve the session's slot.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let second = spawn_watch("5");
+    let out = tokio::task::spawn_blocking(move || second.wait_with_output())
+        .await
+        .expect("the wait task stays alive")
+        .expect("the second watch exits");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("a watch is already running"), "{stdout}");
+
+    // Once the holder exits, the session may watch again.
+    let _ = first.kill();
+    let _ = first.wait();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let third = spawn_watch("2");
+    let out = tokio::task::spawn_blocking(move || third.wait_with_output())
+        .await
+        .expect("the wait task stays alive")
+        .expect("the third watch exits");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
 #[test]
 fn torn_down_worker_diff_stat_comes_from_its_branch() {
     let dir = common::TempDir::new_in_tmp("watch-branch");
