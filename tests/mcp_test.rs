@@ -1656,7 +1656,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         revision: 0,
         auto_continues: 0,
         approved: None,
-}
+    }
 }
 
 /// End to end: a worker that pauses after the server started is pushed into the

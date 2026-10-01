@@ -1524,7 +1524,8 @@ pub(super) struct MergeCheck {
 /// The merge-base commit `branch` shares with `base_branch`, or `None` when
 /// git cannot name one.
 fn merge_base(repo: &std::path::Path, base_branch: &str, branch: &str) -> Option<String> {
-    let output = crate::worktree::git(repo, "merge-base", &["merge-base", base_branch, branch]).ok()?;
+    let output =
+        crate::worktree::git(repo, "merge-base", &["merge-base", base_branch, branch]).ok()?;
     if !output.status.success() {
         return None;
     }

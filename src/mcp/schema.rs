@@ -15,8 +15,21 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "review", "approve", "unapprove", "logs",
-    "list", "kill", "reap", "manifest", "prune", "merge",
+    "dispatch",
+    "status",
+    "steer",
+    "watch",
+    "collect",
+    "review",
+    "approve",
+    "unapprove",
+    "logs",
+    "list",
+    "kill",
+    "reap",
+    "manifest",
+    "prune",
+    "merge",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -84,7 +97,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "tasks",
         "array",
         DescriptionSource::Static(
-            "Batch dispatch: {task, model?, ...} objects, one worker each; top-level values are defaults.",
+            "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
         ),
     ),
     (
@@ -160,7 +173,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model sampling temperature (overrides the default)."),
+        DescriptionSource::Static("Model temperature (overrides the default)."),
     ),
     (
         "review_after",
@@ -173,7 +186,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass '' to disable.",
+            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass an empty string to disable.",
         ),
     ),
     (

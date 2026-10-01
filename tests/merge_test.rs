@@ -106,8 +106,8 @@ impl Fixture {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
-                approved: None,
-};
+            approved: None,
+        };
         save_registry_entry_in(&self.root(), &entry);
     }
 

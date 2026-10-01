@@ -372,14 +372,8 @@ fn push_docs(out: &mut String, val: &serde_json::Value) {
     out.push_str("Docs:\n");
     for doc in docs {
         let path = doc.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let added = doc
-            .get("insertions")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let deleted = doc
-            .get("deletions")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let added = doc.get("insertions").and_then(|v| v.as_u64()).unwrap_or(0);
+        let deleted = doc.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
         out.push_str(&format!("  {path}  +{added} -{deleted}\n"));
     }
 }

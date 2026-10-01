@@ -141,7 +141,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         revision: 1,
         auto_continues: 0,
         approved: None,
-}
+    }
 }
 
 #[test]

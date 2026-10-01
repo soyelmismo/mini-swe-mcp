@@ -392,7 +392,8 @@ mod tests {
         assert_eq!(r.len(), 1);
     }
 
-    /// `review <id>` is a read like `status`: one positional, no flags.
+    /// `review <id>` is a read like `status`: one positional, plus the optional
+    /// diff scope, which maps to the same `diff` argument the MCP action reads.
     #[test]
     fn test_review_maps_its_positional_worker_id() {
         let out = tool_args("review", &args(&["mini-swe-mcp", "review", "w1"]), true)
@@ -400,6 +401,51 @@ mod tests {
             .unwrap();
         assert_eq!(out["action"], "review");
         assert_eq!(out["worker_id"], "w1");
+        assert!(
+            !out.contains_key("diff"),
+            "the default scope is implicit: {out:?}"
+        );
+
+        let scoped = tool_args(
+            "review",
+            &args(&["mini-swe-mcp", "review", "w1", "--diff", "all"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(scoped["worker_id"], "w1");
+        assert_eq!(scoped["diff"], "all");
+    }
+
+    /// `approve <id> ["note"]` maps the id and the note to the same `message`
+    /// argument the MCP action reads; `unapprove <id>` needs only the id.
+    #[test]
+    fn test_approve_maps_the_id_and_optional_note() {
+        let bare = tool_args("approve", &args(&["mini-swe-mcp", "approve", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare["action"], "approve");
+        assert_eq!(bare["worker_id"], "w1");
+        assert!(!bare.contains_key("message"), "{bare:?}");
+
+        let noted = tool_args(
+            "approve",
+            &args(&["mini-swe-mcp", "approve", "w1", "looks right"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(noted["message"], "looks right");
+
+        let back = tool_args(
+            "unapprove",
+            &args(&["mini-swe-mcp", "unapprove", "w1"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(back["action"], "unapprove");
+        assert_eq!(back["worker_id"], "w1");
     }
 
     /// `--full` and `--file` are the CLI spelling of the `collect` tool

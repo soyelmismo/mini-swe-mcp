@@ -1285,7 +1285,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         revision: 0,
         auto_continues: 0,
         approved: None,
-};
+    };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);
     let event = watch::select_event(&view, None, now).expect("a completed worker yields an event");

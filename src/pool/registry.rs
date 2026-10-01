@@ -213,8 +213,8 @@ impl WorkerMeta {
             base_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
-                approved: None,
-}
+            approved: None,
+        }
     }
 
     /// Persist one status update for this worker, unconditionally.
@@ -690,8 +690,8 @@ mod recovery_cleanup_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
-                approved: None,
-}
+            approved: None,
+        }
     }
 
     /// The sweep releases the worktree registration so `steer` can reattach to
