@@ -563,8 +563,20 @@ mod tests {
         assert!(with_diff.starts_with("--- a\n+++ b\n"));
         assert!(with_diff.ends_with("total_steps: 2"));
 
+        // The default collect withholds the diff, so the per-file stat is what
+        // the view reports in its place.
+        let stat_only = format_collect(&v(
+            r#"{"worker_id":"w","diff_stat":{"files":2,"insertions":3,"deletions":1,
+                 "per_file":[{"path":"a.rs","insertions":3,"deletions":0},
+                             {"path":"b.rs","insertions":0,"deletions":1}]}}"#,
+        ));
+        assert_eq!(
+            stat_only,
+            "Worker w: 2 files, +3 -1\n  a.rs  +3 -0\n  b.rs  +0 -1\nno step logs"
+        );
+
         let without = format_collect(&v(r#"{"worker_id":"w","diff":"  "}"#));
-        assert_eq!(without, "Worker w: No git diff produced.\nno step logs");
+        assert_eq!(without, "Worker w: no diff measured\nno step logs");
     }
 
     #[test]
