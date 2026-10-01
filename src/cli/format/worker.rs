@@ -455,6 +455,18 @@ mod tests {
         serde_json::from_str(s).expect("fixture must be valid JSON")
     }
 
+    /// A batch dispatch renders one line per entry, including the entries that
+    /// failed, so a partial failure is visible at a glance.
+    #[test]
+    fn test_format_dispatch_renders_a_batch() {
+        let out = format_dispatch(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1","network":"allow"},{"index":1,"error":"'task' is required"}],"dispatched":1,"failed":1}"#,
+        ));
+        assert!(out.contains("Batch dispatch: 1 started, 1 failed"), "{out}");
+        assert!(out.contains("Task 0: worker w1 dispatched"), "{out}");
+        assert!(out.contains("Task 1 failed: 'task' is required"), "{out}");
+    }
+
     #[test]
     fn test_format_status_covers_string_tagged_and_object_states() {
         let bare = format_status(&v(r#"{"worker_id":"w","state":"Running"}"#));

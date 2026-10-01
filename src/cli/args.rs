@@ -523,7 +523,12 @@ mod tests {
         )
         .expect("write batch file");
 
-        let argv = args(&["mini-swe-mcp", "dispatch", "-f", path.to_str().expect("utf8")]);
+        let argv = args(&[
+            "mini-swe-mcp",
+            "dispatch",
+            "-f",
+            path.to_str().expect("utf8"),
+        ]);
         let out = tool_args("dispatch", &argv, true).unwrap().unwrap();
         assert_eq!(out["action"], "dispatch");
         assert!(
