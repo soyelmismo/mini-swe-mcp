@@ -408,8 +408,8 @@ fn git_ok(repo: &Path, args: &[&str]) -> bool {
 mod round_tests {
     use super::*;
 
-    /// A worker row for the section's bounds: one that always needs
-    /// its per-worker truncation, and one heading-only task.
+    /// A worker row for the section's bounds, with the compact
+    /// `task` derived from the full text the way `build` derives it.
     fn worker(id: &str, full_task: &str) -> RoundWorker {
         RoundWorker {
             id: id.to_string(),
@@ -421,36 +421,95 @@ mod round_tests {
         }
     }
 
-    /// The whole section, footer included, stays inside the documented
-    /// budget: the omitted-count footer is reserved space, not a
-    /// suffix that pushes the section past the cap.
+    /// The footer is reserved space, not a suffix: entries stop
+    /// `FOOTER_BUDGET` early, so the finished section — footer
+    /// included — never exceeds `FULL_TASKS_BUDGET`.
+    ///
+    /// The crafting is exact: full 4 KiB tasks fill the entry
+    /// budget whole, then one task sized to fill the remaining
+    /// bytes exactly, then a task only the unreserved
+    /// implementation still admits, then one more worker neither
+    /// admits. Without the reservation that middle task was
+    /// admitted and the omitted-count footer was appended outside
+    /// the budget, past the cap.
     #[test]
-    fn the_full_task_section_never_exceeds_its_budget() {
-        let many = RoundManifest {
+    fn the_full_task_section_reserves_the_footer_before_admitting_entries() {
+        // The header's own bytes, measured from a rendered section
+        // so the test follows the header's text.
+        let probe = RoundManifest {
             group: "g".to_string(),
             base_branch: None,
-            ready: (0..8)
-                .map(|i| {
-                    worker(
-                        &format!("w{i}"),
-                        &format!("heading {i}\n{}", "z".repeat(4 * 1024)),
-                    )
-                })
-                .collect(),
+            ready: vec![worker("w0", "probe")],
             not_ready: Vec::new(),
             interaction_points: Vec::new(),
         };
-        let section = many.render_full_tasks();
+        let header_len = probe
+            .render_full_tasks()
+            .find("### ")
+            .expect("the section opens with its header");
+
+        // One `  ### wN:\n<task>\n` entry: a two-character id
+        // around a task bounded by the per-worker budget.
+        let full_entry = FULL_TASK_BUDGET + "### w0:\n".len() + "\n".len();
+        let reserved = FULL_TASKS_BUDGET
+            .saturating_sub(header_len)
+            .saturating_sub(FOOTER_BUDGET);
+        let full_entries = reserved / full_entry;
+        let leftover = reserved - full_entries * full_entry;
+        assert!(
+            leftover >= "### w0:\n".len() + "\n".len(),
+            "the crafted round needs room for the exact filler: {leftover}"
+        );
+
+        let mut ready = Vec::new();
+        for i in 0..full_entries {
+            // A task of exactly the per-worker budget: embedded
+            // whole, never truncated.
+            ready.push(worker(
+                &format!("w{}", i + 1),
+                &"a".repeat(FULL_TASK_BUDGET),
+            ));
+        }
+        // The task that fills the reserved bytes exactly.
+        let filler = "b".repeat(leftover - "### w0:\n".len() - "\n".len());
+        ready.push(worker(&format!("w{}", full_entries + 1), &filler));
+        // A task the unreserved budget still admits (it leaves
+        // `FOOTER_BUDGET` bytes free) but the reserved one does
+        // not: the regression's tell-tale.
+        let smuggled = "c".repeat(FOOTER_BUDGET - "### w0:\n".len() - "\n".len());
+        ready.push(worker(&format!("w{}", full_entries + 2), &smuggled));
+        // One more worker neither implementation admits, so both
+        // write the omitted-count footer the section is bounded by.
+        ready.push(worker(
+            &format!("w{}", full_entries + 3),
+            &"d".repeat(FOOTER_BUDGET),
+        ));
+
+        let manifest = RoundManifest {
+            group: "g".to_string(),
+            base_branch: None,
+            ready,
+            not_ready: Vec::new(),
+            interaction_points: Vec::new(),
+        };
+        let section = manifest.render_full_tasks();
+        assert!(
+            section.contains(&filler),
+            "the task filling the reserved bytes is embedded whole: {section}"
+        );
+        assert!(
+            !section.contains(&smuggled),
+            "the entry only the unreserved budget admits must be omitted: {section}"
+        );
         assert!(
             section.contains("omitted"),
-            "a round this size must leave workers out: {section}"
+            "the workers the budget left out are counted: {section}"
         );
         assert!(
             section.len() <= FULL_TASKS_BUDGET,
-            "the footer is reserved space, not an addition: {} bytes over {}: {}",
+            "the footer is reserved space, not an addition: {} bytes over {}",
             section.len().saturating_sub(FULL_TASKS_BUDGET),
             FULL_TASKS_BUDGET,
-            &section[section.len().saturating_sub(160).min(section.len())..],
         );
     }
 
@@ -474,8 +533,10 @@ mod round_tests {
         assert!(section.len() <= FULL_TASKS_BUDGET);
     }
 
-    /// The per-worker bound holds exactly at the budget and never
-    /// splits a code point: a task one byte over keeps its marker.
+    /// The per-worker bound holds exactly at the budget, and a cut
+    /// never splits a code point: a task one byte over keeps its
+    /// marker, and a multi-byte task is cut before the code point,
+    /// not inside it.
     #[test]
     fn a_task_is_bounded_per_worker_without_splitting_a_code_point() {
         let exact = "a".repeat(FULL_TASK_BUDGET);
@@ -487,6 +548,16 @@ mod round_tests {
             "an oversized task must be marked: {bounded}"
         );
         assert!(bounded.len() <= FULL_TASK_BUDGET, "{bounded}");
-        assert!(bounded.is_char_boundary(bounded.len()));
+
+        // A 3-byte code point straddling the cut: the head ends
+        // before it, so the result is whole characters plus the
+        // marker, never a split code point.
+        let head = "a".repeat(FULL_TASK_BUDGET - TASK_TRUNCATION_MARKER.len() - 2);
+        let multi = format!("{head}{}", "\u{2022}".repeat(6));
+        assert_eq!(
+            bound_task(&multi, FULL_TASK_BUDGET),
+            format!("{head}{TASK_TRUNCATION_MARKER}"),
+            "the cut must land before the bullet, not inside it"
+        );
     }
 }
