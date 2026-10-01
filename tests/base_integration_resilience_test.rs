@@ -57,9 +57,9 @@ async fn stopped(pool: &WorkerPool, root: &ScratchRoot, id: &str) -> WorkerState
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Some(state) = pool.get_worker_state(id).await
-                && matches!(
+                && !matches!(
                     state,
-                    WorkerState::Completed { .. } | WorkerState::Failed { .. }
+                    WorkerState::Running { .. } | WorkerState::Paused { .. }
                 )
                 && !root.join(format!("swe-wt-{id}")).exists()
             {
