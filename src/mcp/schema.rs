@@ -181,7 +181,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static("Automatic consolidator's full gate; default: auto-detect."),
+        DescriptionSource::Static("Automatic consolidator's full gate; default: auto-detect. Checked with `sh -n`."),
+    ),
+    (
+        "set",
+        "boolean",
+        DescriptionSource::Static(super::handlers::consolidate::SET_DESCRIPTION),
     ),
     (
         "scope",

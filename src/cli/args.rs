@@ -23,7 +23,7 @@ pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--
 
 /// Consolidate usage line, shared by `--help` and the missing-group error.
 pub const CONSOLIDATE_USAGE: &str =
-    "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>]";
+    "consolidate --group <group> [--model <model>] [--verify <cmd>] [--max-turns <n>] | consolidate --group <group> --set [--model <model>] [--verify <cmd>] (--set amends the pending round's auto-consolidation settings)";
 
 /// Build the `worker` tool arguments for `action` from `cli_args` (argv minus
 /// the program name and the `--json` flag).
