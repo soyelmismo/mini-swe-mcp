@@ -13,6 +13,28 @@ fn test_json_flag_is_detected_and_stripped() {
     assert!(!json_requested(&stripped));
 }
 
+/// `--quiet` is a rendering selector, not a tool argument: it is detected,
+/// stripped before the positional parse, and never reaches the `worker` tool.
+#[test]
+fn test_quiet_flag_is_detected_and_stripped() {
+    for flag in ["--quiet", "-q"] {
+        let raw = args(&["mini-swe-mcp", "dispatch", flag, "task"]);
+        assert!(quiet_requested(&raw), "{flag} must be detected");
+        let stripped = strip_quiet_flag(raw);
+        assert_eq!(stripped, args(&["mini-swe-mcp", "dispatch", "task"]));
+        assert!(!quiet_requested(&stripped));
+
+        let tool = tool_args("dispatch", &stripped, true).unwrap().unwrap();
+        assert_eq!(tool["task"], "task");
+        assert!(!tool.contains_key("quiet"), "{tool:?}");
+    }
+    assert!(!quiet_requested(&args(&[
+        "mini-swe-mcp",
+        "dispatch",
+        "task"
+    ])));
+}
+
 #[test]
 fn test_stdio_and_action_detection() {
     assert!(stdio_requested(&args(&["mini-swe-mcp", "--stdio"])));

@@ -115,6 +115,39 @@ pub(super) fn format_batch_dispatch(
     out
 }
 
+/// The split a `--quiet` dispatch prints: the started worker ids on stdout, one
+/// per line, and the error each entry that never started reported on stderr.
+///
+/// Keeping the two apart here, in a pure formatter, is what lets the binary
+/// keep stdout a clean id list for a script while the failure stays visible.
+pub struct QuietDispatch {
+    /// The `worker_id` of every entry that started, in payload order.
+    pub worker_ids: Vec<String>,
+    /// The error of every entry that never started, in payload order.
+    pub errors: Vec<String>,
+}
+
+/// `dispatch --quiet`: the ids to print, and the entry errors to report.
+///
+/// A single dispatch carries `worker_id`; a batch carries `workers`, whose
+/// entries hold either `worker_id` or `error`.
+pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
+    let mut worker_ids = Vec::new();
+    let mut errors = Vec::new();
+    if let Some(workers) = val.get("workers").and_then(|v| v.as_array()) {
+        for worker in workers {
+            if let Some(wid) = worker.get("worker_id").and_then(|v| v.as_str()) {
+                worker_ids.push(wid.to_string());
+            } else if let Some(error) = worker.get("error").and_then(|v| v.as_str()) {
+                errors.push(error.to_string());
+            }
+        }
+    } else if let Some(wid) = val.get("worker_id").and_then(|v| v.as_str()) {
+        worker_ids.push(wid.to_string());
+    }
+    QuietDispatch { worker_ids, errors }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +162,21 @@ mod tests {
         assert!(out.contains("Batch dispatch: 1 started, 1 failed"), "{out}");
         assert!(out.contains("Task 0: worker w1 dispatched"), "{out}");
         assert!(out.contains("Task 1 failed: 'task' is required"), "{out}");
+    }
+
+    /// `--quiet` is a clean id list: one started id per line, in payload order,
+    /// and the entries that failed go to the errors side, never into stdout.
+    #[test]
+    fn test_format_dispatch_quiet_lists_ids_and_splits_errors() {
+        let single = format_dispatch_quiet(&v(r#"{"worker_id":"w1","status":"dispatched"}"#));
+        assert_eq!(single.worker_ids, vec!["w1"]);
+        assert!(single.errors.is_empty(), "{:?}", single.errors);
+
+        let batch = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"},{"index":1,"error":"'task' is required"},{"index":2,"worker_id":"w2"}]}"#,
+        ));
+        assert_eq!(batch.worker_ids, vec!["w1", "w2"]);
+        assert_eq!(batch.errors, vec!["'task' is required"]);
     }
 
     #[test]

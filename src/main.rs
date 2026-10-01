@@ -5,10 +5,10 @@
 
 use anyhow::Result;
 use mini_swe_mcp::cli::args::{
-    action_of, admin_requested, json_requested, stdio_requested, strip_admin_flag, strip_json_flag,
-    tool_args,
+    action_of, admin_requested, json_requested, quiet_requested, stdio_requested, strip_admin_flag,
+    strip_json_flag, strip_quiet_flag, tool_args,
 };
-use mini_swe_mcp::cli::format::format_output;
+use mini_swe_mcp::cli::format::{format_dispatch_quiet, format_output};
 use mini_swe_mcp::manifest::{BUILTIN_DEFAULT_MODEL, ModelManifest};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
@@ -48,7 +48,10 @@ async fn async_main() -> Result<()> {
     // `--admin` is a connection flag like `--json`: stripped before the
     // positional parse, remembered as the operator's ownership override.
     let admin = admin_requested(&raw_args);
-    let cli_args = strip_admin_flag(strip_json_flag(raw_args));
+    // `--quiet` is a rendering selector like `--json`: stripped before the
+    // positional parse and remembered for the dispatch view.
+    let quiet = quiet_requested(&raw_args);
+    let cli_args = strip_quiet_flag(strip_admin_flag(strip_json_flag(raw_args)));
 
     // The dashboards read only the on-disk registry, so they run before any
     // configuration is resolved and work without an API key in any flag order.
@@ -104,7 +107,7 @@ async fn async_main() -> Result<()> {
         && action != "daemon"
         && env::var("MINI_SWE_NO_DAEMON").ok().as_deref() != Some("1")
     {
-        return run_remote_action(action, &cli_args, json_output, admin).await;
+        return run_remote_action(action, &cli_args, json_output, admin, quiet).await;
     }
 
     let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
@@ -125,6 +128,7 @@ async fn async_main() -> Result<()> {
             json_output,
             !api_key.is_empty(),
             admin,
+            quiet,
         )
         .await;
     }
@@ -164,11 +168,15 @@ async fn run_local_stdio() -> Result<()> {
 /// `admin` is the operator's `--admin`: the handshake then lifts the per-agent
 /// ownership check, so the CLI can steer, kill, collect and watch a worker
 /// another agent dispatched.
+///
+/// `quiet` is the operator's `--quiet`: the dispatch answer then prints the
+/// worker ids alone instead of the human-facing view.
 async fn run_remote_action(
     action: &str,
     cli_args: &[String],
     json_output: bool,
     admin: bool,
+    quiet: bool,
 ) -> Result<()> {
     let api_key_present = !env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
@@ -176,7 +184,7 @@ async fn run_remote_action(
     };
     let mut client = mini_swe_mcp::hub::HubClient::connect_as_admin(admin).await?;
     let result = drive_worker_call(tool_args, async |args| client.worker(args).await).await?;
-    print_result(action, &result, json_output)
+    print_result(action, &result, json_output, quiet)
 }
 
 /// Issue one worker call through either transport. Dispatch and steer detach.
@@ -207,6 +215,9 @@ async fn run_daemon_cmd(server: &McpServer) -> Result<()> {
 /// `admin` is the operator's `--admin`: the in-process connection owns every
 /// worker it dispatches, but the override is what lets it act on the rows a
 /// hub-mode agent left in the shared registry.
+///
+/// `quiet` is the operator's `--quiet`: the dispatch answer then prints the
+/// worker ids alone instead of the human-facing view.
 async fn run_action(
     server: &McpServer,
     action: &str,
@@ -214,6 +225,7 @@ async fn run_action(
     json_output: bool,
     api_key_present: bool,
     admin: bool,
+    quiet: bool,
 ) -> Result<()> {
     // `None` means the verb was already answered (or exited) by `tool_args`.
     let Some(tool_args) = tool_args(action, cli_args, api_key_present)? else {
@@ -227,15 +239,39 @@ async fn run_action(
         server.execute_tool_for("worker", args, &ctx).await
     })
     .await?;
-    print_result(action, &result, json_output)
+    print_result(action, &result, json_output, quiet)
 }
 
 /// Print `result` as pretty JSON or through the action's plain-text renderer.
-fn print_result(action: &str, result: &serde_json::Value, json_output: bool) -> Result<()> {
+///
+/// `quiet` changes only `dispatch`: the dumped worker id(s) replace the
+/// human-facing view, so a script reads them without a JSON parser.
+fn print_result(
+    action: &str,
+    result: &serde_json::Value,
+    json_output: bool,
+    quiet: bool,
+) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(result)?);
+    } else if quiet && action == "dispatch" {
+        print_quiet_dispatch(result)?;
     } else {
         println!("{}", format_output(action, result));
+    }
+    Ok(())
+}
+
+/// `dispatch --quiet`: the started worker ids on stdout, one per line, and each
+/// entry error on stderr. A batch that lost an entry fails after printing the
+/// ids it did start, so a pipe never reads a partial batch as a clean success.
+fn print_quiet_dispatch(result: &serde_json::Value) -> Result<()> {
+    let view = format_dispatch_quiet(result);
+    for id in &view.worker_ids {
+        println!("{id}");
+    }
+    if !view.errors.is_empty() {
+        anyhow::bail!("{}", view.errors.join("\n"));
     }
     Ok(())
 }
