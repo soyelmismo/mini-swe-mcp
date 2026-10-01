@@ -552,3 +552,80 @@ async fn set_completed_owned(pool: &WorkerPool, id: &str, owner: &str) {
     }
     pool.__test_set_worker_state(id, state).await;
 }
+
+/// One identity holds one watch slot at a time: a second connection
+/// running the same `--all` watch is refused, and the first still
+/// gets the round.
+///
+/// The refusal has to come from the watch slot reserved *up front*
+/// — before the round acknowledges its workers. Reserve it after the
+/// acknowledgement instead, and the second connection would consume
+/// (and acknowledge) the events it was denied, so the first
+/// connection's round would never arrive.
+#[tokio::test]
+async fn a_second_connection_watch_is_refused_and_the_first_still_gets_the_round() {
+    let isolated = common::IsolatedPool::new(4, "watch-all-refused");
+    for id in ["w-1", "w-2"] {
+        add_running(&isolated.pool, id).await;
+    }
+    let server = Arc::new(McpServer::new(isolated.pool.clone(), "test".to_string()));
+    let hub = common::TempDir::new_in_tmp("watch-all-refused-hub");
+    let socket = paths(hub.path()).socket();
+    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let task = tokio::spawn(async move {
+        let _ = daemon.run().await;
+    });
+    wait_for_socket(&socket).await;
+
+    // Connection 1 reserves the identity's watch slot by running the
+    // round watch while the workers still run.
+    let mut first = Raw::connect(&socket).await;
+    first.request("hub/hello", json!({"agent_id": OWNER})).await;
+    let reserved = first.request("hub/watch", watch_all()).await;
+    assert!(
+        reserved["error"].is_null(),
+        "the first watch must reserve the slot, not fail: {reserved}"
+    );
+    assert_eq!(
+        reserved["result"]["events"],
+        json!([]),
+        "the round is not done while the workers run: {reserved}"
+    );
+
+    // Connection 2 announces the same identity: same owner, a
+    // different connection, so it must be refused.
+    let mut second = Raw::connect(&socket).await;
+    second
+        .request("hub/hello", json!({"agent_id": OWNER}))
+        .await;
+
+    // The second connection's `--all` watch is refused, not answered.
+    let refused = second.request("hub/watch", watch_all()).await;
+    let error = refused["error"]["message"]
+        .as_str()
+        .expect("a second watch must be an error, not an answer");
+    assert!(
+        error.contains("a watch is already running"),
+        "the refusal must name the running watch: {refused}"
+    );
+
+    // ...and it did not consume the events it was denied: the first
+    // connection still gets the round once the workers stop.
+    set_completed(&isolated.pool, "w-1").await;
+    set_completed(&isolated.pool, "w-2").await;
+    let events = wait_for_round(&mut first).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "the first connection gets the round: {events:?}"
+    );
+    assert_eq!(
+        events[0]["workers"].as_array().map(Vec::len),
+        Some(2),
+        "{events:?}"
+    );
+
+    task.abort();
+    let _ = task.await;
+    drop(hub);
+}
