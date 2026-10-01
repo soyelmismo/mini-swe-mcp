@@ -22,7 +22,11 @@ static TAG: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch hub directory, removed when the test ends.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    // Base the hub dir on the daemon's short scratch root, not the raw
+    // `TMPDIR`: a long `TMPDIR` pushes `<dir>/hub.sock` past the Unix socket
+    // limit, and this test polls `socket()`, which reports the natural path
+    // even when the daemon fell back to an abstract-namespace socket.
+    let dir = mini_swe_mcp::worktree::swe_base_dir().join(format!(
         "swe-identity-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()

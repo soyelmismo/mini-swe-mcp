@@ -210,7 +210,7 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        match action {
+        let result = match action {
             "manifest" => self.handle_manifest(),
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args, ctx).await,
@@ -224,7 +224,17 @@ impl McpServer {
             "prune" => self.handle_prune(args, token, tx, ctx).await,
             "merge" => self.handle_merge(args, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
+        };
+        // Looking at or acting on a worker is the owner having seen it: drop
+        // that worker's queued watch events so a later watch does not replay
+        // them as "while you were not watching".
+        if matches!(action, "status" | "logs" | "collect" | "kill" | "steer")
+            && result.is_ok()
+            && let Ok(wid) = Self::get_worker_id(args, action)
+        {
+            self.hub_events.lock().await.mark_seen(&ctx.agent(), wid);
         }
+        result
     }
 
     /// Owner label of `wid` for a payload: the recorded agent, or a marker for

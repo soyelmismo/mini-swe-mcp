@@ -173,6 +173,30 @@ impl Drop for BuildWait {
     }
 }
 
+/// Holds a worker's "bash command running" mark for the command's lifetime.
+///
+/// The stall detector reads it: a step whose command is still executing is not
+/// idle, so a long `cargo test` or verify gate never looks like a stall.
+pub struct CommandRun {
+    pool: WorkerPool,
+    id: String,
+}
+
+impl Drop for CommandRun {
+    fn drop(&mut self) {
+        let removed = self
+            .pool
+            .command_running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.id)
+            .is_some();
+        if removed {
+            self.pool.notify_change();
+        }
+    }
+}
+
 /// The word that stands for the caller's most recently dispatched worker.
 pub const LAST_WORKER_ID: &str = "last";
 
@@ -202,6 +226,10 @@ pub struct WorkerPool {
     /// Worker id -> heavy commands queued ahead of it while it waits for a
     /// build slot. Set while blocked in admission, cleared when granted.
     admission_waiting: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Worker id -> unix time its current bash command started. Set while
+    /// `execute_bash` runs and cleared when it returns, so the stall detector
+    /// can tell a long command from worker inactivity.
+    command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -285,6 +313,7 @@ impl WorkerPool {
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry,
@@ -320,6 +349,20 @@ impl WorkerPool {
             .insert(id.to_string(), queued);
         self.notify_change();
         BuildWait {
+            pool: self.clone(),
+            id: id.to_string(),
+        }
+    }
+
+    /// Publish that `id`'s bash command started now; the guard clears the mark
+    /// when the command returns or its future is dropped.
+    pub fn command_running(&self, id: &str) -> CommandRun {
+        self.command_running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id.to_string(), unix_timestamp());
+        self.notify_change();
+        CommandRun {
             pool: self.clone(),
             id: id.to_string(),
         }
@@ -677,6 +720,12 @@ impl WorkerPool {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(id)
             .copied();
+        let command_started_at = self
+            .command_running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(id)
+            .copied();
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
         let progress = match &w.state {
@@ -688,6 +737,7 @@ impl WorkerPool {
                 last_command: Some(last_command.clone()),
                 question: None,
                 waiting_for_slot,
+                command_started_at,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
@@ -695,6 +745,7 @@ impl WorkerPool {
                 last_command: None,
                 question: Some(question.clone()),
                 waiting_for_slot,
+                command_started_at: None,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
@@ -702,6 +753,7 @@ impl WorkerPool {
                 last_command: None,
                 question: None,
                 waiting_for_slot: None,
+                command_started_at: None,
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
@@ -709,6 +761,7 @@ impl WorkerPool {
                 last_command: None,
                 question: None,
                 waiting_for_slot: None,
+                command_started_at: None,
             },
         };
         drop(lock);
