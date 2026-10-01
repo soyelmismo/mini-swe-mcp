@@ -308,6 +308,126 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
     let _ = task.await;
 }
 
+/// The command-in-flight mark follows `execute_bash`: published while the
+/// command runs and cleared when it returns, so the stall detector can trust
+/// that a long command is not worker inactivity.
+#[tokio::test]
+async fn a_running_bash_command_is_published_and_then_cleared() {
+    let scratch = common::TempDir::new_in_tmp("cmd-run-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-cmd",
+        "agent-a",
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    assert_eq!(
+        pool.worker_progress("w-cmd")
+            .await
+            .unwrap()
+            .command_started_at,
+        None,
+        "no command is in flight yet"
+    );
+    {
+        let _running = pool.command_running("w-cmd");
+        assert!(
+            pool.worker_progress("w-cmd")
+                .await
+                .unwrap()
+                .command_started_at
+                .is_some(),
+            "a command in flight must be published"
+        );
+    }
+    assert_eq!(
+        pool.worker_progress("w-cmd")
+            .await
+            .unwrap()
+            .command_started_at,
+        None,
+        "the mark must clear when the command returns"
+    );
+}
+
+/// An interactive verb (here `status`) is the owner having seen the worker:
+/// the event it queued must not replay on the next watch.
+#[tokio::test]
+async fn an_interaction_marks_the_workers_events_seen() {
+    isolate_registry();
+    let dir = common::TempDir::new_in_tmp("wseen");
+    let server = pool_with(vec![record(
+        "w-seen",
+        "agent-a",
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "Fixed.".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-seen".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )])
+    .await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&dir.path().join("hub.sock")).await;
+
+    let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
+    owner
+        .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
+    // Let the daemon's 1 s watch loop observe the terminal worker first.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let reply = owner
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
+        .await;
+    let events = reply["result"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(events.len(), 1, "the terminal event is queued: {reply:?}");
+    // Deliberately no ack: the event is still pending for this owner.
+    let status = owner
+        .request(
+            "tools/call",
+            serde_json::json!({"name": "worker",
+                "arguments": {"action": "status", "worker_id": "w-seen"}}),
+        )
+        .await;
+    assert!(status.get("error").is_none(), "{status:?}");
+    let reply = owner
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
+        .await;
+    assert_eq!(
+        reply["result"]["events"],
+        serde_json::json!([]),
+        "seen events must not replay: {reply:?}"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
 #[test]
 fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     let exe = common::binary_path();
@@ -349,7 +469,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     )
     .expect("row");
     std::fs::create_dir_all(swe.path().join("swe-wt-w-cli")).expect("preserved worktree");
-    let output = run(&["watch", "w-cli"]);
+    let output = run(&["watch", "w-cli", "--verbose"]);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -387,7 +507,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
 }
 
 #[test]
-fn tool_description_carries_the_orchestrator_guidelines() {
+fn tool_description_stays_short_and_points_at_the_help_topics() {
     let manifest = ModelManifest::default();
     let server = McpServer::new(
         WorkerPool::with_scratch(
@@ -403,20 +523,22 @@ fn tool_description_carries_the_orchestrator_guidelines() {
     );
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in [
-        "ONE focused concern",
-        "many workers at once is the intended use",
         "mini-swe-mcp watch",
-        "timeout_secs",
+        "mini-swe-mcp help <topic>",
+        "own workers",
         "no_event",
-        "push notifications",
         "steer",
-        "merge only when it is right",
     ] {
         assert!(
             text.contains(needle),
-            "tool schema must carry the guidelines ({needle} missing)"
+            "tool schema must carry the calling rules ({needle} missing)"
         );
     }
+    // The long orchestrator guidelines moved to `mini-swe-mcp help <topic>`.
+    assert!(
+        !text.contains("many workers at once is the intended use"),
+        "the payload must not carry the long-form guidelines: {text}"
+    );
 }
 
 /// The real binary against an in-process daemon: the immediate event, the

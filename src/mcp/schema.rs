@@ -44,7 +44,10 @@ pub const LIST_SCOPE_ALL: &str = "all";
 pub const NETWORK_DEFAULT: &str = "allow";
 
 /// Description of the `worker` tool itself.
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents. Dispatches subagents in isolated Git worktrees, checks progress, injects steering instructions, retrieves git diffs, or inspects models.";
+///
+/// Kept to the rules an agent needs to call the tool correctly; the longer
+/// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, identity, sandbox, env.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -66,14 +69,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent; the reply carries 'watch_command', the exact shell command that waits on YOUR workers -- run it in the background, since a shell cannot know your session), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
+            "Action to perform. 'dispatch': spawn a subagent. 'status': check step and progress. 'steer': correct a completed worker or continue any stopped one (failed, interrupted, killed) on its own branch with full context; never dispatch a replacement. 'watch': block for an event (for shell-less agents; prefer `mini-swe-mcp watch` in the background). 'collect': final diff. 'logs': a live worker's step history. 'list': your workers. 'kill': terminate a worker. 'reap': evict expired terminal records. 'manifest': models catalog. 'prune': clean stale worktrees. Run `mini-swe-mcp help <topic>` for the details.",
         ),
     ),
     (
         "task",
         "string",
         DescriptionSource::Static(
-            "ONE focused concern, naming the files in scope and the acceptance gate. Dispatch independent tasks in parallel: many workers at once is the intended use, and each integrates the latest base branch before completing. Split work so two workers do not rewrite the same function at once. Required for 'dispatch'.",
+            "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
         ),
     ),
     (
@@ -110,14 +113,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Send every correction and merge conflict to the same worker rather than editing its branch yourself. Steering guidance or follow-up instruction. Required for 'steer'. Steering corrects a completed worker or continues any stopped one (failed, interrupted, killed): it resumes on its own worker-<id> branch with the full conversation plus this message, on a fresh turn budget. Optional 'max_turns' sets that budget. Never dispatch a replacement for a stopped worker.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch, each accepting the same prefixes and 'last' as 'worker_id'. Optional for 'watch': omitted watches every one of your own running or paused workers.",
+            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own (running or paused).",
         ),
     ),
     (
@@ -129,47 +132,47 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Client-side deadline in seconds for the blocking 'watch' action, which is a fallback for agents with no shell: prefer running `mini-swe-mcp watch` in the background. When the deadline expires before an event arrives, the call returns {status:'no_event'} instead of blocking, so the agent can simply call 'watch' again. Omit it to wait indefinitely. Hosts with a short tool deadline (opencode ~120 s, Antigravity CLI ~180 s, Hermes 300 s) should pass a value below their own limit, e.g. 90.",
+            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely. Prefer running `mini-swe-mcp watch` in the background.",
         ),
     ),
     (
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash exploration turns (overrides manifest default). Optional for 'dispatch'; on 'steer' it is the fresh turn budget when continuing a stopped worker (completed, failed, interrupted or killed; default 60), and is ignored for running or paused workers.",
+            "Maximum bash exploration turns (overrides the manifest default). On 'steer', the fresh budget when continuing a stopped worker.",
         ),
     ),
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model sampling temperature (overrides manifest default)."),
+        DescriptionSource::Static("Model sampling temperature (overrides the manifest default)."),
     ),
     (
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') to automatically audit and finalize the worktree after implementation completes, using a fresh context window.",
+            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation, with a fresh context.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run through the same sandboxed bash path before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). When absent, the harness auto-detects from the repository layout (Cargo.toml, package.json with a test script, or pyproject.toml/pytest.ini). Pass an empty string to disable the gate. Optional for 'dispatch'.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': omitted or 'mine' returns only the calling agent's workers, 'all' returns every agent's and requires the admin override. Optional for 'list' (default: 'mine').",
+            "Listing scope for 'list': 'mine' (default) is the calling agent's workers, 'all' is every agent's and needs the admin override.",
         ),
     ),
     (
         "network",
         "string",
         DescriptionSource::Static(
-            "Declarative network policy for the worker: 'offline' runs every bash step in an isolated network namespace with no egress (useful for pure refactor/analysis tasks), 'allow' keeps normal connectivity. Optional for 'dispatch' (default: 'allow').",
+            "Network policy: 'offline' runs every bash step in an isolated network namespace with no egress, 'allow' (default) keeps connectivity.",
         ),
     ),
 ];
@@ -271,7 +274,7 @@ pub(super) fn build_tools_list(manifest: &ModelManifest) -> Value {
         "tools": [
             {
                 "name": "worker",
-                "description": format!("{} {}", WORKER_TOOL_DESCRIPTION, crate::cli::watch::WORKFLOW),
+                "description": WORKER_TOOL_DESCRIPTION,
                 "inputSchema": {
                     "type": "object",
                     "properties": Value::Object(properties),
@@ -286,6 +289,11 @@ pub(super) fn build_tools_list(manifest: &ModelManifest) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Pre-trim size of the whole `tools/list` payload, in bytes, measured
+    /// before the descriptions were shortened. The budget is 60% of it, i.e.
+    /// at least a 40% cut.
+    const TOOLS_LIST_BASELINE_BYTES: usize = 6990;
 
     fn worker_schema(tools_list: &Value) -> &Value {
         tools_list["tools"]
@@ -392,11 +400,10 @@ mod tests {
         );
     }
 
-    /// The tool description teaches the transport-neutral wait: the `watch`
-    /// action over MCP (bounded by `timeout_secs`, re-called on `no_event`),
-    /// the shell command, and the channel push notifications.
+    /// The tool description stays a calling contract: the waiting rule, the
+    /// ownership rule, and a one-line pointer to the long-form topics.
     #[test]
-    fn tool_description_teaches_the_mcp_wait() {
+    fn tool_description_names_the_rules_and_points_at_help_topics() {
         let tools_list = build_tools_list(&ModelManifest::default());
         let description = tools_list["tools"]
             .as_array()
@@ -406,43 +413,47 @@ mod tests {
 
         for needle in [
             "mini-swe-mcp watch",
-            "timeout_secs",
-            "no_event",
-            "push notifications",
+            "mini-swe-mcp help <topic>",
+            "own workers",
         ] {
             assert!(
                 description.contains(needle),
                 "the tool description must mention {needle}: {description}"
             );
         }
+        for topic in crate::cli::help::TOPICS {
+            assert!(
+                description.contains(topic),
+                "the tool description must point at the '{topic}' topic: {description}"
+            );
+        }
     }
 
-    /// `message` teaches that steer corrects a completed worker or continues
-    /// any stopped one on its own branch; it never dispatches a replacement.
+    /// Regression budget: this payload is context every MCP agent pays on
+    /// every session, so it must stay at least 40% below the pre-trim size.
     #[test]
-    fn message_description_covers_every_stopped_state() {
+    fn tools_list_stays_within_its_context_budget() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let bytes = serde_json::to_vec(&tools_list)
+            .expect("tools/list serialises")
+            .len();
+        assert!(
+            bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
+            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload"
+        );
+    }
+
+    /// `message` stays a short call contract; the full list of stopped states
+    /// it can continue lives in the `steer` help topic (tested in `cli::help`).
+    #[test]
+    fn message_description_points_at_steer() {
         let tools_list = build_tools_list(&ModelManifest::default());
         let schema = worker_schema(&tools_list);
         let text = schema["properties"]["message"]["description"]
             .as_str()
             .expect("the message property needs a description");
 
-        for needle in [
-            "completed",
-            "failed",
-            "interrupted",
-            "killed",
-            "worker-<id>",
-            "max_turns",
-        ] {
-            assert!(
-                text.contains(needle),
-                "the message description must mention {needle}: {text}"
-            );
-        }
-        assert!(
-            !text.contains("finished (completed/failed)"),
-            "steer continues any stopped state, not just finished ones: {text}"
-        );
+        assert!(text.contains("steer"), "{text}");
+        assert!(text.contains("own branch"), "{text}");
     }
 }
