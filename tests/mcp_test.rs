@@ -1162,7 +1162,12 @@ fn can_create_network_namespace() -> bool {
 async fn a_blocked_wait_returns_promptly_on_a_state_change() {
     use std::time::{Duration, Instant};
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-1");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     pool.__test_insert_worker(running_worker("wait-test-wakes"))
         .await;
     let server = McpServer::new(pool.clone(), "ninja".to_string());
@@ -1250,11 +1255,14 @@ fn running_worker(id: &str) -> WorkerRecord {
 /// An unknown worker is a clear error, never a watch that never returns.
 #[tokio::test]
 async fn watch_on_an_unknown_worker_is_a_clear_error() {
-    let server = McpServer::new(
-        let _scratch = common::TempDir::new_in_tmp("iso-mcp-2");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));,
-        "ninja".to_string(),
+    let _scratch = common::TempDir::new_in_tmp("iso-mcp-2");
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
     );
+    let server = McpServer::new(pool, "ninja".to_string());
 
     let error = server
         .execute_tool(
@@ -1276,7 +1284,12 @@ async fn watch_on_an_unknown_worker_is_a_clear_error() {
 #[tokio::test]
 async fn watch_with_a_deadline_returns_no_event() {
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-3");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     let server = McpServer::new(pool, "ninja".to_string());
 
     let result = server
@@ -1293,7 +1306,12 @@ async fn watch_with_a_deadline_returns_no_event() {
 #[tokio::test]
 async fn watch_on_a_completed_worker_returns_its_event() {
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-4");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     pool.__test_insert_worker(completed_worker("watch-test-done"))
         .await;
     let server = McpServer::new(pool, "ninja".to_string());
@@ -1978,7 +1996,12 @@ async fn a_dispatch_past_the_per_agent_cap_is_refused() {
 #[tokio::test]
 async fn completed_payloads_carry_the_review_guidance() {
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-5");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     pool.__test_insert_worker(completed_worker("guide-done"))
         .await;
     let server = McpServer::new(pool, "ninja".to_string());
@@ -2011,7 +2034,12 @@ async fn completed_payloads_carry_the_review_guidance() {
 #[tokio::test]
 async fn steer_with_a_malformed_budget_is_a_hard_error() {
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-6");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     pool.__test_insert_worker(running_worker("budget-bad"))
         .await;
     let server = McpServer::new(pool, "ninja".to_string());
@@ -2267,7 +2295,12 @@ async fn dispatch_returns_immediately_with_a_watch_hint() {
 #[tokio::test]
 async fn watch_action_answers_no_event_on_an_expired_deadline() {
     let _scratch = common::TempDir::new_in_tmp("iso-mcp-7");
-    let pool = WorkerPool::with_scratch(1, "http://localhost:1".to_string(), "test-key".to_string(), mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()));;
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(_scratch.path()),
+    );
     pool.__test_insert_worker(running_worker("h11-watch-running"))
         .await;
     let server = McpServer::new(pool, "ninja".to_string());
