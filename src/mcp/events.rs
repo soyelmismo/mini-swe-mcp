@@ -484,12 +484,14 @@ impl Drop for WatchGuard {
 
 /// File name of the persisted per-owner acknowledged watch positions.
 const WATCH_ACKS_FILE: &str = "watch_acks.json";
-/// How many owners the persisted store keeps, oldest evicted first.
+/// How many owners the persisted store keeps, least recently
+/// acknowledged evicted first.
 const MAX_ACK_OWNERS: usize = 1024;
-/// How many workers one owner's persisted store keeps.
+/// How many workers one owner's persisted store keeps, least recently
+/// acknowledged evicted first.
 const MAX_ACK_WORKERS: usize = 4096;
-/// Snapshot key marking a terminal worker whose branch is merged into its base
-/// or no longer exists, so its event must never be replayed.
+/// Snapshot key marking a terminal worker whose branch is merged into its
+/// base or no longer exists, so its event must never be replayed.
 const BRANCH_GONE_OR_MERGED: &str = "branch_gone_or_merged";
 
 /// The revision and kind of the last event an owner acknowledged for a worker.
@@ -499,16 +501,34 @@ struct AckPosition {
     event: String,
 }
 
+/// One acknowledged worker and how recently its position was written.
+#[derive(Debug, Clone)]
+struct AckEntry {
+    position: AckPosition,
+    /// Bumped on every `record` for that key, so eviction is by true
+    /// recency and never by key order.
+    recency: u64,
+}
+
 /// Per-owner acknowledged watch positions, persisted so the first watch after a
 /// daemon restart does not replay events the owner already saw.
 ///
-/// `path` is `None` for the stdio router and for unit tests, which keeps the
-/// store entirely in memory; the hub daemon points it at
-/// `<hub dir>/watch_acks.json`.
+/// The in-memory maps carry a monotonically increasing `recency` stamp per
+/// entry; eviction is by least-recently-acknowledged, so the store keeps the
+/// positions the owner is still likely to re-acknowledge. `path` is `None`
+/// for the stdio router and for unit tests, which keeps the store entirely in
+/// memory; the hub daemon points it at `<hub dir>/watch_acks.json`.
+///
+/// Eviction is deterministic (lowest recency stamp first, ties broken by key)
+/// but is not part of the persisted format: a restart re-derives recency from
+/// the order positions are next written, never from the file.
 #[derive(Default)]
 struct AckStore {
     path: Option<PathBuf>,
-    positions: BTreeMap<String, BTreeMap<String, AckPosition>>,
+    positions: BTreeMap<String, BTreeMap<String, AckEntry>>,
+    /// Monotonic stamp handed out by `record`, comparing entries by
+    /// recency across every owner and worker.
+    clock: u64,
 }
 
 impl AckStore {
@@ -516,10 +536,31 @@ impl AckStore {
     /// store, never an error: losing the cache costs a replay, not correctness.
     fn load(&mut self, dir: &Path) {
         let path = dir.join(WATCH_ACKS_FILE);
-        self.positions = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        let loaded: BTreeMap<String, BTreeMap<String, AckPosition>> =
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+        // A freshly loaded store has no recency information: every entry
+        // starts equally stale, and the next `record` stamps it fresh.
+        self.positions = loaded
+            .into_iter()
+            .map(|(owner, workers)| {
+                let workers = workers
+                    .into_iter()
+                    .map(|(wid, position)| {
+                        (
+                            wid,
+                            AckEntry {
+                                position,
+                                recency: 0,
+                            },
+                        )
+                    })
+                    .collect();
+                (owner, workers)
+            })
+            .collect();
         self.trim();
         self.path = Some(path);
     }
@@ -530,36 +571,61 @@ impl AckStore {
         self.positions
             .get(owner)
             .and_then(|workers| workers.get(wid))
-            .is_some_and(|p| p.revision == revision && p.event == event)
+            .is_some_and(|entry| {
+                entry.position.revision == revision && entry.position.event == event
+            })
     }
 
     /// Remember `owner`'s newest acknowledged position for `wid` and persist it.
     fn record(&mut self, owner: &str, wid: &str, revision: u64, event: &str) {
-        self.positions.entry(owner.to_string()).or_default().insert(
-            wid.to_string(),
-            AckPosition {
-                revision,
-                event: event.to_string(),
-            },
-        );
+        self.clock += 1;
+        let recency = self.clock;
+        self.positions
+            .entry(owner.to_string())
+            .or_default()
+            .insert(
+                wid.to_string(),
+                AckEntry {
+                    position: AckPosition {
+                        revision,
+                        event: event.to_string(),
+                    },
+                    recency,
+                },
+            );
         self.trim();
         self.persist();
     }
 
-    /// Keep the store bounded: owners and per-owner workers oldest-first.
+    /// Keep the store bounded, evicting the least recently acknowledged
+    /// owner, then the least recently acknowledged worker of every owner.
     fn trim(&mut self) {
         while self.positions.len() > MAX_ACK_OWNERS {
-            let Some(oldest) = self.positions.keys().next().cloned() else {
+            let Some(victim) = self
+                .positions
+                .iter()
+                .map(|(owner, workers)| {
+                    let oldest = workers.values().map(|e| e.recency).min().unwrap_or(0);
+                    (owner.clone(), oldest)
+                })
+                .min_by_key(|(owner, oldest)| (*oldest, owner.clone()))
+                .map(|(owner, _)| owner)
+            else {
                 break;
             };
-            self.positions.remove(&oldest);
+            self.positions.remove(&victim);
         }
         for workers in self.positions.values_mut() {
             while workers.len() > MAX_ACK_WORKERS {
-                let Some(oldest) = workers.keys().next().cloned() else {
+                let Some(victim) = workers
+                    .iter()
+                    .map(|(wid, entry)| (wid.clone(), entry.recency))
+                    .min_by_key(|(wid, recency)| (*recency, wid.clone()))
+                    .map(|(wid, _)| wid)
+                else {
                     break;
                 };
-                workers.remove(&oldest);
+                workers.remove(&victim);
             }
         }
     }
@@ -570,7 +636,20 @@ impl AckStore {
         let Some(path) = &self.path else {
             return;
         };
-        let Ok(text) = serde_json::to_string(&self.positions) else {
+        // The recency stamps are process-local bookkeeping, so the
+        // persisted file carries only the compact position map.
+        let positions: BTreeMap<_, BTreeMap<_, _>> = self
+            .positions
+            .iter()
+            .map(|(owner, workers)| {
+                let workers = workers
+                    .iter()
+                    .map(|(wid, entry)| (wid, &entry.position))
+                    .collect();
+                (owner, workers)
+            })
+            .collect();
+        let Ok(text) = serde_json::to_string(&positions) else {
             return;
         };
         let tmp = path.with_extension("json.tmp");
@@ -1156,9 +1235,18 @@ struct WatchHistory {
 ///
 /// A merge deletes the worker branch and keeps the registry row, so after a
 /// daemon restart the row still reads `completed` and would otherwise replay.
-/// An unreadable or unknown repository is not suppression: only a branch we can
-/// prove gone or merged counts.
+///
+/// Suppression requires *proof*: the repository must be readable and the
+/// branch must be provably absent (`git show-ref` fails with exit `1`, the
+/// "ref not found" code) or provably contained in the base branch
+/// (`git merge-base --is-ancestor` succeeds). Any other outcome -- the git
+/// process failed to run, the path is not a repository (exit `128`), or the
+/// base ref cannot be resolved -- is *not* suppression: a terminal event that
+/// could not be verified stays visible, never silently dropped.
 fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
+    /// `git` exit code for "the ref is not there", the one outcome that
+    /// proves absence. Every other code means the probe itself failed.
+    const REF_NOT_FOUND: i32 = 1;
     if !matches!(
         entry.status,
         RegistryStatus::Completed | RegistryStatus::Failed | RegistryStatus::Exhausted
@@ -1174,28 +1262,36 @@ fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
         return false;
     };
     let branch = format!("worker-{}", entry.id);
-    if !crate::worktree::git(
-        repo,
-        "rev-parse --verify --quiet",
-        &["rev-parse", "--verify", "--quiet", &branch],
-    )
-    .is_ok_and(|o| o.status.success())
-    {
-        // The ref is gone: merged with branch cleanup, pruned, or reclaimed.
+    // A missing worktree probe is not a gone branch: `show-ref` distinguishes
+    // the two by exit code, `1` meaning the ref is genuinely absent.
+    let branch_gone = matches!(
+        crate::worktree::git(
+            repo,
+            "show-ref --verify --quiet",
+            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        ),
+        Ok(output) if output.status.code() == Some(REF_NOT_FOUND)
+    );
+    if branch_gone {
         return true;
     }
-    entry
+    let Some(base) = entry
         .base_branch
         .as_deref()
         .filter(|base| !base.is_empty())
-        .is_some_and(|base| {
-            crate::worktree::git(
-                repo,
-                "merge-base --is-ancestor",
-                &["merge-base", "--is-ancestor", &branch, base],
-            )
-            .is_ok_and(|o| o.status.success())
-        })
+    else {
+        return false;
+    };
+    // Only a successful ancestry check proves the branch landed in the
+    // base. A failed probe (unreadable repo, unresolved base) is not proof.
+    matches!(
+        crate::worktree::git(
+            repo,
+            "merge-base --is-ancestor",
+            &["merge-base", "--is-ancestor", &branch, base],
+        ),
+        Ok(output) if output.status.success()
+    )
 }
 
 /// Read bounded watch facts in the daemon, without collecting the worker.
