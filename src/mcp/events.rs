@@ -642,6 +642,22 @@ impl AckStore {
         self.persist();
     }
 
+    /// Drop every position that names `worker_id`, in memory and on disk.
+    ///
+    /// The in-memory map is edited *first*, under the router's own lock, so the
+    /// next `persist` from any other owner cannot resurrect the entry this
+    /// removed. A separate file-only edit would race that persist and lose.
+    fn forget(&mut self, worker_id: &str) {
+        let mut dropped = false;
+        for workers in self.positions.values_mut() {
+            dropped |= workers.remove(worker_id).is_some();
+        }
+        self.positions.retain(|_, workers| !workers.is_empty());
+        if dropped {
+            self.persist();
+        }
+    }
+
     /// Keep the store bounded, evicting the least recently acknowledged
     /// owner, then the least recently acknowledged worker of every owner.
     fn trim(&mut self) {
@@ -752,6 +768,17 @@ impl EventRouter {
             }
         }
         self.connections.insert(ctx.id, (agent, ctx.is_admin(), tx));
+    }
+
+    /// Forget every acknowledged position of a retired `worker_id`.
+    ///
+    /// Called on the router's own lock, so the in-memory store and its file
+    /// cannot drift: the edit happens between two `persist` calls rather than
+    /// racing one.
+    pub(super) fn forget_worker(&mut self, worker_id: &str) {
+        self.acks.forget(worker_id);
+        self.seen.remove(worker_id);
+        self.watch_reported.remove(worker_id);
     }
 
     pub(super) fn remove(&mut self, id: u64) {

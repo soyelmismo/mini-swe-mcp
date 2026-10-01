@@ -710,7 +710,7 @@ struct OrphanOwner {
 /// cannot be probed, the answer is `true` (keep), because deleting a reachable
 /// conversation is unrecoverable while keeping an unreachable one only costs
 /// space.
-fn file_has_live_branch(path: &Path, worker_id: &str) -> bool {
+fn file_has_live_branch(path: &Path) -> bool {
     let name = path.to_string_lossy();
     if !(name.ends_with(".history.jsonl") || name.ends_with(".history.json")) {
         return false;
@@ -793,7 +793,7 @@ fn remove_orphan_worker_files(root: &ScratchRoot, exempt: &[String]) -> usize {
             // git. So the branch is probed before the file goes, and the file
             // survives whenever its absence cannot be *proven*: an unreadable
             // file, an unprobeable repository or a git failure all keep it.
-            if file_has_live_branch(entry.path(), id) {
+            if file_has_live_branch(&entry.path()) {
                 continue;
             }
             match std::fs::remove_file(entry.path()) {

@@ -588,6 +588,50 @@ impl WorkerPool {
         retired
     }
 
+    /// Drop the in-memory records of `ids` and return what was dropped.
+    ///
+    /// A retired worker must disappear from `list`, and `list_workers` reads this
+    /// process's live records as well as the registry: deleting the row alone
+    /// would leave the record visible, so an integrated worker would keep showing
+    /// up as "Completed" next to the workers still awaiting integration. The
+    /// worker's own guard releases its resources when the record leaves, exactly
+    /// as it does on reap, so this is the same path with a different trigger.
+    ///
+    /// A record that is still *running* is never dropped: retirement is only
+    /// ever called for a worker that already completed, and a live worker owns
+    /// resources the retirement must not take away from under it.
+    pub async fn forget_retired_workers(&self, ids: &[String]) -> Vec<String> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        {
+            let mut lock = self.workers.write().await;
+            for id in ids {
+                let terminal = lock.get(id).is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        WorkerState::Completed { .. } | WorkerState::Failed { .. }
+                    )
+                });
+                if terminal && lock.remove(id).is_some() {
+                    dropped.push(id.clone());
+                }
+            }
+        }
+        for id in &dropped {
+            self.registry
+                .lock()
+                .expect("registry lock poisoned")
+                .remove(id);
+            self.worktrees.write().await.remove(id);
+        }
+        if !dropped.is_empty() {
+            self.notify_change();
+        }
+        dropped
+    }
+
     /// Retire every already-integrated worker and delete the orphan leftovers
     /// no row and no branch can claim again.
     ///
@@ -599,11 +643,16 @@ impl WorkerPool {
     pub async fn sweep_retired_workers(&self, exempt: &[String]) -> RetireSweep {
         let root = self.scratch.clone();
         let exempt = exempt.to_vec();
-        tokio::task::spawn_blocking(move || {
+        let sweep = tokio::task::spawn_blocking(move || {
             revision::sweep_retired_workers_in(&root, None, &exempt)
         })
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+        // A worker this process still holds a record for is just as retired as
+        // one only the registry knew, so it leaves the live view here too --
+        // otherwise `list` keeps showing an integrated worker as "Completed".
+        self.forget_retired_workers(&sweep.workers).await;
+        sweep
     }
 
     /// Drop the worktree paths of workers whose records are gone.

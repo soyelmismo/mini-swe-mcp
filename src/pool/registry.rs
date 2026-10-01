@@ -386,6 +386,27 @@ impl RegistryWriter {
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
     pub fn save(&mut self, entry: WorkerRegistryEntry) {
+        // A consolidator records the round it integrated on its own row, and
+        // that list is written by a *different* code path than the status
+        // updates. Every status write rebuilds the row from `WorkerMeta`, which
+        // knows nothing about the round, so merging the two halves here is what
+        // makes the list survive the consolidator's own completion: without it,
+        // the very next step would erase the round and the workers it names
+        // could never be retired. The writer is the single choke point every
+        // registry write passes through, so this is the one place that has to
+        // know.
+        let mut entry = entry;
+        if entry.integrated.is_empty() {
+            // The writer's own cache first (no I/O on the common path), then the
+            // row on disk, so a round recorded by an earlier process or before
+            // this writer started also survives.
+            let known = self.rows.get(&entry.id).cloned().or_else(|| {
+                super::load_registry_entry_in(&self.root, &entry.id)
+            });
+            if let Some(known) = known.filter(|known| !known.integrated.is_empty()) {
+                entry.integrated = known.integrated;
+            }
+        }
         let now = Instant::now();
         let transition = self
             .rows

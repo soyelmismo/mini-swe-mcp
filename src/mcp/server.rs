@@ -688,6 +688,16 @@ impl McpServer {
         self.shutdown.subscribe()
     }
 
+    /// Drop the watch acknowledgements of a retired `worker_id`.
+    ///
+    /// On the router's own lock, so the in-memory ack store and the file it
+    /// persists cannot disagree: a worker that is gone can never fire an event
+    /// again, and its position would otherwise be rewritten on the next
+    /// `persist` from an unrelated owner.
+    pub(crate) async fn forget_retired_worker(&self, worker_id: &str) {
+        self.hub_events.lock().await.forget_worker(worker_id);
+    }
+
     /// Close the recovery gate before accepting hub connections; see
     /// [`RecoveryGate`].
     pub fn begin_recovery(&self) {

@@ -148,8 +148,13 @@ impl Fixture {
         .map(|_| ())
     }
 
+    /// One sweep pass, with the workers a `--no-delete` merge protected.
     fn sweep(&self) -> mini_swe_mcp::pool::RetireSweep {
-        sweep_retired_workers_in(&self.root(), None)
+        self.sweep_exempting(&[])
+    }
+
+    fn sweep_exempting(&self, exempt: &[String]) -> mini_swe_mcp::pool::RetireSweep {
+        sweep_retired_workers_in(&self.root(), None, exempt)
     }
 }
 
