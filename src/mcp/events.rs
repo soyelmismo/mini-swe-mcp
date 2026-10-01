@@ -22,6 +22,7 @@
 //! the polling loop are kept apart so the decision is testable on its own.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -481,6 +482,187 @@ impl Drop for WatchGuard {
     }
 }
 
+/// File name of the persisted per-owner acknowledged watch positions.
+const WATCH_ACKS_FILE: &str = "watch_acks.json";
+/// How many owners the persisted store keeps, least recently
+/// acknowledged evicted first.
+const MAX_ACK_OWNERS: usize = 1024;
+/// How many workers one owner's persisted store keeps, least recently
+/// acknowledged evicted first.
+const MAX_ACK_WORKERS: usize = 4096;
+/// Snapshot key marking a terminal worker whose branch is merged into its
+/// base or no longer exists, so its event must never be replayed.
+const BRANCH_GONE_OR_MERGED: &str = "branch_gone_or_merged";
+
+/// The revision and kind of the last event an owner acknowledged for a worker.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AckPosition {
+    revision: u64,
+    event: String,
+}
+
+/// One acknowledged worker and how recently its position was written.
+#[derive(Debug, Clone)]
+struct AckEntry {
+    position: AckPosition,
+    /// Bumped on every `record` for that key, so eviction is by true
+    /// recency and never by key order.
+    recency: u64,
+}
+
+/// Per-owner acknowledged watch positions, persisted so the first watch after a
+/// daemon restart does not replay events the owner already saw.
+///
+/// The in-memory maps carry a monotonically increasing `recency` stamp per
+/// entry; eviction is by least-recently-acknowledged, so the store keeps the
+/// positions the owner is still likely to re-acknowledge. `path` is `None`
+/// for the stdio router and for unit tests, which keeps the store entirely in
+/// memory; the hub daemon points it at `<hub dir>/watch_acks.json`.
+///
+/// Eviction is deterministic (lowest recency stamp first, ties broken by key)
+/// but is not part of the persisted format: a restart re-derives recency from
+/// the order positions are next written, never from the file.
+#[derive(Default)]
+struct AckStore {
+    path: Option<PathBuf>,
+    positions: BTreeMap<String, BTreeMap<String, AckEntry>>,
+    /// Monotonic stamp handed out by `record`, comparing entries by
+    /// recency across every owner and worker.
+    clock: u64,
+}
+
+impl AckStore {
+    /// Load the store under `dir`. A missing or unreadable file is an empty
+    /// store, never an error: losing the cache costs a replay, not correctness.
+    fn load(&mut self, dir: &Path) {
+        let path = dir.join(WATCH_ACKS_FILE);
+        let loaded: BTreeMap<String, BTreeMap<String, AckPosition>> =
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+        // A freshly loaded store has no recency information: every entry
+        // starts equally stale, and the next `record` stamps it fresh.
+        self.positions = loaded
+            .into_iter()
+            .map(|(owner, workers)| {
+                let workers = workers
+                    .into_iter()
+                    .map(|(wid, position)| {
+                        (
+                            wid,
+                            AckEntry {
+                                position,
+                                recency: 0,
+                            },
+                        )
+                    })
+                    .collect();
+                (owner, workers)
+            })
+            .collect();
+        self.trim();
+        self.path = Some(path);
+    }
+
+    /// Whether `owner` already acknowledged exactly this `(revision, kind)` for
+    /// `wid`, so it must not be replayed.
+    fn acknowledged(&self, owner: &str, wid: &str, revision: u64, event: &str) -> bool {
+        self.positions
+            .get(owner)
+            .and_then(|workers| workers.get(wid))
+            .is_some_and(|entry| {
+                entry.position.revision == revision && entry.position.event == event
+            })
+    }
+
+    /// Remember `owner`'s newest acknowledged position for `wid` and persist it.
+    fn record(&mut self, owner: &str, wid: &str, revision: u64, event: &str) {
+        self.clock += 1;
+        let recency = self.clock;
+        self.positions.entry(owner.to_string()).or_default().insert(
+            wid.to_string(),
+            AckEntry {
+                position: AckPosition {
+                    revision,
+                    event: event.to_string(),
+                },
+                recency,
+            },
+        );
+        self.trim();
+        self.persist();
+    }
+
+    /// Keep the store bounded, evicting the least recently acknowledged
+    /// owner, then the least recently acknowledged worker of every owner.
+    fn trim(&mut self) {
+        while self.positions.len() > MAX_ACK_OWNERS {
+            let Some(victim) = self
+                .positions
+                .iter()
+                .map(|(owner, workers)| {
+                    // The owner's latest acknowledgment, not its
+                    // oldest single entry: an owner that keeps
+                    // acknowledging new workers is recent even if
+                    // it also holds a very old position.
+                    let latest = workers.values().map(|e| e.recency).max().unwrap_or(0);
+                    (owner.clone(), latest)
+                })
+                .min_by_key(|(owner, latest)| (*latest, owner.clone()))
+                .map(|(owner, _)| owner)
+            else {
+                break;
+            };
+            self.positions.remove(&victim);
+        }
+        for workers in self.positions.values_mut() {
+            while workers.len() > MAX_ACK_WORKERS {
+                let Some(victim) = workers
+                    .iter()
+                    .map(|(wid, entry)| (wid.clone(), entry.recency))
+                    .min_by_key(|(wid, recency)| (*recency, wid.clone()))
+                    .map(|(wid, _)| wid)
+                else {
+                    break;
+                };
+                workers.remove(&victim);
+            }
+        }
+    }
+
+    /// Write the store atomically at 0600. A failure is logged, never fatal.
+    fn persist(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(path) = &self.path else {
+            return;
+        };
+        // The recency stamps are process-local bookkeeping, so the
+        // persisted file carries only the compact position map.
+        let positions: BTreeMap<_, BTreeMap<_, _>> = self
+            .positions
+            .iter()
+            .map(|(owner, workers)| {
+                let workers = workers
+                    .iter()
+                    .map(|(wid, entry)| (wid, &entry.position))
+                    .collect();
+                (owner, workers)
+            })
+            .collect();
+        let Ok(text) = serde_json::to_string(&positions) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text.as_bytes()).is_ok() {
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct EventRouter {
     latest: VecDeque<(Option<String>, ChannelEvent)>,
@@ -492,6 +674,8 @@ pub(super) struct EventRouter {
     /// published and JSON event shapes are unchanged.
     seen: BTreeMap<String, u64>,
     watch_history: BTreeMap<String, WatchHistory>,
+    /// Per-owner acknowledged positions, persisted across a daemon restart.
+    acks: AckStore,
     watches: Arc<WatchRegistry>,
     sequence: u64,
 }
@@ -554,6 +738,12 @@ impl EventRouter {
     /// answer can drop the "start this" line the caller has already acted on.
     pub(super) fn has_watch(&self, identity: &str) -> bool {
         self.watches.has(identity)
+    }
+
+    /// Load the persisted acknowledged positions from the hub directory. Called
+    /// once at daemon start, before the watcher observes any worker.
+    pub(super) fn load_ack_store(&mut self, dir: &Path) {
+        self.acks.load(dir);
     }
 
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
@@ -1041,6 +1231,112 @@ struct WatchHistory {
     last_sequence: u64,
 }
 
+/// Whether a terminal worker's branch is merged into its base or no longer
+/// exists, so its event must never be replayed.
+///
+/// A merge deletes the worker branch and keeps the registry row, so after a
+/// daemon restart the row still reads `completed` and would otherwise replay.
+///
+/// Suppression requires *proof*: the repository must be readable and the
+/// branch must be provably absent (`git show-ref` fails with exit `1`, the
+/// "ref not found" code) or provably contained in the base branch
+/// (`git merge-base --is-ancestor` succeeds). Any other outcome -- the git
+/// process failed to run, the path is not a repository (exit `128`), or the
+/// base ref cannot be resolved -- is *not* suppression: a terminal event that
+/// could not be verified stays visible, never silently dropped.
+fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
+    /// `git` exit code for "the ref is not there", the one outcome that
+    /// proves absence. Every other code means the probe itself failed.
+    const REF_NOT_FOUND: i32 = 1;
+    if !matches!(
+        entry.status,
+        RegistryStatus::Completed | RegistryStatus::Failed | RegistryStatus::Exhausted
+    ) {
+        return false;
+    }
+    let Some(repo) = entry
+        .repo_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.is_dir())
+    else {
+        return false;
+    };
+    let branch = format!("worker-{}", entry.id);
+    // A missing worktree probe is not a gone branch: `show-ref` distinguishes
+    // the two by exit code, `1` meaning the ref is genuinely absent.
+    let branch_gone = matches!(
+        crate::worktree::git(
+            repo,
+            "show-ref --verify --quiet",
+            &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        ),
+        Ok(output) if output.status.code() == Some(REF_NOT_FOUND)
+    );
+    if branch_gone {
+        return true;
+    }
+    let Some(base) = entry.base_branch.as_deref().filter(|base| !base.is_empty()) else {
+        return false;
+    };
+    // Only a successful ancestry check proves the branch landed in the
+    // base. A failed probe (unreadable repo, unresolved base) is not proof.
+    matches!(
+        crate::worktree::git(
+            repo,
+            "merge-base --is-ancestor",
+            &["merge-base", "--is-ancestor", &branch, base],
+        ),
+        Ok(output) if output.status.success()
+    )
+}
+
+#[cfg(test)]
+mod branch_replay_suppression_tests {
+    use super::*;
+
+    /// Removes a temporary directory when it goes out of scope, so
+    /// a failing assertion still cleans up the scratch it created.
+    struct CleanupDir<'a>(&'a Path);
+
+    impl Drop for CleanupDir<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+
+    /// A terminal worker whose repository cannot be probed is never
+    /// suppressed: the suppression contract requires *proof* that the
+    /// branch is gone or merged, so a failed probe (here `128`, not a
+    /// repository) leaves the event visible. This is the regression
+    /// guard against treating any git failure as "branch gone".
+    #[test]
+    fn completed_worker_with_unprobeable_repo_is_not_suppressed() {
+        // A completed worker whose `repo_path` is a directory that is
+        // deterministically not a repository: an invalid `.git` file
+        // makes every git probe exit `128` regardless of any parent
+        // repository a `TMPDIR` inside the worktree might otherwise
+        // discover. The collision-free name is cleaned up even when
+        // an assertion fails.
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-events-unprobeable-{}-{}",
+            std::process::id(),
+            crate::pool::unix_timestamp()
+        ));
+        let _cleanup = CleanupDir(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        std::fs::write(dir.join(".git"), "not a gitdir\n").expect("write invalid .git marker");
+        let mut row = crate::pool::WorkerRegistryEntry::test_row("w-unprobe", "owner");
+        row.status = RegistryStatus::Completed;
+        row.repo_path = Some(dir.to_string_lossy().into_owned());
+        row.base_branch = Some("main".into());
+        assert!(
+            !branch_replay_suppressed(&row),
+            "an unprobeable repository must not suppress the event"
+        );
+    }
+}
+
 /// Read bounded watch facts in the daemon, without collecting the worker.
 async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     use crate::cli::watch::{enrich_state, registry_snapshot};
@@ -1048,7 +1344,13 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     let mut views: crate::cli::watch::Snapshot =
         crate::pool::load_all_registry_entries_in(pool.scratch_root())
             .iter()
-            .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
+            .map(|entry| {
+                let mut view = registry_snapshot(entry, now);
+                if branch_replay_suppressed(entry) {
+                    view[BRANCH_GONE_OR_MERGED] = json!(true);
+                }
+                (entry.id.clone(), view)
+            })
             .collect();
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
@@ -1181,9 +1483,31 @@ impl EventRouter {
                 }
                 continue;
             }
+            // A terminal worker whose branch is merged into its base or already
+            // gone has no work left to report: replaying it after a restart
+            // would tell the owner to review work that is already landed.
+            if view[BRANCH_GONE_OR_MERGED] == true {
+                self.watch_reported.remove(id);
+                self.seen.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| event["worker_id"] != *id);
+                }
+                continue;
+            }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
             {
+                // The owner already acknowledged this exact transition before
+                // this daemon started, so a restart must not replay it as a
+                // missed event.
+                if self.acks.acknowledged(
+                    event["owner"].as_str().unwrap_or("unattributed"),
+                    id,
+                    event["revision"].as_u64().unwrap_or(0),
+                    event["event"].as_str().unwrap_or(""),
+                ) {
+                    continue;
+                }
                 // One transition is one event, whichever view describes it:
                 // the live snapshot and the registry row of the same revision
                 // share the key `(worker id, revision, kind)` and must not be
@@ -1268,6 +1592,9 @@ impl EventRouter {
                 anyhow::bail!("Worker not found: {id}");
             }
         }
+        if params["all"].as_bool() == Some(true) {
+            return self.watch_round(ctx, params);
+        }
         let watching: BTreeSet<String> = self
             .watch_current
             .values()
@@ -1338,6 +1665,112 @@ impl EventRouter {
         Ok(json!({"watching":watching,"events":events}))
     }
 
+    /// The `--all` watch: one consolidated event per round.
+    ///
+    /// A round needs a group or explicit ids. It answers once when every
+    /// selected worker has stopped, or earlier when one is paused (needs
+    /// input), has failed, or (past the long threshold) has gone quiet. The
+    /// individual transitions it folds in are acknowledged here, so a later
+    /// plain watch does not replay them.
+    fn watch_round(
+        &mut self,
+        ctx: &super::server::ConnectionContext,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        use std::collections::BTreeSet;
+        let ids: BTreeSet<String> = params["worker_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let group = params["group"].as_str();
+        anyhow::ensure!(
+            !ids.is_empty() || group.is_some(),
+            "watch --all needs a group or explicit worker ids"
+        );
+        let owner = ctx.agent();
+        let allowed = |v: &serde_json::Value| {
+            ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed")
+        };
+        let watching: BTreeSet<String> = self
+            .watch_current
+            .values()
+            .filter(|v| {
+                allowed(v)
+                    && crate::cli::watch::matches(v, &ids, group)
+                    && matches!(
+                        v["status"].as_str(),
+                        Some("running" | "paused" | "reviewing")
+                    )
+            })
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        let now = crate::pool::unix_timestamp();
+        // A worker is fresh when one of its transitions is still unacknowledged:
+        // either queued for this owner, or reported but never marked seen.
+        let pending: BTreeSet<String> = self
+            .watch_history
+            .iter()
+            .filter(|(agent, _)| ctx.is_admin() || agent.as_str() == owner)
+            .flat_map(|(_, history)| history.pending.iter())
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        let event = {
+            let reported = &self.watch_reported;
+            let seen = &self.seen;
+            let fresh = |id: &str| {
+                pending.contains(id)
+                    || reported
+                        .get(id)
+                        .and_then(|v| v["sequence"].as_u64())
+                        .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
+            };
+            crate::cli::watch::round_event(&self.watch_current, &ids, group, now, fresh, allowed)
+        };
+        // Reserve the identity's one watch slot before the round is
+        // acknowledged: a second watch must be refused, never let a
+        // caller consume the events it was refused.
+        self.watches.claim(&owner, ctx.id, ctx.pid)?;
+        if let Some(event) = event {
+            self.ack_round(ctx, &ids, group);
+            return Ok(json!({"watching":watching,"events":[event]}));
+        }
+        Ok(json!({"watching":watching,"events":[]}))
+    }
+
+    /// Acknowledge every selected worker the round event folded in.
+    ///
+    /// Its per-worker transitions leave the owner's backlog and are marked
+    /// seen, so a later plain watch treats the round as already delivered.
+    fn ack_round(
+        &mut self,
+        ctx: &super::server::ConnectionContext,
+        ids: &std::collections::BTreeSet<String>,
+        group: Option<&str>,
+    ) {
+        let owner = ctx.agent();
+        let selected: std::collections::BTreeSet<String> = self
+            .watch_current
+            .values()
+            .filter(|v| ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed"))
+            .filter(|v| crate::cli::watch::matches(v, ids, group))
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        for id in selected {
+            if let Some(agent) = self
+                .watch_current
+                .get(&id)
+                .and_then(|v| v["owner"].as_str())
+                .map(str::to_string)
+                && (ctx.is_admin() || agent == owner)
+            {
+                // Round delivery is an acknowledgment too, including after restart.
+                self.mark_seen(&agent, &id);
+            }
+        }
+    }
+
     /// Forget `owner`'s queued events for `wid` and mark its last reported
     /// event seen.
     ///
@@ -1348,32 +1781,51 @@ impl EventRouter {
         if let Some(history) = self.watch_history.get_mut(owner) {
             history.pending.retain(|v| v["worker_id"] != wid);
         }
-        if let Some(sequence) = self
-            .watch_reported
-            .get(wid)
-            .and_then(|v| v["sequence"].as_u64())
-        {
-            self.seen.insert(wid.to_string(), sequence);
+        if let Some(event) = self.watch_reported.get(wid) {
+            if let Some(sequence) = event["sequence"].as_u64() {
+                self.seen.insert(wid.to_string(), sequence);
+            }
+            // An interaction is the owner looking at the worker directly, so
+            // persist the position: a restart must not replay it either.
+            self.acks.record(
+                owner,
+                wid,
+                event["revision"].as_u64().unwrap_or(0),
+                event["event"].as_str().unwrap_or(""),
+            );
         }
     }
 
     fn acknowledge_watch(&mut self, ctx: &super::server::ConnectionContext, sequence: u64) {
         let owner = ctx.agent();
+        // Collect first: the pending deque is borrowed mutably below, while the
+        // acknowledged positions are recorded on `self` afterwards.
+        let mut acknowledged = Vec::new();
         for (agent, history) in &mut self.watch_history {
             if !ctx.is_admin() && *agent != owner {
                 continue;
             }
-            if history
-                .pending
-                .iter()
-                .any(|v| v["sequence"].as_u64() == Some(sequence))
-            {
-                history
-                    .pending
-                    .retain(|v| v["sequence"].as_u64() != Some(sequence));
+            let mut matched = false;
+            history.pending.retain(|v| {
+                if v["sequence"].as_u64() != Some(sequence) {
+                    return true;
+                }
+                matched = true;
+                acknowledged.push((
+                    agent.clone(),
+                    v["worker_id"].as_str().unwrap_or("").to_string(),
+                    v["revision"].as_u64().unwrap_or(0),
+                    v["event"].as_str().unwrap_or("").to_string(),
+                ));
+                false
+            });
+            if matched {
                 history.cursor = history.cursor.max(sequence);
                 history.dropped = 0;
             }
+        }
+        for (agent, wid, revision, event) in acknowledged {
+            self.acks.record(&agent, &wid, revision, &event);
         }
     }
 }
@@ -1437,6 +1889,105 @@ mod watch_stall_regression_tests {
         assert_eq!(router.watch_history["owner"].cursor, sequence);
         let second = router.watch_reply(&ctx, &params).unwrap();
         assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
+    }
+
+    /// Eviction keeps the store bounded by recency, not by key
+    /// order: keys are written in *descending* order so a
+    /// lexically-smallest key is the newest, and the
+    /// lexically-largest -- the least recently acknowledged -- is
+    /// the one dropped. Re-acknowledging the lexically smallest
+    /// (oldest by write order, newest by recency) must keep it.
+    #[test]
+    fn ack_store_evicts_least_recently_acknowledged_worker() {
+        let mut store = AckStore::default();
+        // Keys descend: w-00009 is written first (oldest), w-00000
+        // last (newest), so lexical order is the reverse of recency.
+        let total = MAX_ACK_WORKERS + 10;
+        for i in (0..total).rev() {
+            store.record("owner", &format!("w-{i:05}"), 1, "completed");
+        }
+        assert_eq!(
+            store.positions["owner"].len(),
+            MAX_ACK_WORKERS,
+            "the per-owner store must stay bounded"
+        );
+        // The first ten written -- the lexically largest -- were the
+        // least recently acknowledged, so they are the evicted ones.
+        for i in (MAX_ACK_WORKERS..total).rev() {
+            assert!(
+                !store.acknowledged("owner", &format!("w-{i:05}"), 1, "completed"),
+                "the least recently acknowledged key {i} must be evicted"
+            );
+        }
+        // The lexically smallest keys were written last, so they
+        // survive a pure lexical eviction that would keep them too;
+        // the discriminator is the re-acknowledged stale key below.
+        for i in 0..MAX_ACK_WORKERS {
+            assert!(
+                store.acknowledged("owner", &format!("w-{i:05}"), 1, "completed"),
+                "the newest key {i} must survive"
+            );
+        }
+        // Re-acknowledging an evicted key makes it the most recent,
+        // so it survives while the (now) least recent are dropped.
+        store.record("owner", &format!("w-{:05}", total - 1), 1, "completed");
+        assert!(
+            store.acknowledged("owner", &format!("w-{:05}", total - 1), 1, "completed"),
+            "a re-acknowledged key is the most recent and must survive"
+        );
+    }
+
+    /// The owner bound evicts the owner whose *latest* acknowledgment
+    /// is oldest, not the one with the oldest single entry: an owner
+    /// that keeps acknowledging new workers stays, while one that
+    /// went quiet is dropped.
+    #[test]
+    fn ack_store_evicts_least_recently_acknowledged_owner() {
+        // A long-lived owner is the discriminator: it acknowledges
+        // its FIRST worker before everything else and its LAST
+        // worker after the fillers, so its oldest stamp is the
+        // lowest in the store while its newest is the highest.
+        //
+        // Ranking owners by their *latest* acknowledgment (max)
+        // keeps such an owner -- it was just active -- and evicts
+        // a filler instead. Ranking by the *oldest* single entry
+        // (min) would instead evict the long-lived owner purely
+        // because it started first, which is exactly the bug this
+        // ordering distinguishes.
+        let mut store = AckStore::default();
+        // The oldest acknowledgment in the whole store.
+        store.record("long-lived", "w-first", 1, "completed");
+        for i in 0..(MAX_ACK_OWNERS - 1) {
+            store.record(&format!("filler-{i:05}"), "w", 1, "completed");
+        }
+        // The newest acknowledgment, so this owner is the most
+        // recent by `max` while still the least recent by `min`.
+        store.record("long-lived", "w-last", 1, "completed");
+        assert_eq!(store.positions.len(), MAX_ACK_OWNERS);
+        assert!(store.acknowledged("long-lived", "w-first", 1, "completed"));
+        assert!(store.acknowledged("long-lived", "w-last", 1, "completed"));
+        // One record past the bound evicts exactly one owner: the
+        // filler with the oldest stamp, never the long-lived one.
+        store.record("newcomer", "w", 1, "completed");
+        assert_eq!(
+            store.positions.len(),
+            MAX_ACK_OWNERS,
+            "the owner store must stay bounded"
+        );
+        assert!(
+            store.positions.contains_key("long-lived"),
+            "an owner that just acknowledged must not be evicted"
+        );
+        assert!(store.positions.contains_key("newcomer"));
+        // Both of the long-lived owner's workers survive together:
+        // the owner is evicted whole or kept whole, never split.
+        assert!(store.acknowledged("long-lived", "w-first", 1, "completed"));
+        assert!(store.acknowledged("long-lived", "w-last", 1, "completed"));
+        // A filler was dropped instead.
+        assert!(
+            !store.positions.contains_key("filler-00000"),
+            "the least recently acknowledged owner must be evicted"
+        );
     }
 
     #[test]
@@ -1649,3 +2200,5 @@ mod registry_verified_tests {
 }
 #[cfg(test)]
 mod event_dedup_tests;
+#[cfg(test)]
+mod watch_round_slot_tests;

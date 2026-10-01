@@ -599,13 +599,14 @@ impl HubClient {
         ids: &std::collections::BTreeSet<String>,
         group: Option<&str>,
         initial: bool,
+        all: bool,
     ) -> Result<Value> {
         if !self.watch_line.is_empty() {
             self.next_watch_notification().await?;
         }
         self.request(
             "hub/watch",
-            json!({"worker_ids":ids,"group":group,"initial":initial}),
+            json!({"worker_ids":ids,"group":group,"initial":initial,"all":all}),
         )
         .await
     }

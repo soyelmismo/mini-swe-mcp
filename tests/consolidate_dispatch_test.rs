@@ -436,6 +436,130 @@ fn the_consolidator_task_embeds_the_round_the_gate_and_the_procedure() {
     );
 }
 
+/// The consolidator judges scope from the whole task, so its prompt carries a
+/// clearly delimited section with every worker's *full* task, bounded per
+/// worker -- while the compact `round` payload the orchestrator reads keeps
+/// only each task's first line.
+#[test]
+fn the_consolidator_task_carries_full_worker_tasks_bounded() {
+    let h = Harness::new("round-full-task");
+    let scoped = format!("w1-{}", unique_suffix("w"));
+    let verbose = format!("w2-{}", unique_suffix("w"));
+    h.worker_branch(&scoped, &[("scoped.txt", "scoped\n")]);
+    h.worker_branch(&verbose, &[("verbose.txt", "verbose\n")]);
+
+    let scoped_task =
+        "Keep the header line.\nRemove nothing the task asked for.\nScope: src/lib.rs only.";
+    h.row(
+        &scoped,
+        scoped_task,
+        RegistryStatus::Completed,
+        WorkerRole::Worker,
+        Some(GROUP),
+    );
+    // One short heading and a body well past the 4 KiB per-worker budget.
+    let verbose_task = format!(
+        "verbose heading\n{}\nTAIL-OF-VERBOSE-TASK",
+        "v".repeat(8 * 1024)
+    );
+    h.row(
+        &verbose,
+        &verbose_task,
+        RegistryStatus::Completed,
+        WorkerRole::Worker,
+        Some(GROUP),
+    );
+
+    let manifest = manifest(&h.pool.pool, OWNER, GROUP, h.path());
+    let task = manifest.task_text(Some("cargo test --all-targets"));
+
+    assert!(
+        task.contains("FULL TASKS OF THE ROUND'S WORKERS"),
+        "the full-task section must be labelled and separate: {task}"
+    );
+    for line in scoped_task.lines() {
+        assert!(
+            task.contains(line),
+            "the worker's whole multi-line task must reach the consolidator: {line}"
+        );
+    }
+    assert!(
+        task.contains("[truncated]"),
+        "a task past the per-worker budget must be marked: {task}"
+    );
+    assert!(
+        !task.contains("TAIL-OF-VERBOSE-TASK"),
+        "the tail of an oversized task must be cut, not embedded whole"
+    );
+    assert!(
+        !task.contains(&"v".repeat(4 * 1024)),
+        "a bounded task must stay under the per-worker budget"
+    );
+
+    // The compact manifest the `round` payload and the CLI read keeps its
+    // shape: first line only, no bodies.
+    let compact = manifest.render();
+    assert!(
+        compact.contains(&format!(
+            "{scoped} Completed verified=unknown task=\"Keep the header line.\""
+        )),
+        "the compact manifest keeps each task's first line: {compact}"
+    );
+    for body in [
+        "Remove nothing the task asked for.",
+        "Scope: src/lib.rs only.",
+        "TAIL-OF-VERBOSE-TASK",
+    ] {
+        assert!(
+            !compact.contains(body),
+            "the compact manifest must not gain task bodies: {body}\n{compact}"
+        );
+    }
+    assert!(
+        !compact.contains(&"v".repeat(64))
+            && !compact.contains("FULL TASKS OF THE ROUND'S WORKERS"),
+        "the full-task section lives only in the task, never in the compact round text: {compact}"
+    );
+}
+
+/// The full-task section is bounded overall: a round of many verbose workers
+/// reports what the section budget left out instead of embedding everything.
+#[test]
+fn the_full_task_section_is_bounded_overall() {
+    use mini_swe_mcp::pool::{RoundManifest, RoundWorker};
+
+    let worker = |id: usize| RoundWorker {
+        id: format!("w{id}"),
+        state: "Completed".to_string(),
+        verified: Some(true),
+        task: "heading".to_string(),
+        full_task: format!("heading {id}\n{}", "z".repeat(8 * 1024)),
+        files: Vec::new(),
+    };
+    let manifest = RoundManifest {
+        group: GROUP.to_string(),
+        base_branch: Some("master".to_string()),
+        ready: (1..=8).map(worker).collect(),
+        not_ready: Vec::new(),
+        interaction_points: Vec::new(),
+    };
+    let section = manifest.render_full_tasks();
+    assert!(
+        section.len() <= 16 * 1024,
+        "the section budget is a hard cap, footer included: {} bytes",
+        section.len()
+    );
+    assert!(
+        section.contains("omitted"),
+        "workers the overall budget left out must be counted: {section}"
+    );
+    assert_eq!(
+        manifest.render_full_tasks(),
+        section,
+        "the section is stable across calls"
+    );
+}
+
 /// The CLI turns `consolidate` argv into the same tool arguments the MCP path
 /// sends, and refuses a missing group rather than guessing one.
 #[test]

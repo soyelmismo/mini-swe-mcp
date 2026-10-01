@@ -524,7 +524,14 @@ impl HubServer {
         let recovering = self.clone();
         let recovery_task = tokio::spawn(async move { recovering.recover_and_resume().await });
 
-        let events = self.server.start_hub_events().await;
+        let events = self
+            .server
+            .start_hub_events(Some(self.config.paths().dir()))
+            .await;
+        let auto_consolidate = self
+            .server
+            .start_auto_consolidate(paths.dir().to_path_buf())
+            .await?;
         let mut shutdown = self.server.subscribe_shutdown();
 
         let reaper = crate::pool::spawn_reaper((*self.server.pool()).clone());
@@ -576,6 +583,7 @@ impl HubServer {
         recovery_task.abort();
         reaper.abort();
         events.abort();
+        auto_consolidate.abort();
         let killed = self.server.pool().kill_all().await;
         if killed > 0 {
             info!(workers = killed, "Terminated workers on hub shutdown");

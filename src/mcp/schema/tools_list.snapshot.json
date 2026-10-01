@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
+      "description": "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -29,6 +29,17 @@
           "approved": {
             "description": "Merge every approved worker.",
             "type": "boolean"
+          },
+          "consolidate": {
+            "description": "Auto-consolidate stopped group: true uses strongest/default; string pins model.",
+            "type": [
+              "boolean",
+              "string"
+            ]
+          },
+          "consolidate_verify": {
+            "description": "Automatic consolidator's full gate; default: auto-detect.",
+            "type": "string"
           },
           "diff": {
             "default": "code",
@@ -70,7 +81,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "description": "Required for steer: resumes own branch with full context, including stopped workers; never dispatch a replacement. max_turns sets budget.",
             "type": "string"
           },
           "model": {
@@ -95,7 +106,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
+            "description": "Reviewer model auditing the worktree after implementation.",
             "type": "string"
           },
           "role": {
@@ -116,9 +127,18 @@
             "type": "string"
           },
           "tasks": {
-            "description": "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
+            "description": "Batch {task, model?, ...} entries; top-level defaults.",
             "items": {
               "properties": {
+                "consolidate": {
+                  "type": [
+                    "boolean",
+                    "string"
+                  ]
+                },
+                "consolidate_verify": {
+                  "type": "string"
+                },
                 "group": {
                   "type": "string"
                 },
@@ -155,12 +175,12 @@
             "type": "number"
           },
           "timeout_secs": {
-            "description": "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
+            "description": "Watch deadline seconds; expiry: no_event.",
             "minimum": 0,
             "type": "integer"
           },
           "verify": {
-            "description": "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
@@ -173,6 +193,10 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "all": {
+            "type": "boolean",
+            "description": "Watch the whole round as one event."
           }
         },
         "required": [

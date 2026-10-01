@@ -64,7 +64,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -149,6 +149,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static(super::handlers::watch::TIMEOUT_SECS_DESCRIPTION),
     ),
     (
+        "all",
+        "boolean",
+        DescriptionSource::Static(super::handlers::watch::ALL_DESCRIPTION),
+    ),
+    (
         "max_turns",
         "integer",
         DescriptionSource::Static(super::handlers::steer::MAX_TURNS_DESCRIPTION),
@@ -167,6 +172,16 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(super::handlers::dispatch::VERIFY_DESCRIPTION),
+    ),
+    (
+        "consolidate",
+        "boolean",
+        DescriptionSource::Static(super::handlers::dispatch::AUTO_CONSOLIDATE_DESCRIPTION),
+    ),
+    (
+        "consolidate_verify",
+        "string",
+        DescriptionSource::Static("Automatic consolidator's full gate; default: auto-detect."),
     ),
     (
         "scope",
@@ -269,6 +284,9 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
             Value::String(LIST_SCOPES[0].to_string()),
         );
     }
+    if name == "consolidate" {
+        schema.insert("type".to_string(), json!(["boolean", "string"]));
+    }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));
         schema.insert(
@@ -293,6 +311,8 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     "repo_path": { "type": "string" },
                     "max_turns": { "type": "integer" },
                     "verify": { "type": "string" },
+                    "consolidate": { "type": ["boolean", "string"] },
+                    "consolidate_verify": { "type": "string" },
                     "group": { "type": "string" },
                     "network": { "type": "string" },
                 },
@@ -395,7 +415,12 @@ mod tests {
         assert_eq!(properties.len(), WORKER_PROPERTIES.len());
         for (name, json_type, _) in WORKER_PROPERTIES {
             let property = &properties[*name];
-            assert_eq!(property["type"], *json_type, "wrong type for '{name}'");
+            let expected = if *name == "consolidate" {
+                json!(["boolean", "string"])
+            } else {
+                json!(json_type)
+            };
+            assert_eq!(property["type"], expected, "wrong type for '{name}'");
             assert!(
                 property["description"]
                     .as_str()
