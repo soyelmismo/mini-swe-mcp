@@ -141,7 +141,7 @@ async fn consolidates_once_after_last_worker_and_survives_restart() {
     let hub = scratch.subdir("hub");
     let (url, slow, llm) = scripted_workers().await;
     let first = server(&root, &url);
-    let events = first.start_hub_events().await;
+    let events = first.start_hub_events(Some(&hub)).await;
     let scheduler = first.start_auto_consolidate(hub.clone()).await.unwrap();
     let mut ctx = ConnectionContext::stdio();
     ctx.agent_id = Some("round-owner".into());
@@ -178,7 +178,7 @@ async fn consolidates_once_after_last_worker_and_survives_restart() {
     let _ = scheduler.await;
     events.abort();
     let second = server(&root, &url);
-    let events = second.start_hub_events().await;
+    let events = second.start_hub_events(Some(&hub)).await;
     let scheduler = second.start_auto_consolidate(hub.clone()).await.unwrap();
     slow.add_permits(1);
     wait_status(&root, slow_id, RegistryStatus::Completed).await;
