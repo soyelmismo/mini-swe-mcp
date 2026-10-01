@@ -28,9 +28,7 @@
 //! fleet-wide strip.
 
 use crate::config::env_parse;
-use crate::pool::{
-    RegistryStatus, WorkerRegistryEntry, WorkerRole, load_all_registry_entries, unix_timestamp,
-};
+use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -1106,7 +1104,7 @@ mod tests {
                 started_at: 1000,
                 updated_at: self.updated_at,
                 group: self.group.map(str::to_string),
-                role: WorkerRole::Worker,
+                role: crate::pool::WorkerRole::Worker,
                 repo_path: self.repo.map(str::to_string),
                 owner: None,
                 metrics: self.metrics,
@@ -1132,7 +1130,7 @@ mod tests {
             started_at: 1000,
             updated_at,
             group: None,
-            role: WorkerRole::Worker,
+            role: crate::pool::WorkerRole::Worker,
             repo_path: None,
             owner: None,
             metrics: WorkerMetrics::default(),

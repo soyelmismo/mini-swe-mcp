@@ -14,7 +14,7 @@
 mod guard;
 pub(crate) mod prune;
 
-pub use guard::{BaseSync, FileFingerprint, WorktreeGuard};
+pub use guard::{BaseSync, BranchMerge, FileFingerprint, WorktreeGuard};
 pub use prune::{
     claim_lease_for_test, is_process_alive, prune_stale_worktrees, prune_stale_worktrees_in,
     worktree_is_stale_for_test,

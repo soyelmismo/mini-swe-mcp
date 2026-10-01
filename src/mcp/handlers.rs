@@ -367,7 +367,9 @@ impl McpServer {
         let role = match args.get("role") {
             None => crate::pool::WorkerRole::Worker,
             Some(Value::String(role)) if role == "worker" => crate::pool::WorkerRole::Worker,
-            Some(Value::String(role)) if role == "consolidate" => crate::pool::WorkerRole::Consolidate,
+            Some(Value::String(role)) if role == "consolidate" => {
+                crate::pool::WorkerRole::Consolidate
+            }
             _ => anyhow::bail!("role must be 'worker' or 'consolidate'"),
         };
         if role == crate::pool::WorkerRole::Consolidate

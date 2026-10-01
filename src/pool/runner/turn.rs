@@ -25,19 +25,21 @@ use tracing::{info, warn};
 
 use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
 use crate::manifest::MAX_TURNS_LIMIT;
-use crate::worktree::{BaseSync, WorktreeGuard, git};
+use crate::worktree::{BaseSync, BranchMerge, WorktreeGuard, git};
 
 use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
-use super::super::registry::{RegistryStatus, WorkerMeta};
+use super::super::registry::{
+    RegistryStatus, WorkerMeta, WorkerRole, check_consolidate_delegation,
+};
 use super::super::revision::{WorkerHistory, append_history_message_in};
 use super::super::state::WorkerState;
 use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
-    summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_request_turns, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -577,6 +579,32 @@ impl<'a> TurnEngine<'a> {
         // --- Execute command with semaphores ---
         let (output, code) = self.run_gated(&cmd_str).await?;
 
+        // --- Consolidator merge request (harness side, never bash) ---
+        // The sandbox holds no git credentials, so the merge runs here, on the
+        // harness, through the same machinery the base sync uses. Only a
+        // consolidator sees this verb; an ordinary worker's identical command
+        // stays plain bash.
+        if self.meta.role == WorkerRole::Consolidate
+            && let Some(ids) = parse_consolidate_merge(&cmd_str)
+        {
+            let observation = self.consolidate_merge(&ids).await;
+            let output_text = format!("{COMMAND_OUTPUT_PREFIX}0):\n```\n{observation}\n```");
+            let step_log = build_step_log(*self.step, &label, observation, Some(0));
+            {
+                let mut lock = self.pool.workers.write().await;
+                if let Some(w) = lock.get_mut(self.worker_id) {
+                    w.logs.push(step_log);
+                }
+            }
+            self.push_exchange(
+                llm_resp.content,
+                llm_resp.reasoning_content,
+                llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+                output_text,
+            );
+            return Ok(TurnOutcome::Continue);
+        }
+
         // --- Orchestrator control sentinels (implementer only) ---
         if config.apply_sentinels {
             // REQUEST_TURNS, bounded by the self-grant budget: a worker may
@@ -683,6 +711,68 @@ impl<'a> TurnEngine<'a> {
         );
 
         Ok(TurnOutcome::Continue)
+    }
+
+    /// Merge the named workers' branches into this consolidator's worktree.
+    ///
+    /// Each id is resolved, checked against the delegation rule and merged in
+    /// order; the first conflict stops the run and leaves the rest skipped, so
+    /// the model resolves one merge at a time. A worker the pool and the
+    /// registry do not both know is refused rather than silently ignored.
+    async fn consolidate_merge(&mut self, ids: &[String]) -> String {
+        let mut lines = Vec::new();
+        let mut conflicted = false;
+        for id in ids {
+            if conflicted {
+                lines.push(format!("{id} skipped (an earlier merge conflicted)"));
+                continue;
+            }
+            let target = match self.pool.resolve_worker_id(id, &self.meta.owner).await {
+                Ok(target) => target,
+                Err(e) => {
+                    lines.push(format!("{id} refused: {e}"));
+                    continue;
+                }
+            };
+            let Some(entry) = self.pool.worker_row(&target).await else {
+                lines.push(format!("{id} refused: no such worker"));
+                continue;
+            };
+            if let Err(reason) = check_consolidate_delegation(self.meta, &entry) {
+                lines.push(format!("{id} refused: {reason}"));
+                continue;
+            }
+            if !self.pool.is_completed(&target).await {
+                lines.push(format!("{id} refused: the worker is not completed"));
+                continue;
+            }
+            let path = self.worktree.path.clone();
+            let repo_root = self.worktree.repo_root.clone();
+            let branch = self.worktree.branch.clone();
+            let base_commit = self.worktree.base_commit.clone();
+            let merged = tokio::task::spawn_blocking(move || {
+                WorktreeGuard::merge_branch_at(&path, &repo_root, &branch, &base_commit, &target)
+            })
+            .await;
+            match merged {
+                Ok(Ok(BranchMerge::Merged { files })) => {
+                    // The branch now carries another worker's commits, so it
+                    // must survive this guard's cleanup.
+                    self.worktree.preserve_branch = true;
+                    lines.push(format!("{id} merged ({files} files)"));
+                }
+                Ok(Ok(BranchMerge::Conflicts { files })) => {
+                    conflicted = true;
+                    lines.push(format!(
+                        "{id} conflict: {} (resolve the markers, then continue)",
+                        files.join(", ")
+                    ));
+                }
+                Ok(Err(e)) => lines.push(format!("{id} refused: {e}")),
+                Err(e) => lines.push(format!("{id} refused: {e}")),
+            }
+        }
+        lines.join("\n")
     }
 
     /// Handle a completion sentinel: run the verify gate (if any) and either

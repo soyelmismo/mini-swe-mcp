@@ -298,6 +298,36 @@ impl RegistryWriter {
     }
 }
 
+/// Whether a consolidator may act on `target`, or the reason it may not.
+///
+/// The consolidator's whole authority is this check: it may integrate only
+/// workers its own owner dispatched into its own group, never itself and never
+/// another consolidator (whose branch is an integration, not work). A row with
+/// no recorded owner or group is never authority, so a legacy row is refused
+/// rather than trusted.
+pub fn check_consolidate_delegation(
+    actor: &WorkerMeta,
+    target: &WorkerRegistryEntry,
+) -> Result<(), String> {
+    if actor.role != WorkerRole::Consolidate {
+        return Err("the caller is not a consolidator".to_string());
+    }
+    if actor.owner.is_empty() || target.owner.as_deref() != Some(actor.owner.as_str()) {
+        return Err("the target belongs to another owner".to_string());
+    }
+    let group = actor.group.as_deref().unwrap_or("").trim();
+    if group.is_empty() || target.group.as_deref() != Some(group) {
+        return Err("the target is in another group".to_string());
+    }
+    if actor.id == target.id {
+        return Err("a consolidator cannot integrate itself".to_string());
+    }
+    if target.role == WorkerRole::Consolidate {
+        return Err("the target is itself a consolidator".to_string());
+    }
+    Ok(())
+}
+
 pub fn extract_group(task: &str) -> Option<String> {
     let trimmed = task.trim();
     if trimmed.starts_with('[')

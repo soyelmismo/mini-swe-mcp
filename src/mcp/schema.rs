@@ -132,7 +132,9 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "role",
         "string",
-        DescriptionSource::Static("'consolidate': integrate this group's completed workers (requires 'group')"),
+        DescriptionSource::Static(
+            "'consolidate': integrate this group's completed workers (requires 'group')",
+        ),
     ),
     (
         "timeout_secs",
