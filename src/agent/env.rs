@@ -245,6 +245,79 @@ pub fn apply_clean_environment_cmd(
     }
 }
 
+/// Upper bound on the ambient environment snapshot a client may send to the
+/// daemon (64 KB).
+///
+/// The snapshot exists so the worker can re-run its verify gate in the
+/// orchestrator's environment, not to become a transport for the operator's
+/// whole shell: a caller with a pathological environment must not be able to
+/// grow a hub frame without bound.
+pub const AMBIENT_ENV_MAX_BYTES: usize = 64 * 1024;
+
+/// Substrings that mark a variable name as credential-bearing.
+///
+/// Matched case-insensitively against the *name* only, never the value: a value
+/// is not inspected because the point is to refuse the name before it is ever
+/// read into a snapshot. The list is deliberately broad - a false positive
+/// costs one variable in a differential run, a false negative ships a key.
+const SECRET_NAME_MARKERS: &[&str] = &[
+    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "AUTH", "PRIVATE",
+    "SIGNATURE", "BEARER", "COOKIE", "CERT", "APIKEY", "ACCESS_KEY", "SESSION_KEY", "SALT",
+];
+
+/// Whether `name` is credential-bearing and must never leave the client.
+///
+/// The sandbox's allow-list is the authority on what a child may see; this is
+/// the matching *deny* rule for the one thing that does cross a process
+/// boundary in the other direction - the ambient snapshot a dispatcher sends in
+/// `hub/hello`. Both are applied to every snapshot, on the client that builds
+/// it and again on the daemon that receives it, so neither side can be the only
+/// thing standing between a credential and the model.
+pub fn is_secret_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_NAME_MARKERS
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+/// The caller's environment, filtered for transport to the daemon.
+///
+/// Every variable of this process that is not credential-bearing
+/// ([`is_secret_name`]) and not empty, sorted by name for a stable frame, and
+/// truncated at [`AMBIENT_ENV_MAX_BYTES`] - the entry that would cross the
+/// bound is dropped rather than split, so the result is always a set of whole
+/// variables.
+///
+/// This is the *only* environment the daemon ever learns about the
+/// orchestrator's shell, and it is what the differential verify gate layers on
+/// top of the canonical sandbox environment.
+pub fn ambient_environment_snapshot() -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            if is_secret_name(&name) {
+                return None;
+            }
+            let value = value.to_string_lossy().into_owned();
+            (!value.is_empty()).then_some((name, value))
+        })
+        .collect();
+    pairs.sort();
+    let mut total = 0usize;
+    pairs.retain(|(name, value)| {
+        // `name.len() + value.len() + 2` covers the separator and the
+        // terminator of the wire form, so the bound holds for the encoded
+        // frame and not only for the raw bytes.
+        let cost = name.len() + value.len() + 2;
+        if total + cost > AMBIENT_ENV_MAX_BYTES {
+            return false;
+        }
+        total += cost;
+        true
+    });
+    pairs
+}
+
 /// Serializes tests that mutate the process environment.
 ///
 /// `std::env::set_var` is process-global, and the harness runs unit tests on
@@ -596,6 +669,53 @@ mod tests {
         assert_eq!(resolve_cargo_home(None, Some(&without_cargo)), None);
         assert_eq!(resolve_cargo_home(None, None), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_names_are_detected_case_insensitively() {
+        for name in [
+            "OPENAI_API_KEY",
+            "openai_api_key",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "SSH_AUTH_SOCK",
+            "MY_CREDENTIALS",
+            "BEARER_AUTH",
+            "TLS_CERT",
+            "SESSION_KEY",
+        ] {
+            assert!(is_secret_name(name), "{name} must be treated as a secret");
+        }
+        for name in ["PATH", "USER", "HOME", "TMPDIR", "TZ", "LANG", "MY_FOO", "BUILD_ID"] {
+            assert!(!is_secret_name(name), "{name} must not be treated as a secret");
+        }
+    }
+
+    #[test]
+    fn ambient_snapshot_never_carries_secrets() {
+        let _guard = env_guard();
+        // SAFETY: serialized against every other test that reads the process
+        // environment.
+        unsafe {
+            std::env::set_var("SWE_AMBIENT_PLAIN_TEST", "hello");
+            std::env::set_var("SWE_AMBIENT_SECRET_TOKEN_TEST", "must-not-travel");
+        }
+        let snapshot = ambient_environment_snapshot();
+        unsafe {
+            std::env::remove_var("SWE_AMBIENT_PLAIN_TEST");
+            std::env::remove_var("SWE_AMBIENT_SECRET_TOKEN_TEST");
+        }
+        assert!(
+            snapshot
+                .iter()
+                .any(|(k, v)| k == "SWE_AMBIENT_PLAIN_TEST" && v == "hello"),
+            "plain variables must survive the snapshot"
+        );
+        assert!(
+            !snapshot.iter().any(|(k, _)| k == "SWE_AMBIENT_SECRET_TOKEN_TEST"),
+            "secret names must not survive the snapshot"
+        );
     }
 
     /// An explicit host `CARGO_HOME` wins over the `~/.cargo` fallback and is
