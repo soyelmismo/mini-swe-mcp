@@ -90,7 +90,7 @@ pub fn registry_snapshot(entry: &WorkerRegistryEntry, now: u64) -> Value {
     // A torn-down worktree means the row's metrics were sampled while the worker
     // still lived: fall back to the branch it left behind, but never overwrite a
     // measured diff with a guess.
-    if matches!(view["status"].as_str(), Some("completed" | "failed"))
+    if matches!(view["status"].as_str(), Some("completed" | "failed" | "exhausted"))
         && view["metrics"]["diff_files"].as_u64().unwrap_or(0) == 0
         && view["metrics"]["diff_insertions"].as_u64().unwrap_or(0) == 0
         && view["metrics"]["diff_deletions"].as_u64().unwrap_or(0) == 0
@@ -231,7 +231,7 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
         .unwrap_or_default();
     let idle = now.saturating_sub(view["last_step_at"].as_u64().unwrap_or(now));
     let event = match status {
-        "completed" | "failed" => status,
+        "completed" | "failed" | "exhausted" => status,
         "paused" => "needs_input",
         "running" | "reviewing"
             if idle >= 600
@@ -279,7 +279,17 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     // The counters that moved since the last snapshot, so a compact stall
     // event can name why it fired instead of only how long it has been idle.
     payload["moved_counters"] = json!(moved_counters_since(&metrics, &baseline));
-    payload["next_step"] = json!(crate::pool::next_step_for(view["branch"].as_str()));
+    // An exhausted worker is stopped, not done: its next step is to continue
+    // it with a fresh budget, not to review and merge its branch.
+    payload["next_step"] = json!(if view["status"] == json!("exhausted") {
+        crate::pool::exhausted_next_step(
+            view["worker_id"].as_str().unwrap_or(""),
+            view["turns"].as_u64().unwrap_or(0) as usize,
+            view["branch"].as_str(),
+        )
+    } else {
+        crate::pool::next_step_for(view["branch"].as_str())
+    });
     payload["commands"] = json!(commands(&payload));
     Some(payload)
 }
@@ -292,6 +302,10 @@ pub(crate) fn commands(v: &Value) -> Vec<String> {
     match v["event"].as_str().unwrap_or("") {
         "needs_input" => vec![steer],
         "stalled" => vec![steer, format!("mini-swe-mcp kill {id}")],
+        "exhausted" => vec![format!(
+            "mini-swe-mcp steer {id} \"continue\" --max-turns {}",
+            v["turns"].as_u64().unwrap_or(0).max(1)
+        )],
         _ => {
             let branch = v["branch"].as_str().map(shell);
             let mut out = vec![
@@ -362,7 +376,7 @@ fn render_event(v: &Value, verbose: bool) -> String {
     let verified = v["verified"]
         .as_bool()
         .map_or_else(String::new, |ok| format!(" | Verified: {ok}"));
-    let diff = matches!(event, "completed" | "failed").then(|| {
+    let diff = matches!(event, "completed" | "failed" | "exhausted").then(|| {
         format!(
             " | Diff: {} files, +{} -{}",
             v["diff_stat"]["files"], v["diff_stat"]["insertions"], v["diff_stat"]["deletions"]
@@ -375,6 +389,8 @@ fn render_event(v: &Value, verbose: bool) -> String {
             .or_else(|| one_line(v["summary"].as_str()))
             .unwrap_or_else(|| "done".to_string()),
         "failed" => one_line(v["error"].as_str()).unwrap_or_else(|| "failed".to_string()),
+        "exhausted" => one_line(v["summary"].as_str())
+            .unwrap_or_else(|| "stopped: turn budget exhausted".to_string()),
         "needs_input" => {
             one_line(v["question"].as_str()).unwrap_or_else(|| "needs input".to_string())
         }
@@ -484,7 +500,7 @@ fn render_event_verbose(v: &Value) -> String {
     }
     out.push_str(&format!("{}: {} | {} | owner {} | group {} | branch {} | revision {}\nStep {}/{} | elapsed {}s | {}\n", text("worker_id"), text("event"), text("model"), text("owner"), text("group"), branch, v["revision"], v["step"], v["max_turns"], v["elapsed"], text("task")));
     match text("event") {
-        "completed" | "failed" => {
+        "completed" | "failed" | "exhausted" => {
             // A registry-only row never ran the gate: stay silent rather than
             // printing a null the orchestrator would have to interpret.
             let verified = v["verified"]
@@ -617,7 +633,7 @@ pub fn progress_clock(view: &mut Value, old: Option<&Value>, now: u64) {
 fn terminal(view: &Value) -> bool {
     matches!(
         view["status"].as_str(),
-        Some("completed" | "failed" | "stopped" | "interrupted")
+        Some("completed" | "failed" | "exhausted" | "stopped" | "interrupted")
     )
 }
 
