@@ -63,6 +63,41 @@ const NICE_FLAG: &str = "-n";
 /// `nice` level applied to every child so agent work yields to interactive work.
 const NICE_VALUE: &str = "10";
 
+/// Env var choosing a heavy command's I/O scheduling class.
+///
+/// `0` leaves the inherited class alone, `idle` (or its class number, `3`)
+/// opts into the idle class, and anything else — including an unset variable —
+/// keeps the best-effort default described on [`IoClass`].
+pub const HEAVY_IONICE_ENV: &str = "HUB_HEAVY_IONICE";
+
+/// `IOPRIO_CLASS_SHIFT` from `<linux/ioprio.h>`: a priority value is the class
+/// in its high bits and the level in the low ones.
+const IOPRIO_CLASS_SHIFT: i32 = 13;
+
+/// `IOPRIO_CLASS_BE`: best-effort, the class every ordinary command runs in.
+const IOPRIO_CLASS_BE: i32 = 2;
+
+/// `IOPRIO_CLASS_IDLE`: the disk is only used when nothing else wants it.
+const IOPRIO_CLASS_IDLE: i32 = 3;
+
+/// `IOPRIO_WHO_PROCESS`: the priority value addresses one pid.
+const IOPRIO_WHO_PROCESS: i32 = 1;
+
+/// Best-effort level the kernel gives a task nobody has re-prioritised
+/// (`IOPRIO_BE_NR_LEVELS / 2`), so a light command is pinned to *normal*
+/// rather than to the top of its class.
+const IOPRIO_BE_NORMAL: i32 = 4;
+
+/// Lowest best-effort level (`IOPRIO_BE_NR_LEVELS - 1`): the bottom of the
+/// class, but still a class the scheduler serves whenever the disk is free.
+const IOPRIO_BE_LOWEST: i32 = 7;
+
+/// `ionice` arguments for the default heavy class: best-effort, lowest level.
+const IONICE_HEAVY_ARGS: &str = "-c2 -n7";
+
+/// `ionice` arguments for the idle class, the opt-in heavy class.
+const IONICE_IDLE_ARGS: &str = "-c3";
+
 /// Grace period after `SIGTERM` before a timed-out group is escalated to
 /// `SIGKILL`. Long enough to flush buffers, short enough that a wedged build
 /// still fails near its budget.
@@ -154,9 +189,17 @@ impl AgentRunner {
         // Classify on the model's own command, before any offline wrapper is
         // applied: a wrapper would otherwise mask the command's heaviness
         // from the timeout classifier.
+        let heavy = is_heavy_command(command);
         let timeout_secs = self
             .command_timeout_override
-            .unwrap_or_else(|| command_timeout_secs(command));
+            .unwrap_or_else(|| command_timeout_secs(heavy));
+        // Disk priority rides the same classification: a saturated disk must
+        // slow the build down, not the light commands around it.
+        let io_plan = io_plan(
+            heavy,
+            ioprio_syscall_supported(),
+            heavy_ionice_setting(std::env::var(HEAVY_IONICE_ENV).ok().as_deref()),
+        );
 
         match select_backend() {
             SandboxBackend::Kernel => {
@@ -169,6 +212,7 @@ impl AgentRunner {
                     dir,
                     sandbox_target,
                     self.network_offline,
+                    io_plan,
                 ) {
                     Ok(denied) => denied,
                     Err(e) => {
@@ -190,6 +234,7 @@ impl AgentRunner {
                 } else {
                     wrap_network_command(command, self.network_offline)
                 };
+                let final_command = apply_io_wrapper(final_command, io_plan);
                 cmd.current_dir(dir)
                     .args([NICE_FLAG, NICE_VALUE, "bash", "-c", &final_command]);
             }
@@ -198,17 +243,25 @@ impl AgentRunner {
                 // Landlock here would only risk re-confining a process bwrap
                 // already confined. Offline still needs its network namespace.
                 let final_command = wrap_network_command(command, self.network_offline);
+                let final_command = apply_io_wrapper(final_command, io_plan);
                 apply_sandbox_args(&mut cmd, dir, sandbox_target);
                 cmd.args(["--chdir", &dir.to_string_lossy()]);
                 cmd.args(["/usr/bin/bash", "-c", &final_command]);
+                if let IoPlan::Set(class) = io_plan {
+                    apply_io_priority(&mut cmd, class);
+                }
             }
             SandboxBackend::Unconfined => {
                 warn_unconfined_once();
                 // No confinement is never "with network access" when the
                 // policy says offline.
                 let final_command = wrap_network_command(command, self.network_offline);
+                let final_command = apply_io_wrapper(final_command, io_plan);
                 cmd.current_dir(dir)
                     .args([NICE_FLAG, NICE_VALUE, "bash", "-c", &final_command]);
+                if let IoPlan::Set(class) = io_plan {
+                    apply_io_priority(&mut cmd, class);
+                }
             }
         }
 
@@ -429,6 +482,7 @@ fn apply_kernel_confinement(
     dir: &Path,
     target_dir: &Path,
     offline: bool,
+    io_plan: IoPlan,
 ) -> Result<bool> {
     // Parent side of the hook: everything that allocates happens here, so the
     // closure below is reduced to syscalls. A `None` plan means this host
@@ -445,10 +499,21 @@ fn apply_kernel_confinement(
     // `confinement.apply` performs only raw syscalls - it allocates nothing,
     // takes no lock and never unwinds - and confines only that child, never
     // the parent.
+    // The I/O class rides this same closure rather than a second `pre_exec`
+    // registration, so the confinement can never be the half that is dropped.
+    let io_hook = match io_plan {
+        IoPlan::Set(class) => Some(IoPriorityHook(class)),
+        IoPlan::Wrap(_) | IoPlan::Inherit => None,
+    };
+
     unsafe {
         cmd.pre_exec(move || {
             // SAFETY: forwarded from this function's contract; see above.
-            confinement.apply()
+            confinement.apply()?;
+            if let Some(hook) = &io_hook {
+                let _ = hook.apply();
+            }
+            Ok(())
         });
     }
     Ok(network_denied)
@@ -461,6 +526,7 @@ fn apply_kernel_confinement(
     _dir: &Path,
     _target_dir: &Path,
     _offline: bool,
+    _io_plan: IoPlan,
 ) -> Result<bool> {
     Ok(false)
 }
@@ -474,6 +540,194 @@ fn configure_process(cmd: &mut Command) {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+}
+
+/// I/O scheduling class a command's process group runs in.
+///
+/// The CPU side of "agent work yields to everything else" is already `nice`;
+/// this is the disk side of the same idea. A build is I/O-bound and mostly
+/// indifferent to latency, while the light commands that make up most steps
+/// (grep, sed, git, cat) are latency-bound and do almost no I/O. Sending the
+/// first to the bottom of the best-effort class is what keeps the second
+/// responsive when several builds saturate the disk.
+///
+/// The idle class is deliberately *not* the default: it is only served when no
+/// best-effort or realtime queue anywhere on the host has pending I/O, so on a
+/// machine with continuous background traffic (sync clients, network mounts,
+/// browsers) an idle build can starve for minutes. Best-effort at its lowest
+/// level reduces contention without requiring every other queue to be empty.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IoClass {
+    /// Best-effort at the normal level: the class an ordinary command runs in.
+    BestEffort,
+    /// Best-effort at the lowest level: the default for a heavy command.
+    Heavy,
+    /// Idle: the disk is only used once nothing else wants it. Opt-in.
+    Idle,
+}
+
+/// How [`HEAVY_IONICE_ENV`] configures a heavy command's I/O class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeavyIonice {
+    /// Best-effort at the lowest level: the default.
+    Lowest,
+    /// The idle class, for hosts that want it.
+    Idle,
+    /// Leave the inherited class alone.
+    Inherit,
+}
+
+/// Read [`HEAVY_IONICE_ENV`].
+///
+/// `idle` (or its class number, `3`) opts a host into the idle class, `0`
+/// disables the demotion outright, and anything else — including an unset or
+/// unparsable variable — keeps the best-effort default.
+fn heavy_ionice_setting(raw: Option<&str>) -> HeavyIonice {
+    match raw.map(str::trim) {
+        Some("0") => HeavyIonice::Inherit,
+        Some("idle") | Some("3") => HeavyIonice::Idle,
+        _ => HeavyIonice::Lowest,
+    }
+}
+
+/// How a command's child is placed in its I/O scheduling class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IoPlan {
+    /// Install the class with `ioprio_set` in the child's `pre_exec` hook.
+    Set(IoClass),
+    /// Wrap the command in `ionice`: this host has no working `ioprio_set`.
+    Wrap(IoClass),
+    /// Leave the class the child inherits alone.
+    Inherit,
+}
+
+/// Decide how `command`'s child gets its I/O scheduling class.
+///
+/// A heavy command is sent to the bottom of the best-effort class so a build
+/// cannot starve the light commands that make up most steps, and
+/// [`HEAVY_IONICE_ENV`] picks between that, the idle class and no demotion at
+/// all. A light command is pinned to best-effort *normal* so it can never
+/// inherit a demotion from whatever spawned it. `syscall_ok` picks the
+/// mechanism: `ioprio_set` in the child, or the `ionice` wrapper on a host
+/// where the syscall does not answer.
+fn io_plan(heavy: bool, syscall_ok: bool, ionice: HeavyIonice) -> IoPlan {
+    let class = match (heavy, ionice) {
+        (false, _) => IoClass::BestEffort,
+        // `HUB_HEAVY_IONICE=0` disables the feature outright: the child keeps
+        // whatever class it inherited, demotion and pinning alike.
+        (true, HeavyIonice::Inherit) => return IoPlan::Inherit,
+        (true, HeavyIonice::Idle) => IoClass::Idle,
+        (true, HeavyIonice::Lowest) => IoClass::Heavy,
+    };
+    if syscall_ok {
+        return IoPlan::Set(class);
+    }
+    match class {
+        // No `ioprio_set` on this host, so `ionice` is the only way to demote.
+        IoClass::Heavy | IoClass::Idle => IoPlan::Wrap(class),
+        // Nothing to demote: the child keeps the class it inherited.
+        IoClass::BestEffort => IoPlan::Inherit,
+    }
+}
+
+/// The `ioprio_set` argument for `class`: the class in the high bits, the
+/// level below it.
+fn ioprio_value(class: IoClass) -> i32 {
+    let (class, level) = match class {
+        IoClass::BestEffort => (IOPRIO_CLASS_BE, IOPRIO_BE_NORMAL),
+        IoClass::Heavy => (IOPRIO_CLASS_BE, IOPRIO_BE_LOWEST),
+        // The idle class has no levels; the low bits are ignored.
+        IoClass::Idle => (IOPRIO_CLASS_IDLE, 0),
+    };
+    (class << IOPRIO_CLASS_SHIFT) | level
+}
+
+/// Whether `ioprio_set` answers on this host, probed once.
+///
+/// The probe asks for a pid that cannot exist, so it changes nothing: `ESRCH`
+/// means the kernel implements the syscall, anything else means it cannot be
+/// used here and the `ionice` wrapper has to carry the demotion instead.
+fn ioprio_syscall_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        // SAFETY: a raw syscall over three integers that reads and writes no
+        // memory we own; the pid is deliberately nonexistent.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS as libc::c_long,
+                -1,
+                ioprio_value(IoClass::Idle) as libc::c_long,
+            )
+        };
+        rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    })
+}
+
+/// Child-side hook placing the calling process in an I/O scheduling class.
+///
+/// Tolerant by design: a kernel or a locked-down container that refuses the
+/// call leaves the inherited class rather than failing the step, because a
+/// command that runs at the wrong I/O priority still beats one that never
+/// runs.
+struct IoPriorityHook(IoClass);
+
+impl IoPriorityHook {
+    fn apply(&self) -> std::io::Result<()> {
+        // SAFETY: `ioprio_set` takes three integers and touches no memory we
+        // own, and it is async-signal-safe -- which is exactly what a
+        // `pre_exec` closure in the forked child of a multi-threaded server
+        // is allowed to do.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS as libc::c_long,
+                0,
+                ioprio_value(self.0) as libc::c_long,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Install the I/O class on `cmd`'s child through its `pre_exec` hook.
+///
+/// Only for the backends that register no other hook. The kernel backend
+/// carries the class inside its confinement closure instead: a second
+/// registration that replaced the confinement would run the command
+/// unconfined, which is not a price worth any priority.
+#[cfg(unix)]
+fn apply_io_priority(cmd: &mut Command, class: IoClass) {
+    let hook = IoPriorityHook(class);
+    // SAFETY: the closure runs in the child between `fork` and `exec` and does
+    // nothing but the raw syscall above, which allocates nothing and takes no
+    // lock.
+    unsafe {
+        cmd.pre_exec(move || {
+            let _ = hook.apply();
+            Ok(())
+        });
+    }
+}
+
+/// Non-unix stub: no I/O scheduling class to install.
+#[cfg(not(unix))]
+fn apply_io_priority(_cmd: &mut Command, _class: IoClass) {}
+
+/// Apply the `ionice` fallback to an already-wrapped command string.
+///
+/// `ionice` sets its own class and then execs the shell, so the whole process
+/// group inherits that class just as the syscall path would leave it.
+fn apply_io_wrapper(command: String, plan: IoPlan) -> String {
+    let args = match plan {
+        IoPlan::Wrap(IoClass::Heavy) => IONICE_HEAVY_ARGS,
+        IoPlan::Wrap(IoClass::Idle) => IONICE_IDLE_ARGS,
+        IoPlan::Wrap(IoClass::BestEffort) | IoPlan::Set(_) | IoPlan::Inherit => return command,
+    };
+    format!("ionice {args} {OFFLINE_SHELL} -c {}", shell_quote(&command))
 }
 
 /// Read-only bind for a toolchain cache directory.
@@ -619,8 +873,54 @@ fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
     super::env::apply_clean_environment_cmd(cmd, &repo_path, dir);
 }
 
-/// Universal build/test parallelism caps so a command cannot oversubscribe the
-/// machine no matter which build tool it drives.
+/// `WORKER_BUILD_DEBUG=1` keeps Cargo's default (full) debug info in worker
+/// builds.
+const WORKER_BUILD_DEBUG_VAR: &str = "WORKER_BUILD_DEBUG";
+
+/// Cargo settings that keep a worker's private target directory small.
+///
+/// Debug info is the bulk of what a Rust build writes, and a worker's target
+/// directory is rebuilt from scratch far more often than it is reused, so the
+/// DWARF can dwarf the object code that is actually verifiable. Incremental
+/// state is the same trade: a large, worker-private artefact set whose reuse
+/// does not survive the next worker. Neither is needed to *read* a failure -
+/// an assertion message is printed verbatim, and a panic still prints a
+/// backtrace, because the symbol names come from the symbol table that
+/// `debug = 0` leaves in place.
+///
+/// The defaults apply only when the operator has not spoken: a value already
+/// exported is forwarded verbatim (`lookup` reports it), and
+/// `WORKER_BUILD_DEBUG=1` disables the defaults outright. `lookup` is the
+/// process environment in production and a synthetic map in tests, so the
+/// policy is testable without mutating process-global state.
+fn cargo_artifact_diet(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(String, String)> {
+    let keep_debug = lookup(WORKER_BUILD_DEBUG_VAR).as_deref() == Some(std::ffi::OsStr::new("1"));
+    [
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
+        "CARGO_INCREMENTAL",
+    ]
+    .into_iter()
+    .filter_map(|name| match lookup(name) {
+        Some(value) => Some((name.to_string(), value.to_string_lossy().into_owned())),
+        // The operator asked for full debug info: let Cargo apply its default.
+        None if keep_debug => None,
+        None => Some((name.to_string(), "0".to_string())),
+    })
+    .collect()
+}
+
+/// The operator's environment, as [`cargo_artifact_diet`] reads it.
+fn operator_build_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+/// Universal build/test environment: parallelism caps so a command cannot
+/// oversubscribe the machine no matter which build tool it drives, a private
+/// scratch directory, and the Cargo artifact diet ([`cargo_artifact_diet`])
+/// that keeps a Rust worker's target directory small.
 fn apply_build_env(
     cmd: &mut Command,
     target_dir: Option<&Path>,
@@ -629,6 +929,10 @@ fn apply_build_env(
 ) {
     if let Some(target) = target_dir {
         cmd.env("CARGO_TARGET_DIR", target);
+    }
+    // Trim what a per-worker target directory writes; see [`cargo_artifact_diet`].
+    for (name, value) in cargo_artifact_diet(&operator_build_env) {
+        cmd.env(name, value);
     }
     // Private scratch is never shared with another slot user.
     cmd.env("TMPDIR", tmp_dir)
@@ -660,10 +964,13 @@ fn apply_build_env(
         .env("PYTEST_XDIST_AUTO_NUM_WORKERS", parallelism);
 }
 
-/// Wall-clock budget (seconds) for `command`: heavy commands get a longer
-/// default; `COMMAND_TIMEOUT_SECS` overrides either tier.
-fn command_timeout_secs(command: &str) -> u64 {
-    let default_timeout = if is_heavy_command(command) {
+/// Wall-clock budget (seconds) for a command of weight `heavy`: heavy commands
+/// get a longer default; `COMMAND_TIMEOUT_SECS` overrides either tier.
+///
+/// `heavy` is the caller's classification of the model's own command, so the
+/// budget and the I/O priority can never disagree about what a command is.
+fn command_timeout_secs(heavy: bool) -> u64 {
+    let default_timeout = if heavy {
         crate::config::env_parse("COMMAND_HEAVY_TIMEOUT_SECS").unwrap_or(DEFAULT_HEAVY_TIMEOUT_SECS)
     } else {
         crate::config::env_parse("COMMAND_LIGHT_TIMEOUT_SECS").unwrap_or(DEFAULT_LIGHT_TIMEOUT_SECS)
@@ -1236,6 +1543,82 @@ mod tests {
         assert_eq!(value("MAKEFLAGS"), "-j3");
     }
 
+    /// Worker builds discard Cargo's debug info and incremental state by
+    /// default: both are large writes into a target directory that is leased
+    /// per worker and rebuilt often.
+    #[test]
+    fn build_env_discards_cargo_debug_info_and_incremental_state() {
+        if std::env::var_os(WORKER_BUILD_DEBUG_VAR).is_some()
+            || std::env::var_os("CARGO_PROFILE_DEV_DEBUG").is_some()
+            || std::env::var_os("CARGO_PROFILE_TEST_DEBUG").is_some()
+            || std::env::var_os("CARGO_INCREMENTAL").is_some()
+        {
+            return; // Operator overrides make the defaults unobservable.
+        }
+        let mut cmd = Command::new("true");
+        apply_build_env(&mut cmd, None, Path::new("/tmp/private"), "1");
+        let value = |name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| panic!("{name} must be set"))
+        };
+        assert_eq!(value("CARGO_PROFILE_DEV_DEBUG"), "0");
+        assert_eq!(value("CARGO_PROFILE_TEST_DEBUG"), "0");
+        assert_eq!(value("CARGO_INCREMENTAL"), "0");
+    }
+
+    /// An operator-exported value is forwarded verbatim; only the names the
+    /// operator left alone take the diet's default.
+    #[test]
+    fn cargo_artifact_diet_keeps_operator_values() {
+        let lookup = |name: &str| match name {
+            "CARGO_PROFILE_DEV_DEBUG" => Some(std::ffi::OsString::from("2")),
+            _ => None,
+        };
+        let diet: std::collections::HashMap<String, String> =
+            cargo_artifact_diet(&lookup).into_iter().collect();
+        assert_eq!(
+            diet.get("CARGO_PROFILE_DEV_DEBUG").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            diet.get("CARGO_PROFILE_TEST_DEBUG").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(diet.get("CARGO_INCREMENTAL").map(String::as_str), Some("0"));
+    }
+
+    /// `WORKER_BUILD_DEBUG=1` restores Cargo's own defaults for the names the
+    /// operator did not set, so debug info and backtraces stay complete.
+    #[test]
+    fn worker_build_debug_suppresses_the_diet_defaults() {
+        let keep_debug = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("1")),
+            _ => None,
+        };
+        assert!(cargo_artifact_diet(&keep_debug).is_empty());
+
+        // Only `1` is the opt-out; any other value keeps the diet.
+        let zero = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("0")),
+            _ => None,
+        };
+        assert_eq!(cargo_artifact_diet(&zero).len(), 3);
+
+        // An explicitly exported Cargo value still rides along.
+        let explicit = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("1")),
+            "CARGO_INCREMENTAL" => Some(std::ffi::OsString::from("0")),
+            _ => None,
+        };
+        assert_eq!(
+            cargo_artifact_diet(&explicit),
+            vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())]
+        );
+    }
+
     #[test]
     fn heavy_commands_get_the_larger_default_budget() {
         if std::env::var_os("COMMAND_TIMEOUT_SECS").is_some()
@@ -1245,11 +1628,155 @@ mod tests {
             return; // Environment overrides make the defaults unobservable.
         }
         assert!(is_heavy_command("cargo build"));
+        assert_eq!(command_timeout_secs(true), DEFAULT_HEAVY_TIMEOUT_SECS);
+        assert_eq!(command_timeout_secs(false), DEFAULT_LIGHT_TIMEOUT_SECS);
+    }
+
+    // ---------- I/O priority ----------
+
+    /// Scheduling decisions are independent of ambient environment variables.
+    #[test]
+    fn io_plan_demotes_heavy_commands_and_pins_light_ones() {
+        use HeavyIonice::{Idle, Inherit, Lowest};
+        let cases = [
+            (true, true, Lowest, IoPlan::Set(IoClass::Heavy)),
+            (true, false, Lowest, IoPlan::Wrap(IoClass::Heavy)),
+            (true, true, Idle, IoPlan::Set(IoClass::Idle)),
+            (true, false, Idle, IoPlan::Wrap(IoClass::Idle)),
+            (true, true, Inherit, IoPlan::Inherit),
+            (true, false, Inherit, IoPlan::Inherit),
+            (false, true, Lowest, IoPlan::Set(IoClass::BestEffort)),
+            (false, true, Idle, IoPlan::Set(IoClass::BestEffort)),
+            (false, true, Inherit, IoPlan::Set(IoClass::BestEffort)),
+            (false, false, Lowest, IoPlan::Inherit),
+        ];
+        for (heavy, supported, setting, expected) in cases {
+            assert_eq!(io_plan(heavy, supported, setting), expected);
+        }
+    }
+
+    #[test]
+    fn heavy_ionice_setting_accepts_opt_out_and_idle_opt_in() {
+        for (raw, expected) in [
+            (None, HeavyIonice::Lowest),
+            (Some(""), HeavyIonice::Lowest),
+            (Some("1"), HeavyIonice::Lowest),
+            (Some("7"), HeavyIonice::Lowest),
+            (Some("unknown"), HeavyIonice::Lowest),
+            (Some("0"), HeavyIonice::Inherit),
+            (Some(" 0 "), HeavyIonice::Inherit),
+            (Some("idle"), HeavyIonice::Idle),
+            (Some(" idle "), HeavyIonice::Idle),
+            (Some("3"), HeavyIonice::Idle),
+        ] {
+            assert_eq!(heavy_ionice_setting(raw), expected, "{raw:?}");
+        }
+    }
+
+    /// A priority value is the class in its high bits and the level below it,
+    /// and best-effort normal is the level the kernel gives an unpinned task.
+    #[test]
+    fn ioprio_values_carry_the_class_and_the_level() {
         assert_eq!(
-            command_timeout_secs("cargo build"),
-            DEFAULT_HEAVY_TIMEOUT_SECS
+            ioprio_value(IoClass::Heavy),
+            (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 7
         );
-        assert_eq!(command_timeout_secs("echo hi"), DEFAULT_LIGHT_TIMEOUT_SECS);
+        assert_eq!(
+            ioprio_value(IoClass::Idle),
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT
+        );
+        assert_eq!(
+            ioprio_value(IoClass::BestEffort),
+            (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORMAL
+        );
+    }
+
+    /// The `ionice` fallback re-quotes the command exactly once, so a command
+    /// carrying its own quotes and metacharacters survives the wrapper.
+    #[tokio::test]
+    async fn the_ionice_wrapper_runs_the_command_unchanged() {
+        if !crate::agent::sandbox::binary_available("ionice") {
+            return; // No `ionice` on this host: nothing to observe.
+        }
+        let wrapped = apply_io_wrapper(
+            "echo 'a b' | tr ' ' '_'".to_string(),
+            IoPlan::Wrap(IoClass::Heavy),
+        );
+        assert!(
+            wrapped.starts_with("ionice -c2 -n7 bash -c "),
+            "the wrapper must prefix the command: {wrapped}"
+        );
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", &wrapped]);
+        let out = cmd.output().await.expect("the wrapper must run");
+        assert!(out.status.success(), "wrapper failed: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "a_b",
+            "the wrapped command must behave exactly as the bare one"
+        );
+        let idle = apply_io_wrapper("true".into(), IoPlan::Wrap(IoClass::Idle));
+        assert!(idle.starts_with("ionice -c3 bash -c "));
+        // Every other plan leaves the command string untouched.
+        let plain = "echo hi".to_string();
+        assert_eq!(apply_io_wrapper(plain.clone(), IoPlan::Inherit), plain);
+        assert_eq!(
+            apply_io_wrapper(plain.clone(), IoPlan::Set(IoClass::Idle)),
+            plain
+        );
+    }
+
+    /// A process's I/O priority value, or `None` when the host refuses to say.
+    ///
+    /// `ioprio_get` is the only way to observe the class: `/proc/<pid>/io`
+    /// carries byte counters, not scheduling.
+    #[cfg(unix)]
+    fn ioprio_of(pid: u32) -> Option<i32> {
+        // SAFETY: a raw syscall over two integers that reads no memory we own.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_get,
+                IOPRIO_WHO_PROCESS as libc::c_long,
+                pid as libc::c_long,
+            )
+        };
+        (rc >= 0).then_some(rc as i32)
+    }
+
+    /// Both best-effort levels and the idle opt-in are observable in the
+    /// child, not merely decided in the parent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_inherits_the_io_class_of_its_command() {
+        if !ioprio_syscall_supported() {
+            return; // No `ioprio_set` here, so there is nothing to observe.
+        }
+        for (heavy, setting, expected) in [
+            (true, HeavyIonice::Lowest, IoClass::Heavy),
+            (false, HeavyIonice::Lowest, IoClass::BestEffort),
+            (true, HeavyIonice::Idle, IoClass::Idle),
+        ] {
+            let mut cmd = Command::new("sleep");
+            configure_process(&mut cmd);
+            cmd.arg("30");
+            let IoPlan::Set(class) = io_plan(heavy, true, setting) else {
+                panic!("a syscall-capable host must plan to set the class");
+            };
+            apply_io_priority(&mut cmd, class);
+            // `spawn` only returns once the child has exec'd, and the
+            // `pre_exec` hook runs before that, so the class is already set.
+            let mut child = cmd.spawn().expect("sleep must spawn");
+            let pid = child.id().expect("the child must still be running");
+            let value = ioprio_of(pid).expect("the child's ioprio must be readable");
+            assert_eq!(
+                value,
+                ioprio_value(expected),
+                "a {} command's child must run at the expected I/O priority",
+                if heavy { "heavy" } else { "light" }
+            );
+            child.kill().await.expect("kill the probe child");
+            child.wait().await.expect("reap the probe child");
+        }
     }
 
     #[test]
@@ -2108,8 +2635,14 @@ mod tests {
     async fn run_confined_python(offline: bool, tag: &str, script: &str) -> String {
         let scratch = LandlockScratch::new(tag);
         let mut cmd = Command::new("python3");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, offline)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            offline,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(script);
         let out = cmd
             .output()
@@ -2222,8 +2755,14 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
     async fn a_command_runs_while_the_landlock_hook_is_installed() {
         let scratch = LandlockScratch::new("runs");
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("echo confined-and-alive");
 
         let out = cmd
@@ -2295,8 +2834,14 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         );
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(&probe);
         let out = cmd.output().await.expect("spawn the confined probe");
 
@@ -2350,15 +2895,27 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("true");
         let _ = cmd.output().await.expect("spawn");
 
         // The child could not have read it...
         let mut child = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut child, &scratch.worktree, &scratch.target, false)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut child,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         child.arg("-c").arg(format!("cat {}", outside.display()));
         let out = child.output().await.expect("spawn");
         assert!(

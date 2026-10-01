@@ -1757,10 +1757,14 @@ async fn admission_grants_with_job_count() {
         mem_full_avg10: None,
         io_full_avg10: None,
     }));
-    let first = gate.acquire().await;
+    let first = gate
+        .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+        .await;
     assert_eq!(first.jobs(), 4, "the first build owns the machine");
     assert_eq!(gate.running_heavy(), 1);
-    let second = gate.acquire().await;
+    let second = gate
+        .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+        .await;
     assert_eq!(second.jobs(), 2, "two builds split the cores");
     drop(first);
     drop(second);
@@ -1781,14 +1785,18 @@ async fn admission_waiters_are_granted_fifo() {
         mem_full_avg10: None,
         io_full_avg10: None,
     }));
-    let held = gate.acquire().await;
+    let held = gate
+        .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+        .await;
 
     let order = Arc::new(Mutex::new(Vec::new()));
     let spawn_waiter = |tag: &'static str| {
         let gate = gate.clone();
         let order = order.clone();
         tokio::spawn(async move {
-            let _permit = gate.acquire().await;
+            let _permit = gate
+                .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+                .await;
             order.lock().expect("order lock poisoned").push(tag);
         })
     };
@@ -1825,18 +1833,26 @@ async fn admission_a_cancelled_waiter_releases_its_place() {
         mem_full_avg10: None,
         io_full_avg10: None,
     }));
-    let held = gate.acquire().await;
+    let held = gate
+        .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+        .await;
 
     let doomed = tokio::spawn({
         let gate = gate.clone();
         async move {
-            let _permit = gate.acquire().await;
+            let _permit = gate
+                .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+                .await;
         }
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let survivor = tokio::spawn({
         let gate = gate.clone();
-        async move { gate.acquire().await.jobs() }
+        async move {
+            gate.acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+                .await
+                .jobs()
+        }
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(gate.waiting(), 2);
@@ -1869,9 +1885,12 @@ async fn admission_first_build_never_blocks() {
         mem_full_avg10: None,
         io_full_avg10: None,
     }));
-    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire())
-        .await
-        .expect("the first build must be admitted without waiting");
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gate.acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory),
+    )
+    .await
+    .expect("the first build must be admitted without waiting");
     assert_eq!(gate.running_heavy(), 1);
     drop(permit);
 }
@@ -1889,7 +1908,9 @@ async fn admission_memory_shortage_waits_then_admits() {
         mem_full_avg10: None,
         io_full_avg10: None,
     }));
-    let _held = gate.acquire().await;
+    let _held = gate
+        .acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+        .await;
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(100),
         load1: Some(0.5),
@@ -1899,7 +1920,10 @@ async fn admission_memory_shortage_waits_then_admits() {
     }));
     let waiter = tokio::spawn({
         let gate = gate.clone();
-        async move { gate.acquire().await }
+        async move {
+            gate.acquire(mini_swe_mcp::pool::admission::AdmissionClass::Exploratory)
+                .await
+        }
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(gate.waiting(), 1, "the second build must wait on memory");

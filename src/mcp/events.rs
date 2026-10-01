@@ -31,8 +31,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::pool::{
-    RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRegistryEntry, WorkerState,
-    clamp_string,
+    LogBuffer, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRegistryEntry,
+    WorkerState, clamp_string,
 };
 
 /// How often the event task re-reads the registry for workers it does not own.
@@ -626,7 +626,7 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
 /// `warning:`, `assertion`) win the budget: when none of the last 40 lines
 /// carries one, the most recent marked lines are shown instead of the oldest
 /// tail lines, and the byte cap drops unmarked lines first.
-fn verify_tail(output: &str) -> String {
+pub(super) fn verify_tail(output: &str) -> String {
     const MAX_LINES: usize = 40;
     const MAX_BYTES: usize = 4096;
     const MARKERS: [&str; 5] = ["FAILED", "panicked", "error", "warning:", "assertion"];
@@ -668,6 +668,26 @@ fn verify_tail(output: &str) -> String {
         text = text[start..].to_string();
     }
     text
+}
+
+/// The failure-focused tail of the newest `[verify]` step in `logs`, when the
+/// window holds one.
+pub(super) fn verify_tail_of(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
+    logs.iter()
+        .rev()
+        .find(|log| log.command.starts_with("[verify]"))
+        .map(|log| verify_tail(&log.output))
+}
+
+/// Attach the newest `[verify]` log tail to a view that is not verified.
+///
+/// A worker whose earlier verify run failed can still pass its completion
+/// gate: showing that stale run would read as a current failure, so only an
+/// unverified worker (whose tail explains the live failure) carries a tail.
+fn attach_verify_tail(view: &mut serde_json::Value, logs: &LogBuffer) {
+    if view["verified"] != true {
+        view["verify_output_tail"] = json!(verify_tail_of(&logs.tail(1000)));
+    }
 }
 
 /// A worker as the on-disk registry describes it.
@@ -966,17 +986,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
                     .map(|log| clamp_string(&log.command, 256))
                     .collect::<Vec<_>>()
             );
-            if view["verified"] == false
-                || view["metrics"]["verify_failures"].as_u64().unwrap_or(0) > 0
-            {
-                view["verify_output_tail"] = json!(
-                    logs.tail(1000)
-                        .iter()
-                        .rev()
-                        .find(|log| log.command.starts_with("[verify]"))
-                        .map(|log| verify_tail(&log.output))
-                );
-            }
+            attach_verify_tail(view, &logs);
         }
     }
     views
@@ -1375,5 +1385,53 @@ mod verify_tail_tests {
             !tail.contains("case_0"),
             "passing noise gives up the budget first"
         );
+    }
+}
+
+/// Once the completion gate passes, an earlier failing `[verify]` run must not
+/// resurface as a current failure in the watch payload.
+#[cfg(test)]
+mod verify_tail_attachment_tests {
+    use super::attach_verify_tail;
+    use crate::agent::AgentStepLog;
+    use crate::pool::LogBuffer;
+    use serde_json::json;
+
+    fn logs_with_failed_verify() -> LogBuffer {
+        let mut logs = LogBuffer::new();
+        logs.push(AgentStepLog {
+            step: 1,
+            command: "[verify] cargo test".to_string(),
+            output: "Command timed out after 600s and was terminated.".to_string(),
+            exit_code: Some(1),
+        });
+        logs
+    }
+
+    fn completed_view(verified: bool) -> serde_json::Value {
+        json!({"worker_id":"w", "event":"completed", "status":"completed",
+            "verified":verified, "metrics":{"verify_failures":1}})
+    }
+
+    #[test]
+    fn a_completed_worker_hides_a_stale_failing_verify_tail_after_the_gate_passes() {
+        let mut view = completed_view(true);
+        attach_verify_tail(&mut view, &logs_with_failed_verify());
+        assert!(
+            view.get("verify_output_tail").is_none(),
+            "a verified worker must not carry a stale verify tail: {view}"
+        );
+        assert_eq!(
+            view["metrics"]["verify_failures"], 1,
+            "the failure counter stays as is"
+        );
+    }
+
+    #[test]
+    fn an_unverified_worker_carries_the_failing_verify_tail() {
+        let mut view = completed_view(false);
+        attach_verify_tail(&mut view, &logs_with_failed_verify());
+        let tail = view["verify_output_tail"].as_str().unwrap_or_default();
+        assert!(tail.contains("Command timed out after 600s"), "{view}");
     }
 }
