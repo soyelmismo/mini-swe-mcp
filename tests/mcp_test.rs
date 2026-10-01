@@ -1237,6 +1237,7 @@ fn completed_worker(id: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     )
 }
@@ -1459,6 +1460,16 @@ fn worker_transitions_become_one_event_each() {
         verified: Some(true),
         diff_stat: Some(String::from("2 files, +30 -4")),
         error: None,
+        report: Some(WorkerReport {
+            done: "Fixed the retry loop.".to_string(),
+            files: "src/retry.rs, src/pool/mod.rs".to_string(),
+            tests: "cargo test: passed".to_string(),
+            risks: "none".to_string(),
+        }),
+        per_file: vec![
+            FileStat { path: "src/retry.rs".to_string(), insertions: 28, deletions: 3 },
+            FileStat { path: "src/pool/mod.rs".to_string(), insertions: 2, deletions: 1 },
+        ],
     };
     let mut failed = worker_view("w-dead", Some(EventKind::Failed));
     failed.outcome = Outcome {
@@ -1655,6 +1666,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        report: None,
     }
 }
 

@@ -80,6 +80,7 @@ fn meta(id: &str, repo: &Path) -> WorkerMeta {
         revision: 0,
         auto_continues: 0,
         metrics: WorkerMetrics::default(),
+        report: None,
     }
 }
 
