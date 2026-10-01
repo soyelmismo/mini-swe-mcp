@@ -1025,6 +1025,7 @@ impl super::WorkerPool {
             metrics: super::WorkerMetrics::default(),
             base_branch: history.base_branch.clone(),
             base_commit: Some(history.base_commit.clone()),
+            head_commit: None,
             revision,
             auto_continues: history.auto_continues,
             owner: Some(owner.clone()),

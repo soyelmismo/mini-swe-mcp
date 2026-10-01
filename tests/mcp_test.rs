@@ -1674,6 +1674,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         metrics: WorkerMetrics::default(),
         base_branch: None,
         base_commit: None,
+        head_commit: None,
         revision: 0,
         auto_continues: 0,
         report: None,

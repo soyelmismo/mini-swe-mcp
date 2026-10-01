@@ -133,6 +133,11 @@ pub struct WorkerRegistryEntry {
     /// Base commit the worker branched from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Commit `worker-<id>` pointed at when the run finished, recorded so a
+    /// continuation can recreate the branch after a merge pruned it (see the
+    /// retired grace period). `None` on a row written before head tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
     /// How many revisions this worker has run. `0` on a row written before
     /// revisions were counted.
     #[serde(default)]
@@ -221,6 +226,7 @@ impl WorkerMeta {
             metrics: self.metrics,
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
             report: self.report.clone(),
@@ -699,6 +705,7 @@ mod recovery_cleanup_tests {
             metrics: WorkerMetrics::default(),
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             report: None,

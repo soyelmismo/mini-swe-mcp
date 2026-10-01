@@ -1116,6 +1116,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         metrics: WorkerMetrics::default(),
         base_branch: None,
         base_commit: None,
+        head_commit: None,
         revision: 0,
         auto_continues: 0,
         approved: None,
@@ -1143,6 +1144,7 @@ fn measured_entry() -> WorkerRegistryEntry {
         owner: Some(TEST_OWNER.into()),
         base_branch: Some("master".into()),
         base_commit: Some("abc123".into()),
+        head_commit: None,
         revision: 1,
         auto_continues: 0,
         metrics: WorkerMetrics {
