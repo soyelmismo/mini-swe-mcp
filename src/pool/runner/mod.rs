@@ -151,6 +151,23 @@ impl Drop for JobGuard<'_> {
     }
 }
 
+/// The worker's opening user message: the task, then -- when a completion
+/// verify is configured -- the exact command the gate will run.
+///
+/// The gate reuses an identical passing run on an unchanged tree (see
+/// `TurnEngine::reusable_verify_step`), but only when the worker ran exactly
+/// the verify string. Naming it here is what lets the worker's own last check
+/// be the run the gate reuses instead of paying for a second full run.
+pub fn opening_task_message(task: &str, verify: Option<&str>) -> String {
+    let mut message = format!("TASK:\n{task}\n\nBegin by exploring the repository.");
+    if let Some(verify) = verify.filter(|v| !v.is_empty()) {
+        message.push_str(&format!(
+            "\n\nCompletion gate: `{verify}`. Run exactly this command as your last check; an identical passing run on the same tree is reused."
+        ));
+    }
+    message
+}
+
 impl WorkerPool {
     /// Take the guidance queued in this process for `worker_id`, if any.
     ///
@@ -272,10 +289,7 @@ impl WorkerPool {
             Some(replayed) => replayed,
             None => vec![
                 ChatMessage::text(Role::System, system_prompt),
-                ChatMessage::text(
-                    Role::User,
-                    format!("TASK:\n{}\n\nBegin by exploring the repository.", task),
-                ),
+                ChatMessage::text(Role::User, opening_task_message(&task, verify.as_deref())),
             ],
         };
 
