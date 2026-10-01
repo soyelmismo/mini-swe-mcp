@@ -14,9 +14,9 @@
 //! counter: a command byte-identical to the previous turn's is answered
 //! instead of re-run (and three of those in a row park the worker on the
 //! orchestrator), a worktree that stops changing gets a "make the edit or
-//! escalate" nudge -- which a worker that has only been reading earns earlier,
-//! once, and never fatally -- `REQUEST_TURNS` may only add half the dispatch's
-//! budget,
+//! escalate" nudge -- earned earlier, once and never fatally, by a worker whose
+//! dispatch already named the files to edit and that only reads anyway --
+//! `REQUEST_TURNS` may only add half the dispatch's budget,
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
 
@@ -95,10 +95,6 @@ fn stagnation_nudge() -> String {
 
 /// Thresholds of the read-only detector: the consecutive read-only turns that
 /// earn the first nudge and the turns that earn its single escalation.
-///
-/// A dispatch that names a file to edit is nudged at [`READ_ONLY_NUDGE_TURNS`],
-/// one that does not keeps the stagnation timing; both are overridable through
-/// the environment, so the read-only budget can be tuned without a rebuild.
 #[derive(Debug, Clone, Copy)]
 struct ReadOnlyThresholds {
     /// Consecutive read-only turns before the first "write the edit now" nudge.
@@ -107,29 +103,30 @@ struct ReadOnlyThresholds {
     escalate: usize,
 }
 
-impl ReadOnlyThresholds {
-    /// Defaults for `task`: the earlier budget only when the dispatch already
-    /// names a file or a path, because then reading further is not exploration.
-    fn defaults_for(task: &str) -> Self {
-        let first = if task_names_files(task) {
-            READ_ONLY_NUDGE_TURNS
-        } else {
-            STAGNATION_TURNS_LIMIT
-        };
-        Self {
-            first,
-            escalate: first.saturating_mul(2),
-        }
+/// The read-only detector's defaults: the first nudge at
+/// [`READ_ONLY_NUDGE_TURNS`] and its escalation at twice that.
+fn named_file_defaults() -> ReadOnlyThresholds {
+    ReadOnlyThresholds {
+        first: READ_ONLY_NUDGE_TURNS,
+        escalate: READ_ONLY_NUDGE_TURNS.saturating_mul(2),
     }
+}
 
-    /// [`Self::defaults_for`], overridden by the environment variables.
-    fn from_env(task: &str) -> Self {
-        let defaults = Self::defaults_for(task);
-        Self {
-            first: env_threshold(READ_ONLY_NUDGE_ENV).unwrap_or(defaults.first),
-            escalate: env_threshold(READ_ONLY_ESCALATE_ENV).unwrap_or(defaults.escalate),
-        }
+/// Read-only thresholds for `task`, or `None` when the dispatch names no file:
+/// a worker that still has to find the code is exploring, and the stagnation
+/// detector keeps its existing timing for it.
+///
+/// The thresholds themselves are overridable through the environment, so the
+/// read-only budget can be tuned without a rebuild.
+fn read_only_thresholds(task: &str) -> Option<ReadOnlyThresholds> {
+    if !task_names_files(task) {
+        return None;
     }
+    let defaults = named_file_defaults();
+    Some(ReadOnlyThresholds {
+        first: env_threshold(READ_ONLY_NUDGE_ENV).unwrap_or(defaults.first),
+        escalate: env_threshold(READ_ONLY_ESCALATE_ENV).unwrap_or(defaults.escalate),
+    })
 }
 
 /// Parse an environment override: a positive turn count, or `None` for an
@@ -601,9 +598,7 @@ impl<'a> TurnEngine<'a> {
 
         // --- Change detectors (implementer only, like the sentinels) ---
         if config.apply_sentinels {
-            let sample = self.sample_repository().await;
-            self.check_stagnation(sample.clone());
-            self.check_read_only(sample, config);
+            self.check_changes(config).await;
         }
 
         // --- LLM call with error handling ---
@@ -1470,6 +1465,25 @@ impl<'a> TurnEngine<'a> {
             .flatten()
     }
 
+    /// Sample the worktree once and feed both change detectors with it.
+    ///
+    /// The sample is taken every turn when the read-only detector is active
+    /// (a dispatch that names a file to edit); otherwise it keeps the
+    /// [`STAGNATION_SAMPLE_TURNS`] cadence it has today, so a dispatch that
+    /// names no file pays nothing new.
+    async fn check_changes(&mut self, config: &TurnConfig<'_>) {
+        let read_only = read_only_thresholds(config.task);
+        let stagnation_due = *self.step > 0 && (*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS);
+        if read_only.is_none() && !stagnation_due {
+            return;
+        }
+        let sample = self.sample_repository().await;
+        self.check_stagnation(sample.clone());
+        if let Some(limits) = read_only {
+            self.check_read_only(sample, limits);
+        }
+    }
+
     /// Tell a worker that stopped changing anything to make the edit or
     /// escalate, sampled every [`STAGNATION_SAMPLE_TURNS`] turns.
     fn check_stagnation(&mut self, sample: Option<String>) {
@@ -1493,12 +1507,12 @@ impl<'a> TurnEngine<'a> {
     /// Tell a worker whose worktree has not changed for a run of turns to make
     /// its first edit, and escalate once at twice that budget.
     ///
-    /// A long read-only streak is the common shape of a worker that is stuck
-    /// exploring a task whose spec already named the files, so the streak is
-    /// counted per turn rather than per [`STAGNATION_SAMPLE_TURNS`] window. The
-    /// detector only ever injects guidance: it never ends the worker.
-    fn check_read_only(&mut self, sample: Option<String>, config: &TurnConfig<'_>) {
-        let limits = ReadOnlyThresholds::from_env(config.task);
+    /// Only called for a dispatch whose spec already named the files to edit,
+    /// where a long read-only streak means the worker is stuck rather than
+    /// still looking for the code, so the streak is counted per turn rather
+    /// than per [`STAGNATION_SAMPLE_TURNS`] window. The detector only ever
+    /// injects guidance: it never ends the worker.
+    fn check_read_only(&mut self, sample: Option<String>, limits: ReadOnlyThresholds) {
         let Some(nudge) = self.watch.read_only.record(sample, limits) else {
             return;
         };
@@ -1798,8 +1812,9 @@ impl<'a> TurnEngine<'a> {
 mod tests {
     use super::{
         MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, ReadOnlyNudge,
-        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, STAGNATION_TURNS_LIMIT,
-        extension_budget, parse_shortstat, parse_threshold, task_names_files,
+        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, extension_budget,
+        named_file_defaults, parse_shortstat, parse_threshold, read_only_escalation_text,
+        read_only_nudge_text, read_only_thresholds, task_names_files,
     };
 
     #[test]
@@ -1957,6 +1972,20 @@ mod tests {
         );
     }
 
+    /// Both read-only nudges name the streak and offer the worker the two ways
+    /// out; the escalation says outright that exploring is not a failure.
+    #[test]
+    fn the_read_only_nudges_offer_an_edit_or_a_question() {
+        let first = read_only_nudge_text(15);
+        assert!(first.contains("read 15 files"), "got {first:?}");
+        assert!(first.contains("write the first edit now"), "got {first:?}");
+        assert!(first.contains("ASK_ORCHESTRATOR"), "got {first:?}");
+        let escalated = read_only_escalation_text(30);
+        assert!(escalated.contains("Stop reading"), "got {escalated:?}");
+        assert!(escalated.contains("ASK_ORCHESTRATOR"), "got {escalated:?}");
+        assert!(escalated.contains("not a failure"), "got {escalated:?}");
+    }
+
     /// A sample git could not answer is not evidence of progress: it neither
     /// extends nor resets a read-only streak.
     #[test]
@@ -1979,17 +2008,16 @@ mod tests {
         );
     }
 
-    /// A dispatch that already names the files to edit earns the earlier
-    /// read-only budget; prose that names none keeps the stagnation timing.
+    /// A dispatch that already names the files to edit gets the read-only
+    /// detector and its earlier budget; one that names none leaves the detector
+    /// off, so the existing stagnation timing stands for it.
     #[test]
-    fn a_task_that_names_files_gets_the_earlier_read_only_budget() {
-        let named =
-            ReadOnlyThresholds::defaults_for("edit src/pool/runner/turn.rs, see `Cargo.toml`");
-        assert_eq!(named.first, READ_ONLY_NUDGE_TURNS);
-        assert_eq!(named.escalate, 2 * READ_ONLY_NUDGE_TURNS);
-        let vague = ReadOnlyThresholds::defaults_for("fix the failing test");
-        assert_eq!(vague.first, STAGNATION_TURNS_LIMIT);
-        assert_eq!(vague.escalate, 2 * STAGNATION_TURNS_LIMIT);
+    fn only_a_task_that_names_files_gets_the_read_only_detector() {
+        let defaults = named_file_defaults();
+        assert_eq!(defaults.first, READ_ONLY_NUDGE_TURNS);
+        assert_eq!(defaults.escalate, 2 * READ_ONLY_NUDGE_TURNS);
+        assert!(read_only_thresholds("edit src/pool/runner/turn.rs, see `Cargo.toml`").is_some());
+        assert!(read_only_thresholds("fix the failing test").is_none());
     }
 
     #[test]
