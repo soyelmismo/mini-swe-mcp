@@ -542,6 +542,7 @@ impl AckStore {
                 event: event.to_string(),
             },
         );
+        self.trim();
         self.persist();
     }
 
