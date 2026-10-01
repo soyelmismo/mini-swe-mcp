@@ -80,34 +80,6 @@ pub fn unique_suffix(tag: &str) -> String {
     )
 }
 
-/// A compact, unique suffix for a scratch directory name.
-///
-/// Unix socket paths must stay under `SUN_LEN` (108 bytes) and `TMPDIR` can be
-/// deep, so a 19-digit nanosecond stamp would not fit: the pid separates
-/// concurrent processes and the per-process counter separates calls inside one.
-/// [`TempDir::new`] clears a stale path before creating it, so a pid reused
-/// after a restart is safe.
-fn scratch_suffix() -> String {
-    format!(
-        "{:x}-{:x}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-/// The shortest temp root this process may file scratch directories under.
-///
-/// The suite's sandbox names its writable root in `SWE_TEMP_DIR`; preferring it
-/// over a deep `TMPDIR` keeps the `<dir>/hub.sock` a test binds under the unix
-/// socket length limit.
-fn shortest_temp_dir() -> PathBuf {
-    let system = std::env::temp_dir();
-    match std::env::var_os("SWE_TEMP_DIR") {
-        Some(root) if root.len() < system.as_os_str().len() => PathBuf::from(root),
-        _ => system,
-    }
-}
-
 // ----------
 // Isolated scratch roots
 // ----------
@@ -167,21 +139,16 @@ pub struct TempDir {
 impl TempDir {
     /// Create (clearing any stale entry first) a scratch directory under `base`.
     pub fn new(base: &Path, tag: &str) -> Self {
-        let path = base.join(format!("swe-test-{tag}-{}", scratch_suffix()));
+        let path = base.join(format!("swe-test-{tag}-{}", unique_suffix("dir")));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("failed to create temp dir {}: {e}", path.display()));
         Self { path }
     }
 
-    /// Create a scratch directory under the shortest temp root available.
-    ///
-    /// A test that binds `<dir>/hub.sock` needs a path under `SUN_LEN` (108
-    /// bytes), and `TMPDIR` can be deep, so the sandbox's `SWE_TEMP_DIR` wins
-    /// whenever it is shorter than the system temp dir. The directory name
-    /// stays compact for the same reason (see [`scratch_suffix`]).
+    /// Create a scratch directory under the system temp dir.
     pub fn new_in_tmp(tag: &str) -> Self {
-        Self::new(&shortest_temp_dir(), tag)
+        Self::new(&std::env::temp_dir(), tag)
     }
 
     pub fn path(&self) -> &Path {
