@@ -549,6 +549,233 @@ fn one_watch_call_replays_every_missed_event() {
     );
 }
 
+/// A no-arg MCP `watch` follows a worker dispatched after it started: its set
+/// is re-evaluated on every poll instead of frozen at the first one.
+#[tokio::test]
+async fn a_no_arg_watch_action_follows_late_dispatches() {
+    isolate_registry();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-mcp-first",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
+
+    let watch = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .execute_tool(
+                    "worker",
+                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
+                )
+                .await
+        }
+    });
+    // Let the watch resolve its initial set to w-mcp-first.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The late dispatch: only its completion should wake the watch.
+    pool.__test_insert_worker(record(
+        "w-mcp-second",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "late worker done".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-mcp-second".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    ))
+    .await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), watch)
+        .await
+        .expect("a late dispatch must wake the no-arg watch")
+        .expect("the watch task stays alive")
+        .expect("the watch answers");
+    assert_eq!(result["status"], "event", "{result}");
+    let events = result["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["worker_id"] == "w-mcp-second"),
+        "the late worker must be reported: {result}"
+    );
+}
+
+/// The backgrounded `mini-swe-mcp watch` the orchestrator runs must follow a
+/// worker dispatched after it started, not the set it saw first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
+    isolate_registry();
+    let hub = common::TempDir::new_in_tmp("watch-late-hub");
+    let swe = common::TempDir::new_in_tmp("watch-late-swe");
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    let owner = common::host_of_this_process();
+    pool.__test_insert_worker(record(
+        "w-late-first",
+        &owner,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
+    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&hub.path().join("hub.sock")).await;
+
+    let child = common::binary_command(&common::binary_path())
+        .args(["--json", "watch", "--timeout", "20"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", swe.path())
+        .env("TMPDIR", swe.path())
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the backgrounded watch");
+
+    // Let the watch resolve its initial set to w-late-first.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    pool.__test_insert_worker(record(
+        "w-late-second",
+        &owner,
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "late worker done".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-late-second".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    ))
+    .await;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("the backgrounded watch must wake for the late dispatch")
+    .expect("the wait task stays alive")
+    .expect("child output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| event["worker_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        reported.contains(&"w-late-second".to_string()),
+        "the late worker must be reported: {stdout}"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
+/// A no-arg registry-polling watch follows a worker registered after it
+/// started, and `--group` still filters late arrivals.
+#[test]
+fn a_no_arg_polling_watch_follows_late_dispatches_under_a_group() {
+    let dir = common::TempDir::new_in_tmp("watch-late-poll");
+    let registry = dir.subdir("swe-registry");
+    let owner = common::host_of_this_process();
+    let now = mini_swe_mcp::pool::unix_timestamp();
+    let row = |id: &str, status: &str, group: &str| {
+        serde_json::json!({
+            "id": id, "pid": std::process::id(), "task": "watch probe", "model": "test",
+            "status": status, "step": 2, "max_turns": 10, "last_command": "cargo test",
+            "started_at": 1, "updated_at": now, "owner": owner, "group": group,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        registry.join("w-first.json"),
+        row("w-first", "running", "g1"),
+    )
+    .expect("first row");
+
+    let child = common::binary_command(&common::binary_path())
+        .args(["--json", "watch", "--group", "g1", "--timeout", "15"])
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("SWE_TEMP_DIR", dir.path())
+        .env("TMPDIR", dir.path())
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env_remove("OPENAI_API_KEY")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the watch");
+
+    // Let the watch resolve its initial set to w-first.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A late worker in another group is never watched.
+    std::fs::write(
+        registry.join("w-other.json"),
+        row("w-other", "completed", "g2"),
+    )
+    .expect("other row");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // A late worker in the watched group is reported; its worktree keeps the
+    // terminal row from being pruned.
+    let _ = dir.subdir("swe-wt-w-late");
+    std::fs::write(
+        registry.join("w-late.json"),
+        row("w-late", "completed", "g1"),
+    )
+    .expect("late row");
+
+    let output = child.wait_with_output().expect("the watch must exit");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| event["worker_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(reported.contains(&"w-late".to_string()), "{stdout}");
+    assert!(!reported.contains(&"w-other".to_string()), "{stdout}");
+}
+
 #[test]
 fn torn_down_worker_diff_stat_comes_from_its_branch() {
     let dir = common::TempDir::new_in_tmp("watch-branch");
