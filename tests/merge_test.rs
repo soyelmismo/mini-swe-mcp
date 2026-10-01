@@ -206,21 +206,14 @@ fn stale_branch_runs_the_gate_on_the_merge_result() {
         "from the worker\n"
     );
     // The gate's throwaway worktree is gone, and it never lived in the
-    // operator's checkout.
-    let leftovers: Vec<String> = std::fs::read_dir(f.scratch.path())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("swe-merge-"))
-        .collect();
+    // operator's checkout. The exact path is what is checked, so a scratch
+    // directory whose own name happens to carry the prefix cannot pass for a
+    // leftover.
+    let gate_dir = f.scratch.path().join("swe-merge-w2");
+    assert!(!gate_dir.exists(), "the gate worktree must be reclaimed");
     assert!(
-        leftovers.is_empty(),
-        "the gate worktree must be reclaimed: {leftovers:?}"
-    );
-    let registered = git(f.repo(), &["worktree", "list", "--porcelain"]);
-    assert!(
-        !registered.contains("swe-merge-"),
-        "the gate worktree must be unregistered: {registered}"
+        !common::worktree_is_registered(f.repo(), &gate_dir),
+        "the gate worktree must be unregistered"
     );
 }
 
