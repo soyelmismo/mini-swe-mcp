@@ -4,10 +4,12 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::info;
 
 use super::daemon::hub_lock_held;
 use super::identity;
@@ -390,39 +392,166 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
     unreachable!("the second negotiation always returns")
 }
 
-/// Forward bytes unchanged with fixed-size buffers and immediate output flushes.
-async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+/// How many times the stdio proxy re-dials a hub that went away before it lets
+/// the MCP client see the failure instead of following it again.
+const MAX_PROXY_RECONNECTS: usize = 8;
+
+/// Bytes per stdio hop: large enough that a frame rarely spans two reads, small
+/// enough that a reply is never delayed behind a big write.
+const PROXY_CHUNK: usize = 16 * 1024;
+
+/// How many unanswered requests a cut may answer, so a pipelining client cannot
+/// grow the set without bound.
+const MAX_TRACKED_REQUESTS: usize = 16;
+
+/// Largest daemon frame the proxy buffers while looking for its reply id.
+const MAX_PROXY_FRAME: usize = 32 * 1024 * 1024;
+
+/// The `id` of a JSON-RPC request frame, or `None` for a notification or reply.
+///
+/// A frame that does not parse is forwarded untouched and untracked.
+fn request_id(frame: &[u8]) -> Option<Value> {
+    let value: Value = serde_json::from_slice(frame).ok()?;
+    let id = value.get("id")?;
+    value.get("method").is_some().then(|| id.clone())
+}
+
+/// Forward stdin to the daemon, remembering which requests are still unanswered.
+///
+/// Bytes are forwarded exactly as they arrive; frames are only scanned for the
+/// `id` of a request, so a cut can answer it instead of leaving the MCP client
+/// waiting for a reply that died with the old daemon.
+async fn pump_stdin(
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    in_flight: std::sync::Arc<std::sync::Mutex<VecDeque<Value>>>,
+) {
+    let mut stdin = tokio::io::stdin();
+    let mut chunk = [0u8; PROXY_CHUNK];
+    // A frame split across two reads is only inspected once it is whole.
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        let count = match stdin.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        carry.extend_from_slice(&chunk[..count]);
+        while let Some(end) = carry.iter().position(|byte| *byte == b'\n') {
+            let frame: Vec<u8> = carry.drain(..=end).collect();
+            if let Some(id) = request_id(&frame) {
+                let mut pending = in_flight
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if pending.len() >= MAX_TRACKED_REQUESTS {
+                    pending.pop_front();
+                }
+                pending.push_back(id);
+            }
+        }
+        if !carry.is_empty() && tx.send(std::mem::take(&mut carry)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Forward the daemon's frames to the client, forgetting each request as its
+/// reply passes so a later cut does not answer it twice.
+async fn forward_daemon<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     mut writer: W,
+    in_flight: &std::sync::Mutex<VecDeque<Value>>,
 ) -> Result<()> {
-    let mut buffer = [0; 8192];
+    let mut line = Vec::new();
     loop {
-        let count = reader.read(&mut buffer).await?;
+        line.clear();
+        let count = reader.read_until(b'\n', &mut line).await?;
         if count == 0 {
             return Ok(());
         }
-        writer.write_all(&buffer[..count]).await?;
+        anyhow::ensure!(line.len() <= MAX_PROXY_FRAME, "Hub frame exceeds 32 MiB");
+        if let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Some(id) = value.get("id")
+        {
+            in_flight
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .retain(|pending| pending != id);
+        }
+        writer.write_all(&line).await?;
         writer.flush().await?;
     }
 }
 
-/// Proxy stdio until either input closes. The daemon owns all MCP semantics.
+/// Answer the requests the cut took with it, once each.
+///
+/// Their replies are gone with the old daemon, so the client is told the request
+/// is retryable rather than left waiting for an answer that will never come.
+/// Requests sent after the reconnect are answered by the new daemon.
+async fn answer_cut_requests(
+    stdout: &mut tokio::io::Stdout,
+    in_flight: &std::sync::Mutex<VecDeque<Value>>,
+) -> Result<()> {
+    let pending: Vec<Value> = in_flight
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .drain(..)
+        .collect();
+    for id in pending {
+        let frame = json!({"jsonrpc": "2.0", "id": id,
+            "error": {"code": -32000, "message": "Hub restarted; retry the request"}});
+        stdout.write_all(format!("{frame}\n").as_bytes()).await?;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// Proxy stdio until the client closes its input, following the daemon.
+///
+/// A handover — or any daemon restart — closes the connection underneath a
+/// long-lived MCP client. Instead of exiting, the proxy re-dials the hub,
+/// re-announces the same identity with `hub/hello` and keeps forwarding, so the
+/// orchestrator never notices the cut. The daemon owns all MCP semantics.
 pub async fn proxy_stdio() -> Result<()> {
-    let client = negotiated(false, false).await?;
-    let buffered = client.stream.buffer().to_vec();
-    let (reader, writer) = client.stream.into_inner().into_split();
-    let output = async move {
+    // One pump owns stdin for the whole proxy, so a reconnect cannot lose a byte
+    // the client already sent: chunks wait in the channel until a daemon takes
+    // them.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let in_flight = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    tokio::spawn(pump_stdin(tx, in_flight.clone()));
+    let mut reconnects = 0usize;
+    loop {
+        let client = negotiated(false, false).await?;
+        // Frames that arrived during the handshake — event replay, a reply that
+        // raced the hello — belong to the client, not to the daemon.
+        let buffered = client.stream.buffer().to_vec();
+        let (reader, mut writer) = client.stream.into_inner().into_split();
+        let reader = BufReader::new(reader);
         let mut stdout = tokio::io::stdout();
         for frame in client.notifications {
             stdout.write_all(&frame).await?;
         }
         stdout.write_all(&buffered).await?;
         stdout.flush().await?;
-        forward(reader, stdout).await
-    };
-    tokio::select! {
-        result = forward(tokio::io::stdin(), writer) => result,
-        result = output => result,
+        let to_daemon = async {
+            while let Some(chunk) = rx.recv().await {
+                writer.write_all(&chunk).await?;
+                writer.flush().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let from_daemon = forward_daemon(reader, &mut stdout, &in_flight);
+        tokio::select! {
+            // The client closed its input: nothing left to serve.
+            result = to_daemon => return result,
+            // The daemon went away: answer what it took, then dial again.
+            result = from_daemon => result?,
+        }
+        answer_cut_requests(&mut stdout, &in_flight).await?;
+        reconnects += 1;
+        anyhow::ensure!(
+            reconnects <= MAX_PROXY_RECONNECTS,
+            "The hub went away {reconnects} times; restart the MCP client"
+        );
+        info!("Hub connection closed; reconnecting the stdio proxy");
     }
 }
 

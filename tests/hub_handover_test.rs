@@ -14,7 +14,7 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, connect_endpoint};
+use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 use serde_json::{Value, json};
@@ -185,7 +185,7 @@ async fn a_handover_waits_for_the_command_to_clear() {
         None,
     );
     pool.__test_insert_worker(running_worker("handover-wait")).await;
-    let (paths, daemon) = daemon_on(&hub, pool);
+    let (paths, daemon) = daemon_on(&hub, pool.clone());
     let task = tokio::spawn(async move { daemon.run().await });
 
     let mut client = Client::connect(&paths.socket()).await;
@@ -242,6 +242,15 @@ async fn the_deadline_hands_over_while_a_command_runs() {
     let hub = common::TempDir::new_in_tmp("handover-deadline");
     let isolated = common::IsolatedPool::new(2, "handover-deadline");
     let pool = isolated.pool.clone();
+    pool.__test_save_status(
+        &meta("handover-deadline"),
+        "test",
+        mini_swe_mcp::pool::RegistryStatus::Running,
+        1,
+        10,
+        "cargo test",
+        None,
+    );
     pool.__test_insert_worker(running_worker("handover-deadline")).await;
     let (paths, daemon) = daemon_on(&hub, pool.clone());
     let task = tokio::spawn(async move { daemon.run().await });
@@ -359,6 +368,36 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         frame
     }
 
+    /// One request with arguments, one reply, over the proxy's stdio.
+    async fn call_with(
+        stdin: &mut tokio::process::ChildStdin,
+        stdout: &mut TokioBufReader<tokio::process::ChildStdout>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        stdin
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
+            .await
+            .expect("the proxy answers")
+            .expect("read the reply");
+        assert!(!line.is_empty(), "the proxy closed its stdout");
+        let frame: Value = serde_json::from_str(line.trim()).expect("reply is JSON");
+        assert_eq!(frame["id"], json!(id), "{frame}");
+        frame
+    }
+
     // The first call auto-starts the daemon through the proxy.
     let initialize = call(&mut stdin, &mut stdout, 1, "initialize").await;
     assert_eq!(
@@ -368,6 +407,22 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     let tools = call(&mut stdin, &mut stdout, 2, "tools/list").await;
     assert!(tools["result"]["tools"].is_array(), "{tools}");
 
+    // A watch with nothing to watch blocks until its own deadline, so it is
+    // still in flight when the daemon is killed underneath it.
+    let watching = tokio::spawn(call_with(
+        {
+            let mut stdin = stdin_handle(&mut child);
+            stdin
+        },
+        &mut stdout,
+        3,
+        "tools/call",
+        json!({"name": "worker", "arguments": {"action": "watch", "timeout_secs": 30}}),
+    ));
+    let _ = &watching;
+    // Wait until the daemon has the watch open before cutting the connection.
+    wait_for_log(&hub_dir, "Serving MCP connection", 2).await;
+
     // Kill the daemon the proxy is talking to: the socket goes stale and the
     // proxy's connection is cut, exactly as a handover cuts it.
     let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
@@ -375,9 +430,23 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the daemon");
     wait_for_socket_gone(&HubPaths::new(hub_dir.clone()).socket()).await;
 
+    // The request that was in flight at the cut is answered once, with an error
+    // that says to retry it: its reply died with the old daemon.
+    let cut = tokio::time::timeout(Duration::from_secs(10), watching)
+        .await
+        .expect("the cut is answered")
+        .expect("the reader task joins");
+    assert_eq!(cut["error"]["code"], -32000, "{cut}");
+    assert!(
+        cut["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("retry")),
+        "{cut}"
+    );
+
     // The proxy reconnects — auto-starting the replacement daemon itself — and
     // keeps serving the same MCP client.
-    let replayed = call(&mut stdin, &mut stdout, 3, "tools/list").await;
+    let replayed = call(&mut stdin, &mut stdout, 4, "tools/list").await;
     assert!(
         replayed["result"]["tools"].is_array(),
         "the proxy must answer after the daemon went away: {replayed}"
@@ -407,9 +476,7 @@ fn daemon_pid(hub_dir: &std::path::Path) -> Option<i32> {
 /// Wait until nothing accepts connections on `socket`, or panic.
 async fn wait_for_socket_gone(socket: &std::path::Path) {
     for _ in 0..100 {
-        if mini_swe_mcp::hub::connect_endpoint(
-            &mini_swe_mcp::hub::HubEndpoint::Path(socket.to_path_buf()),
-        )
+        if mini_swe_mcp::hub::connect_endpoint(&HubEndpoint::Path(socket.to_path_buf()))
         .await
         .is_err()
         {
