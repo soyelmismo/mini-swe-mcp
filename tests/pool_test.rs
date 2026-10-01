@@ -791,7 +791,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
 
     // The full payload is still available, untouched, on the terminal path.
     match pool.get_worker_state("p2").await.unwrap() {
-        WorkerState::Completed { diff, .. } => assert_eq!(diff.len(), 2 * 1024 * 1024),
+        WorkerState::Completed { diff, ..  } => assert_eq!(diff.len(), 2 * 1024 * 1024),
         other => panic!("expected Completed, got {other:?}"),
     }
 }
@@ -1116,7 +1116,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         revision: 0,
         auto_continues: 0,
     }
-}
+    }
 
 /// A registry row with every counter moved, as a finished run would write it.
 fn measured_entry() -> WorkerRegistryEntry {
@@ -1154,7 +1154,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_deletions: 340,
         },
     }
-}
+    }
 
 #[test]
 fn test_worker_metrics_survive_a_registry_row_round_trip() {
@@ -2081,7 +2081,7 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
             verified: None,
             revision: 0,
             metrics: WorkerMetrics::default(),
-        },
+    },
         ..owned_worker("h3-a3", "agent-a")
     })
     .await;

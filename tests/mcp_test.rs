@@ -21,7 +21,7 @@ use mini_swe_mcp::mcp::{
     ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
     WORKER_ACTIONS, WorkerSnapshot, WorkerView, channel_frame, diff_events,
 };
-use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
+use mini_swe_mcp::pool::{FileStat, LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerReport, WorkerState};
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerRegistryEntry, remove_registry_entry_in, save_registry_entry_in,
 };

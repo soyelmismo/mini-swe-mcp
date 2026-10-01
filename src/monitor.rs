@@ -1112,6 +1112,7 @@ mod tests {
                 base_commit: None,
                 revision: 0,
                 auto_continues: 0,
+                report: None,
             }
         }
     }

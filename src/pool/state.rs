@@ -350,7 +350,7 @@ impl WorkerState {
     pub fn step(&self) -> usize {
         match self {
             WorkerState::Running { step, .. } | WorkerState::Paused { step, .. } => *step,
-            WorkerState::Completed { turns, .. } => *turns,
+            WorkerState::Completed { turns, ..  } => *turns,
             WorkerState::Failed { step, .. } => *step,
         }
     }
@@ -388,7 +388,7 @@ impl WorkerState {
                 revision,
                 report,
                 ..
-            } => serde_json::json!({
+    } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
@@ -447,7 +447,7 @@ impl WorkerRecord {
         // A revision that dies keeps its number: the failure payload says
         // which attempt died, not just that something did.
         let revision = match &self.state {
-            WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
+            WorkerState::Completed { revision, ..  } | WorkerState::Failed { revision, .. } => {
                 *revision
             }
             WorkerState::Running { .. } | WorkerState::Paused { .. } => self.revision,
@@ -464,7 +464,7 @@ impl WorkerRecord {
     /// Unix timestamp when this record became terminal, if it is terminal.
     pub fn terminal_at(&self) -> Option<u64> {
         match &self.state {
-            WorkerState::Completed { completed_at, .. } => Some(*completed_at),
+            WorkerState::Completed { completed_at, ..  } => Some(*completed_at),
             WorkerState::Failed { failed_at, .. } => Some(*failed_at),
             WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
         }
@@ -617,6 +617,7 @@ mod tests {
                 verified: None,
                 metrics: WorkerMetrics::default(),
                 revision: 0,
+                report: None,
             }
             .step(),
             12
@@ -652,6 +653,7 @@ mod tests {
             verified: None,
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
@@ -660,8 +662,8 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
         };
-        assert!(!matches!(running, WorkerState::Completed { .. }));
-        assert!(matches!(completed, WorkerState::Completed { .. }));
+        assert!(!matches!(running, WorkerState::Completed { ..  }));
+        assert!(matches!(completed, WorkerState::Completed { ..  }));
         assert!(matches!(failed, WorkerState::Failed { .. }));
     }
 
@@ -692,6 +694,7 @@ mod tests {
             verified: None,
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         }
     }
 
