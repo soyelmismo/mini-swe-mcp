@@ -43,6 +43,20 @@ impl McpServer {
         self.dispatch_one(args, token, tx, ctx).await
     }
 
+    fn dispatch_round_key(args: &Value, owner: &str) -> (String, String) {
+        let group = args
+            .get("group")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                args.get("task")
+                    .and_then(Value::as_str)
+                    .and_then(crate::pool::extract_group)
+            })
+            .unwrap_or_else(|| "default".into());
+        (owner.into(), group)
+    }
+
     /// Effective arguments of one batch entry: the shared top-level dispatch
     /// values, overridden by the entry's own keys.
     pub(super) fn batch_entry_args(shared: &Value, entry: &Value) -> Result<Map<String, Value>> {
@@ -70,11 +84,6 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
-        let store = self.auto_store();
-        let _round_dispatch = match store {
-            Some(store) => Some(store.dispatch_guard().await),
-            None => None,
-        };
         let tasks = args
             .get("tasks")
             .and_then(Value::as_array)
@@ -83,6 +92,16 @@ impl McpServer {
             anyhow::bail!("'tasks' must contain at least one task for action 'dispatch'");
         }
 
+        let keys = tasks
+            .iter()
+            .filter_map(|entry| Self::batch_entry_args(args, entry).ok())
+            .map(|entry| Self::dispatch_round_key(&Value::Object(entry), &ctx.agent()))
+            .collect();
+        let store = self.auto_store();
+        let _round_dispatch = match store {
+            Some(store) => Some(store.dispatch_guard(keys).await),
+            None => None,
+        };
         let mut workers = Vec::with_capacity(tasks.len());
         let mut dispatched = 0usize;
         let mut failed = 0usize;
@@ -138,9 +157,11 @@ impl McpServer {
     ) -> Result<Value> {
         let store = self.auto_store();
         let _round_dispatch = match store {
-            Some(store) if args.get("role").and_then(Value::as_str) != Some("consolidate") => {
-                Some(store.dispatch_guard().await)
-            }
+            Some(store) if args.get("role").and_then(Value::as_str) != Some("consolidate") => Some(
+                store
+                    .dispatch_guard(vec![Self::dispatch_round_key(args, &ctx.agent())])
+                    .await,
+            ),
             _ => None,
         };
         let task = Self::required_string(args, "task", "dispatch")?.to_string();
@@ -256,7 +277,7 @@ pub(in crate::mcp) const TASK_DESCRIPTION: &str =
     "ONE focused concern: files in scope and the acceptance gate.";
 
 pub(in crate::mcp) const TASKS_DESCRIPTION: &str =
-    "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.";
+    "Batch {task, model?, ...} entries; top-level defaults.";
 
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Absolute repository root (alias: 'path'). Required for 'dispatch'.";
@@ -264,9 +285,10 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.";
 
-pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str = "Auto-consolidate this owner's group once stopped; true uses strongest/default, string pins model. See help consolidate.";
+pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
+    "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";

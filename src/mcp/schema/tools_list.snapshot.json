@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
+      "description": "SWE workers in Git worktrees. Use mini-swe-mcp watch; run it again after each event. MCP: watch with timeout_secs. Only your own workers; admin excepted. mini-swe-mcp help <topic>: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -31,14 +31,14 @@
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate this owner's group once stopped; true uses strongest/default, string pins model. See help consolidate.",
+            "description": "Auto-consolidate stopped group: true uses strongest/default; string pins model.",
             "type": [
               "boolean",
               "string"
             ]
           },
           "consolidate_verify": {
-            "description": "Full gate for the automatic consolidator; omitted means auto-detect.",
+            "description": "Automatic consolidator's full gate; default: auto-detect.",
             "type": "string"
           },
           "diff": {
@@ -81,7 +81,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "description": "Required for steer: resumes own branch with full context, including stopped workers; never dispatch a replacement. max_turns sets budget.",
             "type": "string"
           },
           "model": {
@@ -127,7 +127,7 @@
             "type": "string"
           },
           "tasks": {
-            "description": "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
+            "description": "Batch {task, model?, ...} entries; top-level defaults.",
             "items": {
               "properties": {
                 "consolidate": {
@@ -180,7 +180,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
