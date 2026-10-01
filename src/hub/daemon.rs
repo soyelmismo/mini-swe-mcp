@@ -111,18 +111,15 @@ impl HubPaths {
     /// A Unix socket path must fit in `sun_path` (108 bytes on Linux). When
     /// `<hub dir>/hub.sock` is longer - a deep `SWE_HUB_DIR` or `TMPDIR` - the
     /// socket lives in a short private directory derived from the hub dir
-    /// instead (`/tmp/mswe-<uid>-<hash>`, created 0700 and owner-checked like
-    /// the hub dir), so the daemon and every client still agree on one path.
+    /// instead (`<temp dir>/mswe-<uid>-<hash>`, created 0700 and owner-checked
+    /// like the hub dir), so the daemon and every client still agree on one
+    /// path.
     pub fn socket(&self) -> PathBuf {
         let natural = self.dir.join("hub.sock");
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
             return natural;
         }
-        let short = PathBuf::from(format!(
-            "/tmp/mswe-{}-{:016x}",
-            current_uid(),
-            fnv1a(self.dir.as_os_str().as_encoded_bytes())
-        ));
+        let short = socket_fallback_dir(self.dir.as_os_str().as_encoded_bytes());
         match harden_hub_dir(short) {
             Ok(dir) => dir.join("hub.sock"),
             // Binding the natural path then fails with a clear error.
@@ -162,6 +159,18 @@ pub fn hub_dir() -> Result<PathBuf> {
 
 /// Longest socket path used as-is, below Linux's 108-byte `sun_path`.
 const MAX_SOCKET_PATH: usize = 100;
+
+/// The short private directory a socket moves to when the hub dir's own path is
+/// too long to bind: `<temp dir>/mswe-<uid>-<hash of the hub dir>`.
+///
+/// The base is the process's temp dir rather than a hardcoded `/tmp`, because a
+/// host that mounts `/tmp` read-only - or a daemon confined away from it - would
+/// otherwise leave the daemon with no writable short path at all, and it would
+/// fall back to the path that cannot be bound. `TMPDIR` is honoured, so a
+/// confined daemon and its clients still derive the same directory.
+fn socket_fallback_dir(hub_dir: &[u8]) -> PathBuf {
+    std::env::temp_dir().join(format!("mswe-{}-{:016x}", current_uid(), fnv1a(hub_dir)))
+}
 
 /// FNV-1a: a stable short name for a hub dir's fallback socket directory.
 fn fnv1a(bytes: &[u8]) -> u64 {
