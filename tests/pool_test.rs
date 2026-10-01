@@ -1097,38 +1097,19 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
 /// A registry row for a worker owned by a live process elsewhere.
 fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        report: None,
-        id: id.to_string(),
         pid,
         task: "t".into(),
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         model: "ninja".into(),
-        status: mini_swe_mcp::pool::RegistryStatus::Running,
         step: 1,
-        max_turns: 10,
         last_command: "cargo test".into(),
-        question: None,
-        repo_path: None,
-        started_at: 0,
-        updated_at: 0,
         owner: None,
-        metrics: WorkerMetrics::default(),
-        base_branch: None,
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row(id, "")
     }
 }
 
 /// A registry row with every counter moved, as a finished run would write it.
 fn measured_entry() -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        report: None,
-        id: "m1".into(),
         pid: 42,
         task: "t".into(),
         model: "ninja".into(),
@@ -1136,18 +1117,13 @@ fn measured_entry() -> WorkerRegistryEntry {
         step: 142,
         max_turns: 150,
         last_command: "completed".into(),
-        question: None,
         started_at: 1_700_000_000,
         updated_at: 1_700_000_100,
         group: Some("g".into()),
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some("/tmp/repo".into()),
-        owner: Some(TEST_OWNER.into()),
         base_branch: Some("master".into()),
         base_commit: Some("abc123".into()),
-        head_commit: None,
         revision: 1,
-        auto_continues: 0,
         metrics: WorkerMetrics {
             turns_used: 142,
             extensions_granted: 4,
@@ -1161,8 +1137,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_insertions: 120,
             diff_deletions: 340,
         },
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row("m1", TEST_OWNER)
     }
 }
 
@@ -1670,19 +1645,8 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
     let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let meta = mini_swe_mcp::pool::WorkerMeta {
-        report: None,
-        id: "h5a-reg".into(),
         task: "t".into(),
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
-        repo_path: None,
-        owner: TEST_OWNER.into(),
-        started_at: 0,
-        pid: std::process::id(),
-        metrics: WorkerMetrics::default(),
-        revision: 0,
-        auto_continues: 0,
-        verified: None,
+        ..mini_swe_mcp::pool::WorkerMeta::test_meta("h5a-reg", TEST_OWNER)
     };
     let row_path = std::path::PathBuf::from(&dir)
         .join("swe-registry")

@@ -83,17 +83,17 @@ pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
-    WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
-    parse_request_turns, parse_wait_job, summarize_command,
+    WorkerLaunchConfig, is_completion_request, opening_task_message, parse_ask_orchestrator,
+    parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
+    parse_report, parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
+    ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
     DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED,
     WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport,
-    WorkerState, churn_line, diff_sections_of, file_stats_of_diff, normalize_diff_path,
-    retention_expired, same_diff_path, terminal_retention_secs, within_retired_grace,
-    worker_retired_grace_secs,
+    WorkerState, churn_line, compact_artifacts, diff_sections_of, file_stats_of_diff,
+    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
+    within_retired_grace, worker_retired_grace_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -1701,6 +1701,38 @@ impl WorkerPool {
         steer::read_source(&self.scratch, id).is_some()
     }
 
+    /// Whether `id`'s lifecycle events belong to a consolidator that steered it
+    /// and has not stopped.
+    ///
+    /// A worker a consolidator steered ([`steer::SteerSource`]) reports its
+    /// completion, failure or exhaustion to that consolidator, which is blocked
+    /// in `CONSOLIDATE_WAIT` on exactly that stop. Until the consolidator
+    /// finishes, fails or dies the owner's watch stays quiet, the same way
+    /// [`question_for_consolidator`](Self::question_for_consolidator) already
+    /// silences its questions; once the source names no live consolidator,
+    /// normal delivery resumes and the stopped worker is visible again.
+    pub async fn steered_by_live_consolidator(&self, id: &str) -> bool {
+        let Some(source) = steer::read_source(&self.scratch, id) else {
+            return false;
+        };
+        self.consolidator_live(&source.consolidator).await
+    }
+
+    /// Whether `id` names a consolidator that has not finished, failed or
+    /// died. An absent consolidator is not live, so the workers it steered
+    /// fall back to their owner's watch.
+    async fn consolidator_live(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            return !matches!(
+                state,
+                WorkerState::Completed { .. }
+                    | WorkerState::Failed { .. }
+                    | WorkerState::Exhausted { .. }
+            );
+        }
+        load_registry_entry_in(&self.scratch, id).is_some_and(|entry| entry.status.is_live())
+    }
+
     async fn deliver_steer(
         &self,
         id: &str,
@@ -2366,57 +2398,31 @@ mod verify_detection_tests {
 
 #[cfg(test)]
 mod consolidate_delegation_tests {
+    use super::RegistryStatus;
     use super::registry::{
         WorkerMeta, WorkerRegistryEntry, WorkerRole, check_consolidate_delegation,
     };
-    use super::{RegistryStatus, WorkerMetrics};
 
     /// A consolidator's registry row, as its dispatch wrote it.
     fn consolidator(id: &str, owner: &str, group: &str) -> WorkerMeta {
         WorkerMeta {
-            id: id.to_string(),
             task: "integrate the round".to_string(),
             group: Some(group.to_string()),
             role: WorkerRole::Consolidate,
-            repo_path: None,
-            owner: owner.to_string(),
-            started_at: 0,
-            pid: std::process::id(),
-            revision: 0,
-            auto_continues: 0,
-            metrics: WorkerMetrics::default(),
-            report: None,
-            verified: None,
+            ..WorkerMeta::test_meta(id, owner)
         }
     }
 
     /// A target worker's registry row, as its own dispatch wrote it.
     fn target(id: &str, owner: &str, group: &str, role: WorkerRole) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            id: id.to_string(),
-            pid: std::process::id(),
             task: "do the work".to_string(),
-            model: "test".to_string(),
             status: RegistryStatus::Completed,
             step: 3,
-            max_turns: 10,
             last_command: "completed".to_string(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
             group: Some(group.to_string()),
             role,
-            repo_path: None,
-            owner: Some(owner.to_string()),
-            metrics: WorkerMetrics::default(),
-            base_branch: None,
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            report: None,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id, owner)
         }
     }
 

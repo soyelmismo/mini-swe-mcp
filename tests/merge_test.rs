@@ -86,30 +86,13 @@ impl Fixture {
     /// Write the registry row the merge's "still running" check reads.
     fn record_status(&self, id: &str, status: RegistryStatus) {
         let entry = WorkerRegistryEntry {
-            id: id.to_string(),
-            pid: std::process::id(),
             task: format!("do the {id} work"),
-            role: Default::default(),
-            model: "test".to_string(),
             status,
             step: 1,
-            max_turns: 10,
-            last_command: String::new(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
-            group: None,
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
             owner: None,
-            metrics: Default::default(),
             base_branch: Some("main".to_string()),
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            report: None,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id, "")
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -171,7 +154,7 @@ fn clean_merge_skips_the_gate_when_the_branch_is_already_verified() {
 
     // The merge commit is on main and carries the worker's credit.
     let subjects = git(f.repo(), &["log", "--format=%s", "-n", "1"]);
-    assert_eq!(subjects.trim(), "do the w1 work (worker w1)");
+    assert_eq!(subjects.trim(), "Merge worker-w1: do the w1 work");
     // The worker's file landed on the base branch.
     assert_eq!(
         std::fs::read_to_string(f.repo().join("worker.txt")).unwrap(),

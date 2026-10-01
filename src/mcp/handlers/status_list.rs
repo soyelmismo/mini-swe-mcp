@@ -30,12 +30,27 @@ impl McpServer {
                 }
                 _ => None,
             };
-            let approved = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
-                .and_then(|entry| entry.approved);
+            let entry = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid);
+            // The build-slot wait and the command in flight live on the live
+            // progress, not on the state, so read them once for the compact
+            // projection.
+            let progress = self.pool.worker_progress(wid).await;
+            let approved = entry.as_ref().and_then(|entry| entry.approved.clone());
             Ok(json!({
                 "worker_id": wid,
                 "owner": self.owner_of(wid).await,
-                "state": state,
+                // The full state carries the multi-megabyte diff and every
+                // artifact path; the projection below keeps exactly what an
+                // orchestrator reads and leaves the diff to collect/review.
+                "state": {
+                    "state": state.name(),
+                    "details": compact_status_details(
+                        &state,
+                        entry.as_ref(),
+                        progress.as_ref(),
+                        crate::pool::unix_timestamp(),
+                    ),
+                },
                 "approved": approved,
                 "next_step": next_step,
             }))
@@ -57,6 +72,13 @@ impl McpServer {
             } else {
                 None
             };
+            // A terminal row stopped the clock at its last write; a live row is
+            // still running, so it is measured to now.
+            let elapsed = if entry.status.is_terminal() {
+                entry.updated_at.saturating_sub(entry.started_at)
+            } else {
+                crate::pool::unix_timestamp().saturating_sub(entry.started_at)
+            };
             Ok(json!({
                 "worker_id": wid,
                 "owner": crate::pool::registry_owner_label(&entry),
@@ -68,6 +90,8 @@ impl McpServer {
                         "status": state_name,
                         "step": entry.step,
                         "turns": entry.step,
+                        "max_turns": entry.max_turns,
+                        "revision": entry.revision,
                         "summary": entry.last_command.clone(),
                         "report": entry.report,
                         "verified": entry.verified,
@@ -75,6 +99,7 @@ impl McpServer {
                         "question": entry.question,
                         "pid": entry.pid,
                         "started_at": entry.started_at,
+                        "elapsed": elapsed,
                         "metrics": entry.metrics,
                     }
                 },
@@ -131,3 +156,159 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const WORKER_ID_DESCRIPTION: &str = "Target worker (alias 'id'): a unique 3+ char prefix or 'last'; required for verbs that target one.";
+
+/// The compact `details` object behind a live worker's `status`.
+///
+/// Only what an orchestrator reads: the step and its budget, the elapsed time
+/// and the command in flight (or the build slot it waits for), plus the fields
+/// a terminal state carries. The diff is deliberately absent -- `collect` and
+/// `review` serve it -- and the artifact list is capped to a preview plus a
+/// count, so a worker that synced hundreds of files stays small.
+fn compact_status_details(
+    state: &crate::pool::WorkerState,
+    entry: Option<&crate::pool::WorkerRegistryEntry>,
+    progress: Option<&crate::pool::WorkerProgress>,
+    now: u64,
+) -> Value {
+    let mut details = serde_json::Map::new();
+    details.insert("step".into(), json!(state.step()));
+    details.insert("turns".into(), json!(state.step()));
+    if let Some(max_turns) = entry.map(|entry| entry.max_turns) {
+        details.insert("max_turns".into(), json!(max_turns));
+    }
+    // Prefer the registry row's dispatch time: it is the one clock that also
+    // answers for a worker this process only knows through its row.
+    let started_at = entry
+        .map(|entry| entry.started_at)
+        .or_else(|| state_timestamp(state));
+    if let Some(started_at) = started_at {
+        let elapsed = match state_end(state) {
+            Some(end) => end.saturating_sub(started_at),
+            None => now.saturating_sub(started_at),
+        };
+        details.insert("started_at".into(), json!(started_at));
+        details.insert("elapsed".into(), json!(elapsed));
+    }
+    if let Some(revision) = state_revision(state).or_else(|| entry.map(|entry| entry.revision)) {
+        details.insert("revision".into(), json!(revision));
+    }
+    if let Some(metrics) = state_metrics(state).or_else(|| entry.map(|entry| entry.metrics)) {
+        details.insert("metrics".into(), json!(metrics));
+    }
+    if let Some(progress) = progress {
+        if let Some(command) = progress.last_command.as_deref() {
+            details.insert("last_command".into(), json!(command));
+        }
+        if let Some(waiting) = progress.waiting_for_slot {
+            details.insert("waiting_for_slot".into(), json!(waiting));
+        }
+        if let Some(started) = progress.command_started_at {
+            details.insert("command_started_at".into(), json!(started));
+            details.insert("command_elapsed".into(), json!(now.saturating_sub(started)));
+        }
+        if let Some(question) = progress.question.as_deref() {
+            details.insert("question".into(), json!(question));
+        }
+    }
+    match state {
+        crate::pool::WorkerState::Running { last_command, .. } => {
+            details
+                .entry("last_command".to_string())
+                .or_insert_with(|| json!(last_command));
+        }
+        crate::pool::WorkerState::Paused { question, .. } => {
+            details
+                .entry("question".to_string())
+                .or_insert_with(|| json!(question));
+        }
+        crate::pool::WorkerState::Completed {
+            summary,
+            artifacts,
+            branch,
+            verified,
+            revision,
+            report,
+            ..
+        } => {
+            details.insert("summary".into(), json!(summary));
+            insert_compact_artifacts(&mut details, artifacts);
+            details.insert("branch".into(), json!(branch));
+            details.insert("verified".into(), json!(verified));
+            details.insert("revision".into(), json!(revision));
+            // The report is a handful of fields, not the diff: it travels so a
+            // live completion answers the same question its registry row does.
+            details.insert("report".into(), json!(report));
+        }
+        crate::pool::WorkerState::Failed {
+            error, revision, ..
+        } => {
+            details.insert("error".into(), json!(error));
+            details.insert("revision".into(), json!(revision));
+        }
+        crate::pool::WorkerState::Exhausted {
+            summary,
+            artifacts,
+            branch,
+            revision,
+            report,
+            ..
+        } => {
+            details.insert("summary".into(), json!(summary));
+            insert_compact_artifacts(&mut details, artifacts);
+            details.insert("branch".into(), json!(branch));
+            details.insert("revision".into(), json!(revision));
+            details.insert("reason".into(), json!(crate::pool::TURN_BUDGET_EXHAUSTED));
+            details.insert("report".into(), json!(report));
+        }
+    }
+    Value::Object(details)
+}
+
+/// Cap the artifact list to a preview and report how many were left out, so a
+/// large completion answer carries a count instead of every path.
+fn insert_compact_artifacts(details: &mut serde_json::Map<String, Value>, artifacts: &[String]) {
+    let (preview, total) = crate::pool::compact_artifacts(artifacts);
+    details.insert("artifacts".into(), json!(preview));
+    details.insert("artifacts_total".into(), json!(total));
+}
+
+/// The clock a non-running state records: dispatch time while live, completion
+/// time once terminal.
+fn state_timestamp(state: &crate::pool::WorkerState) -> Option<u64> {
+    match state {
+        crate::pool::WorkerState::Running { started_at, .. } => Some(*started_at),
+        crate::pool::WorkerState::Paused { paused_at, .. } => Some(*paused_at),
+        crate::pool::WorkerState::Completed { completed_at, .. } => Some(*completed_at),
+        crate::pool::WorkerState::Failed { failed_at, .. } => Some(*failed_at),
+        crate::pool::WorkerState::Exhausted { stopped_at, .. } => Some(*stopped_at),
+    }
+}
+
+/// The moment a terminal state stopped the clock, so its elapsed time is the
+/// run's length rather than the time since it finished.
+fn state_end(state: &crate::pool::WorkerState) -> Option<u64> {
+    match state {
+        crate::pool::WorkerState::Running { .. } | crate::pool::WorkerState::Paused { .. } => None,
+        _ => state_timestamp(state),
+    }
+}
+
+/// The revision counter a state carries, when it has one.
+fn state_revision(state: &crate::pool::WorkerState) -> Option<usize> {
+    match state {
+        crate::pool::WorkerState::Completed { revision, .. }
+        | crate::pool::WorkerState::Failed { revision, .. }
+        | crate::pool::WorkerState::Exhausted { revision, .. } => Some(*revision),
+        crate::pool::WorkerState::Running { .. } | crate::pool::WorkerState::Paused { .. } => None,
+    }
+}
+
+/// The metrics a state carries, when it has them.
+fn state_metrics(state: &crate::pool::WorkerState) -> Option<crate::pool::WorkerMetrics> {
+    match state {
+        crate::pool::WorkerState::Completed { metrics, .. }
+        | crate::pool::WorkerState::Failed { metrics, .. }
+        | crate::pool::WorkerState::Exhausted { metrics, .. } => Some(*metrics),
+        crate::pool::WorkerState::Running { .. } | crate::pool::WorkerState::Paused { .. } => None,
+    }
+}

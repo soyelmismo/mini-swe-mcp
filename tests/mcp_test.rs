@@ -1656,30 +1656,14 @@ fn channel_frames_carry_content_and_valid_meta_keys() {
 /// never normalizes it to `stopped`.
 fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        id: worker_id.to_string(),
-        pid: std::process::id(),
         task: String::from("channel smoke test"),
         model: String::from("ninja"),
         status,
         step: 3,
         max_turns: 20,
         last_command: String::from("cargo test"),
-        question: None,
-        started_at: 0,
-        updated_at: 0,
         group: Some(String::from("backend")),
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
-        repo_path: None,
-        owner: Some(String::from("registry-owner")),
-        metrics: WorkerMetrics::default(),
-        base_branch: None,
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row(worker_id, String::from("registry-owner"))
     }
 }
 

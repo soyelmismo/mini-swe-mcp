@@ -1,7 +1,7 @@
 //! Plain-text renderers for the per-worker inspection verbs.
 //!
-//! Formatters behind `status`, `collect`, `logs`, `dispatch`, `steer`, `wait`,
-//! `kill` and `reap` — the actions that answer about one worker (or, for
+//! Formatters behind `status`, `collect`, `logs`, `dispatch`, `consolidate`,
+//! `steer`, `wait`, `kill` and `reap` — the actions that answer about one worker (or, for
 //! `reap`, about a set of terminal workers) rather than about the system
 //! catalog. `format_dispatch` doubles as the worker-result view, because
 //! `wait` and `steer --wait` answer with exactly that payload.
@@ -15,6 +15,7 @@
 //! keeps the CLI dispatch layer down to argument handling.
 
 mod collect;
+mod consolidate;
 mod dispatch;
 mod kill;
 mod logs;
@@ -25,7 +26,8 @@ mod status;
 mod steer;
 
 pub use collect::format_collect;
-pub use dispatch::format_dispatch;
+pub use consolidate::format_consolidate;
+pub use dispatch::{format_dispatch, format_dispatch_quiet};
 pub use kill::format_kill;
 pub use logs::format_logs;
 pub use merge::format_merge;

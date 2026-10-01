@@ -408,6 +408,11 @@ impl WatchRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Whether `identity` holds a watch slot right now.
+    fn has(&self, identity: &str) -> bool {
+        self.lock().contains_key(identity)
+    }
+
     fn busy(active: &ActiveWatch) -> anyhow::Error {
         let held = match active.pid {
             Some(pid) => format!("pid {pid}, since {}", active.since),
@@ -545,6 +550,12 @@ impl EventRouter {
         })
     }
 
+    /// Whether `identity` already has a watch running, so a dispatch or steer
+    /// answer can drop the "start this" line the caller has already acted on.
+    pub(super) fn has_watch(&self, identity: &str) -> bool {
+        self.watches.has(identity)
+    }
+
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
         self.latest
             .retain(|(_, old)| old.worker_id != event.worker_id);
@@ -676,6 +687,17 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
     }
     for (id, view) in &mut current {
         if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id) {
+            view.event = None;
+        } else if matches!(
+            view.event,
+            Some(EventKind::Completed | EventKind::Failed | EventKind::Exhausted)
+        ) && pool.steered_by_live_consolidator(id).await
+        {
+            // The consolidator that steered this worker is blocked in
+            // `CONSOLIDATE_WAIT` on exactly this stop, so the owner's watch
+            // stays quiet until the round is over (or the consolidator died):
+            // the owner sees the worker again once the source names no live
+            // consolidator.
             view.event = None;
         }
     }
@@ -1103,6 +1125,9 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         if pool.question_for_consolidator(id) {
             view["question_for_consolidator"] = json!(true);
         }
+        if pool.steered_by_live_consolidator(id).await {
+            view["steered_by_consolidator"] = json!(true);
+        }
     }
     views
 }
@@ -1141,6 +1166,18 @@ impl EventRouter {
                     history.pending.retain(|event| {
                         !(event["worker_id"] == *id && event["event"] == "needs_input")
                     });
+                }
+                continue;
+            }
+            // A consolidator that steered this worker waits on its stop; every
+            // event of the worker -- completed, failed, exhausted, stalled --
+            // belongs to that consolidator, not the owner's watch. Skipping one
+            // also drops what is queued, so a duplicate never leaks through.
+            if view["steered_by_consolidator"] == true {
+                self.watch_reported.remove(id);
+                self.seen.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| event["worker_id"] != *id);
                 }
                 continue;
             }
@@ -1577,25 +1614,16 @@ mod verify_tail_attachment_tests {
 #[cfg(test)]
 mod registry_verified_tests {
     use super::{EventKind, registry_view};
-    use crate::pool::{RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerRegistryEntry};
 
     fn completed_row(verified: Option<bool>) -> WorkerRegistryEntry {
         // Built through the same constructor a real write uses, so the fixture
         // picks up fields the current build adds to a row without a literal.
         let meta = WorkerMeta {
-            id: "w-registry".to_string(),
             task: "persist the verdict".to_string(),
-            group: None,
-            role: WorkerRole::Worker,
-            repo_path: None,
-            owner: "owner".to_string(),
-            started_at: 0,
             pid: 0,
-            revision: 0,
-            auto_continues: 0,
-            metrics: WorkerMetrics::default(),
-            report: None,
             verified,
+            ..WorkerMeta::test_meta("w-registry", "owner")
         };
         meta.entry(
             "test-model",

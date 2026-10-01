@@ -291,6 +291,21 @@ pub fn same_diff_path(requested: &str, actual: &str) -> bool {
 /// fresh budget rather than treat the branch as done.
 pub const TURN_BUDGET_EXHAUSTED: &str = "turn_budget_exhausted";
 
+/// Most artifact paths a compact view embeds before the tail is reported as a
+/// count. A worker that synced hundreds of files must not make every `status`
+/// or `list` answer large.
+pub const ARTIFACT_PREVIEW: usize = 5;
+
+/// Split a worker's artifacts into the paths a compact view carries and the
+/// total count, so a long tail is reported as a number instead of being
+/// dropped silently.
+pub fn compact_artifacts(artifacts: &[String]) -> (Vec<String>, usize) {
+    (
+        artifacts.iter().take(ARTIFACT_PREVIEW).cloned().collect(),
+        artifacts.len(),
+    )
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
@@ -377,6 +392,18 @@ impl WorkerState {
         }
     }
 
+    /// The variant name, matching the serde tag so a compact projection and
+    /// the full serialization agree.
+    pub fn name(&self) -> &'static str {
+        match self {
+            WorkerState::Running { .. } => "Running",
+            WorkerState::Paused { .. } => "Paused",
+            WorkerState::Completed { .. } => "Completed",
+            WorkerState::Failed { .. } => "Failed",
+            WorkerState::Exhausted { .. } => "Exhausted",
+        }
+    }
+
     pub fn to_summary(&self) -> serde_json::Value {
         match self {
             WorkerState::Running {
@@ -410,19 +437,23 @@ impl WorkerState {
                 revision,
                 report,
                 diff,
-            } => serde_json::json!({
-                "status": "Completed",
-                "turns": turns,
-                "summary": summary,
-                "completed_at": completed_at,
-                "artifacts": artifacts,
-                "branch": branch,
-                "verified": verified,
-                "metrics": metrics,
-                "revision": revision,
-                "report": report,
-                "per_file": file_stats_of_diff(diff),
-            }),
+            } => {
+                let (artifacts, artifacts_total) = compact_artifacts(artifacts);
+                serde_json::json!({
+                    "status": "Completed",
+                    "turns": turns,
+                    "summary": summary,
+                    "completed_at": completed_at,
+                    "artifacts": artifacts,
+                    "artifacts_total": artifacts_total,
+                    "branch": branch,
+                    "verified": verified,
+                    "metrics": metrics,
+                    "revision": revision,
+                    "report": report,
+                    "per_file": file_stats_of_diff(diff),
+                })
+            }
             WorkerState::Failed {
                 error,
                 step,
@@ -447,19 +478,23 @@ impl WorkerState {
                 revision,
                 report,
                 diff,
-            } => serde_json::json!({
-                "status": "Exhausted",
-                "turns": turns,
-                "summary": summary,
-                "stopped_at": stopped_at,
-                "artifacts": artifacts,
-                "branch": branch,
-                "metrics": metrics,
-                "revision": revision,
-                "report": report,
-                "reason": TURN_BUDGET_EXHAUSTED,
-                "per_file": file_stats_of_diff(diff),
-            }),
+            } => {
+                let (artifacts, artifacts_total) = compact_artifacts(artifacts);
+                serde_json::json!({
+                    "status": "Exhausted",
+                    "turns": turns,
+                    "summary": summary,
+                    "stopped_at": stopped_at,
+                    "artifacts": artifacts,
+                    "artifacts_total": artifacts_total,
+                    "branch": branch,
+                    "metrics": metrics,
+                    "revision": revision,
+                    "report": report,
+                    "reason": TURN_BUDGET_EXHAUSTED,
+                    "per_file": file_stats_of_diff(diff),
+                })
+            }
         }
     }
 }

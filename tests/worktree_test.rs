@@ -471,11 +471,11 @@ fn test_sync_never_reverts_a_newer_repo_file_the_worker_never_touched() {
         "newer content from another worker\n",
         "the sync reverted a repo file that moved on after seeding"
     );
-    // Skipping the copy is not the same as hiding the artifact: callers still
-    // get it in the reported list.
+    // A file the worker never touched is not its artifact: the sync neither
+    // copies it nor reports it, so the completion view stays the worker's own.
     assert!(
-        synced.contains(&"audits/memory.md".to_string()),
-        "an inherited artifact must still be reported, got: {synced:?}"
+        !synced.contains(&"audits/memory.md".to_string()),
+        "an inherited artifact must not be reported, got: {synced:?}"
     );
 
     drop(guard);

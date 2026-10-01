@@ -2,25 +2,14 @@
 mod common;
 
 use mini_swe_mcp::agent::CONSOLIDATOR_INSTRUCTIONS;
-use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRole, save_registry_entry_in,
-};
+use mini_swe_mcp::pool::{RegistryStatus, WorkerMeta, WorkerRole, save_registry_entry_in};
 
 fn actor() -> WorkerMeta {
     WorkerMeta {
-        id: "consolidator".into(),
         task: "integrate".into(),
         group: Some("round".into()),
         role: WorkerRole::Consolidate,
-        repo_path: None,
-        owner: "owner".into(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        report: None,
-        verified: None,
+        ..WorkerMeta::test_meta("consolidator", "owner")
     }
 }
 

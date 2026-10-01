@@ -1268,30 +1268,13 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
     common::git(&repo, &["checkout", "-q", "main"]);
 
     let entry = WorkerRegistryEntry {
-        id: "w-gone".to_string(),
-        pid: std::process::id(),
         task: "fix the parser".to_string(),
-        model: "test".to_string(),
         status: RegistryStatus::Completed,
         step: 2,
-        max_turns: 10,
         last_command: "cargo test".to_string(),
-        question: None,
-        started_at: 0,
-        updated_at: 0,
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().to_string()),
-        owner: Some("agent-a".to_string()),
-        metrics: WorkerMetrics::default(),
         base_branch: Some("main".to_string()),
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row("w-gone", "agent-a")
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);

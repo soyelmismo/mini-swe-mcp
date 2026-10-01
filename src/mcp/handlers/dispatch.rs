@@ -116,7 +116,7 @@ impl McpServer {
             "failed": failed,
             "message": "Workers are executing in isolated worktrees in background. Use 'watch' (or mini-swe-mcp watch) to wait for them.",
         });
-        Self::with_watch_command(&mut payload, ctx);
+        self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
 
@@ -230,7 +230,7 @@ impl McpServer {
             "network": if network_offline { "offline" } else { crate::mcp::schema::NETWORK_DEFAULT },
             "message": "Worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
         });
-        Self::with_watch_command(&mut payload, ctx);
+        self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
 }
