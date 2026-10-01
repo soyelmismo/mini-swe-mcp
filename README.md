@@ -123,7 +123,7 @@ If the second run fails the completion is refused and the model is told which va
 
 ## Resource management
 
-- **Admission.** Heavy commands are classified and dosed: at most `BASH_BUILD_LIMIT` (default the core count) heavy builds at once, gated by free memory (`HUB_MEM_RESERVE_MB`, `HUB_BUILD_MEM_MB`). Light commands use `BASH_CONCURRENT_LIMIT` slots (default one per worker).
+- **Admission.** Heavy commands are classified and dosed: at most `BASH_BUILD_LIMIT` (default the core count) heavy builds at once, gated by free memory (`HUB_MEM_RESERVE_MB`, `HUB_BUILD_MEM_MB`) and by Linux pressure-stall information — CPU `some avg10` (`HUB_CPU_PRESSURE_MAX`), memory and IO `full avg10` (`HUB_MEM_PRESSURE_MAX`, `HUB_IO_PRESSURE_MAX`). PSI measures the time tasks actually stalled on a resource, so it is not fooled by I/O wait or unrelated processes the way the 1-minute load average is; when `/proc/pressure` is unavailable the controller falls back to that load average. Light commands use `BASH_CONCURRENT_LIMIT` slots (default one per worker).
 - **Fair scheduling.** `MAX_CONCURRENT_WORKERS` bounds the pool and `MAX_WORKERS_PER_AGENT` caps each agent so one orchestrator cannot starve the others; runnable workers are scheduled across agents.
 - **Shared warm build dirs.** Workers share compiler/package caches under `SWE_CACHE_DIR`, so the second build is warm. `SWE_SHARED_CACHES` adds custom cache binds; `SWE_DISABLE_KACHE=1` (or `KACHE_DISABLED=1`) turns the kache layer off. Shared build slots are pruned by `HUB_TARGET_TTL_HOURS` / `HUB_TARGET_MAX_GB`.
 - **Any ecosystem.** The caches, the sandbox grants and the parallelism caps are not Rust-specific: each tool is pointed at a shared cache under `SWE_CACHE_DIR` through its own variable, and the sandbox grants that directory (never the operator's home) with the rights the tool needs.
@@ -162,6 +162,9 @@ Defaults are what the code uses when the variable is unset.
 | `BASH_BUILD_LIMIT` | core count | Concurrent heavy builds. |
 | `HUB_MEM_RESERVE_MB` | `2048` | Free memory held back from admission. |
 | `HUB_BUILD_MEM_MB` | `1536` | Memory one heavy build is assumed to need. |
+| `HUB_CPU_PRESSURE_MAX` | `60` | CPU `some avg10` ceiling (PSI, percent). |
+| `HUB_MEM_PRESSURE_MAX` | `10` | Memory `full avg10` ceiling (PSI, percent). |
+| `HUB_IO_PRESSURE_MAX` | `40` | IO `full avg10` ceiling (PSI, percent). |
 | `BUILD_PARALLELISM` | granted jobs, else half the cores | Parallelism exported to a build. |
 | `HUB_LLM_CONCURRENCY` | `0` (unlimited) | In-flight LLM requests hub-wide. |
 | `LLM_MAX_RETRIES` | `6` | Attempts per completion. |
