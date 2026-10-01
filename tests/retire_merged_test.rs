@@ -552,6 +552,13 @@ fn a_no_delete_merge_survives_the_post_merge_sweep() {
 
     f.merge_keeping_branch_then_sweep("nd1")
         .expect("a --no-delete merge must succeed");
+    // Durable, not a one-off exemption: a *later* sweep must also leave it be.
+    let later = f.sweep();
+    assert!(
+        !later.workers.iter().any(|id| id == "nd1"),
+        "a keep_branch worker must survive every later sweep too: {:?}",
+        later.workers
+    );
 
     assert!(
         git_ref_exists(f.repo(), "worker-nd1"),
