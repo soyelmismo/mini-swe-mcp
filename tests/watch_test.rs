@@ -398,6 +398,7 @@ fn tool_description_carries_the_orchestrator_guidelines() {
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in [
         "ONE focused concern",
+        "many workers at once is the intended use",
         "mini-swe-mcp watch",
         "timeout_secs",
         "no_event",
@@ -560,6 +561,559 @@ fn one_watch_call_replays_every_missed_event() {
     assert!(
         replayed.contains(&"w-first".to_string()) && replayed.contains(&"w-second".to_string()),
         "one call must replay every missed event: {stdout}"
+    );
+}
+
+/// A no-arg MCP `watch` follows a worker dispatched after it started: its set
+/// is re-evaluated on every poll instead of frozen at the first one.
+#[tokio::test]
+async fn a_no_arg_watch_action_follows_late_dispatches() {
+    isolate_registry();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-mcp-first",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
+
+    let watch = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .execute_tool(
+                    "worker",
+                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
+                )
+                .await
+        }
+    });
+    // Let the watch resolve its initial set to w-mcp-first.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The late dispatch: only its completion should wake the watch.
+    pool.__test_insert_worker(record(
+        "w-mcp-second",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "late worker done".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-mcp-second".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    ))
+    .await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), watch)
+        .await
+        .expect("a late dispatch must wake the no-arg watch")
+        .expect("the watch task stays alive")
+        .expect("the watch answers");
+    assert_eq!(result["status"], "event", "{result}");
+    let events = result["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["worker_id"] == "w-mcp-second"),
+        "the late worker must be reported: {result}"
+    );
+}
+
+/// The backgrounded `mini-swe-mcp watch` the orchestrator runs must follow a
+/// worker dispatched after it started, not the set it saw first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
+    isolate_registry();
+    let hub = common::TempDir::new_in_tmp("watch-late-hub");
+    let swe = common::TempDir::new_in_tmp("watch-late-swe");
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    let owner = common::host_of_this_process();
+    pool.__test_insert_worker(record(
+        "w-late-first",
+        &owner,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
+    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&hub.path().join("hub.sock")).await;
+
+    let child = common::binary_command(&common::binary_path())
+        .args(["--json", "watch", "--timeout", "20"])
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", swe.path())
+        .env("TMPDIR", swe.path())
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the backgrounded watch");
+
+    // Let the watch resolve its initial set to w-late-first.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    pool.__test_insert_worker(record(
+        "w-late-second",
+        &owner,
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "late worker done".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-late-second".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    ))
+    .await;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("the backgrounded watch must wake for the late dispatch")
+    .expect("the wait task stays alive")
+    .expect("child output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| event["worker_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        reported.contains(&"w-late-second".to_string()),
+        "the late worker must be reported: {stdout}"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
+/// A no-arg registry-polling watch follows a worker registered after it
+/// started, and `--group` still filters late arrivals.
+#[test]
+fn a_no_arg_polling_watch_follows_late_dispatches_under_a_group() {
+    let dir = common::TempDir::new_in_tmp("watch-late-poll");
+    let registry = dir.subdir("swe-registry");
+    let owner = common::host_of_this_process();
+    let now = mini_swe_mcp::pool::unix_timestamp();
+    let row = |id: &str, status: &str, group: &str| {
+        serde_json::json!({
+            "id": id, "pid": std::process::id(), "task": "watch probe", "model": "test",
+            "status": status, "step": 2, "max_turns": 10, "last_command": "cargo test",
+            "started_at": 1, "updated_at": now, "owner": owner, "group": group,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        registry.join("w-first.json"),
+        row("w-first", "running", "g1"),
+    )
+    .expect("first row");
+
+    let child = common::binary_command(&common::binary_path())
+        .args(["--json", "watch", "--group", "g1", "--timeout", "15"])
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("SWE_TEMP_DIR", dir.path())
+        .env("TMPDIR", dir.path())
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env_remove("OPENAI_API_KEY")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the watch");
+
+    // Let the watch resolve its initial set to w-first.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // A late worker in another group is never watched.
+    std::fs::write(
+        registry.join("w-other.json"),
+        row("w-other", "completed", "g2"),
+    )
+    .expect("other row");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // A late worker in the watched group is reported; its worktree keeps the
+    // terminal row from being pruned.
+    let _ = dir.subdir("swe-wt-w-late");
+    std::fs::write(
+        registry.join("w-late.json"),
+        row("w-late", "completed", "g1"),
+    )
+    .expect("late row");
+
+    let output = child.wait_with_output().expect("the watch must exit");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| event["worker_id"].as_str().map(str::to_string))
+        .collect();
+    assert!(reported.contains(&"w-late".to_string()), "{stdout}");
+    assert!(!reported.contains(&"w-other".to_string()), "{stdout}");
+}
+
+/// One watch per identity: a second connection of the same agent is refused
+/// and named the first, another agent watches at the same time, and the slot
+/// frees when the holder disconnects.
+#[tokio::test]
+async fn the_daemon_allows_one_watch_per_identity() {
+    isolate_registry();
+    let dir = common::TempDir::new_in_tmp("wg-one-daemon");
+    let server = pool_with(vec![
+        record(
+            "w-one-a",
+            "agent-a",
+            WorkerState::Running {
+                step: 1,
+                last_command: "t".to_string(),
+                started_at: 0,
+            },
+        ),
+        record(
+            "w-one-b",
+            "agent-b",
+            WorkerState::Running {
+                step: 1,
+                last_command: "t".to_string(),
+                started_at: 0,
+            },
+        ),
+    ])
+    .await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    let socket = dir.path().join("hub.sock");
+    wait_for_socket(&socket).await;
+    let watch = serde_json::json!({"worker_ids": [], "group": null, "initial": true});
+
+    let mut a1 = Raw::connect(&socket).await;
+    a1.request(
+        "hub/hello",
+        serde_json::json!({"agent_id": "agent-a", "pid": 1111}),
+    )
+    .await;
+    let reply = a1.request("hub/watch", watch.clone()).await;
+    assert!(reply.get("error").is_none(), "{reply:?}");
+
+    // A second connection of the same identity is refused, naming the first.
+    let mut a2 = Raw::connect(&socket).await;
+    a2.request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
+    let reply = a2.request("hub/watch", watch.clone()).await;
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("a watch is already running"), "{reply:?}");
+    assert!(message.contains("pid 1111"), "{reply:?}");
+
+    // A different identity watches at the same time.
+    let mut b = Raw::connect(&socket).await;
+    b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
+        .await;
+    let reply = b.request("hub/watch", watch.clone()).await;
+    assert!(reply.get("error").is_none(), "{reply:?}");
+    assert!(
+        reply["result"]["watching"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&serde_json::json!("w-one-b"))),
+        "{reply:?}"
+    );
+
+    // Closing the holder frees the slot for the identity's next watch.
+    drop(a1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let a3 = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot must free when its connection closes"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut candidate = Raw::connect(&socket).await;
+        candidate
+            .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+            .await;
+        let reply = candidate.request("hub/watch", watch.clone()).await;
+        if reply.get("error").is_none() {
+            break candidate;
+        }
+    };
+    let _ = a3; // Keep the reconnected watch alive until the daemon stops.
+
+    task.abort();
+    let _ = task.await;
+}
+
+/// The MCP `watch` action obeys the same one-watch-per-identity rule.
+#[tokio::test]
+async fn the_mcp_watch_action_allows_one_watch_per_identity() {
+    isolate_registry();
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    pool.__test_insert_worker(record(
+        "w-mcp-one",
+        mini_swe_mcp::mcp::LOCAL_AGENT,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool, "test".to_string()));
+
+    let first = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .execute_tool(
+                    "worker",
+                    serde_json::json!({"action": "watch", "timeout_secs": 10}),
+                )
+                .await
+        }
+    });
+    // Let the first watch reserve the identity's slot.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let error = server
+        .execute_tool(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 10}),
+        )
+        .await
+        .expect_err("a second watch for the same identity must be refused");
+    assert!(
+        error.to_string().contains("a watch is already running"),
+        "{error}"
+    );
+
+    // A different identity may watch at the same time.
+    let other = mini_swe_mcp::mcp::ConnectionContext {
+        agent_id: Some("agent-other".to_string()),
+        ..mini_swe_mcp::mcp::ConnectionContext::hub_connection(9)
+    };
+    let reply = server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 0}),
+            &other,
+        )
+        .await
+        .expect("a different identity watches concurrently");
+    assert_eq!(reply["status"], "no_event", "{reply}");
+
+    // Cancelling the holder frees its slot.
+    first.abort();
+    let _ = first.await;
+    let reply = server
+        .execute_tool(
+            "worker",
+            serde_json::json!({"action": "watch", "timeout_secs": 0}),
+        )
+        .await
+        .expect("the freed slot accepts a new watch");
+    assert_eq!(reply["status"], "no_event", "{reply}");
+}
+
+/// The CLI maps a refused second watch of one session to exit code 5 and
+/// accepts a fresh watch once the holder has exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_cli_watch_for_one_session_exits_five() {
+    isolate_registry();
+    let hub = common::TempDir::new_in_tmp("wg-cli-hub");
+    let swe = common::TempDir::new_in_tmp("wg-cli-swe");
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
+        .with_manifest(Arc::new(ModelManifest::default()));
+    let owner = common::host_of_this_process();
+    pool.__test_insert_worker(record(
+        "w-cli-one",
+        &owner,
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo test".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    let server = Arc::new(McpServer::new(pool, "test".to_string()));
+    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&hub.path().join("hub.sock")).await;
+
+    let spawn_watch = |timeout: &str| {
+        common::binary_command(&common::binary_path())
+            .args(["--json", "watch", "--timeout", timeout])
+            .env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", swe.path())
+            .env("TMPDIR", swe.path())
+            .env("OPENAI_API_KEY", "test-key-not-used")
+            .env("ENV_FILE", "/nonexistent-mini-swe-env")
+            .env(
+                "MODELS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn watch")
+    };
+    let mut first = spawn_watch("30");
+    // Let the first watch reserve the session's slot.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let second = spawn_watch("5");
+    let out = tokio::task::spawn_blocking(move || second.wait_with_output())
+        .await
+        .expect("the wait task stays alive")
+        .expect("the second watch exits");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("a watch is already running"), "{stdout}");
+
+    // Once the holder exits, the session may watch again.
+    let _ = first.kill();
+    let _ = first.wait();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let third = spawn_watch("2");
+    let out = tokio::task::spawn_blocking(move || third.wait_with_output())
+        .await
+        .expect("the wait task stays alive")
+        .expect("the third watch exits");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
+/// A worker queued for a heavy build slot is not stalled, however long the
+/// wait: the admission wait is its own state, and the stall detector skips it.
+#[test]
+fn a_queued_build_slot_is_never_a_stall() {
+    let mut view = serde_json::json!({
+        "worker_id": "w-slot",
+        "owner": "local",
+        "status": "running",
+        "step": 4,
+        "turns": 4,
+        "revision": 0,
+        "question": null,
+        "branch": null,
+        "metrics": {},
+        "last_step_at": 400u64,
+        "waiting_for_slot": 3,
+    });
+    let now = 1001; // 601 s since the last step, well past the stall threshold.
+    assert!(
+        watch::select_event(&view, None, now).is_none(),
+        "a queued build slot must never be reported as stalled"
+    );
+
+    // Without the admission wait the same idle is a stall.
+    view["waiting_for_slot"] = serde_json::json!(null);
+    let event = watch::select_event(&view, None, now).expect("idle with no wait is a stall");
+    assert_eq!(event["event"], "stalled");
+}
+
+/// Waiting for a build slot keeps the idle clock at zero, so granting the slot
+/// starts a fresh episode instead of a stall the moment admission succeeds.
+#[test]
+fn a_build_slot_wait_keeps_the_idle_clock_at_zero() {
+    let mut view = serde_json::json!({
+        "step": 1,
+        "revision": 0,
+        "last_step_at": 10u64,
+        "waiting_for_slot": 2,
+    });
+    let old = serde_json::json!({"step": 1, "revision": 0, "last_step_at": 10u64});
+    watch::progress_clock(&mut view, Some(&old), 5000);
+    assert_eq!(view["last_step_at"], serde_json::json!(5000));
+}
+
+/// The pool publishes a worker's queued build slot and clears it as soon as the
+/// wait ends, so the exposed state tracks admission exactly.
+#[tokio::test]
+async fn the_pool_exposes_then_clears_a_build_slot_wait() {
+    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    pool.__test_insert_worker(record(
+        "w-slot-pool",
+        "local",
+        WorkerState::Running {
+            step: 1,
+            last_command: "cargo build".to_string(),
+            started_at: 0,
+        },
+    ))
+    .await;
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        None
+    );
+    let wait = pool.wait_for_build_slot("w-slot-pool", 4);
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        Some(4)
+    );
+    drop(wait);
+    assert_eq!(
+        pool.worker_progress("w-slot-pool")
+            .await
+            .unwrap()
+            .waiting_for_slot,
+        None
     );
 }
 

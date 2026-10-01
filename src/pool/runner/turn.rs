@@ -300,6 +300,11 @@ pub(super) struct TurnEngine<'a> {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<&'a str>,
+    /// The dispatcher's ambient environment, filtered by the sandbox's secret
+    /// filter. Layered on top of the canonical sandbox environment for the
+    /// differential verify run, so a suite that only passes in the
+    /// orchestrator's shell is caught by the worker itself.
+    pub client_env: &'a [(String, String)],
     /// The budget the dispatch was given, the base the self-grant cap is
     /// measured from (`current_max_turns` moves as the worker extends it).
     pub dispatch_max_turns: usize,
@@ -730,13 +735,16 @@ impl<'a> TurnEngine<'a> {
         };
 
         self.meta.metrics.verify_runs += 1;
+        // The side-effect baseline is taken before the gate runs, so both the
+        // canonical run and the divergent run are audited against it.
+        let gate_baseline = super::divergent::snapshot(&self.worktree.repo_root);
         let (output, code) = self.run_gated(verify).await?;
 
         let exit = code.unwrap_or(-1);
         if exit == 0 {
-            return Ok(TurnOutcome::Completed {
-                verified: Some(true),
-            });
+            return self
+                .finish_verified_completion(llm_resp, verify, &gate_baseline)
+                .await;
         }
 
         // Verification failed. Record a step log and push the output back to
@@ -773,6 +781,103 @@ impl<'a> TurnEngine<'a> {
                 .clone()
                 .zip(llm_resp.tool_call_id.clone()),
             output_text,
+        );
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// Finish a completion whose canonical verify run passed: audit what it
+    /// left behind, then re-run the same command in the divergent environment.
+    ///
+    /// Variant B runs only after A passed and only at completion, so a worker
+    /// that is still iterating pays no second-verify cost. Either refusal
+    /// replays the completion turn, exactly like a verify failure, so the next
+    /// request never carries a dangling tool_call.
+    async fn finish_verified_completion(
+        &mut self,
+        llm_resp: &LlmResponse,
+        verify: &str,
+        baseline: &super::divergent::SideEffectBaseline,
+    ) -> Result<TurnOutcome> {
+        let repo_root = self.worktree.repo_root.clone();
+        let worktree_path = self.worktree.path.clone();
+        let worker_id = self.worker_id.to_string();
+
+        // Side-effect audit of the canonical run, against the pre-gate
+        // baseline: the suite must leave the repository, its refs and its
+        // processes exactly as it found them.
+        let effects = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
+        if !effects.is_empty() {
+            super::divergent::cleanup(&repo_root, &effects);
+            let refusal = super::divergent::side_effect_refusal(&effects);
+            self.push_exchange(
+                llm_resp.content.clone(),
+                llm_resp.reasoning_content.clone(),
+                llm_resp
+                    .tool_calls
+                    .clone()
+                    .zip(llm_resp.tool_call_id.clone()),
+                refusal,
+            );
+            return Ok(TurnOutcome::Continue);
+        }
+
+        // Variant B: the same command in the divergent environment. Disabled
+        // by the operator, or skipped when there is nothing to diverge on.
+        if !super::divergent::enabled() {
+            return Ok(TurnOutcome::Completed {
+                verified: Some(true),
+            });
+        }
+        let divergent_env =
+            super::divergent::divergent_environment(&worktree_path, self.client_env);
+        tracing::info!(
+            worker = %self.worker_id,
+            names = ?super::divergent::divergent_names(&divergent_env),
+            "Running divergent verify variant B"
+        );
+        let (output_b, code_b) = self
+            .run_gated_with_env(verify, divergent_env.clone())
+            .await?;
+        tracing::info!(
+            worker = %self.worker_id,
+            exit = ?code_b,
+            output = %crate::agent::sandbox::truncate_output(&output_b),
+            "Divergent verify variant B finished"
+        );
+
+        // The audit covers both runs: variant B must clean up after itself too.
+        let effects_b = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
+        if !effects_b.is_empty() {
+            super::divergent::cleanup(&repo_root, &effects_b);
+            let refusal = super::divergent::side_effect_refusal(&effects_b);
+            self.push_exchange(
+                llm_resp.content.clone(),
+                llm_resp.reasoning_content.clone(),
+                llm_resp
+                    .tool_calls
+                    .clone()
+                    .zip(llm_resp.tool_call_id.clone()),
+                refusal,
+            );
+            return Ok(TurnOutcome::Continue);
+        }
+
+        let exit_b = code_b.unwrap_or(-1);
+        if exit_b == 0 {
+            return Ok(TurnOutcome::Completed {
+                verified: Some(true),
+            });
+        }
+        let differing = super::divergent::divergent_names(&divergent_env);
+        let refusal = super::divergent::divergence_refusal(verify, &differing, code_b, &output_b);
+        self.push_exchange(
+            llm_resp.content.clone(),
+            llm_resp.reasoning_content.clone(),
+            llm_resp
+                .tool_calls
+                .clone()
+                .zip(llm_resp.tool_call_id.clone()),
+            refusal,
         );
         Ok(TurnOutcome::Continue)
     }
@@ -918,9 +1023,48 @@ impl<'a> TurnEngine<'a> {
     /// A granted heavy command also carries the job count the controller
     /// divided over the builds already running, which rides on a runner clone
     /// for this one command; a light command keeps the default parallelism.
+    /// [`run_gated`] with an environment overlay layered on top of the
+    /// sanitized environment (see [`AgentRunner::with_extra_env`]).
+    async fn run_gated_with_env(
+        &mut self,
+        command: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<(String, Option<i32>)> {
+        let heavy = crate::agent::is_heavy_command(command);
+        let build_permit = if heavy {
+            Some(self.pool.admission.acquire().await)
+        } else {
+            None
+        };
+        let _bash_permit = self
+            .pool
+            .bash_semaphore
+            .acquire()
+            .await
+            .context("Bash semaphore closed")?;
+        let mut runner = self.runner.clone();
+        if let Some(permit) = &build_permit {
+            runner = runner.with_build_jobs(permit.jobs());
+        }
+        // The overlay is applied after the job count, so a divergent
+        // environment can never be dropped by a builder-chain reorder.
+        runner = runner.with_extra_env(extra_env);
+        runner.build_target_dir = if heavy {
+            self.worktree.build_dir().await
+        } else {
+            self.worktree.leased_build_dir().map(Path::to_path_buf)
+        };
+        runner.execute_bash(&self.worktree.path, command).await
+    }
+
     async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {
+            // A queued heavy command is not worker inactivity: publish the wait
+            // (with the requests ahead of it) so the stall detector skips it.
+            let _waiting = self
+                .pool
+                .wait_for_build_slot(self.worker_id, self.pool.admission.waiting() + 1);
             Some(self.pool.admission.acquire().await)
         } else {
             None
@@ -1042,6 +1186,7 @@ impl<'a> TurnEngine<'a> {
             branch: self.worktree.branch.clone(),
             network_offline: config.network_offline,
             verify: self.verify.map(str::to_string),
+            client_env: self.client_env.to_vec(),
             max_turns: config.max_turns,
             review_after: config.review_after.map(str::to_string),
             revision: self.meta.revision,

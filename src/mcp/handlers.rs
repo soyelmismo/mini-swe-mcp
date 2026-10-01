@@ -365,6 +365,7 @@ impl McpServer {
                 review_after,
                 network_offline,
                 verify,
+                ctx.client_env.clone(),
             )
             .await?;
         drop(admission);
@@ -640,6 +641,10 @@ impl McpServer {
         if let Some(id) = args.get("worker_id").and_then(Value::as_str) {
             ids.insert(id.to_string());
         }
+        // Without explicit ids the watch follows every worker the caller owns,
+        // re-checked on each poll, so a later dispatch joins automatically. An
+        // explicit id set stays fixed for the whole call.
+        let explicit = !ids.is_empty();
         let group = args.get("group").and_then(Value::as_str);
         let timeout = Self::get_timeout(args, "watch")?;
         // A named worker must exist and be the caller's own: watching a
@@ -647,9 +652,18 @@ impl McpServer {
         for id in &ids {
             self.require_owner(id, ctx).await?;
         }
+        // One watch per identity: reserve this call's slot up front and hold it
+        // until the call returns (or is cancelled), so a second watch is
+        // refused instead of silently competing for the same events.
+        let _slot = self
+            .hub_events
+            .lock()
+            .await
+            .begin_watch(&ctx.agent(), ctx.id, ctx.pid)?;
         let started = tokio::time::Instant::now();
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;
+        let mut watched_any = false;
         loop {
             let reply = self.watch_poll(ctx, &ids, group, initial).await?;
             let events = reply["events"].as_array().cloned().unwrap_or_default();
@@ -667,36 +681,44 @@ impl McpServer {
                     "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
                 }));
             }
-            let watching = reply["watching"].as_array().is_some_and(|w| !w.is_empty());
-            if initial && !watching {
-                return Ok(json!({
-                    "status": "no_event",
-                    "events": [],
-                    "watching": [],
-                    "message": "nothing to watch",
-                }));
+            let watching: Vec<Value> = reply["watching"].as_array().cloned().unwrap_or_default();
+            if !watching.is_empty() {
+                watched_any = true;
             }
-            if initial {
-                ids = reply["watching"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
+            if initial && explicit {
+                ids = watching
+                    .iter()
                     .filter_map(|id| id.as_str().map(str::to_string))
                     .collect();
+                if ids.is_empty() {
+                    return Ok(json!({
+                        "status": "no_event",
+                        "events": [],
+                        "watching": [],
+                        "message": "nothing to watch",
+                    }));
+                }
             }
             initial = false;
-            if !watching {
+            if watching.is_empty() && (explicit || watched_any) {
                 return Ok(json!({"status": "no_event", "events": [], "watching": []}));
             }
             let left = match timeout {
                 Some(t) => match t.checked_sub(started.elapsed()) {
                     Some(left) => left,
                     None => {
-                        return Ok(json!({
+                        // The deadline expired. A no-id watch that never saw a
+                        // worker reports nothing to watch; otherwise the caller
+                        // just got no event and can call again.
+                        let mut payload = json!({
                             "status": "no_event",
                             "events": [],
-                            "watching": reply["watching"].as_array().cloned().unwrap_or_default(),
-                        }));
+                            "watching": watching,
+                        });
+                        if !watched_any {
+                            payload["message"] = json!("nothing to watch");
+                        }
+                        return Ok(payload);
                     }
                 },
                 None => Duration::from_secs(1),

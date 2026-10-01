@@ -1260,6 +1260,7 @@ fn sample_history(
         branch: branch.to_string(),
         network_offline: false,
         verify: None,
+        client_env: Vec::new(),
         max_turns: 10,
         review_after: None,
         revision: 0,
@@ -1516,10 +1517,11 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // loop owns them now, so assert on the registry row + branch instead.
     let wt_path = scratch.path().join("swe-wt-revwork");
     // Give the spawned revision task a moment to check out the branch.
-    // The directory appears before `git worktree add` writes its `.git` link,
-    // so wait for the link: only then does the checkout name its branch.
+    // The directory appears before `git worktree add` writes its `.git` link
+    // and checks out the tracked files, so wait for both: only then does the
+    // worktree name its branch *and* hold the preserved checkpoint.
     for _ in 0..200 {
-        if wt_path.join(".git").exists() {
+        if wt_path.join(".git").exists() && wt_path.join("fix.txt").is_file() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

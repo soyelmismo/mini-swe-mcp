@@ -193,6 +193,7 @@ impl WorkerPool {
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: None,
+                client_env: &[],
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
             };
