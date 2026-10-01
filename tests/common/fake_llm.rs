@@ -35,18 +35,41 @@ pub struct FakeLlm {
     heavy: Arc<AtomicUsize>,
 }
 
+/// What commands a [`FakeLlm`] answers with, turn by turn.
+#[derive(Clone)]
+enum Script {
+    /// `light` on turn 1, `heavy` on turn 2, the completion sentinel after.
+    LightThenHeavy { light: String, heavy: String },
+    /// A distinct benign command on every turn and never the sentinel, so a
+    /// worker under this script can only end by exhausting its turn budget.
+    Loop,
+}
+
 impl FakeLlm {
     /// Bind loopback and serve `light` on turn 1, `heavy` on turn 2 and the
     /// completion sentinel from turn 3 on, for as long as the handle lives.
     pub async fn spawn(light: &str, heavy: &str) -> Self {
+        Self::spawn_script(Script::LightThenHeavy {
+            light: light.to_string(),
+            heavy: heavy.to_string(),
+        })
+        .await
+    }
+
+    /// Serve a different benign command on every turn, never the completion
+    /// sentinel: a worker dispatched against this server stops only when its
+    /// turn budget runs out.
+    pub async fn spawn_looping() -> Self {
+        Self::spawn_script(Script::Loop).await
+    }
+
+    async fn spawn_script(script: Script) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the fake LLM on loopback");
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
         let requests = Arc::new(AtomicUsize::new(0));
         let heavy_served = Arc::new(AtomicUsize::new(0));
-        let light = light.to_string();
-        let heavy = heavy.to_string();
         let counted = requests.clone();
         let heavy_counted = heavy_served.clone();
 
@@ -55,14 +78,13 @@ impl FakeLlm {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                let light = light.clone();
-                let heavy = heavy.clone();
+                let script = script.clone();
                 let requests = counted.clone();
                 let heavy_served = heavy_counted.clone();
                 // One task per connection: a slow or stalled client must never
                 // hold up the conversations behind it.
                 tokio::spawn(async move {
-                    serve_turn(socket, &light, &heavy, requests, heavy_served).await;
+                    serve_turn(socket, &script, requests, heavy_served).await;
                 });
             }
         });
@@ -93,8 +115,7 @@ impl FakeLlm {
 /// Answer one request with the SSE body its turn calls for.
 async fn serve_turn(
     mut socket: TcpStream,
-    light: &str,
-    heavy: &str,
+    script: &Script,
     requests: Arc<AtomicUsize>,
     heavy_served: Arc<AtomicUsize>,
 ) {
@@ -103,15 +124,20 @@ async fn serve_turn(
     };
     requests.fetch_add(1, Ordering::Relaxed);
     let turn = turn_of(&body);
-    let command = match turn {
-        0 => light.to_string(),
-        1 => {
-            heavy_served.fetch_add(1, Ordering::Relaxed);
-            heavy.to_string()
-        }
-        // Past the script the worker is done: keep answering the sentinel so a
-        // stray extra turn ends the run instead of hanging it.
-        _ => format!("echo {}", mini_swe_mcp::pool::COMPLETION_SENTINEL),
+    let command = match script {
+        Script::LightThenHeavy { light, heavy } => match turn {
+            0 => light.clone(),
+            1 => {
+                heavy_served.fetch_add(1, Ordering::Relaxed);
+                heavy.clone()
+            }
+            // Past the script the worker is done: keep answering the sentinel
+            // so a stray extra turn ends the run instead of hanging it.
+            _ => format!("echo {}", mini_swe_mcp::pool::COMPLETION_SENTINEL),
+        },
+        // Each turn writes a distinct file, so neither the repetition detector
+        // nor the stagnation guard fires; the run ends only at the budget.
+        Script::Loop => format!("echo loop > loop-turn-{turn}.txt"),
     };
     let response = sse_response(&command, turn);
     let _ = socket.write_all(response.as_bytes()).await;

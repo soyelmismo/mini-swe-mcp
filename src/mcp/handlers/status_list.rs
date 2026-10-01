@@ -21,6 +21,13 @@ impl McpServer {
                 | crate::pool::WorkerState::Failed { .. } => Some(crate::pool::next_step_for(
                     crate::pool::terminal_branch(&state).as_deref(),
                 )),
+                crate::pool::WorkerState::Exhausted { turns, .. } => {
+                    Some(crate::pool::exhausted_next_step(
+                        wid,
+                        *turns,
+                        crate::pool::terminal_branch(&state).as_deref(),
+                    ))
+                }
                 _ => None,
             };
             let approved = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
@@ -38,10 +45,18 @@ impl McpServer {
             let state_name = entry.status.display_name();
             // A registry-only terminal row (collected worker, restarted hub)
             // carries the same review guidance as the live path.
-            let next_step = entry
-                .status
-                .is_terminal()
-                .then(|| crate::pool::next_step_for(None));
+            let branch = format!("worker-{wid}");
+            let next_step = if entry.status == crate::pool::RegistryStatus::Exhausted {
+                Some(crate::pool::exhausted_next_step(
+                    wid,
+                    entry.step,
+                    Some(branch.as_str()),
+                ))
+            } else if entry.status.is_terminal() {
+                Some(crate::pool::next_step_for(None))
+            } else {
+                None
+            };
             Ok(json!({
                 "worker_id": wid,
                 "owner": crate::pool::registry_owner_label(&entry),

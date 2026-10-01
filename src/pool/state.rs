@@ -286,6 +286,11 @@ pub fn same_diff_path(requested: &str, actual: &str) -> bool {
             && actual[..actual.len() - requested.len()].ends_with('/'))
 }
 
+/// The typed reason an [`WorkerState::Exhausted`] records. A worker that ran
+/// out of turns stopped without completing; its caller must continue it with a
+/// fresh budget rather than treat the branch as done.
+pub const TURN_BUDGET_EXHAUSTED: &str = "turn_budget_exhausted";
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
@@ -335,6 +340,30 @@ pub enum WorkerState {
         #[serde(default)]
         revision: usize,
     },
+    /// The worker spent its whole turn budget without emitting the completion
+    /// sentinel. Its work is checkpointed on its branch exactly like a
+    /// completion, but it never verified, and it must be read as stopped, not
+    /// done: the caller continues it with a fresh budget.
+    Exhausted {
+        turns: usize,
+        diff: String,
+        summary: String,
+        stopped_at: u64,
+        #[serde(default)]
+        artifacts: Vec<String>,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        metrics: WorkerMetrics,
+        /// Same counter as on [`WorkerState::Completed`]: an exhausted worker
+        /// that was itself a revision reports which attempt ran out of turns.
+        #[serde(default)]
+        revision: usize,
+        /// The structured report of the last turn, when the worker supplied
+        /// one; the summary stays the fallback.
+        #[serde(default)]
+        report: Option<WorkerReport>,
+    },
 }
 
 impl WorkerState {
@@ -344,6 +373,7 @@ impl WorkerState {
             WorkerState::Running { step, .. } | WorkerState::Paused { step, .. } => *step,
             WorkerState::Completed { turns, .. } => *turns,
             WorkerState::Failed { step, .. } => *step,
+            WorkerState::Exhausted { turns, .. } => *turns,
         }
     }
 
@@ -407,6 +437,29 @@ impl WorkerState {
                 "metrics": metrics,
                 "revision": revision,
             }),
+            WorkerState::Exhausted {
+                turns,
+                summary,
+                stopped_at,
+                artifacts,
+                branch,
+                metrics,
+                revision,
+                report,
+                diff,
+            } => serde_json::json!({
+                "status": "Exhausted",
+                "turns": turns,
+                "summary": summary,
+                "stopped_at": stopped_at,
+                "artifacts": artifacts,
+                "branch": branch,
+                "metrics": metrics,
+                "revision": revision,
+                "report": report,
+                "reason": TURN_BUDGET_EXHAUSTED,
+                "per_file": file_stats_of_diff(diff),
+            }),
         }
     }
 }
@@ -440,9 +493,9 @@ impl WorkerRecord {
         // A revision that dies keeps its number: the failure payload says
         // which attempt died, not just that something did.
         let revision = match &self.state {
-            WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
-                *revision
-            }
+            WorkerState::Completed { revision, .. }
+            | WorkerState::Failed { revision, .. }
+            | WorkerState::Exhausted { revision, .. } => *revision,
             WorkerState::Running { .. } | WorkerState::Paused { .. } => self.revision,
         };
         self.state = WorkerState::Failed {
@@ -459,6 +512,7 @@ impl WorkerRecord {
         match &self.state {
             WorkerState::Completed { completed_at, .. } => Some(*completed_at),
             WorkerState::Failed { failed_at, .. } => Some(*failed_at),
+            WorkerState::Exhausted { stopped_at, .. } => Some(*stopped_at),
             WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
         }
     }
@@ -480,6 +534,7 @@ pub enum WorkerPhase {
     Paused,
     Completed,
     Failed,
+    Exhausted,
 }
 
 /// Lightweight, allocation-cheap snapshot of a worker's progress.
@@ -702,6 +757,21 @@ mod tests {
             .step(),
             3
         );
+        assert_eq!(
+            WorkerState::Exhausted {
+                turns: 7,
+                diff: String::new(),
+                summary: String::new(),
+                stopped_at: 0,
+                artifacts: Vec::new(),
+                branch: None,
+                metrics: WorkerMetrics::default(),
+                revision: 0,
+                report: None,
+            }
+            .step(),
+            7
+        );
     }
 
     #[test]
@@ -789,9 +859,12 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
         };
+        let exhausted = exhausted_at(1_700_000_002);
         assert!(!matches!(running, WorkerState::Completed { .. }));
         assert!(matches!(completed, WorkerState::Completed { .. }));
         assert!(matches!(failed, WorkerState::Failed { .. }));
+        assert!(matches!(exhausted, WorkerState::Exhausted { .. }));
+        assert_eq!(record_with(exhausted).terminal_at(), Some(1_700_000_002));
     }
 
     fn record_with(state: WorkerState) -> WorkerRecord {
@@ -835,6 +908,20 @@ mod tests {
         }
     }
 
+    fn exhausted_at(when: u64) -> WorkerState {
+        WorkerState::Exhausted {
+            turns: 1,
+            diff: String::new(),
+            summary: String::new(),
+            stopped_at: when,
+            artifacts: Vec::new(),
+            branch: None,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+            report: None,
+        }
+    }
+
     // ----------
     // Terminal-record TTL (audit 07, R3)
     // ----------
@@ -845,6 +932,10 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert("old-done".to_string(), record_with(completed_at(now - 400)));
         workers.insert("old-failed".to_string(), record_with(failed_at(now - 400)));
+        workers.insert(
+            "old-exhausted".to_string(),
+            record_with(exhausted_at(now - 400)),
+        );
         workers.insert("fresh-done".to_string(), record_with(completed_at(now)));
         workers.insert(
             "running".to_string(),
@@ -866,7 +957,11 @@ mod tests {
         let expired = expired_terminal_ids(&workers, DEFAULT_TERMINAL_TTL_SECS);
         assert_eq!(
             expired,
-            vec!["old-done".to_string(), "old-failed".to_string()],
+            vec![
+                "old-done".to_string(),
+                "old-exhausted".to_string(),
+                "old-failed".to_string()
+            ],
             "only aged terminal records may be evicted"
         );
     }

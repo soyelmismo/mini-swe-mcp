@@ -89,7 +89,7 @@ pub use self::runner::{
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
-    DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner,
+    DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED, WorkerMetrics, WorkerOwner,
     WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport, WorkerState, churn_line,
     diff_sections_of, file_stats_of_diff, normalize_diff_path, retention_expired, same_diff_path,
     terminal_retention_secs, within_retired_grace, worker_retired_grace_secs,
@@ -167,10 +167,38 @@ pub fn next_step_for(branch: Option<&str>) -> String {
     }
 }
 
+/// Guidance for a worker that spent its whole turn budget without completing.
+///
+/// Distinct from [`next_step_for`]: the branch is checkpointed exactly like a
+/// completion, but the worker is stopped, not done, so the only next action is
+/// to continue it with a fresh budget rather than to review and merge it.
+pub fn exhausted_next_step(id: &str, turns: usize, branch: Option<&str>) -> String {
+    let on = branch
+        .map(|branch| format!(" on branch {branch}"))
+        .unwrap_or_default();
+    format!(
+        "Stopped, not done: it spent its {}-turn budget without completing{on}. \
+         Its work is checkpointed. Continue it with a fresh budget: {}",
+        turns.max(1),
+        exhausted_continue_command(id, turns),
+    )
+}
+
+/// The command that continues a worker whose turn budget ran out: the same
+/// branch, the same conversation, a fresh budget.
+pub fn exhausted_continue_command(id: &str, turns: usize) -> String {
+    format!(
+        "mini-swe-mcp steer {id} \"continue\" --max-turns {}",
+        turns.max(1)
+    )
+}
+
 /// The branch a terminal [`WorkerState`] finished on, if it kept one.
 pub fn terminal_branch(state: &WorkerState) -> Option<String> {
     match state {
-        WorkerState::Completed { branch, .. } => branch.clone(),
+        WorkerState::Completed { branch, .. } | WorkerState::Exhausted { branch, .. } => {
+            branch.clone()
+        }
         WorkerState::Running { .. } | WorkerState::Paused { .. } | WorkerState::Failed { .. } => {
             None
         }
@@ -950,6 +978,15 @@ impl WorkerPool {
                 command_started_at: None,
                 jobs: Vec::new(),
             },
+            WorkerState::Exhausted { turns, .. } => WorkerProgress {
+                phase: WorkerPhase::Exhausted,
+                step: *turns,
+                last_command: None,
+                question: None,
+                waiting_for_slot: None,
+                command_started_at: None,
+                jobs: Vec::new(),
+            },
         };
         drop(lock);
         Some(progress)
@@ -1425,6 +1462,9 @@ impl WorkerPool {
                     format!("{id} completed {}", verified_label(*verified))
                 }
                 WorkerState::Failed { error, .. } => format!("{id} failed: {}", stop_reason(error)),
+                WorkerState::Exhausted { turns, .. } => format!(
+                    "{id} exhausted: turn budget of {turns} spent without completing; {TURN_BUDGET_EXHAUSTED}"
+                ),
             };
         }
         let Some(entry) = load_registry_entry_in(&self.scratch, id) else {
@@ -1698,7 +1738,9 @@ impl WorkerPool {
                     return Ok(SteerOutcome::Queued);
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
-                WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
+                WorkerState::Completed { .. }
+                | WorkerState::Failed { .. }
+                | WorkerState::Exhausted { .. } => {
                     // A finished worker cannot be resumed mid-turn -- it has no
                     // turn left -- so the message continues it below, outside
                     // the guard.
@@ -2070,6 +2112,17 @@ impl WorkerPool {
                 artifacts: Vec::new(),
                 branch: Some(format!("worker-{id}")),
                 verified: entry.verified,
+                metrics: entry.metrics,
+                revision: entry.revision,
+                report: entry.report.clone(),
+            },
+            RegistryStatus::Exhausted => WorkerState::Exhausted {
+                turns: entry.step,
+                diff: String::new(),
+                summary: entry.last_command.clone(),
+                stopped_at: entry.updated_at,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
                 metrics: entry.metrics,
                 revision: entry.revision,
                 report: entry.report.clone(),

@@ -36,7 +36,7 @@ use self::turn::{
 };
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::revision::{WorkerHistory, append_history_message_in};
-use super::state::WorkerState;
+use super::state::{TURN_BUDGET_EXHAUSTED, WorkerState};
 use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
@@ -394,6 +394,9 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
+        // Whether the implementer's loop ended on the completion sentinel
+        // rather than by running out of turns.
+        let mut completed = false;
         // The completion report and the one follow-up it may cost live across
         // turns: a verify failure replays the completion turn, and the report
         // the worker already wrote must survive that replay.
@@ -443,6 +446,7 @@ impl WorkerPool {
                     // disclosure note here, and a crash must not lose it.
                     engine.flush_history_log(&turn_config).await;
                     verified = v;
+                    completed = true;
                     break;
                 }
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
@@ -457,7 +461,7 @@ impl WorkerPool {
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
         if let Some(reviewer_model) = review_after {
-            step = self
+            let outcome = self
                 .run_review_phase(
                     worktree,
                     ReviewPhase {
@@ -474,6 +478,10 @@ impl WorkerPool {
                     },
                 )
                 .await?;
+            step = outcome.step;
+            // The reviewer's own completion stands in for the implementer's:
+            // a run is finished only when some phase emitted the sentinel.
+            completed |= outcome.completed;
         }
 
         // The artifact sync, the final diff and the final commit all shell
@@ -539,6 +547,62 @@ impl WorkerPool {
             meta.metrics.diff_deletions = deletions;
         }
 
+        // The payload (diff/summary/artifacts/branch) is assembled *before* the
+        // write-guard is taken: the critical section only performs the O(1)
+        // move of the pre-built value into the record. The revision that
+        // produced it rides along: a fresh dispatch is at zero, a revised
+        // worker at its attempt number.
+        let revision = self
+            .workers
+            .read()
+            .await
+            .get(worker_id)
+            .map(|w| w.revision)
+            .unwrap_or(0);
+
+        if !completed {
+            // The turn budget ran out before any phase emitted the completion
+            // sentinel. The work is checkpointed on the branch exactly like a
+            // completion, but the run is stopped, not done, and never verified.
+            let summary = if summary.trim().is_empty() {
+                format!("Stopped after {step} turns: {TURN_BUDGET_EXHAUSTED} before completion")
+            } else {
+                format!(
+                    "{summary}\n\nStopped after {step} turns: {TURN_BUDGET_EXHAUSTED} before completion"
+                )
+            };
+            let exhausted_state = WorkerState::Exhausted {
+                turns: step,
+                diff,
+                summary,
+                stopped_at: now,
+                artifacts,
+                branch,
+                metrics: meta.metrics,
+                revision,
+                report: report.clone(),
+            };
+            self.update_worker(worker_id, |w| w.state = exhausted_state)
+                .await;
+            meta.report = report;
+            self.save_status(
+                meta,
+                &model,
+                RegistryStatus::Exhausted,
+                step,
+                current_max_turns,
+                TURN_BUDGET_EXHAUSTED,
+                None,
+            );
+            self.unregister_worktree(worker_id).await;
+            info!(
+                worker = %worker_id,
+                turns = step,
+                "Worker exhausted its turn budget without completing"
+            );
+            return Ok(());
+        }
+
         // A worker that exhausted its verification budget completes anyway but
         // is flagged: both the completion summary and the registry last_command
         // must say so, so the harness never mistakes it for a clean pass.
@@ -551,18 +615,6 @@ impl WorkerPool {
             (summary, "completed".to_string())
         };
 
-        // The completion payload (diff/summary/artifacts/branch) is assembled
-        // *before* the write-guard is taken: the critical section only performs
-        // the O(1) move of the pre-built value into the record.
-        // The completion carries the revision that produced it: a fresh
-        // dispatch completes at zero, a revised worker at its attempt number.
-        let revision = self
-            .workers
-            .read()
-            .await
-            .get(worker_id)
-            .map(|w| w.revision)
-            .unwrap_or(0);
         let completed_state = WorkerState::Completed {
             turns: step,
             diff,

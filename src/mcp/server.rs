@@ -956,7 +956,9 @@ impl McpServer {
                         .await;
                     }
                 }
-                crate::pool::WorkerPhase::Completed | crate::pool::WorkerPhase::Failed => {
+                crate::pool::WorkerPhase::Completed
+                | crate::pool::WorkerPhase::Failed
+                | crate::pool::WorkerPhase::Exhausted => {
                     Self::emit_progress(
                         tx,
                         token,

@@ -64,6 +64,9 @@ pub enum EventKind {
     Completed,
     /// A worker died and wants an inspection.
     Failed,
+    /// A worker spent its turn budget without completing. Its branch is
+    /// checkpointed, but it is stopped, not done.
+    Exhausted,
 }
 
 impl EventKind {
@@ -74,6 +77,7 @@ impl EventKind {
             Self::NeedsInput => "needs_input",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Exhausted => "exhausted",
         }
     }
 }
@@ -128,6 +132,9 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Times the worker was revised after finishing.
     pub revision: usize,
+    /// Turns the worker has performed, so an exhausted worker's continuation
+    /// can name the budget it spent.
+    pub turns: usize,
 }
 
 /// One tick's view of every known worker, keyed by worker id.
@@ -307,6 +314,24 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
                 body,
                 format!(
                     "Inspect it with the worker tool: action \"status\" (then \"logs\"), worker_id \"{}\".",
+                    view.worker_id
+                ),
+            )
+        }
+        EventKind::Exhausted => {
+            let mut body = String::new();
+            if let Some(diff) = &view.outcome.diff_stat {
+                body.push_str(&format!("Diff: {diff}\n"));
+            }
+            body.push_str(&crate::pool::exhausted_next_step(
+                &view.worker_id,
+                view.turns,
+                view.branch.as_deref(),
+            ));
+            (
+                body.trim_end().to_string(),
+                format!(
+                    "Continue it with the worker tool: action \"steer\", worker_id \"{}\", message \"continue\".",
                     view.worker_id
                 ),
             )
@@ -619,11 +644,13 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             continue;
         };
         view.status = phase_status(progress.phase).to_string();
+        view.turns = progress.step;
         view.event = match progress.phase {
             WorkerPhase::Running => None,
             WorkerPhase::Paused => Some(EventKind::NeedsInput),
             WorkerPhase::Completed => Some(EventKind::Completed),
             WorkerPhase::Failed => Some(EventKind::Failed),
+            WorkerPhase::Exhausted => Some(EventKind::Exhausted),
         };
         if let Some(question) = progress.question {
             view.question = Some(question);
@@ -640,9 +667,9 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             // the completion guidance points at the branch a revision resumes.
             view.branch = crate::pool::terminal_branch(&state);
             view.revision = match &state {
-                WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
-                    *revision
-                }
+                WorkerState::Completed { revision, .. }
+                | WorkerState::Failed { revision, .. }
+                | WorkerState::Exhausted { revision, .. } => *revision,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => 0,
             };
         }
@@ -735,6 +762,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             RegistryStatus::Paused => Some(EventKind::NeedsInput),
             RegistryStatus::Completed => Some(EventKind::Completed),
             RegistryStatus::Failed => Some(EventKind::Failed),
+            RegistryStatus::Exhausted => Some(EventKind::Exhausted),
             // Interrupted is terminal for listing but continuable, so it is
             // not a terminal event: the worker is expected back.
             RegistryStatus::Interrupted => None,
@@ -772,6 +800,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
         // real branch when this process owns the worker.
         branch: None,
         revision: 0,
+        turns: entry.step,
     }
 }
 
@@ -810,6 +839,20 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             error: (!error.trim().is_empty()).then(|| quote(error)),
             diff_stat: diff_stat(metrics),
             ..Outcome::default()
+        },
+        WorkerState::Exhausted {
+            summary,
+            metrics,
+            diff,
+            report,
+            ..
+        } => Outcome {
+            summary: first_line(summary),
+            verified: None,
+            diff_stat: diff_stat(metrics),
+            error: None,
+            report: report.clone(),
+            per_file: file_stats_of_diff(diff),
         },
         WorkerState::Running { .. } | WorkerState::Paused { .. } => Outcome::default(),
     }
@@ -854,6 +897,7 @@ fn registry_status(status: RegistryStatus) -> &'static str {
         RegistryStatus::Reviewing => "reviewing",
         RegistryStatus::Completed => "completed",
         RegistryStatus::Failed => "failed",
+        RegistryStatus::Exhausted => "exhausted",
         RegistryStatus::Stopped => "stopped",
         RegistryStatus::Interrupted => "interrupted",
     }
@@ -866,6 +910,7 @@ fn phase_status(phase: WorkerPhase) -> &'static str {
         WorkerPhase::Paused => "paused",
         WorkerPhase::Completed => "completed",
         WorkerPhase::Failed => "failed",
+        WorkerPhase::Exhausted => "exhausted",
     }
 }
 
