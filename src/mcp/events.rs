@@ -1599,6 +1599,7 @@ mod registry_verified_tests {
             metrics: WorkerMetrics::default(),
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             report: None,
