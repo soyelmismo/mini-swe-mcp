@@ -750,8 +750,10 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
                 let (files, insertions, deletions) = crate::cli::watch::branch_diff_stat(entry)?;
                 stat_text(files, insertions, deletions)
             }),
-            // The row carries the report so a worker whose in-memory record
-            // was already evicted still says what it did.
+            // The row carries the report and its verification verdict so a
+            // worker whose in-memory record was already evicted still says
+            // what it did and whether it verified.
+            verified: entry.verified,
             report: entry.report.clone(),
             summary: entry
                 .report

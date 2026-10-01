@@ -1678,6 +1678,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

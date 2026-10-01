@@ -52,6 +52,7 @@ impl Harness {
             revision: 0,
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
+            verified: None,
         }
     }
 }
@@ -81,6 +82,7 @@ fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEn
         revision: 0,
         auto_continues: 0,
         approved: None,
+        verified: None,
     }
 }
 

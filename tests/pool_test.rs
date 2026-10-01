@@ -1119,6 +1119,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         revision: 0,
         auto_continues: 0,
         approved: None,
+        verified: None,
     }
 }
 
@@ -1159,6 +1160,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_deletions: 340,
         },
         approved: None,
+        verified: None,
     }
 }
 
@@ -1678,6 +1680,7 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         metrics: WorkerMetrics::default(),
         revision: 0,
         auto_continues: 0,
+        verified: None,
     };
     let row_path = std::path::PathBuf::from(&dir)
         .join("swe-registry")

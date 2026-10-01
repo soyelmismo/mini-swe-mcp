@@ -142,6 +142,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

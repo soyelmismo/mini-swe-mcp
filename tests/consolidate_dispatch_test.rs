@@ -109,6 +109,7 @@ impl Harness {
             revision: 0,
             auto_continues: 0,
             approved: None,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }

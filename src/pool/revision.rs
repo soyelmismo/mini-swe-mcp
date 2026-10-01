@@ -1032,6 +1032,7 @@ impl super::WorkerPool {
             // A revision changes the branch, so the previous review no longer
             // applies: drop any approval this row carried.
             approved: None,
+            verified: None,
         };
 
         let pool = self.clone();
@@ -1051,6 +1052,7 @@ impl super::WorkerPool {
             auto_continues: history.auto_continues,
             owner,
             report: None,
+            verified: None,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {

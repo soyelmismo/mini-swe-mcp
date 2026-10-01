@@ -1114,6 +1114,7 @@ mod tests {
                 auto_continues: 0,
                 report: None,
                 approved: None,
+                verified: None,
             }
         }
     }
@@ -1142,6 +1143,7 @@ mod tests {
             revision: 0,
             auto_continues: 0,
             approved: None,
+            verified: None,
         }
     }
 
