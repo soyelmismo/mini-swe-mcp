@@ -115,6 +115,12 @@ Every tool command is confined by the kernel by default:
 - **bubblewrap is opt-in** with `SWE_SANDBOX=bwrap`; it is no longer the default. On a kernel with neither Landlock nor seccomp the sandbox falls back to bwrap when installed and otherwise runs unconfined.
 - `SWE_DISABLE_SANDBOX=1` disables all confinement.
 
+## Differential verification
+
+A verify gate that only runs in the sandbox proves the suite is hermetic *against the sandbox*, not against the shell the code is later verified in. So when the gate passes in the canonical environment the same command runs once more in a **divergent** one: the dispatcher's ambient variables (filtered by the sandbox's secret filter, so no key or token ever crosses the wire), a fresh `HOME` and `TMPDIR`, and a `TZ` shifted far from the host's. Same sandbox, same worktree, same command.
+
+If the second run fails the completion is refused and the model is told which variables differ, that `HOME`/`TMPDIR`/`TZ` differ, and what failed. Around both runs the harness audits what the suite left behind — refs and worktrees in the shared repository, processes the reap sweep had to kill, new files in the main checkout — and refuses with the exact list, cleaning up what it can. `WORKER_DIVERGENT_VERIFY=0` turns the second run off. Nothing here assumes a language: the gate is whatever verify command the dispatch or the auto-detection chose.
+
 ## Resource management
 
 - **Admission.** Heavy commands are classified and dosed: at most `BASH_BUILD_LIMIT` (default the core count) heavy builds at once, gated by free memory (`HUB_MEM_RESERVE_MB`, `HUB_BUILD_MEM_MB`). Light commands use `BASH_CONCURRENT_LIMIT` slots (default one per worker).
@@ -173,6 +179,7 @@ Defaults are what the code uses when the variable is unset.
 | `SWE_DISABLE_LANDLOCK` | `0` | `1` disables Landlock. |
 | `MINI_SWE_LANDLOCK_ENFORCE` | `0` | `1` makes a missing Landlock fatal. |
 | `SWE_DISABLE_SANDBOX` | `0` | `1` disables all confinement. |
+| `WORKER_DIVERGENT_VERIFY` | `1` | `0` skips the divergent second verify run. |
 | `SWE_CACHE_DIR` | `<SWE_TEMP_DIR>/swe-cache` | Shared compiler/package cache root. |
 | `SWE_SHARED_CACHES` | — | Extra cache binds for the sandbox. |
 | `SWE_DISABLE_KACHE` / `KACHE_DISABLED` | unset | `1` disables the kache layer. |

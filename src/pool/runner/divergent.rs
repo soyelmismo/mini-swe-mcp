@@ -603,5 +603,4 @@ mod tests {
             assert!(enabled(), "an unset variable leaves variant B on");
         });
     }
-
 }

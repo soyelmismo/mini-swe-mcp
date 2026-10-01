@@ -1272,6 +1272,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
     fn combine_streams_joins_both_streams_and_truncates() {
         // Both streams non-empty: stdout, the separator, then stderr.
         assert_eq!(
