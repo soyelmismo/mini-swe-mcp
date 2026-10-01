@@ -753,13 +753,13 @@ impl WorktreeGuard {
     /// the user edited the file) keeps its newer content instead of being
     /// reverted to the stale copy the worker never looked at.
     ///
-    /// Returns the sorted, duplicate-free list of repository-relative files in
-    /// sync after the call, including the seeded-unchanged ones, so callers
-    /// keep counting every artifact the worktree holds. The copy is otherwise
-    /// conservative: unchanged files are left untouched, dependency caches and
-    /// build output ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is
-    /// published atomically so a concurrent reader never observes a partially
-    /// written artifact.
+    /// Returns the sorted, duplicate-free list of repository-relative files
+    /// the worker created or changed, so a status view never has to carry the
+    /// seeded files the repo already held. The copy itself is conservative:
+    /// unchanged files are left untouched, dependency caches and build output
+    /// ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is published
+    /// atomically so a concurrent reader never observes a partially written
+    /// artifact.
     ///
     /// Per-directory I/O errors are logged rather than propagated: both call
     /// sites discard the `Result` (`pool::runner` wants the artifact count,
@@ -1239,7 +1239,12 @@ fn copy_dir_all(
             if !inherited && !is_up_to_date(&src_path, &dst_path) {
                 copy_file_atomic(&src_path, &dst_path)?;
             }
-            if let (Some(rel), Some(fingerprint)) = (rel, fingerprint) {
+            // Only the worker's own output is collected. A seeded file whose
+            // content still matches is not the worker's artifact, so reporting
+            // it would inflate every completion view with pre-existing files.
+            if !inherited
+                && let (Some(rel), Some(fingerprint)) = (rel, fingerprint)
+            {
                 collected.insert(rel, fingerprint);
             }
         }

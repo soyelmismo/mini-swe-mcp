@@ -415,13 +415,14 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
         .set_times(std::fs::FileTimes::new().set_modified(sentinel))
         .expect("failed to stamp destination mtime");
 
-    // The unchanged file is still reported as in sync...
+    // ...but a file that still matches its seed is not the worker's output, so
+    // the second sync must not report it again.
     let second = guard.sync_artifacts();
     assert!(
-        second.contains(&"audits/stable_audit.md".to_string()),
-        "an unchanged but present artifact must still be reported, got: {second:?}"
+        !second.contains(&"audits/stable_audit.md".to_string()),
+        "an unchanged seeded artifact must not be reported as the worker's, got: {second:?}"
     );
-    // ...but it was not rewritten.
+    // It was not rewritten either.
     let mtime = std::fs::metadata(&destination)
         .expect("failed to stat destination")
         .modified()
@@ -471,11 +472,11 @@ fn test_sync_never_reverts_a_newer_repo_file_the_worker_never_touched() {
         "newer content from another worker\n",
         "the sync reverted a repo file that moved on after seeding"
     );
-    // Skipping the copy is not the same as hiding the artifact: callers still
-    // get it in the reported list.
+    // A file the worker never touched is not its artifact: the sync neither
+    // copies it nor reports it, so the completion view stays the worker's own.
     assert!(
-        synced.contains(&"audits/memory.md".to_string()),
-        "an inherited artifact must still be reported, got: {synced:?}"
+        !synced.contains(&"audits/memory.md".to_string()),
+        "an inherited artifact must not be reported, got: {synced:?}"
     );
 
     drop(guard);
