@@ -529,30 +529,14 @@ async fn report_survives_eviction_in_status_review_and_collect() {
         risks: "none".into(),
     };
     let entry = WorkerRegistryEntry {
-        approved: None,
-        id: "evicted-report".into(),
-        pid: std::process::id(),
         task: "probe".into(),
-        model: "test".into(),
         status: RegistryStatus::Completed,
         step: 1,
         max_turns: 1,
         last_command: report.done.clone(),
-        question: None,
-        started_at: 0,
         updated_at: mini_swe_mcp::pool::unix_timestamp(),
-        group: None,
-        role: Default::default(),
-        repo_path: None,
-        owner: Some(TEST_OWNER.into()),
-        metrics: WorkerMetrics::default(),
-        base_branch: None,
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
         report: Some(report.clone()),
-        verified: None,
+        ..WorkerRegistryEntry::test_row("evicted-report".into(), TEST_OWNER.into())
     };
     save_registry_entry_in(&owned.root(), &entry);
     owned

@@ -129,34 +129,20 @@ fn registry_row(
     repo: Option<&Path>,
 ) -> mini_swe_mcp::pool::WorkerRegistryEntry {
     mini_swe_mcp::pool::WorkerRegistryEntry {
-        id: id.to_string(),
-        pid: std::process::id(),
         task: "Fix the parser\nand its docs".to_string(),
         model: "test-model".to_string(),
         status,
         step: 3,
         max_turns: 60,
         last_command: "cargo test".to_string(),
-        question: None,
-        started_at: 0,
         // Fresh, so the terminal-TTL filter in `list` still shows the row.
         updated_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default(),
-        group: None,
-        role: WorkerRole::Worker,
         repo_path: repo.map(|repo| repo.to_string_lossy().into_owned()),
-        owner: Some(owner.to_string()),
-        metrics: WorkerMetrics::default(),
         base_branch: Some("master".to_string()),
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
     }
 }
 

@@ -86,30 +86,13 @@ impl Fixture {
     /// Write the registry row the merge's "still running" check reads.
     fn record_status(&self, id: &str, status: RegistryStatus) {
         let entry = WorkerRegistryEntry {
-            id: id.to_string(),
-            pid: std::process::id(),
             task: format!("do the {id} work"),
-            role: Default::default(),
-            model: "test".to_string(),
             status,
             step: 1,
-            max_turns: 10,
-            last_command: String::new(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
-            group: None,
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
             owner: None,
-            metrics: Default::default(),
             base_branch: Some("main".to_string()),
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            report: None,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id.to_string(), "")
         };
         save_registry_entry_in(&self.root(), &entry);
     }

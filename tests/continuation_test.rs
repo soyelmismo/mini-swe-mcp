@@ -120,30 +120,17 @@ fn repo_with_branch(tag: &str, id: &str) -> std::path::PathBuf {
 /// A registry row for `id` in `status`, as a stopped run leaves behind.
 fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::WorkerRegistryEntry {
     mini_swe_mcp::pool::WorkerRegistryEntry {
-        id: id.to_string(),
-        pid: std::process::id(),
         task: "fix the parser".to_string(),
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         model: "test-model".to_string(),
         status,
         step: 4,
-        max_turns: 10,
         last_command: "cargo test".into(),
-        question: None,
         repo_path: Some(repo.to_string_lossy().to_string()),
-        started_at: 0,
-        updated_at: 0,
         owner: None,
-        metrics: Default::default(),
         base_branch: Some("master".into()),
         base_commit: Some("base".into()),
-        head_commit: None,
         revision: 1,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id.to_string(), "")
     }
 }
 

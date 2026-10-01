@@ -1099,7 +1099,6 @@ mod tests {
 
         fn build(self) -> WorkerRegistryEntry {
             WorkerRegistryEntry {
-                id: self.id.into(),
                 pid: 1234,
                 task: self.task,
                 model: "ninja".into(),
@@ -1107,52 +1106,28 @@ mod tests {
                 step: self.step,
                 max_turns: self.max_turns,
                 last_command: self.command,
-                question: None,
                 started_at: 1000,
                 updated_at: self.updated_at,
                 group: self.group.map(str::to_string),
-                role: crate::pool::WorkerRole::Worker,
                 repo_path: self.repo.map(str::to_string),
                 owner: None,
                 metrics: self.metrics,
-                base_branch: None,
-                base_commit: None,
-                head_commit: None,
-                revision: 0,
-                auto_continues: 0,
-                report: None,
-                approved: None,
-                verified: None,
+                ..WorkerRegistryEntry::test_row(self.id.into(), "")
             }
         }
     }
 
     fn line_entry(id: &str, status: RegistryStatus, updated_at: u64) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            id: id.into(),
             pid: 1234,
-            task: "task".into(),
             model: "ninja".into(),
             status,
             step: 1,
             max_turns: 100,
-            last_command: String::new(),
-            question: None,
             started_at: 1000,
             updated_at,
-            report: None,
-            group: None,
-            role: crate::pool::WorkerRole::Worker,
-            repo_path: None,
             owner: None,
-            metrics: WorkerMetrics::default(),
-            base_branch: None,
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id.into(), "")
         }
     }
 

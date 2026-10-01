@@ -91,19 +91,11 @@ fn row(
     // Built through the same constructor a real write uses, so the fixture
     // picks up fields the current build adds to a row without a literal here.
     let meta = WorkerMeta {
-        id: id.to_string(),
         task: format!("task for {id}"),
         group: Some(GROUP.to_string()),
-        role: WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().into_owned()),
-        owner: OWNER.to_string(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        report: None,
         verified,
+        ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
     };
     let mut entry = meta.entry("test-model", status, 4, 10, "cargo test", None);
     entry.base_branch = Some("master".to_string());

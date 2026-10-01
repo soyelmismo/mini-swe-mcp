@@ -47,30 +47,13 @@ fn running_worker(id: &str, owner: &str) -> WorkerRecord {
 /// A running registry row owned by `owner`, dispatched at `started_at`.
 fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        id: id.to_string(),
-        pid: std::process::id(),
-        task: "task".to_string(),
         model: "ninja".to_string(),
-        status: RegistryStatus::Running,
         step: 1,
         max_turns: 20,
         last_command: "cargo test".to_string(),
-        question: None,
         started_at,
         updated_at: started_at,
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
-        repo_path: None,
-        owner: Some(owner.to_string()),
-        metrics: WorkerMetrics::default(),
-        base_branch: None,
-        base_commit: None,
-        head_commit: None,
-        revision: 0,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-        verified: None,
+        ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
     }
 }
 

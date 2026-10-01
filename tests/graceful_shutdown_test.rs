@@ -69,19 +69,9 @@ fn running_worker(id: &str) -> WorkerRecord {
 
 fn meta(id: &str, repo: &Path) -> WorkerMeta {
     WorkerMeta {
-        id: id.to_string(),
         task: "keep the work going".to_string(),
-        group: None,
-        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: Some(repo.to_string_lossy().into_owned()),
-        owner: OWNER.to_string(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        report: None,
-        verified: None,
+        ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
     }
 }
 

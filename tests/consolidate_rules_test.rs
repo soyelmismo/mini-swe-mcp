@@ -8,19 +8,10 @@ use mini_swe_mcp::pool::{
 
 fn actor() -> WorkerMeta {
     WorkerMeta {
-        id: "consolidator".into(),
         task: "integrate".into(),
         group: Some("round".into()),
         role: WorkerRole::Consolidate,
-        repo_path: None,
-        owner: "owner".into(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        report: None,
-        verified: None,
+        ..WorkerMeta::test_meta("consolidator".into(), "owner".into())
     }
 }
 

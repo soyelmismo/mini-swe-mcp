@@ -2374,49 +2374,23 @@ mod consolidate_delegation_tests {
     /// A consolidator's registry row, as its dispatch wrote it.
     fn consolidator(id: &str, owner: &str, group: &str) -> WorkerMeta {
         WorkerMeta {
-            id: id.to_string(),
             task: "integrate the round".to_string(),
             group: Some(group.to_string()),
             role: WorkerRole::Consolidate,
-            repo_path: None,
-            owner: owner.to_string(),
-            started_at: 0,
-            pid: std::process::id(),
-            revision: 0,
-            auto_continues: 0,
-            metrics: WorkerMetrics::default(),
-            report: None,
-            verified: None,
+            ..WorkerMeta::test_meta(id.to_string(), owner.to_string())
         }
     }
 
     /// A target worker's registry row, as its own dispatch wrote it.
     fn target(id: &str, owner: &str, group: &str, role: WorkerRole) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            id: id.to_string(),
-            pid: std::process::id(),
             task: "do the work".to_string(),
-            model: "test".to_string(),
             status: RegistryStatus::Completed,
             step: 3,
-            max_turns: 10,
             last_command: "completed".to_string(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
             group: Some(group.to_string()),
             role,
-            repo_path: None,
-            owner: Some(owner.to_string()),
-            metrics: WorkerMetrics::default(),
-            base_branch: None,
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            report: None,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
         }
     }
 

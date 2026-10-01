@@ -87,30 +87,15 @@ impl Harness {
         group: Option<&str>,
     ) {
         let entry = WorkerRegistryEntry {
-            report: None,
-            id: worker_id.to_string(),
-            pid: std::process::id(),
             task: task.to_string(),
-            model: "test".to_string(),
             status,
             step: 3,
-            max_turns: 10,
             last_command: "completed".to_string(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
             group: group.map(str::to_string),
             role,
             repo_path: Some(self.path().to_string_lossy().to_string()),
-            owner: Some(OWNER.to_string()),
-            metrics: WorkerMetrics::default(),
             base_branch: Some("master".to_string()),
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(worker_id.to_string(), OWNER.to_string())
         };
         save_registry_entry_in(&self.root(), &entry);
     }

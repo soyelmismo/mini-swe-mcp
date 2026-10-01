@@ -169,6 +169,45 @@ pub struct WorkerRegistryEntry {
     pub verified: Option<bool>,
 }
 
+impl WorkerRegistryEntry {
+    /// A fully defaulted registry row for tests.
+    ///
+    /// `id` and `owner` are the two fields nearly every fixture varies; a
+    /// caller adjusts the rest with struct update syntax or a setter. The
+    /// helper is hidden but public so the integration tests under `tests/` can
+    /// build rows too: a new field on the struct then touches this builder
+    /// alone instead of every fixture literal.
+    #[doc(hidden)]
+    pub fn test_row(id: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            pid: std::process::id(),
+            task: "task".into(),
+            model: "test".into(),
+            status: RegistryStatus::Running,
+            step: 0,
+            max_turns: 10,
+            last_command: String::new(),
+            question: None,
+            started_at: 0,
+            updated_at: 0,
+            group: None,
+            role: WorkerRole::Worker,
+            repo_path: None,
+            owner: Some(owner.into()),
+            metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            head_commit: None,
+            revision: 0,
+            auto_continues: 0,
+            report: None,
+            approved: None,
+            verified: None,
+        }
+    }
+}
+
 /// The immutable per-worker fields shared by every registry write for a worker.
 ///
 /// Only the status/step/max_turns/last_command/question/updated_at/model vary
@@ -207,6 +246,27 @@ pub struct WorkerMeta {
 }
 
 impl WorkerMeta {
+    /// A fully defaulted meta for tests, the [`WorkerRegistryEntry::test_row`]
+    /// counterpart for [`WorkerMeta`].
+    #[doc(hidden)]
+    pub fn test_meta(id: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            task: "task".into(),
+            group: None,
+            role: WorkerRole::Worker,
+            repo_path: None,
+            owner: owner.into(),
+            started_at: 0,
+            pid: std::process::id(),
+            revision: 0,
+            auto_continues: 0,
+            metrics: WorkerMetrics::default(),
+            report: None,
+            verified: None,
+        }
+    }
+
     /// The row this worker's next status update describes.
     ///
     /// Built as a value so the pool's [`RegistryWriter`] can decide whether it
@@ -702,30 +762,11 @@ mod recovery_cleanup_tests {
     /// hub crash.
     fn orphan_row(id: &str) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            id: id.to_string(),
             pid: dead_pid(),
             task: "orphan".to_string(),
-            model: "test".to_string(),
-            status: RegistryStatus::Running,
             step: 1,
-            max_turns: 10,
             last_command: "orphaned".to_string(),
-            question: None,
-            started_at: 0,
-            updated_at: 0,
-            group: None,
-            role: WorkerRole::Worker,
-            repo_path: None,
-            owner: Some("agent-a".to_string()),
-            metrics: WorkerMetrics::default(),
-            base_branch: None,
-            base_commit: None,
-            head_commit: None,
-            revision: 0,
-            auto_continues: 0,
-            report: None,
-            approved: None,
-            verified: None,
+            ..WorkerRegistryEntry::test_row(id.to_string(), "agent-a".to_string())
         }
     }
 

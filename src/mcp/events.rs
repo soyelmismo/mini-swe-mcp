@@ -1583,19 +1583,10 @@ mod registry_verified_tests {
         // Built through the same constructor a real write uses, so the fixture
         // picks up fields the current build adds to a row without a literal.
         let meta = WorkerMeta {
-            id: "w-registry".to_string(),
             task: "persist the verdict".to_string(),
-            group: None,
-            role: WorkerRole::Worker,
-            repo_path: None,
-            owner: "owner".to_string(),
-            started_at: 0,
             pid: 0,
-            revision: 0,
-            auto_continues: 0,
-            metrics: WorkerMetrics::default(),
-            report: None,
             verified,
+            ..WorkerMeta::test_meta("w-registry".to_string(), "owner".to_string())
         };
         meta.entry(
             "test-model",
