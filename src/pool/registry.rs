@@ -167,6 +167,17 @@ pub struct WorkerRegistryEntry {
     /// written before the flag was recorded readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// Workers whose branches a consolidator merged into its own branch, in
+    /// merge order. Recorded on the consolidator's row because that row is the
+    /// only durable record of the round it integrated: when the consolidator
+    /// itself is merged, every worker it absorbed is fully integrated too and
+    /// is retired with it.
+    ///
+    /// `#[serde(default)]` keeps a row written before consolidators recorded
+    /// their round readable; such a consolidator falls back to the sweep, which
+    /// proves each worker's branch is merged by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrated: Vec<String>,
 }
 
 impl WorkerRegistryEntry {
@@ -204,6 +215,7 @@ impl WorkerRegistryEntry {
             report: None,
             approved: None,
             verified: None,
+            integrated: Vec::new(),
         }
     }
 }
@@ -306,6 +318,7 @@ impl WorkerMeta {
             report: self.report.clone(),
             approved: None,
             verified: self.verified,
+            integrated: Vec::new(),
         }
     }
 
@@ -373,6 +386,29 @@ impl RegistryWriter {
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
     pub fn save(&mut self, entry: WorkerRegistryEntry) {
+        // A consolidator records the round it integrated on its own row, and
+        // that list is written by a *different* code path than the status
+        // updates. Every status write rebuilds the row from `WorkerMeta`, which
+        // knows nothing about the round, so merging the two halves here is what
+        // makes the list survive the consolidator's own completion: without it,
+        // the very next step would erase the round and the workers it names
+        // could never be retired. The writer is the single choke point every
+        // registry write passes through, so this is the one place that has to
+        // know.
+        let mut entry = entry;
+        if entry.integrated.is_empty() {
+            // The writer's own cache first (no I/O on the common path), then the
+            // row on disk, so a round recorded by an earlier process or before
+            // this writer started also survives.
+            let known = self
+                .rows
+                .get(&entry.id)
+                .cloned()
+                .or_else(|| super::load_registry_entry_in(&self.root, &entry.id));
+            if let Some(known) = known.filter(|known| !known.integrated.is_empty()) {
+                entry.integrated = known.integrated;
+            }
+        }
         let now = Instant::now();
         let transition = self
             .rows
@@ -480,11 +516,20 @@ pub fn remove_registry_entry(worker_id: &str) {
 }
 
 /// [`remove_registry_entry`] under an explicit scratch root.
-pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) {
+///
+/// Returns whether a row was actually there to remove, so a caller reporting
+/// what it reclaimed never claims a deletion that did not happen.
+pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) -> bool {
+    let mut removed = false;
     for dir in root.base_dirs() {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
-        let _ = std::fs::remove_file(path);
+        // A base dir this process never wrote to fails with `NotFound`, which
+        // is not a removal; any other failure is likewise not a removal.
+        if std::fs::remove_file(path).is_ok() {
+            removed = true;
+        }
     }
+    removed
 }
 
 fn worktree_exists_in(root: &ScratchRoot, worker_id: &str) -> bool {

@@ -46,6 +46,28 @@ impl McpServer {
         })
         .await
         .map_err(|e| anyhow::anyhow!("merge task for worker {wid} failed: {e}"))??;
+        // The backstop sweep, so a worker integrated by any other path (an older
+        // merge, another session, a consolidator) is retired too. `--no-delete`
+        // is an explicit decision to keep this worker, so the sweep leaves it
+        // alone: undoing it here would silently discard the operator's branch
+        // (and its row) seconds after they asked for it.
+        let exempt: &[String] = if keep_branch {
+            std::slice::from_ref(&report.worker_id)
+        } else {
+            &[]
+        };
+        // A retired worker's events can never fire again, so its acknowledged
+        // positions go with it, in memory and on disk, under the router's lock.
+        if !keep_branch {
+            self.forget_retired_worker(&report.worker_id).await;
+        }
+        let retired: Vec<String> = if keep_branch {
+            Vec::new()
+        } else {
+            vec![report.worker_id.clone()]
+        };
+        self.pool.forget_retired_workers(&retired).await;
+        self.pool.sweep_retired_workers(exempt).await;
         Ok(json!({
             "worker_id": report.worker_id,
             "branch": report.branch,
@@ -96,6 +118,13 @@ impl McpServer {
         })
         .await
         .map_err(|e| anyhow::anyhow!("batch merge task failed: {e}"))??;
+        // The batch never honours `--no-delete`, so nothing is exempt here.
+        let retired: Vec<String> = report.merged.iter().map(|m| m.worker_id.clone()).collect();
+        for worker in &report.merged {
+            self.forget_retired_worker(&worker.worker_id).await;
+        }
+        self.pool.forget_retired_workers(&retired).await;
+        self.pool.sweep_retired_workers(&[]).await;
         Ok(json!({
             "approved": true,
             "group": group_echo,

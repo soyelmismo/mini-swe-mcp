@@ -31,7 +31,10 @@ use anyhow::{Context, Result};
 
 use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
-use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
+use super::revision::{
+    RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
+    retire_worker_with,
+};
 use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
 
@@ -217,8 +220,14 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
     })?;
     let commit = head_commit(repo);
 
-    let (branch_deleted, cleaned) =
-        cleanup(root, worker_id, repo, &resolved.branch, req.keep_branch);
+    let (branch_deleted, cleaned) = cleanup(
+        root,
+        worker_id,
+        repo,
+        &resolved.branch,
+        &resolved.base_branch,
+        req.keep_branch,
+    );
 
     Ok(MergeReport {
         worker_id: worker_id.to_string(),
@@ -682,41 +691,123 @@ fn merge_subject(task: &str, worker_id: &str) -> String {
     format!("Merge worker-{worker_id}: {clamped}")
 }
 
-/// Post-merge cleanup: the worktree leftovers, the branch and the history file.
+/// Post-merge retirement: the merged worker leaves nothing behind at all.
 ///
-/// Reuses the same helpers the prune sweep uses, so a merged worker leaves
-/// exactly what a pruned one does. The registry row survives: `status` and
-/// `collect` still answer about the run, and `reap` expires it on its own TTL.
+/// A merged worker is fully integrated -- its commits are in the base branch --
+/// so nothing of it is needed any more. The merge therefore calls the one
+/// shared [`retire_worker_with`] rather than picking which leftovers to drop:
+/// branch, registry row, history, steering mailbox and steer-source, watch
+/// acknowledgements, and the worktree, scratch and build directories it held go
+/// together, so `list` shows only live and awaiting-integration workers without
+/// any hiding logic.
+///
+/// `--no-delete` is the one exception: the operator asked to keep the branch, so
+/// the branch stays and only the scratch traces are reclaimed. A sweep does not
+/// see a branch that outlived its merge and therefore leaves that worker alone
+/// until the branch itself goes.
+///
+/// Returns whether the branch was deleted and what was reclaimed, in the words
+/// the CLI prints.
 fn cleanup(
     root: &ScratchRoot,
     worker_id: &str,
     repo: &Path,
     branch: &str,
+    base_branch: &str,
     keep_branch: bool,
 ) -> (bool, Vec<String>) {
-    // The worktree goes first: a leftover that is still registered would make
-    // the branch undeletable, and `git worktree prune` clears the registration
-    // once its directory is gone.
     let worktree = root.join(format!("swe-wt-{worker_id}"));
     let reclaimed = worktree.exists();
-    if reclaimed {
-        force_remove_dir(&worktree);
-        remove_target_dirs_in(root, &worktree);
-        let _ = git(repo, "worktree prune", &["worktree", "prune"]);
+    // A consolidator carries the round it integrated on its own row, and that
+    // round is now fully in the base branch too. Read the list before the row
+    // goes, so each worker it absorbed is retired with it.
+    let integrated = load_registry_entry_in(root, worker_id)
+        .map(|row| row.integrated)
+        .unwrap_or_default();
+    let ctx = RetireContext {
+        repo: Some(repo),
+        ack_dir: None,
+        keep_branch,
+    };
+    // The retirement performs the branch deletion, so its report is the truth:
+    // a separate `git branch -D` probe here could disagree with what actually
+    // happened (a ref another worktree still held, an already-absent branch) and
+    // would then skip the round below for a merge that did land.
+    let outcome = retire_worker_reporting(root, worker_id, &ctx);
+
+    // Only a consolidator whose own ref is gone has its round retired: with
+    // `--no-delete` the operator kept it, so the round stays a known round.
+    let mut retired_round = 0;
+    if outcome.branch_deleted && !keep_branch && !integrated.is_empty() {
+        for id in &integrated {
+            // A worker may have been revised after its earlier tip was
+            // integrated: its branch then holds work the base does not have, and
+            // deleting it would destroy that work. Retire only what is provably
+            // integrated now, and leave a re-revised worker alone.
+            // `base_branch`, not `branch`: the worker's commits must be in the
+            // branch the merge landed on, which is the whole round's base.
+            if !branch_is_integrated_in(root, repo, id, base_branch) {
+                continue;
+            }
+            retire_worker_with(root, id, &ctx);
+            retired_round += 1;
+        }
     }
-    let branch_deleted = !keep_branch
-        && git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
-    remove_worker_history_in(root, worker_id);
 
     let mut cleaned = Vec::new();
-    if branch_deleted {
+    if outcome.branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
+    } else if keep_branch {
+        cleaned.push(format!("branch {branch} kept (--no-delete)"));
     }
-    cleaned.push("history file removed".to_string());
-    if reclaimed {
+    if retired_round > 0 {
+        cleaned.push(format!(
+            "{retired_round} integrated worker(s) retired with the round"
+        ));
+    }
+    cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());
+    if outcome.worktree_reclaimed || reclaimed {
         cleaned.push("worktree leftovers removed".to_string());
     }
-    (branch_deleted, cleaned)
+    (outcome.branch_deleted, cleaned)
+}
+
+/// Whether `worker-<id>`'s current branch is proven contained in `base`.
+///
+/// The round a consolidator integrated records which branches it merged *at
+/// that moment*. A worker revised afterwards commits new work on its own
+/// branch, so its recorded membership is not enough: only a fresh ancestry
+/// proof shows that whatever is on the branch right now is already in the base.
+/// Any doubt -- no row, no repository, no branch, an unprobeable repo -- answers
+/// false, so a re-revised worker survives instead of losing work.
+fn branch_is_integrated_in(root: &ScratchRoot, repo: &Path, worker_id: &str, base: &str) -> bool {
+    let Some(row) = load_registry_entry_in(root, worker_id) else {
+        return false;
+    };
+    // The worker's branch must live in the repository the round landed in, or
+    // the probe below would be reading a different repository's refs. Compared
+    // canonically, because a row records the path as it was resolved and the
+    // merge resolves it again: `/tmp` is a symlink to `/private/tmp` on some
+    // hosts, and a textual comparison would read that as two repositories.
+    let same_repo = row
+        .repo_path
+        .as_deref()
+        .map(Path::new)
+        .is_some_and(|path| path.canonicalize().ok() == repo.canonicalize().ok());
+    if !same_repo {
+        return false;
+    }
+    crate::worktree::git(
+        repo,
+        "merge-base --is-ancestor",
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &format!("worker-{worker_id}"),
+            base,
+        ],
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 // ----------
@@ -961,7 +1052,7 @@ pub fn merge_approved_in(
             )
         })?;
         let commit = head_commit(repo);
-        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, false);
+        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, &base_branch, false);
         cleaned.extend(worker_cleaned);
         merged.push(MergedWorker {
             worker_id: id.clone(),

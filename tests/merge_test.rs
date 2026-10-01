@@ -440,8 +440,8 @@ fn running_worker_refuses() {
     assert!(git_ref_exists(f.repo(), "worker-w7"));
 }
 
-/// After a merge the branch, the history file and the worktree leftovers are
-/// gone; `--no-delete` keeps the branch.
+/// After a merge the whole worker is retired -- branch, registry row, history
+/// and worktree leftovers; `--no-delete` keeps the branch and the row with it.
 #[test]
 fn merge_cleans_up_and_no_delete_keeps_the_branch() {
     let f = Fixture::new("merge-cleanup");
@@ -478,16 +478,19 @@ fn merge_cleans_up_and_no_delete_keeps_the_branch() {
         !f.scratch.path().join("swe-target-swe-wt-w8").exists(),
         "the leftover target dir must be reclaimed"
     );
-    // The registry row survives so `status` and `collect` still answer.
+    // Nothing of a merged worker is needed any more: its commits are in the
+    // base branch, so the row goes too and `list` shows only live and
+    // awaiting-integration workers.
     assert!(
-        mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "w8").is_some(),
-        "the registry row outlives the merge"
+        mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "w8").is_none(),
+        "a merged worker is retired outright, registry row included"
     );
 
     // `--no-delete` keeps the branch and everything else still merges.
     let g = Fixture::new("merge-no-delete");
     g.commit_on_worker_branch("w9", "worker.txt", "from the worker\n");
     g.record_worker("w9", None);
+    g.record_status("w9", RegistryStatus::Completed);
     g.merge("w9", Some(true), true)
         .expect("a --no-delete merge must succeed");
     assert!(
@@ -495,6 +498,10 @@ fn merge_cleans_up_and_no_delete_keeps_the_branch() {
         "--no-delete must keep the branch"
     );
     assert!(!g.history_exists("w9"), "the history file is still removed");
+    assert!(
+        mini_swe_mcp::pool::load_registry_entry_in(&g.root(), "w9").is_some(),
+        "a kept branch keeps its worker known, so its row must survive"
+    );
 }
 
 /// A merge never pushes: the only refs it writes are the local merge commit and
