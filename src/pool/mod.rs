@@ -1701,6 +1701,38 @@ impl WorkerPool {
         steer::read_source(&self.scratch, id).is_some()
     }
 
+    /// Whether `id`'s lifecycle events belong to a consolidator that steered it
+    /// and has not stopped.
+    ///
+    /// A worker a consolidator steered ([`steer::SteerSource`]) reports its
+    /// completion, failure or exhaustion to that consolidator, which is blocked
+    /// in `CONSOLIDATE_WAIT` on exactly that stop. Until the consolidator
+    /// finishes, fails or dies the owner's watch stays quiet, the same way
+    /// [`question_for_consolidator`](Self::question_for_consolidator) already
+    /// silences its questions; once the source names no live consolidator,
+    /// normal delivery resumes and the stopped worker is visible again.
+    pub async fn steered_by_live_consolidator(&self, id: &str) -> bool {
+        let Some(source) = steer::read_source(&self.scratch, id) else {
+            return false;
+        };
+        self.consolidator_live(&source.consolidator).await
+    }
+
+    /// Whether `id` names a consolidator that has not finished, failed or
+    /// died. An absent consolidator is not live, so the workers it steered
+    /// fall back to their owner's watch.
+    async fn consolidator_live(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            return !matches!(
+                state,
+                WorkerState::Completed { .. }
+                    | WorkerState::Failed { .. }
+                    | WorkerState::Exhausted { .. }
+            );
+        }
+        load_registry_entry_in(&self.scratch, id).is_some_and(|entry| entry.status.is_live())
+    }
+
     async fn deliver_steer(
         &self,
         id: &str,
