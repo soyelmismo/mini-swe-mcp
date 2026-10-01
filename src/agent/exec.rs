@@ -619,8 +619,54 @@ fn apply_sanitized_environment(cmd: &mut Command, dir: &Path) {
     super::env::apply_clean_environment_cmd(cmd, &repo_path, dir);
 }
 
-/// Universal build/test parallelism caps so a command cannot oversubscribe the
-/// machine no matter which build tool it drives.
+/// `WORKER_BUILD_DEBUG=1` keeps Cargo's default (full) debug info in worker
+/// builds.
+const WORKER_BUILD_DEBUG_VAR: &str = "WORKER_BUILD_DEBUG";
+
+/// Cargo settings that keep a worker's private target directory small.
+///
+/// Debug info is the bulk of what a Rust build writes, and a worker's target
+/// directory is rebuilt from scratch far more often than it is reused, so the
+/// DWARF can dwarf the object code that is actually verifiable. Incremental
+/// state is the same trade: a large, worker-private artefact set whose reuse
+/// does not survive the next worker. Neither is needed to *read* a failure -
+/// an assertion message is printed verbatim, and a panic still prints a
+/// backtrace, because the symbol names come from the symbol table that
+/// `debug = 0` leaves in place.
+///
+/// The defaults apply only when the operator has not spoken: a value already
+/// exported is forwarded verbatim (`lookup` reports it), and
+/// `WORKER_BUILD_DEBUG=1` disables the defaults outright. `lookup` is the
+/// process environment in production and a synthetic map in tests, so the
+/// policy is testable without mutating process-global state.
+fn cargo_artifact_diet(
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(String, String)> {
+    let keep_debug = lookup(WORKER_BUILD_DEBUG_VAR).as_deref() == Some(std::ffi::OsStr::new("1"));
+    [
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
+        "CARGO_INCREMENTAL",
+    ]
+    .into_iter()
+    .filter_map(|name| match lookup(name) {
+        Some(value) => Some((name.to_string(), value.to_string_lossy().into_owned())),
+        // The operator asked for full debug info: let Cargo apply its default.
+        None if keep_debug => None,
+        None => Some((name.to_string(), "0".to_string())),
+    })
+    .collect()
+}
+
+/// The operator's environment, as [`cargo_artifact_diet`] reads it.
+fn operator_build_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+/// Universal build/test environment: parallelism caps so a command cannot
+/// oversubscribe the machine no matter which build tool it drives, a private
+/// scratch directory, and the Cargo artifact diet ([`cargo_artifact_diet`])
+/// that keeps a Rust worker's target directory small.
 fn apply_build_env(
     cmd: &mut Command,
     target_dir: Option<&Path>,
@@ -629,6 +675,10 @@ fn apply_build_env(
 ) {
     if let Some(target) = target_dir {
         cmd.env("CARGO_TARGET_DIR", target);
+    }
+    // Trim what a per-worker target directory writes; see [`cargo_artifact_diet`].
+    for (name, value) in cargo_artifact_diet(&operator_build_env) {
+        cmd.env(name, value);
     }
     // Private scratch is never shared with another slot user.
     cmd.env("TMPDIR", tmp_dir)
@@ -1234,6 +1284,78 @@ mod tests {
         // Cargo's own caps are unchanged.
         assert_eq!(value("CARGO_BUILD_JOBS"), "3");
         assert_eq!(value("MAKEFLAGS"), "-j3");
+    }
+
+    /// Worker builds discard Cargo's debug info and incremental state by
+    /// default: both are large writes into a target directory that is leased
+    /// per worker and rebuilt often.
+    #[test]
+    fn build_env_discards_cargo_debug_info_and_incremental_state() {
+        if std::env::var_os(WORKER_BUILD_DEBUG_VAR).is_some()
+            || std::env::var_os("CARGO_PROFILE_DEV_DEBUG").is_some()
+            || std::env::var_os("CARGO_PROFILE_TEST_DEBUG").is_some()
+            || std::env::var_os("CARGO_INCREMENTAL").is_some()
+        {
+            return; // Operator overrides make the defaults unobservable.
+        }
+        let mut cmd = Command::new("true");
+        apply_build_env(&mut cmd, None, Path::new("/tmp/private"), "1");
+        let value = |name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| panic!("{name} must be set"))
+        };
+        assert_eq!(value("CARGO_PROFILE_DEV_DEBUG"), "0");
+        assert_eq!(value("CARGO_PROFILE_TEST_DEBUG"), "0");
+        assert_eq!(value("CARGO_INCREMENTAL"), "0");
+    }
+
+    /// An operator-exported value is forwarded verbatim; only the names the
+    /// operator left alone take the diet's default.
+    #[test]
+    fn cargo_artifact_diet_keeps_operator_values() {
+        let lookup = |name: &str| match name {
+            "CARGO_PROFILE_DEV_DEBUG" => Some(std::ffi::OsString::from("2")),
+            _ => None,
+        };
+        let diet: std::collections::HashMap<String, String> =
+            cargo_artifact_diet(&lookup).into_iter().collect();
+        assert_eq!(
+            diet.get("CARGO_PROFILE_DEV_DEBUG").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            diet.get("CARGO_PROFILE_TEST_DEBUG").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(diet.get("CARGO_INCREMENTAL").map(String::as_str), Some("0"));
+    }
+
+    /// `WORKER_BUILD_DEBUG=1` restores Cargo's own defaults for the names the
+    /// operator did not set, so debug info and backtraces stay complete.
+    #[test]
+    fn worker_build_debug_suppresses_the_diet_defaults() {
+        let keep_debug = |name: &str| {
+            (name == WORKER_BUILD_DEBUG_VAR).then(|| std::ffi::OsString::from("1"))
+        };
+        assert!(cargo_artifact_diet(&keep_debug).is_empty());
+
+        // Only `1` is the opt-out; any other value keeps the diet.
+        let zero = |name: &str| (name == WORKER_BUILD_DEBUG_VAR).then(|| "0".into());
+        assert_eq!(cargo_artifact_diet(&zero).len(), 3);
+
+        // An explicitly exported Cargo value still rides along.
+        let explicit = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("1")),
+            "CARGO_INCREMENTAL" => Some(std::ffi::OsString::from("0")),
+            _ => None,
+        };
+        assert_eq!(
+            cargo_artifact_diet(&explicit),
+            vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())]
+        );
     }
 
     #[test]

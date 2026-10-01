@@ -175,6 +175,8 @@ Defaults are what the code uses when the variable is unset.
 | `HUB_MEM_PRESSURE_MAX` | `10` | Memory `full avg10` ceiling (PSI, percent). |
 | `HUB_IO_PRESSURE_MAX` | `40` | IO `full avg10` ceiling (PSI, percent). |
 | `BUILD_PARALLELISM` | granted jobs, else half the cores | Parallelism exported to a build. |
+| `WORKER_BUILD_DEBUG` | `0` | `1` keeps Cargo's debug info and incremental state in worker builds. |
+| `CARGO_PROFILE_DEV_DEBUG`, `CARGO_PROFILE_TEST_DEBUG`, `CARGO_INCREMENTAL` | `0` | Forced on worker builds to cut target-dir I/O; an operator-exported value is respected. |
 | `HUB_LLM_CONCURRENCY` | `0` (unlimited) | In-flight LLM requests hub-wide. |
 | `LLM_MAX_RETRIES` | `6` | Attempts per completion. |
 | `LLM_OUTAGE_PATIENCE_SECS` | `600` | How long a turn waits out an outage. |
