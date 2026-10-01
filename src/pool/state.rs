@@ -350,7 +350,7 @@ impl WorkerState {
     pub fn step(&self) -> usize {
         match self {
             WorkerState::Running { step, .. } | WorkerState::Paused { step, .. } => *step,
-            WorkerState::Completed { turns, ..  } => *turns,
+            WorkerState::Completed { turns, .. } => *turns,
             WorkerState::Failed { step, .. } => *step,
         }
     }
@@ -388,7 +388,7 @@ impl WorkerState {
                 revision,
                 report,
                 ..
-    } => serde_json::json!({
+            } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
                 "summary": summary,
@@ -447,7 +447,7 @@ impl WorkerRecord {
         // A revision that dies keeps its number: the failure payload says
         // which attempt died, not just that something did.
         let revision = match &self.state {
-            WorkerState::Completed { revision, ..  } | WorkerState::Failed { revision, .. } => {
+            WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
                 *revision
             }
             WorkerState::Running { .. } | WorkerState::Paused { .. } => self.revision,
@@ -464,7 +464,7 @@ impl WorkerRecord {
     /// Unix timestamp when this record became terminal, if it is terminal.
     pub fn terminal_at(&self) -> Option<u64> {
         match &self.state {
-            WorkerState::Completed { completed_at, ..  } => Some(*completed_at),
+            WorkerState::Completed { completed_at, .. } => Some(*completed_at),
             WorkerState::Failed { failed_at, .. } => Some(*failed_at),
             WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
         }
@@ -578,7 +578,8 @@ mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
     use super::{
-        DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerRecord, WorkerState, expired_terminal_ids,
+        DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics, WorkerRecord, WorkerState, churn_line,
+        expired_terminal_ids, file_stats_of_diff,
     };
     use std::collections::HashMap;
 
@@ -636,6 +637,64 @@ mod tests {
     }
 
     #[test]
+    fn churn_line_names_the_top_files_then_counts_the_rest() {
+        let mut stats = Vec::new();
+        for index in 0..11 {
+            stats.push(FileStat {
+                path: format!("src/f{index}.rs"),
+                insertions: index,
+                deletions: 0,
+            });
+        }
+        let line = churn_line(&stats);
+        assert_eq!(
+            line,
+            "src/f10.rs (+10 -0), src/f9.rs (+9 -0), src/f8.rs (+8 -0), \
+             src/f7.rs (+7 -0), src/f6.rs (+6 -0), src/f5.rs (+5 -0), \
+             src/f4.rs (+4 -0), src/f3.rs (+3 -0), +3 more"
+        );
+        assert!(churn_line(&[]).is_empty(), "no diff, no line");
+    }
+
+    #[test]
+    fn a_unified_diff_is_read_into_per_file_stats() {
+        let diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "index 111..222 100644\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " context\n",
+            "-removed\n",
+            "++added line that starts with a plus\n",
+            "--removed line that starts with two dashes\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "new file mode 100644\n",
+            "index 000..333\n",
+            "--- /dev/null\n",
+            "+++ b/two.rs\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+first\n",
+            "+second\n",
+        );
+        assert_eq!(
+            file_stats_of_diff(diff),
+            vec![
+                FileStat {
+                    path: "one.rs".to_string(),
+                    insertions: 1,
+                    deletions: 2,
+                },
+                FileStat {
+                    path: "two.rs".to_string(),
+                    insertions: 2,
+                    deletions: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn test_terminal_at_only_reports_terminal_states() {
         let running = WorkerState::Running {
             step: 0,
@@ -662,8 +721,8 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
         };
-        assert!(!matches!(running, WorkerState::Completed { ..  }));
-        assert!(matches!(completed, WorkerState::Completed { ..  }));
+        assert!(!matches!(running, WorkerState::Completed { .. }));
+        assert!(matches!(completed, WorkerState::Completed { .. }));
         assert!(matches!(failed, WorkerState::Failed { .. }));
     }
 

@@ -749,8 +749,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             summary: entry
                 .report
                 .as_ref()
-                .map(|report| first_line(&report.done))
-                .flatten()
+                .and_then(|report| first_line(&report.done))
                 .or_else(|| first_line(&entry.last_command)),
             ..Outcome::default()
         },

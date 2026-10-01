@@ -727,7 +727,7 @@ async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
 
     let mut done = running_worker("w4");
     done.state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 1,
         diff: String::new(),
         summary: String::new(),
@@ -772,7 +772,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut w = running_worker("p2");
     w.state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 7,
         diff: "d".repeat(2 * 1024 * 1024),
         summary: "s".repeat(1024),
@@ -793,7 +793,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
 
     // The full payload is still available, untouched, on the terminal path.
     match pool.get_worker_state("p2").await.unwrap() {
-        WorkerState::Completed { diff, ..  } => assert_eq!(diff.len(), 2 * 1024 * 1024),
+        WorkerState::Completed { diff, .. } => assert_eq!(diff.len(), 2 * 1024 * 1024),
         other => panic!("expected Completed, got {other:?}"),
     }
 }
@@ -1097,7 +1097,7 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
 /// A registry row for a worker owned by a live process elsewhere.
 fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-    report: None,
+        report: None,
         id: id.to_string(),
         pid,
         task: "t".into(),
@@ -1119,12 +1119,12 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         revision: 0,
         auto_continues: 0,
     }
-    }
+}
 
 /// A registry row with every counter moved, as a finished run would write it.
 fn measured_entry() -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-    report: None,
+        report: None,
         id: "m1".into(),
         pid: 42,
         task: "t".into(),
@@ -1158,7 +1158,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_deletions: 340,
         },
     }
-    }
+}
 
 #[test]
 fn test_worker_metrics_survive_a_registry_row_round_trip() {
@@ -1207,7 +1207,7 @@ fn test_a_partially_recorded_metrics_object_fills_the_rest_with_zero() {
 #[test]
 fn test_a_completed_state_serializes_its_health_counters() {
     let state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 3,
         diff: String::new(),
         summary: "s".into(),
@@ -1480,7 +1480,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("revwork");
     done.state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 2,
         diff: "fix".to_string(),
         summary: "fixed the parser".to_string(),
@@ -1569,7 +1569,7 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("keep1");
     done.state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 1,
         diff: String::new(),
         summary: "done".to_string(),
@@ -1603,7 +1603,7 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let mut done = running_worker("gonework");
     done.state = WorkerState::Completed {
-    report: None,
+        report: None,
         turns: 1,
         diff: String::new(),
         summary: "done".to_string(),
@@ -1664,7 +1664,7 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
     let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let meta = mini_swe_mcp::pool::WorkerMeta {
-    report: None,
+        report: None,
         id: "h5a-reg".into(),
         task: "t".into(),
         group: None,
@@ -2081,7 +2081,7 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
     // A finished worker of the same agent no longer occupies the cap.
     pool.__test_insert_worker(WorkerRecord {
         state: WorkerState::Completed {
-        report: None,
+            report: None,
             turns: 1,
             diff: String::new(),
             summary: String::new(),
@@ -2091,7 +2091,7 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
             verified: None,
             revision: 0,
             metrics: WorkerMetrics::default(),
-    },
+        },
         ..owned_worker("h3-a3", "agent-a")
     })
     .await;

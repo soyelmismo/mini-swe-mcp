@@ -159,7 +159,7 @@ pub fn next_step_for(branch: Option<&str>) -> String {
 /// The branch a terminal [`WorkerState`] finished on, if it kept one.
 pub fn terminal_branch(state: &WorkerState) -> Option<String> {
     match state {
-        WorkerState::Completed { branch, ..  } => branch.clone(),
+        WorkerState::Completed { branch, .. } => branch.clone(),
         WorkerState::Running { .. } | WorkerState::Paused { .. } | WorkerState::Failed { .. } => {
             None
         }
@@ -709,7 +709,7 @@ impl WorkerPool {
         if let Some(state) = self.get_worker_state(id).await {
             if matches!(
                 state,
-                WorkerState::Completed { ..  } | WorkerState::Failed { .. }
+                WorkerState::Completed { .. } | WorkerState::Failed { .. }
             ) {
                 return true;
             }
@@ -820,7 +820,7 @@ impl WorkerPool {
                 waiting_for_slot,
                 command_started_at: None,
             },
-            WorkerState::Completed { turns, ..  } => WorkerProgress {
+            WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
                 step: *turns,
                 last_command: None,
@@ -964,7 +964,7 @@ impl WorkerPool {
     /// running or failed worker's branch is not a round contribution.
     pub async fn is_completed(&self, id: &str) -> bool {
         if let Some(state) = self.get_worker_state(id).await {
-            return matches!(state, WorkerState::Completed { ..  });
+            return matches!(state, WorkerState::Completed { .. });
         }
         load_registry_entry_in(&self.scratch, id)
             .is_some_and(|entry| entry.status == RegistryStatus::Completed)
@@ -1253,7 +1253,7 @@ impl WorkerPool {
                     return Ok(SteerOutcome::Queued);
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
-                WorkerState::Completed { ..  } | WorkerState::Failed { .. } => {
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
                     // A finished worker cannot be resumed mid-turn -- it has no
                     // turn left -- so the message continues it below, outside
                     // the guard.

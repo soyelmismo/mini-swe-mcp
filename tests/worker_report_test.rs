@@ -95,7 +95,11 @@ impl ScriptedSseServer {
 
     /// A completion turn whose prose carries no REPORT block.
     fn bare_completion(call_id: &str) -> ScriptedTurn {
-        Self::turn(call_id, "Now I'll make the edits.", &format!("echo {COMPLETION_SENTINEL}"))
+        Self::turn(
+            call_id,
+            "Now I'll make the edits.",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        )
     }
 
     /// A completion turn whose prose carries a REPORT block.
@@ -201,13 +205,13 @@ async fn dispatch_and_wait(
         .await
         .expect("dispatch");
     for _ in 0..600 {
-        if let Some(state) = pool.get_worker_state(&worker_id).await {
-            if matches!(
+        if let Some(state) = pool.get_worker_state(&worker_id).await
+            && matches!(
                 state,
                 WorkerState::Completed { .. } | WorkerState::Failed { .. }
-            ) {
-                return (pool, worker_id, state);
-            }
+            )
+        {
+            return (pool, worker_id, state);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -228,7 +232,10 @@ async fn a_completion_without_a_report_is_asked_once() {
 
     let (_pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
 
-    let WorkerState::Completed { report, summary, .. } = state else {
+    let WorkerState::Completed {
+        report, summary, ..
+    } = state
+    else {
         panic!("the worker must complete, got {state:?}");
     };
     let report = report.expect("the follow-up must have produced a report");
@@ -272,7 +279,10 @@ async fn a_second_reportless_completion_falls_back_to_the_summary() {
 
     let (_pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
 
-    let WorkerState::Completed { report, summary, .. } = state else {
+    let WorkerState::Completed {
+        report, summary, ..
+    } = state
+    else {
         panic!("the worker must complete, got {state:?}");
     };
     assert!(report.is_none(), "no block was ever written: {report:?}");
@@ -311,7 +321,10 @@ fn the_compact_completion_event_carries_done_files_and_risks() {
     let text = watch::render(&event);
     assert!(text.contains("Fix completion reporting"), "{text}");
     assert!(text.contains("files: src/a.rs (+3 -2)"), "{text}");
-    assert!(text.contains("risks: Changes completion feedback"), "{text}");
+    assert!(
+        text.contains("risks: Changes completion feedback"),
+        "{text}"
+    );
     assert!(text.lines().count() <= 5, "{text}");
 }
 

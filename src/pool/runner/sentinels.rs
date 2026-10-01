@@ -240,7 +240,9 @@ fn strip_markup(line: &str) -> String {
     {
         line = sep.trim();
     }
-    line.trim_start_matches(['#', '>', '*', '_']).trim().to_string()
+    line.trim_start_matches(['#', '>', '*', '_'])
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]

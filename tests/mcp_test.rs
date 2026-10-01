@@ -21,7 +21,9 @@ use mini_swe_mcp::mcp::{
     ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
     WORKER_ACTIONS, WorkerSnapshot, WorkerView, channel_frame, diff_events,
 };
-use mini_swe_mcp::pool::{FileStat, LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerReport, WorkerState};
+use mini_swe_mcp::pool::{
+    FileStat, LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerReport, WorkerState,
+};
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerRegistryEntry, remove_registry_entry_in, save_registry_entry_in,
 };
@@ -1467,8 +1469,16 @@ fn worker_transitions_become_one_event_each() {
             risks: "none".to_string(),
         }),
         per_file: vec![
-            FileStat { path: "src/retry.rs".to_string(), insertions: 28, deletions: 3 },
-            FileStat { path: "src/pool/mod.rs".to_string(), insertions: 2, deletions: 1 },
+            FileStat {
+                path: "src/retry.rs".to_string(),
+                insertions: 28,
+                deletions: 3,
+            },
+            FileStat {
+                path: "src/pool/mod.rs".to_string(),
+                insertions: 2,
+                deletions: 1,
+            },
         ],
     };
     let mut failed = worker_view("w-dead", Some(EventKind::Failed));

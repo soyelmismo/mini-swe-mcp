@@ -142,7 +142,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         auto_continues: 0,
         report: None,
     }
-    }
+}
 
 #[test]
 fn the_append_only_log_survives_a_torn_last_line() {
@@ -472,7 +472,7 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(id).await {
             match state {
-                WorkerState::Completed { ..  } | WorkerState::Failed { .. } => return state,
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
@@ -484,7 +484,7 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
 /// The revision a payload carries, from whichever terminal state it is in.
 fn payload_revision(state: &WorkerState) -> Option<usize> {
     match state {
-        WorkerState::Completed { revision, ..  } | WorkerState::Failed { revision, .. } => {
+        WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
             Some(*revision)
         }
         WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
