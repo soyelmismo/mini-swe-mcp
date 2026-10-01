@@ -26,10 +26,20 @@ impl McpServer {
         let resolved = self.resolve_worker_id(args, "discard", ctx).await?;
         let wid = resolved.as_str();
         self.require_owner(wid, ctx).await?;
-        // Read this process's own record first: it is the only state that
-        // distinguishes a live worker from a row a dead process left behind,
-        // and it is the live one that must be killed first.
-        match self.pool.get_worker_state(wid).await {
+        // The repository is the one thing a retirement cannot guess: it is what
+        // holds the `worker-<id>` branch. A row names it, and so does the
+        // history of a row that is already gone.
+        let repo = self.discard_repo(wid).await;
+        // A worker nothing knows has nothing to retire, and its id reached this
+        // call as free text: one naming no live record, no row and no history
+        // must not be spliced into a scratch path or a git argument. Refusing
+        // it here is both the honest answer and the safe one.
+        let state = self.pool.get_worker_state(wid).await;
+        // guard removed for the failing signal
+        // This process's own record is the only state that distinguishes a live
+        // worker from a row a dead process left behind, and a live one must be
+        // killed first: a discard deletes unmerged work with no gate at all.
+        match state {
             Some(WorkerState::Running { .. }) => anyhow::bail!(
                 "Worker {wid} is still running: kill it first with `kill {wid}`, then discard it"
             ),
@@ -38,10 +48,6 @@ impl McpServer {
             ),
             _ => {}
         }
-        // The repository is the one thing a retirement cannot guess: it is what
-        // holds the `worker-<id>` branch. A row names it, and so does the
-        // history of a row that is already gone.
-        let repo = self.discard_repo(wid).await;
         let root = self.pool.scratch_root().clone();
         let worker_id = wid.to_string();
         // The retirement shells out to git, so it runs off the runtime thread.

@@ -397,6 +397,31 @@ async fn discard_refuses_another_owners_worker() {
     assert!(f.scratch_file("swe-wt-theirs1.round-base").exists());
 }
 
+/// An id nothing knows is refused rather than spliced into a scratch path or a
+/// git argument: a discard deletes, so it must only ever act on a worker this
+/// pool or its registry actually knows -- a traversal payload included.
+#[tokio::test]
+async fn discard_refuses_an_id_nothing_knows() {
+    let f = Fixture::new("discard-unknown");
+    let victim = f.scratch_file("swe-wt-../../escaped");
+    // A payload that would escape the scratch base if it were ever joined.
+    let hostile = "../../escaped";
+
+    let error = discard(&f.server(), hostile, &owner_context())
+        .await
+        .expect_err("an id nothing knows must be refused");
+    assert_eq!(
+        error.to_string(),
+        format!("Worker not found: {hostile}"),
+        "the refusal must be the plain not-found answer: {error}"
+    );
+    assert!(
+        !victim.exists() && !victim.with_extension("").exists(),
+        "an unknown id must never reach a path: {}",
+        victim.display()
+    );
+}
+
 /// The renderer the CLI prints, so `discard` has a human-facing answer instead
 /// of raw JSON.
 #[test]
