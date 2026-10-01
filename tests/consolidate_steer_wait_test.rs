@@ -43,7 +43,7 @@ impl Harness {
             task: "integrate the round".to_string(),
             group: Some(GROUP.to_string()),
             role: WorkerRole::Consolidate,
-            ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
+            ..WorkerMeta::test_meta(id, OWNER)
         }
     }
 }
@@ -56,7 +56,7 @@ fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEn
         step: 3,
         last_command: "cargo test".to_string(),
         group: Some(GROUP.to_string()),
-        ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
+        ..WorkerRegistryEntry::test_row(id, owner)
     }
 }
 

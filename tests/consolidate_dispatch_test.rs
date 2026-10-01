@@ -95,7 +95,7 @@ impl Harness {
             role,
             repo_path: Some(self.path().to_string_lossy().to_string()),
             base_branch: Some("master".to_string()),
-            ..WorkerRegistryEntry::test_row(worker_id.to_string(), OWNER.to_string())
+            ..WorkerRegistryEntry::test_row(worker_id, OWNER)
         };
         save_registry_entry_in(&self.root(), &entry);
     }

@@ -1274,7 +1274,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         last_command: "cargo test".to_string(),
         repo_path: Some(repo.to_string_lossy().to_string()),
         base_branch: Some("main".to_string()),
-        ..WorkerRegistryEntry::test_row("w-gone".to_string(), "agent-a".to_string())
+        ..WorkerRegistryEntry::test_row("w-gone", "agent-a")
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);

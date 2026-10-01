@@ -718,6 +718,6 @@ impl Drop for Reaper {
 fn meta(id: &str) -> mini_swe_mcp::pool::WorkerMeta {
     mini_swe_mcp::pool::WorkerMeta {
         task: "handover probe".to_string(),
-        ..mini_swe_mcp::pool::WorkerMeta::test_meta(id.to_string(), "handover-test".to_string())
+        ..mini_swe_mcp::pool::WorkerMeta::test_meta(id, "handover-test")
     }
 }

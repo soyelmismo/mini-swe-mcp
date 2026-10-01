@@ -1103,7 +1103,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         step: 1,
         last_command: "cargo test".into(),
         owner: None,
-        ..WorkerRegistryEntry::test_row(id.to_string(), "")
+        ..WorkerRegistryEntry::test_row(id, "")
     }
 }
 
@@ -1137,7 +1137,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_insertions: 120,
             diff_deletions: 340,
         },
-        ..WorkerRegistryEntry::test_row("m1".into(), TEST_OWNER.into())
+        ..WorkerRegistryEntry::test_row("m1", TEST_OWNER)
     }
 }
 
@@ -1646,7 +1646,7 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     let meta = mini_swe_mcp::pool::WorkerMeta {
         task: "t".into(),
-        ..mini_swe_mcp::pool::WorkerMeta::test_meta("h5a-reg".into(), TEST_OWNER.into())
+        ..mini_swe_mcp::pool::WorkerMeta::test_meta("h5a-reg", TEST_OWNER)
     };
     let row_path = std::path::PathBuf::from(&dir)
         .join("swe-registry")

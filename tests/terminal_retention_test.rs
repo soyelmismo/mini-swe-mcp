@@ -142,7 +142,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         base_branch: Some("master".into()),
         base_commit: Some("base".into()),
         revision: 1,
-        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id.to_string(), "")
+        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id, "")
     }
 }
 

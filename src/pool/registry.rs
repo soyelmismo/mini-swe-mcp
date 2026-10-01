@@ -766,7 +766,7 @@ mod recovery_cleanup_tests {
             task: "orphan".to_string(),
             step: 1,
             last_command: "orphaned".to_string(),
-            ..WorkerRegistryEntry::test_row(id.to_string(), "agent-a".to_string())
+            ..WorkerRegistryEntry::test_row(id, "agent-a")
         }
     }
 

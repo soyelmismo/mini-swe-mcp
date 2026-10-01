@@ -92,7 +92,7 @@ impl Fixture {
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
             owner: None,
             base_branch: Some("main".to_string()),
-            ..WorkerRegistryEntry::test_row(id.to_string(), "")
+            ..WorkerRegistryEntry::test_row(id, "")
         };
         save_registry_entry_in(&self.root(), &entry);
     }

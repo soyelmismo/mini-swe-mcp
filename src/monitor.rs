@@ -1112,7 +1112,7 @@ mod tests {
                 repo_path: self.repo.map(str::to_string),
                 owner: None,
                 metrics: self.metrics,
-                ..WorkerRegistryEntry::test_row(self.id.into(), "")
+                ..WorkerRegistryEntry::test_row(self.id, "")
             }
         }
     }
@@ -1127,7 +1127,7 @@ mod tests {
             started_at: 1000,
             updated_at,
             owner: None,
-            ..WorkerRegistryEntry::test_row(id.into(), "")
+            ..WorkerRegistryEntry::test_row(id, "")
         }
     }
 

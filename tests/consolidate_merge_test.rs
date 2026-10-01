@@ -10,7 +10,7 @@ mod common;
 
 use common::{IsolatedPool, TempDir, git, git_ref_exists, unique_suffix};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRegistryEntry, WorkerRole,
+    RegistryStatus, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerRole,
     load_registry_entry_in, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
@@ -83,7 +83,7 @@ impl Harness {
             role,
             repo_path: Some(self.path().to_string_lossy().to_string()),
             base_branch: Some("master".to_string()),
-            ..WorkerRegistryEntry::test_row(worker_id.to_string(), owner.to_string())
+            ..WorkerRegistryEntry::test_row(worker_id, owner)
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -95,7 +95,7 @@ impl Harness {
             group: Some(GROUP.to_string()),
             role: WorkerRole::Consolidate,
             repo_path: Some(self.path().to_string_lossy().to_string()),
-            ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
+            ..WorkerMeta::test_meta(id, OWNER)
         }
     }
 

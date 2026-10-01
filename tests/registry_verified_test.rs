@@ -14,9 +14,9 @@ use std::time::Duration;
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRegistryEntry,
-    WorkerRole, WorkerState, append_history_message_in, load_registry_entry_in,
-    save_registry_entry_in, unix_timestamp,
+    RegistryStatus, WorkerHistory, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerRole,
+    WorkerState, append_history_message_in, load_registry_entry_in, save_registry_entry_in,
+    unix_timestamp,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
@@ -95,7 +95,7 @@ fn row(
         group: Some(GROUP.to_string()),
         repo_path: Some(repo.to_string_lossy().into_owned()),
         verified,
-        ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
+        ..WorkerMeta::test_meta(id, OWNER)
     };
     let mut entry = meta.entry("test-model", status, 4, 10, "cargo test", None);
     entry.base_branch = Some("master".to_string());

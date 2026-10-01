@@ -71,7 +71,7 @@ fn meta(id: &str, repo: &Path) -> WorkerMeta {
     WorkerMeta {
         task: "keep the work going".to_string(),
         repo_path: Some(repo.to_string_lossy().into_owned()),
-        ..WorkerMeta::test_meta(id.to_string(), OWNER.to_string())
+        ..WorkerMeta::test_meta(id, OWNER)
     }
 }
 

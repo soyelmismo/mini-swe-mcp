@@ -2,7 +2,7 @@
 mod common;
 
 use mini_swe_mcp::pool::{
-    WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerState, save_worker_history_in,
+    WorkerHistory, WorkerMeta, WorkerPool, WorkerState, save_worker_history_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use std::time::Duration;
@@ -57,13 +57,13 @@ async fn revision_start_does_not_integrate_the_moving_master_tip() {
         group: Some("round".into()),
         role: mini_swe_mcp::pool::WorkerRole::Consolidate,
         repo_path: Some(history.repo_path.clone()),
-        ..WorkerMeta::test_meta("actor".into(), "owner".into())
+        ..WorkerMeta::test_meta("actor", "owner")
     };
     let target = WorkerMeta {
         task: "integrate".into(),
         group: Some("round".into()),
         repo_path: Some(history.repo_path.clone()),
-        ..WorkerMeta::test_meta("pinned".into(), "owner".into())
+        ..WorkerMeta::test_meta("pinned", "owner")
     };
     mini_swe_mcp::pool::save_registry_entry_in(
         &root,

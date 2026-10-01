@@ -1663,7 +1663,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         max_turns: 20,
         last_command: String::from("cargo test"),
         group: Some(String::from("backend")),
-        ..WorkerRegistryEntry::test_row(worker_id.to_string(), String::from("registry-owner"))
+        ..WorkerRegistryEntry::test_row(worker_id, String::from("registry-owner"))
     }
 }
 

@@ -2366,10 +2366,10 @@ mod verify_detection_tests {
 
 #[cfg(test)]
 mod consolidate_delegation_tests {
+    use super::RegistryStatus;
     use super::registry::{
         WorkerMeta, WorkerRegistryEntry, WorkerRole, check_consolidate_delegation,
     };
-    use super::{RegistryStatus, WorkerMetrics};
 
     /// A consolidator's registry row, as its dispatch wrote it.
     fn consolidator(id: &str, owner: &str, group: &str) -> WorkerMeta {
@@ -2377,7 +2377,7 @@ mod consolidate_delegation_tests {
             task: "integrate the round".to_string(),
             group: Some(group.to_string()),
             role: WorkerRole::Consolidate,
-            ..WorkerMeta::test_meta(id.to_string(), owner.to_string())
+            ..WorkerMeta::test_meta(id, owner)
         }
     }
 
@@ -2390,7 +2390,7 @@ mod consolidate_delegation_tests {
             last_command: "completed".to_string(),
             group: Some(group.to_string()),
             role,
-            ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
+            ..WorkerRegistryEntry::test_row(id, owner)
         }
     }
 

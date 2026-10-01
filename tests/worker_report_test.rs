@@ -518,7 +518,7 @@ fn json_channel_and_watch_events_keep_the_full_report_and_stats() {
 async fn report_survives_eviction_in_status_review_and_collect() {
     use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
     use mini_swe_mcp::pool::{
-        LogBuffer, RegistryStatus, WorkerMetrics, WorkerRecord, WorkerRegistryEntry, WorkerReport,
+        LogBuffer, RegistryStatus, WorkerRecord, WorkerRegistryEntry, WorkerReport,
         save_registry_entry_in,
     };
     let owned = common::IsolatedPool::new(1, "report-evict");
@@ -536,7 +536,7 @@ async fn report_survives_eviction_in_status_review_and_collect() {
         last_command: report.done.clone(),
         updated_at: mini_swe_mcp::pool::unix_timestamp(),
         report: Some(report.clone()),
-        ..WorkerRegistryEntry::test_row("evicted-report".into(), TEST_OWNER.into())
+        ..WorkerRegistryEntry::test_row("evicted-report", TEST_OWNER)
     };
     save_registry_entry_in(&owned.root(), &entry);
     owned

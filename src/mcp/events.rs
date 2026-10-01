@@ -1577,7 +1577,7 @@ mod verify_tail_attachment_tests {
 #[cfg(test)]
 mod registry_verified_tests {
     use super::{EventKind, registry_view};
-    use crate::pool::{RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerRegistryEntry};
 
     fn completed_row(verified: Option<bool>) -> WorkerRegistryEntry {
         // Built through the same constructor a real write uses, so the fixture
@@ -1586,7 +1586,7 @@ mod registry_verified_tests {
             task: "persist the verdict".to_string(),
             pid: 0,
             verified,
-            ..WorkerMeta::test_meta("w-registry".to_string(), "owner".to_string())
+            ..WorkerMeta::test_meta("w-registry", "owner")
         };
         meta.entry(
             "test-model",

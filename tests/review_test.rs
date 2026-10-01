@@ -124,7 +124,7 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         repo_path: Some(repo.to_string_lossy().into_owned()),
         base_branch: Some("master".to_string()),
         revision,
-        ..WorkerRegistryEntry::test_row(id.to_string(), OWNER.to_string())
+        ..WorkerRegistryEntry::test_row(id, OWNER)
     }
 }
 

@@ -142,7 +142,7 @@ fn registry_row(
             .unwrap_or_default(),
         repo_path: repo.map(|repo| repo.to_string_lossy().into_owned()),
         base_branch: Some("master".to_string()),
-        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
+        ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(id, owner)
     }
 }
 

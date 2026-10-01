@@ -101,7 +101,7 @@ impl Fixture {
             group: group.map(str::to_string),
             repo_path: Some(self.repo().to_string_lossy().into_owned()),
             base_branch: Some("main".to_string()),
-            ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
+            ..WorkerRegistryEntry::test_row(id, owner)
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -600,7 +600,7 @@ fn workers_of_two_repositories_are_refused() {
         step: 1,
         repo_path: Some(other.path().to_string_lossy().into_owned()),
         base_branch: Some("main".to_string()),
-        ..WorkerRegistryEntry::test_row("w2".to_string(), "agent-a".to_string())
+        ..WorkerRegistryEntry::test_row("w2", "agent-a")
     };
     save_registry_entry_in(&f.root(), &entry);
 

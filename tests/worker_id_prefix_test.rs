@@ -10,8 +10,8 @@ use common::IsolatedPool;
 
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{
-    LogBuffer, RegistryStatus, WorkerIdLookup, WorkerMetrics, WorkerRecord, WorkerRegistryEntry,
-    WorkerState, save_registry_entry_in,
+    LogBuffer, WorkerIdLookup, WorkerMetrics, WorkerRecord, WorkerRegistryEntry, WorkerState,
+    save_registry_entry_in,
 };
 use serde_json::json;
 
@@ -53,7 +53,7 @@ fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
         last_command: "cargo test".to_string(),
         started_at,
         updated_at: started_at,
-        ..WorkerRegistryEntry::test_row(id.to_string(), owner.to_string())
+        ..WorkerRegistryEntry::test_row(id, owner)
     }
 }
 
