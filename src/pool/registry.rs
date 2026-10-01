@@ -245,7 +245,6 @@ impl RegistryWriter {
         }
     }
 
-
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
     pub fn save(&mut self, entry: WorkerRegistryEntry) {
@@ -501,7 +500,7 @@ fn recover_entries_in(
         // directory itself, so they need their own cleanup: without it every
         // hub restart leaks one `swe-target-<id>` tree and one stale `.pid`.
         if !checkout.is_dir() {
-            crate::worktree::remove_target_dirs(&checkout);
+            crate::worktree::remove_target_dirs_in(root, &checkout);
             let _ = std::fs::remove_file(crate::worktree::pid_file_for(&checkout));
         }
         // Interrupted, not failed: the worker stopped because the hub did, not
@@ -572,10 +571,7 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
 }
 
 /// [`load_registry_entry`] under an explicit scratch root.
-pub fn load_registry_entry_in(
-    root: &ScratchRoot,
-    worker_id: &str,
-) -> Option<WorkerRegistryEntry> {
+pub fn load_registry_entry_in(root: &ScratchRoot, worker_id: &str) -> Option<WorkerRegistryEntry> {
     for dir in root.base_dirs() {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         if let Ok(content) = std::fs::read_to_string(&path)
@@ -662,7 +658,6 @@ mod recovery_cleanup_tests {
         std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
 
         let recovered = recover_entries_in(&root, [(path.clone(), row)]);
-        let _ = std::fs::remove_dir_all(&base);
         assert_eq!(recovered, 1, "the orphan row must be recovered");
         let row: WorkerRegistryEntry =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -674,5 +669,6 @@ mod recovery_cleanup_tests {
             "the orphan's scratch dir must be removed"
         );
         assert!(!pid.exists(), "the orphan's lease must be removed");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

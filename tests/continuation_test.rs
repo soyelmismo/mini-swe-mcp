@@ -28,7 +28,10 @@ impl Scratch {
     fn new(tag: &str) -> Self {
         let dir = common::TempDir::new_in_tmp(tag);
         let path = dir.path().to_path_buf();
-        Self { _dir: dir, dir: path }
+        Self {
+            _dir: dir,
+            dir: path,
+        }
     }
 
     fn path(&self) -> &Path {
@@ -160,7 +163,8 @@ fn the_append_only_log_survives_a_torn_last_line() {
     std::fs::write(&path, torn).unwrap();
 
     // The reload keeps everything before the torn line and never fails.
-    let reloaded = load_worker_history_in(&root, "torn1").expect("a torn last line must not fail the reload");
+    let reloaded =
+        load_worker_history_in(&root, "torn1").expect("a torn last line must not fail the reload");
     assert_eq!(
         reloaded.messages.len(),
         3,
@@ -210,7 +214,8 @@ fn a_legacy_whole_file_history_is_still_read() {
     )
     .unwrap();
 
-    let loaded = load_worker_history_in(&root, "leg1").expect("the legacy whole-file form is still read");
+    let loaded =
+        load_worker_history_in(&root, "leg1").expect("the legacy whole-file form is still read");
     assert_eq!(loaded.messages.len(), 4);
     assert!(
         !history_log_path_in(&root, "leg1").exists(),

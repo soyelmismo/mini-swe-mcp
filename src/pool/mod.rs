@@ -52,9 +52,9 @@ pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
     load_all_registry_entries, load_all_registry_entries_in, load_registry_entries_read_only,
-    load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in,
-    registry_dir, registry_dir_in, registry_owner_label, remove_registry_entry,
-    remove_registry_entry_in, save_registry_entry, save_registry_entry_in,
+    load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in, registry_dir,
+    registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
+    save_registry_entry, save_registry_entry_in,
 };
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
@@ -176,12 +176,7 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
-        Self::with_scratch(
-            max_concurrent,
-            api_base,
-            api_key,
-            ScratchRoot::from_env(),
-        )
+        Self::with_scratch(max_concurrent, api_base, api_key, ScratchRoot::from_env())
     }
 
     /// [`WorkerPool::new`] under an explicit scratch root.
@@ -682,8 +677,8 @@ impl WorkerPool {
         let registry = load_all_registry_entries_in(&self.scratch)
             .into_iter()
             .filter(|e| {
-            !seen.contains(&e.id) && owner.is_none_or(|owner| e.owner.as_deref() == Some(owner))
-        });
+                !seen.contains(&e.id) && owner.is_none_or(|owner| e.owner.as_deref() == Some(owner))
+            });
         rows.extend(registry.map(|e| {
             serde_json::json!({
                 "id": e.id,

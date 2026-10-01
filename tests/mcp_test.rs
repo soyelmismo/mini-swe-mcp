@@ -1659,10 +1659,7 @@ fn a_worker_transition_reaches_the_session_over_stdio() {
     server.initialize();
     let mut paused = synthetic_registry_row(&worker_id, RegistryStatus::Paused);
     paused.question = Some(String::from("Ship the migration or roll it back?"));
-    save_registry_entry_in(
-        &mini_swe_mcp::worktree::ScratchRoot::new(&swe),
-        &paused,
-    );
+    save_registry_entry_in(&mini_swe_mcp::worktree::ScratchRoot::new(&swe), &paused);
     // The row belongs to another process, so the server only discovers it on
     // its coarse cross-process fallback tick.
     let event = server.expect_channel_event_within("the paused worker", Duration::from_secs(45));
@@ -1736,7 +1733,9 @@ fn owned_server() -> (IsolatedPool, McpServer) {
 #[tokio::test]
 async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
     let (owned, server) = owned_server();
-    owned.pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
+    owned
+        .pool
+        .__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
         .await;
     let agent_b = agent_context("agent-b");
 
@@ -1819,7 +1818,9 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
 #[tokio::test]
 async fn an_admin_connection_bypasses_the_ownership_check() {
     let (owned, server) = owned_server();
-    owned.pool.__test_insert_worker(owned_worker("h3-admin", "agent-a"))
+    owned
+        .pool
+        .__test_insert_worker(owned_worker("h3-admin", "agent-a"))
         .await;
 
     let steered = server
@@ -1937,7 +1938,9 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 #[tokio::test]
 async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     let (owned, server) = owned_server();
-    owned.pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
+    owned
+        .pool
+        .__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
         .await;
     let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
     let capped = agent_context("cap-agent");

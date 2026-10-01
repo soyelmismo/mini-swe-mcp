@@ -178,7 +178,10 @@ pub fn remove_steer_file(worker_id: &str) {
 
 /// [`remove_steer_file`] under an explicit scratch root.
 pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
-    for path in [steer_path_in(root, worker_id), claim_path_in(root, worker_id)] {
+    for path in [
+        steer_path_in(root, worker_id),
+        claim_path_in(root, worker_id),
+    ] {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 debug!(worker = %worker_id, path = %path.display(), "Removed steering mailbox")

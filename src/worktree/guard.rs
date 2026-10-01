@@ -7,7 +7,7 @@
 //! only owns one worktree at a time.
 
 use super::{
-    force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs, ScratchRoot,
+    ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;

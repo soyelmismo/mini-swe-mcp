@@ -366,7 +366,6 @@ fn steer_mailbox_uses_the_documented_path_and_json_lines() {
         assert!(v["message"].is_string());
         assert_eq!(v["pid"], json!(std::process::id() as u32));
     }
-
 }
 
 #[test]
@@ -387,8 +386,9 @@ fn steer_mailbox_drain_returns_messages_in_order_and_empties_the_file() {
     assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "d1").exists());
 
     // A worker nobody ever steered drains empty rather than erroring.
-    assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "never-steered").is_empty());
-
+    assert!(
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "never-steered").is_empty()
+    );
 }
 
 #[test]
@@ -407,7 +407,6 @@ fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
         mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"),
         vec![patch.to_string(), unicode.to_string()]
     );
-
 }
 
 #[test]
@@ -430,7 +429,6 @@ fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
         mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "c1"),
         vec!["good one", "good two"]
     );
-
 }
 
 #[test]
@@ -458,7 +456,6 @@ fn steer_mailbox_drain_claims_the_file_so_two_readers_never_both_win() {
         .filter(|n| n.contains("r1"))
         .collect();
     assert!(leftovers.is_empty(), "claim file leaked: {leftovers:?}");
-
 }
 
 #[test]
@@ -474,8 +471,10 @@ fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
     // A steer that lands *after* the rename recreated the original path; it
     // must wait for the next drain rather than being lost in the claim.
     mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "l1", "late").unwrap();
-    assert_eq!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "l1"), vec!["late"]);
-
+    assert_eq!(
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "l1"),
+        vec!["late"]
+    );
 }
 
 #[test]
@@ -496,7 +495,6 @@ fn removing_the_steer_file_clears_the_mailbox_and_its_claim() {
 
     // Removing a mailbox that was never created is a no-op, not an error.
     mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "never-existed");
-
 }
 
 #[tokio::test]
@@ -512,11 +510,15 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
 
     // Local guidance (this process) and remote guidance (another process).
     pool.steer("m1", "from this process".into()).await.unwrap();
-    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "m1", "from another process").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "m1", "from another process")
+        .unwrap();
 
     // `take_pending_steer` is the loop's read of the in-memory half.
     let mut seen = pool.take_pending_steer("m1").await;
-    seen.extend(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"));
+    seen.extend(mini_swe_mcp::pool::drain_steer_messages_in(
+        &scratch.root(),
+        "m1",
+    ));
 
     assert!(seen.contains(&"from this process".to_string()));
     assert!(seen.contains(&"from another process".to_string()));
@@ -528,9 +530,11 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
     // A second turn finds nothing left to inject -- guidance is consumed, not
     // replayed on every subsequent turn.
     let mut again = pool.take_pending_steer("m1").await;
-    again.extend(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"));
+    again.extend(mini_swe_mcp::pool::drain_steer_messages_in(
+        &scratch.root(),
+        "m1",
+    ));
     assert!(again.is_empty(), "guidance was re-delivered: {again:?}");
-
 }
 
 #[tokio::test]
@@ -541,7 +545,6 @@ async fn draining_the_mailbox_for_an_unknown_worker_is_a_no_op() {
 
     assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "ghost").is_empty());
     assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "ghost").exists());
-
 }
 
 // ----------
@@ -676,12 +679,7 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
     // process: an id with no live row is continued here instead, and a mailbox
     // nobody reads is never written.
     let scratch = ScratchRootGuard::new("steer-live-row-mailbox");
-    let pool = WorkerPool::with_scratch(
-        1,
-        "http://x".into(),
-        "k".into(),
-        scratch.root(),
-    );
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
 
     // A live pid in another process: the row's owner is alive, so the message
     // is queued for it rather than continued here.
@@ -1088,7 +1086,6 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
         leftovers.is_empty(),
         "worker exit leaked files: {leftovers:?}"
     );
-
 }
 
 // ----------
@@ -1326,7 +1323,8 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
 
     let repo = scratch_repo("history-roundtrip");
     let history = sample_history(&repo, "abc123", "worker-rev1");
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "rev1", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "rev1", &history)
+        .expect("save history");
 
     let mut legacy = serde_json::to_value(&history).unwrap();
     assert_eq!(legacy["base_branch"], "master");
@@ -1351,7 +1349,8 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
         assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
     }
 
-    let loaded = mini_swe_mcp::pool::load_worker_history_in(&scratch.root(), "rev1").expect("reload history");
+    let loaded = mini_swe_mcp::pool::load_worker_history_in(&scratch.root(), "rev1")
+        .expect("reload history");
     assert_eq!(loaded.task, "fix the parser");
     assert_eq!(loaded.branch, "worker-rev1");
     assert_eq!(loaded.messages.len(), 4);
@@ -1383,9 +1382,14 @@ fn prune_retires_histories_whose_branch_is_gone() {
         assert!(out.status.success(), "git {args:?}");
     };
     git(&["branch", "worker-alive"]);
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "alive", &sample_history(&repo, "abc", "worker-alive"))
-        .expect("save the revisable history");
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), 
+    mini_swe_mcp::pool::save_worker_history_in(
+        &scratch.root(),
+        "alive",
+        &sample_history(&repo, "abc", "worker-alive"),
+    )
+    .expect("save the revisable history");
+    mini_swe_mcp::pool::save_worker_history_in(
+        &scratch.root(),
         "merged",
         &sample_history(&repo, "abc", "worker-merged"),
     )
@@ -1416,7 +1420,8 @@ async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
     let repo = scratch_repo("history-owner");
     let mut history = sample_history(&repo, "abc", "worker-reaped");
     history.owner = Some("agent-x".to_string());
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "reaped", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "reaped", &history)
+        .expect("save history");
 
     let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), scratch.root());
     assert_eq!(
@@ -1480,7 +1485,8 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // The finished run's history file is what the revision reloads.
     let mut history = sample_history(&repo, &base, branch);
     history.branch = branch.to_string();
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "revwork", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "revwork", &history)
+        .expect("save history");
 
     pool.steer("revwork", "also handle empty input".into())
         .await
@@ -1564,7 +1570,8 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     };
     pool.__test_insert_worker(done).await;
     let history = sample_history(&repo, "abc123", "worker-keep1");
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "keep1", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "keep1", &history)
+        .expect("save history");
     pool.collect("keep1").await.expect("collect the worker");
     assert!(
         mini_swe_mcp::pool::history_path_in(&scratch.root(), "keep1").is_file(),
@@ -1597,7 +1604,8 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     pool.__test_insert_worker(done).await;
     // No `worker-gonework` branch was ever created in the scratch repo.
     let history = sample_history(&repo, "abc123", "worker-gonework");
-    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "gonework", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "gonework", &history)
+        .expect("save history");
 
     let err = pool.steer("gonework", "fix it".into()).await.unwrap_err();
     assert!(
@@ -1706,7 +1714,6 @@ async fn step_only_registry_updates_coalesce_to_one_write() {
         mtime() >= stepped,
         "a status transition must write immediately"
     );
-
 }
 
 /// Every runner reuses the single process-wide HTTP client.

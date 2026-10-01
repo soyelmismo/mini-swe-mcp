@@ -379,14 +379,17 @@ async fn dispatch_and_wait(
     review_after: Option<String>,
     verify: Option<String>,
 ) -> (WorkerPool, String, WorkerState) {
+    // The scratch root outlives this call: the caller inspects the worker's
+    // history file after the run, so the directory must still be there.
     let scratch = common::TempDir::new_in_tmp("loop-pool");
+    let path = scratch.path().to_path_buf();
+    std::mem::forget(scratch);
     let pool = WorkerPool::with_scratch(
         1,
         base_url.to_string(),
         "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+        mini_swe_mcp::worktree::ScratchRoot::new(path),
     );
-    let _scratch = scratch;
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -1245,7 +1248,7 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
         .collect();
     script.push(ScriptedSseServer::completion_turn("call_done"));
     let server = ScriptedSseServer::spawn(script).await;
-    let (_pool, worker_id, state) =
+    let (pool, worker_id, state) =
         dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
     assert!(matches!(state, WorkerState::Completed { .. }), "{state:?}");
     let requests = server.requests.all().await;
@@ -1308,7 +1311,9 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     // compaction is applied when the conversation is rebuilt for a request.
     let history = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(history) = mini_swe_mcp::pool::load_worker_history(&worker_id) {
+            if let Ok(history) =
+                mini_swe_mcp::pool::load_worker_history_in(pool.scratch_root(), &worker_id)
+            {
                 break history;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

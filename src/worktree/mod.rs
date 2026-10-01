@@ -165,8 +165,13 @@ pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
 
 /// Delete private scratch and legacy targets, never shared build dirs.
 pub(crate) fn remove_target_dirs(wt_path: &Path) {
+    remove_target_dirs_in(&ScratchRoot::from_env(), wt_path)
+}
+
+/// [`remove_target_dirs`] under an explicit scratch root.
+pub(crate) fn remove_target_dirs_in(root: &ScratchRoot, wt_path: &Path) {
     if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
-        for base in swe_base_dirs() {
+        for base in root.base_dirs() {
             force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
             force_remove_dir(&base.join(format!("swe-tmp-{wt_name}")));
         }

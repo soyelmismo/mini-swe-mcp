@@ -790,8 +790,8 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     let mut views: crate::cli::watch::Snapshot =
         crate::pool::load_all_registry_entries_in(pool.scratch_root())
             .iter()
-        .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
-        .collect();
+            .map(|entry| (entry.id.clone(), registry_snapshot(entry, now)))
+            .collect();
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
             continue;

@@ -388,7 +388,9 @@ fn tool_description_carries_the_orchestrator_guidelines() {
             1,
             "http://localhost:1".to_string(),
             "k".to_string(),
-            mini_swe_mcp::worktree::ScratchRoot::new(common::TempDir::new_in_tmp("watch-tools").path()),
+            mini_swe_mcp::worktree::ScratchRoot::new(
+                common::TempDir::new_in_tmp("watch-tools").path(),
+            ),
         )
         .with_manifest(Arc::new(manifest)),
         "m".to_string(),

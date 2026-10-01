@@ -35,11 +35,11 @@ use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 use super::registry::{RegistryStatus, WorkerMeta};
-use crate::worktree::ScratchRoot;
 use super::revision::{WorkerHistory, append_history_message_in};
 use super::state::WorkerState;
 use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
+use crate::worktree::ScratchRoot;
 
 pub(crate) mod history;
 mod pause;
@@ -241,8 +241,7 @@ impl WorkerPool {
             messages: Vec::new(),
         };
         if !super::revision::history_log_path_in(&self.scratch, &worker_id).exists()
-            && let Err(e) =
-                self.append_history_messages(&worker_id, &opening_meta, &messages)
+            && let Err(e) = self.append_history_messages(&worker_id, &opening_meta, &messages)
         {
             warn!(
                 worker = %worker_id,
