@@ -94,6 +94,15 @@ Send corrections here instead of dispatching a second worker on the same files, 
 
 Merge `worker-<id>` yourself once the diff is reviewed and the base branch is green. Before reporting completion the worker syncs the base branch into its worktree (`WORKER_SYNC_BASE=0` disables that).
 
+Or let `merge` do the whole sequence in one command:
+
+```bash
+mini-swe-mcp merge <id>            # trial merge, gate, merge --no-ff, cleanup
+mini-swe-mcp merge <id> --no-delete  # keep the branch afterwards
+```
+
+It merges into the base branch recorded for the worker, and refuses -- changing nothing -- while the worker still runs, while the repository has another branch checked out, while a file the merge would touch has uncommitted changes (untracked and unrelated files are left alone), or while the branch conflicts, in which case it prints the conflicting files and the `steer` that sends them back. The verify gate (the worker's own command, or the auto-detected one) runs on the merge result in a throwaway worktree and is skipped when the branch already contains the base tip and the worker's last verify passed. On success it prints one line naming the merge commit and what it cleaned up. It never pushes.
+
 ## The hub
 
 One daemon, many orchestrators.

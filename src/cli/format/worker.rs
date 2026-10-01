@@ -419,7 +419,6 @@ fn watch_command_line(val: &serde_json::Value) -> String {
 /// The gate is the part an operator wants to know about without reading a
 /// paragraph: whether it ran, or why it was skipped.
 pub fn format_merge(val: &serde_json::Value) -> String {
-    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let commit = val.get("commit").and_then(|v| v.as_str()).unwrap_or("");
     let base = val
         .get("base_branch")
