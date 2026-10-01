@@ -2095,6 +2095,7 @@ fn completed_channel_event_carries_the_review_guidance() {
         outcome: Default::default(),
         branch: Some("worker-ev-done".to_string()),
         revision: 0,
+        turns: 0,
     };
     let event = ChannelEvent {
         worker_id: view.worker_id.clone(),

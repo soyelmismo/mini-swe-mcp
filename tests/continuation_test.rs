@@ -487,9 +487,9 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
 /// The revision a payload carries, from whichever terminal state it is in.
 fn payload_revision(state: &WorkerState) -> Option<usize> {
     match state {
-        WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
-            Some(*revision)
-        }
+        WorkerState::Completed { revision, .. }
+        | WorkerState::Failed { revision, .. }
+        | WorkerState::Exhausted { revision, .. } => Some(*revision),
         WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
     }
 }
