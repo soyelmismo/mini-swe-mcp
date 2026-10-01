@@ -106,27 +106,39 @@ impl HubPaths {
         &self.dir
     }
 
-    /// The Unix socket clients connect to.
+    /// The Unix socket clients connect to, when it lives on the filesystem.
     ///
     /// A Unix socket path must fit in `sun_path` (108 bytes on Linux). When
     /// `<hub dir>/hub.sock` is longer - a deep `SWE_HUB_DIR` or `TMPDIR` - the
-    /// socket lives in a short private directory derived from the hub dir
-    /// instead (`/tmp/mswe-<uid>-<hash>`, created 0700 and owner-checked like
-    /// the hub dir), so the daemon and every client still agree on one path.
+    /// socket moves to a short private directory derived from the hub dir
+    /// (`/tmp/mswe-<uid>-<hash>`, created 0700 and owner-checked like the hub
+    /// dir). See [`HubPaths::endpoint`] for the case where no such directory
+    /// can be created either.
     pub fn socket(&self) -> PathBuf {
+        match self.endpoint() {
+            HubEndpoint::Path(path) => path,
+            HubEndpoint::Abstract(_) => self.dir.join("hub.sock"),
+        }
+    }
+
+    /// Where the hub listens: a filesystem socket when one fits, otherwise
+    /// (no short writable directory, e.g. inside a sandbox that denies `/tmp`)
+    /// a Linux abstract-namespace socket named after the hub dir. Daemon and
+    /// clients derive the same endpoint; access stays restricted to this user
+    /// by the daemon's `SO_PEERCRED` check.
+    pub fn endpoint(&self) -> HubEndpoint {
         let natural = self.dir.join("hub.sock");
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
-            return natural;
+            return HubEndpoint::Path(natural);
         }
-        let short = PathBuf::from(format!(
-            "/tmp/mswe-{}-{:016x}",
+        let key = format!(
+            "mswe-{}-{:016x}",
             current_uid(),
             fnv1a(self.dir.as_os_str().as_encoded_bytes())
-        ));
-        match harden_hub_dir(short) {
-            Ok(dir) => dir.join("hub.sock"),
-            // Binding the natural path then fails with a clear error.
-            Err(_) => natural,
+        );
+        match harden_hub_dir(PathBuf::from("/tmp").join(&key)) {
+            Ok(dir) => HubEndpoint::Path(dir.join("hub.sock")),
+            Err(_) => HubEndpoint::Abstract(key),
         }
     }
 
@@ -158,6 +170,59 @@ pub fn hub_dir() -> Result<PathBuf> {
     }
     let dir = crate::worktree::swe_base_dir().join(format!("mini-swe-hub-{}", current_uid()));
     harden_hub_dir(dir)
+}
+
+/// Where a hub listens; see [`HubPaths::endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubEndpoint {
+    /// A filesystem socket.
+    Path(PathBuf),
+    /// A Linux abstract-namespace socket with this name.
+    Abstract(String),
+}
+
+impl std::fmt::Display for HubEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HubEndpoint::Path(path) => write!(f, "{}", path.display()),
+            HubEndpoint::Abstract(name) => write!(f, "@{name}"),
+        }
+    }
+}
+
+/// Connect to a hub endpoint.
+pub async fn connect_endpoint(endpoint: &HubEndpoint) -> std::io::Result<UnixStream> {
+    match endpoint {
+        HubEndpoint::Path(path) => UnixStream::connect(path).await,
+        HubEndpoint::Abstract(name) => {
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+            let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+            stream.set_nonblocking(true)?;
+            UnixStream::from_std(stream)
+        }
+    }
+}
+
+/// Bind a hub endpoint (a filesystem socket is restricted to 0600).
+fn bind_endpoint(endpoint: &HubEndpoint) -> Result<UnixListener> {
+    match endpoint {
+        HubEndpoint::Path(path) => {
+            let listener = UnixListener::bind(path)
+                .with_context(|| format!("Could not bind hub socket {}", path.display()))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Could not restrict {} to 0600", path.display()))?;
+            Ok(listener)
+        }
+        HubEndpoint::Abstract(name) => {
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+            let listener = std::os::unix::net::UnixListener::bind_addr(&addr)
+                .with_context(|| format!("Could not bind abstract hub socket @{name}"))?;
+            listener.set_nonblocking(true)?;
+            Ok(UnixListener::from_std(listener)?)
+        }
+    }
 }
 
 /// Longest socket path used as-is, below Linux's 108-byte `sun_path`.
@@ -323,7 +388,7 @@ impl HubServer {
             if let Some(lock) = acquire_lock(&path)? {
                 return Ok(Some(lock));
             }
-            if UnixStream::connect(self.config.paths().socket())
+            if connect_endpoint(&self.config.paths().endpoint())
                 .await
                 .is_ok()
             {
@@ -373,12 +438,10 @@ impl HubServer {
             append_log(&paths.log(), &format!("auto-continued {resumed} workers"));
         }
 
-        let listener = UnixListener::bind(&socket)
-            .with_context(|| format!("Could not bind hub socket {}", socket.display()))?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Could not restrict {} to 0600", socket.display()))?;
+        let endpoint = paths.endpoint();
+        let listener = bind_endpoint(&endpoint)?;
 
-        info!(socket = %socket.display(), idle_secs = self.config.idle_secs(), "Hub daemon listening");
+        info!(socket = %endpoint, idle_secs = self.config.idle_secs(), "Hub daemon listening");
         append_log(&paths.log(), "listening");
 
         let events = self.server.start_hub_events().await;
@@ -811,4 +874,25 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The abstract-namespace fallback (used when no short writable directory
+    /// exists, e.g. inside a sandbox) binds and accepts like a path socket.
+    #[tokio::test]
+    async fn an_abstract_endpoint_binds_and_connects() {
+        let endpoint = HubEndpoint::Abstract(format!("mswe-test-{}", std::process::id()));
+        let listener = bind_endpoint(&endpoint).expect("bind the abstract socket");
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        connect_endpoint(&endpoint)
+            .await
+            .expect("connect to the abstract socket");
+        accept
+            .await
+            .expect("accept task")
+            .expect("accept the connection");
+    }
 }

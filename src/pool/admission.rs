@@ -13,7 +13,16 @@
 //!
 //! * `running_heavy < max_heavy` (`BASH_BUILD_LIMIT`, default the core count),
 //! * `MemAvailable - HUB_MEM_RESERVE_MB >= HUB_BUILD_MEM_MB`,
-//! * the 1-minute load average `< cores * 1.25`.
+//! * CPU `some avg10 < HUB_CPU_PRESSURE_MAX` (default 60),
+//! * memory `full avg10 < HUB_MEM_PRESSURE_MAX` (default 10),
+//! * IO `full avg10 < HUB_IO_PRESSURE_MAX` (default 40).
+//!
+//! The pressure criteria come from Linux PSI (`/proc/pressure/*`), which
+//! measures the time tasks actually stalled on a resource instead of the
+//! 1-minute load average — that average counts I/O wait and unrelated desktop
+//! processes, and lags by a minute. When `/proc/pressure` is unavailable
+//! (older kernels, containers without PSI) the controller falls back to the
+//! 1-minute load average `< cores * 1.25`.
 //!
 //! The one exception is the progress guarantee: with nothing heavy running a
 //! slot is *always* granted, so a saturated host can never deadlock a worker
@@ -47,6 +56,20 @@ pub const DEFAULT_BUILD_MEM_MB: u64 = 1536;
 /// How far the 1-minute load average may exceed the core count.
 const LOAD_HEADROOM: f64 = 1.25;
 
+/// Env var overriding the CPU `some avg10` ceiling (percent).
+pub const CPU_PRESSURE_MAX_ENV: &str = "HUB_CPU_PRESSURE_MAX";
+/// Env var overriding the memory `full avg10` ceiling (percent).
+pub const MEM_PRESSURE_MAX_ENV: &str = "HUB_MEM_PRESSURE_MAX";
+/// Env var overriding the IO `full avg10` ceiling (percent).
+pub const IO_PRESSURE_MAX_ENV: &str = "HUB_IO_PRESSURE_MAX";
+
+/// Default CPU `some avg10` ceiling, in percent.
+pub const DEFAULT_CPU_PRESSURE_MAX: f64 = 60.0;
+/// Default memory `full avg10` ceiling, in percent.
+pub const DEFAULT_MEM_PRESSURE_MAX: f64 = 10.0;
+/// Default IO `full avg10` ceiling, in percent.
+pub const DEFAULT_IO_PRESSURE_MAX: f64 = 40.0;
+
 /// How often a queued heavy command is re-evaluated when nothing wakes it.
 pub const RE_EVALUATE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -66,6 +89,12 @@ pub struct HostSample {
     pub mem_available_mb: Option<u64>,
     /// The 1-minute load average from `/proc/loadavg`.
     pub load1: Option<f64>,
+    /// CPU `some avg10` from `/proc/pressure/cpu`, in percent.
+    pub cpu_some_avg10: Option<f64>,
+    /// Memory `full avg10` from `/proc/pressure/memory`, in percent.
+    pub mem_full_avg10: Option<f64>,
+    /// IO `full avg10` from `/proc/pressure/io`, in percent.
+    pub io_full_avg10: Option<f64>,
 }
 
 /// Everything [`admit`] decides on. Plain data so the decision stays a pure
@@ -86,6 +115,18 @@ pub struct AdmissionInputs {
     pub load1: Option<f64>,
     /// Cores the job count is divided over.
     pub cores: usize,
+    /// CPU `some avg10` ceiling, in percent.
+    pub cpu_pressure_max: f64,
+    /// Memory `full avg10` ceiling, in percent.
+    pub mem_pressure_max: f64,
+    /// IO `full avg10` ceiling, in percent.
+    pub io_pressure_max: f64,
+    /// CPU `some avg10`, or `None` when unreadable.
+    pub cpu_some_avg10: Option<f64>,
+    /// Memory `full avg10`, or `None` when unreadable.
+    pub mem_full_avg10: Option<f64>,
+    /// IO `full avg10`, or `None` when unreadable.
+    pub io_full_avg10: Option<f64>,
 }
 
 /// Why a heavy command was not admitted.
@@ -97,6 +138,12 @@ pub enum Blocked {
     Memory,
     /// The 1-minute load average reached the ceiling.
     Load,
+    /// CPU `some avg10` reached its ceiling.
+    CpuPressure,
+    /// Memory `full avg10` reached its ceiling.
+    MemPressure,
+    /// IO `full avg10` reached its ceiling.
+    IoPressure,
 }
 
 impl Blocked {
@@ -106,6 +153,9 @@ impl Blocked {
             Blocked::SlotLimit => "heavy slot limit reached",
             Blocked::Memory => "available memory below the build reserve",
             Blocked::Load => "load average at the ceiling",
+            Blocked::CpuPressure => "CPU pressure at the ceiling",
+            Blocked::MemPressure => "memory pressure at the ceiling",
+            Blocked::IoPressure => "IO pressure at the ceiling",
         }
     }
 }
@@ -135,9 +185,12 @@ pub fn jobs_for(cores: usize, running_after_grant: usize) -> usize {
 ///
 /// The slot limit is checked first and the progress guarantee second: with
 /// nothing heavy running the host is by definition not saturated *by us*, so
-/// the first build always starts even when memory is tight or the load average
-/// is already high. Only a build that would stack on top of another one is
-/// dosed.
+/// the first build always starts even when memory is tight or the pressure is
+/// already high. Only a build that would stack on top of another one is dosed.
+///
+/// The memory estimate is always checked when readable. The PSI criteria are
+/// checked when `/proc/pressure` is available, each skipped when its own file
+/// is unreadable; the load average is the fallback for hosts without PSI.
 pub fn admit(inputs: &AdmissionInputs) -> Decision {
     if inputs.running >= inputs.max {
         return Decision::Waiting(Blocked::SlotLimit);
@@ -152,7 +205,29 @@ pub fn admit(inputs: &AdmissionInputs) -> Decision {
     {
         return Decision::Waiting(Blocked::Memory);
     }
-    if let Some(load) = inputs.load1
+    // PSI is available when at least one `/proc/pressure` file was readable;
+    // then the load average is ignored, because it counts I/O wait and
+    // unrelated processes and lags by a minute.
+    let psi_available = inputs.cpu_some_avg10.is_some()
+        || inputs.mem_full_avg10.is_some()
+        || inputs.io_full_avg10.is_some();
+    if psi_available {
+        if let Some(cpu) = inputs.cpu_some_avg10
+            && cpu >= inputs.cpu_pressure_max
+        {
+            return Decision::Waiting(Blocked::CpuPressure);
+        }
+        if let Some(mem) = inputs.mem_full_avg10
+            && mem >= inputs.mem_pressure_max
+        {
+            return Decision::Waiting(Blocked::MemPressure);
+        }
+        if let Some(io) = inputs.io_full_avg10
+            && io >= inputs.io_pressure_max
+        {
+            return Decision::Waiting(Blocked::IoPressure);
+        }
+    } else if let Some(load) = inputs.load1
         && load >= inputs.cores as f64 * LOAD_HEADROOM
     {
         return Decision::Waiting(Blocked::Load);
@@ -185,6 +260,50 @@ fn loadavg_1m_from(loadavg: &str) -> Option<f64> {
     loadavg.split_whitespace().next()?.parse().ok()
 }
 
+/// CPU `some avg10` from `/proc/pressure/cpu`, in percent; `None` when
+/// unreadable.
+pub fn cpu_pressure_some_avg10() -> Option<f64> {
+    psi_some_avg10_from(&std::fs::read_to_string("/proc/pressure/cpu").ok()?)
+}
+
+/// Memory `full avg10` from `/proc/pressure/memory`, in percent; `None` when
+/// unreadable.
+pub fn mem_pressure_full_avg10() -> Option<f64> {
+    psi_full_avg10_from(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+}
+
+/// IO `full avg10` from `/proc/pressure/io`, in percent; `None` when
+/// unreadable.
+pub fn io_pressure_full_avg10() -> Option<f64> {
+    psi_full_avg10_from(&std::fs::read_to_string("/proc/pressure/io").ok()?)
+}
+
+/// Pure core of [`cpu_pressure_some_avg10`]: the `some` line's `avg10` field.
+fn psi_some_avg10_from(body: &str) -> Option<f64> {
+    psi_avg10_from(body, "some")
+}
+
+/// Pure core of [`mem_pressure_full_avg10`] and [`io_pressure_full_avg10`]:
+/// the `full` line's `avg10` field.
+fn psi_full_avg10_from(body: &str) -> Option<f64> {
+    psi_avg10_from(body, "full")
+}
+
+/// Parse the `avg10=` field of the `kind` (`some` or `full`) line of a PSI
+/// file body. A PSI file looks like:
+///
+/// ```text
+/// some avg10=0.00 avg60=0.00 avg300=0.00 total=123456
+/// full avg10=0.00 avg60=0.00 avg300=0.00 total=987654
+/// ```
+fn psi_avg10_from(body: &str, kind: &str) -> Option<f64> {
+    let line = body
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(kind))?;
+    let field = line.split_whitespace().find(|f| f.starts_with("avg10="))?;
+    field.strip_prefix("avg10=")?.parse().ok()
+}
+
 /// The mutable half of the controller: the running count and the FIFO queue.
 struct Gate {
     /// Heavy commands holding a slot right now.
@@ -208,6 +327,9 @@ struct Inner {
     max_heavy: usize,
     reserve_mb: u64,
     estimate_mb: u64,
+    cpu_pressure_max: f64,
+    mem_pressure_max: f64,
+    io_pressure_max: f64,
     /// Serializes decide-and-reserve so two waiters waking on the same
     /// notification cannot both be granted the last slot. Never held across an
     /// await point.
@@ -229,13 +351,24 @@ pub struct AdmissionController {
 
 impl AdmissionController {
     /// A controller with explicit limits.
-    pub fn new(max_heavy: usize, cores: usize, reserve_mb: u64, estimate_mb: u64) -> Self {
+    pub fn new(
+        max_heavy: usize,
+        cores: usize,
+        reserve_mb: u64,
+        estimate_mb: u64,
+        cpu_pressure_max: f64,
+        mem_pressure_max: f64,
+        io_pressure_max: f64,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(Inner {
                 cores,
                 max_heavy: max_heavy.max(1),
                 reserve_mb,
                 estimate_mb,
+                cpu_pressure_max,
+                mem_pressure_max,
+                io_pressure_max,
                 gate: std::sync::Mutex::new(Gate {
                     running: 0,
                     slots: vec![false; max_heavy.max(1)],
@@ -262,6 +395,9 @@ impl AdmissionController {
             cores,
             crate::config::env_parse(MEM_RESERVE_ENV).unwrap_or(DEFAULT_MEM_RESERVE_MB),
             crate::config::env_parse(BUILD_MEM_ENV).unwrap_or(DEFAULT_BUILD_MEM_MB),
+            crate::config::env_parse(CPU_PRESSURE_MAX_ENV).unwrap_or(DEFAULT_CPU_PRESSURE_MAX),
+            crate::config::env_parse(MEM_PRESSURE_MAX_ENV).unwrap_or(DEFAULT_MEM_PRESSURE_MAX),
+            crate::config::env_parse(IO_PRESSURE_MAX_ENV).unwrap_or(DEFAULT_IO_PRESSURE_MAX),
         )
     }
 
@@ -331,6 +467,12 @@ impl AdmissionController {
                         estimate_mb: self.inner.estimate_mb,
                         load1: sample.load1,
                         cores: self.inner.cores,
+                        cpu_pressure_max: self.inner.cpu_pressure_max,
+                        mem_pressure_max: self.inner.mem_pressure_max,
+                        io_pressure_max: self.inner.io_pressure_max,
+                        cpu_some_avg10: sample.cpu_some_avg10,
+                        mem_full_avg10: sample.mem_full_avg10,
+                        io_full_avg10: sample.io_full_avg10,
                     }) {
                         Decision::Granted { jobs } => {
                             gate.queue.pop_front();
@@ -364,6 +506,12 @@ impl AdmissionController {
                     reserve_mb = self.inner.reserve_mb,
                     estimate_mb = self.inner.estimate_mb,
                     load1 = sample.load1,
+                    cpu_some_avg10 = sample.cpu_some_avg10,
+                    cpu_pressure_max = self.inner.cpu_pressure_max,
+                    mem_full_avg10 = sample.mem_full_avg10,
+                    mem_pressure_max = self.inner.mem_pressure_max,
+                    io_full_avg10 = sample.io_full_avg10,
+                    io_pressure_max = self.inner.io_pressure_max,
                     reason = blocked.reason(),
                     "Heavy command waiting for admission"
                 ),
@@ -412,6 +560,9 @@ impl AdmissionController {
         let fresh = HostSample {
             mem_available_mb: mem_available_mb(),
             load1: loadavg_1m(),
+            cpu_some_avg10: cpu_pressure_some_avg10(),
+            mem_full_avg10: mem_pressure_full_avg10(),
+            io_full_avg10: io_pressure_full_avg10(),
         };
         host.sampled = Some((Instant::now(), fresh));
         fresh
@@ -488,12 +639,18 @@ mod tests {
             estimate_mb: 1536,
             load1: Some(1.0),
             cores: 4,
+            cpu_pressure_max: DEFAULT_CPU_PRESSURE_MAX,
+            mem_pressure_max: DEFAULT_MEM_PRESSURE_MAX,
+            io_pressure_max: DEFAULT_IO_PRESSURE_MAX,
+            cpu_some_avg10: None,
+            mem_full_avg10: None,
+            io_full_avg10: None,
         }
     }
 
     #[tokio::test]
     async fn slots_are_exclusive_and_reuse_the_lowest_free_index() {
-        let controller = AdmissionController::new(3, 4, 0, 0);
+        let controller = AdmissionController::new(3, 4, 0, 0, 60.0, 10.0, 40.0);
         controller.__test_set_host_sample(Some(HostSample::default()));
         let first = controller.acquire().await;
         let second = controller.acquire().await;
@@ -625,5 +782,130 @@ mod tests {
     fn loadavg_reader_parses_first_field() {
         assert_eq!(loadavg_1m_from("2.50 1.75 1.25 4/512 12345\n"), Some(2.5));
         assert_eq!(loadavg_1m_from(""), None);
+    }
+
+    #[test]
+    fn cpu_pressure_blocks() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            cpu_some_avg10: Some(65.0),
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::CpuPressure));
+    }
+
+    #[test]
+    fn cpu_pressure_below_ceiling_admits() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            cpu_some_avg10: Some(59.9),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn memory_pressure_blocks() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            mem_full_avg10: Some(12.0),
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::MemPressure));
+    }
+
+    #[test]
+    fn io_pressure_blocks() {
+        let inputs = AdmissionInputs {
+            running: 1,
+            io_full_avg10: Some(45.0),
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::IoPressure));
+    }
+
+    #[test]
+    fn unreadable_psi_criterion_is_skipped() {
+        // CPU pressure is unreadable (None) but the other two are fine, so the
+        // missing file is skipped rather than read as a failure.
+        let inputs = AdmissionInputs {
+            running: 1,
+            cpu_some_avg10: None,
+            mem_full_avg10: Some(5.0),
+            io_full_avg10: Some(5.0),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn psi_present_ignores_the_load_average() {
+        // PSI is available and clear, so a high load average must not block:
+        // the load average is only the PSI-unavailable fallback.
+        let inputs = AdmissionInputs {
+            running: 1,
+            load1: Some(99.0),
+            cpu_some_avg10: Some(9.0),
+            mem_full_avg10: Some(1.0),
+            io_full_avg10: Some(2.0),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn psi_missing_falls_back_to_the_load_average() {
+        // No PSI file was readable, so the load-average criterion applies.
+        let inputs = AdmissionInputs {
+            running: 1,
+            load1: Some(5.0),
+            cpu_some_avg10: None,
+            mem_full_avg10: None,
+            io_full_avg10: None,
+            ..open()
+        };
+        assert_eq!(admit(&inputs), Decision::Waiting(Blocked::Load));
+    }
+
+    #[test]
+    fn progress_guarantee_beats_pressure() {
+        // With nothing heavy running the slot is granted even under maximum
+        // pressure, so a saturated host can never deadlock the first build.
+        let inputs = AdmissionInputs {
+            running: 0,
+            cpu_some_avg10: Some(99.0),
+            mem_full_avg10: Some(99.0),
+            io_full_avg10: Some(99.0),
+            ..open()
+        };
+        assert!(matches!(admit(&inputs), Decision::Granted { .. }));
+    }
+
+    #[test]
+    fn psi_reader_parses_avg10_by_field_name() {
+        let body = "some avg10=0.00 avg60=0.00 avg300=0.00 total=123456\n                    full avg10=1.50 avg60=0.00 avg300=0.00 total=789012\n";
+        assert_eq!(psi_avg10_from(body, "some"), Some(0.0));
+        assert_eq!(psi_avg10_from(body, "full"), Some(1.5));
+    }
+
+    #[test]
+    fn psi_reader_is_robust_to_shape() {
+        // The requested line is absent.
+        assert_eq!(
+            psi_avg10_from("full avg10=2.00 avg60=0.00 avg300=0.00 total=1\n", "some"),
+            None
+        );
+        // avg10 is matched by name, so a reordered body still parses.
+        assert_eq!(
+            psi_avg10_from("some avg60=0.00 avg10=3.25 avg300=0.00 total=1\n", "some"),
+            Some(3.25)
+        );
+        // A non-numeric value yields None rather than a panic.
+        assert_eq!(
+            psi_avg10_from("some avg10=nope avg60=0.00 avg300=0.00 total=1\n", "some"),
+            None
+        );
+        // An empty body yields None.
+        assert_eq!(psi_avg10_from("", "some"), None);
     }
 }
