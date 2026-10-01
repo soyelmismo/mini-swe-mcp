@@ -3,9 +3,12 @@
 //! -- demand the edit, hand back the plan the task spells out, then park on the
 //! orchestrator -- instead of spending its whole budget on reads.
 //!
-//! The thresholds are the defaults the pool ships (15, 30 and 45 read-only
-//! turns), so these tests read no environment and no other test can observe
-//! their effect: they pay for that with a turn budget sized to reach all three.
+//! The tests run against the thresholds the pool ships (15, 30 and 45 read-only
+//! turns), which the code under test reads from the environment at dispatch
+//! time. They therefore *set* nothing and *restore* nothing: a test that
+//! lowered the thresholds would mutate process-global state its parallel
+//! siblings could observe. The price is a turn budget sized to reach all three
+//! steps at the shipped defaults.
 
 mod common;
 
@@ -35,7 +38,6 @@ const PAUSE_TURN: usize = 45;
 /// the read-only detector and what the plan half of the escalation quotes back.
 const TASK: &str = "Add the plan to `fn check_read_only` in src/lib.rs.";
 
-/// The three read-only thresholds, pulled down so the whole escalation runs
 /// A read-only turn: a command that leaves the worktree exactly as it found it,
 /// so the detector keeps counting the streak.
 fn read_turn(n: usize) -> String {
@@ -127,7 +129,6 @@ fn bash_turn(call_id: &str, command: &str) -> String {
     )
 }
 
-/// The completion turn, carrying the REPORT block the system prompt requires.
 /// The completion turn. Its prose carries the REPORT block the system prompt
 /// requires, so the scripted worker is a compliant one and the harness never
 /// spends a turn asking for a report it would not get.

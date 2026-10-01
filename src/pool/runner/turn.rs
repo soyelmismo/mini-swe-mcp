@@ -109,6 +109,12 @@ const EDIT_PLAN_IDENTIFIER_WORDS: usize = 3;
 /// Bytes one identifier of the edit plan may occupy.
 const EDIT_PLAN_IDENTIFIER_BYTES: usize = 48;
 
+/// Bytes one path of the edit plan may occupy. Bounding the number of files is
+/// not enough on its own: a token with a file extension can be arbitrarily
+/// long, and the nudge that carries the plan stays one sentence only if each
+/// name in it is bounded too.
+const EDIT_PLAN_PATH_BYTES: usize = 120;
+
 /// Bytes of the dispatch the pause question quotes back, so a pause carries
 /// the spec without pasting a whole dispatch into the orchestrator's terminal.
 const TASK_QUESTION_BYTES: usize = 240;
@@ -321,13 +327,16 @@ fn path_of(token: &str) -> Option<String> {
     let token = token
         .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
         .trim_end_matches('.');
-    is_path_token(token).then(|| token.to_string())
+    (token.len() <= EDIT_PLAN_PATH_BYTES && is_path_token(token)).then(|| token.to_string())
 }
 
 /// Whether a backticked span reads as an identifier -- `fn x`, a type name, a
 /// command -- rather than as a sentence of prose: it is at most a few words
 /// long and every character is one an identifier, a call or a flag is written
 /// with, so a quoted sentence of the dispatch stays out of the plan.
+///
+/// Alphanumerics are Unicode, not ASCII: the extractor is language-agnostic,
+/// and a name like `vérifier` is as ordinary in a dispatch as `verify`.
 fn is_identifier(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() || text.len() > EDIT_PLAN_IDENTIFIER_BYTES {
@@ -337,7 +346,7 @@ fn is_identifier(text: &str) -> bool {
     words.len() <= EDIT_PLAN_IDENTIFIER_WORDS
         && words.iter().all(|word| {
             word.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-.:,()[]<>*&'!/=+".contains(c))
+                .all(|c| c.is_alphanumeric() || "_-.:,()[]<>*&'!/=+".contains(c))
         })
 }
 
@@ -2214,12 +2223,12 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS,
-        REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
-        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
-        edit_plan_text, extension_budget, named_file_defaults, parse_shortstat, parse_threshold,
-        read_only_nudge_text, read_only_pause_question, read_only_plan_text, read_only_thresholds,
-        summarized_task, task_names_files,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch,
+        READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
+        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, named_file_defaults,
+        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
+        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2541,6 +2550,32 @@ mod tests {
         // path, so it stays an identifier.
         let named = edit_plan("call `src/a.rs` from `fn main`");
         assert_eq!(named[0].identifiers, ["fn main"]);
+    }
+
+    /// A plan is bounded per name as well as per file count: an arbitrarily
+    /// long token with a file extension cannot drag a wall of text into the
+    /// nudge, and a name outside ASCII is read the same way an ASCII one is.
+    #[test]
+    fn the_edit_plan_bounds_each_name_and_reads_non_ascii_names() {
+        // Bounded per file count, but each name is long enough to matter.
+        let long_name = format!("src/{}.rs", "a".repeat(400));
+        let plan = edit_plan(&format!("edit {long_name}"));
+        assert!(
+            plan.is_empty(),
+            "a path past the byte cap must not enter the plan: {} bytes",
+            long_name.len()
+        );
+        let just_over = format!("src/{}.rs", "b".repeat(EDIT_PLAN_PATH_BYTES));
+        assert!(
+            just_over.len() > EDIT_PLAN_PATH_BYTES,
+            "the fixture must actually exceed the cap"
+        );
+        assert!(edit_plan(&format!("edit {just_over}")).is_empty());
+
+        // A non-ASCII path and identifier are ordinary names, not prose.
+        let unicode = edit_plan("mettre à jour `src/données.rs` : `fn vérifier`");
+        assert_eq!(unicode[0].path, "src/données.rs");
+        assert_eq!(unicode[0].identifiers, ["fn vérifier"]);
     }
 
     /// The extractor is language-agnostic: it mines whatever paths and
