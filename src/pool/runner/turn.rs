@@ -24,7 +24,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall, tree_fingerprint};
+use crate::agent::exec::tree_fingerprint;
+use crate::agent::{AgentRunner, ChatMessage, LlmResponse, Role, ToolCall};
 use crate::manifest::MAX_TURNS_LIMIT;
 use crate::worktree::{BaseSync, WorktreeGuard, git};
 
@@ -275,6 +276,12 @@ impl ProgressWatch {
     fn reusable_verify_step(&self, command: &str, current: &str) -> Option<usize> {
         let recorded = self.verify_success.get(command)?;
         (recorded.fingerprint == current).then_some(recorded.step)
+    }
+
+    /// Drop any recorded success of `command`: a later failure means an
+    /// earlier pass no longer describes the tree, so the gate re-runs it.
+    fn invalidate_verify_success(&mut self, command: &str) {
+        self.verify_success.remove(command);
     }
 }
 
@@ -885,8 +892,10 @@ impl<'a> TurnEngine<'a> {
         let effects = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
         if !effects.is_empty() {
             super::divergent::cleanup(&repo_root, &effects);
-            let refusal =
-                format!("{reuse_note}{}", super::divergent::side_effect_refusal(&effects));
+            let refusal = format!(
+                "{reuse_note}{}",
+                super::divergent::side_effect_refusal(&effects)
+            );
             self.push_exchange(
                 llm_resp.content.clone(),
                 llm_resp.reasoning_content.clone(),
@@ -927,8 +936,10 @@ impl<'a> TurnEngine<'a> {
         let effects_b = super::divergent::audit(&repo_root, &worktree_path, &worker_id, baseline);
         if !effects_b.is_empty() {
             super::divergent::cleanup(&repo_root, &effects_b);
-            let refusal =
-                format!("{reuse_note}{}", super::divergent::side_effect_refusal(&effects_b));
+            let refusal = format!(
+                "{reuse_note}{}",
+                super::divergent::side_effect_refusal(&effects_b)
+            );
             self.push_exchange(
                 llm_resp.content.clone(),
                 llm_resp.reasoning_content.clone(),
@@ -948,8 +959,10 @@ impl<'a> TurnEngine<'a> {
             });
         }
         let differing = super::divergent::divergent_names(&divergent_env);
-        let refusal =
-            format!("{reuse_note}{}", super::divergent::divergence_refusal(verify, &differing, code_b, &output_b));
+        let refusal = format!(
+            "{reuse_note}{}",
+            super::divergent::divergence_refusal(verify, &differing, code_b, &output_b)
+        );
         self.push_exchange(
             llm_resp.content.clone(),
             llm_resp.reasoning_content.clone(),
@@ -1170,21 +1183,29 @@ impl<'a> TurnEngine<'a> {
             self.worktree.leased_build_dir().map(Path::to_path_buf)
         };
         let result = runner.execute_bash(&self.worktree.path, command).await;
-        // A heavy command that passed is remembered with the tree it
-        // produced, so the completion gate can reuse it on an unchanged
-        // tree instead of recompiling and re-testing the same bytes. A
-        // light command is cheap to re-run and is never recorded.
-        if heavy && matches!(&result, Ok((_, Some(0)))) {
-            self.note_verify_success(command).await;
+        if heavy {
+            self.update_verify_success(command, &result).await;
         }
         result
     }
 
-    /// Fingerprint the worktree off the runtime thread and record the run
-    /// as the latest success of `command`. A fingerprint that could not be
-    /// taken is not recorded: reusing a run whose tree state is unknown
-    /// would be unsound, so the gate simply re-runs it.
-    async fn note_verify_success(&mut self, command: &str) {
+    /// Record or drop the reuse entry for a heavy `command` from its result.
+    ///
+    /// A pass is remembered with the tree it produced, so the completion gate
+    /// can reuse it on an unchanged tree instead of recompiling and re-testing
+    /// the same bytes. A failure drops any earlier pass: a command that has
+    /// since failed no longer describes the tree, so the gate must re-run it.
+    /// A fingerprint that could not be taken records nothing, so an unknown
+    /// tree state is never reused.
+    async fn update_verify_success(
+        &mut self,
+        command: &str,
+        result: &Result<(String, Option<i32>)>,
+    ) {
+        if !matches!(result, Ok((_, Some(0)))) {
+            self.watch.invalidate_verify_success(command);
+            return;
+        }
         let path = self.worktree.path.clone();
         let Some(fingerprint) = tokio::task::spawn_blocking(move || tree_fingerprint(&path))
             .await
@@ -1480,7 +1501,8 @@ mod tests {
     /// The completion gate reuses a verify run only when the command *and*
     /// the tree both match a recorded success; anything else re-runs.
     mod verify_reuse {
-        use super::super::{ProgressWatch, tree_fingerprint};
+        use super::ProgressWatch;
+        use crate::agent::exec::tree_fingerprint;
         use std::path::{Path, PathBuf};
 
         fn scratch(tag: &str) -> PathBuf {
@@ -1585,6 +1607,50 @@ mod tests {
                 watch.reusable_verify_step("cargo test", &fp),
                 None,
                 "a command with no recorded success must re-run"
+            );
+        }
+
+        /// A pass followed by a later failure of the same command on the
+        /// same tree must not be reused: the failure drops the earlier pass.
+        #[test]
+        fn a_later_failure_invalidates_an_earlier_pass() {
+            let dir = repo("stale");
+            let fp = tree_fingerprint(&dir).expect("fingerprint the seeded tree");
+            let mut watch = ProgressWatch::default();
+            watch.record_verify_success("cargo test".to_string(), fp.clone(), 4);
+            assert_eq!(
+                watch.reusable_verify_step("cargo test", &fp),
+                Some(4),
+                "the pass is reusable before the failure"
+            );
+            // The same command later fails on the unchanged tree.
+            watch.invalidate_verify_success("cargo test");
+            assert_eq!(
+                watch.reusable_verify_step("cargo test", &fp),
+                None,
+                "a command that has since failed must re-run"
+            );
+        }
+
+        /// The success map is bounded: a new command past the cap evicts the
+        /// oldest entry rather than growing without limit.
+        #[test]
+        fn the_success_map_is_bounded() {
+            let mut watch = ProgressWatch::default();
+            for step in 0..super::super::VERIFY_SUCCESS_LIMIT + 4 {
+                watch.record_verify_success(format!("cmd-{step}"), "fp".to_string(), step);
+            }
+            // The oldest entries were evicted; the newest survives.
+            assert_eq!(
+                watch.reusable_verify_step("cmd-0", "fp"),
+                None,
+                "the oldest entry must have been evicted"
+            );
+            let newest = super::super::VERIFY_SUCCESS_LIMIT + 3;
+            assert_eq!(
+                watch.reusable_verify_step(&format!("cmd-{newest}"), "fp"),
+                Some(newest),
+                "the newest entry must survive"
             );
         }
     }

@@ -16,7 +16,6 @@ pub use env::{
     host_cargo_home, is_secret_name, resolve_cargo_home, sanitize_ambient_value,
 };
 pub use exec::{has_unshare, wrap_network_command};
-pub(crate) use exec::tree_fingerprint;
 pub use retry::{DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries};
 pub use runner::AgentRunner;
 pub use sandbox::{

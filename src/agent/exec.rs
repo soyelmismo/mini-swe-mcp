@@ -247,7 +247,8 @@ impl AgentRunner {
 /// fingerprint that could not be taken is never read as "unchanged".
 pub(crate) fn tree_fingerprint(dir: &Path) -> Option<String> {
     let head = crate::worktree::git(dir, "rev-parse HEAD", &["rev-parse", "HEAD"]).ok()?;
-    let diff = crate::worktree::git(dir, "diff HEAD --binary", &["diff", "HEAD", "--binary"]).ok()?;
+    let diff =
+        crate::worktree::git(dir, "diff HEAD --binary", &["diff", "HEAD", "--binary"]).ok()?;
     let others = crate::worktree::git(
         dir,
         "ls-files --others --exclude-standard",
@@ -2442,7 +2443,7 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
 
     /// The tree fingerprint the completion gate reuses a verify run on.
     mod fingerprint {
-        use crate::agent::tree_fingerprint;
+        use crate::agent::exec::tree_fingerprint;
         use std::path::{Path, PathBuf};
 
         fn git(dir: &Path, args: &[&str]) {
