@@ -111,11 +111,19 @@ async fn a_client_is_served_before_startup_recovery_finishes() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock before the epoch")
         .as_secs();
+    // The row's `worker-<id>` branch is what keeps it listable after recovery
+    // marks it terminal; without one `list` would prune it as an empty orphan.
+    let repo = root.subdir("repo");
+    common::git(&repo, &["init", "-b", "master"]);
+    common::git(&repo, &["config", "user.name", "test"]);
+    common::git(&repo, &["config", "user.email", "test@localhost"]);
+    common::git(&repo, &["commit", "--allow-empty", "-m", "seed"]);
+    common::git(&repo, &["branch", &format!("worker-{wid}")]);
     let row = serde_json::json!({
         "id": wid, "pid": dead_pid, "task": "t", "model": "ninja", "status": "running",
         "step": 1, "max_turns": 10, "last_command": "cargo test",
         "started_at": now - 60, "updated_at": now - 60,
-        "owner": agent,
+        "owner": agent, "repo_path": repo.to_string_lossy(),
     });
     std::fs::create_dir_all(swe.join("swe-registry")).expect("create the registry");
     std::fs::write(
