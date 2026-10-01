@@ -23,6 +23,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -33,14 +34,26 @@ const HOST: &str = "host:opencode:730:12";
 const TAB_A: &str = "host:opencode:730:12/session:tab-a";
 const TAB_B: &str = "host:opencode:730:12/session:tab-b";
 
+static TAG: AtomicU64 = AtomicU64::new(0);
+
 /// A scratch hub directory, removed when the test ends.
 ///
 /// Mode 0700: the client side resolves a watch token through `hub_dir()`, which
 /// refuses a directory that is group or world accessible.
 fn scratch_dir() -> PathBuf {
-    // The leaf stays short (`common::scratch_name`): a hub socket lives inside
-    // and `sun_path` is capped, so a deep `TMPDIR` must still fit.
-    let dir = std::env::temp_dir().join(common::scratch_name("session"));
+    // Base the hub dir on the daemon's short scratch root, not the raw
+    // `TMPDIR`: a long `TMPDIR` pushes `<dir>/hub.sock` past the Unix socket
+    // limit, where the daemon falls back to an abstract-namespace socket that
+    // a filesystem path cannot reach.
+    let dir = mini_swe_mcp::worktree::swe_base_dir().join(format!(
+        "swe-session-test-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos(),
+        TAG.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch hub dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
