@@ -1003,3 +1003,95 @@ async fn the_mcp_consolidator_merge_retires_its_round_from_every_view() {
     }
     events.abort();
 }
+
+/// A worker whose registry row was already pruned is still reported retired, and
+/// its acknowledgement is still cleared.
+///
+/// The race this pins: the retirement deletes the branch and only then the row,
+/// and a concurrent reader's `branch_exists` probe prunes a terminal row whose
+/// branch is gone. If retirement reported "nothing removed" because it found no
+/// row, that worker would drop out of the merge report -- keeping its watch
+/// acknowledgement and replay state forever. Retirement is idempotent, so what it
+/// must report is that no row *remains*.
+#[tokio::test]
+async fn an_already_pruned_row_is_still_reported_retired_with_its_ack_cleared() {
+    let f = Fixture::new("retire-pruned-row");
+    for id in ["pr-cons", "pr-a"] {
+        f.commit_on_worker_branch(id, &format!("{id}.txt"), &format!("{id}\n"));
+        f.record(id);
+    }
+    f.commit_on_worker_branch("prcons", "prcons.txt", "consolidated\n");
+    git(f.repo(), &["checkout", "-q", "worker-prcons"]);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate a", "worker-pr-a"],
+    );
+    git(f.repo(), &["checkout", "-q", "main"]);
+    f.record_with_verify("prcons", Some("true"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            task: "consolidate".to_string(),
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 1,
+            owner: Some("agent-a".to_string()),
+            repo_path: Some(f.repo().to_string_lossy().into_owned()),
+            base_branch: Some("main".to_string()),
+            integrated: vec!["pr-a".to_string()],
+            ..WorkerRegistryEntry::test_row("prcons", "agent-a")
+        },
+    );
+
+    let hub = f.scratch.path().join("hub");
+    std::fs::create_dir_all(&hub).unwrap();
+    std::fs::write(
+        hub.join("watch_acks.json"),
+        r#"{"agent-a":{"pr-a":{"revision":1,"event":"completed"}}}"#,
+    )
+    .unwrap();
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    let server = mini_swe_mcp::mcp::McpServer::new(pool.clone(), "agent-a".to_string());
+    let events = server.start_hub_events(Some(&hub)).await;
+
+    // Simulate the concurrent prune: the round member's row disappears before
+    // the merge reaches it, exactly as the registry's own branch probe would.
+    assert!(f.row_exists("pr-a"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 9,
+            ..WorkerRegistryEntry::test_row("pr-a", "agent-a")
+        },
+    );
+    let row_path = f.root().join("swe-registry").join("pr-a.json");
+    std::fs::remove_file(row_path).expect("simulate the concurrent row prune");
+    assert!(!f.row_exists("pr-a"), "the row is gone before the merge");
+
+    let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
+    ctx.agent_id = Some("agent-a".to_string());
+    server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "merge", "worker_id": "prcons"}),
+            &ctx,
+        )
+        .await
+        .expect("the consolidator merge must succeed");
+
+    // The already-pruned worker must still have been retired, so its
+    // acknowledgement goes with it.
+    let acked: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.join("watch_acks.json")).unwrap()).unwrap();
+    assert!(
+        acked.get("agent-a").and_then(|a| a.get("pr-a")).is_none(),
+        "an already-pruned member must still lose its acknowledgement: {acked}"
+    );
+    events.abort();
+}

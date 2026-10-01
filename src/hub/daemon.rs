@@ -457,13 +457,17 @@ impl HubServer {
         })
         .await
         {
-            Ok(sweep) if !sweep.workers.is_empty() || sweep.orphans > 0 => {
+            Ok(sweep)
+                if !sweep.workers.is_empty()
+                    || !sweep.orphan_workers.is_empty()
+                    || sweep.orphans > 0 =>
+            {
                 // The file edit above is not enough on its own: the event
                 // router may already hold the store in memory, and its next
                 // `persist` would rewrite the very entries just removed. Forget
                 // them through the router, on its own lock, so memory and file
                 // agree whichever was loaded first.
-                for id in &sweep.workers {
+                for id in sweep.workers.iter().chain(sweep.orphan_workers.iter()) {
                     self.server.forget_retired_worker(id).await;
                 }
                 info!(

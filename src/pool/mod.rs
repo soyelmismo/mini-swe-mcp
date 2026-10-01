@@ -642,7 +642,8 @@ impl WorkerPool {
     /// per repository and base, and the orphan scan reads only history metadata.
     ///
     /// Returns the ids it retired, so the caller can also drop the acknowledgements
-    /// and live records those ids still have. An operator's `keep_branch` row is
+    /// and live records those ids still have -- both the merged rows it retired
+    /// and the workers whose orphan files it reclaimed. An operator's `keep_branch` row is
     /// skipped by the sweep itself, so no per-call exemption list is needed.
     pub async fn sweep_retired_workers(&self) -> RetireSweep {
         let root = self.scratch.clone();

@@ -754,14 +754,24 @@ fn cleanup(
     let mut round_retired = 0;
     if !keep_branch {
         for id in &integrated {
-            // A worker may have been revised after its earlier tip was
-            // integrated: its branch then holds work the base does not have, and
-            // deleting it would destroy that work. Retire only what is provably
-            // integrated now, and leave a re-revised worker alone.
-            // `base_branch`, not `branch`: the worker's commits must be in the
-            // branch the merge landed on, which is the whole round's base.
-            if !branch_is_integrated_in(root, repo, id, base_branch) {
-                continue;
+            // A member whose row a concurrent reader already pruned is still
+            // retired: the row being gone is the end state, not a reason to
+            // skip it (which would leave its acknowledgement behind). Its
+            // scratch traces are removed regardless, and there is nothing left
+            // to protect -- the branch is this round's own work, proven
+            // integrated below.
+            let row_gone = load_registry_entry_in(root, id).is_none();
+            if !row_gone {
+                // A worker may have been revised after its earlier tip was
+                // integrated: its branch then holds work the base does not have,
+                // and deleting it would destroy that work. Retire only what is
+                // provably integrated now, and leave a re-revised worker alone.
+                // `base_branch`, not `branch`: the worker's commits must be in
+                // the branch the merge landed on, which is the whole round's
+                // base.
+                if !branch_is_integrated_in(root, repo, id, base_branch) {
+                    continue;
+                }
             }
             if retire_worker_reporting(root, id, &ctx).row_removed {
                 retired.push(id.clone());
