@@ -246,8 +246,10 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
     save_registry_entry_in(&f.root(), &row);
     f.write_steer_source("cons");
 
+    eprintln!("DBG cons row integrated={:?}", mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "cons").map(|r| r.integrated));
     f.merge("cons")
         .expect("a clean consolidator merge must succeed");
+    eprintln!("DBG branch c-a exists={}", git_ref_exists(f.repo(), "worker-c-a"));
 
     for id in ["cons", "c-a", "c-b"] {
         assert!(
@@ -293,14 +295,38 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
     f.record("v1");
     git(f.repo(), &["branch", "-D", "worker-v1"]);
 
-    // 4. Two histories with neither a row nor a branch: pure orphans.
+    // 4. Two histories with neither a row nor a branch: pure orphans. They name
+    //    a real repository whose branch is genuinely gone, which is the only
+    //    shape the sweep may delete (a rowless *live* branch is kept, below).
     for id in ["o1", "o2"] {
+        f.commit_on_worker_branch(id, &format!("{id}.txt"), &format!("{id}\n"));
+        git(f.repo(), &["branch", "-D", &format!("worker-{id}")]);
         write(
             f.scratch.path(),
             &format!("swe-wt-{id}.history.jsonl"),
-            "{\"repo_path\":\"nonsense\"}\n",
+            &format!(
+                "{{\"repo_path\":\"{}\",\"branch\":\"worker-{id}\"}}\n",
+                f.repo().display()
+            ),
         );
     }
+
+    // 5. A history whose row is gone but whose BRANCH still lives: the
+    //    conversation is the only record of work that is still in git, so the
+    //    sweep must keep it even though there is no row to match it.
+    f.commit_on_worker_branch("k1", "k1.txt", "k1\n");
+    write(
+        f.scratch.path(),
+        "swe-wt-k1.history.jsonl",
+        &format!(
+            "{{\"repo_path\":\"{}\",\"branch\":\"worker-k1\"}}\n",
+            f.repo().display()
+        ),
+    );
+
+    // 6. A history the sweep cannot place at all (unreadable first line): its
+    //    unreachability is unproven, so it must survive.
+    write(f.scratch.path(), "swe-wt-k2.history.jsonl", "not json at all\n");
 
     let sweep = f.sweep();
 
@@ -321,7 +347,15 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
     assert!(
         !f.scratch.path().join("swe-wt-o1.history.jsonl").exists()
             && !f.scratch.path().join("swe-wt-o2.history.jsonl").exists(),
-        "orphan histories must be deleted"
+        "orphan histories with no row and no branch must be deleted"
+    );
+    assert!(
+        f.history_exists("k1"),
+        "a rowless history whose branch still exists must be kept: it is the only record of work still in git"
+    );
+    assert!(
+        f.history_exists("k2"),
+        "a history whose repository cannot be read must be kept: unreachability is unproven"
     );
 
     // The unmerged completed worker is untouched: still listed, still

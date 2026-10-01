@@ -221,7 +221,14 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
     let commit = head_commit(repo);
 
     let (branch_deleted, cleaned) =
-        cleanup(root, worker_id, repo, &resolved.branch, req.keep_branch);
+        cleanup(
+        root,
+        worker_id,
+        repo,
+        &resolved.branch,
+        &resolved.base_branch,
+        req.keep_branch,
+    );
 
     Ok(MergeReport {
         worker_id: worker_id.to_string(),
@@ -707,6 +714,7 @@ fn cleanup(
     worker_id: &str,
     repo: &Path,
     branch: &str,
+    base_branch: &str,
     keep_branch: bool,
 ) -> (bool, Vec<String>) {
     let worktree = root.join(format!("swe-wt-{worker_id}"));
@@ -737,7 +745,8 @@ fn cleanup(
             // integrated: its branch then holds work the base does not have, and
             // deleting it would destroy that work. Retire only what is provably
             // integrated now, and leave a re-revised worker alone.
-            if !branch_is_integrated_in(root, repo, id, branch) {
+            let ok = branch_is_integrated_in(root, repo, id, branch);
+            if !ok {
                 continue;
             }
             retire_worker_with(root, id, &ctx);
@@ -781,15 +790,19 @@ fn branch_is_integrated_in(
         return false;
     };
     // The worker's branch must live in the repository the round landed in, or
-    // the probe below would be reading a different repository's refs.
-    if !row
+    // the probe below would be reading a different repository's refs. Compared
+    // canonically, because a row records the path as it was resolved and the
+    // merge resolves it again: `/tmp` is a symlink to `/private/tmp` on some
+    // hosts, and a textual comparison would read that as two repositories.
+    let same_repo = row
         .repo_path
         .as_deref()
-        .is_some_and(|path| Path::new(path) == repo)
-    {
+        .map(Path::new)
+        .is_some_and(|path| path.canonicalize().ok() == repo.canonicalize().ok());
+    if !same_repo {
         return false;
     }
-    crate::worktree::git(
+    let r = crate::worktree::git(
         repo,
         "merge-base --is-ancestor",
         &[
@@ -798,8 +811,9 @@ fn branch_is_integrated_in(
             &format!("worker-{worker_id}"),
             base,
         ],
-    )
-    .is_ok_and(|out| out.status.success())
+    );
+    eprintln!("DBG probe {worker_id} base={base} ok={:?} success={:?}", r.is_ok(), r.as_ref().map(|o| o.status.success()));
+    r.is_ok_and(|out| out.status.success())
 }
 
 // ----------
@@ -1044,7 +1058,7 @@ pub fn merge_approved_in(
             )
         })?;
         let commit = head_commit(repo);
-        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, false);
+        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, &base_branch, false);
         cleaned.extend(worker_cleaned);
         merged.push(MergedWorker {
             worker_id: id.clone(),
