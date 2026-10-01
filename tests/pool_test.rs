@@ -1745,10 +1745,13 @@ fn agent_runners_share_one_http_client() {
 #[tokio::test]
 async fn admission_grants_with_job_count() {
     use mini_swe_mcp::pool::{AdmissionController, HostSample};
-    let gate = AdmissionController::new(4, 4, 2048, 1536);
+    let gate = AdmissionController::new(4, 4, 2048, 1536, 60.0, 10.0, 40.0);
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(12_000),
         load1: Some(1.0),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let first = gate.acquire().await;
     assert_eq!(first.jobs(), 4, "the first build owns the machine");
@@ -1766,10 +1769,13 @@ async fn admission_grants_with_job_count() {
 async fn admission_waiters_are_granted_fifo() {
     use mini_swe_mcp::pool::{AdmissionController, HostSample};
     use std::sync::{Arc, Mutex};
-    let gate = AdmissionController::new(1, 4, 2048, 1536);
+    let gate = AdmissionController::new(1, 4, 2048, 1536, 60.0, 10.0, 40.0);
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(12_000),
         load1: Some(0.5),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let held = gate.acquire().await;
 
@@ -1807,10 +1813,13 @@ async fn admission_waiters_are_granted_fifo() {
 #[tokio::test]
 async fn admission_a_cancelled_waiter_releases_its_place() {
     use mini_swe_mcp::pool::{AdmissionController, HostSample};
-    let gate = AdmissionController::new(1, 4, 2048, 1536);
+    let gate = AdmissionController::new(1, 4, 2048, 1536, 60.0, 10.0, 40.0);
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(12_000),
         load1: Some(0.5),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let held = gate.acquire().await;
 
@@ -1848,10 +1857,13 @@ async fn admission_a_cancelled_waiter_releases_its_place() {
 #[tokio::test]
 async fn admission_first_build_never_blocks() {
     use mini_swe_mcp::pool::{AdmissionController, HostSample};
-    let gate = AdmissionController::new(2, 4, 2048, 1536);
+    let gate = AdmissionController::new(2, 4, 2048, 1536, 60.0, 10.0, 40.0);
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(64),
         load1: Some(99.0),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let permit = tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire())
         .await
@@ -1865,15 +1877,21 @@ async fn admission_first_build_never_blocks() {
 #[tokio::test]
 async fn admission_memory_shortage_waits_then_admits() {
     use mini_swe_mcp::pool::{AdmissionController, HostSample};
-    let gate = AdmissionController::new(2, 4, 2048, 1536);
+    let gate = AdmissionController::new(2, 4, 2048, 1536, 60.0, 10.0, 40.0);
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(12_000),
         load1: Some(0.5),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let _held = gate.acquire().await;
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(100),
         load1: Some(0.5),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     let waiter = tokio::spawn({
         let gate = gate.clone();
@@ -1884,6 +1902,9 @@ async fn admission_memory_shortage_waits_then_admits() {
     gate.__test_set_host_sample(Some(HostSample {
         mem_available_mb: Some(12_000),
         load1: Some(0.5),
+        cpu_some_avg10: None,
+        mem_full_avg10: None,
+        io_full_avg10: None,
     }));
     // The waiter re-evaluates every 2 s at the latest.
     let permit = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
