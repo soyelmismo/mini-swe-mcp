@@ -28,7 +28,11 @@ fn test_quiet_flag_is_detected_and_stripped() {
         assert_eq!(tool["task"], "task");
         assert!(!tool.contains_key("quiet"), "{tool:?}");
     }
-    assert!(!quiet_requested(&args(&["mini-swe-mcp", "dispatch", "task"])));
+    assert!(!quiet_requested(&args(&[
+        "mini-swe-mcp",
+        "dispatch",
+        "task"
+    ])));
 }
 
 #[test]

@@ -1194,7 +1194,6 @@ fn path_of(token: &str) -> &str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
