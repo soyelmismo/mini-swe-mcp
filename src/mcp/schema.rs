@@ -187,7 +187,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before completion is honoured; pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
         ),
     ),
     (
