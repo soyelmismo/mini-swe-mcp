@@ -139,9 +139,10 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
     .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&dir.path().join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
 
-    let mut a = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut a =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     let reply = a
         .request(
             "hub/watch",
@@ -154,7 +155,8 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
     );
     drop(a);
 
-    let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut owner =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     owner
         .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
         .await;
@@ -172,7 +174,8 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
         "{reply:?}"
     );
 
-    let mut b = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut b =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
         .await;
     let reply = b
@@ -184,7 +187,8 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
     assert_eq!(reply["result"]["watching"], serde_json::json!([]));
     assert_eq!(reply["result"]["events"], serde_json::json!([]));
 
-    let mut admin = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut admin =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     admin
         .request(
             "hub/hello",
@@ -232,9 +236,10 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
     .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&dir.path().join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
 
-    let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut owner =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     owner
         .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
         .await;
@@ -283,7 +288,8 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
         .await;
     assert_eq!(reply["result"]["events"], serde_json::json!([]));
 
-    let mut b = Raw::connect(&dir.path().join("hub.sock")).await;
+    let mut b =
+        Raw::connect(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
     b.request("hub/hello", serde_json::json!({"agent_id": "agent-b"}))
         .await;
     let reply = b
@@ -573,7 +579,7 @@ async fn the_binary_watches_through_the_hub() {
     .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&hub.path().join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
     let run = |args: &[&str]| {
         common::binary_command(&common::binary_path())
             .args(args)
@@ -772,7 +778,7 @@ async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
     let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
     let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&hub.path().join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
 
     let child = common::binary_command(&common::binary_path())
         .args(["--json", "watch", "--timeout", "20"])
@@ -941,7 +947,7 @@ async fn the_daemon_allows_one_watch_per_identity() {
     .await;
     let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    let socket = dir.path().join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket();
     wait_for_socket(&socket).await;
     let watch = serde_json::json!({"worker_ids": [], "group": null, "initial": true});
 
@@ -1095,7 +1101,7 @@ async fn a_second_cli_watch_for_one_session_exits_five() {
     let server = Arc::new(McpServer::new(pool, "test".to_string()));
     let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&hub.path().join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
 
     let spawn_watch = |timeout: &str| {
         common::binary_command(&common::binary_path())

@@ -16,10 +16,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
 
 /// A scratch hub directory, removed when the test ends.
+///
+/// The name stays short (see [`common::scratch_name`]) because the daemon binds
+/// a Unix socket inside it and `sun_path` is length-bounded.
 fn scratch_dir() -> PathBuf {
-    // Short leaf: this directory holds `hub.sock`, and `sun_path` is capped at
-    // `SUN_LEN`, so a deep `TMPDIR` must still leave room for the socket.
-    let dir = std::env::temp_dir().join(format!("swe-{}", common::unique_token("hub")));
+    let dir = std::env::temp_dir().join(common::scratch_name("hub"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch hub dir");
     dir
@@ -174,7 +175,7 @@ async fn two_clients_share_one_daemon() {
     let daemon = HubServer::new(server(), config);
     let task = tokio::spawn(async move { daemon.run().await });
 
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     wait_for_socket(&socket).await;
     let (mut a, mut b) = tokio::join!(Client::connect(&socket), Client::connect(&socket));
     let (init_a, init_b) = tokio::join!(a.call("initialize"), b.call("initialize"),);
@@ -204,7 +205,7 @@ async fn second_daemon_defers_to_the_lock_holder() {
         let held = first.run().await.expect("first daemon runs");
         *flag.lock().await = held;
     });
-    wait_for_socket(&dir.join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket()).await;
     let second = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 60));
     assert!(!second.run().await.expect("lock query runs"));
 
@@ -233,7 +234,7 @@ async fn a_starting_daemon_waits_out_a_shutting_down_predecessor() {
         drop(lock);
     });
 
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     let probe = socket.clone();
     tokio::time::timeout(std::time::Duration::from_secs(8), wait_for_socket(&probe))
         .await
@@ -251,7 +252,7 @@ async fn a_starting_daemon_waits_out_a_shutting_down_predecessor() {
 async fn idle_daemon_removes_its_socket() {
     let dir = scratch_dir();
     let daemon = HubServer::new(server(), HubConfig::new(hub_paths_for_test(&dir), 1));
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     let probe = socket.clone();
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&probe).await;
@@ -372,7 +373,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        hub_dir.join("hub.sock").exists(),
+        mini_swe_mcp::hub::HubPaths::new(hub_dir.to_path_buf())
+            .socket()
+            .exists(),
         "first call auto-starts the daemon"
     );
     let first_log =
@@ -543,7 +546,9 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !bare.path().join("hub.sock").exists(),
+        !mini_swe_mcp::hub::HubPaths::new(bare.path().to_path_buf())
+            .socket()
+            .exists(),
         "MINI_SWE_NO_DAEMON=1 creates no socket"
     );
 }
@@ -708,7 +713,7 @@ async fn a_hub_connection_only_controls_its_own_workers() {
     let dir = scratch_dir();
     let daemon = HubServer::new(server, HubConfig::new(hub_paths_for_test(&dir), 60));
     let task = tokio::spawn(async move { daemon.run().await });
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     wait_for_socket(&socket).await;
 
     // Agent B: an ordinary orchestrator, identified by its hello.
@@ -910,7 +915,11 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         .spawn()
         .expect("spawn recovery daemon");
     for _ in 0..100 {
-        if std::os::unix::net::UnixStream::connect(hub.join("hub.sock")).is_ok() {
+        if std::os::unix::net::UnixStream::connect(
+            mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf()).socket(),
+        )
+        .is_ok()
+        {
             break;
         }
         assert!(
@@ -920,7 +929,9 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert!(
-        hub.join("hub.sock").exists(),
+        mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf())
+            .socket()
+            .exists(),
         "daemon must listen after recovery"
     );
     let entry: WorkerRegistryEntry = serde_json::from_slice(
@@ -1032,7 +1043,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    wait_for_socket(&hub.join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf()).socket()).await;
     let out = command()
         .args([
             "dispatch",
@@ -1104,7 +1115,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    wait_for_socket(&hub.join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.to_path_buf()).socket()).await;
     let recovered = wait_for_registry_status(
         &swe.join("swe-registry"),
         wid,
@@ -1305,7 +1316,7 @@ async fn events_are_owner_scoped_and_replayed_after_hello() {
         HubConfig::new(hub_paths_for_test(&dir), 60),
     );
     let task = tokio::spawn(async move { daemon.run().await });
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     wait_for_socket(&socket).await;
     let mut a = Client::connect(&socket).await;
     let mut b = Client::connect(&socket).await;
@@ -1415,7 +1426,7 @@ async fn shutdown_refuses_running_and_paused_workers_then_stops_when_idle() {
         HubConfig::new(hub_paths_for_test(&dir), 60),
     );
     let task = tokio::spawn(async move { daemon.run().await });
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     wait_for_socket(&socket).await;
     let mut client = Client::connect(&socket).await;
     let hello = client
@@ -1521,7 +1532,7 @@ fn a_replacing_client_waits_for_the_predecessor_to_release_the_lock() {
     let _reaper = DaemonReaper(hub.path().to_path_buf());
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = hub.path().join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket();
     let lock_path = hub.path().join("hub.lock");
     let listener = UnixListener::bind(&socket).expect("bind the fake predecessor");
     let fake = std::thread::spawn(move || {
@@ -1615,7 +1626,8 @@ async fn run_list_twice_with_client_build_skew(build_skew_nanos: i128) -> String
 
     // The daemon's own clock is the reference, whatever this test binary was
     // itself compiled with.
-    let mut probe = Client::connect(&hub.path().join("hub.sock")).await;
+    let mut probe =
+        Client::connect(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
     let hello = probe
         .request("hub/hello", serde_json::json!({"agent_id": "build-probe"}))
         .await;
@@ -1678,7 +1690,7 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
         HubConfig::new(hub_paths_for_test(&dir), 60),
     );
     let task = tokio::spawn(async move { daemon.run().await });
-    wait_for_socket(&dir.join("hub.sock")).await;
+    wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket()).await;
     let mut command = tokio::process::Command::new(common::binary_path());
     command
         .args(["list", "--json"])
@@ -1697,7 +1709,11 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
         1,
         "{stderr}"
     );
-    assert!(dir.join("hub.sock").exists());
+    assert!(
+        mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf())
+            .socket()
+            .exists()
+    );
 
     // The same (client build, hub build) pair stays quiet on the next command:
     // remembering it is what stops the warning repeating every command.
@@ -1780,7 +1796,7 @@ async fn a_blocked_steer_does_not_delay_shutdowns_answer() {
         HubConfig::new(hub_paths_for_test(&dir), 60),
     );
     let task = tokio::spawn(async move { daemon.run().await });
-    let socket = dir.join("hub.sock");
+    let socket = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).socket();
     wait_for_socket(&socket).await;
     let mut waiter = Client::connect(&socket).await;
     waiter
@@ -1838,7 +1854,9 @@ fn a_client_degrades_gracefully_against_a_pre_handshake_hub() {
         std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700))
             .expect("restrict the hub dir to 0700");
     }
-    let listener = UnixListener::bind(hub.path().join("hub.sock")).expect("bind the fake hub");
+    let listener =
+        UnixListener::bind(mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket())
+            .expect("bind the fake hub");
     let fake = std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept the client");
         let mut writer = stream.try_clone().expect("clone the stream");
@@ -1908,7 +1926,9 @@ fn a_hub_without_a_build_field_falls_back_to_the_release() {
                 .expect("restrict the hub dir to 0700");
         }
         let version = version.to_string();
-        let listener = UnixListener::bind(hub.path().join("hub.sock")).expect("bind the fake hub");
+        let listener =
+            UnixListener::bind(mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket())
+                .expect("bind the fake hub");
         let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept the client");
             let mut writer = stream.try_clone().expect("clone the stream");
@@ -1980,5 +2000,39 @@ fn a_hub_without_a_build_field_falls_back_to_the_release() {
     assert!(
         methods.contains(&("hub/shutdown".to_string(), true)),
         "{methods:?}"
+    );
+}
+
+/// A hub directory deep enough that `<dir>/hub.sock` exceeds the Unix socket
+/// path limit (108 bytes) still works: the socket moves to a short private
+/// fallback directory that the daemon and the client both derive.
+#[test]
+fn a_deep_hub_dir_still_gets_a_working_socket() {
+    let base = common::TempDir::new_in_tmp("hub-deep");
+    let deep = base
+        .path()
+        .join("a-rather-long-directory-name-to-push-the-socket-path")
+        .join("past-the-unix-socket-path-limit-of-one-hundred-and-eight-bytes");
+    std::fs::create_dir_all(&deep).expect("create the deep hub dir");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(
+        deep.join("hub.sock").as_os_str().len() > 108,
+        "the test path must be too long"
+    );
+    let out = common::binary_command(&common::binary_path())
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", &deep)
+        .env("SWE_TEMP_DIR", base.subdir("swe"))
+        .env("HUB_IDLE_SECS", "1")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .output()
+        .expect("run the CLI");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
