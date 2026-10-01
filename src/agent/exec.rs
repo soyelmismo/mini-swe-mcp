@@ -164,8 +164,27 @@ impl AgentRunner {
                 // no wrapper when the seccomp filter denies INET sockets; if
                 // this kernel could not install one, the network namespace
                 // still enforces the policy rather than silently dropping it.
-                let network_denied =
-                    apply_kernel_confinement(&mut cmd, dir, sandbox_target, self.network_offline);
+                let network_denied = match apply_kernel_confinement(
+                    &mut cmd,
+                    dir,
+                    sandbox_target,
+                    self.network_offline,
+                ) {
+                    Ok(denied) => denied,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %format!("{e:#}"),
+                            worktree = %dir.display(),
+                            "sandbox could not be prepared; refusing to run the command"
+                        );
+                        return Ok((
+                            format!(
+                                "BLOCKED: the sandbox could not be prepared ({e:#}); the command was not run."
+                            ),
+                            Some(1),
+                        ));
+                    }
+                };
                 let final_command = if network_denied {
                     command.to_string()
                 } else {
@@ -410,21 +429,15 @@ fn apply_kernel_confinement(
     dir: &Path,
     target_dir: &Path,
     offline: bool,
-) -> bool {
+) -> Result<bool> {
     // Parent side of the hook: everything that allocates happens here, so the
     // closure below is reduced to syscalls. A `None` plan means this host
-    // cannot confine the process, which is not an error.
-    let confinement = match KernelConfinement::prepare(dir, target_dir, offline) {
-        Ok(Some(confinement)) => confinement,
-        Ok(None) => return false,
-        Err(e) => {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                worktree = %dir.display(),
-                "kernel confinement unavailable; running the command unconfined"
-            );
-            return false;
-        }
+    // cannot confine the process, which is not an error. A plan that cannot be
+    // built (the worktree or the target dir is gone) fails CLOSED: the command
+    // is not run rather than run without the confinement it was promised.
+    let confinement = match KernelConfinement::prepare(dir, target_dir, offline)? {
+        Some(confinement) => confinement,
+        None => return Ok(false),
     };
     let network_denied = offline && confinement.has_seccomp();
 
@@ -438,7 +451,7 @@ fn apply_kernel_confinement(
             confinement.apply()
         });
     }
-    network_denied
+    Ok(network_denied)
 }
 
 /// Non-unix stub: no Landlock LSM, no seccomp and no `fork` to hook.
@@ -448,8 +461,8 @@ fn apply_kernel_confinement(
     _dir: &Path,
     _target_dir: &Path,
     _offline: bool,
-) -> bool {
-    false
+) -> Result<bool> {
+    Ok(false)
 }
 
 /// Baseline child setup: kill the process group on drop, detach stdin, capture
@@ -1720,10 +1733,23 @@ mod tests {
         let started = std::time::Instant::now();
         let (out, code) = runner()
             .with_command_timeout(1)
-            .execute_bash(&tmp, "echo BEFORE-LEAK; (setsid sleep 300 &); sleep 300")
+            .execute_bash(
+                &tmp,
+                "echo BEFORE-LEAK; (setsid sleep 300 & echo $! > leaked.pid); sleep 300",
+            )
             .await
             .expect("a leaked pipe must not turn the timeout into a hang");
         let elapsed = started.elapsed();
+        // The detached sleeper is the point of the test, but it must not
+        // outlive it: the harness audit rightly reports a suite that leaves
+        // processes behind.
+        if let Some(pid) = std::fs::read_to_string(tmp.join("leaked.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
 
         assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "{out:?}");
         assert!(
@@ -2049,6 +2075,31 @@ mod tests {
         assert!(out.contains("scratch-ok"), "{out:?}");
     }
 
+    /// A sandbox that cannot be prepared (here: the worktree no longer exists)
+    /// fails closed: the command is refused, never run unconfined.
+    #[tokio::test]
+    async fn a_missing_worktree_refuses_the_command_instead_of_running_it_unconfined() {
+        if select_backend() != SandboxBackend::Kernel {
+            eprintln!("skipping: the kernel backend is not in use on this host");
+            return;
+        }
+        let gone =
+            crate::worktree::swe_base_dir().join(format!("exec-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+        let marker = std::env::temp_dir().join(format!("exec-gone-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let (out, code) = runner()
+            .execute_bash(&gone, &format!("touch {}", marker.display()))
+            .await
+            .expect("a refused command is ordinary output");
+        assert_eq!(code, Some(1), "{out:?}");
+        assert!(
+            out.contains("BLOCKED: the sandbox could not be prepared"),
+            "{out:?}"
+        );
+        assert!(!marker.exists(), "the command must not have run");
+    }
+
     /// Run a python snippet under the kernel backend and return its stdout.
     ///
     /// Python's `ctypes` issues raw syscalls, which is the only way to check
@@ -2057,7 +2108,8 @@ mod tests {
     async fn run_confined_python(offline: bool, tag: &str, script: &str) -> String {
         let scratch = LandlockScratch::new(tag);
         let mut cmd = Command::new("python3");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, offline);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, offline)
+            .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(script);
         let out = cmd
             .output()
@@ -2170,7 +2222,8 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
     async fn a_command_runs_while_the_landlock_hook_is_installed() {
         let scratch = LandlockScratch::new("runs");
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
+            .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("echo confined-and-alive");
 
         let out = cmd
@@ -2242,7 +2295,8 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         );
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
+            .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(&probe);
         let out = cmd.output().await.expect("spawn the confined probe");
 
@@ -2296,13 +2350,15 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false);
+        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false)
+            .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("true");
         let _ = cmd.output().await.expect("spawn");
 
         // The child could not have read it...
         let mut child = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut child, &scratch.worktree, &scratch.target, false);
+        apply_kernel_confinement(&mut child, &scratch.worktree, &scratch.target, false)
+            .expect("prepare the kernel confinement");
         child.arg("-c").arg(format!("cat {}", outside.display()));
         let out = child.output().await.expect("spawn");
         assert!(

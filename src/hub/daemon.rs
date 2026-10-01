@@ -107,8 +107,27 @@ impl HubPaths {
     }
 
     /// The Unix socket clients connect to.
+    ///
+    /// A Unix socket path must fit in `sun_path` (108 bytes on Linux). When
+    /// `<hub dir>/hub.sock` is longer - a deep `SWE_HUB_DIR` or `TMPDIR` - the
+    /// socket lives in a short private directory derived from the hub dir
+    /// instead (`/tmp/mswe-<uid>-<hash>`, created 0700 and owner-checked like
+    /// the hub dir), so the daemon and every client still agree on one path.
     pub fn socket(&self) -> PathBuf {
-        self.dir.join("hub.sock")
+        let natural = self.dir.join("hub.sock");
+        if natural.as_os_str().len() < MAX_SOCKET_PATH {
+            return natural;
+        }
+        let short = PathBuf::from(format!(
+            "/tmp/mswe-{}-{:016x}",
+            current_uid(),
+            fnv1a(self.dir.as_os_str().as_encoded_bytes())
+        ));
+        match harden_hub_dir(short) {
+            Ok(dir) => dir.join("hub.sock"),
+            // Binding the natural path then fails with a clear error.
+            Err(_) => natural,
+        }
     }
 
     /// The lock file serialising daemons on this directory.
@@ -139,6 +158,16 @@ pub fn hub_dir() -> Result<PathBuf> {
     }
     let dir = crate::worktree::swe_base_dir().join(format!("mini-swe-hub-{}", current_uid()));
     harden_hub_dir(dir)
+}
+
+/// Longest socket path used as-is, below Linux's 108-byte `sun_path`.
+const MAX_SOCKET_PATH: usize = 100;
+
+/// FNV-1a: a stable short name for a hub dir's fallback socket directory.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// This process's uid.
@@ -408,6 +437,12 @@ impl HubServer {
             info!(workers = killed, "Terminated workers on hub shutdown");
         }
         let _ = std::fs::remove_file(&socket);
+        // A socket moved to a short fallback directory takes it along.
+        if let Some(parent) = socket.parent()
+            && parent != paths.dir()
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
         append_log(&paths.log(), "stopped");
         drop(lock);
         debug!("Hub daemon stopped");

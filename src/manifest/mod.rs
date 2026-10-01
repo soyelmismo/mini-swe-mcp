@@ -7,6 +7,8 @@
 //!   and the process-wide constants that bound them.
 //! * `catalog` — the markdown catalog rendering used by the MCP `tools/list`
 //!   payload ([`ModelManifest::build_tool_description`]).
+//! * `instructions` — the repository's standard instruction files (`AGENTS.md`,
+//!   `CLAUDE.md`, …) loaded into a worker's system prompt.
 //! * `memory` — the persistent per-role memory (`.agents/memory/<alias>.md`)
 //!   loaded into a worker's system prompt.
 //! * `rules` — the accept/reject rules for the optional declarative execution
@@ -26,6 +28,7 @@ use tracing::{error, info, warn};
 use crate::config::xdg_config_dir;
 
 mod catalog;
+mod instructions;
 mod memory;
 mod rules;
 mod types;
@@ -35,6 +38,7 @@ mod validate;
 mod tests;
 
 pub use self::catalog::build_system_prompt;
+pub use self::instructions::{INSTRUCTION_FILES, MAX_INSTRUCTIONS_PROMPT_BYTES};
 pub use self::memory::{MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory};
 pub use self::types::{
     BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT, ModelDefinition,
