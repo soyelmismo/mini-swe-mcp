@@ -957,7 +957,7 @@ impl EventRouter {
                 anyhow::bail!("Worker not found: {id}");
             }
         }
-        let mut watching: BTreeSet<String> = self
+        let watching: BTreeSet<String> = self
             .watch_current
             .values()
             .filter(|v| {
@@ -1016,11 +1016,6 @@ impl EventRouter {
                     events.push(v.clone());
                 }
             }
-        }
-        // A caller that resumes with no live ids must not start watching new
-        // dispatches made after its original selection.
-        if !initial && ids.is_empty() {
-            watching.clear();
         }
         Ok(json!({"watching":watching,"events":events}))
     }
