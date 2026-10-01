@@ -578,7 +578,15 @@ pub fn retire_worker_reporting(
     // that goes -- by the sweep, or by the next merge.
     let mut row_removed = false;
     if !ctx.keep_branch {
-        row_removed = super::remove_registry_entry_in(root, worker_id);
+        super::remove_registry_entry_in(root, worker_id);
+        // Retirement is idempotent, so the reported fact is that no row
+        // *remains* -- not that this call found one to delete. A concurrent
+        // reader can prune a terminal row in the window between the branch
+        // deletion and here (the registry's own `branch_exists` probe drops a
+        // terminal row whose branch is gone), and reporting "nothing removed"
+        // then would drop this worker from the merge report, leaving its watch
+        // acknowledgement and replay state behind.
+        row_removed = super::load_registry_entry_in(root, worker_id).is_none();
         if let Some(dir) = ctx.ack_dir {
             crate::mcp::events::forget_watch_acks(dir, worker_id);
         }
@@ -612,9 +620,16 @@ pub fn sweep_retired_workers() -> RetireSweep {
 pub struct RetireSweep {
     /// Workers whose branch is merged into its base, retired with it.
     pub workers: Vec<String>,
-    /// History, steer or steer-source files with neither a registry row nor a
-    /// branch to go with them.
+    /// Files with neither a registry row nor a branch to go with them.
     pub orphans: usize,
+    /// The workers whose *companion files* the orphan scan reclaimed, including
+    /// ones that already had no row.
+    ///
+    /// Reported separately from `workers` because the reclamation is what makes
+    /// them retired: such a worker has no row left to consult, so without this
+    /// list its watch acknowledgement and replay state would survive a file
+    /// deletion that already happened.
+    pub orphan_workers: Vec<String>,
 }
 
 /// Retire every worker that is already integrated, and delete the leftovers of
@@ -688,7 +703,9 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
             sweep.workers.push(id.clone());
         }
     }
-    sweep.orphans = remove_orphan_worker_files(root);
+    let (orphans, orphan_workers) = remove_orphan_worker_files(root);
+    sweep.orphans = orphans;
+    sweep.orphan_workers = orphan_workers;
     sweep
 }
 
@@ -794,7 +811,7 @@ fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {
 ///
 /// Bounded: the branch set is read once per repository, not once per file, and
 /// only the metadata line of a history is read.
-fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
+fn remove_orphan_worker_files(root: &ScratchRoot) -> (usize, Vec<String>) {
     let live: std::collections::HashSet<String> = super::load_registry_entries_read_only_in(root)
         .into_iter()
         .map(|entry| entry.id)
@@ -832,6 +849,7 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
         Option<std::collections::HashSet<String>>,
     > = std::collections::HashMap::new();
     let mut removed = 0;
+    let mut reclaimed: Vec<String> = Vec::new();
     for (id, path) in files {
         if live.contains(&id) {
             continue;
@@ -875,7 +893,12 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
             continue;
         }
         match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
+            Ok(()) => {
+                removed += 1;
+                if !reclaimed.contains(&id) {
+                    reclaimed.push(id.clone());
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!(
                 path = %path.display(),
@@ -884,7 +907,8 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
             ),
         }
     }
-    removed
+    reclaimed.sort();
+    (removed, reclaimed)
 }
 
 /// Retire the durable state of every terminal worker whose retention expired.
