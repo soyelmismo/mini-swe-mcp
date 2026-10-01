@@ -64,28 +64,62 @@ fn test_cli_help_flag() {
             stdout.contains("watch [<worker_id>...]"),
             "help missing the watch usage: {stdout}"
         );
-        // The orchestrator guidelines live where every orchestrator reads them.
+        // Long-form guidance moved to the `help <topic>` topics; `--help` only
+        // indexes them.
         assert!(
-            stdout.contains("Workflow:"),
-            "help missing the workflow section: {stdout}"
+            stdout.contains("mini-swe-mcp help <topic>"),
+            "help must point at the topics: {stdout}"
         );
-        assert!(
-            stdout.contains("ONE focused concern"),
-            "help missing the task guidance: {stdout}"
-        );
-        assert!(
-            stdout.contains("many workers at once is the intended use"),
-            "help must encourage parallel dispatch: {stdout}"
-        );
-        assert!(
-            stdout.contains("mini-swe-mcp watch"),
-            "help must name watch: {stdout}"
-        );
+        for topic in ["workflow", "watch", "steer", "identity", "sandbox", "env"] {
+            assert!(
+                stdout.contains(topic),
+                "help must list the '{topic}' topic: {stdout}"
+            );
+        }
         assert!(
             stdout.contains("watch [<worker_id>...]"),
             "help missing the watch usage: {stdout}"
         );
     }
+}
+
+/// `mini-swe-mcp help <topic>` prints the long-form guidance the MCP tool
+/// description points at; an unknown topic is refused with the available list.
+#[test]
+fn test_cli_help_topics() {
+    let exe = binary_path();
+    for (topic, needle) in [
+        ("workflow", "ONE focused concern"),
+        ("watch", "mini-swe-mcp watch"),
+        ("steer", "worker-<id>"),
+        ("identity", "own workers"),
+        ("sandbox", "offline"),
+        ("env", "OPENAI_API_KEY"),
+    ] {
+        let output = common::binary_command(&exe)
+            .env("MINI_SWE_NO_DAEMON", "1")
+            .args(["help", topic])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+        assert!(output.status.success(), "help {topic} failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(needle),
+            "help {topic} must mention {needle}: {stdout}"
+        );
+    }
+
+    let output = common::binary_command(&exe)
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .args(["help", "nope"])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+    assert!(!output.status.success(), "an unknown topic must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workflow"),
+        "an unknown topic must list the topics: {stderr}"
+    );
 }
 
 /// `--version`/`-V` and `--help`/`-h` must be handled *before* any API-key
