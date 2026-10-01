@@ -633,3 +633,22 @@ fn workers_of_two_repositories_are_refused() {
     assert!(git_ref_exists(f.repo(), "worker-w1"), "nothing was merged");
     let _ = PathBuf::from(other.path());
 }
+
+/// A missing recorded command is not agreement with another worker's command.
+#[test]
+fn one_missing_verify_requires_a_project_gate() {
+    let f = Fixture::new("batch-missing-verify");
+    f.commit_on_worker_branch("w1", "w1.txt", "one\n");
+    f.commit_on_worker_branch("w2", "w2.txt", "two\n");
+    f.approved_worker("w1", "agent-a", Some("true"));
+    f.approved_worker("w2", "agent-a", None);
+    let err = f
+        .merge_approved(Some("agent-a"), None)
+        .expect_err("missing command is not agreement");
+    assert!(
+        err.to_string()
+            .contains("record no verify command they agree on"),
+        "{err}"
+    );
+    assert!(f.merge_subjects().is_empty());
+}

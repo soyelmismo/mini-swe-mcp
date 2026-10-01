@@ -243,6 +243,17 @@ history push + in-memory state + registry row
     Exit 0 completes the run as verified; a non-zero exit pushes the output back to the
     model as `VERIFICATION FAILED` for another turn. After three failures the worker
     completes anyway, flagged unverified — the gate is a floor, not a dead end.
+- **A command that outlives its budget becomes a background job, not a corpse.** The step
+  timeout no longer kills a running command (`agent/jobs.rs`): the process group keeps
+  running, its output keeps streaming to a capped log in the worker's private scratch, and the
+  turn is answered with the job number. `echo WAIT_JOB <n>` blocks for up to 600 s without
+  spending a turn and then reports the exit code plus the bounded tail; `echo KILL_JOB <n>`
+  stops it. A job is confined exactly like the command that started it — same sandbox, same
+  build-dir lease, same process group, so the reap sweep still reaches it — and the
+  heavy-command admission permit moves into the job, so a job never outlives the build slot it
+  was admitted with. An absolute ceiling (45 min, `JOB_MAX_SECS`) and the end of the worker
+  both kill it. This replaces the `nohup … &` plus `sleep`-polling loop that cost one turn per
+  poll.
 - **Health metrics.** `WorkerMeta.metrics` carries the per-worker counters (turns used,
   extensions granted/refused, repeat blocks, stagnation nudges, loop pauses, verify runs and
   failures, final diff size). They move at the point each guard fires and are written with
@@ -382,10 +393,14 @@ bash real
   removing the transient 2-3x serialization spike a full 150-turn history used
   to cost per request.
 - **Bounded lifetime**: `WORKER_TERMINAL_TTL_SECS` (default 300) evicts
-  `Completed` / `Failed` records — with their registry rows — via a background
-  reaper and lazily on the next `dispatch`. Fresh terminal records are kept, so
-  a `collect` immediately after `wait: true` still resolves. `Running` and
-  `Paused` records are never expired.
+  `Completed` / `Failed` records via a background reaper and lazily on the next
+  `dispatch`. Fresh terminal records are kept, so a `collect` immediately after
+  `wait: true` still resolves. `Running` and `Paused` records are never
+  expired. The TTL bounds *memory* only: the evicted record leaves its registry
+  row and its saved conversation in place, because a finished worker stays
+  steerable for as long as its branch does. Those are retired by
+  `WORKER_RETENTION_SECS` (default 7 days), or by `prune` once the branch is
+  gone — never by the in-memory eviction.
 - **No silent degradation**: `total_steps`, `logs_retained`, `logs_omitted` and
   `logs_dropped` are reported on every log-bearing response, with a
   `logs_truncation_notice` whenever history is missing.

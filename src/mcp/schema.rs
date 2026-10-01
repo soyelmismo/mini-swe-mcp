@@ -15,8 +15,20 @@ use crate::manifest::ModelManifest;
 /// enum derives from it, the dispatcher matches on it, and the CLI's
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
-    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
-    "manifest", "prune", "merge",
+    "dispatch",
+    "status",
+    "steer",
+    "watch",
+    "collect",
+    "review",
+    "logs",
+    "list",
+    "kill",
+    "reap",
+    "manifest",
+    "prune",
+    "merge",
+    "consolidate",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -47,7 +59,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs'. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -68,7 +80,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static("Action to perform; see `mini-swe-mcp help <topic>`."),
+        DescriptionSource::Static("Action to perform; the enum lists every verb."),
     ),
     (
         "task",
@@ -106,7 +118,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'kill'.",
+            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for every verb that targets one worker.",
         ),
     ),
     (
@@ -118,21 +130,21 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches every worker you own.",
+            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
         ),
     ),
     (
         "group",
         "string",
         DescriptionSource::Static(
-            "Only workers of this group. Optional for 'watch' and 'merge --approved'.",
+            "Only workers of this group. For 'watch' and 'merge --approved'.",
         ),
     ),
     (
@@ -153,7 +165,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash exploration turns (overrides the manifest default). On 'steer', the fresh budget when continuing a stopped worker.",
+            "Maximum bash exploration turns (overrides the manifest default). On 'steer', the budget when continuing a stopped worker.",
         ),
     ),
     (
@@ -165,21 +177,21 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model that audits and finalizes the worktree after implementation.",
+            "Optional reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured. Omit to auto-detect; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate. Consolidated round: give workers the cheap gate.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
+            "Listing scope for 'list': 'mine' (default) or 'all' (needs the admin override).",
         ),
     ),
     (

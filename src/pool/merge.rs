@@ -601,7 +601,12 @@ async fn run_gate_confined(
     // The bash path never dials the API, so the transport fields are unused;
     // only the confinement, environment and build directory matter here.
     let mut runner = AgentRunner::new(String::new(), String::new(), String::new(), None)
-        .with_extra_env(client_env.to_vec());
+        .with_extra_env(client_env.to_vec())
+        // The gate is run by the harness, not the model, so it must never
+        // become a background job; its budget is the absolute job ceiling, so a
+        // slow gate takes longer instead of failing.
+        .without_job_conversion()
+        .with_command_timeout(crate::agent::jobs::job_max_secs());
     runner.build_target_dir = Some(build_dir);
     let (text, code) = runner.execute_bash(gate_dir, command).await?;
     Ok((code, text))
@@ -1041,7 +1046,9 @@ fn shared_gate_command(repo: &Path, included: &[&(String, Resolved)]) -> Result<
     }
     recorded
         .first()
-        .filter(|_| recorded.len() == 1)
+        .filter(|_| {
+            recorded.len() == 1 && included.iter().all(|(_, worker)| worker.verify.is_some())
+        })
         .map(|command| (*command).to_string())
         .or_else(|| super::detect_verify_command(repo))
         .ok_or_else(|| {
@@ -1075,10 +1082,21 @@ fn attribute_failures(
 ) -> String {
     let mut owners: Vec<(String, Vec<String>)> = Vec::new();
     for (id, worker) in included {
-        let Ok(files) = touched_files(repo, base_branch, &worker.branch) else {
+        let Some(forked) = merge_base_of(repo, base_branch, &worker.branch) else {
             continue;
         };
-        for path in files {
+        let Ok(diff) = git(
+            repo,
+            "diff --name-only",
+            &["diff", "--name-only", "-z", &forked, &worker.branch],
+        ) else {
+            continue;
+        };
+        for path in String::from_utf8_lossy(&diff.stdout)
+            .split(' ')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+        {
             match owners.iter_mut().find(|(known, _)| *known == path) {
                 Some((_, ids)) => {
                     if !ids.contains(id) {
