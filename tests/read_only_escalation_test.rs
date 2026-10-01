@@ -53,11 +53,7 @@ impl Thresholds {
             .iter()
             .map(|name| (*name, std::env::var(name).ok()))
             .collect();
-        for (name, value) in [
-            (names[0], "2"),
-            (names[1], "3"),
-            (names[2], "4"),
-        ] {
+        for (name, value) in [(names[0], "2"), (names[1], "3"), (names[2], "4")] {
             unsafe { std::env::set_var(name, value) };
         }
         Self {
@@ -155,10 +151,7 @@ fn bash_turn(call_id: &str, command: &str) -> String {
 
 /// The completion turn, carrying the REPORT block the system prompt requires.
 fn completion_turn(call_id: &str) -> String {
-    bash_turn(
-        call_id,
-        &format!("echo {COMPLETION_SENTINEL}"),
-    )
+    bash_turn(call_id, &format!("echo {COMPLETION_SENTINEL}"))
 }
 
 async fn write_sse(socket: &mut TcpStream, turn: Option<&str>) {
@@ -220,8 +213,7 @@ struct TestRepo {
 
 impl TestRepo {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir()
-            .join(common::unique_suffix(&format!("read-only-{tag}")));
+        let dir = std::env::temp_dir().join(common::unique_suffix(&format!("read-only-{tag}")));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch repo");
         let dir = dir.canonicalize().expect("canonicalize scratch repo");
@@ -336,7 +328,9 @@ async fn dispatch(pool: &WorkerPool, repo: &Path, max_turns: usize) -> String {
 async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
     let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("escalate");
-    let mut turns: Vec<String> = (1..=8).map(|n| bash_turn(&format!("call_{n}"), &read_turn(n))).collect();
+    let mut turns: Vec<String> = (1..=8)
+        .map(|n| bash_turn(&format!("call_{n}"), &read_turn(n)))
+        .collect();
     turns.push(completion_turn("call_done"));
     let server = ScriptedServer::spawn(turns).await;
 

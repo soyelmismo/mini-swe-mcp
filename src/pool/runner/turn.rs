@@ -361,6 +361,10 @@ impl ReadOnlyStreak {
     /// Remember one command of the streak, keeping the newest few distinct
     /// summaries: the pause question quotes them back, and an unbounded list
     /// would grow with every turn a worker only reads.
+    ///
+    /// Folded in by [`ReadOnlyStreak::record`] rather than at execution time:
+    /// the detector runs before this turn's command is registered, so a pause
+    /// it raises would otherwise report that nothing had been read.
     fn note_command(&mut self, command: &str) {
         let summary = summarize_command(command);
         if summary.is_empty() {
@@ -388,10 +392,11 @@ impl ReadOnlyStreak {
 }
 
 impl ReadOnlyStreak {
-    /// Fold one turn's repository sample in and report the nudge, if any, it
-    /// earns. Each of the three thresholds fires once per streak and in order,
-    /// so a streak of unchanged worktree reaches the plan and then the pause
-    /// no matter where its thresholds sit.
+    /// Fold one turn's repository sample in, remember the command the turn
+    /// ran, and report the nudge, if any, the streak has earned. Each of the
+    /// three thresholds fires once per streak and in order, so a streak of
+    /// unchanged worktree reaches the plan and then the pause no matter where
+    /// its thresholds sit.
     ///
     /// `None` is a sample git could not answer: it is not evidence of progress,
     /// so it neither extends nor resets the streak.
@@ -399,13 +404,16 @@ impl ReadOnlyStreak {
         &mut self,
         sample: Option<String>,
         limits: ReadOnlyThresholds,
+        command: &str,
     ) -> Option<ReadOnlyNudge> {
+        self.note_command(command);
         let sample = sample?;
         if self.last_sample.as_deref() != Some(sample.as_str()) {
             self.read_only_turns = 0;
             self.nudged = false;
             self.planned = false;
             self.paused = false;
+            self.recent_commands.clear();
             self.last_sample = Some(sample);
             return None;
         }
@@ -628,7 +636,6 @@ impl ProgressWatch {
     /// turns it repeats, or `None` when it is a fresh command.
     fn register_command(&mut self, command: &str) -> Option<usize> {
         let command = command.trim();
-        self.read_only.note_command(command);
         if self.last_command.as_deref() == Some(command) {
             self.repeat_blocks += 1;
             Some(self.repeat_blocks)
@@ -1809,7 +1816,11 @@ impl<'a> TurnEngine<'a> {
         sample: Option<String>,
         limits: ReadOnlyThresholds,
     ) -> Result<()> {
-        let Some(nudge) = self.watch.read_only.record(sample, limits) else {
+        // The detector runs before this turn's command is registered, so the
+        // command it is told about is the one the streak last read: the pause
+        // it may raise has to report what the worker spent its turns on.
+        let last_command = self.watch.last_command.clone().unwrap_or_default();
+        let Some(nudge) = self.watch.read_only.record(sample, limits, &last_command) else {
             return Ok(());
         };
         self.meta.metrics.stagnation_nudges += 1;
@@ -2334,56 +2345,56 @@ mod tests {
         let mut streak = ReadOnlyStreak::default();
         let same = || Some("head-a\nstat".to_string());
         // The first sample only fixes the baseline the next one is compared to.
-        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(streak.record(same(), limits, "cat README.md"), None);
         for turns in 1..limits.first {
             assert_eq!(
-                streak.record(same(), limits),
+                streak.record(same(), limits, "cat README.md"),
                 None,
                 "no nudge after only {turns} read-only turns"
             );
         }
         assert_eq!(
-            streak.record(same(), limits),
+            streak.record(same(), limits, "cat README.md"),
             Some(ReadOnlyNudge::First { read_only_turns: 3 })
         );
         // The first nudge is sent once, not on every following turn.
-        assert_eq!(streak.record(same(), limits), None);
-        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(streak.record(same(), limits, "cat README.md"), None);
+        assert_eq!(streak.record(same(), limits, "cat README.md"), None);
         assert_eq!(
-            streak.record(same(), limits),
+            streak.record(same(), limits, "cat README.md"),
             Some(ReadOnlyNudge::Plan { read_only_turns: 6 }),
             "the second threshold carries the plan"
         );
         for turns in 7..limits.pause {
             assert_eq!(
-                streak.record(same(), limits),
+                streak.record(same(), limits, "cat README.md"),
                 None,
                 "no pause after only {turns} read-only turns"
             );
         }
         assert_eq!(
-            streak.record(same(), limits),
+            streak.record(same(), limits, "cat README.md"),
             Some(ReadOnlyNudge::Pause { read_only_turns: 9 }),
             "the third threshold parks the worker on the orchestrator"
         );
         assert_eq!(
-            streak.record(same(), limits),
+            streak.record(same(), limits, "cat README.md"),
             None,
             "the pause is sent once per streak"
         );
         // An edit resets the streak, and the next streak nudges again: the
         // sample taken right after the edit is the new baseline.
         assert_eq!(
-            streak.record(Some("head-a\nedit".to_string()), limits),
+            streak.record(Some("head-a\nedit".to_string()), limits, "cat README.md"),
             None
         );
         // The first of these fixes the post-edit baseline; the rest are the
         // start of the new streak, still short of the threshold.
         for _ in 1..=limits.first {
-            assert_eq!(streak.record(same(), limits), None);
+            assert_eq!(streak.record(same(), limits, "cat README.md"), None);
         }
         assert_eq!(
-            streak.record(same(), limits),
+            streak.record(same(), limits, "cat README.md"),
             Some(ReadOnlyNudge::First { read_only_turns: 3 }),
             "after an edit the streak starts over and nudges again"
         );
@@ -2434,15 +2445,18 @@ mod tests {
             pause: 6,
         };
         let mut streak = ReadOnlyStreak::default();
-        assert_eq!(streak.record(Some("a".to_string()), limits), None);
-        assert_eq!(streak.record(None, limits), None);
         assert_eq!(
-            streak.record(Some("a".to_string()), limits),
+            streak.record(Some("a".to_string()), limits, "cat README.md"),
+            None
+        );
+        assert_eq!(streak.record(None, limits, "cat README.md"), None);
+        assert_eq!(
+            streak.record(Some("a".to_string()), limits, "cat README.md"),
             None,
             "the streak is at one turn, not two: the failed sample did not count"
         );
         assert_eq!(
-            streak.record(Some("a".to_string()), limits),
+            streak.record(Some("a".to_string()), limits, "cat README.md"),
             Some(ReadOnlyNudge::First { read_only_turns: 2 })
         );
     }
