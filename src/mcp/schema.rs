@@ -142,7 +142,9 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "group",
         "string",
-        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static(
+            "Only workers of this group; optional for 'watch', required for 'consolidate'.",
+        ),
     ),
     (
         "role",

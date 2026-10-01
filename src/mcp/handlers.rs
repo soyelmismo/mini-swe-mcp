@@ -438,6 +438,10 @@ impl McpServer {
         Ok(payload)
     }
 
+    /// How many not-ready workers a `consolidate` refusal names before it
+    /// truncates, so the message stays a line rather than a listing.
+    const MAX_REFUSED_WORKERS: usize = 8;
+
     /// `consolidate` action: dispatch the round's consolidator.
     ///
     /// The glue that makes a consolidated round hard to run wrong: the caller
@@ -472,10 +476,30 @@ impl McpServer {
         let repo_path = Self::get_repo_path(args, ctx);
         let manifest = self.pool.round_manifest(&agent, &group, &repo_path).await;
         if !manifest.has_ready() {
+            // Name what the group does hold: the usual cause is a worker that
+            // is still running, and the orchestrator needs to know which.
+            let waiting = if manifest.not_ready.is_empty() {
+                "every branch in it is already merged".to_string()
+            } else {
+                let listed: Vec<String> = manifest
+                    .not_ready
+                    .iter()
+                    .take(Self::MAX_REFUSED_WORKERS)
+                    .map(|worker| format!("{} ({})", worker.id, worker.state))
+                    .collect();
+                format!(
+                    "{} not ready: {}{}",
+                    manifest.not_ready.len(),
+                    listed.join(", "),
+                    if manifest.not_ready.len() > Self::MAX_REFUSED_WORKERS {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                )
+            };
             anyhow::bail!(
-                "group '{group}' has no completed, unmerged worker of yours to consolidate \
-                 ({} not ready)",
-                manifest.not_ready.len()
+                "group '{group}' has no completed, unmerged worker of yours to consolidate: {waiting}"
             );
         }
 
@@ -511,10 +535,9 @@ impl McpServer {
         if let Some(turns) = args.get("max_turns").and_then(|v| v.as_u64()) {
             dispatch.insert("max_turns".into(), Value::Number(turns.into()));
         }
-        let payload = self
+        let mut payload = self
             .dispatch_one(&Value::Object(dispatch), token, tx, ctx)
             .await?;
-        let mut payload = payload;
         if let Some(object) = payload.as_object_mut() {
             object.insert("group".into(), Value::String(group));
             object.insert("round".into(), Value::String(manifest.render()));

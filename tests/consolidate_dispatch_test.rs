@@ -394,6 +394,58 @@ fn an_already_merged_group_is_refused_too() {
     assert!(manifest.not_ready.is_empty(), "{manifest:?}");
 }
 
+/// The consolidator's built-in instructions name every verb of the round
+/// workflow, the review criteria and the report the orchestrator reads.
+#[test]
+fn the_consolidator_instructions_cover_the_whole_round_workflow() {
+    let text = mini_swe_mcp::agent::CONSOLIDATOR_INSTRUCTIONS;
+    for needle in [
+        "CONSOLIDATE_MERGE",
+        "CONSOLIDATE_STEER",
+        "CONSOLIDATE_WAIT",
+        "FULL gate once",
+        "REPORT <id> approved|returned|fixed:",
+        "RISK:",
+        "never weaken",
+        "sandbox, governance or identity",
+        "hermetic and meaningful",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the instructions must mention {needle}: {text}"
+        );
+    }
+}
+
+/// The task the consolidator is dispatched with carries the round it inherits,
+/// the one gate it must run, and the procedure it follows.
+#[test]
+fn the_consolidator_task_embeds_the_round_the_gate_and_the_procedure() {
+    let h = Harness::new("round-task");
+    let done = format!("w1-{}", unique_suffix("w"));
+    h.worker_branch(&done, &[("done.txt", "done\n")]);
+    h.row(
+        &done,
+        "done task",
+        RegistryStatus::Completed,
+        WorkerRole::Worker,
+        Some(GROUP),
+    );
+
+    let manifest = manifest(&h.pool.pool, OWNER, GROUP, h.path());
+    let task = manifest.task_text(Some("cargo test --all-targets"));
+    assert!(task.contains(&done), "the round's workers: {task}");
+    assert!(task.contains("done.txt"), "the files they touched: {task}");
+    assert!(
+        task.contains("Full gate for this round: `cargo test --all-targets`"),
+        "the gate it must run once: {task}"
+    );
+    assert!(
+        task.contains(mini_swe_mcp::agent::CONSOLIDATOR_INSTRUCTIONS),
+        "the procedure it follows: {task}"
+    );
+}
+
 /// The CLI turns `consolidate` argv into the same tool arguments the MCP path
 /// sends, and refuses a missing group rather than guessing one.
 #[test]
@@ -520,14 +572,4 @@ fn the_consolidate_help_topic_describes_the_round_workflow() {
         verify.contains("cheap gate"),
         "the verify description must point at the cheap worker gate: {verify}"
     );
-}
-
-#[test]
-fn temporary_size_probe() {
-    let server = mini_swe_mcp::mcp::McpServer::new(
-        mini_swe_mcp::pool::WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()),
-        "ninja".to_string(),
-    );
-    let bytes = serde_json::to_vec(&server.tools_list()).unwrap().len();
-    println!("TOOLS_LIST_BYTES {bytes}");
 }
