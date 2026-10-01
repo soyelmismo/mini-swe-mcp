@@ -17,9 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
-    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, LogBuffer, RegistryStatus, SteerOutcome,
-    WorkerHistory, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState, append_history_message_in,
-    history_log_path_in, load_registry_entry_in, load_worker_history_in,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_WORKER_RETIRED_GRACE_SECS, LogBuffer,
+    RegistryStatus, SteerOutcome, WorkerHistory, WorkerMetrics, WorkerPool, WorkerRecord,
+    WorkerState, append_history_message_in, history_log_path_in, load_registry_entry_in,
+    load_worker_history_in, prune_orphan_histories_with_retention_and_grace_in,
     prune_orphan_histories_with_retention_in, save_registry_entry_in,
 };
 
@@ -82,6 +83,21 @@ fn repo_with_branch(tag: &str, id: &str) -> PathBuf {
     dir
 }
 
+/// The trimmed stdout of one git command in `repo`, asserting it succeeded.
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// The replayable conversation a finished worker leaves behind.
 fn history(worker_id: &str, repo: &Path) -> WorkerHistory {
     WorkerHistory {
@@ -134,6 +150,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         metrics: WorkerMetrics::default(),
         base_branch: Some("master".into()),
         base_commit: Some("base".into()),
+        head_commit: None,
         revision: 1,
         auto_continues: 0,
         approved: None,
@@ -308,26 +325,33 @@ async fn collect_answers_from_the_registry_row_after_the_record_is_reaped() {
     drop(scratch);
 }
 
-/// The branch is what keeps a worker alive: once it is gone, `prune` retires
-/// the row and the conversation together.
+/// The branch is what keeps a worker alive, but its disappearance no longer
+/// retires the worker at once: the row and conversation survive the retired
+/// grace period so a reverted merge can still be continued, and go past it.
 #[tokio::test]
-async fn a_worker_whose_branch_is_gone_is_retired_by_prune() {
+async fn a_worker_whose_branch_is_gone_is_kept_through_its_grace_then_retired() {
     let scratch = Scratch::new("branchgone");
     let root = scratch.root();
     let repo = repo_with_branch("branchgone", "bg1");
     durable_state(&scratch, &repo, "bg1", RegistryStatus::Completed);
 
+    let prune = || {
+        prune_orphan_histories_with_retention_and_grace_in(
+            &root,
+            &repo,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            DEFAULT_WORKER_RETIRED_GRACE_SECS,
+        )
+    };
+
     // The branch is still there, so a prune keeps everything: an eviction is
     // not a reason to delete.
-    assert_eq!(
-        prune_orphan_histories_with_retention_in(&root, &repo, DEFAULT_TERMINAL_RETENTION_SECS),
-        0,
-        "a worker whose branch exists is not pruned"
-    );
+    assert_eq!(prune(), 0, "a worker whose branch exists is not pruned");
     assert!(load_registry_entry_in(&root, "bg1").is_some());
     assert!(history_log_path_in(&root, "bg1").exists());
 
-    // The branch is merged away: nothing can continue the worker now.
+    // The branch is merged away. Within the grace the row and conversation
+    // survive, so the worker can still be continued after a reverted merge.
     let out = std::process::Command::new("git")
         .current_dir(&repo)
         .args(["branch", "-D", "worker-bg1"])
@@ -335,18 +359,126 @@ async fn a_worker_whose_branch_is_gone_is_retired_by_prune() {
         .unwrap();
     assert!(out.status.success());
 
-    assert_eq!(
-        prune_orphan_histories_with_retention_in(&root, &repo, DEFAULT_TERMINAL_RETENTION_SECS),
-        1,
-        "a worker whose branch is gone is retired"
+    assert_eq!(prune(), 0, "the grace keeps the row and the conversation");
+    assert!(
+        load_registry_entry_in(&root, "bg1").is_some(),
+        "the row survives the branch within the grace"
     );
     assert!(
+        history_log_path_in(&root, "bg1").exists(),
+        "the conversation survives the branch within the grace"
+    );
+
+    // Past the grace (still inside the retention) the trace goes.
+    let mut aged = row("bg1", &repo, RegistryStatus::Completed);
+    aged.updated_at = mini_swe_mcp::pool::unix_timestamp() - DEFAULT_WORKER_RETIRED_GRACE_SECS - 1;
+    save_registry_entry_in(&root, &aged);
+
+    assert_eq!(prune(), 1, "a worker past its retired grace is retired");
+    assert!(
         load_registry_entry_in(&root, "bg1").is_none(),
-        "the row goes with the branch"
+        "the row goes with the grace"
     );
     assert!(
         !history_log_path_in(&root, "bg1").exists(),
-        "the conversation goes with the branch"
+        "the conversation goes with the grace"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    drop(scratch);
+}
+
+/// A merge pruned the branch, but the row and conversation survive the grace,
+/// so a continuation recreates `worker-<id>` from the head commit the
+/// completion recorded instead of failing "branch no longer exists".
+#[tokio::test]
+async fn a_continuation_recreates_a_pruned_branch_from_the_recorded_head() {
+    let scratch = Scratch::new("recreate");
+    let root = scratch.root();
+    let repo = repo_with_branch("recreate", "rc1");
+    let head = git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc1"]);
+    durable_state(&scratch, &repo, "rc1", RegistryStatus::Completed);
+    let mut recorded = row("rc1", &repo, RegistryStatus::Completed);
+    recorded.head_commit = Some(head.clone());
+    save_registry_entry_in(&root, &recorded);
+
+    let out = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["branch", "-D", "worker-rc1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        prune_orphan_histories_with_retention_and_grace_in(
+            &root,
+            &repo,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            DEFAULT_WORKER_RETIRED_GRACE_SECS,
+        ),
+        0,
+        "the grace keeps the pruned worker continuable"
+    );
+
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
+    let outcome = pool
+        .steer("rc1", "reapply the parser fix".into())
+        .await
+        .expect("a pruned branch within the grace must be continuable");
+    assert!(
+        matches!(outcome, SteerOutcome::Continuing { cold: false, .. }),
+        "the saved conversation is replayed: {outcome:?}"
+    );
+    assert_eq!(
+        git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc1"]),
+        head,
+        "the continuation recreated the branch at the recorded head"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    drop(scratch);
+}
+
+/// The observed failure: a cold worker (no saved conversation) whose branch
+/// was pruned. The row survives the grace, so the continuation rebuilds the
+/// branch from its recorded head and the conversation from the row.
+#[tokio::test]
+async fn a_cold_continuation_recreates_a_pruned_branch_from_the_recorded_head() {
+    let scratch = Scratch::new("recreatecold");
+    let root = scratch.root();
+    let repo = repo_with_branch("recreatecold", "rc2");
+    let head = git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc2"]);
+    let mut recorded = row("rc2", &repo, RegistryStatus::Completed);
+    recorded.head_commit = Some(head.clone());
+    save_registry_entry_in(&root, &recorded);
+
+    let out = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["branch", "-D", "worker-rc2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        prune_orphan_histories_with_retention_and_grace_in(
+            &root,
+            &repo,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            DEFAULT_WORKER_RETIRED_GRACE_SECS,
+        ),
+        0,
+        "the grace keeps the cold worker's row"
+    );
+
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
+    let outcome = pool
+        .steer("rc2", "reapply the parser fix".into())
+        .await
+        .expect("a cold worker whose row survived the grace must be continuable");
+    assert!(
+        matches!(outcome, SteerOutcome::Continuing { cold: true, .. }),
+        "the conversation is rebuilt from the row: {outcome:?}"
+    );
+    assert_eq!(
+        git_stdout(&repo, &["rev-parse", "refs/heads/worker-rc2"]),
+        head,
+        "the cold continuation recreated the branch at the recorded head"
     );
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);

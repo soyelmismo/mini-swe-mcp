@@ -502,21 +502,22 @@ impl WorkerPool {
         let metrics_path = path.clone();
         let metrics_base = base_commit.clone();
         let metrics_base_branch = base_branch.clone();
-        let (artifacts, diff, summary, branch, now) = tokio::task::spawn_blocking(move || {
-            finalize_worktree(FinalizeInput {
-                path,
-                repo_root,
-                base_commit,
-                base_branch,
-                branch,
-                seeded,
-                task_headline,
-                agent_summary,
-                step,
+        let (artifacts, diff, summary, branch, head_commit, now) =
+            tokio::task::spawn_blocking(move || {
+                finalize_worktree(FinalizeInput {
+                    path,
+                    repo_root,
+                    base_commit,
+                    base_branch,
+                    branch,
+                    seeded,
+                    task_headline,
+                    agent_summary,
+                    step,
+                })
             })
-        })
-        .await
-        .context("Worktree finalization task failed")??;
+            .await
+            .context("Worktree finalization task failed")??;
         worktree.preserve_branch = worktree.preserve_branch || branch.is_some();
         if !artifacts.is_empty() {
             info!(
@@ -591,6 +592,9 @@ impl WorkerPool {
             &last_command,
             None,
         );
+        // Remember where the branch ended, so a continuation can recreate it
+        // after a merge prunes it within the retired grace period.
+        self.record_head_commit(worker_id, head_commit).await;
 
         self.unregister_worktree(worker_id).await;
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
@@ -616,8 +620,16 @@ struct FinalizeInput {
 ///
 /// The worker's finished output: synced artifacts, final diff, completion
 /// summary, the branch the commit landed on (`None` when there was nothing to
-/// commit) and the completion timestamp.
-type FinalizedWork = (Vec<String>, String, String, Option<String>, u64);
+/// commit), the head commit of that branch (`None` alongside a missing branch)
+/// and the completion timestamp.
+type FinalizedWork = (
+    Vec<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    u64,
+);
 
 /// Sync the worker's artifacts, take its final diff and commit it.
 fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
@@ -669,5 +681,23 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
         let commit_msg = format!("worker({branch}): {clean_subject}");
         WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &commit_msg)?
     };
-    Ok((artifacts, diff, summary, committed, unix_timestamp()))
+    let head_commit = committed.as_ref().and_then(|branch| {
+        crate::worktree::git(
+            &repo_root,
+            "rev-parse",
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|sha| !sha.is_empty())
+    });
+    Ok((
+        artifacts,
+        diff,
+        summary,
+        committed,
+        head_commit,
+        unix_timestamp(),
+    ))
 }

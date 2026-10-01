@@ -548,6 +548,7 @@ async fn report_survives_eviction_in_status_review_and_collect() {
         metrics: WorkerMetrics::default(),
         base_branch: None,
         base_commit: None,
+        head_commit: None,
         revision: 0,
         auto_continues: 0,
         report: Some(report.clone()),

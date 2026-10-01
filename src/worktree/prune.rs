@@ -360,16 +360,12 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     );
     if is_branch_merged(repo_root, br) {
         let _ = git(repo_root, "branch -D", &["branch", "-D", br]);
-        // The branch is gone, so nothing can continue the worker any more:
-        // retire its saved conversation, the steering mailbox the finished
-        // run's guard may never have dropped on a crash, and its registry row,
-        // from every scratch base. An unmerged branch keeps all three -- the
-        // work is still reviewable and the worker still steerable.
-        if let Some(name) = wt_path.file_name().and_then(|n| n.to_str())
-            && let Some(id) = name.strip_prefix("swe-wt-")
-        {
-            crate::pool::retire_worker(id);
-        }
+        // The branch is gone, but the worker's registry row and saved
+        // conversation are kept through the retired grace period (see
+        // `pool::prune_orphan_histories_with_retention_and_grace_in`), so an
+        // orchestrator that reverts this merge can still continue the worker.
+        // The orphan sweep retires all three once the grace runs out; an
+        // unmerged branch keeps them too, since the work is still reviewable.
     } else {
         info!(branch = %br, "Preserving unmerged worker branch with commits");
     }

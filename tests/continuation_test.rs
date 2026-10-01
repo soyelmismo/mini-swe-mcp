@@ -138,6 +138,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         metrics: Default::default(),
         base_branch: Some("master".into()),
         base_commit: Some("base".into()),
+        head_commit: None,
         revision: 1,
         auto_continues: 0,
         report: None,
@@ -324,12 +325,13 @@ async fn steer_on_a_worker_without_history_continues_cold_on_the_same_branch() {
 }
 
 #[tokio::test]
-async fn a_missing_branch_is_the_only_cold_continuation_error() {
+async fn a_missing_branch_with_no_recorded_head_is_a_cold_continuation_error() {
     let scratch = Scratch::new("nobranch");
     let root = scratch.root();
     let repo = repo_with_branch("nobranch", "gone1");
     save_registry_entry_in(&root, &row("gone1", &repo, RegistryStatus::Failed));
-    // The branch is gone: nothing a continuation can work around.
+    // The branch is gone and the row records no head to recreate it from:
+    // nothing a continuation can work around.
     let out = std::process::Command::new("git")
         .current_dir(&repo)
         .args(["branch", "-D", "worker-gone1"])
