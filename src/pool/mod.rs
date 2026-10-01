@@ -710,7 +710,10 @@ impl WorkerPool {
                 crate::worktree::git(&repo, "record round base", &["rev-parse", "HEAD"])
             })
             .await??;
-            anyhow::ensure!(base.status.success(), "Cannot record consolidator round base");
+            anyhow::ensure!(
+                base.status.success(),
+                "Cannot record consolidator round base"
+            );
             std::fs::write(
                 self.scratch.join(format!("swe-wt-{worker_id}.round-base")),
                 base.stdout,
@@ -1288,13 +1291,19 @@ impl WorkerPool {
         if let Err(reason) = check_consolidate_delegation(actor, &entry) {
             return format!("{id} refused: {reason}");
         }
-        let round_base = std::fs::read_to_string(
-            self.scratch.join(format!("swe-wt-{}.round-base", actor.id)),
-        )
-        .ok()
-        .map(|base| base.trim().to_string())
-        .or_else(|| load_worker_history_in(&self.scratch, &actor.id).ok().map(|h| h.base_commit));
-        let source = steer::SteerSource { consolidator: actor.id.clone(), round_base };
+        let round_base =
+            std::fs::read_to_string(self.scratch.join(format!("swe-wt-{}.round-base", actor.id)))
+                .ok()
+                .map(|base| base.trim().to_string())
+                .or_else(|| {
+                    load_worker_history_in(&self.scratch, &actor.id)
+                        .ok()
+                        .map(|h| h.base_commit)
+                });
+        let source = steer::SteerSource {
+            consolidator: actor.id.clone(),
+            round_base,
+        };
         match self.steer_relaunchable(&target, message, source).await {
             Ok(outcome) => format!(
                 "{target} {} (revision {})",
@@ -1392,8 +1401,8 @@ impl WorkerPool {
             .is_some_and(|e| e.status.is_terminal() || e.status == RegistryStatus::Paused)
     }
 
-    /// One compact line for a waited-on worker: its state, whether it verified
-    /// its work, and the one-line error or question that stopped it.
+    /// A waited-on worker's state, verification flag, and stop reason.
+    /// Paused workers carry the full question and the verb that answers it.
     ///
     /// The live record carries the `verified` flag; a worker that survives only
     /// as a registry row reports its status alone.
@@ -1405,7 +1414,7 @@ impl WorkerPool {
                 }
                 WorkerState::Running { .. } => format!("{id} running"),
                 WorkerState::Paused { question, .. } => {
-                    format!("{id} paused: {}", stop_reason(question))
+                    format!("{id} paused: {question}\nanswer it with CONSOLIDATE_STEER")
                 }
                 WorkerState::Completed { verified, .. } => {
                     format!("{id} completed {}", verified_label(*verified))
@@ -1420,8 +1429,8 @@ impl WorkerPool {
         match entry.status {
             RegistryStatus::Failed => format!("{id} failed: {}", stop_reason(&entry.last_command)),
             RegistryStatus::Paused => format!(
-                "{id} paused: {}",
-                stop_reason(entry.question.as_deref().unwrap_or_default())
+                "{id} paused: {}\nanswer it with CONSOLIDATE_STEER",
+                entry.question.as_deref().unwrap_or_default()
             ),
             RegistryStatus::Running | RegistryStatus::Reviewing if timed_out => {
                 format!("{id} {status} (still running after {timeout_secs}s)")
@@ -1703,7 +1712,9 @@ impl WorkerPool {
         };
         // Send without holding the lock: the worker needs the write-guard to
         // transition back to `Running` right after `rx.recv().await`.
-        let _ = tx.send(message).await;
+        tx.send(message)
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker {id} resume channel closed"))?;
         Ok(SteerOutcome::Resumed)
     }
 

@@ -202,7 +202,8 @@ pub(super) struct SteerSource {
 }
 
 pub(super) fn read_source(root: &ScratchRoot, id: &str) -> Option<SteerSource> {
-    serde_json::from_slice(&std::fs::read(root.join(format!("swe-wt-{id}.steer-source"))).ok()?).ok()
+    serde_json::from_slice(&std::fs::read(root.join(format!("swe-wt-{id}.steer-source"))).ok()?)
+        .ok()
 }
 
 pub(super) fn write_source(
@@ -210,6 +211,13 @@ pub(super) fn write_source(
     id: &str,
     source: Option<&SteerSource>,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Invalid worker id: {id}"
+    );
     let path = root.join(format!("swe-wt-{id}.steer-source"));
     if let Some(source) = source {
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));

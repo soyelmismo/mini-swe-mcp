@@ -168,13 +168,25 @@ pub(super) async fn shortstat_of(
 }
 
 /// Run harness git off the runtime thread before a completion can reach verification.
-async fn sync_base_for_completion(worktree: &WorktreeGuard) -> Result<BaseSync> {
+async fn sync_base_for_completion(
+    worktree: &WorktreeGuard,
+    round_base: Option<String>,
+) -> Result<BaseSync> {
     let path = worktree.path.clone();
     let repo_root = worktree.repo_root.clone();
     let branch = worktree.branch.clone();
     let base_commit = worktree.base_commit.clone();
     let base_branch = worktree.base_branch.clone();
     tokio::task::spawn_blocking(move || {
+        if let Some(round_base) = round_base {
+            return WorktreeGuard::sync_round_base_at(
+                &path,
+                &repo_root,
+                &branch,
+                &base_commit,
+                &round_base,
+            );
+        }
         WorktreeGuard::sync_base_at(
             &path,
             &repo_root,
@@ -934,7 +946,9 @@ impl<'a> TurnEngine<'a> {
             _ => {}
         }
 
-        let merged = match sync_base_for_completion(self.worktree).await? {
+        let round_base = super::super::steer::read_source(&self.pool.scratch, self.worker_id)
+            .and_then(|source| source.round_base);
+        let merged = match sync_base_for_completion(self.worktree, round_base).await? {
             BaseSync::Unchanged => None,
             BaseSync::Merged { branch } => {
                 self.worktree.preserve_branch = true;

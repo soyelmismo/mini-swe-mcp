@@ -458,21 +458,42 @@ impl WorktreeGuard {
         base_commit: &str,
         base_branch: Option<&str>,
     ) -> Result<BaseSync> {
-        let Some(base_branch) = base_branch.filter(|_| {
-            std::env::var_os("WORKER_SYNC_BASE").as_deref() != Some(std::ffi::OsStr::new("0"))
-        }) else {
+        if std::env::var_os("WORKER_SYNC_BASE").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return Ok(BaseSync::Unchanged);
+        }
+        let Some(base_branch) = base_branch else {
             return Ok(BaseSync::Unchanged);
         };
-        Self::sync_base_inner(path, repo_root, branch, base_commit, base_branch)
+        Self::sync_reference_at(
+            path,
+            repo_root,
+            branch,
+            base_commit,
+            &format!("refs/heads/{base_branch}"),
+            base_branch,
+        )
     }
 
-    /// Integrate the dispatch's base branch before verification, on the harness.
-    /// Conflicts remain in place for the model; only a later completion may commit them.
-    fn sync_base_inner(
+    /// Integrate a pinned round commit using the same conflict lifecycle as base sync.
+    pub fn sync_round_base_at(
         path: &Path,
         repo_root: &Path,
         branch: &str,
         base_commit: &str,
+        round_base: &str,
+    ) -> Result<BaseSync> {
+        if std::env::var_os("WORKER_SYNC_BASE").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return Ok(BaseSync::Unchanged);
+        }
+        Self::sync_reference_at(path, repo_root, branch, base_commit, round_base, round_base)
+    }
+
+    fn sync_reference_at(
+        path: &Path,
+        repo_root: &Path,
+        branch: &str,
+        base_commit: &str,
+        reference: &str,
         base_branch: &str,
     ) -> Result<BaseSync> {
         let mut merged = false;
@@ -489,12 +510,16 @@ impl WorktreeGuard {
             PendingMerge::None => {}
         }
 
-        let reference = format!("refs/heads/{base_branch}");
-        let base = Self::diff_base_at(path, base_commit, Some(base_branch))?;
+        let ancestor = checked_git(
+            path,
+            "resolve integration ancestor",
+            &["merge-base", "HEAD", reference],
+        )?;
+        let base = String::from_utf8_lossy(&ancestor.stdout).trim().to_string();
         let tip = checked_git(
             path,
             "resolve base tip",
-            &["rev-parse", "--verify", &reference],
+            &["rev-parse", "--verify", reference],
         )?;
         if base == String::from_utf8_lossy(&tip.stdout).trim() {
             return Ok(if merged {
@@ -508,7 +533,7 @@ impl WorktreeGuard {
 
         // The base sync may fast-forward: a worker with nothing of its own yet
         // simply moves to the base tip.
-        match Self::merge_reference_at(path, repo_root, branch, base_commit, &reference, false)? {
+        match Self::merge_reference_at(path, repo_root, branch, base_commit, reference, false)? {
             BranchMerge::Merged { .. } => Ok(BaseSync::Merged {
                 branch: base_branch.to_string(),
             }),
