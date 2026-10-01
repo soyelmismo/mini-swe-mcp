@@ -42,7 +42,7 @@
             ]
           },
           "consolidate_verify": {
-            "description": "Automatic consolidator's full gate; default: auto-detect. Checked with `sh -n`.",
+            "description": "Automatic consolidator's full gate; default: auto-detect.",
             "type": "string"
           },
           "diff": {
@@ -188,7 +188,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
