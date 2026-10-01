@@ -31,8 +31,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::pool::{
-    RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRegistryEntry, WorkerState,
-    clamp_string,
+    LogBuffer, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool, WorkerRegistryEntry,
+    WorkerState, clamp_string,
 };
 
 /// How often the event task re-reads the registry for workers it does not own.
@@ -425,6 +425,10 @@ pub(super) struct EventRouter {
     connections: BTreeMap<u64, (String, bool, mpsc::Sender<String>)>,
     watch_current: crate::cli::watch::Snapshot,
     watch_reported: crate::cli::watch::Snapshot,
+    /// Worker id -> sequence of its last event the owner saw through an
+    /// interactive verb. The sequence stays out of the payload so the
+    /// published and JSON event shapes are unchanged.
+    seen: BTreeMap<String, u64>,
     watch_history: BTreeMap<String, WatchHistory>,
     watches: Arc<WatchRegistry>,
     sequence: u64,
@@ -622,7 +626,7 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
 /// `warning:`, `assertion`) win the budget: when none of the last 40 lines
 /// carries one, the most recent marked lines are shown instead of the oldest
 /// tail lines, and the byte cap drops unmarked lines first.
-fn verify_tail(output: &str) -> String {
+pub(super) fn verify_tail(output: &str) -> String {
     const MAX_LINES: usize = 40;
     const MAX_BYTES: usize = 4096;
     const MARKERS: [&str; 5] = ["FAILED", "panicked", "error", "warning:", "assertion"];
@@ -664,6 +668,26 @@ fn verify_tail(output: &str) -> String {
         text = text[start..].to_string();
     }
     text
+}
+
+/// The failure-focused tail of the newest `[verify]` step in `logs`, when the
+/// window holds one.
+pub(super) fn verify_tail_of(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
+    logs.iter()
+        .rev()
+        .find(|log| log.command.starts_with("[verify]"))
+        .map(|log| verify_tail(&log.output))
+}
+
+/// Attach the newest `[verify]` log tail to a view that is not verified.
+///
+/// A worker whose earlier verify run failed can still pass its completion
+/// gate: showing that stale run would read as a current failure, so only an
+/// unverified worker (whose tail explains the live failure) carries a tail.
+fn attach_verify_tail(view: &mut serde_json::Value, logs: &LogBuffer) {
+    if view["verified"] != true {
+        view["verify_output_tail"] = json!(verify_tail_of(&logs.tail(1000)));
+    }
 }
 
 /// A worker as the on-disk registry describes it.
@@ -924,6 +948,11 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             view["question"] = json!(progress.question);
             // A queued build slot is shown as its own state, never as a stall.
             view["waiting_for_slot"] = json!(progress.waiting_for_slot);
+            // A command in flight keeps the worker out of the stall detector;
+            // publish the mark only while there is one.
+            if let Some(started) = progress.command_started_at {
+                view["command_started_at"] = json!(started);
+            }
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];
@@ -957,17 +986,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
                     .map(|log| clamp_string(&log.command, 256))
                     .collect::<Vec<_>>()
             );
-            if view["verified"] == false
-                || view["metrics"]["verify_failures"].as_u64().unwrap_or(0) > 0
-            {
-                view["verify_output_tail"] = json!(
-                    logs.tail(1000)
-                        .iter()
-                        .rev()
-                        .find(|log| log.command.starts_with("[verify]"))
-                        .map(|log| verify_tail(&log.output))
-                );
-            }
+            attach_verify_tail(view, &logs);
         }
     }
     views
@@ -999,6 +1018,7 @@ impl EventRouter {
                 .is_some_and(|old| old["status"] != view["status"])
             {
                 self.watch_reported.remove(id);
+                self.seen.remove(id);
             }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
@@ -1034,6 +1054,7 @@ impl EventRouter {
             }
         }
         self.watch_reported.retain(|id, _| views.contains_key(id));
+        self.seen.retain(|id, _| views.contains_key(id));
         self.watch_current = views;
     }
 
@@ -1132,6 +1153,7 @@ impl EventRouter {
                 if !events.iter().any(|v| v["worker_id"] == *id)
                     && let Some(v) = self.watch_reported.get(id).filter(|v| {
                         matches!(v["event"].as_str(), Some("completed" | "failed"))
+                            && self.seen.get(id).copied() != v["sequence"].as_u64()
                             && allowed(v)
                             && crate::cli::watch::matches(v, &ids, group)
                     })
@@ -1141,6 +1163,25 @@ impl EventRouter {
             }
         }
         Ok(json!({"watching":watching,"events":events}))
+    }
+
+    /// Forget `owner`'s queued events for `wid` and mark its last reported
+    /// event seen.
+    ///
+    /// An interaction (status, logs, collect, kill, steer) is the owner
+    /// looking at the worker directly, so a later watch must not replay those
+    /// events as "while you were not watching".
+    pub(super) fn mark_seen(&mut self, owner: &str, wid: &str) {
+        if let Some(history) = self.watch_history.get_mut(owner) {
+            history.pending.retain(|v| v["worker_id"] != wid);
+        }
+        if let Some(sequence) = self
+            .watch_reported
+            .get(wid)
+            .and_then(|v| v["sequence"].as_u64())
+        {
+            self.seen.insert(wid.to_string(), sequence);
+        }
     }
 
     fn acknowledge_watch(&mut self, ctx: &super::server::ConnectionContext, sequence: u64) {
@@ -1240,6 +1281,49 @@ mod watch_stall_regression_tests {
 }
 
 #[cfg(test)]
+mod mark_seen_tests {
+    use super::*;
+
+    fn completed(id: &str) -> serde_json::Value {
+        json!({"worker_id":id, "owner":"owner", "status":"completed", "step":2,
+            "revision":0, "verified":true, "branch":format!("worker-{id}"),
+            "metrics":crate::pool::WorkerMetrics::default()})
+    }
+
+    /// An interactive verb is the owner looking at the worker, so its queued
+    /// event must not come back as "while you were not watching".
+    #[test]
+    fn an_interaction_drops_the_pending_event_and_its_initial_replay() {
+        let mut router = EventRouter::default();
+        router.observe_watch([("w".to_string(), completed("w"))].into());
+        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let params = json!({"worker_ids":[], "initial":true});
+        let first = router.watch_reply(&ctx, &params).unwrap();
+        assert_eq!(first["events"][0]["event"], "completed", "{first}");
+        assert_eq!(
+            router.watch_history["owner"].pending.len(),
+            1,
+            "no ack, so the event is still queued"
+        );
+
+        router.mark_seen("owner", "w");
+        assert!(router.watch_history["owner"].pending.is_empty());
+        let second = router.watch_reply(&ctx, &params).unwrap();
+        assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
+        // The explicit-id path replays the last reported terminal event; it
+        // must respect the seen mark too.
+        let explicit = router
+            .watch_reply(&ctx, &json!({"worker_ids":["w"], "initial":true}))
+            .unwrap();
+        assert!(
+            explicit["events"].as_array().unwrap().is_empty(),
+            "{explicit}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod verify_tail_tests {
     use super::verify_tail;
 
@@ -1301,5 +1385,53 @@ mod verify_tail_tests {
             !tail.contains("case_0"),
             "passing noise gives up the budget first"
         );
+    }
+}
+
+/// Once the completion gate passes, an earlier failing `[verify]` run must not
+/// resurface as a current failure in the watch payload.
+#[cfg(test)]
+mod verify_tail_attachment_tests {
+    use super::attach_verify_tail;
+    use crate::agent::AgentStepLog;
+    use crate::pool::LogBuffer;
+    use serde_json::json;
+
+    fn logs_with_failed_verify() -> LogBuffer {
+        let mut logs = LogBuffer::new();
+        logs.push(AgentStepLog {
+            step: 1,
+            command: "[verify] cargo test".to_string(),
+            output: "Command timed out after 600s and was terminated.".to_string(),
+            exit_code: Some(1),
+        });
+        logs
+    }
+
+    fn completed_view(verified: bool) -> serde_json::Value {
+        json!({"worker_id":"w", "event":"completed", "status":"completed",
+            "verified":verified, "metrics":{"verify_failures":1}})
+    }
+
+    #[test]
+    fn a_completed_worker_hides_a_stale_failing_verify_tail_after_the_gate_passes() {
+        let mut view = completed_view(true);
+        attach_verify_tail(&mut view, &logs_with_failed_verify());
+        assert!(
+            view.get("verify_output_tail").is_none(),
+            "a verified worker must not carry a stale verify tail: {view}"
+        );
+        assert_eq!(
+            view["metrics"]["verify_failures"], 1,
+            "the failure counter stays as is"
+        );
+    }
+
+    #[test]
+    fn an_unverified_worker_carries_the_failing_verify_tail() {
+        let mut view = completed_view(false);
+        attach_verify_tail(&mut view, &logs_with_failed_verify());
+        let tail = view["verify_output_tail"].as_str().unwrap_or_default();
+        assert!(tail.contains("Command timed out after 600s"), "{view}");
     }
 }

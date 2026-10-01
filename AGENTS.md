@@ -20,6 +20,14 @@ system prompt at dispatch time, so keep them short and actionable.
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test`
 
+## Iterating
+
+- While working, build and run only what you touch: `cargo test --test <file>`
+  or `cargo test <name>`, and `cargo check` instead of a full build.
+- Run the full gates (fmt --check, clippy, full test) once, right before
+  requesting completion: the harness reuses an identical passing run and runs
+  the divergent variant itself.
+
 ## Tests must be hermetic
 
 - Give every file, directory, daemon or registry a test touches a temporary
