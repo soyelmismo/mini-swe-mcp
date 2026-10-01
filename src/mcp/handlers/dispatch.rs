@@ -283,7 +283,7 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Absolute repository root (alias: 'path'). Required for 'dispatch'.";
 
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.";
+    "Reviewer model auditing the worktree after implementation.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate stopped group: true uses strongest/default; string pins model.";

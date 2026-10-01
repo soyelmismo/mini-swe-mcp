@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "SWE workers in Git worktrees. Use mini-swe-mcp watch; run it again after each event. MCP: watch with timeout_secs. Only your own workers; admin excepted. mini-swe-mcp help <topic>: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.",
+      "description": "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -106,7 +106,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
+            "description": "Reviewer model auditing the worktree after implementation.",
             "type": "string"
           },
           "role": {
@@ -175,7 +175,7 @@
             "type": "number"
           },
           "timeout_secs": {
-            "description": "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
+            "description": "Watch deadline seconds; expiry: no_event.",
             "minimum": 0,
             "type": "integer"
           },

@@ -64,7 +64,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "SWE workers in Git worktrees. Use mini-swe-mcp watch; run it again after each event. MCP: watch with timeout_secs. Only your own workers; admin excepted. mini-swe-mcp help <topic>: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {

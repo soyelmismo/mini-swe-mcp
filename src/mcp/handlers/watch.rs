@@ -194,6 +194,6 @@ pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
     "Only workers of this group. For 'watch' and 'merge --approved'.";
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str =
-    "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.";
+    "Watch deadline seconds; expiry: no_event.";
 
 pub(in crate::mcp) const ALL_DESCRIPTION: &str = "Watch the whole round as one event.";
