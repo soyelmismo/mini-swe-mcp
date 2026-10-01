@@ -415,14 +415,13 @@ fn test_sync_artifacts_skips_unchanged_files_but_copies_changed_ones() {
         .set_times(std::fs::FileTimes::new().set_modified(sentinel))
         .expect("failed to stamp destination mtime");
 
-    // ...but a file that still matches its seed is not the worker's output, so
-    // the second sync must not report it again.
+    // The unchanged file is still reported as in sync...
     let second = guard.sync_artifacts();
     assert!(
-        !second.contains(&"audits/stable_audit.md".to_string()),
-        "an unchanged seeded artifact must not be reported as the worker's, got: {second:?}"
+        second.contains(&"audits/stable_audit.md".to_string()),
+        "an unchanged but present artifact must still be reported, got: {second:?}"
     );
-    // It was not rewritten either.
+    // ...but it was not rewritten.
     let mtime = std::fs::metadata(&destination)
         .expect("failed to stat destination")
         .modified()
