@@ -408,6 +408,11 @@ impl WatchRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Whether `identity` holds a watch slot right now.
+    fn has(&self, identity: &str) -> bool {
+        self.lock().contains_key(identity)
+    }
+
     fn busy(active: &ActiveWatch) -> anyhow::Error {
         let held = match active.pid {
             Some(pid) => format!("pid {pid}, since {}", active.since),
@@ -543,6 +548,12 @@ impl EventRouter {
             identity: identity.to_string(),
             token,
         })
+    }
+
+    /// Whether `identity` already has a watch running, so a dispatch or steer
+    /// answer can drop the "start this" line the caller has already acted on.
+    pub(super) fn has_watch(&self, identity: &str) -> bool {
+        self.watches.has(identity)
     }
 
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {

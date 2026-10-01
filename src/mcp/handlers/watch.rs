@@ -15,11 +15,20 @@ impl McpServer {
     }
 
     /// Add `watch_command` to a dispatch or steer payload, when this caller has
-    /// a token store to mint from.
-    pub(super) fn with_watch_command(
+    /// a token store to mint from and no watch of its own already running.
+    ///
+    /// One watch per identity is the hub's rule, so a caller that already has
+    /// one does not need the command again: its watch will deliver the next
+    /// event. Repeating it would only make every answer carry tokens the
+    /// caller cannot spend.
+    pub(super) async fn with_watch_command(
+        &self,
         payload: &mut Value,
         ctx: &crate::mcp::server::ConnectionContext,
     ) {
+        if self.hub_events.lock().await.has_watch(&ctx.agent()) {
+            return;
+        }
         if let Some(command) = Self::watch_command(ctx) {
             payload["watch_command"] = json!(command);
         }

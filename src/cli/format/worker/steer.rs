@@ -19,6 +19,26 @@ pub fn format_steer(val: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::cli::format::worker::tests::v;
+    /// A steer answer carries the `watch_command` only while the caller has no
+    /// watch of its own running: the hub drops the field otherwise, and the
+    /// render must then omit the line.
+    #[test]
+    fn test_format_steer_shows_the_watch_command_only_when_the_hub_minted_one() {
+        let with_token = format_steer(&v(
+            r#"{"worker_id":"w","status":"steered","message":"queued","watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert!(
+            with_token.contains("\nTo wait for it: MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch")
+                && with_token
+                    .contains("run it in the background as-is; run it again after each event"),
+            "{with_token}"
+        );
+        let without = format_steer(&v(
+            r#"{"worker_id":"w","status":"steered","message":"queued"}"#,
+        ));
+        assert!(!without.contains("To wait for it"), "{without}");
+    }
+
     /// `steer --wait` answers with the awaited result, so it must be rendered
     /// by the worker-result view rather than as a bare acknowledgement.
     #[test]
