@@ -374,10 +374,14 @@ bash real
   removing the transient 2-3x serialization spike a full 150-turn history used
   to cost per request.
 - **Bounded lifetime**: `WORKER_TERMINAL_TTL_SECS` (default 300) evicts
-  `Completed` / `Failed` records — with their registry rows — via a background
-  reaper and lazily on the next `dispatch`. Fresh terminal records are kept, so
-  a `collect` immediately after `wait: true` still resolves. `Running` and
-  `Paused` records are never expired.
+  `Completed` / `Failed` records via a background reaper and lazily on the next
+  `dispatch`. Fresh terminal records are kept, so a `collect` immediately after
+  `wait: true` still resolves. `Running` and `Paused` records are never
+  expired. The TTL bounds *memory* only: the evicted record leaves its registry
+  row and its saved conversation in place, because a finished worker stays
+  steerable for as long as its branch does. Those are retired by
+  `WORKER_RETENTION_SECS` (default 7 days), or by `prune` once the branch is
+  gone — never by the in-memory eviction.
 - **No silent degradation**: `total_steps`, `logs_retained`, `logs_omitted` and
   `logs_dropped` are reported on every log-bearing response, with a
   `logs_truncation_notice` whenever history is missing.

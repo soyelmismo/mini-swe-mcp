@@ -360,21 +360,22 @@ fn remove_worker_worktree(repo_root: &Path, wt: &str, br: &str) {
     );
     if is_branch_merged(repo_root, br) {
         let _ = git(repo_root, "branch -D", &["branch", "-D", br]);
+        // The branch is gone, so nothing can continue the worker any more:
+        // retire its saved conversation, the steering mailbox the finished
+        // run's guard may never have dropped on a crash, and its registry row,
+        // from every scratch base. An unmerged branch keeps all three -- the
+        // work is still reviewable and the worker still steerable.
+        if let Some(name) = wt_path.file_name().and_then(|n| n.to_str())
+            && let Some(id) = name.strip_prefix("swe-wt-")
+        {
+            crate::pool::retire_worker(id);
+        }
     } else {
         info!(branch = %br, "Preserving unmerged worker branch with commits");
     }
     force_remove_dir(wt_path);
     let _ = std::fs::remove_file(&pid_file);
     remove_target_dirs(wt_path);
-    // The worker is gone past review: retire its saved conversation (and its
-    // steering mailbox, which the finished run's guard may never have dropped
-    // on a crash) from every scratch base.
-    if let Some(name) = wt_path.file_name().and_then(|n| n.to_str())
-        && let Some(id) = name.strip_prefix("swe-wt-")
-    {
-        crate::pool::remove_worker_history(id);
-        crate::pool::remove_steer_file(id);
-    }
 }
 
 /// True when `branch` has no commits missing from `HEAD`, i.e. deleting it
