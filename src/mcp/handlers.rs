@@ -325,7 +325,122 @@ impl McpServer {
         }))
     }
 
+    /// Dispatch one worker, or a batch when the call carries `tasks`.
+    ///
+    /// A batch is a list of `{task, model?, repo_path?, max_turns?, verify?,
+    /// group?, network?}` objects; shared top-level dispatch values act as
+    /// defaults for every entry. Each entry goes through the same single-task
+    /// path, so one bad entry only answers with its own error.
     async fn handle_dispatch(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        if args.get("tasks").is_some() {
+            return self.handle_batch_dispatch(args, token, tx, ctx).await;
+        }
+        self.dispatch_one(args, token, tx, ctx).await
+    }
+
+    /// The dispatch properties a batch entry may set, and whose top-level value
+    /// becomes the default for every entry.
+    const BATCH_ENTRY_KEYS: &'static [&'static str] = &[
+        "task",
+        "model",
+        "repo_path",
+        "path",
+        "max_turns",
+        "temperature",
+        "review_after",
+        "group",
+        "network",
+        "verify",
+    ];
+
+    /// Effective arguments of one batch entry: the shared top-level dispatch
+    /// values, overridden by the entry's own keys.
+    fn batch_entry_args(shared: &Value, entry: &Value) -> Result<Map<String, Value>> {
+        let entry = entry.as_object().ok_or_else(|| {
+            anyhow::anyhow!("each 'tasks' entry must be an object such as {{task, model}}")
+        })?;
+        let mut merged = Map::new();
+        for key in Self::BATCH_ENTRY_KEYS {
+            if let Some(value) = entry.get(*key).or_else(|| shared.get(*key)) {
+                merged.insert((*key).to_string(), value.clone());
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Dispatch every entry of a batch, one compact result per task.
+    ///
+    /// A bad entry reports its own error in its slot; it never aborts the
+    /// others. Each slot is `{index, worker_id, network}` on success and
+    /// `{index, error}` on failure.
+    async fn handle_batch_dispatch(
+        &self,
+        args: &Value,
+        token: Option<&Value>,
+        tx: Option<&mpsc::Sender<String>>,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let tasks = args
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("'tasks' must be an array for action 'dispatch'"))?;
+        if tasks.is_empty() {
+            anyhow::bail!("'tasks' must contain at least one task for action 'dispatch'");
+        }
+
+        let mut workers = Vec::with_capacity(tasks.len());
+        let mut dispatched = 0usize;
+        let mut failed = 0usize;
+        for (index, entry) in tasks.iter().enumerate() {
+            let outcome = match Self::batch_entry_args(args, entry) {
+                Ok(entry_args) => self
+                    .dispatch_one(&Value::Object(entry_args), token, tx, ctx)
+                    .await
+                    .map(|payload| {
+                        json!({
+                            "index": index,
+                            "worker_id": payload.get("worker_id").cloned().unwrap_or(Value::Null),
+                            "network": payload
+                                .get("network")
+                                .cloned()
+                                .unwrap_or_else(|| json!(super::schema::NETWORK_DEFAULT)),
+                        })
+                    }),
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(worker) => {
+                    dispatched += 1;
+                    workers.push(worker);
+                }
+                Err(error) => {
+                    failed += 1;
+                    workers.push(json!({ "index": index, "error": error.to_string() }));
+                }
+            }
+        }
+
+        let mut payload = json!({
+            "workers": workers,
+            "dispatched": dispatched,
+            "failed": failed,
+            "message": "Workers are executing in isolated worktrees in background. Use 'watch' (or mini-swe-mcp watch) to wait for them.",
+        });
+        Self::with_watch_command(&mut payload, ctx);
+        Ok(payload)
+    }
+
+    /// Dispatch exactly one worker from a `dispatch` argument object.
+    ///
+    /// Shared by the single-task form and every batch entry, so both go through
+    /// one validation path.
+    async fn dispatch_one(
         &self,
         args: &Value,
         token: Option<&Value>,

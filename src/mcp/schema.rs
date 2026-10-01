@@ -68,15 +68,20 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static(
-            "Action: dispatch spawns; status checks progress; steer corrects completed or continues stopped workers on their branch with full context (never dispatch a replacement); watch waits for an event (prefer background `mini-swe-mcp watch`); collect gets the diff; logs gets steps; list lists yours; kill terminates; reap expires records; manifest lists models; prune cleans worktrees; merge verifies, merges --no-ff and cleans a finished worker. Details: `mini-swe-mcp help <topic>`.",
-        ),
+        DescriptionSource::Static("Action to perform; see `mini-swe-mcp help <topic>`."),
     ),
     (
         "task",
         "string",
         DescriptionSource::Static(
             "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
+        ),
+    ),
+    (
+        "tasks",
+        "array",
+        DescriptionSource::Static(
+            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
@@ -113,7 +118,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker (failed, interrupted, killed): never dispatch a replacement.",
         ),
     ),
     (
@@ -172,13 +177,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' runs every bash step in an isolated network namespace with no egress, 'allow' (default) keeps connectivity.",
+            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
         ),
     ),
     (
         "keep_branch",
         "boolean",
-        DescriptionSource::Static("For 'merge': keep the branch (--no-delete); default false."),
+        DescriptionSource::Static("Keep the branch (--no-delete)."),
     ),
 ];
 
@@ -243,6 +248,24 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     }
     if name == "worker_ids" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
+    }
+    if name == "tasks" {
+        schema.insert(
+            "items".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "model": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "max_turns": { "type": "integer" },
+                    "verify": { "type": "string" },
+                    "group": { "type": "string" },
+                    "network": { "type": "string" },
+                },
+                "required": ["task"],
+            }),
+        );
     }
     if name == "temperature" {
         schema.insert(
@@ -405,6 +428,34 @@ mod tests {
         );
     }
 
+    /// Batch dispatch is advertised: `tasks` is an array of task objects, each
+    /// requiring `task`, and it stays optional like every other dispatch
+    /// property.
+    #[test]
+    fn tasks_property_advertises_the_batch_contract() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let tasks = &schema["properties"]["tasks"];
+
+        assert_eq!(tasks["type"], json!("array"));
+        assert_eq!(tasks["items"]["type"], json!("object"));
+        assert_eq!(tasks["items"]["required"], json!(["task"]));
+        for key in [
+            "task",
+            "model",
+            "repo_path",
+            "max_turns",
+            "verify",
+            "group",
+            "network",
+        ] {
+            assert!(
+                tasks["items"]["properties"].get(key).is_some(),
+                "the items schema must document '{key}': {tasks}"
+            );
+        }
+    }
+
     /// The tool description stays a calling contract: the waiting rule, the
     /// ownership rule, and a one-line pointer to the long-form topics.
     #[test]
@@ -460,5 +511,6 @@ mod tests {
 
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
+        assert!(text.contains("never dispatch a replacement"), "{text}");
     }
 }

@@ -516,7 +516,7 @@ fn run_gate(
             format!("could not materialise the merge result for worker {worker_id}")
         }),
     };
-    reclaim_gate_worktree(repo, &gate_dir);
+    reclaim_gate_worktree(root, repo, &gate_dir);
     let (code, text) = gate?;
     if code == Some(0) {
         return Ok(());
@@ -595,13 +595,19 @@ fn base_tip_ref(repo: &Path) -> Result<String> {
 }
 
 /// Remove a gate worktree and its registration, whatever the gate did.
-fn reclaim_gate_worktree(repo: &Path, gate_dir: &Path) {
+///
+/// The executor also opens a private scratch directory beside the worktree
+/// (`swe-tmp-<name>`), so the same helper the prune sweep uses reclaims both.
+/// The repository's leased build directory is named after the repository, not
+/// after this worktree, so it survives for the next build to reuse.
+fn reclaim_gate_worktree(root: &ScratchRoot, repo: &Path, gate_dir: &Path) {
     let _ = git(
         repo,
         "worktree remove",
         &["worktree", "remove", "--force", &gate_dir.to_string_lossy()],
     );
     force_remove_dir(gate_dir);
+    remove_target_dirs_in(root, gate_dir);
     let _ = git(repo, "worktree prune", &["worktree", "prune"]);
 }
 

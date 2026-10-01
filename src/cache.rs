@@ -7,6 +7,16 @@
 //! process and ensured to exist before use. The memoized tool probes
 //! (`has_kache` / `has_sccache`) answer "is this compiler wrapper installed?"
 //! at most once per process.
+//!
+//! Rust builds are the disk-heaviest consumer. Worker commands get
+//! `RUSTC_WRAPPER=kache` but with executable caching off
+//! (`KACHE_CACHE_EXECUTABLES=0`), because re-caching the crate's own test
+//! binaries - which the per-worker target directory already holds - doubles
+//! each write and lets the resulting store GC evict the third-party
+//! dependencies a hit would have saved. `agent::exec::apply_build_env`
+//! complements that by dropping debug info and incremental state from those
+//! directories (`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+//! `CARGO_INCREMENTAL=0`).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -234,11 +244,56 @@ pub fn apply_shared_cache_env(cmd: &mut tokio::process::Command) {
     if std::env::var("SWE_DISABLE_KACHE").as_deref() != Ok("1")
         && std::env::var("KACHE_DISABLED").as_deref() != Ok("1")
     {
-        if has_kache() {
-            cmd.env("RUSTC_WRAPPER", "kache");
+        let wrapper = if has_kache() {
+            Some("kache")
         } else if has_sccache() {
-            cmd.env("RUSTC_WRAPPER", "sccache");
-        }
+            Some("sccache")
+        } else {
+            None
+        };
+        apply_rust_compiler_cache_env(cmd, wrapper, std::env::var_os(KACHE_CACHE_EXECUTABLES_VAR));
+    }
+}
+
+/// kache's switch for caching binaries and test executables.
+const KACHE_CACHE_EXECUTABLES_VAR: &str = "KACHE_CACHE_EXECUTABLES";
+
+/// Wire the Rust compiler cache wrapper onto a child command.
+///
+/// `wrapper` is the installed wrapper, if any. `cache_executables` is the
+/// ambient [`KACHE_CACHE_EXECUTABLES_VAR`], forwarded verbatim so an operator's
+/// explicit choice survives the cleared child environment; when the operator
+/// set nothing, kache's executable caching is turned off
+/// ([`kache_cache_executables`]).
+fn apply_rust_compiler_cache_env(
+    cmd: &mut tokio::process::Command,
+    wrapper: Option<&str>,
+    cache_executables: Option<std::ffi::OsString>,
+) {
+    let Some(wrapper) = wrapper else {
+        return;
+    };
+    cmd.env("RUSTC_WRAPPER", wrapper);
+    if wrapper == "kache" {
+        cmd.env(
+            KACHE_CACHE_EXECUTABLES_VAR,
+            kache_cache_executables(cache_executables),
+        );
+    }
+}
+
+/// The `KACHE_CACHE_EXECUTABLES` value a worker command gets.
+///
+/// kache's own default caches *binaries and test executables*, which are
+/// exactly the artefacts a per-worker target directory already holds: caching
+/// them writes each crate test binary twice and grows the store past its cap,
+/// where the resulting GC evicts the third-party dependencies that a hit would
+/// have saved. Worker commands therefore opt out; an operator's explicit value
+/// wins verbatim.
+fn kache_cache_executables(ambient: Option<std::ffi::OsString>) -> String {
+    match ambient {
+        Some(value) => value.to_string_lossy().into_owned(),
+        None => "0".to_string(),
     }
 }
 
@@ -870,5 +925,36 @@ mod tests {
             maven_opts.contains(&format!("-Dmaven.repo.local={}", dirs.maven.display())),
             "the shared local repository must be added: {maven_opts}"
         );
+    }
+
+    /// kache's executable caching doubles the write of a worker's own test
+    /// binaries and evicts the dependency cache, so worker commands opt out;
+    /// an operator-exported value is forwarded verbatim.
+    #[test]
+    fn test_kache_does_not_cache_executables_by_default() {
+        let env = |cmd: &tokio::process::Command, name: &str| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+
+        let mut cmd = tokio::process::Command::new("true");
+        apply_rust_compiler_cache_env(&mut cmd, Some("kache"), None);
+        assert_eq!(env(&cmd, "RUSTC_WRAPPER").as_deref(), Some("kache"));
+        assert_eq!(env(&cmd, KACHE_CACHE_EXECUTABLES_VAR).as_deref(), Some("0"));
+
+        // The operator's explicit choice is respected, not overridden.
+        let mut cmd = tokio::process::Command::new("true");
+        apply_rust_compiler_cache_env(&mut cmd, Some("kache"), Some("1".into()));
+        assert_eq!(env(&cmd, KACHE_CACHE_EXECUTABLES_VAR).as_deref(), Some("1"));
+
+        // sccache has no equivalent knob, and no wrapper sets nothing.
+        let mut cmd = tokio::process::Command::new("true");
+        apply_rust_compiler_cache_env(&mut cmd, Some("sccache"), None);
+        assert_eq!(env(&cmd, KACHE_CACHE_EXECUTABLES_VAR), None);
+        let mut cmd = tokio::process::Command::new("true");
+        apply_rust_compiler_cache_env(&mut cmd, None, None);
+        assert_eq!(env(&cmd, "RUSTC_WRAPPER"), None);
     }
 }

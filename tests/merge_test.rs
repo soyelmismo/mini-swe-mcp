@@ -212,6 +212,11 @@ fn stale_branch_runs_the_gate_on_the_merge_result() {
     // leftover.
     let gate_dir = f.scratch.path().join("swe-merge-w2");
     assert!(!gate_dir.exists(), "the gate worktree must be reclaimed");
+    // The executor's private scratch directory beside it goes with it.
+    assert!(
+        !f.scratch.path().join("swe-tmp-swe-merge-w2").exists(),
+        "the gate's scratch directory must be reclaimed"
+    );
     assert!(
         !common::worktree_is_registered(f.repo(), &gate_dir),
         "the gate worktree must be unregistered"
