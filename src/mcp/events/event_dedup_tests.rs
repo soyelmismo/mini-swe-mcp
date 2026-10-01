@@ -7,7 +7,7 @@
 //! delivery, while a new revision or a different kind still is.
 
 use super::*;
-use crate::pool::{RegistryStatus, WorkerRegistryEntry, WorkerRole};
+use crate::pool::WorkerRegistryEntry;
 
 /// The in-memory view of a worker that just completed at `revision`.
 fn live_completion(id: &str, revision: usize, step: usize) -> serde_json::Value {
@@ -20,31 +20,18 @@ fn live_completion(id: &str, revision: usize, step: usize) -> serde_json::Value 
 }
 
 /// The registry row the same completion leaves behind.
+///
+/// Built from JSON, not a struct literal: the registry gains optional columns
+/// over time, and every other reader parses the row from disk, so the fixture
+/// exercises that path and does not have to name a column added later.
 fn row(id: &str, revision: usize, step: usize) -> WorkerRegistryEntry {
-    WorkerRegistryEntry {
-        id: id.to_string(),
-        pid: std::process::id(),
-        task: "deliver once".to_string(),
-        model: "test".to_string(),
-        status: RegistryStatus::Completed,
-        step,
-        max_turns: 10,
-        last_command: "completed".to_string(),
-        question: None,
-        started_at: 0,
-        updated_at: 0,
-        group: None,
-        role: WorkerRole::Worker,
-        repo_path: None,
-        owner: Some("owner".to_string()),
-        metrics: WorkerMetrics::default(),
-        base_branch: None,
-        base_commit: None,
-        revision,
-        auto_continues: 0,
-        report: None,
-        approved: None,
-    }
+    serde_json::from_value(json!({
+        "id": id, "pid": std::process::id(), "task": "deliver once",
+        "model": "test", "status": "completed", "step": step, "max_turns": 10,
+        "last_command": "completed", "question": null, "started_at": 0,
+        "updated_at": 0, "revision": revision,
+    }))
+    .expect("a registry row round-trips")
 }
 
 /// Every event the router has queued, in sequence order.
