@@ -37,6 +37,7 @@ pub mod admission;
 mod buffer;
 mod clock;
 mod fair;
+pub mod merge;
 mod registry;
 pub mod revision;
 pub mod round;
@@ -54,6 +55,7 @@ pub use self::buffer::{
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
 };
 pub use self::clock::unix_timestamp;
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole,
@@ -69,18 +71,22 @@ pub use self::revision::{
     history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
+    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
+    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, save_worker_history,
+    save_worker_history_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_consolidate_merge, parse_request_turns, summarize_command,
+    parse_consolidate_merge, parse_kill_job, parse_request_turns, parse_wait_job,
+    summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerState,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics,
+    WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerState, retention_expired,
+    terminal_retention_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -88,6 +94,7 @@ pub use self::steer::{
 };
 
 use self::state::expired_terminal_ids;
+use crate::agent::jobs::{JobHandle, JobTable};
 use crate::manifest::ModelManifest;
 use crate::worktree::{BranchMerge, ScratchRoot, WorktreeGuard};
 
@@ -242,6 +249,10 @@ pub struct WorkerPool {
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
     command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Background jobs of every live worker: a command that outlived its
+    /// budget keeps running here, confined exactly as the command was, until
+    /// it ends or its worker does.
+    jobs: Arc<JobTable>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -326,6 +337,7 @@ impl WorkerPool {
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            jobs: JobTable::new(),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry,
@@ -341,7 +353,30 @@ impl WorkerPool {
         }
     }
 
+    /// A handle on `worker_id`'s background jobs, for the runner that executes
+    /// its commands.
+    pub fn job_handle(&self, worker_id: &str) -> JobHandle {
+        JobHandle::new(Arc::clone(&self.jobs), worker_id)
+    }
+
+    /// Stop every background job of `worker_id`.
+    ///
+    /// Called when the worker ends, however it ends: a job is confined exactly
+    /// like the command that started it, so it must not outlive the worker.
+    pub fn end_worker_jobs(&self, worker_id: &str) -> usize {
+        self.jobs.kill_all(worker_id)
+    }
+
     /// The scratch root this pool resolves every per-worker path under.
+    /// The pool's heavy-command admission controller.
+    ///
+    /// Shared by clone, so a caller (the merge gate) reserves host budget from
+    /// the same controller every worker's heavy step does instead of starting
+    /// a second, unaware one.
+    pub fn admission(&self) -> AdmissionController {
+        self.admission.clone()
+    }
+
     pub fn scratch_root(&self) -> &ScratchRoot {
         &self.scratch
     }
@@ -443,9 +478,14 @@ impl WorkerPool {
         self.log_policy
     }
 
-    /// Evict terminal worker records whose TTL expired, plus their registry
-    /// entries. Fresh terminal records are deliberately kept so a subsequent
-    /// `collect` / `wait: true` still finds them (audit 07, R3).
+    /// Evict terminal worker records whose TTL expired. Fresh terminal records
+    /// are deliberately kept so a subsequent `collect` / `wait: true` still
+    /// finds them (audit 07, R3).
+    ///
+    /// The eviction bounds *memory* only: a reaped record leaves its registry
+    /// row and its saved conversation in place, so a finished worker stays
+    /// steerable for as long as its branch does. Those are retired by
+    /// [`WorkerPool::retire_expired_terminal_workers`], never from here.
     pub async fn reap(&self) -> Vec<String> {
         let expired = {
             let mut lock = self.workers.write().await;
@@ -453,6 +493,30 @@ impl WorkerPool {
         };
         self.forget_worktrees(&expired).await;
         expired
+    }
+
+    /// Retire the durable state of every terminal worker whose retention ran
+    /// out: its registry row, its saved conversation and its steering mailbox.
+    ///
+    /// Age-based and independent of the in-memory records, so a worker whose
+    /// branch remains keeps everything until this retention ends. Returns how
+    /// many workers were retired.
+    pub async fn retire_expired_terminal_workers(&self) -> usize {
+        let root = self.scratch.clone();
+        let retention = terminal_retention_secs();
+        let retired = tokio::task::spawn_blocking(move || {
+            revision::retire_expired_terminal_workers_in(&root, retention)
+        })
+        .await
+        .unwrap_or(0);
+        if retired > 0 {
+            tracing::info!(
+                retired,
+                retention_secs = retention,
+                "Retired terminal workers past their retention"
+            );
+        }
+        retired
     }
 
     /// Drop the worktree paths of workers whose records are gone.
@@ -470,12 +534,18 @@ impl WorkerPool {
     }
 
     /// Shared eviction helper: removes expired terminal records from `lock`.
+    ///
+    /// Only the record goes. The registry row and the saved conversation are
+    /// what make a finished worker continuable hours later, so they outlive the
+    /// eviction and are retired by the retention sweep (or by `prune`, once the
+    /// branch is gone) instead.
     fn reap_locked(&self, lock: &mut HashMap<String, WorkerRecord>) -> Vec<String> {
         let ttl = self.terminal_ttl.as_secs();
         let expired = expired_terminal_ids(lock, ttl);
         for id in &expired {
             lock.remove(id);
-            remove_registry_entry_in(&self.scratch, id);
+            // The writer's last-row cache is dropped with the record so the map
+            // stays bounded by the live workers; the on-disk row is untouched.
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -786,6 +856,7 @@ impl WorkerPool {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(id)
             .copied();
+        let jobs = self.jobs.summaries(id);
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
         let progress = match &w.state {
@@ -798,6 +869,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot,
                 command_started_at,
+                jobs,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
@@ -806,6 +878,7 @@ impl WorkerPool {
                 question: Some(question.clone()),
                 waiting_for_slot,
                 command_started_at: None,
+                jobs,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
@@ -814,6 +887,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
@@ -822,6 +896,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
         };
         drop(lock);
@@ -1609,7 +1684,12 @@ impl WorkerPool {
         // worktree path is retired, so no `.await` runs under the guard.
         let record = {
             let mut lock = self.workers.write().await;
-            let record = lock.remove(id)?;
+            let Some(record) = lock.remove(id) else {
+                // No record here: the worker may still be a terminal registry
+                // row, which is what a reaped or cross-process worker leaves.
+                drop(lock);
+                return self.collect_from_registry(id).await;
+            };
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -1637,18 +1717,78 @@ impl WorkerPool {
             logs_truncation_notice: view.logs_truncation_notice,
         })
     }
+
+    /// [`WorkerPool::collect`] for a worker this pool holds no record for.
+    ///
+    /// A terminal record is evicted from memory after its TTL, but its registry
+    /// row outlives the eviction, so `collect` still answers from the row: the
+    /// branch is what the caller acts on, and the summary is the row's own
+    /// `last_command`. The step-log window left with the record, so the
+    /// counters report what the row knows and the notice says so. A row that is
+    /// still live belongs to another process and is not collectible here.
+    async fn collect_from_registry(&self, id: &str) -> Option<CollectedWorker> {
+        let entry = load_registry_entry_in(&self.scratch, id)?;
+        if !entry.status.is_terminal() {
+            return None;
+        }
+        let state = match entry.status {
+            RegistryStatus::Completed => WorkerState::Completed {
+                turns: entry.step,
+                diff: String::new(),
+                summary: entry.last_command.clone(),
+                completed_at: entry.updated_at,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
+                verified: None,
+                metrics: entry.metrics,
+                revision: entry.revision,
+            },
+            _ => WorkerState::Failed {
+                error: entry.last_command.clone(),
+                step: entry.step,
+                failed_at: entry.updated_at,
+                metrics: entry.metrics,
+                revision: entry.revision,
+            },
+        };
+        let owner = registry_owner_label(&entry).to_string();
+        Some(CollectedWorker {
+            id: entry.id,
+            task: entry.task,
+            model: entry.model,
+            owner,
+            state,
+            logs: Vec::new(),
+            logs_omitted: 0,
+            logs_dropped: 0,
+            logs_truncation_notice: Some(
+                "the step log left with the evicted in-memory record".to_string(),
+            ),
+        })
+    }
 }
 
-/// Spawn the background reaper that evicts expired terminal worker records.
+/// Spawn the background reaper that evicts expired terminal worker records
+/// and, on a much slower cadence, retires the durable state of the workers
+/// whose retention ran out.
 ///
 /// Kept in the library so the server can start it from `run_stdio` without
 /// depending on `main.rs`.
 pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(30);
+        // The durable retention is a week, so sweeping it needs no such
+        // cadence: one registry scan per hour rather than one per tick.
+        let retention_every = 120u32;
+        let mut since_retention = 0u32;
         loop {
             tokio::time::sleep(interval).await;
             pool.reap().await;
+            since_retention += 1;
+            if since_retention >= retention_every {
+                since_retention = 0;
+                pool.retire_expired_terminal_workers().await;
+            }
         }
     })
 }

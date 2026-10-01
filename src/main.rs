@@ -274,6 +274,9 @@ fn print_help() {
     println!("           Workers you own; --all (with --admin) lists every agent's.");
     println!("  kill <worker_id>");
     println!("           Terminate a worker.");
+    println!("  merge <worker_id> [--no-delete]");
+    println!("           Merge a finished worker's branch into its base branch: trial merge,");
+    println!("           verify gate on the merge result, then merge --no-ff and clean up.");
     println!("  reap");
     println!("           Evict expired terminal worker records.");
     println!("  prune");

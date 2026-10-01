@@ -58,12 +58,17 @@ pub fn tool_args(
                 }
             }
         }
-        "status" | "collect" | "logs" | "kill" | "review" => {
+        "collect" | "kill" | "logs" | "review" | "status" | "merge" => {
             if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
             }
             if action == "collect" {
                 collect_diff_args(cli_args, &mut tool_args);
+            }
+            // `--no-delete` keeps the merged branch: the same tool argument
+            // the MCP action reads, so the flag has one implementation.
+            if flag_index(cli_args, &["--no-delete"]).is_some() {
+                tool_args.insert("keep_branch".into(), Value::Bool(true));
             }
         }
         "consolidate" => {

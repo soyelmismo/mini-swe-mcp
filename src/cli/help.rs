@@ -24,6 +24,7 @@ pub const TOPICS: &[&str] = &[
     "steer",
     "review",
     "collect",
+    "merge",
     "identity",
     "sandbox",
     "env",
@@ -38,6 +39,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "steer" => STEER,
         "review" => REVIEW,
         "collect" => COLLECT,
+        "merge" => MERGE,
         "identity" => IDENTITY,
         "sandbox" => SANDBOX,
         "env" => ENV,
@@ -47,7 +49,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
 }
 
 /// `workflow`: dispatch in parallel, review, and never edit a worker's branch.
-const WORKFLOW: &str = "Write the task as ONE focused concern with files in scope and an acceptance gate. Dispatch independent tasks in parallel - many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time. To wait, run `mini-swe-mcp watch` in the background (see `mini-swe-mcp help watch`). After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer (see `mini-swe-mcp help steer`). Do not edit its branch yourself; merge only when it is right.";
+const WORKFLOW: &str = "Write the task as ONE focused concern with files in scope and an acceptance gate. Dispatch independent tasks in parallel - many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time. To wait, run `mini-swe-mcp watch` in the background (see `mini-swe-mcp help watch`). After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer (see `mini-swe-mcp help steer`). Do not edit its branch yourself; merge only when it is right. Use `mini-swe-mcp merge <id>` to trial merge, verify the merge result, merge --no-ff and clean up; --no-delete keeps the branch. A running worker, a wrong checked-out branch, a dirty touched file or a conflict refuses the merge.";
 
 /// `watch`: the process that wakes the orchestrator when a worker needs it.
 const WATCH: &str = "Run `mini-swe-mcp watch` in the background: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
@@ -60,6 +62,9 @@ const REVIEW: &str = "Run `mini-swe-mcp review <worker_id>` for everything neede
 
 /// `collect`: the final message, with the diff summarised unless asked for.
 const COLLECT: &str = "Run `mini-swe-mcp collect <worker_id>` for a finished worker's final message. The default reply is compact - summary, verification outcome, per-file diff stat and branch - because the full diff of a large task is what makes a review expensive. Pass --full for the whole diff, or --file <path> (repeatable) for the diff of named files only. Collect ends the worker's reviewable life: prefer `review` while the worker is still live, and collect once it is done.";
+
+/// `merge`: land a reviewed worker's branch in one command.
+const MERGE: &str = "`mini-swe-mcp merge <worker_id>` lands a finished worker's branch on the base branch recorded for it: it trial-merges, runs the verify gate on the merge result in a throwaway worktree, merges with --no-ff and then deletes the branch, its history file and its worktree leftovers. It refuses - changing nothing - while the worker still runs, while the repository has another branch checked out, while a file the merge would touch has uncommitted changes (untracked and unrelated files are left alone), or while the branch conflicts, in which case it names the conflicting files and the steer that sends them back. The gate is skipped when the branch already contains the base tip and the worker's last verify passed. `--no-delete` keeps the branch. It never pushes.";
 
 /// `identity`: who owns a worker and which override sees everything.
 const IDENTITY: &str = "A worker belongs to the agent that dispatched it: status, steer, kill, collect, logs, list and watch only ever see or act on your own workers. Your identity is derived per session and exported to the watch your shell runs, so the CLI and the MCP connection agree; `mini-swe-mcp whoami` prints it and how it was derived. The human operator's `--admin` override is the only way to act on another agent's workers (H-3).";
@@ -101,7 +106,7 @@ mod tests {
     /// not, so `help <topic>` can refuse it with the available list.
     #[test]
     fn every_topic_has_text_and_unknown_ones_do_not() {
-        assert_eq!(TOPICS.len(), 9);
+        assert_eq!(TOPICS.len(), 10);
         for topic in TOPICS {
             let text = topic_text(topic).unwrap_or_else(|| panic!("'{topic}' has no text"));
             assert!(!text.trim().is_empty(), "'{topic}' is empty");
