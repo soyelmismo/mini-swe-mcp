@@ -761,17 +761,13 @@ fn cleanup(
             // `base_branch`, not `branch`: the worker's commits must be in the
             // branch the merge landed on, which is the whole round's base.
             if !branch_is_integrated_in(root, repo, id, base_branch) {
-                eprintln!("RETIRE_DEBUG not-integrated id={id} base={base_branch}");
                 continue;
             }
             if retire_worker_reporting(root, id, &ctx).row_removed {
                 retired.push(id.clone());
                 round_retired += 1;
-            } else {
-                eprintln!("RETIRE_DEBUG no-row-removed id={id}");
             }
         }
-        eprintln!("RETIRE_DEBUG worker={worker_id} integrated={integrated:?} retired={retired:?} keep={keep_branch}");
         if outcome.row_removed {
             retired.push(worker_id.to_string());
         }
