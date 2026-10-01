@@ -799,10 +799,10 @@ impl McpServer {
         let verify_tail = if verified == Some(true) {
             None
         } else {
-            match self.pool.get_worker_logs(&wid).await {
-                Some(logs) => verify_tail(&logs.tail(VERIFY_TAIL_STEPS)),
-                None => None,
-            }
+            self.pool
+                .get_worker_logs(&wid)
+                .await
+                .and_then(|logs| super::events::verify_tail_of(&logs.tail(VERIFY_TAIL_STEPS)))
         };
         Ok(json!({
             "worker_id": wid,
@@ -1199,12 +1199,6 @@ impl McpServer {
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
 
-/// How many lines of a failed verify a review carries.
-const VERIFY_TAIL_LINES: usize = 20;
-
-/// Hard cap on the verify tail, so one enormous test log cannot bloat the view.
-const VERIFY_TAIL_MAX_CHARS: usize = 4_000;
-
 /// The three fields only a completed worker carries: its summary, whether the
 /// gate verified it, and the branch it leaves behind.
 fn completed_fields(
@@ -1257,26 +1251,6 @@ fn revision_of(
         | Some(crate::pool::WorkerState::Failed { revision, .. }) => *revision,
         _ => entry.map_or(0, |entry| entry.revision),
     }
-}
-
-/// The bounded tail of the last failed verify run, when there was one.
-///
-/// The gate pushes its output back to the model as a `[verify]` step log, so
-/// the tail of the last such entry is what the worker itself was told to fix.
-fn verify_tail(logs: &[&crate::agent::AgentStepLog]) -> Option<String> {
-    let entry = logs
-        .iter()
-        .rev()
-        .find(|entry| entry.command.starts_with("[verify]"))?;
-    let mut lines: Vec<&str> = entry.output.lines().rev().take(VERIFY_TAIL_LINES).collect();
-    lines.reverse();
-    Some(
-        lines
-            .join("\n")
-            .chars()
-            .take(VERIFY_TAIL_MAX_CHARS)
-            .collect(),
-    )
 }
 
 /// The command that acts on this review: merge a clean branch, or send the
@@ -1961,9 +1935,9 @@ mod tests {
         };
         let logs = vec![&build, &verify];
         assert_eq!(
-            verify_tail(&logs).expect("a failed verify must be shown"),
+            crate::mcp::events::verify_tail_of(&logs).expect("a failed verify must be shown"),
             "test a ... FAILED\nassertion failed"
         );
-        assert_eq!(verify_tail(&logs[..1]), None);
+        assert_eq!(crate::mcp::events::verify_tail_of(&logs[..1]), None);
     }
 }
