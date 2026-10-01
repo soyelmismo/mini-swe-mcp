@@ -19,7 +19,7 @@ pub const HELP_FLAGS: &str = concat!(
 /// here, one concern per topic, so an agent can fetch exactly what it needs
 /// without paying for all of it in every session's context.
 pub const TOPICS: &[&str] = &[
-    "workflow", "watch", "steer", "review", "collect", "identity", "sandbox", "env",
+    "workflow", "watch", "steer", "review", "collect", "merge", "identity", "sandbox", "env",
 ];
 
 /// Text of one help topic, or `None` for an unknown topic.
