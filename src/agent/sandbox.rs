@@ -434,6 +434,103 @@ const COMMAND_WRAPPERS: &[&str] = &[
     "bunx", "pnpx",
 ];
 
+/// True for CPU-heavy commands (builds, test runners) vs lightweight ones.
+///
+/// Pure and table-driven: the command is split on shell operators, each
+/// segment's program is resolved past wrappers and `VAR=value` assignments,
+/// and the answer is a lookup in [`HEAVY_TOOLS`]. No environment or
+/// filesystem access, so the classification is deterministic and testable.
+pub fn is_heavy_command(command: &str) -> bool {
+    command.split(['\n', ';', '|', '&']).any(segment_is_heavy)
+}
+
+/// Whether one operator-free command segment is heavy.
+fn segment_is_heavy(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    let Some(program) = program_word(&mut words) else {
+        return false;
+    };
+    let args: Vec<&str> = words.collect();
+
+    if let Some(tool) = HEAVY_TOOLS.iter().find(|tool| tool.program == program) {
+        // `make` builds by default, but `--version`, `-n` and friends never
+        // build: any invocation carrying one of those flags is light.
+        if tool.program == "make" || tool.program == "gmake" {
+            return args.is_empty() || !args.iter().any(|arg| MAKE_LIGHT_FLAGS.contains(arg));
+        }
+        if tool.subcommands.is_empty() || matches_subcommand(&args, tool.subcommands) {
+            return true;
+        }
+    }
+
+    // `python -m pytest` / `python -m pip install`: the module is the entry
+    // point, so the words after `-m` carry the subcommand.
+    if matches!(program, "python" | "python2" | "python3" | "py")
+        && let Some(rest) = words_after_flag(&args, "-m")
+    {
+        return matches_subcommand(rest, PYTHON_MODULE_COMMANDS);
+    }
+
+    // `bash -c 'cargo build'`: the script is the command, so classify it. The
+    // script word keeps the caller's quoting, which the classifier ignores.
+    if matches!(program, "bash" | "sh" | "dash" | "zsh" | "ksh")
+        && let Some(script) = words_after_flag(&args, "-c").and_then(|rest| rest.first())
+    {
+        return is_heavy_command(script.trim_matches(|c| c == '\'' || c == '"'));
+    }
+
+    false
+}
+
+/// The program word of a segment: wrappers, flags and `VAR=value`
+/// assignments are skipped, and a leading directory is dropped so `./gradlew`
+/// and `/usr/bin/go` match the table.
+fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    words.find_map(|word| {
+        // A bare number is a flag value (`nice -n 10`), never a program.
+        let is_flag_value = !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+        if COMMAND_WRAPPERS.contains(&word)
+            || word.starts_with('-')
+            || is_flag_value
+            || is_env_assignment(word)
+        {
+            None
+        } else {
+            Some(basename(word))
+        }
+    })
+}
+
+/// A `VAR=value` assignment, which only sets up the environment for a command.
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
+/// Program name without any leading directory components.
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// Whether `args` contains one of `subcommands` as a contiguous run of words.
+fn matches_subcommand(args: &[&str], subcommands: &[&str]) -> bool {
+    subcommands.iter().any(|subcommand| {
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        !words.is_empty()
+            && args
+                .windows(words.len())
+                .any(|window| window == words.as_slice())
+    })
+}
+
+/// The words following `flag` in `args`, when the flag is present.
+fn words_after_flag<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a [&'a str]> {
+    args.iter()
+        .position(|word| *word == flag)
+        .map(|at| &args[at + 1..])
+}
+
 /// Whether a binary is available on this host, probed once per name.
 ///
 /// Memoized so the (potentially `fork`+`exec`-bound) probe runs at most once
@@ -1394,22 +1491,165 @@ mod tests {
 
     #[test]
     fn test_is_heavy_command() {
-        assert!(is_heavy_command("cargo build"));
-        assert!(is_heavy_command("cargo test --all"));
-        assert!(is_heavy_command("cargo"));
-        assert!(is_heavy_command("pytest tests/"));
-        assert!(is_heavy_command("make -j4"));
-        assert!(is_heavy_command("make"));
-        assert!(is_heavy_command("gcc -O3 main.c"));
+        // Rust, C/C++ and the portable build systems: every invocation builds.
+        for command in [
+            "cargo build",
+            "cargo test --all",
+            "cargo",
+            "rustc src/main.rs",
+            "make -j4",
+            "make",
+            "gmake check",
+            "cmake --build build",
+            "ninja -C build",
+            "meson compile -C build",
+            "bazel build //...",
+            "bazelisk test //...",
+            "gcc -O3 main.c",
+            "g++ -O2 main.cpp",
+            "cc -c foo.c",
+            "clang --version",
+            "tsc",
+            "tsc --noEmit",
+            "esbuild src/index.ts --bundle",
+            "webpack",
+            "rollup -c",
+            "jest",
+            "vitest run",
+            "pytest tests/",
+            "tox",
+            "nox -s tests",
+            "mvn -q test",
+            "mvnw verify",
+            "gradle build",
+            "gradlew test",
+            "./gradlew test",
+            "sbt test",
+            "ant test",
+            "msbuild solution.sln",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
 
-        assert!(!is_heavy_command("git status"));
-        assert!(!is_heavy_command("git diff HEAD"));
-        assert!(!is_heavy_command("ls -la"));
-        assert!(!is_heavy_command("cat src/agent.rs"));
-        assert!(!is_heavy_command("find . -name '*.rs'"));
-        assert!(!is_heavy_command(
-            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-        ));
+        // Node, Python, Go and .NET: only the build/test/install verbs.
+        for command in [
+            "npm run build",
+            "npm test",
+            "npm ci",
+            "npm install",
+            "npm rebuild",
+            "pnpm run build",
+            "pnpm install",
+            "pnpm build",
+            "yarn run build",
+            "yarn install",
+            "yarn build",
+            "bun run build",
+            "bun test",
+            "bun install",
+            "bun build ./index.tsx",
+            "deno test",
+            "deno task build",
+            "deno compile main.ts",
+            "vite build",
+            "playwright test",
+            "cypress run",
+            "nx run app:build",
+            "turbo run build",
+            "pip install -r requirements.txt",
+            "pip wheel .",
+            "pip3 install requests",
+            "uv sync",
+            "uv run pytest",
+            "uv pip install -r requirements.txt",
+            "poetry install",
+            "poetry build",
+            "pipenv install",
+            "conda install numpy",
+            "conda env create -f env.yml",
+            "go build ./...",
+            "go test ./...",
+            "go run ./cmd/server",
+            "go vet ./...",
+            "go mod download",
+            "go mod tidy",
+            "/usr/bin/go build ./...",
+            "dotnet build",
+            "dotnet test",
+            "dotnet publish",
+            "dotnet run",
+            "python -m build",
+            "python -m pip install .",
+            "python -m pytest",
+            "python -m unittest",
+            "python3 -m pip install requests",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
+
+        // Composition: operators, wrappers and env assignments must not hide
+        // a build, and a quoted script is classified by its content.
+        for command in [
+            "cd src && cargo test",
+            "RUST_BACKTRACE=1 cargo test",
+            "sudo make install",
+            "nice -n 10 go test ./...",
+            "npx tsc --noEmit",
+            "bash -c 'cargo build'",
+            "echo done && npm run build",
+            "go test ./... | tail -5",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
+
+        // Read-only commands stay on the light budget, even when they name a
+        // tool that also builds or mention a build in their arguments.
+        for command in [
+            "git status",
+            "git diff HEAD",
+            "ls -la",
+            "cat src/agent.rs",
+            "cat package.json",
+            "find . -name '*.rs'",
+            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "npm ls",
+            "npm list",
+            "npm --version",
+            "npm view react version",
+            "pnpm list",
+            "yarn --version",
+            "yarn list",
+            "yarn why react",
+            "bun --version",
+            "deno lint",
+            "deno fmt --check",
+            "vite --version",
+            "pip list",
+            "pip show requests",
+            "pip freeze",
+            "uv pip list",
+            "poetry show",
+            "conda list",
+            "conda info",
+            "go env",
+            "go list ./...",
+            "go version",
+            "go fmt ./...",
+            "dotnet --info",
+            "dotnet list package",
+            "python -m pip list",
+            "python --version",
+            "grep -rn 'cargo build' .",
+            "echo cargo build",
+            "echo 'go test'",
+            "make --version",
+            "make -n build",
+        ] {
+            assert!(!is_heavy_command(command), "{command} must be light");
+        }
+
+        assert!(!is_heavy_command(""));
+        assert!(!is_heavy_command("   "));
     }
 
     #[test]
