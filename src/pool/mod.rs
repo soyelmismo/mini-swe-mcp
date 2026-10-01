@@ -40,6 +40,7 @@ mod fair;
 pub mod merge;
 mod registry;
 pub mod revision;
+pub mod round;
 mod runner;
 mod state;
 mod steer;
@@ -54,6 +55,7 @@ pub use self::buffer::{
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
 };
 pub use self::clock::unix_timestamp;
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole,
@@ -69,28 +71,33 @@ pub use self::revision::{
     history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
+    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
+    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, save_worker_history,
+    save_worker_history_in,
 };
-
-pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
+pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, REPORT_FOLLOWUP, WorkerLaunchConfig, is_completion_request,
-    parse_ask_orchestrator, parse_consolidate_merge, parse_report, parse_request_turns,
-    summarize_command,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
+    WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, FileStat, TOP_FILE_LIMIT, WorkerMetrics,
-    WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport, WorkerState, churn_line,
-    diff_sections_of, file_stats_of_diff, normalize_diff_path, same_diff_path,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat,
+    TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord,
+    WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
+    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
     steer_path, steer_path_in, write_steer_message, write_steer_message_in,
 };
 
+use self::revision::outcome_revision;
 use self::state::expired_terminal_ids;
+use crate::agent::jobs::{JobHandle, JobTable};
 use crate::manifest::ModelManifest;
 use crate::worktree::{BranchMerge, ScratchRoot, WorktreeGuard};
 
@@ -164,6 +171,22 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
             None
         }
     }
+}
+
+/// The `verified` / `unverified` tag a completed worker's wait line carries.
+fn verified_label(verified: Option<bool>) -> &'static str {
+    match verified {
+        Some(true) => "verified",
+        _ => "unverified",
+    }
+}
+
+/// One line of a stopped worker's reason: the first line only, the failed row's
+/// `error: ` label stripped, clamped to a fixed byte budget so a stack trace
+/// cannot flood the observation.
+fn stop_reason(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    clamp_string(first.strip_prefix("error: ").unwrap_or(first).trim(), 200)
 }
 
 /// Clears a worker's heavy-slot wait when the slot is granted or the wait is
@@ -245,6 +268,10 @@ pub struct WorkerPool {
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
     command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Background jobs of every live worker: a command that outlived its
+    /// budget keeps running here, confined exactly as the command was, until
+    /// it ends or its worker does.
+    jobs: Arc<JobTable>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -329,6 +356,7 @@ impl WorkerPool {
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            jobs: JobTable::new(),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry,
@@ -342,6 +370,20 @@ impl WorkerPool {
             next_dispatch_seq: Arc::new(AtomicU64::new(1)),
             scratch,
         }
+    }
+
+    /// A handle on `worker_id`'s background jobs, for the runner that executes
+    /// its commands.
+    pub fn job_handle(&self, worker_id: &str) -> JobHandle {
+        JobHandle::new(Arc::clone(&self.jobs), worker_id)
+    }
+
+    /// Stop every background job of `worker_id`.
+    ///
+    /// Called when the worker ends, however it ends: a job is confined exactly
+    /// like the command that started it, so it must not outlive the worker.
+    pub fn end_worker_jobs(&self, worker_id: &str) -> usize {
+        self.jobs.kill_all(worker_id)
     }
 
     /// The scratch root this pool resolves every per-worker path under.
@@ -455,9 +497,14 @@ impl WorkerPool {
         self.log_policy
     }
 
-    /// Evict terminal worker records whose TTL expired, plus their registry
-    /// entries. Fresh terminal records are deliberately kept so a subsequent
-    /// `collect` / `wait: true` still finds them (audit 07, R3).
+    /// Evict terminal worker records whose TTL expired. Fresh terminal records
+    /// are deliberately kept so a subsequent `collect` / `wait: true` still
+    /// finds them (audit 07, R3).
+    ///
+    /// The eviction bounds *memory* only: a reaped record leaves its registry
+    /// row and its saved conversation in place, so a finished worker stays
+    /// steerable for as long as its branch does. Those are retired by
+    /// [`WorkerPool::retire_expired_terminal_workers`], never from here.
     pub async fn reap(&self) -> Vec<String> {
         let expired = {
             let mut lock = self.workers.write().await;
@@ -465,6 +512,30 @@ impl WorkerPool {
         };
         self.forget_worktrees(&expired).await;
         expired
+    }
+
+    /// Retire the durable state of every terminal worker whose retention ran
+    /// out: its registry row, its saved conversation and its steering mailbox.
+    ///
+    /// Age-based and independent of the in-memory records, so a worker whose
+    /// branch remains keeps everything until this retention ends. Returns how
+    /// many workers were retired.
+    pub async fn retire_expired_terminal_workers(&self) -> usize {
+        let root = self.scratch.clone();
+        let retention = terminal_retention_secs();
+        let retired = tokio::task::spawn_blocking(move || {
+            revision::retire_expired_terminal_workers_in(&root, retention)
+        })
+        .await
+        .unwrap_or(0);
+        if retired > 0 {
+            tracing::info!(
+                retired,
+                retention_secs = retention,
+                "Retired terminal workers past their retention"
+            );
+        }
+        retired
     }
 
     /// Drop the worktree paths of workers whose records are gone.
@@ -482,12 +553,18 @@ impl WorkerPool {
     }
 
     /// Shared eviction helper: removes expired terminal records from `lock`.
+    ///
+    /// Only the record goes. The registry row and the saved conversation are
+    /// what make a finished worker continuable hours later, so they outlive the
+    /// eviction and are retired by the retention sweep (or by `prune`, once the
+    /// branch is gone) instead.
     fn reap_locked(&self, lock: &mut HashMap<String, WorkerRecord>) -> Vec<String> {
         let ttl = self.terminal_ttl.as_secs();
         let expired = expired_terminal_ids(lock, ttl);
         for id in &expired {
             lock.remove(id);
-            remove_registry_entry_in(&self.scratch, id);
+            // The writer's last-row cache is dropped with the record so the map
+            // stays bounded by the live workers; the on-disk row is untouched.
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -799,6 +876,7 @@ impl WorkerPool {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(id)
             .copied();
+        let jobs = self.jobs.summaries(id);
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
         let progress = match &w.state {
@@ -811,6 +889,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot,
                 command_started_at,
+                jobs,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
@@ -819,6 +898,7 @@ impl WorkerPool {
                 question: Some(question.clone()),
                 waiting_for_slot,
                 command_started_at: None,
+                jobs,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
@@ -827,6 +907,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
@@ -835,6 +916,7 @@ impl WorkerPool {
                 question: None,
                 waiting_for_slot: None,
                 command_started_at: None,
+                jobs: Vec::new(),
             },
         };
         drop(lock);
@@ -970,6 +1052,61 @@ impl WorkerPool {
             .is_some_and(|entry| entry.status == RegistryStatus::Completed)
     }
 
+    /// The round `owner` is about to consolidate in `group`.
+    ///
+    /// Every row of the caller's own workers in that group, in the shape
+    /// [`round::build`] probes the repository with. The registry is the only
+    /// cross-process record of a group, so a worker this process never
+    /// dispatched (a hub restart, another connection) is still listed; the
+    /// in-process state is consulted only for the verification outcome, which
+    /// no registry row carries.
+    ///
+    /// `repo` is the repository the dispatch will run in, used when the rows
+    /// name none.
+    pub async fn round_manifest(&self, owner: &str, group: &str, repo: &Path) -> RoundManifest {
+        let mut rows: Vec<RoundRow> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut repo_hint: Option<PathBuf> = None;
+        let mut base_hint: Option<String> = None;
+        let mut entries: Vec<WorkerRegistryEntry> = load_all_registry_entries_in(&self.scratch)
+            .into_iter()
+            .filter(|entry| {
+                entry.owner.as_deref() == Some(owner)
+                    && entry.group.as_deref() == Some(group)
+                    && entry.role == WorkerRole::Worker
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        for entry in entries {
+            if !seen.insert(entry.id.clone()) {
+                continue;
+            }
+            if repo_hint.is_none() {
+                repo_hint = entry.repo_path.as_deref().map(PathBuf::from);
+            }
+            if base_hint.is_none() {
+                base_hint = entry.base_branch.clone();
+            }
+            let verified = match self.get_worker_state(&entry.id).await {
+                Some(WorkerState::Completed { verified, .. }) => verified,
+                _ => None,
+            };
+            rows.push(RoundRow {
+                id: entry.id,
+                task: entry.task,
+                status: entry.status,
+                verified,
+            });
+        }
+        round::build(
+            group,
+            base_hint,
+            Some(repo_hint.unwrap_or_else(|| repo.to_path_buf())),
+            rows,
+        )
+        .await
+    }
+
     /// Integrate the named workers' branches into a consolidator's worktree.
     ///
     /// One `CONSOLIDATE_MERGE` request: each id is resolved, checked against
@@ -1043,6 +1180,160 @@ impl WorkerPool {
         ConsolidateMerge {
             observation: lines.join("\n"),
             integrated,
+        }
+    }
+
+    /// Route a failure or a conflict back to the worker that owns it.
+    ///
+    /// One `CONSOLIDATE_STEER` request: the target is resolved, checked against
+    /// [`check_consolidate_delegation`], then steered exactly as the orchestrator
+    /// would -- a live worker takes the message on its next step, a stopped one
+    /// is continued on its own id and branch. The consolidator's owner is the
+    /// acting agent throughout, so the guidance can never arrive from -- or be
+    /// aimed at -- another owner.
+    pub async fn consolidate_steer(&self, actor: &WorkerMeta, id: &str, message: String) -> String {
+        let target = match self.resolve_worker_id(id, &actor.owner).await {
+            Ok(target) => target,
+            Err(e) => return format!("{id} refused: {e}"),
+        };
+        let Some(entry) = self.worker_row(&target).await else {
+            return format!("{id} refused: no such worker");
+        };
+        if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+            return format!("{id} refused: {reason}");
+        }
+        match self.steer_relaunchable(&target, message).await {
+            Ok(outcome) => format!(
+                "{target} {} (revision {})",
+                outcome.verb(),
+                outcome_revision(&outcome)
+            ),
+            Err(e) => format!("{target} refused: {e}"),
+        }
+    }
+
+    /// Block until every named worker has stopped, or the deadline passes.
+    ///
+    /// One `CONSOLIDATE_WAIT` request. Each id is resolved and delegation-
+    /// checked up front, so a refused id is reported immediately instead of
+    /// after the wait. The wait spends no turn and holds the caller's
+    /// [`command_running`](WorkerPool::command_running) mark, so the stall
+    /// detector reads a long wait as work rather than as a hung step.
+    pub async fn consolidate_wait(
+        &self,
+        actor: &WorkerMeta,
+        ids: &[String],
+        timeout_secs: Option<u64>,
+    ) -> String {
+        // One slot per requested id, in request order: a refusal fills it now,
+        // a waited-on id fills it once its worker has stopped.
+        let mut lines: Vec<Option<String>> = Vec::with_capacity(ids.len());
+        let mut waited: Vec<(usize, String)> = Vec::new();
+        for id in ids {
+            let target = match self.resolve_worker_id(id, &actor.owner).await {
+                Ok(target) => target,
+                Err(e) => {
+                    lines.push(Some(format!("{id} refused: {e}")));
+                    continue;
+                }
+            };
+            let Some(entry) = self.worker_row(&target).await else {
+                lines.push(Some(format!("{id} refused: no such worker")));
+                continue;
+            };
+            if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+                lines.push(Some(format!("{id} refused: {reason}")));
+                continue;
+            }
+            lines.push(None);
+            waited.push((lines.len() - 1, target));
+        }
+
+        let timeout = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(CONSOLIDATE_WAIT_DEFAULT_SECS)
+                .min(CONSOLIDATE_WAIT_MAX_SECS),
+        );
+        // Held for the whole wait: the consolidator is running a command as far
+        // as the stall detector is concerned.
+        let _running = self.command_running(&actor.id);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut changes = self.subscribe_changes();
+        let mut timed_out = false;
+        loop {
+            let mut pending = false;
+            for (_, id) in &waited {
+                if !self.is_stopped(id).await {
+                    pending = true;
+                    break;
+                }
+            }
+            if !pending {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                timed_out = true;
+                break;
+            }
+            // The pool's change channel wakes this the moment a worker stops;
+            // the tick only bounds how long a missed wake-up can stall it.
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep((deadline - now).min(Duration::from_secs(1))) => {}
+            }
+        }
+        for (slot, id) in &waited {
+            lines[*slot] = Some(self.stopped_line(id, timed_out, timeout.as_secs()).await);
+        }
+        lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Whether `id` has stopped: completed, failed, killed, interrupted, or
+    /// parked waiting for an answer. A worker still `Reviewing` is live.
+    async fn is_stopped(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            return !matches!(state, WorkerState::Running { .. });
+        }
+        load_registry_entry_in(&self.scratch, id)
+            .is_some_and(|e| e.status.is_terminal() || e.status == RegistryStatus::Paused)
+    }
+
+    /// One compact line for a waited-on worker: its state, whether it verified
+    /// its work, and the one-line error or question that stopped it.
+    ///
+    /// The live record carries the `verified` flag; a worker that survives only
+    /// as a registry row reports its status alone.
+    async fn stopped_line(&self, id: &str, timed_out: bool, timeout_secs: u64) -> String {
+        if let Some(state) = self.get_worker_state(id).await {
+            return match &state {
+                WorkerState::Running { .. } if timed_out => {
+                    format!("{id} running (still running after {timeout_secs}s)")
+                }
+                WorkerState::Running { .. } => format!("{id} running"),
+                WorkerState::Paused { question, .. } => {
+                    format!("{id} paused: {}", stop_reason(question))
+                }
+                WorkerState::Completed { verified, .. } => {
+                    format!("{id} completed {}", verified_label(*verified))
+                }
+                WorkerState::Failed { error, .. } => format!("{id} failed: {}", stop_reason(error)),
+            };
+        }
+        let Some(entry) = load_registry_entry_in(&self.scratch, id) else {
+            return format!("{id} stopped (no registry row)");
+        };
+        let status = entry.status.display_name().to_lowercase();
+        match entry.status {
+            RegistryStatus::Failed => format!("{id} failed: {}", stop_reason(&entry.last_command)),
+            RegistryStatus::Paused => format!(
+                "{id} paused: {}",
+                stop_reason(entry.question.as_deref().unwrap_or_default())
+            ),
+            RegistryStatus::Running | RegistryStatus::Reviewing if timed_out => {
+                format!("{id} {status} (still running after {timeout_secs}s)")
+            }
+            _ => format!("{id} {status}"),
         }
     }
 
@@ -1206,6 +1497,20 @@ impl WorkerPool {
     /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
     pub async fn steer(&self, id: &str, message: String) -> Result<SteerOutcome> {
         self.steer_with_budget(id, message, None).await
+    }
+
+    /// [`WorkerPool::steer`] with the relaunched loop's future type erased.
+    ///
+    /// Steering a stopped worker relaunches its loop, and a consolidator's own
+    /// turn awaits that steer -- so the loop's future type would otherwise
+    /// depend on itself and have no resolvable size. Erasing it behind a
+    /// `dyn Future` keeps the awaiting turn a plain, finite type.
+    fn steer_relaunchable<'a>(
+        &'a self,
+        id: &'a str,
+        message: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<SteerOutcome>> + Send + 'a>> {
+        Box::pin(self.steer(id, message))
     }
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
@@ -1567,7 +1872,12 @@ impl WorkerPool {
         // worktree path is retired, so no `.await` runs under the guard.
         let record = {
             let mut lock = self.workers.write().await;
-            let record = lock.remove(id)?;
+            let Some(record) = lock.remove(id) else {
+                // No record here: the worker may still be a terminal registry
+                // row, which is what a reaped or cross-process worker leaves.
+                drop(lock);
+                return self.collect_from_registry(id).await;
+            };
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -1595,18 +1905,79 @@ impl WorkerPool {
             logs_truncation_notice: view.logs_truncation_notice,
         })
     }
+
+    /// [`WorkerPool::collect`] for a worker this pool holds no record for.
+    ///
+    /// A terminal record is evicted from memory after its TTL, but its registry
+    /// row outlives the eviction, so `collect` still answers from the row: the
+    /// branch is what the caller acts on, and the summary is the row's own
+    /// `last_command`. The step-log window left with the record, so the
+    /// counters report what the row knows and the notice says so. A row that is
+    /// still live belongs to another process and is not collectible here.
+    async fn collect_from_registry(&self, id: &str) -> Option<CollectedWorker> {
+        let entry = load_registry_entry_in(&self.scratch, id)?;
+        if !entry.status.is_terminal() {
+            return None;
+        }
+        let state = match entry.status {
+            RegistryStatus::Completed => WorkerState::Completed {
+                turns: entry.step,
+                diff: String::new(),
+                summary: entry.last_command.clone(),
+                completed_at: entry.updated_at,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
+                verified: None,
+                metrics: entry.metrics,
+                revision: entry.revision,
+                report: entry.report.clone(),
+            },
+            _ => WorkerState::Failed {
+                error: entry.last_command.clone(),
+                step: entry.step,
+                failed_at: entry.updated_at,
+                metrics: entry.metrics,
+                revision: entry.revision,
+            },
+        };
+        let owner = registry_owner_label(&entry).to_string();
+        Some(CollectedWorker {
+            id: entry.id,
+            task: entry.task,
+            model: entry.model,
+            owner,
+            state,
+            logs: Vec::new(),
+            logs_omitted: 0,
+            logs_dropped: 0,
+            logs_truncation_notice: Some(
+                "the step log left with the evicted in-memory record".to_string(),
+            ),
+        })
+    }
 }
 
-/// Spawn the background reaper that evicts expired terminal worker records.
+/// Spawn the background reaper that evicts expired terminal worker records
+/// and, on a much slower cadence, retires the durable state of the workers
+/// whose retention ran out.
 ///
 /// Kept in the library so the server can start it from `run_stdio` without
 /// depending on `main.rs`.
 pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(30);
+        // The durable retention is a week, so sweeping it needs no such
+        // cadence: one registry scan per hour rather than one per tick.
+        let retention_every = 120u32;
+        let mut since_retention = 0u32;
         loop {
             tokio::time::sleep(interval).await;
             pool.reap().await;
+            since_retention += 1;
+            if since_retention >= retention_every {
+                since_retention = 0;
+                pool.retire_expired_terminal_workers().await;
+            }
         }
     })
 }

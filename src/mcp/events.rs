@@ -152,6 +152,9 @@ pub struct ChannelEvent {
     pub status: String,
     /// The rendered message.
     pub content: String,
+    /// Full completion report and per-file stats, independent of the text view.
+    pub report: Option<WorkerReport>,
+    pub per_file: Vec<FileStat>,
 }
 
 /// The events for the transitions between two snapshots, ordered by worker id.
@@ -175,6 +178,8 @@ pub fn diff_events(previous: &WorkerSnapshot, current: &WorkerSnapshot) -> Vec<C
                 model: view.model.clone(),
                 status: view.status.clone(),
                 content: render(view, kind),
+                report: view.outcome.report.clone(),
+                per_file: view.outcome.per_file.clone(),
             })
         })
         .collect()
@@ -191,6 +196,8 @@ pub fn channel_frame(event: &ChannelEvent) -> Option<String> {
         "method": CHANNEL_METHOD,
         "params": {
             "content": event.content.clone(),
+            "report": event.report,
+            "per_file": event.per_file,
             "meta": {
                 "event": event.kind.as_str(),
                 "worker_id": event.worker_id.clone(),
@@ -868,6 +875,8 @@ mod router_tests {
             model: "test".to_string(),
             status: kind.as_str().to_string(),
             content: "test".to_string(),
+            report: None,
+            per_file: Vec::new(),
         }
     }
 
@@ -990,11 +999,23 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             if let Some(started) = progress.command_started_at {
                 view["command_started_at"] = json!(started);
             }
+            // A command that outlived its budget keeps running as a background
+            // job the worker waits on, so it belongs in the status view.
+            if !progress.jobs.is_empty() {
+                view["jobs"] = json!(
+                    progress
+                        .jobs
+                        .iter()
+                        .map(|job| job.label())
+                        .collect::<Vec<_>>()
+                );
+            }
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];
                 for key in [
-                    "summary", "verified", "branch", "revision", "metrics", "error",
+                    "summary", "verified", "branch", "revision", "metrics", "error", "report",
+                    "per_file",
                 ] {
                     if let Some(value) = details.get(key) {
                         view[key] = value

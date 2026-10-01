@@ -42,6 +42,13 @@ impl CapturedRequests {
 struct ScriptedSseServer {
     base_url: String,
     requests: CapturedRequests,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ScriptedSseServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl ScriptedSseServer {
@@ -51,7 +58,7 @@ impl ScriptedSseServer {
         let requests = CapturedRequests(Arc::new(Mutex::new(Vec::new())));
         let sink = requests.clone();
         let script = Arc::new(std::sync::Mutex::new(turns.into_iter()));
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -72,6 +79,7 @@ impl ScriptedSseServer {
         Self {
             base_url: format!("http://{addr}"),
             requests,
+            task,
         }
     }
 
@@ -178,10 +186,9 @@ async fn dispatch_and_wait(
     server: &ScriptedSseServer,
     repo: &std::path::Path,
     max_turns: usize,
-) -> (WorkerPool, String, WorkerState) {
+) -> (common::TempDir, WorkerPool, String, WorkerState) {
     let scratch = common::TempDir::new_in_tmp("report-pool");
     let root = scratch.path().to_path_buf();
-    std::mem::forget(scratch);
     let pool = WorkerPool::with_scratch(
         1,
         server.base_url.clone(),
@@ -211,7 +218,7 @@ async fn dispatch_and_wait(
                 WorkerState::Completed { .. } | WorkerState::Failed { .. }
             )
         {
-            return (pool, worker_id, state);
+            return (scratch, pool, worker_id, state);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -230,7 +237,7 @@ async fn a_completion_without_a_report_is_asked_once() {
     ])
     .await;
 
-    let (_pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
+    let (_scratch, pool, id, state) = dispatch_and_wait(&server, &repo, 1).await;
 
     let WorkerState::Completed {
         report, summary, ..
@@ -239,6 +246,9 @@ async fn a_completion_without_a_report_is_asked_once() {
         panic!("the worker must complete, got {state:?}");
     };
     let report = report.expect("the follow-up must have produced a report");
+    let entry = mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &id)
+        .expect("the terminal row must exist");
+    assert_eq!(entry.report.as_ref(), Some(&report));
     assert_eq!(report.done, "Fixed the parser");
     assert_eq!(report.files, "src/a.rs, src/b.rs");
     assert_eq!(report.tests, "cargo test: 4 passed");
@@ -277,7 +287,7 @@ async fn a_second_reportless_completion_falls_back_to_the_summary() {
     ])
     .await;
 
-    let (_pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
+    let (_scratch, _pool, _id, state) = dispatch_and_wait(&server, &repo, 10).await;
 
     let WorkerState::Completed {
         report, summary, ..
@@ -371,4 +381,150 @@ fn a_stalled_event_names_the_counter_that_moved() {
         "{text}"
     );
     assert!(text.lines().count() <= 5, "{text}");
+}
+
+#[test]
+fn json_channel_and_watch_events_keep_the_full_report_and_stats() {
+    use mini_swe_mcp::mcp::{EventKind, WorkerSnapshot, WorkerView, channel_frame, diff_events};
+    use mini_swe_mcp::pool::{WorkerMetrics, WorkerReport};
+    let report = WorkerReport {
+        done: "Fix the parser".into(),
+        files: "src/a.rs".into(),
+        tests: "cargo test: 4 passed".into(),
+        risks: "Changes completion feedback".into(),
+    };
+    let state = WorkerState::Completed {
+        turns: 1,
+        diff: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+        summary: report.done.clone(),
+        completed_at: 1,
+        artifacts: vec![],
+        branch: Some("worker-json".into()),
+        verified: Some(true),
+        metrics: WorkerMetrics::default(),
+        revision: 0,
+        report: Some(report.clone()),
+    };
+    let mut view = json!({"worker_id":"json", "task":"probe"});
+    watch::enrich_state(&mut view, &state);
+    let event = watch::select_event(&view, None, 1).expect("completed event");
+    let wire: Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+    assert_eq!(wire["report"], json!(report));
+    assert_eq!(
+        wire["per_file"],
+        json!([{"path":"src/a.rs","insertions":1,"deletions":1}])
+    );
+    let summary = state.to_summary();
+    assert_eq!(summary["report"], wire["report"]);
+    assert_eq!(summary["per_file"], wire["per_file"]);
+    let mut current = WorkerSnapshot::new();
+    current.insert(
+        "json".into(),
+        WorkerView {
+            worker_id: "json".into(),
+            event: Some(EventKind::Completed),
+            outcome: mini_swe_mcp::mcp::Outcome {
+                report: Some(report),
+                per_file: mini_swe_mcp::pool::file_stats_of_diff(match &state {
+                    WorkerState::Completed { diff, .. } => diff,
+                    _ => unreachable!(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let events = diff_events(&WorkerSnapshot::new(), &current);
+    let frame: Value = serde_json::from_str(&channel_frame(&events[0]).unwrap()).unwrap();
+    assert_eq!(frame["params"]["report"], wire["report"]);
+    assert_eq!(frame["params"]["per_file"], wire["per_file"]);
+}
+
+#[tokio::test]
+async fn report_survives_eviction_in_status_review_and_collect() {
+    use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
+    use mini_swe_mcp::pool::{
+        LogBuffer, RegistryStatus, WorkerMetrics, WorkerRecord, WorkerRegistryEntry, WorkerReport,
+        save_registry_entry_in,
+    };
+    let owned = common::IsolatedPool::new(1, "report-evict");
+    let report = WorkerReport {
+        done: "Fix the parser".into(),
+        files: "src/a.rs".into(),
+        tests: "cargo test: 4 passed".into(),
+        risks: "none".into(),
+    };
+    let entry = WorkerRegistryEntry {
+        id: "evicted-report".into(),
+        pid: std::process::id(),
+        task: "probe".into(),
+        model: "test".into(),
+        status: RegistryStatus::Completed,
+        step: 1,
+        max_turns: 1,
+        last_command: report.done.clone(),
+        question: None,
+        started_at: 0,
+        updated_at: mini_swe_mcp::pool::unix_timestamp(),
+        group: None,
+        role: Default::default(),
+        repo_path: None,
+        owner: Some(TEST_OWNER.into()),
+        metrics: WorkerMetrics::default(),
+        base_branch: None,
+        base_commit: None,
+        revision: 0,
+        auto_continues: 0,
+        report: Some(report.clone()),
+    };
+    save_registry_entry_in(&owned.root(), &entry);
+    owned
+        .pool
+        .__test_insert_worker(WorkerRecord {
+            id: entry.id.clone(),
+            task: entry.task.clone(),
+            model: entry.model.clone(),
+            owner: TEST_OWNER.into(),
+            state: WorkerState::Completed {
+                turns: 1,
+                diff: String::new(),
+                summary: report.done.clone(),
+                completed_at: 0,
+                artifacts: vec![],
+                branch: None,
+                verified: None,
+                metrics: entry.metrics,
+                revision: 0,
+                report: Some(report.clone()),
+            },
+            metrics: entry.metrics,
+            logs: LogBuffer::new(),
+            pending_steer: vec![],
+            resume_tx: None,
+            handle: None,
+            revision: 0,
+        })
+        .await;
+    assert_eq!(owned.pool.reap().await, vec![entry.id.clone()]);
+    let server = McpServer::new(owned.pool.clone(), "test".into());
+    let ctx = ConnectionContext {
+        agent_id: Some(TEST_OWNER.into()),
+        ..ConnectionContext::hub_connection(7)
+    };
+    for action in ["status", "review", "collect"] {
+        let payload = server
+            .execute_tool_for(
+                "worker",
+                json!({"action":action,"worker_id":entry.id}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let actual = if action == "status" {
+            &payload["state"]["details"]["report"]
+        } else {
+            &payload["report"]
+        };
+        assert_eq!(actual, &json!(report), "{action}: {payload}");
+    }
 }

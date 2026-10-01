@@ -2102,6 +2102,8 @@ fn completed_channel_event_carries_the_review_guidance() {
         model: view.model.clone(),
         status: view.status.clone(),
         content: mini_swe_mcp::mcp::render_for_test(&view, EventKind::Completed),
+        report: view.outcome.report.clone(),
+        per_file: view.outcome.per_file.clone(),
     };
     assert!(
         event.content.contains("steer"),

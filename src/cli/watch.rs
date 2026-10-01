@@ -334,7 +334,7 @@ fn render_event(v: &Value, verbose: bool) -> String {
     let mut out = String::new();
     if let Some(dropped) = v["dropped_events"].as_u64().filter(|n| *n > 0) {
         out.push_str(&format!(
-            "{dropped} older events dropped (backlog limit 100).\n"
+            "{dropped} older events dropped (backlog limit 100). | "
         ));
     }
     // The headline carries what decides the next move: the outcome, its

@@ -102,7 +102,8 @@ DISCIPLINE:
 15. Concurrency: never hold a lock, guard or permit across a wait that can be long (network, child process, another worker). Anything that joins a queue or takes a slot must give it back when the operation fails or is cancelled (release it in a guard/Drop/finally, not only on the success path).
 16. Tests must be hermetic and deterministic: give every file, directory, daemon or registry they touch a temporary location passed to the code under test; do not mutate process-global state (environment variables) in tests that run in parallel; do not depend on the order of concurrent replies; poll for a condition instead of sleeping. Never write an assertion that cannot fail: a new test must fail without your change.
 17. Do not call a failure "environmental" or "pre-existing" without proof: show the same failure on the unmodified code (e.g. `git show HEAD:<path>`) and explain the mechanism; otherwise it is yours to fix.
-18. Other workers change the same repository in parallel: keep the diff to what the task needs, and put new tests in a module or file dedicated to your change rather than appending to the end of a large shared test file."#;
+18. Other workers change the same repository in parallel: keep the diff to what the task needs, and put new tests in a module or file dedicated to your change rather than appending to the end of a large shared test file.
+19. A command that reaches its timeout is not killed: it keeps running as job <n>, and the tool result tells you the number. Wait for it with `echo WAIT_JOB <n>` (blocks until it exits or 600s, then reports its exit code and the tail of its output) and stop it with `echo KILL_JOB <n>`. Never background a build yourself (`nohup cargo test > log &`) and never poll it with `sleep`; that burns a turn per poll and looks like a stall."#;
 
 /// Chat roles accepted by the OpenAI chat-completions API.
 ///

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 
 use crate::agent::AgentStepLog;
+use crate::agent::jobs::JobStatus;
 
 use super::buffer::{LogBuffer, LogStats};
 use super::unix_timestamp;
@@ -108,15 +109,6 @@ impl WorkerReport {
             && self.files.is_empty()
             && self.tests.is_empty()
             && self.risks.is_empty()
-    }
-
-    /// The paths the report names, split on commas and trimmed.
-    pub fn file_paths(&self) -> Vec<&str> {
-        self.files
-            .split(',')
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .collect()
     }
 }
 
@@ -387,7 +379,7 @@ impl WorkerState {
                 metrics,
                 revision,
                 report,
-                ..
+                diff,
             } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
@@ -399,6 +391,7 @@ impl WorkerState {
                 "metrics": metrics,
                 "revision": revision,
                 "report": report,
+                "per_file": file_stats_of_diff(diff),
             }),
             WorkerState::Failed {
                 error,
@@ -510,6 +503,9 @@ pub struct WorkerProgress {
     /// executing; `None` when no command is in flight. A step whose command is
     /// still running is not worker inactivity.
     pub command_started_at: Option<u64>,
+    /// Background jobs this worker still has running: commands that outlived
+    /// their budget and were continued instead of killed.
+    pub jobs: Vec<JobStatus>,
 }
 
 /// Who a worker belongs to, as the pool and the registry record it.
@@ -546,7 +542,45 @@ pub struct CollectedWorker {
 
 /// Default age (seconds) after which a `Completed`/`Failed` worker record is
 /// evicted from the pool.
+///
+/// This bounds *memory* only. The record's registry row and its saved
+/// conversation outlive the eviction, because a finished worker stays
+/// steerable for as long as its branch does (see
+/// [`DEFAULT_TERMINAL_RETENTION_SECS`]).
 pub const DEFAULT_TERMINAL_TTL_SECS: u64 = 300;
+
+/// Default age (seconds) after which a terminal worker's registry row and its
+/// saved conversation are retired, even though its branch still exists.
+///
+/// A week: long enough that an orchestrator reviewing, gating or merging hours
+/// or days later still finds the worker continuable, short enough that a
+/// scratch root cannot grow without bound. Overridable through
+/// `WORKER_RETENTION_SECS`.
+pub const DEFAULT_TERMINAL_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The retention an operator configured, or [`DEFAULT_TERMINAL_RETENTION_SECS`].
+///
+/// Read from the environment on each call rather than cached on the pool: the
+/// sweeps that apply it are free functions with no pool at hand, and a
+/// non-positive or unparseable value falls back to the default rather than to
+/// "retire everything now".
+pub fn terminal_retention_secs() -> u64 {
+    std::env::var("WORKER_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_TERMINAL_RETENTION_SECS)
+}
+
+/// Whether a row last written at `updated_at` is past `retention_secs`.
+///
+/// A row that never recorded an age (`updated_at` of zero, written before the
+/// field existed) is *not* expired: an unknown age must not be read as an
+/// ancient one. Clock skew is absorbed by `saturating_sub`, exactly as
+/// [`expired_terminal_ids`] absorbs it.
+pub fn retention_expired(updated_at: u64, retention_secs: u64, now: u64) -> bool {
+    updated_at != 0 && now.saturating_sub(updated_at) >= retention_secs
+}
 
 /// Ids of `Completed`/`Failed` records that reached the terminal TTL (audit 07, R3).
 ///
@@ -578,8 +612,9 @@ mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
     use super::{
-        DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics, WorkerRecord, WorkerState, churn_line,
-        expired_terminal_ids, file_stats_of_diff,
+        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics,
+        WorkerRecord, WorkerState, churn_line, expired_terminal_ids, file_stats_of_diff,
+        retention_expired,
     };
     use std::collections::HashMap;
 
@@ -801,6 +836,33 @@ mod tests {
             vec!["old-done".to_string(), "old-failed".to_string()],
             "only aged terminal records may be evicted"
         );
+    }
+
+    #[test]
+    fn test_retention_expires_only_a_row_that_recorded_its_age() {
+        let now = unix_timestamp();
+        // Aged past the retention: the row goes even though its branch lives.
+        assert!(retention_expired(
+            now - DEFAULT_TERMINAL_RETENTION_SECS - 1,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
+        // Inside the retention: the row stays, so an orchestrator hours or
+        // days later still finds the worker continuable.
+        assert!(!retention_expired(
+            now - DEFAULT_TERMINAL_RETENTION_SECS + 60,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
+        // A row written before the field existed carries no age at all, and an
+        // unknown age must not be read as an ancient one.
+        assert!(!retention_expired(0, DEFAULT_TERMINAL_RETENTION_SECS, now));
+        // Clock skew is absorbed exactly as the TTL absorbs it.
+        assert!(!retention_expired(
+            now + 10_000,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
     }
 
     #[test]

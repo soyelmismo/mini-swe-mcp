@@ -4,9 +4,12 @@
 //! subagent only ever emits an ordinary `echo`/`printf` command, and the
 //! parsers here are the single place that decides whether that command carries
 //! a control signal ([`parse_request_turns`] for a turn-budget extension,
-//! [`parse_ask_orchestrator`] for a blocking question,
-//! [`parse_consolidate_merge`] for a consolidator's branch integration) or is
-//! just work.
+//! [`parse_ask_orchestrator`] for a blocking question, [`parse_wait_job`] and
+//! [`parse_kill_job`] for a background job,
+//! [`parse_consolidate_merge`] for a consolidator's branch integration,
+//! [`parse_consolidate_steer`] for routing a failure back to the worker that
+//! owns it, [`parse_consolidate_wait`] for blocking until that group stops) or
+//! is just work.
 //!
 //! [`summarize_command`] lives here too because it is the same "read a bash
 //! command" concern: it renders the bounded one-line label the registry, the
@@ -120,6 +123,46 @@ pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
             .trim();
         if !line.is_empty() && line != "<your specific question>" && line != "<question>" {
             return Some(line.to_string());
+        }
+    }
+    None
+}
+
+/// `echo "WAIT_JOB: <n>"` → the background job to block on.
+///
+/// Echo/`printf` form only, like every other sentinel: the job number is the
+/// first integer after the keyword, so `printf 'WAIT_JOB %d' 1` parses too.
+/// A missing or zero number yields `None`, which the loop answers with "no
+/// such job" rather than waiting on nothing.
+pub fn parse_wait_job(cmd: &str) -> Option<u64> {
+    parse_job_id(cmd, "WAIT_JOB")
+}
+
+/// `echo "KILL_JOB: <n>"` → the background job to stop.
+pub fn parse_kill_job(cmd: &str) -> Option<u64> {
+    parse_job_id(cmd, "KILL_JOB")
+}
+
+/// The job number an `echo`/`printf` of `keyword <n>` names.
+///
+/// Shared by both job sentinels so they cannot disagree about what a job
+/// number looks like. The keyword must appear in an `echo`/`printf` command,
+/// which keeps a `grep -rn WAIT_JOB` or a heredoc fixture from being read as a
+/// request to wait.
+fn parse_job_id(cmd: &str, keyword: &str) -> Option<u64> {
+    let trimmed = cmd.trim();
+    if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
+        && let Some(pos) = trimmed.find(keyword)
+    {
+        let num_str: String = trimmed[pos + keyword.len()..]
+            .chars()
+            .skip_while(|c| c.is_whitespace() || *c == ':')
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = num_str.parse::<u64>()
+            && n > 0
+        {
+            return Some(n);
         }
     }
     None
@@ -245,11 +288,86 @@ fn strip_markup(line: &str) -> String {
         .to_string()
 }
 
+/// Deadline of a `CONSOLIDATE_WAIT` that names none, and the ceiling on one
+/// that does.
+///
+/// A consolidator that waits without `timeout=` gives its group fifteen
+/// minutes; one that asks for longer is capped at an hour, so a wait can never
+/// outlive the turn it is spent inside.
+pub const CONSOLIDATE_WAIT_DEFAULT_SECS: u64 = 900;
+pub const CONSOLIDATE_WAIT_MAX_SECS: u64 = 3600;
+
+/// `echo/printf "CONSOLIDATE_STEER <id> <message...>"` → the worker to steer
+/// and the message, verbatim.
+///
+/// Only a consolidator interprets this sentinel: for an ordinary worker the
+/// identical command stays plain bash. Everything after the id is the message,
+/// spaces and quotes included, so a correction reaches the worker the way the
+/// consolidator wrote it; a request with no message is not a request.
+pub fn parse_consolidate_steer(cmd: &str) -> Option<(String, String)> {
+    let trimmed = cmd.trim();
+    let arg = trimmed
+        .strip_prefix("echo ")
+        .or_else(|| trimmed.strip_prefix("printf "))?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches("\\n");
+    // The sentinel must be a whole word: `CONSOLIDATE_STEERED` is not a request.
+    let rest = arg.strip_prefix("CONSOLIDATE_STEER")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (id, message) = rest.trim_start().split_once(char::is_whitespace)?;
+    let message = message.trim();
+    let id_is_token = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    (!message.is_empty() && id_is_token).then(|| (id.to_string(), message.to_string()))
+}
+
+/// `echo/printf "CONSOLIDATE_WAIT <id> [<id> ...] [timeout=<secs>]"` → the
+/// workers to wait on and the deadline in seconds, when one was given.
+///
+/// Only a consolidator interprets this sentinel. The optional `timeout=` is a
+/// trailing word; the caller clamps it to [`CONSOLIDATE_WAIT_MAX_SECS`]. Ids
+/// are validated as tokens, exactly as [`parse_consolidate_merge`] validates
+/// them, so a grep of the sentinel is never a request.
+pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
+    let trimmed = cmd.trim();
+    let arg = trimmed
+        .strip_prefix("echo ")
+        .or_else(|| trimmed.strip_prefix("printf "))?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches("\\n");
+    let mut words = arg.split_whitespace();
+    if words.next()? != "CONSOLIDATE_WAIT" {
+        return None;
+    }
+    let mut ids = Vec::new();
+    let mut timeout = None;
+    for word in words {
+        if let Some(secs) = word.strip_prefix("timeout=") {
+            timeout = Some(secs.parse::<u64>().ok()?);
+        } else if word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            ids.push(word.to_string());
+        } else {
+            return None;
+        }
+    }
+    (!ids.is_empty()).then_some((ids, timeout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-        parse_report, parse_request_turns, summarize_command,
+        parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
+        parse_request_turns, parse_wait_job, summarize_command,
     };
     use crate::pool::WorkerReport;
 
@@ -332,6 +450,59 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_steer_takes_the_id_and_the_verbatim_message() {
+        let (id, message) =
+            parse_consolidate_steer("echo CONSOLIDATE_STEER w1 fix the \"quoted\" name").unwrap();
+        assert_eq!(id, "w1");
+        assert_eq!(message, "fix the \"quoted\" name");
+
+        let (id, message) =
+            parse_consolidate_steer("printf 'CONSOLIDATE_STEER abc-1 revert it\\n'").unwrap();
+        assert_eq!(id, "abc-1");
+        assert_eq!(message, "revert it");
+
+        for no in [
+            "echo ordinary text",
+            "grep -rn CONSOLIDATE_STEER src/",
+            "echo CONSOLIDATE_STEER w1",
+            "echo CONSOLIDATE_STEERED w1 fix it",
+            "echo other CONSOLIDATE_STEER w1 fix it",
+            "",
+        ] {
+            assert_eq!(parse_consolidate_steer(no), None, "{no:?} is not a request");
+        }
+    }
+
+    #[test]
+    fn consolidate_wait_parses_ids_and_the_optional_timeout() {
+        let (ids, timeout) = parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 w3").unwrap();
+        assert_eq!(ids, vec!["w1", "w2", "w3"]);
+        assert_eq!(timeout, None);
+
+        let (ids, timeout) =
+            parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 timeout=120").unwrap();
+        assert_eq!(ids, vec!["w1", "w2"]);
+        assert_eq!(timeout, Some(120));
+
+        let (ids, timeout) =
+            parse_consolidate_wait("printf 'CONSOLIDATE_WAIT w1 timeout=0\\n'").unwrap();
+        assert_eq!(ids, vec!["w1"]);
+        assert_eq!(timeout, Some(0));
+
+        for no in [
+            "echo ordinary text",
+            "grep -rn CONSOLIDATE_WAIT src/",
+            "echo CONSOLIDATE_WAIT",
+            "echo CONSOLIDATE_WAIT timeout=30",
+            "echo CONSOLIDATE_WAIT w1 timeout=soon",
+            "echo CONSOLIDATE_WAITED w1",
+            "",
+        ] {
+            assert_eq!(parse_consolidate_wait(no), None, "{no:?} is not a request");
+        }
+    }
+
+    #[test]
     fn test_summarize_command_utf8() {
         let cmd =
             "echo 'esta_es_una_palabra_extremadamente_larga_con_ñ_y_acentos_para_superar_limite'";
@@ -375,6 +546,32 @@ mod tests {
         assert_eq!(parse_request_turns("cat file.rs"), None);
         assert_eq!(parse_request_turns("echo nothing"), None);
         assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0"), None);
+    }
+
+    #[test]
+    fn test_parse_job_sentinels() {
+        for (cmd, id) in [
+            ("echo WAIT_JOB 1", Some(1)),
+            ("echo WAIT_JOB: 7", Some(7)),
+            ("printf 'WAIT_JOB 12\n'", Some(12)),
+            ("echo WAIT_JOB", None),
+            ("echo WAIT_JOB 0", None),
+            ("cat job.log", None),
+            ("grep -rn WAIT_JOB src/", None),
+        ] {
+            assert_eq!(parse_wait_job(cmd), id, "{cmd:?}");
+        }
+        for (cmd, id) in [
+            ("echo KILL_JOB 2", Some(2)),
+            ("echo KILL_JOB: 9", Some(9)),
+            ("echo KILL_JOB", None),
+            ("echo WAIT_JOB 4", None),
+        ] {
+            assert_eq!(parse_kill_job(cmd), id, "{cmd:?}");
+        }
+        // A job number is not a turn request, and the other way round.
+        assert_eq!(parse_request_turns("echo WAIT_JOB 5"), None);
+        assert_eq!(parse_wait_job("echo REQUEST_TURNS: 5"), None);
     }
 
     #[test]
