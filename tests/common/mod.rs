@@ -146,9 +146,14 @@ impl TempDir {
         Self { path }
     }
 
-    /// Create a scratch directory under the system temp dir.
+    /// Create a scratch directory under the daemon's scratch root.
+    ///
+    /// Deliberately not the raw `TMPDIR`: the hub tests bind a Unix socket
+    /// inside these directories, and a long `TMPDIR` would push the socket path
+    /// past `SUN_LEN`. [`mini_swe_mcp::worktree::swe_base_dir`] makes the same
+    /// short-base choice the daemon itself does.
     pub fn new_in_tmp(tag: &str) -> Self {
-        Self::new(&std::env::temp_dir(), tag)
+        Self::new(&mini_swe_mcp::worktree::swe_base_dir(), tag)
     }
 
     pub fn path(&self) -> &Path {
