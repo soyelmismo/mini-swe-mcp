@@ -275,6 +275,9 @@ pub struct WorkerProgress {
     pub last_command: Option<String>,
     /// Escalated question while paused.
     pub question: Option<String>,
+    /// Queued heavy commands ahead of this worker while it waits for a build
+    /// slot; `None` when it is not waiting. Time spent here is not a stall.
+    pub waiting_for_slot: Option<usize>,
 }
 
 /// Who a worker belongs to, as the pool and the registry record it.

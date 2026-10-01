@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -323,6 +324,101 @@ async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &st
 }
 
 /// Latest events survive disconnected owners, but never retain more than 100 workers.
+/// One agent's live watch: who holds it and what to tell a second caller.
+struct ActiveWatch {
+    token: u64,
+    connection: u64,
+    pid: Option<u32>,
+    since: u64,
+}
+
+/// Identity -> the single watch that may be active for it.
+///
+/// A hub connection owns its slot for the connection's lifetime, released from
+/// [`EventRouter::remove`]; an MCP `watch` call owns it for the call's lifetime
+/// through a [`WatchGuard`]. A closed or cancelled watch frees its own slot, so
+/// no stale lock outlives its watcher.
+#[derive(Default)]
+pub(super) struct WatchRegistry {
+    slots: std::sync::Mutex<BTreeMap<String, ActiveWatch>>,
+    next_token: AtomicU64,
+}
+
+impl WatchRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, ActiveWatch>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn busy(active: &ActiveWatch) -> anyhow::Error {
+        let held = match active.pid {
+            Some(pid) => format!("pid {pid}, since {}", active.since),
+            None => format!("since {}", active.since),
+        };
+        anyhow::anyhow!(
+            "a watch is already running for your session ({held}); it will deliver the next event - do not start another"
+        )
+    }
+
+    fn insert(&self, identity: &str, connection: u64, pid: Option<u32>) -> anyhow::Result<u64> {
+        let mut slots = self.lock();
+        if let Some(active) = slots.get(identity) {
+            return Err(Self::busy(active));
+        }
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        slots.insert(
+            identity.to_string(),
+            ActiveWatch {
+                token,
+                connection,
+                pid,
+                since: crate::pool::unix_timestamp(),
+            },
+        );
+        Ok(token)
+    }
+
+    /// Claim `identity` for a hub connection, re-entrant so that connection's
+    /// own repeated polls keep the same slot instead of locking themselves out.
+    fn claim(&self, identity: &str, connection: u64, pid: Option<u32>) -> anyhow::Result<()> {
+        if let Some(active) = self.lock().get(identity) {
+            anyhow::ensure!(active.connection == connection, "{}", Self::busy(active));
+            return Ok(());
+        }
+        self.insert(identity, connection, pid)?;
+        Ok(())
+    }
+
+    fn release_token(&self, identity: &str, token: u64) {
+        let mut slots = self.lock();
+        if slots
+            .get(identity)
+            .is_some_and(|active| active.token == token)
+        {
+            slots.remove(identity);
+        }
+    }
+
+    fn release_connection(&self, connection: u64) {
+        self.lock()
+            .retain(|_, active| active.connection != connection);
+    }
+}
+
+/// Holds one identity's watch slot for the lifetime of an MCP `watch` call.
+pub(super) struct WatchGuard {
+    registry: Arc<WatchRegistry>,
+    identity: String,
+    token: u64,
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.registry.release_token(&self.identity, self.token);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct EventRouter {
     latest: VecDeque<(Option<String>, ChannelEvent)>,
@@ -330,6 +426,7 @@ pub(super) struct EventRouter {
     watch_current: crate::cli::watch::Snapshot,
     watch_reported: crate::cli::watch::Snapshot,
     watch_history: BTreeMap<String, WatchHistory>,
+    watches: Arc<WatchRegistry>,
     sequence: u64,
 }
 
@@ -368,6 +465,23 @@ impl EventRouter {
 
     pub(super) fn remove(&mut self, id: u64) {
         self.connections.remove(&id);
+        self.watches.release_connection(id);
+    }
+
+    /// Reserve `identity`'s one watch slot for an MCP `watch` call. The returned
+    /// guard frees it when the call returns or is cancelled.
+    pub(super) fn begin_watch(
+        &self,
+        identity: &str,
+        connection: u64,
+        pid: Option<u32>,
+    ) -> anyhow::Result<WatchGuard> {
+        let token = self.watches.insert(identity, connection, pid)?;
+        Ok(WatchGuard {
+            registry: Arc::clone(&self.watches),
+            identity: identity.to_string(),
+            token,
+        })
     }
 
     fn publish(&mut self, owner: Option<String>, event: ChannelEvent) {
@@ -807,6 +921,8 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             view["turns"] = json!(progress.step);
             view["status"] = json!(phase_status(progress.phase));
             view["question"] = json!(progress.question);
+            // A queued build slot is shown as its own state, never as a stall.
+            view["waiting_for_slot"] = json!(progress.waiting_for_slot);
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];
@@ -957,7 +1073,7 @@ impl EventRouter {
                 anyhow::bail!("Worker not found: {id}");
             }
         }
-        let mut watching: BTreeSet<String> = self
+        let watching: BTreeSet<String> = self
             .watch_current
             .values()
             .filter(|v| {
@@ -1002,6 +1118,12 @@ impl EventRouter {
             }
         }
         events.sort_by_key(|v| v["sequence"].as_u64());
+        // At most one watch per identity: a hub poll with anything to watch
+        // claims the caller's slot, refusing a second connection. An MCP action
+        // already holds the slot through its guard, so its own claim is a no-op.
+        if !watching.is_empty() || !events.is_empty() {
+            self.watches.claim(&owner, ctx.id, ctx.pid)?;
+        }
         // An explicit terminal id is reported immediately even if another
         // watch already acknowledged its transition.
         if initial {
@@ -1016,11 +1138,6 @@ impl EventRouter {
                     events.push(v.clone());
                 }
             }
-        }
-        // A caller that resumes with no live ids must not start watching new
-        // dispatches made after its original selection.
-        if !initial && ids.is_empty() {
-            watching.clear();
         }
         Ok(json!({"watching":watching,"events":events}))
     }

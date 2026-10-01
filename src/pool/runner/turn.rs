@@ -921,6 +921,11 @@ impl<'a> TurnEngine<'a> {
     async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {
+            // A queued heavy command is not worker inactivity: publish the wait
+            // (with the requests ahead of it) so the stall detector skips it.
+            let _waiting = self
+                .pool
+                .wait_for_build_slot(self.worker_id, self.pool.admission.waiting() + 1);
             Some(self.pool.admission.acquire().await)
         } else {
             None
