@@ -4,9 +4,9 @@
 //! orchestrator -- instead of spending its whole budget on reads.
 //!
 //! The thresholds are pulled down through the pool's own environment overrides
-//! so the test reaches all three steps in a handful of turns, and it is the one
-//! test in this binary that sets them, so no other test in it can observe a
-//! lowered threshold.
+//! so a test reaches all three steps in a handful of turns. Those overrides are
+//! process-global, so every test here takes one lock around them and none of
+//! them runs in parallel with another that reads them.
 
 mod common;
 
@@ -63,10 +63,7 @@ impl Thresholds {
         for (name, value) in THRESHOLD_NAMES.iter().zip(["2", "3", "4"]) {
             unsafe { std::env::set_var(name, value) };
         }
-        Self {
-            _lock: lock,
-            saved,
-        }
+        Self { _lock: lock, saved }
     }
 }
 
@@ -177,10 +174,7 @@ fn bash_turn(call_id: &str, command: &str) -> String {
 /// requires, so the scripted worker is a compliant one and the harness never
 /// spends a turn asking for a report it would not get.
 fn completion_turn(call_id: &str) -> String {
-    completion_with_report(call_id, "REPORT\ndone: scripted completion\nfiles: lib.rs\ntests: none\nrisks: none")
-}
-
-fn completion_with_report(call_id: &str, report: &str) -> String {
+    let report = "REPORT\ndone: scripted completion\nfiles: lib.rs\ntests: none\nrisks: none";
     let arguments = json!({ "command": format!("echo {COMPLETION_SENTINEL}") }).to_string();
     format!(
         "data: {}\n\n",
@@ -311,16 +305,10 @@ async fn wait_for_paused(pool: &WorkerPool, worker_id: &str) -> Option<String> {
 }
 
 async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
-    wait_for_terminal_inner(pool, worker_id, 600).await
-}
-
-async fn wait_for_terminal_inner(
-    pool: &WorkerPool,
-    worker_id: &str,
-    tries: usize,
-) -> WorkerState {
+    // The last state seen is reported on timeout: "never finished" is only
+    // actionable when it says what the worker was doing instead.
     let mut last = None;
-    for _ in 0..tries {
+    for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
                 WorkerState::Completed { .. }
