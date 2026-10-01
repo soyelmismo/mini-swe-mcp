@@ -45,7 +45,6 @@ system prompt at dispatch time, so keep them short and actionable.
 
 ## Working style
 
-- Never modify models.yaml (the operator's model catalog).
 - Reuse existing helpers (`tests/common/`, module-level functions) instead of
   copying a block of logic into a second place.
 - Keep the diff to the task's scope; put new tests in a file dedicated to the
