@@ -10,7 +10,6 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -326,12 +325,17 @@ fn harden_hub_dir(dir: PathBuf) -> Result<PathBuf> {
 pub struct HubConfig {
     paths: HubPaths,
     idle_secs: u64,
+    respawn: bool,
 }
 
 impl HubConfig {
     /// Configuration for an explicit hub directory and idle window.
     pub fn new(paths: HubPaths, idle_secs: u64) -> Self {
-        Self { paths, idle_secs }
+        Self {
+            paths,
+            idle_secs,
+            respawn: false,
+        }
     }
 
     /// The resolved hub files.
@@ -584,12 +588,14 @@ impl HubServer {
             let _ = std::fs::remove_dir(parent);
         }
         append_log(&paths.log(), "stopped");
+        drop(listener);
+        drop(_socket_cleanup);
         drop(lock);
         // A handover leaves the hub unserved until a client dials it again, and
         // the workers it just interrupted are auto-continued by whichever
         // daemon binds the socket next, so the daemon that stepped aside starts
         // that daemon itself rather than waiting for one.
-        if self.server.handover_requested() {
+        if self.config.respawn && self.server.handover_requested() {
             respawn_daemon(paths);
         }
         debug!("Hub daemon stopped");
@@ -640,13 +646,15 @@ impl HubServer {
         tokio::spawn(async move {
             *open_conns.lock().await += 1;
             let (reader, writer) = stream.into_split();
-            let res = server
-                .serve_connection(
+            let mut shutdown = server.subscribe_shutdown();
+            let res = tokio::select! {
+                _ = shutdown.changed() => Ok(()),
+                res = server.serve_connection(
                     tokio::io::BufReader::new(reader),
                     writer,
                     crate::mcp::ConnectionContext::hub_connection(id).with_watch_tokens(tokens),
-                )
-                .await;
+                ) => res,
+            };
             *open_conns.lock().await -= 1;
             if let Err(e) = res {
                 debug!(connection = id, error = %e, "Hub connection ended");
@@ -667,46 +675,8 @@ fn respawn_daemon(paths: &HubPaths) {
         warn!("No executable to hand over to; the next client will start the hub");
         return;
     };
-    let log = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(paths.log())
-    {
-        Ok(log) => log,
-        Err(e) => {
-            warn!(error = %e, "Could not open the hub log for the replacement daemon");
-            return;
-        }
-    };
-    let mut command = std::process::Command::new(&exe);
-    command
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log);
-    // SAFETY: setsid is async-signal-safe and touches no Rust state after fork.
-    // SAFETY: setsid is async-signal-safe and touches no Rust state after fork.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    match tokio::process::Command::from(command).spawn() {
-        Ok(mut child) => {
-            info!(exe = %exe.display(), "Started the replacement hub daemon");
-            append_log(&paths.log(), &format!("handover to {}", exe.display()));
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-        }
-        Err(e) => {
-            warn!(error = %e, exe = %exe.display(), "Could not start the replacement hub daemon")
-        }
+    if let Err(e) = super::client::spawn_daemon(paths, &exe) {
+        warn!(error = %e, "Could not start replacement daemon");
     }
 }
 
@@ -716,8 +686,11 @@ fn respawn_daemon(paths: &HubPaths) {
 /// respawn and the next client starts the hub instead.
 fn current_exe_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let text = exe.to_string_lossy();
-    let path = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text));
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = exe.as_os_str().as_bytes();
+    let path = PathBuf::from(std::ffi::OsString::from_vec(
+        bytes.strip_suffix(b" (deleted)").unwrap_or(bytes).to_vec(),
+    ));
     path.is_file().then_some(path)
 }
 
@@ -807,9 +780,9 @@ pub async fn run_daemon(
     let idle = idle_secs
         .or_else(|| crate::config::env_parse("HUB_IDLE_SECS"))
         .unwrap_or(DEFAULT_IDLE_SECS);
-    HubServer::new(server, HubConfig::new(paths, idle))
-        .run()
-        .await
+    let mut config = HubConfig::new(paths, idle);
+    config.respawn = true;
+    HubServer::new(server, config).run().await
 }
 
 /// Watch tokens: one unguessable token per agent identity, kept in the hub

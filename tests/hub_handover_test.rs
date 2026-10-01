@@ -66,7 +66,13 @@ impl Client {
 
     async fn notify(&mut self, method: &str, params: Value) {
         self.get_mut()
-            .write_all(format!("{}\n", json!({"jsonrpc": "2.0", "method": method, "params": params})).as_bytes())
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "method": method, "params": params})
+                )
+                .as_bytes(),
+            )
             .await
             .expect("write notification");
         self.get_mut().flush().await.expect("flush notification");
@@ -94,10 +100,7 @@ impl Client {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut line = String::new();
-                self.reader
-                    .read_line(&mut line)
-                    .await
-                    .expect("read reply");
+                self.reader.read_line(&mut line).await.expect("read reply");
                 assert!(!line.is_empty(), "hub closed before replying to {method}");
                 let frame: Value = serde_json::from_str(line.trim()).expect("reply is JSON");
                 if frame["id"] == json!(id) {
@@ -184,7 +187,8 @@ async fn a_handover_waits_for_the_command_to_clear() {
         "cargo test",
         None,
     );
-    pool.__test_insert_worker(running_worker("handover-wait")).await;
+    pool.__test_insert_worker(running_worker("handover-wait"))
+        .await;
     let (paths, daemon) = daemon_on(&hub, pool.clone());
     let task = tokio::spawn(async move { daemon.run().await });
 
@@ -235,6 +239,36 @@ async fn a_handover_waits_for_the_command_to_clear() {
     );
 }
 
+#[tokio::test]
+async fn handover_waits_for_a_heavy_permit() {
+    use mini_swe_mcp::pool::admission::AdmissionClass;
+    let hub = common::TempDir::new_in_tmp("handover-heavy");
+    let isolated = common::IsolatedPool::new(2, "handover-heavy");
+    let permit = isolated
+        .pool
+        .admission()
+        .acquire(AdmissionClass::Completion)
+        .await;
+    let (paths, daemon) = daemon_on(&hub, isolated.pool.clone());
+    let task = tokio::spawn(async move { daemon.run().await });
+    let mut client = Client::connect(&paths.socket()).await;
+    assert_eq!(client.handover(900).await["result"]["pending"], true);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(client.request("ping", json!({})).await["result"], json!({}));
+        tokio::task::yield_now().await;
+    }
+    assert!(!task.is_finished());
+    drop(permit);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+}
+
 /// The deadline hands over even while a command is still running, so a daemon
 /// busy all day still picks up the newer build.
 #[tokio::test]
@@ -251,7 +285,8 @@ async fn the_deadline_hands_over_while_a_command_runs() {
         "cargo test",
         None,
     );
-    pool.__test_insert_worker(running_worker("handover-deadline")).await;
+    pool.__test_insert_worker(running_worker("handover-deadline"))
+        .await;
     let (paths, daemon) = daemon_on(&hub, pool.clone());
     let task = tokio::spawn(async move { daemon.run().await });
 
@@ -272,7 +307,9 @@ async fn the_deadline_hands_over_while_a_command_runs() {
     drop(running);
     assert!(!paths.socket().exists());
     assert!(
-        pool.interrupted_workers().await.contains(&"handover-deadline".to_string()),
+        pool.interrupted_workers()
+            .await
+            .contains(&"handover-deadline".to_string()),
         "the deadline path must still checkpoint live workers"
     );
 }
@@ -301,7 +338,10 @@ async fn an_older_client_cannot_ask_for_a_handover() {
             .is_some_and(|message| message.contains("not newer")),
         "{reply}"
     );
-    assert!(!task.is_finished(), "an older client must not stop the daemon");
+    assert!(
+        !task.is_finished(),
+        "an older client must not stop the daemon"
+    );
     assert_eq!(
         client.request("ping", json!({})).await["result"],
         json!({}),
@@ -331,6 +371,7 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
     let mut proxy = tokio::process::Command::new(&exe);
     proxy
         .arg("--stdio")
+        .env_remove("MINI_SWE_NO_DAEMON")
         .env("SWE_HUB_DIR", &hub_dir)
         .env("SWE_TEMP_DIR", &swe)
         .env("ENV_FILE", "/nonexistent-mini-swe-env")
@@ -392,15 +433,19 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
         json!({"name": "worker", "arguments": {"action": "watch", "timeout_secs": 30}}),
     )
     .await;
-    // Wait until the daemon is serving the proxy before cutting the connection,
-    // so the watch really is in flight rather than still on the wire.
-    wait_for_log(&hub_dir, "Serving MCP connection", 1).await;
+    // A later ping proves the preceding watch reached the daemon before the cut.
+    send(&mut stdin, 5, "ping", json!({})).await;
+    assert_eq!(read_reply(&mut stdout, 5).await["result"], json!({}));
 
     // Kill the daemon the proxy is talking to: the socket goes stale and the
     // proxy's connection is cut, exactly as a handover cuts it.
     let pid = daemon_pid(&hub_dir).expect("the auto-started daemon logged its pid");
     // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the daemon");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGKILL) },
+        0,
+        "kill the daemon"
+    );
 
     // The request that was in flight at the cut is answered once, with an error
     // that says to retry it: its reply died with the old daemon.
@@ -436,7 +481,17 @@ async fn wait_for_log(hub_dir: &std::path::Path, event: &str, count: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let seen = std::fs::read_to_string(hub_dir.join("hub.log"))
-            .map(|log| log.lines().filter(|line| line.contains(event)).count())
+            .map(|log| {
+                log.lines()
+                    .filter(|line| {
+                        if event == "listening" {
+                            line.ends_with(" listening")
+                        } else {
+                            line.contains(event)
+                        }
+                    })
+                    .count()
+            })
             .unwrap_or(0);
         if seen >= count || std::time::Instant::now() >= deadline {
             assert!(seen >= count, "hub.log never showed {count} x {event}");
@@ -464,23 +519,22 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     // A live worker owned by the watching agent, standing in for one the
     // orchestrator dispatched: its pid is a real sleeper, so the daemon's
     // recovery leaves it running rather than interrupting it.
-    let mut sleeper = std::process::Command::new("sleep")
+    let mut sleeper = tokio::process::Command::new("sleep")
         .arg("60")
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn the stand-in worker process");
     let mut meta = meta("handover-watch");
-    meta.pid = sleeper.id();
-    isolated
-        .pool
-        .__test_save_status(
-            &meta,
-            "test",
-            mini_swe_mcp::pool::RegistryStatus::Running,
-            1,
-            10,
-            "probe",
-            None,
-        );
+    meta.pid = sleeper.id().unwrap();
+    isolated.pool.__test_save_status(
+        &meta,
+        "test",
+        mini_swe_mcp::pool::RegistryStatus::Running,
+        1,
+        10,
+        "probe",
+        None,
+    );
 
     let mut daemon = common::binary_command(&exe);
     daemon
@@ -491,7 +545,13 @@ async fn the_cli_watch_survives_a_daemon_restart() {
         .env("ENV_FILE", "/nonexistent-mini-swe-env")
         .env("OPENAI_API_KEY", "test-key-not-used-by-the-handover-test")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(hub_dir.join("hub.log"))
+                .unwrap(),
+        );
     let mut daemon = tokio::process::Command::from(daemon)
         .spawn()
         .expect("start the daemon");
@@ -500,6 +560,7 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     let mut watch = common::binary_command(&exe);
     watch
         .args(["watch", "--json"])
+        .env_remove("MINI_SWE_NO_DAEMON")
         .env("SWE_HUB_DIR", &hub_dir)
         .env("SWE_TEMP_DIR", &swe)
         .env("MINI_SWE_AGENT_ID", "handover-test")
@@ -517,7 +578,11 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     // Kill the daemon the watch is talking to, exactly as a handover cuts it.
     let pid = daemon_pid(&hub_dir).expect("the daemon logged its pid");
     // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill the daemon");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGKILL) },
+        0,
+        "kill the daemon"
+    );
     let _ = daemon.wait().await;
 
     // The watch follows the daemon: it reconnects to the replacement the hub
@@ -530,38 +595,72 @@ async fn the_cli_watch_survives_a_daemon_restart() {
 
     // And it is still watching: an event the replacement daemon reports reaches
     // the same CLI process.
-    let mut client = Client::connect(&HubPaths::new(hub_dir.clone()).socket()).await;
-    client
-        .notify(
-            "hub/hello",
-            json!({"agent_id": "handover-test", "admin": true}),
-        )
-        .await;
-    let killed = client
-        .request(
-            "tools/call",
-            json!({"name": "worker",
-                   "arguments": {"action": "kill", "worker_id": "handover-watch"}}),
-        )
-        .await;
-    assert!(
-        killed["result"]["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("kill")),
-        "{killed}"
+    std::fs::create_dir_all(isolated.root().join("swe-wt-handover-watch")).unwrap();
+    isolated
+        .pool
+        .__test_reset_registry_throttle("handover-watch");
+    isolated.pool.__test_save_status(
+        &meta,
+        "test",
+        mini_swe_mcp::pool::RegistryStatus::Failed,
+        2,
+        10,
+        "probe ended",
+        None,
     );
     let output = tokio::time::timeout(Duration::from_secs(15), watch.wait_with_output())
         .await
         .expect("the watch ends once its worker is terminal")
         .expect("the watch exits");
-    assert!(output.status.success(), "the watch reported its last event: {output:?}");
+    assert!(
+        output.status.success(),
+        "the watch reported its last event: {output:?}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
         stdout.contains("handover-watch"),
         "the reconnected watch must still print events: {stdout}"
     );
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
+    let _ = sleeper.kill().await;
+    let _ = sleeper.wait().await;
+}
+
+#[tokio::test]
+async fn daemon_respawns_itself_after_handover_without_a_client() {
+    let hub = common::TempDir::new_in_tmp("handover-respawn");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let swe = hub.subdir("swe");
+    let _reaper = Reaper(hub.path().to_path_buf());
+    let mut command = tokio::process::Command::new(common::binary_path());
+    command
+        .arg("daemon")
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", &swe)
+        .env("ENV_FILE", hub.path().join("absent.env"))
+        .env("OPENAI_API_KEY", "unused")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    common::scrub_identity_env(command.as_std_mut());
+    let mut daemon = command.spawn().unwrap();
+    let paths = HubPaths::new(hub.path().to_path_buf());
+    let mut client = Client::connect(&paths.socket()).await;
+    assert_eq!(client.handover(900).await["result"]["pending"], true);
+    drop(client);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), daemon.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    // No client connects until the replacement has already announced listening.
+    wait_for_log(hub.path(), "listening", 2).await;
+    let mut replacement = Client::connect(&paths.socket()).await;
+    assert!(replacement.request("tools/list", json!({})).await["result"]["tools"].is_array());
 }
 
 /// The pid of the daemon the hub log last reported listening.
@@ -594,9 +693,7 @@ impl Drop for Reaper {
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline
-            && pids
-                .iter()
-                .any(|pid| (unsafe { libc::kill(*pid, 0) }) == 0)
+            && pids.iter().any(|pid| (unsafe { libc::kill(*pid, 0) }) == 0)
         {
             std::thread::sleep(Duration::from_millis(20));
         }

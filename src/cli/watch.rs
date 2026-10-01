@@ -588,7 +588,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut watched_any = false;
     let mut printed_event = false;
     let mut reconnects = 0usize;
-    loop {
+    'watch: loop {
         let response = match client
             .watch_snapshot(&ids, opts.group.as_deref(), initial)
             .await
@@ -637,9 +637,18 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         print_events(&events, json_output, opts.follow, opts.verbose)?;
         printed_event |= !events.is_empty();
         for event in &events {
-            client
+            if let Err(error) = client
                 .watch_ack(event["sequence"].as_u64().unwrap_or(0))
-                .await?;
+                .await
+            {
+                if daemon_went_away(&error) {
+                    client = follow(&mut reconnects, admin).await?;
+                    initial = true;
+                    ids = opts.ids.clone();
+                    continue 'watch;
+                }
+                return Err(error);
+            }
         }
         // Every missed event came back in this one reply, so a non-following
         // caller leaves as soon as it has been caught up.

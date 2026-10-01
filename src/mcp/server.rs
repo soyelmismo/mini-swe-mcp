@@ -360,6 +360,15 @@ impl McpServer {
             }
         });
 
+        // Cancelling a connection must also release its detached writer socket.
+        struct WriterGuard(tokio::task::AbortHandle);
+        impl Drop for WriterGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _writer_guard = WriterGuard(writer_task.abort_handle());
+        let mut requests = tokio::task::JoinSet::new();
         let mut requested_shutdown = false;
         let served = async {
             while let Some(oversized) = read_bounded_line(&mut reader, &mut input).await? {
@@ -511,6 +520,7 @@ impl McpServer {
                             id,
                             json!({
                                 "version": &*self.daemon_version,
+                                "pending": true,
                                 "busy": self.pool.active_worker_count().await > 0,
                                 "deadline_secs": deadline.as_secs(),
                             }),
@@ -522,7 +532,8 @@ impl McpServer {
                 let server = self.clone();
                 let tx = out_tx.clone();
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                while requests.try_join_next().is_some() {}
+                requests.spawn(async move {
                     let response = server.handle_request(req, ctx, Some(tx.clone())).await;
                     let frame = response
                         .to_frame()
@@ -534,6 +545,7 @@ impl McpServer {
             Ok::<(), anyhow::Error>(())
         }
         .await;
+        requests.abort_all();
         drop(out_tx);
         if let Some(events) = events {
             events.abort();
@@ -813,7 +825,9 @@ impl McpServer {
             }
         }
         if !self.handover_quiet() {
-            warn!("Hub handover deadline reached with a command still running; handing over anyway");
+            warn!(
+                "Hub handover deadline reached with a command still running; handing over anyway"
+            );
         }
         info!("Hub handover: stopping for the newer build");
         // The same admission gate `hub/shutdown` takes, so a dispatch that
@@ -828,7 +842,7 @@ impl McpServer {
 
     pub(super) async fn admit_worker(&self) -> Result<tokio::sync::RwLockReadGuard<'_, bool>> {
         let admission = self.hub_shutdown_gate.read().await;
-        if *admission {
+        if *admission || *self.shutdown.borrow() {
             anyhow::bail!("Hub is shutting down");
         }
         Ok(admission)

@@ -4,12 +4,10 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, info};
 
 use super::daemon::hub_lock_held;
 use super::identity;
@@ -22,6 +20,25 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
+    spawn_daemon(&paths, &std::env::current_exe()?)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut delay = Duration::from_millis(20);
+    loop {
+        match super::daemon::connect_endpoint(&paths.endpoint()).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+        delay = (delay * 2).min(Duration::from_millis(250));
+    }
+}
+
+/// Start a detached daemon; both auto-start and handover use this path.
+pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -29,9 +46,10 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(paths.log())
         .context("Could not open hub log")?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(exe);
     command
         .arg("daemon")
+        .env("SWE_HUB_DIR", paths.dir())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
@@ -51,19 +69,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         let _ = child.wait().await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut delay = Duration::from_millis(20);
-    loop {
-        match super::daemon::connect_endpoint(&paths.endpoint()).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
-            }
-            Err(_) => {}
-        }
-        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
-        delay = (delay * 2).min(Duration::from_millis(250));
-    }
+    Ok(())
 }
 
 /// Announce this process to the daemon.
@@ -303,6 +309,10 @@ fn label(version: &str, build: &Value) -> String {
 
 /// Negotiate once, replacing only an older idle daemon. The retry is bounded.
 async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
+    negotiated_identity(cli, hello_params(admin, &client_version(), &client_build())).await
+}
+
+async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
     let version = client_version();
     let build = client_build();
     for attempt in 0..2 {
@@ -316,14 +326,13 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
         // host process they walked up to; the CLI additionally answers the
         // `initialize` the daemon expects from it below, and a client that
         // names no host at all keeps the `cli`/`clientInfo` fallback.
-        let params = hello_params(admin, &version, &build);
         let reply = match client.request("hub/hello", params.clone()).await {
             Ok(reply) => reply,
             // A daemon from before the version handshake only knows hello as
             // a notification: announce the identity that way and keep going,
             // since it cannot be asked to step aside either.
             Err(error) if error.to_string().starts_with("Method not found") => {
-                client.notify("hub/hello", params).await?;
+                client.notify("hub/hello", params.clone()).await?;
                 eprintln!(
                     "[mini-swe] The running hub predates the version handshake; restart it when idle to pick up {version}."
                 );
@@ -365,6 +374,8 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                     }
                 }
             }
+            // Older hubs may not implement planned handover; keep their warning.
+            let _ = client.request("hub/handover", json!({})).await;
             warn_newer_once(
                 &hub_dir()?,
                 build["id"].as_str().unwrap_or(&version),
@@ -392,180 +403,105 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
     unreachable!("the second negotiation always returns")
 }
 
-/// How many times the stdio proxy re-dials a hub that went away before it lets
-/// the MCP client see the failure instead of following it again.
-const MAX_PROXY_RECONNECTS: usize = 8;
-
-/// Bytes per stdio hop: large enough that a frame rarely spans two reads, small
-/// enough that a reply is never delayed behind a big write.
-const PROXY_CHUNK: usize = 16 * 1024;
-
-/// How many unanswered requests a cut may answer, so a pipelining client cannot
-/// grow the set without bound.
-const MAX_TRACKED_REQUESTS: usize = 16;
-
-/// Largest daemon frame the proxy buffers while looking for its reply id.
-const MAX_PROXY_FRAME: usize = 32 * 1024 * 1024;
-
-/// The `id` of a JSON-RPC request frame, or `None` for a notification or reply.
-///
-/// A frame that does not parse is forwarded untouched and untracked.
-fn request_id(frame: &[u8]) -> Option<Value> {
-    let value: Value = serde_json::from_slice(frame).ok()?;
-    let id = value.get("id")?;
-    value.get("method").is_some().then(|| id.clone())
-}
-
-/// Forward stdin to the daemon, remembering which requests are still unanswered.
-///
-/// Bytes are forwarded exactly as they arrive; frames are only scanned for the
-/// `id` of a request, so a cut can answer it instead of leaving the MCP client
-/// waiting for a reply that died with the old daemon.
-async fn pump_stdin(
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    in_flight: std::sync::Arc<std::sync::Mutex<VecDeque<Value>>>,
-) {
-    let mut stdin = tokio::io::stdin();
-    let mut chunk = [0u8; PROXY_CHUNK];
-    // A frame split across two reads is only inspected once it is whole.
-    let mut carry: Vec<u8> = Vec::new();
+/// Read complete input frames into a bounded queue across daemon reconnects.
+async fn pump_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<()> {
+    let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let count = match stdin.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(count) => count,
-        };
-        // Everything read is forwarded, partial frame included: the daemon
-        // reassembles its own frames, and a reconnect must not reorder bytes.
-        // Only the trailing partial frame is held back, for the next read.
-        let mut out = std::mem::take(&mut carry);
-        out.extend_from_slice(&chunk[..count]);
-        let mut scanned = 0;
-        while let Some(end) = out[scanned..].iter().position(|byte| *byte == b'\n') {
-            let end = scanned + end + 1;
-            if let Some(id) = request_id(&out[scanned..end]) {
-                let mut pending = in_flight
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if pending.len() >= MAX_TRACKED_REQUESTS {
-                    pending.pop_front();
-                }
-                pending.push_back(id);
-            }
-            scanned = end;
-        }
-        carry = out.split_off(scanned);
-        if tx.send(out).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// Forward the daemon's frames to the client, forgetting each request as its
-/// reply passes so a later cut does not answer it twice.
-async fn forward_daemon<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
-    mut reader: R,
-    mut writer: W,
-    in_flight: &std::sync::Mutex<VecDeque<Value>>,
-) -> Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let count = reader.read_until(b'\n', &mut line).await?;
+        let mut frame = Vec::new();
+        let count = (&mut stdin)
+            .take(1024 * 1024 + 1)
+            .read_until(b'\n', &mut frame)
+            .await?;
         if count == 0 {
             return Ok(());
         }
-        anyhow::ensure!(line.len() <= MAX_PROXY_FRAME, "Hub frame exceeds 32 MiB");
-        if let Ok(value) = serde_json::from_slice::<Value>(&line)
-            && let Some(id) = value.get("id")
-        {
-            in_flight
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .retain(|pending| pending != id);
+        anyhow::ensure!(frame.len() <= 1024 * 1024, "MCP request exceeds 1 MiB");
+        if tx.send(frame).await.is_err() {
+            return Ok(());
         }
-        writer.write_all(&line).await?;
-        writer.flush().await?;
     }
 }
 
-/// Answer the requests the cut took with it, once each.
-///
-/// Their replies are gone with the old daemon, so the client is told the request
-/// is retryable rather than left waiting for an answer that will never come.
-/// Requests sent after the reconnect are answered by the new daemon.
-async fn answer_cut_requests(
-    stdout: &mut tokio::io::Stdout,
-    in_flight: &std::sync::Mutex<VecDeque<Value>>,
+/// Answer each request sent to a lost daemon once, without replaying side effects.
+async fn answer_cut_requests<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    pending: &mut std::collections::BTreeMap<String, Value>,
 ) -> Result<()> {
-    let pending: Vec<Value> = in_flight
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .drain(..)
-        .collect();
-    for id in pending {
-        let frame = json!({"jsonrpc": "2.0", "id": id,
-            "error": {"code": -32000, "message": "Hub restarted; retry the request"}});
+    for (_, id) in std::mem::take(pending) {
+        let frame = json!({"jsonrpc":"2.0", "id":id, "error": {
+            "code":-32000, "message":"Hub restarted; retry the request",
+            "data":{"retryable":true}}});
         stdout.write_all(format!("{frame}\n").as_bytes()).await?;
     }
     stdout.flush().await?;
     Ok(())
 }
 
-/// Proxy stdio until the client closes its input, following the daemon.
-///
-/// A handover — or any daemon restart — closes the connection underneath a
-/// long-lived MCP client. Instead of exiting, the proxy re-dials the hub,
-/// re-announces the same identity with `hub/hello` and keeps forwarding, so the
-/// orchestrator never notices the cut. The daemon owns all MCP semantics.
+/// Follow daemon restarts, preserving identity and failing only requests in flight.
 pub async fn proxy_stdio() -> Result<()> {
-    // One pump owns stdin for the whole proxy, so a reconnect cannot lose a byte
-    // the client already sent: chunks wait in the channel until a daemon takes
-    // them.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    let in_flight = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    tokio::spawn(pump_stdin(tx, in_flight.clone()));
-    let mut reconnects = 0usize;
-    loop {
-        let client = negotiated(false, false).await?;
-        // Frames that arrived during the handshake — event replay, a reply that
-        // raced the hello — belong to the client, not to the daemon.
-        let buffered = client.stream.buffer().to_vec();
-        let (reader, mut writer) = client.stream.into_inner().into_split();
-        let reader = BufReader::new(reader);
-        let mut stdout = tokio::io::stdout();
-        for frame in client.notifications {
-            stdout.write_all(&frame).await?;
-        }
-        stdout.write_all(&buffered).await?;
-        stdout.flush().await?;
-        let to_daemon = async {
-            while let Some(chunk) = rx.recv().await {
-                writer.write_all(&chunk).await?;
-                writer.flush().await?;
+    let mut identity = hello_params(false, &client_version(), &client_build());
+    if identity["agent_id"].is_null()
+        && identity["host_id"].is_null()
+        && identity["session_id"].is_null()
+        && identity["watch_token"].is_null()
+    {
+        identity["agent_id"] = json!(format!("proxy:{}", uuid::Uuid::new_v4()));
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let input = tokio::spawn(pump_stdin(tx));
+    let mut pending = std::collections::BTreeMap::new();
+    let mut initialize: Option<Value> = None;
+    let mut stdout = tokio::io::stdout();
+    let result = async {
+        loop {
+            let mut client = negotiated_identity(false, identity.clone()).await?;
+            if let Some(params) = &initialize {
+                client.request("initialize", params.clone()).await?;
             }
-            Ok::<(), anyhow::Error>(())
-        };
-        let from_daemon = forward_daemon(reader, &mut stdout, &in_flight);
-        tokio::select! {
-            // The client closed its input: nothing left to serve.
-            result = to_daemon => return result,
-            // The daemon went away. A reset is as final as an EOF — a killed
-            // or replaced daemon closes the socket either way — so both are
-            // followed rather than reported to the MCP client.
-            result = from_daemon => {
-                if let Err(e) = &result {
-                    debug!(error = %e, "Hub connection ended");
+            for frame in client.notifications.drain(..) {
+                stdout.write_all(&frame).await?;
+            }
+            stdout.flush().await?;
+            // Retain partial reply bytes across cancelled reads in select.
+            let mut reply = Vec::new();
+            loop {
+                tokio::select! {
+                    frame = rx.recv(), if pending.len() < 128 => {
+                        let Some(frame) = frame else { return Ok::<(), anyhow::Error>(()); };
+                        if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                            if value["method"] == "initialize" {
+                                initialize = Some(value["params"].clone());
+                            }
+                            if let Some(id) = value.get("id") {
+                                pending.insert(id.to_string(), id.clone());
+                            }
+                        }
+                        if client.stream.get_mut().write_all(&frame).await.is_err() { break; }
+                    }
+                    count = async {
+                        (&mut client.stream).take(32 * 1024 * 1024 + 1 - reply.len() as u64)
+                            .read_until(b'\n', &mut reply).await
+                    } => {
+                        match count {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        anyhow::ensure!(reply.len() <= 32 * 1024 * 1024, "Hub frame exceeds 32 MiB");
+                        if let Ok(value) = serde_json::from_slice::<Value>(&reply)
+                            && let Some(id) = value.get("id") {
+                            pending.remove(&id.to_string());
+                        }
+                        stdout.write_all(&reply).await?;
+                        stdout.flush().await?;
+                        reply.clear();
+                    }
                 }
             }
+            answer_cut_requests(&mut stdout, &mut pending).await?;
         }
-        answer_cut_requests(&mut stdout, &in_flight).await?;
-        reconnects += 1;
-        anyhow::ensure!(
-            reconnects <= MAX_PROXY_RECONNECTS,
-            "The hub went away {reconnects} times; restart the MCP client"
-        );
-        info!("Hub connection closed; reconnecting the stdio proxy");
-    }
+    }.await;
+    input.abort();
+    result
 }
 
 /// Sequential CLI requests, ignoring asynchronous MCP event notifications.
