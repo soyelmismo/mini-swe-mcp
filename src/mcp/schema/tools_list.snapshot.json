@@ -70,7 +70,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Correction or follow-up for 'steer': continues on the worker's own branch with full context ('max_turns' sets the budget) or a stopped worker. Never dispatch a replacement.",
+            "description": "Correction or follow-up for 'steer': continues with full context on the worker's own branch ('max_turns' sets the budget) or a stopped worker: never dispatch a replacement.",
             "type": "string"
           },
           "model": {

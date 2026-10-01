@@ -101,6 +101,6 @@ impl McpServer {
     }
 }
 
-pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str = "Correction or follow-up for 'steer': continues on the worker's own branch with full context ('max_turns' sets the budget) or a stopped worker. Never dispatch a replacement.";
+pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str = "Correction or follow-up for 'steer': continues with full context on the worker's own branch ('max_turns' sets the budget) or a stopped worker: never dispatch a replacement.";
 
 pub(in crate::mcp) const MAX_TURNS_DESCRIPTION: &str = "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.";
