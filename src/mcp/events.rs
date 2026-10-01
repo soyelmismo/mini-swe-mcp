@@ -1495,3 +1495,51 @@ mod verify_tail_attachment_tests {
         assert!(tail.contains("Command timed out after 600s"), "{view}");
     }
 }
+
+/// A registry row reduced to a view must carry the completion's persisted
+/// verdict, so an evicted or restarted worker's event still reports it.
+#[cfg(test)]
+mod registry_verified_tests {
+    use super::{EventKind, registry_view};
+    use crate::pool::{RegistryStatus, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
+
+    fn completed_row(verified: Option<bool>) -> WorkerRegistryEntry {
+        WorkerRegistryEntry {
+            id: "w-registry".to_string(),
+            pid: 0,
+            task: "persist the verdict".to_string(),
+            model: "test-model".to_string(),
+            status: RegistryStatus::Completed,
+            step: 5,
+            max_turns: 10,
+            last_command: "all gates green".to_string(),
+            question: None,
+            repo_path: None,
+            started_at: 0,
+            updated_at: 0,
+            group: None,
+            role: WorkerRole::Worker,
+            owner: Some("owner".to_string()),
+            metrics: WorkerMetrics::default(),
+            base_branch: None,
+            base_commit: None,
+            revision: 0,
+            auto_continues: 0,
+            report: None,
+            approved: None,
+            verified,
+        }
+    }
+
+    #[test]
+    fn a_completed_rows_view_carries_the_persisted_verdict() {
+        let view = registry_view(&completed_row(Some(true)));
+        assert_eq!(view.event, Some(EventKind::Completed));
+        assert_eq!(view.outcome.verified, Some(true));
+    }
+
+    #[test]
+    fn a_row_without_a_verdict_stays_unknown() {
+        assert_eq!(registry_view(&completed_row(None)).outcome.verified, None);
+    }
+}
