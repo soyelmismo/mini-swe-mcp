@@ -63,8 +63,11 @@
             "type": "boolean"
           },
           "group": {
-            "description": "Only workers of this group. For 'watch' and 'merge --approved'.",
-            "type": "string"
+            "description": "Group of workers, one name or several; also 'merge --approved'.",
+            "type": [
+              "string",
+              "array"
+            ]
           },
           "id": {
             "description": "Alias for worker_id.",
@@ -196,7 +199,7 @@
           },
           "all": {
             "type": "boolean",
-            "description": "Watch the whole round as one event."
+            "description": "Watch whole rounds, one event each."
           }
         },
         "required": [
