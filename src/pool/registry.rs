@@ -400,9 +400,11 @@ impl RegistryWriter {
             // The writer's own cache first (no I/O on the common path), then the
             // row on disk, so a round recorded by an earlier process or before
             // this writer started also survives.
-            let known = self.rows.get(&entry.id).cloned().or_else(|| {
-                super::load_registry_entry_in(&self.root, &entry.id)
-            });
+            let known = self
+                .rows
+                .get(&entry.id)
+                .cloned()
+                .or_else(|| super::load_registry_entry_in(&self.root, &entry.id));
             if let Some(known) = known.filter(|known| !known.integrated.is_empty()) {
                 entry.integrated = known.integrated;
             }

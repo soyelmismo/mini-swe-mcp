@@ -220,8 +220,7 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
     })?;
     let commit = head_commit(repo);
 
-    let (branch_deleted, cleaned) =
-        cleanup(
+    let (branch_deleted, cleaned) = cleanup(
         root,
         worker_id,
         repo,
@@ -781,12 +780,7 @@ fn cleanup(
 /// proof shows that whatever is on the branch right now is already in the base.
 /// Any doubt -- no row, no repository, no branch, an unprobeable repo -- answers
 /// false, so a re-revised worker survives instead of losing work.
-fn branch_is_integrated_in(
-    root: &ScratchRoot,
-    repo: &Path,
-    worker_id: &str,
-    base: &str,
-) -> bool {
+fn branch_is_integrated_in(root: &ScratchRoot, repo: &Path, worker_id: &str, base: &str) -> bool {
     let Some(row) = load_registry_entry_in(root, worker_id) else {
         return false;
     };

@@ -12,8 +12,8 @@ mod common;
 use common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
-    MergeRequest, WorkerHistory, WorkerRegistryEntry, append_history_message_in, merge_worker_in,
-    save_registry_entry_in, sweep_retired_workers_in,
+    MergeRequest, WorkerHistory, WorkerRecord, WorkerRegistryEntry, append_history_message_in,
+    merge_worker_in, save_registry_entry_in, sweep_retired_workers_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::{Path, PathBuf};
@@ -130,6 +130,25 @@ impl Fixture {
 
     fn row_exists(&self, id: &str) -> bool {
         mini_swe_mcp::pool::load_registry_entry_in(&self.root(), id).is_some()
+    }
+
+    /// `merge <id> --no-delete`, then the same post-merge sweep the MCP handler
+    /// runs, so the operator contract is tested end to end.
+    fn merge_keeping_branch_then_sweep(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<mini_swe_mcp::pool::RetireSweep> {
+        merge_worker_in(
+            &self.root(),
+            &MergeRequest {
+                worker_id: id,
+                verified: Some(true),
+                keep_branch: true,
+                admission: None,
+            },
+        )?;
+        // The handler exempts a `--no-delete` worker from this pass.
+        Ok(self.sweep_exempting(std::slice::from_ref(&id.to_string())))
     }
 
     /// Merge `id` through the same entry point the MCP handler uses.
@@ -324,7 +343,11 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
 
     // 6. A history the sweep cannot place at all (unreadable first line): its
     //    unreachability is unproven, so it must survive.
-    write(f.scratch.path(), "swe-wt-k2.history.jsonl", "not json at all\n");
+    write(
+        f.scratch.path(),
+        "swe-wt-k2.history.jsonl",
+        "not json at all\n",
+    );
 
     let sweep = f.sweep();
 
@@ -393,8 +416,14 @@ fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
     }
     // The consolidator integrates both tips.
     f.commit_on_worker_branch("rcons", "rcons.txt", "consolidated\n");
-    git(f.repo(), &["merge", "--no-ff", "-m", "integrate", "worker-r-ok"]);
-    git(f.repo(), &["merge", "--no-ff", "-m", "integrate", "worker-r-new"]);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate", "worker-r-ok"],
+    );
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate", "worker-r-new"],
+    );
     f.record_with_verify("rcons", Some("true"));
     save_registry_entry_in(
         &f.root(),
@@ -418,7 +447,8 @@ fn a_worker_revised_after_its_tip_was_integrated_is_not_retired() {
     git(f.repo(), &["commit", "-m", "revision after integration"]);
     git(f.repo(), &["checkout", "-q", "main"]);
 
-    f.merge("rcons").expect("the consolidator merge must succeed");
+    f.merge("rcons")
+        .expect("the consolidator merge must succeed");
 
     assert!(
         !f.row_exists("r-ok"),
@@ -491,5 +521,102 @@ fn a_consolidators_round_survives_its_later_status_writes() {
         row.integrated,
         vec!["x1".to_string()],
         "the status write must not erase the round the consolidator integrated"
+    );
+}
+
+/// `merge --no-delete` is an explicit operator decision, and the sweep that runs
+/// immediately after must not undo it: the branch, its row and its history stay,
+/// so the worker is still a known, steerable, re-mergeable worker.
+#[test]
+fn a_no_delete_merge_survives_the_post_merge_sweep() {
+    let f = Fixture::new("retire-no-delete");
+    f.commit_on_worker_branch("nd1", "nd1.txt", "nd1\n");
+    f.record_with_verify("nd1", Some("true"));
+    f.write_steer_source("nd1");
+
+    f.merge_keeping_branch_then_sweep("nd1")
+        .expect("a --no-delete merge must succeed");
+
+    assert!(
+        git_ref_exists(f.repo(), "worker-nd1"),
+        "--no-delete must keep the branch through the post-merge sweep"
+    );
+    assert!(
+        f.row_exists("nd1"),
+        "--no-delete must keep the row: the branch is what keeps the worker known"
+    );
+}
+
+/// A merged worker leaves this process's live records too, not just its row.
+///
+/// `list_workers` reads both the registry and this process's live records, so
+/// deleting only the row would keep an integrated worker visible as "Completed"
+/// next to the ones still awaiting integration -- exactly the hiding problem the
+/// retirement exists to remove.
+#[tokio::test]
+async fn a_retired_worker_leaves_the_live_list() {
+    let f = Fixture::new("retire-live-list");
+    f.commit_on_worker_branch("lv1", "lv1.txt", "lv1\n");
+    f.record_with_verify("lv1", Some("true"));
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    pool.__test_insert_worker(WorkerRecord {
+        id: "lv1".to_string(),
+        task: "do the work".to_string(),
+        model: "test".to_string(),
+        owner: "agent-a".to_string(),
+        state: mini_swe_mcp::pool::WorkerState::Completed {
+            turns: 3,
+            diff: "1 file changed".to_string(),
+            summary: "done".to_string(),
+            completed_at: 1,
+            artifacts: Vec::new(),
+            branch: Some("worker-lv1".to_string()),
+            verified: Some(true),
+            metrics: Default::default(),
+            report: None,
+            revision: 0,
+        },
+        metrics: Default::default(),
+        logs: mini_swe_mcp::pool::LogBuffer::new(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    });
+
+    let listed: Vec<String> = pool
+        .list_workers()
+        .await
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        listed.iter().any(|id| id == "lv1"),
+        "a completed worker in this process is listed before it is retired: {listed:?}"
+    );
+
+    f.merge("lv1").expect("the merge must succeed");
+    // Exactly what the merge handler and the sweep do.
+    pool.forget_retired_workers(&["lv1".to_string()]).await;
+
+    let listed: Vec<String> = pool
+        .list_workers()
+        .await
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !listed.iter().any(|id| id == "lv1"),
+        "a retired worker must leave the live list: {listed:?}"
+    );
+    assert!(
+        !f.row_exists("lv1"),
+        "and must leave no registry row either"
     );
 }
