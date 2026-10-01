@@ -126,6 +126,28 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
     }
 }
 
+/// Clears a worker's heavy-slot wait when the slot is granted or the wait is
+/// abandoned (its worker killed, its step aborted).
+pub struct BuildWait {
+    pool: WorkerPool,
+    id: String,
+}
+
+impl Drop for BuildWait {
+    fn drop(&mut self) {
+        let removed = self
+            .pool
+            .admission_waiting
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.id)
+            .is_some();
+        if removed {
+            self.pool.notify_change();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     worker_slots: fair::FairScheduler,
@@ -133,6 +155,9 @@ pub struct WorkerPool {
     /// Resource-aware gate for heavy commands: the slot count, the memory and
     /// load criteria and the job count all live here.
     admission: AdmissionController,
+    /// Worker id -> heavy commands queued ahead of it while it waits for a
+    /// build slot. Set while blocked in admission, cleared when granted.
+    admission_waiting: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
@@ -189,6 +214,7 @@ impl WorkerPool {
             worker_slots: fair::FairScheduler::new(max_concurrent),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
+            admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
             registry: Arc::new(std::sync::Mutex::new(registry::RegistryWriter::default())),
@@ -204,6 +230,21 @@ impl WorkerPool {
     /// Subscribe before reading state so a concurrent change cannot be missed.
     pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    /// Mark `id` as queued for a heavy build slot behind `queued` requests.
+    /// The returned guard clears the state when the slot is granted or the
+    /// wait is abandoned, so a killed worker leaves no stale wait behind.
+    pub fn wait_for_build_slot(&self, id: &str, queued: usize) -> BuildWait {
+        self.admission_waiting
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id.to_string(), queued);
+        self.notify_change();
+        BuildWait {
+            pool: self.clone(),
+            id: id.to_string(),
+        }
     }
 
     fn notify_change(&self) {
@@ -541,6 +582,12 @@ impl WorkerPool {
     /// Clones only the small strings needed to render progress and never the
     /// potentially multi-megabyte terminal payload.
     pub async fn worker_progress(&self, id: &str) -> Option<WorkerProgress> {
+        let waiting_for_slot = self
+            .admission_waiting
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(id)
+            .copied();
         let lock = self.workers.read().await;
         let w = lock.get(id)?;
         let progress = match &w.state {
@@ -551,24 +598,28 @@ impl WorkerPool {
                 step: *step,
                 last_command: Some(last_command.clone()),
                 question: None,
+                waiting_for_slot,
             },
             WorkerState::Paused { question, step, .. } => WorkerProgress {
                 phase: WorkerPhase::Paused,
                 step: *step,
                 last_command: None,
                 question: Some(question.clone()),
+                waiting_for_slot,
             },
             WorkerState::Completed { turns, .. } => WorkerProgress {
                 phase: WorkerPhase::Completed,
                 step: *turns,
                 last_command: None,
                 question: None,
+                waiting_for_slot: None,
             },
             WorkerState::Failed { step, .. } => WorkerProgress {
                 phase: WorkerPhase::Failed,
                 step: *step,
                 last_command: None,
                 question: None,
+                waiting_for_slot: None,
             },
         };
         drop(lock);

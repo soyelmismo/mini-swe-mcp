@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 pub type Snapshot = BTreeMap<String, Value>;
 
 /// The workflow shared by CLI help and the MCP tool description.
-pub const WORKFLOW: &str = "Write task as ONE focused concern with files in scope and an acceptance gate. Dispatch independent tasks in parallel - many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time. To wait, run `mini-swe-mcp watch` in the background: it blocks until an actionable event, prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event. After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer: it resumes on its branch with full context. Do not edit its branch yourself; merge only when it is right.";
+pub const WORKFLOW: &str = "Write task as ONE focused concern with files in scope and an acceptance gate. Dispatch independent tasks in parallel - many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time. To wait, run `mini-swe-mcp watch` in the background: it blocks until an actionable event, prints it and exits, so the host CLI wakes you when it ends; missed events are replayed first. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event. After completion, review the diff and run the checks. Send every correction AND any merge conflict back to the same worker with steer: it resumes on its branch with full context. Do not edit its branch yourself; merge only when it is right.";
 
 #[derive(Default)]
 pub struct Options {
@@ -154,6 +154,11 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
 /// Decide from state and the last reported health baseline, without I/O.
 pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<Value> {
     let status = view["status"].as_str()?;
+    // A worker queued for a heavy build slot is not idle in the worker sense:
+    // the time is spent waiting on admission, so it can never be a stall.
+    if view["waiting_for_slot"].is_number() && matches!(status, "running" | "reviewing") {
+        return None;
+    }
     let metrics: WorkerMetrics =
         serde_json::from_value(view["metrics"].clone()).unwrap_or_default();
     let baseline: WorkerMetrics = previous
@@ -373,6 +378,13 @@ fn print_events_to(
 
 /// Update the progress clock only when the turn changes, not on health writes.
 pub fn progress_clock(view: &mut Value, old: Option<&Value>, now: u64) {
+    // Time queued for a heavy build slot is not inactivity: keep the worker's
+    // idle clock at zero while it waits, so granting the slot starts a fresh
+    // episode instead of an immediate stall.
+    if view["waiting_for_slot"].is_number() {
+        view["last_step_at"] = json!(now);
+        return;
+    }
     if let Some(old) = old {
         view["last_step_at"] = if old["step"] == view["step"] && old["revision"] == view["revision"]
         {
@@ -381,6 +393,14 @@ pub fn progress_clock(view: &mut Value, old: Option<&Value>, now: u64) {
             json!(now)
         };
     }
+}
+
+/// A worker whose status can never produce another watch event.
+fn terminal(view: &Value) -> bool {
+    matches!(
+        view["status"].as_str(),
+        Some("completed" | "failed" | "stopped" | "interrupted")
+    )
 }
 
 pub fn matches(view: &Value, ids: &BTreeSet<String>, group: Option<&str>) -> bool {
@@ -408,15 +428,24 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         }
         Err(error) => return Err(error),
     };
+    // With no explicit ids the set is dynamic: every worker this caller owns
+    // is watched, so a dispatch made after the watch began joins automatically.
+    // An explicit id set stays fixed for the whole watch.
+    let explicit = !opts.ids.is_empty();
     let started = tokio::time::Instant::now();
     let mut ids = opts.ids.clone();
     let mut initial = true;
+    let mut watched_any = false;
     loop {
         let response = match client
             .watch_snapshot(&ids, opts.group.as_deref(), initial)
             .await
         {
             Ok(value) => value,
+            Err(error) if error.to_string().contains("a watch is already running") => {
+                println!("{error}");
+                return Ok(5);
+            }
             Err(error) if error.to_string().contains("belongs to agent") => {
                 println!("{error}");
                 return Ok(4);
@@ -429,14 +458,20 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             }
             Err(error) => return Err(error),
         };
-        ids = response["watching"]
+        let watching: BTreeSet<String> = response["watching"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        if explicit {
+            ids = watching.clone();
+        }
+        if !watching.is_empty() {
+            watched_any = true;
+        }
         let events = response["events"].as_array().cloned().unwrap_or_default();
-        if initial && ids.is_empty() && events.is_empty() {
+        if initial && explicit && ids.is_empty() && events.is_empty() {
             println!("nothing to watch");
             return Ok(3);
         }
@@ -452,14 +487,18 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             return Ok(0);
         }
         initial = false;
-        if ids.is_empty() {
+        if watching.is_empty() && (explicit || watched_any) {
             return Ok(0);
         }
         let wait = match opts.timeout {
             Some(timeout) => {
                 let Some(left) = timeout.checked_sub(started.elapsed()) else {
-                    println!("no event");
-                    return Ok(2);
+                    if watched_any {
+                        println!("no event");
+                        return Ok(2);
+                    }
+                    println!("nothing to watch");
+                    return Ok(3);
                 };
                 left.min(Duration::from_secs(1))
             }
@@ -477,11 +516,17 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
     // The same resolution the hub applies to this process: the operator's
     // override, then the host process, then the CLI's own identity.
     let owner = crate::hub::identity::identity(crate::mcp::CLI_AGENT).id;
+    // With no explicit ids the set is dynamic: every owned worker joins, so one
+    // dispatched after the watch began is followed too. An explicit id set is
+    // fixed for the whole watch.
+    let explicit = !opts.ids.is_empty();
     let started = tokio::time::Instant::now();
     let mut previous = Snapshot::new();
     let mut reported = Snapshot::new();
     let mut ids = opts.ids.clone();
+    let mut ignored: BTreeSet<String> = BTreeSet::new();
     let mut initial = true;
+    let mut watched_any = false;
     loop {
         let now = crate::pool::unix_timestamp();
         let mut current: Snapshot = crate::pool::load_all_registry_entries()
@@ -502,27 +547,37 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                     anyhow::bail!("Worker not found: {id}");
                 }
             }
-            if ids.is_empty() {
-                ids = current
-                    .values()
-                    .filter(|v| {
+            // A worker already terminal when the watch began is not a late
+            // dispatch: a no-arg watch must not replay it.
+            if !explicit {
+                ignored = current
+                    .iter()
+                    .filter(|(_, v)| {
                         (admin || v["owner"] == owner)
                             && matches(v, &opts.ids, opts.group.as_deref())
-                            && matches!(v["status"].as_str(), Some("running" | "paused"))
+                            && terminal(v)
                     })
-                    .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+                    .map(|(id, _)| id.clone())
                     .collect();
             }
-            if ids.is_empty() {
-                println!("nothing to watch");
-                return Ok(3);
-            }
             initial = false;
+        }
+        // Every owned worker joins a no-id watch, whenever it was dispatched;
+        // --group still filters the set.
+        if !explicit {
+            for (id, v) in &current {
+                if !ignored.contains(id)
+                    && (admin || v["owner"] == owner)
+                    && matches(v, &opts.ids, opts.group.as_deref())
+                {
+                    ids.insert(id.clone());
+                }
+            }
         }
         current.retain(|id, v| {
             ids.contains(id)
                 && (admin || v["owner"] == owner)
-                && matches(v, &ids, opts.group.as_deref())
+                && matches(v, &opts.ids, opts.group.as_deref())
         });
         let mut events = Vec::new();
         for (id, view) in &mut current {
@@ -542,15 +597,11 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
         if !events.is_empty() && !opts.follow {
             return Ok(0);
         }
-        ids.retain(|id| {
-            current.get(id).is_some_and(|v| {
-                !matches!(
-                    v["status"].as_str(),
-                    Some("completed" | "failed" | "stopped")
-                )
-            })
-        });
-        if ids.is_empty() {
+        if !current.is_empty() {
+            watched_any = true;
+        }
+        ids.retain(|id| current.get(id).is_some_and(|v| !terminal(v)));
+        if ids.is_empty() && (explicit || watched_any) {
             return Ok(0);
         }
         previous = current;
@@ -558,8 +609,12 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             .timeout
             .is_some_and(|timeout| started.elapsed() >= timeout)
         {
-            println!("no event");
-            return Ok(2);
+            if watched_any {
+                println!("no event");
+                return Ok(2);
+            }
+            println!("nothing to watch");
+            return Ok(3);
         }
         tokio::time::sleep(
             opts.timeout
