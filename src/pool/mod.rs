@@ -81,9 +81,9 @@ pub use self::runner::{
     summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerReport, WorkerState, file_stats_of_diff,
-    normalize_diff_path,
+    CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, FileStat, TOP_FILE_LIMIT, WorkerMetrics,
+    WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport, WorkerState, churn_line,
+    diff_sections_of, file_stats_of_diff, normalize_diff_path, same_diff_path,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,

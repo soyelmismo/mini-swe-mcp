@@ -151,45 +151,152 @@ pub fn normalize_diff_path(path: &str) -> String {
     path.strip_prefix("./").unwrap_or(path).to_string()
 }
 
-/// Read a unified diff into its per-file stats.
+/// How many files a per-file diff line names before it starts counting the rest.
+pub const TOP_FILE_LIMIT: usize = 8;
+
+/// `a.rs (+3 -2), b.rs (+1 -1), +2 more`: the biggest-churn files of a diff,
+/// then how many were left out.
 ///
-/// Pure and bounded by the diff's own size: one pass over the lines, counting
-/// the `+`/`-` body lines of each `diff --git` section. A section with no
-/// header path (a truncated diff) is skipped rather than guessed at, and a
-/// binary file — which has no body lines at all — reports zero and zero, the
-/// same thing `git diff --numstat` prints for it.
-pub fn file_stats_of_diff(diff: &str) -> Vec<FileStat> {
-    let mut stats: Vec<FileStat> = Vec::new();
-    let mut current: Option<usize> = None;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            // `a/<path> b/<path>`; a quoted path may contain a space, so the
-            // split is on the ` b/` separator rather than on whitespace.
-            let path = rest
-                .rsplit_once(" b/")
-                .map(|(_, tail)| tail)
-                .unwrap_or(rest)
-                .to_string();
-            stats.push(FileStat {
-                path: normalize_diff_path(&path),
-                ..FileStat::default()
-            });
-            current = Some(stats.len() - 1);
-            continue;
-        }
-        let Some(index) = current else { continue };
-        // The `+++`/`---` header lines are not body lines.
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
-        let stat = &mut stats[index];
-        if line.starts_with('+') {
-            stat.insertions += 1;
-        } else if line.starts_with('-') {
-            stat.deletions += 1;
+/// Ordered by churn and then by path so the line is deterministic, and bounded
+/// by [`TOP_FILE_LIMIT`] so it can never grow with the size of the diff.
+pub fn churn_line(stats: &[FileStat]) -> String {
+    let mut ordered: Vec<&FileStat> = stats.iter().collect();
+    ordered.sort_by(|a, b| b.churn().cmp(&a.churn()).then_with(|| a.path.cmp(&b.path)));
+    let shown = ordered.len().min(TOP_FILE_LIMIT);
+    let mut line = ordered[..shown]
+        .iter()
+        .map(|stat| {
+            format!(
+                "{} (+{} -{})",
+                stat.path, stat.insertions, stat.deletions
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = ordered.len().saturating_sub(shown);
+    if more > 0 {
+        line.push_str(&format!(", +{more} more"));
+    }
+    line
+}
+
+/// One section of a unified diff: the path it is about plus its raw body.
+struct DiffSection {
+    /// Path from the `+++` header, or from the `diff --git` line.
+    path: String,
+    /// Path from the `---` header, which is the only one a deleted file has.
+    minus: String,
+    body: String,
+}
+
+impl DiffSection {
+    /// The path the section is about: the "after" side when the file still
+    /// exists, the "before" side when it does not.
+    fn path(&self) -> &str {
+        if self.path.is_empty() {
+            &self.minus
+        } else {
+            &self.path
         }
     }
-    stats
+}
+
+/// Split a unified diff into one `(path, section)` pair per file.
+///
+/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
+/// removed line that happens to start with `--` can never be mistaken for one.
+/// A section with neither header — a binary file, a mode-only change — falls
+/// back to the paths its `diff --git` line names.
+pub fn diff_sections_of(diff: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<DiffSection> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            if let Some(section) = current.take() {
+                sections.push((section.path().to_string(), section.body));
+            }
+            current = Some(DiffSection {
+                path: diff_git_path(header).unwrap_or_default(),
+                minus: String::new(),
+                body: format!("{line}\n"),
+            });
+            continue;
+        }
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        section.body.push_str(line);
+        section.body.push('\n');
+        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
+            section.minus = found;
+        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
+            section.path = found;
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push((section.path().to_string(), section.body));
+    }
+    sections
+        .into_iter()
+        .filter(|(path, _)| !path.is_empty())
+        .collect()
+}
+
+/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
+fn diff_git_path(header: &str) -> Option<String> {
+    let split = header.rfind(" b/")?;
+    let path = &header[..split];
+    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
+}
+
+/// The path a `--- `/`+++ ` header names, or `None` for `/dev/null`.
+fn diff_header_path(header: &str) -> Option<String> {
+    let path = header.trim();
+    (path != "/dev/null").then(|| normalize_diff_path(path))
+}
+
+/// Per-file `(path, insertions, deletions)` of a unified diff.
+///
+/// Only hunk lines are counted, and a hunk starts at its `@@` header, so the
+/// `---`/`+++` headers and an added line that itself starts with `+` are never
+/// counted as content.
+pub fn file_stats_of_diff(diff: &str) -> Vec<FileStat> {
+    diff_sections_of(diff)
+        .into_iter()
+        .map(|(path, section)| {
+            let mut insertions = 0;
+            let mut deletions = 0;
+            let mut in_hunks = false;
+            for line in section.lines() {
+                if line.starts_with("@@") {
+                    in_hunks = true;
+                } else if in_hunks && line.starts_with('+') {
+                    insertions += 1;
+                } else if in_hunks && line.starts_with('-') {
+                    deletions += 1;
+                }
+            }
+            FileStat {
+                path,
+                insertions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
+/// Whether a requested path names the file a diff section is about.
+///
+/// Exact after normalisation, or a whole-component suffix of it, so `--file
+/// a.rs` still finds `src/a.rs`.
+pub fn same_diff_path(requested: &str, actual: &str) -> bool {
+    let requested = normalize_diff_path(requested);
+    let actual = normalize_diff_path(actual);
+    actual == requested
+        || (!requested.is_empty()
+            && actual.len() > requested.len()
+            && actual.ends_with(&requested)
+            && actual[..actual.len() - requested.len()].ends_with('/'))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

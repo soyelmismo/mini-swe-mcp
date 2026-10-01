@@ -62,7 +62,12 @@ WORKFLOW:
 1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files in the current repository.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
 3. Every response MUST execute EXACTLY ONE command using the `bash` tool. If the bash tool is unavailable, use a ```bash ... ``` code block instead.
-4. When finished:
+4. When finished, your last message must contain this REPORT block, then the sentinel:
+   REPORT
+   done: <one line: what changed>
+   files: <paths changed, comma-separated>
+   tests: <the commands run and their result, one line>
+   risks: <security/contract/behaviour risks, or none>
    - For code tasks: verify with tests and execute:
      echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
    - For audit/analysis tasks: print your concise findings report to stdout and in the same or next turn execute:

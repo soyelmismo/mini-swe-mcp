@@ -424,7 +424,14 @@ impl WorkerPool {
             .find(|l| !l.is_empty())
             .unwrap_or("completed task")
             .to_string();
-        let agent_summary = last_assistant_text.trim().to_string();
+        // The report's `done:` line is the summary every consumer reads; the
+        // last chat message stays the fallback for a worker that never wrote
+        // one, so the commit subject is never "Now I'll make the edits.".
+        let agent_summary = report
+            .as_ref()
+            .map(|r| r.done.trim().to_string())
+            .filter(|done| !done.is_empty())
+            .unwrap_or_else(|| last_assistant_text.trim().to_string());
         let path = worktree.path.clone();
         let repo_root = worktree.repo_root.clone();
         let base_commit = worktree.base_commit.clone();
