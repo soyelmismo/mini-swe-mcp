@@ -62,6 +62,9 @@ fn watch_args(worker: &str) -> serde_json::Value {
 async fn a_steered_completion_waits_for_the_consolidator_to_finish() {
     let harness = IsolatedPool::new(2, "consolidate-events");
     let root = harness.root();
+    // A terminal registry row survives the loader only while its worktree
+    // still exists; the event router is the reader that keeps it.
+    std::fs::create_dir_all(root.join("swe-wt-w1")).unwrap();
     write_row(&root, "w1", WorkerRole::Worker, RegistryStatus::Completed);
     write_row(
         &root,
