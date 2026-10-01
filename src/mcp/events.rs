@@ -1268,6 +1268,9 @@ impl EventRouter {
                 anyhow::bail!("Worker not found: {id}");
             }
         }
+        if params["all"].as_bool() == Some(true) {
+            return self.watch_round(ctx, params);
+        }
         let watching: BTreeSet<String> = self
             .watch_current
             .values()
@@ -1336,6 +1339,116 @@ impl EventRouter {
             }
         }
         Ok(json!({"watching":watching,"events":events}))
+    }
+
+    /// The `--all` watch: one consolidated event per round.
+    ///
+    /// A round needs a group or explicit ids. It answers once when every
+    /// selected worker has stopped, or earlier when one is paused (needs
+    /// input), has failed, or (past the long threshold) has gone quiet. The
+    /// individual transitions it folds in are acknowledged here, so a later
+    /// plain watch does not replay them.
+    fn watch_round(
+        &mut self,
+        ctx: &super::server::ConnectionContext,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        use std::collections::BTreeSet;
+        let ids: BTreeSet<String> = params["worker_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let group = params["group"].as_str();
+        anyhow::ensure!(
+            !ids.is_empty() || group.is_some(),
+            "watch --all needs a group or explicit worker ids"
+        );
+        let owner = ctx.agent();
+        let allowed = |v: &serde_json::Value| {
+            ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed")
+        };
+        let watching: BTreeSet<String> = self
+            .watch_current
+            .values()
+            .filter(|v| {
+                allowed(v)
+                    && crate::cli::watch::matches(v, &ids, group)
+                    && matches!(
+                        v["status"].as_str(),
+                        Some("running" | "paused" | "reviewing")
+                    )
+            })
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        let now = crate::pool::unix_timestamp();
+        // A worker is fresh when one of its transitions is still unacknowledged:
+        // either queued for this owner, or reported but never marked seen.
+        let pending: BTreeSet<String> = self
+            .watch_history
+            .iter()
+            .filter(|(agent, _)| ctx.is_admin() || *agent == owner)
+            .flat_map(|(_, history)| history.pending.iter())
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        let event = {
+            let reported = &self.watch_reported;
+            let seen = &self.seen;
+            let fresh = |id: &str| {
+                pending.contains(id)
+                    || reported
+                        .get(id)
+                        .and_then(|v| v["sequence"].as_u64())
+                        .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
+            };
+            crate::cli::watch::round_event(&self.watch_current, &ids, group, now, fresh)
+        };
+        if let Some(event) = event {
+            self.ack_round(ctx, &ids, group);
+            self.watches.claim(&owner, ctx.id, ctx.pid)?;
+            return Ok(json!({"watching":watching,"events":[event]}));
+        }
+        if !watching.is_empty() {
+            self.watches.claim(&owner, ctx.id, ctx.pid)?;
+        }
+        Ok(json!({"watching":watching,"events":[]}))
+    }
+
+    /// Acknowledge every selected worker the round event folded in.
+    ///
+    /// Its per-worker transitions leave the owner's backlog and are marked
+    /// seen, so a later plain watch treats the round as already delivered.
+    fn ack_round(
+        &mut self,
+        ctx: &super::server::ConnectionContext,
+        ids: &std::collections::BTreeSet<String>,
+        group: Option<&str>,
+    ) {
+        let owner = ctx.agent();
+        let selected: std::collections::BTreeSet<String> = self
+            .watch_current
+            .values()
+            .filter(|v| crate::cli::watch::matches(v, ids, group))
+            .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
+            .collect();
+        for (agent, history) in &mut self.watch_history {
+            if !ctx.is_admin() && *agent != owner {
+                continue;
+            }
+            history
+                .pending
+                .retain(|v| v["worker_id"].as_str().is_none_or(|id| !selected.contains(id)));
+        }
+        for id in &selected {
+            if let Some(sequence) = self
+                .watch_reported
+                .get(id)
+                .and_then(|v| v["sequence"].as_u64())
+            {
+                self.seen.insert(id.clone(), sequence);
+            }
+        }
     }
 
     /// Forget `owner`'s queued events for `wid` and mark its last reported

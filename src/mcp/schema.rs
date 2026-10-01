@@ -149,6 +149,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static(super::handlers::watch::TIMEOUT_SECS_DESCRIPTION),
     ),
     (
+        "all",
+        "boolean",
+        DescriptionSource::Static(super::handlers::watch::ALL_DESCRIPTION),
+    ),
+    (
         "max_turns",
         "integer",
         DescriptionSource::Static(super::handlers::steer::MAX_TURNS_DESCRIPTION),
