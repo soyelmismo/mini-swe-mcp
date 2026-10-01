@@ -11,7 +11,7 @@ mod common;
 use common::IsolatedPool;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRole, save_registry_entry_in,
+    RegistryStatus, WorkerMeta, WorkerPool, WorkerRole, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 
@@ -21,19 +21,10 @@ const OWNER: &str = "owner";
 /// The registry row a worker of `role` in the round leaves behind.
 fn write_row(root: &ScratchRoot, id: &str, role: WorkerRole, status: RegistryStatus) {
     let meta = WorkerMeta {
-        report: None,
-        id: id.to_string(),
         task: "exercise consolidate routing".to_string(),
         group: Some("round-1".to_string()),
         role,
-        repo_path: None,
-        owner: OWNER.to_string(),
-        started_at: 0,
-        pid: std::process::id(),
-        revision: 0,
-        auto_continues: 0,
-        metrics: WorkerMetrics::default(),
-        verified: None,
+        ..WorkerMeta::test_meta(id, OWNER)
     };
     save_registry_entry_in(
         root,
