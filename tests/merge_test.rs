@@ -104,10 +104,12 @@ impl Fixture {
             metrics: Default::default(),
             base_branch: Some("main".to_string()),
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }

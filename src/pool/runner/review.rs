@@ -53,9 +53,18 @@ pub struct ReviewPhase<'a> {
     pub meta: &'a mut WorkerMeta,
 }
 
-/// The step counter after the review phase, for the caller to fold back into
-/// its own loop state.
-pub type ReviewPhaseOutcome = usize;
+/// What the review phase hands back: the combined step counter and whether the
+/// reviewer itself emitted the completion sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewPhaseOutcome {
+    /// The combined turn counter, for the caller to fold back into its own
+    /// loop state.
+    pub step: usize,
+    /// Whether the reviewer completed. `false` when the reviewer gave up
+    /// quietly or ran out of turns, so the whole run must be read as stopped
+    /// rather than done.
+    pub completed: bool,
+}
 
 impl WorkerPool {
     /// Run the review auditor over the finished implementation.
@@ -168,6 +177,7 @@ impl WorkerPool {
         // the engine's report state is a sink here.
         let mut report = None;
         let mut report_asked = false;
+        let mut report_text = String::new();
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -205,6 +215,7 @@ impl WorkerPool {
                 watch: &mut watch,
                 report: &mut report,
                 report_asked: &mut report_asked,
+                report_text: &mut report_text,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { .. } => {
@@ -213,13 +224,27 @@ impl WorkerPool {
                         step = review_step,
                         "Reviewer completed and approved changes"
                     );
-                    return Ok(step);
+                    return Ok(ReviewPhaseOutcome {
+                        step,
+                        completed: true,
+                    });
                 }
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
-                TurnOutcome::EndReview => return Ok(step),
+                // The reviewer gave up quietly (an LLM error under
+                // `EndQuietly`): the audit is inconclusive, not approved.
+                TurnOutcome::EndReview => {
+                    return Ok(ReviewPhaseOutcome {
+                        step,
+                        completed: false,
+                    });
+                }
             }
         }
 
-        Ok(step)
+        // The budget ran out with no completion sentinel.
+        Ok(ReviewPhaseOutcome {
+            step,
+            completed: false,
+        })
     }
 }

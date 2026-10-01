@@ -1036,6 +1036,10 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     // Unix socket paths are bounded by sockaddr_un, unlike scratch paths.
     let hub = std::env::temp_dir().join(format!("h5-{}", std::process::id()));
     std::fs::create_dir_all(&hub).unwrap();
+    // Both daemons are SIGKILLed on purpose, so their own shutdown never runs:
+    // own the hub directory and the short socket fallback directory it derives.
+    let _hub_dir = common::TempDir::own(hub.clone());
+    let _fallback = common::fallback_socket_dir(&hub);
     let swe = root.subdir("swe");
     let repo = root.subdir("repo");
     for dir in [&hub, &swe] {

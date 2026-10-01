@@ -27,6 +27,10 @@ pub enum RegistryStatus {
     Reviewing,
     Completed,
     Failed,
+    /// The worker ran out of turns before it completed. Terminal and
+    /// continuable: its branch is checkpointed, but it must not be integrated
+    /// as a finished contribution.
+    Exhausted,
     Stopped,
     /// A hub crash interrupted a live worker. Terminal for listing -- its
     /// uptime is frozen -- but continuable: its branch and its conversation
@@ -39,7 +43,7 @@ impl RegistryStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Stopped | Self::Interrupted
+            Self::Completed | Self::Failed | Self::Exhausted | Self::Stopped | Self::Interrupted
         )
     }
 
@@ -56,6 +60,7 @@ impl RegistryStatus {
             Self::Reviewing => "Reviewing",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
+            Self::Exhausted => "Exhausted",
             Self::Stopped => "Stopped",
             Self::Interrupted => "Interrupted",
         }
@@ -133,6 +138,11 @@ pub struct WorkerRegistryEntry {
     /// Base commit the worker branched from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// Commit `worker-<id>` pointed at when the run finished, recorded so a
+    /// continuation can recreate the branch after a merge pruned it (see the
+    /// retired grace period). `None` on a row written before head tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
     /// How many revisions this worker has run. `0` on a row written before
     /// revisions were counted.
     #[serde(default)]
@@ -151,6 +161,12 @@ pub struct WorkerRegistryEntry {
     /// is unreviewed. Persisted so it survives the in-memory eviction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<WorkerApproval>,
+    /// Whether the completion passed its verify gate. Written with the terminal
+    /// row and cleared when a revision restarts the worker, so a view built
+    /// from the row alone still reports it. `#[serde(default)]` keeps a row
+    /// written before the flag was recorded readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -185,6 +201,9 @@ pub struct WorkerMeta {
     /// The completion report, set by the phase loop once the worker has
     /// finished and written with the terminal row.
     pub report: Option<WorkerReport>,
+    /// Whether the completion passed its verify gate, written with the
+    /// terminal row so the row carries the same verdict as the report.
+    pub verified: Option<bool>,
 }
 
 impl WorkerMeta {
@@ -221,10 +240,12 @@ impl WorkerMeta {
             metrics: self.metrics,
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
             report: self.report.clone(),
             approved: None,
+            verified: self.verified,
         }
     }
 
@@ -699,10 +720,12 @@ mod recovery_cleanup_tests {
             metrics: WorkerMetrics::default(),
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         }
     }
 

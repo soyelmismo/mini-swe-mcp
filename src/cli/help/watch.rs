@@ -1,0 +1,27 @@
+/// `watch`: the process that wakes the orchestrator when a worker needs it.
+pub(super) const TEXT: &str = "Run `mini-swe-mcp watch` exactly as printed, using the host's own background mechanism (e.g. a background shell task) - no redirection, no trailing `&`, no wrapper: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, and the host wakes you with the finished task's output; missed events are replayed first. After every event, run it again. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::help::topic_text;
+    /// `watch` carries the shell-less wait contract: the background command,
+    /// the `timeout_secs`/`no_event` fallback, and the channel push.
+    #[test]
+    fn watch_topic_teaches_the_mcp_wait() {
+        let text = topic_text("watch").expect("watch topic");
+        for needle in [
+            "mini-swe-mcp watch",
+            "background shell task",
+            "no redirection",
+            "run it again",
+            "timeout_secs",
+            "no_event",
+            "push notifications",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the watch topic must mention {needle}: {text}"
+            );
+        }
+    }
+}

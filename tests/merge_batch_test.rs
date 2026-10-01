@@ -114,8 +114,10 @@ impl Fixture {
             metrics: Default::default(),
             base_branch: Some("main".to_string()),
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }
@@ -196,6 +198,16 @@ impl Fixture {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // The batch gate runs in `<scratch>/swe-merge-approved`, and the
+        // executor files its private scratch beside the short scratch root as
+        // `swe-tmp-swe-merge-approved`; reclaiming under the injected scratch
+        // root alone never sees it, so remove it with the product helper.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.scratch.path().join("swe-merge-approved"));
     }
 }
 
@@ -618,8 +630,10 @@ fn workers_of_two_repositories_are_refused() {
         metrics: Default::default(),
         base_branch: Some("main".to_string()),
         base_commit: None,
+        head_commit: None,
         revision: 0,
         auto_continues: 0,
+        verified: None,
     };
     save_registry_entry_in(&f.root(), &entry);
 

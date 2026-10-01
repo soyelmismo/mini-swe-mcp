@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{ChatMessage, Role};
 
-use super::state::retention_expired;
+use super::state::{retention_expired, within_retired_grace};
 use super::steer::remove_steer_file_in;
 
 /// Prefix of the user message a revision appends after the reloaded history.
@@ -469,6 +469,9 @@ pub fn retire_worker(worker_id: &str) {
 /// The one deletion path, so a row can never outlive the conversation it names
 /// (or the other way round) and leave a half-known worker behind.
 pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
+    for suffix in ["steer-source", "round-base"] {
+        let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
+    }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
     super::remove_registry_entry_in(root, worker_id);
@@ -500,7 +503,10 @@ pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u6
 /// A finished worker has no worktree left, so the worktree sweep of `prune`
 /// never reaches its history file; this is the sweep that does. A worker whose
 /// branch survives is kept unless its retention expired, so a finished worker
-/// stays continuable for as long as its branch does.
+/// stays continuable for as long as its branch does. One whose branch is gone
+/// is kept through its retired grace period (see
+/// [`super::state::DEFAULT_WORKER_RETIRED_GRACE_SECS`]) so an orchestrator that
+/// reverts the merge can still continue it.
 pub fn prune_orphan_histories(repo_root: &Path) -> usize {
     prune_orphan_histories_in(&ScratchRoot::from_env(), repo_root)
 }
@@ -516,10 +522,36 @@ pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize 
 
 /// [`prune_orphan_histories_in`] with an explicit retention, so a caller (or a
 /// test) can name the age instead of reading the environment.
+///
+/// The retired grace is still read from the environment; use
+/// [`prune_orphan_histories_with_retention_and_grace_in`] to name both.
 pub fn prune_orphan_histories_with_retention_in(
     root: &ScratchRoot,
     repo_root: &Path,
     retention_secs: u64,
+) -> usize {
+    prune_orphan_histories_with_retention_and_grace_in(
+        root,
+        repo_root,
+        retention_secs,
+        super::state::worker_retired_grace_secs(),
+    )
+}
+
+/// [`prune_orphan_histories_with_retention_in`] with an explicit retired grace
+/// too, so a caller (or a test) can name both ages instead of reading the
+/// environment.
+///
+/// A worker whose branch is gone keeps its registry row and conversation for
+/// `grace_secs` after its row was last written, because the merge that pruned
+/// the branch may still be reverted and the worker continued. Without a row
+/// there is nothing to recreate the branch from, so the conversation is
+/// retired at once.
+pub fn prune_orphan_histories_with_retention_and_grace_in(
+    root: &ScratchRoot,
+    repo_root: &Path,
+    retention_secs: u64,
+    grace_secs: u64,
 ) -> usize {
     /// The two fields the sweep needs, without parsing the conversation.
     #[derive(Deserialize)]
@@ -568,11 +600,17 @@ pub fn prune_orphan_histories_with_retention_in(
                 &["rev-parse", "--verify", "--quiet", &reference],
             )
             .is_ok_and(|out| out.status.success());
-            // The branch is gone, or it outlived its retention: either way the
-            // worker cannot be continued any more, so the whole trace goes.
-            let expired = super::load_registry_entry_in(root, id)
-                .is_some_and(|entry| retention_expired(entry.updated_at, retention_secs, now));
-            if !branch_exists || expired {
+            let entry = super::load_registry_entry_in(root, id);
+            // The branch outlived its retention, or it is gone with nothing
+            // left to recreate it from, or its grace has run out: either way
+            // the worker cannot be continued any more and the whole trace goes.
+            let expired = entry
+                .as_ref()
+                .is_some_and(|e| retention_expired(e.updated_at, retention_secs, now));
+            let kept_through_grace = entry
+                .as_ref()
+                .is_some_and(|e| within_retired_grace(e.updated_at, grace_secs, now));
+            if expired || (!branch_exists && !kept_through_grace) {
                 retire_worker_in(root, id);
                 removed += 1;
             }
@@ -691,13 +729,104 @@ impl super::WorkerPool {
         .await;
     }
 
+    /// Record the branch head commit of a finished run on the registry row.
+    ///
+    /// A continuation recreates `worker-<id>` from this commit after a merge
+    /// pruned the branch (within the retired grace period), so the row must
+    /// name where the branch ended. Written at completion; rewritten when a
+    /// later run finishes on a new commit.
+    pub(crate) async fn record_head_commit(&self, id: &str, head_commit: Option<String>) {
+        let Some(head_commit) = head_commit else {
+            return;
+        };
+        let id = id.to_string();
+        let root = self.scratch.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut entry) = super::load_registry_entry_in(&root, &id) else {
+                return;
+            };
+            if entry.head_commit.as_deref() == Some(head_commit.as_str()) {
+                return;
+            }
+            entry.head_commit = Some(head_commit);
+            super::save_registry_entry_in(&root, &entry);
+        })
+        .await;
+    }
+
+    /// Make sure `branch` exists before a continuation relaunches on it.
+    ///
+    /// A merged worker's branch is pruned, but its row and conversation are
+    /// kept through the retired grace period. When the branch is gone, recreate
+    /// it at the head commit the row recorded at completion, so the
+    /// continuation keeps the worker's work instead of failing. The error names
+    /// the branch when there is nothing to recreate it from.
+    async fn ensure_worker_branch(
+        &self,
+        id: &str,
+        repo_path: &std::path::Path,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        if Self::worker_branch_exists(repo_path, branch).await {
+            return Ok(());
+        }
+        let Some(head_commit) =
+            super::load_registry_entry_in(&self.scratch, id).and_then(|entry| entry.head_commit)
+        else {
+            anyhow::bail!(
+                "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
+            );
+        };
+        let repo = repo_path.to_path_buf();
+        let branch_for_git = branch.to_string();
+        let head = head_commit.clone();
+        let recreated = tokio::task::spawn_blocking(move || {
+            crate::worktree::git(&repo, "branch", &["branch", &branch_for_git, &head])
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        if !recreated {
+            anyhow::bail!(
+                "Worker branch {branch} no longer exists and could not be recreated from commit {head_commit}; the finished worker {id} cannot be revised"
+            );
+        }
+        tracing::info!(
+            worker = %id,
+            branch = %branch,
+            commit = %head_commit,
+            "Recreated a pruned worker branch from its recorded head"
+        );
+        Ok(())
+    }
+
+    /// Whether `refs/heads/{branch}` exists (the blocking git runs off the
+    /// runtime).
+    async fn worker_branch_exists(repo_path: &std::path::Path, branch: &str) -> bool {
+        let repo = repo_path.to_path_buf();
+        let reference = format!("refs/heads/{branch}");
+        tokio::task::spawn_blocking(move || {
+            crate::worktree::git(
+                &repo,
+                "show-ref",
+                &["show-ref", "--verify", "--quiet", &reference],
+            )
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Continue a worker with no surviving conversation: same id, same branch,
     /// a fresh conversation built from the registry row.
     ///
     /// The registry row still names the task, the model and the branch, so the
     /// fresh conversation is the system prompt, the original task, a note that
     /// the branch already holds the previous attempt's work, and the steer
-    /// message. Only a missing branch is an error.
+    /// message. A branch pruned after a merge is recreated from the head
+    /// commit the row recorded.
     async fn cold_continue(
         &self,
         id: &str,
@@ -718,26 +847,9 @@ impl super::WorkerPool {
                 format!("Repository of worker {id} no longer exists; it cannot be continued")
             })?;
         let branch = format!("worker-{id}");
-        // Fail fast when the branch is gone, before anything is relaunched:
-        // this is the one condition a continuation cannot work around.
-        {
-            let repo = repo_path.clone();
-            let reference = format!("refs/heads/{branch}");
-            let exists = tokio::task::spawn_blocking(move || {
-                crate::worktree::git(
-                    &repo,
-                    "show-ref",
-                    &["show-ref", "--verify", "--quiet", &reference],
-                )
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if !exists {
-                anyhow::bail!("branch {branch} no longer exists");
-            }
-        }
+        // The branch may have been pruned after a merge; recreate it from the
+        // row's recorded head before anything is relaunched.
+        self.ensure_worker_branch(id, &repo_path, &branch).await?;
 
         let max_turns = revision_turns.unwrap_or(super::DEFAULT_REVISION_TURNS);
         if max_turns == 0 {
@@ -864,34 +976,10 @@ impl super::WorkerPool {
                 history.repo_path
             );
         }
-        // Fail fast when the reviewed branch is gone, before the record is
-        // touched: the error names the branch, not just the worker.
-        {
-            let branch = history.branch.clone();
-            let repo = repo_path.clone();
-            let exists = tokio::task::spawn_blocking(move || {
-                crate::worktree::git(
-                    &repo,
-                    "show-ref",
-                    &[
-                        "show-ref",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/{branch}"),
-                    ],
-                )
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if !exists {
-                anyhow::bail!(
-                    "Worker branch {} no longer exists; the finished worker {id} cannot be revised",
-                    history.branch
-                );
-            }
-        }
+        // The branch may have been pruned after a merge; recreate it from the
+        // row's recorded head before the record is touched.
+        self.ensure_worker_branch(id, &repo_path, &history.branch)
+            .await?;
 
         if !prefix.is_empty() {
             history.messages.push(ChatMessage::text(
@@ -1025,6 +1113,7 @@ impl super::WorkerPool {
             metrics: super::WorkerMetrics::default(),
             base_branch: history.base_branch.clone(),
             base_commit: Some(history.base_commit.clone()),
+            head_commit: None,
             revision,
             auto_continues: history.auto_continues,
             owner: Some(owner.clone()),
@@ -1032,6 +1121,7 @@ impl super::WorkerPool {
             // A revision changes the branch, so the previous review no longer
             // applies: drop any approval this row carried.
             approved: None,
+            verified: None,
         };
 
         let pool = self.clone();
@@ -1051,6 +1141,7 @@ impl super::WorkerPool {
             auto_continues: history.auto_continues,
             owner,
             report: None,
+            verified: None,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {

@@ -36,7 +36,7 @@ use self::turn::{
 };
 use super::registry::{RegistryStatus, WorkerMeta};
 use super::revision::{WorkerHistory, append_history_message_in};
-use super::state::WorkerState;
+use super::state::{TURN_BUDGET_EXHAUSTED, WorkerState};
 use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
@@ -215,17 +215,41 @@ impl WorkerPool {
         let repo_path_owned = repo_path.clone();
         let worker_id_owned = worker_id.clone();
         let scratch = self.scratch.clone();
-        let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
-            Some(base) => {
-                let mut guard =
-                    WorktreeGuard::reopen_in(&scratch, &repo_path_owned, &worker_id_owned, base)?;
-                guard.base_branch = resume_base_branch;
-                Ok(guard)
-            }
-            None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned),
-        })
-        .await
-        .context("Worktree checkout task failed")??;
+        let round_base =
+            super::steer::read_source(&scratch, &worker_id).and_then(|source| source.round_base);
+        let (mut worktree, initial_sync) =
+            tokio::task::spawn_blocking(move || match &resume_base_commit {
+                Some(base) => {
+                    let mut guard = WorktreeGuard::reopen_in(
+                        &scratch,
+                        &repo_path_owned,
+                        &worker_id_owned,
+                        base,
+                    )?;
+                    guard.base_branch = resume_base_branch;
+                    let sync = match round_base {
+                        Some(base) => WorktreeGuard::sync_round_base_at(
+                            &guard.path,
+                            &guard.repo_root,
+                            &guard.branch,
+                            &guard.base_commit,
+                            &base,
+                        ),
+                        None => WorktreeGuard::sync_base_at(
+                            &guard.path,
+                            &guard.repo_root,
+                            &guard.branch,
+                            &guard.base_commit,
+                            guard.base_branch.as_deref(),
+                        ),
+                    }?;
+                    Ok((guard, sync))
+                }
+                None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned)
+                    .map(|guard| (guard, crate::worktree::BaseSync::Unchanged)),
+            })
+            .await
+            .context("Worktree checkout task failed")??;
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -285,6 +309,18 @@ impl WorkerPool {
                 error = %e,
                 "Could not persist the worker conversation; this worker can no longer be revised"
             );
+        }
+
+        if let crate::worktree::BaseSync::Conflicts { branch, files } = initial_sync {
+            let notice = ChatMessage::text(
+                Role::User,
+                format!(
+                    "BASE INTEGRATION pending with {branch}. Remaining conflicted files: {}. Resolve the markers and request completion; the harness will re-check them.",
+                    files.join(", ")
+                ),
+            );
+            append_history_message_in(&self.scratch, &worker_id, &opening_meta, &notice)?;
+            messages.push(notice);
         }
 
         // The conversation is durable one line per message (see
@@ -369,11 +405,15 @@ impl WorkerPool {
         let mut last_assistant_text = String::new();
         let mut watch = ProgressWatch::default();
         let mut verified: Option<bool> = None;
+        // Whether the implementer's loop ended on the completion sentinel
+        // rather than by running out of turns.
+        let mut completed = false;
         // The completion report and the one follow-up it may cost live across
         // turns: a verify failure replays the completion turn, and the report
         // the worker already wrote must survive that replay.
         let mut report: Option<crate::pool::WorkerReport> = None;
         let mut report_asked = false;
+        let mut report_text = String::new();
 
         while step < current_max_turns {
             step += 1;
@@ -409,6 +449,7 @@ impl WorkerPool {
                 watch: &mut watch,
                 report: &mut report,
                 report_asked: &mut report_asked,
+                report_text: &mut report_text,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
@@ -416,6 +457,7 @@ impl WorkerPool {
                     // disclosure note here, and a crash must not lose it.
                     engine.flush_history_log(&turn_config).await;
                     verified = v;
+                    completed = true;
                     break;
                 }
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
@@ -430,7 +472,7 @@ impl WorkerPool {
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
         if let Some(reviewer_model) = review_after {
-            step = self
+            let outcome = self
                 .run_review_phase(
                     worktree,
                     ReviewPhase {
@@ -447,6 +489,10 @@ impl WorkerPool {
                     },
                 )
                 .await?;
+            step = outcome.step;
+            // The reviewer's own completion stands in for the implementer's:
+            // a run is finished only when some phase emitted the sentinel.
+            completed |= outcome.completed;
         }
 
         // The artifact sync, the final diff and the final commit all shell
@@ -475,21 +521,22 @@ impl WorkerPool {
         let metrics_path = path.clone();
         let metrics_base = base_commit.clone();
         let metrics_base_branch = base_branch.clone();
-        let (artifacts, diff, summary, branch, now) = tokio::task::spawn_blocking(move || {
-            finalize_worktree(FinalizeInput {
-                path,
-                repo_root,
-                base_commit,
-                base_branch,
-                branch,
-                seeded,
-                task_headline,
-                agent_summary,
-                step,
+        let (artifacts, diff, summary, branch, head_commit, now) =
+            tokio::task::spawn_blocking(move || {
+                finalize_worktree(FinalizeInput {
+                    path,
+                    repo_root,
+                    base_commit,
+                    base_branch,
+                    branch,
+                    seeded,
+                    task_headline,
+                    agent_summary,
+                    step,
+                })
             })
-        })
-        .await
-        .context("Worktree finalization task failed")??;
+            .await
+            .context("Worktree finalization task failed")??;
         worktree.preserve_branch = worktree.preserve_branch || branch.is_some();
         if !artifacts.is_empty() {
             info!(
@@ -511,6 +558,62 @@ impl WorkerPool {
             meta.metrics.diff_deletions = deletions;
         }
 
+        // The payload (diff/summary/artifacts/branch) is assembled *before* the
+        // write-guard is taken: the critical section only performs the O(1)
+        // move of the pre-built value into the record. The revision that
+        // produced it rides along: a fresh dispatch is at zero, a revised
+        // worker at its attempt number.
+        let revision = self
+            .workers
+            .read()
+            .await
+            .get(worker_id)
+            .map(|w| w.revision)
+            .unwrap_or(0);
+
+        if !completed {
+            // The turn budget ran out before any phase emitted the completion
+            // sentinel. The work is checkpointed on the branch exactly like a
+            // completion, but the run is stopped, not done, and never verified.
+            let summary = if summary.trim().is_empty() {
+                format!("Stopped after {step} turns: {TURN_BUDGET_EXHAUSTED} before completion")
+            } else {
+                format!(
+                    "{summary}\n\nStopped after {step} turns: {TURN_BUDGET_EXHAUSTED} before completion"
+                )
+            };
+            let exhausted_state = WorkerState::Exhausted {
+                turns: step,
+                diff,
+                summary,
+                stopped_at: now,
+                artifacts,
+                branch,
+                metrics: meta.metrics,
+                revision,
+                report: report.clone(),
+            };
+            self.update_worker(worker_id, |w| w.state = exhausted_state)
+                .await;
+            meta.report = report;
+            self.save_status(
+                meta,
+                &model,
+                RegistryStatus::Exhausted,
+                step,
+                current_max_turns,
+                TURN_BUDGET_EXHAUSTED,
+                None,
+            );
+            self.unregister_worktree(worker_id).await;
+            info!(
+                worker = %worker_id,
+                turns = step,
+                "Worker exhausted its turn budget without completing"
+            );
+            return Ok(());
+        }
+
         // A worker that exhausted its verification budget completes anyway but
         // is flagged: both the completion summary and the registry last_command
         // must say so, so the harness never mistakes it for a clean pass.
@@ -523,18 +626,6 @@ impl WorkerPool {
             (summary, "completed".to_string())
         };
 
-        // The completion payload (diff/summary/artifacts/branch) is assembled
-        // *before* the write-guard is taken: the critical section only performs
-        // the O(1) move of the pre-built value into the record.
-        // The completion carries the revision that produced it: a fresh
-        // dispatch completes at zero, a revised worker at its attempt number.
-        let revision = self
-            .workers
-            .read()
-            .await
-            .get(worker_id)
-            .map(|w| w.revision)
-            .unwrap_or(0);
         let completed_state = WorkerState::Completed {
             turns: step,
             diff,
@@ -550,9 +641,11 @@ impl WorkerPool {
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
 
-        // The report travels with the meta so the terminal row carries it: the
-        // in-memory record is evicted after its TTL, the row is not.
+        // The report and its verification verdict travel with the meta so the
+        // terminal row carries them: the in-memory record is evicted after its
+        // TTL, the row is not.
         meta.report = report;
+        meta.verified = verified;
         self.save_status(
             meta,
             &model,
@@ -562,6 +655,9 @@ impl WorkerPool {
             &last_command,
             None,
         );
+        // Remember where the branch ended, so a continuation can recreate it
+        // after a merge prunes it within the retired grace period.
+        self.record_head_commit(worker_id, head_commit).await;
 
         self.unregister_worktree(worker_id).await;
         info!(worker = %worker_id, turns = step, "Worker completed successfully");
@@ -587,8 +683,16 @@ struct FinalizeInput {
 ///
 /// The worker's finished output: synced artifacts, final diff, completion
 /// summary, the branch the commit landed on (`None` when there was nothing to
-/// commit) and the completion timestamp.
-type FinalizedWork = (Vec<String>, String, String, Option<String>, u64);
+/// commit), the head commit of that branch (`None` alongside a missing branch)
+/// and the completion timestamp.
+type FinalizedWork = (
+    Vec<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    u64,
+);
 
 /// Sync the worker's artifacts, take its final diff and commit it.
 fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
@@ -640,5 +744,23 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
         let commit_msg = format!("worker({branch}): {clean_subject}");
         WorktreeGuard::commit_changes_at(&path, &repo_root, &branch, &base_commit, &commit_msg)?
     };
-    Ok((artifacts, diff, summary, committed, unix_timestamp()))
+    let head_commit = committed.as_ref().and_then(|branch| {
+        crate::worktree::git(
+            &repo_root,
+            "rev-parse",
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|sha| !sha.is_empty())
+    });
+    Ok((
+        artifacts,
+        diff,
+        summary,
+        committed,
+        head_commit,
+        unix_timestamp(),
+    ))
 }

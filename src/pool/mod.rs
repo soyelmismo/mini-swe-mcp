@@ -74,9 +74,9 @@ pub use self::revision::{
     history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
-    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, save_worker_history,
-    save_worker_history_in,
+    prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
+    remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
+    retire_worker, retire_worker_in, save_worker_history, save_worker_history_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
@@ -88,10 +88,12 @@ pub use self::runner::{
     parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat,
-    TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord,
-    WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
-    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
+    DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED,
+    WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport,
+    WorkerState, churn_line, diff_sections_of, file_stats_of_diff, normalize_diff_path,
+    retention_expired, same_diff_path, terminal_retention_secs, within_retired_grace,
+    worker_retired_grace_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -166,10 +168,38 @@ pub fn next_step_for(branch: Option<&str>) -> String {
     }
 }
 
+/// Guidance for a worker that spent its whole turn budget without completing.
+///
+/// Distinct from [`next_step_for`]: the branch is checkpointed exactly like a
+/// completion, but the worker is stopped, not done, so the only next action is
+/// to continue it with a fresh budget rather than to review and merge it.
+pub fn exhausted_next_step(id: &str, turns: usize, branch: Option<&str>) -> String {
+    let on = branch
+        .map(|branch| format!(" on branch {branch}"))
+        .unwrap_or_default();
+    format!(
+        "Stopped, not done: it spent its {}-turn budget without completing{on}. \
+         Its work is checkpointed. Continue it with a fresh budget: {}",
+        turns.max(1),
+        exhausted_continue_command(id, turns),
+    )
+}
+
+/// The command that continues a worker whose turn budget ran out: the same
+/// branch, the same conversation, a fresh budget.
+pub fn exhausted_continue_command(id: &str, turns: usize) -> String {
+    format!(
+        "mini-swe-mcp steer {id} \"continue\" --max-turns {}",
+        turns.max(1)
+    )
+}
+
 /// The branch a terminal [`WorkerState`] finished on, if it kept one.
 pub fn terminal_branch(state: &WorkerState) -> Option<String> {
     match state {
-        WorkerState::Completed { branch, .. } => branch.clone(),
+        WorkerState::Completed { branch, .. } | WorkerState::Exhausted { branch, .. } => {
+            branch.clone()
+        }
         WorkerState::Running { .. } | WorkerState::Paused { .. } | WorkerState::Failed { .. } => {
             None
         }
@@ -682,6 +712,7 @@ impl WorkerPool {
             revision: 0,
             auto_continues: 0,
             report: None,
+            verified: None,
         };
 
         let initial_record = WorkerRecord {
@@ -704,6 +735,21 @@ impl WorkerPool {
             revision: 0,
         };
 
+        if role == WorkerRole::Consolidate {
+            let repo = repo_path.clone();
+            let base = tokio::task::spawn_blocking(move || {
+                crate::worktree::git(&repo, "record round base", &["rev-parse", "HEAD"])
+            })
+            .await??;
+            anyhow::ensure!(
+                base.status.success(),
+                "Cannot record consolidator round base"
+            );
+            std::fs::write(
+                self.scratch.join(format!("swe-wt-{worker_id}.round-base")),
+                base.stdout,
+            )?;
+        }
         self.save_status(
             &meta,
             &model,
@@ -933,6 +979,15 @@ impl WorkerPool {
                 command_started_at: None,
                 jobs: Vec::new(),
             },
+            WorkerState::Exhausted { turns, .. } => WorkerProgress {
+                phase: WorkerPhase::Exhausted,
+                step: *turns,
+                last_command: None,
+                question: None,
+                waiting_for_slot: None,
+                command_started_at: None,
+                jobs: Vec::new(),
+            },
         };
         drop(lock);
         Some(progress)
@@ -1023,6 +1078,7 @@ impl WorkerPool {
                     "started_at": e.started_at,
                 },
                 "total_steps": e.step,
+                "verified": e.verified,
                 "approved": e.approved,
                 // Registry rows are cross-process and carry no in-memory log
                 // buffer, so the retention counters are reported as 0/0 rather
@@ -1132,8 +1188,8 @@ impl WorkerPool {
     /// [`round::build`] probes the repository with. The registry is the only
     /// cross-process record of a group, so a worker this process never
     /// dispatched (a hub restart, another connection) is still listed; the
-    /// in-process state is consulted only for the verification outcome, which
-    /// no registry row carries.
+    /// verification outcome comes from the in-process state when this process
+    /// still holds it and from the row's persisted copy otherwise.
     ///
     /// `repo` is the repository the dispatch will run in, used when the rows
     /// name none.
@@ -1161,9 +1217,11 @@ impl WorkerPool {
             if base_hint.is_none() {
                 base_hint = entry.base_branch.clone();
             }
+            // The completion write persists the verdict on the row, so a
+            // worker whose record this process no longer holds still says it.
             let verified = match self.get_worker_state(&entry.id).await {
-                Some(WorkerState::Completed { verified, .. }) => verified,
-                _ => None,
+                Some(WorkerState::Completed { verified, .. }) => verified.or(entry.verified),
+                _ => entry.verified,
             };
             rows.push(RoundRow {
                 id: entry.id,
@@ -1276,7 +1334,20 @@ impl WorkerPool {
         if let Err(reason) = check_consolidate_delegation(actor, &entry) {
             return format!("{id} refused: {reason}");
         }
-        match self.steer_relaunchable(&target, message).await {
+        let round_base =
+            std::fs::read_to_string(self.scratch.join(format!("swe-wt-{}.round-base", actor.id)))
+                .ok()
+                .map(|base| base.trim().to_string())
+                .or_else(|| {
+                    load_worker_history_in(&self.scratch, &actor.id)
+                        .ok()
+                        .map(|h| h.base_commit)
+                });
+        let source = steer::SteerSource {
+            consolidator: actor.id.clone(),
+            round_base,
+        };
+        match self.steer_relaunchable(&target, message, source).await {
             Ok(outcome) => format!(
                 "{target} {} (revision {})",
                 outcome.verb(),
@@ -1373,8 +1444,8 @@ impl WorkerPool {
             .is_some_and(|e| e.status.is_terminal() || e.status == RegistryStatus::Paused)
     }
 
-    /// One compact line for a waited-on worker: its state, whether it verified
-    /// its work, and the one-line error or question that stopped it.
+    /// A waited-on worker's state, verification flag, and stop reason.
+    /// Paused workers carry the full question and the verb that answers it.
     ///
     /// The live record carries the `verified` flag; a worker that survives only
     /// as a registry row reports its status alone.
@@ -1386,12 +1457,15 @@ impl WorkerPool {
                 }
                 WorkerState::Running { .. } => format!("{id} running"),
                 WorkerState::Paused { question, .. } => {
-                    format!("{id} paused: {}", stop_reason(question))
+                    format!("{id} paused: {question}\nanswer it with CONSOLIDATE_STEER")
                 }
                 WorkerState::Completed { verified, .. } => {
                     format!("{id} completed {}", verified_label(*verified))
                 }
                 WorkerState::Failed { error, .. } => format!("{id} failed: {}", stop_reason(error)),
+                WorkerState::Exhausted { turns, .. } => format!(
+                    "{id} exhausted: turn budget of {turns} spent without completing; {TURN_BUDGET_EXHAUSTED}"
+                ),
             };
         }
         let Some(entry) = load_registry_entry_in(&self.scratch, id) else {
@@ -1401,8 +1475,8 @@ impl WorkerPool {
         match entry.status {
             RegistryStatus::Failed => format!("{id} failed: {}", stop_reason(&entry.last_command)),
             RegistryStatus::Paused => format!(
-                "{id} paused: {}",
-                stop_reason(entry.question.as_deref().unwrap_or_default())
+                "{id} paused: {}\nanswer it with CONSOLIDATE_STEER",
+                entry.question.as_deref().unwrap_or_default()
             ),
             RegistryStatus::Running | RegistryStatus::Reviewing if timed_out => {
                 format!("{id} {status} (still running after {timeout_secs}s)")
@@ -1583,8 +1657,9 @@ impl WorkerPool {
         &'a self,
         id: &'a str,
         message: String,
+        source: steer::SteerSource,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<SteerOutcome>> + Send + 'a>> {
-        Box::pin(self.steer(id, message))
+        Box::pin(self.steer_from(id, message, None, Some(source)))
     }
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
@@ -1595,6 +1670,38 @@ impl WorkerPool {
     /// worker was `Queued` or `Resumed`, a stopped one was `Continuing` -- as
     /// a revision of its saved conversation, or cold when none survived.
     pub async fn steer_with_budget(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> Result<SteerOutcome> {
+        self.steer_from(id, message, revision_turns, None).await
+    }
+
+    async fn steer_from(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+        source: Option<steer::SteerSource>,
+    ) -> Result<SteerOutcome> {
+        // Record before delivery: the resumed worker can immediately pause again.
+        let previous = steer::read_source(&self.scratch, id);
+        steer::write_source(&self.scratch, id, source.as_ref())?;
+        let result = self.deliver_steer(id, message, revision_turns).await;
+        if result.is_err() {
+            steer::write_source(&self.scratch, id, previous.as_ref())?;
+        }
+        self.notify_change();
+        result
+    }
+
+    /// Whether a paused worker's answer belongs to its last steering consolidator.
+    pub fn question_for_consolidator(&self, id: &str) -> bool {
+        steer::read_source(&self.scratch, id).is_some()
+    }
+
+    async fn deliver_steer(
         &self,
         id: &str,
         message: String,
@@ -1632,7 +1739,9 @@ impl WorkerPool {
                     return Ok(SteerOutcome::Queued);
                 }
                 WorkerState::Paused { .. } => w.resume_tx.take(),
-                WorkerState::Completed { .. } | WorkerState::Failed { .. } => {
+                WorkerState::Completed { .. }
+                | WorkerState::Failed { .. }
+                | WorkerState::Exhausted { .. } => {
                     // A finished worker cannot be resumed mid-turn -- it has no
                     // turn left -- so the message continues it below, outside
                     // the guard.
@@ -1651,7 +1760,9 @@ impl WorkerPool {
         };
         // Send without holding the lock: the worker needs the write-guard to
         // transition back to `Running` right after `rx.recv().await`.
-        let _ = tx.send(message).await;
+        tx.send(message)
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker {id} resume channel closed"))?;
         Ok(SteerOutcome::Resumed)
     }
 
@@ -2001,7 +2112,18 @@ impl WorkerPool {
                 completed_at: entry.updated_at,
                 artifacts: Vec::new(),
                 branch: Some(format!("worker-{id}")),
-                verified: None,
+                verified: entry.verified,
+                metrics: entry.metrics,
+                revision: entry.revision,
+                report: entry.report.clone(),
+            },
+            RegistryStatus::Exhausted => WorkerState::Exhausted {
+                turns: entry.step,
+                diff: String::new(),
+                summary: entry.last_command.clone(),
+                stopped_at: entry.updated_at,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
                 metrics: entry.metrics,
                 revision: entry.revision,
                 report: entry.report.clone(),
@@ -2264,6 +2386,7 @@ mod consolidate_delegation_tests {
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
             report: None,
+            verified: None,
         }
     }
 
@@ -2288,10 +2411,12 @@ mod consolidate_delegation_tests {
             metrics: WorkerMetrics::default(),
             base_branch: None,
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             report: None,
             approved: None,
+            verified: None,
         }
     }
 

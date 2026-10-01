@@ -14,7 +14,9 @@
 //! counter: a command byte-identical to the previous turn's is answered
 //! instead of re-run (and three of those in a row park the worker on the
 //! orchestrator), a worktree that stops changing gets a "make the edit or
-//! escalate" nudge, `REQUEST_TURNS` may only add half the dispatch's budget,
+//! escalate" nudge -- earned earlier, once and never fatally, by a worker whose
+//! dispatch already named the files to edit and that only reads anyway --
+//! `REQUEST_TURNS` may only add half the dispatch's budget,
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
 
@@ -40,9 +42,10 @@ use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
-    parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
-    parse_report, parse_request_turns, parse_wait_job, summarize_command,
+    COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
+    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+    parse_consolidate_wait, parse_kill_job, parse_report, parse_request_turns, parse_wait_job,
+    summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -59,11 +62,28 @@ pub(super) const NO_COMMAND_NUDGE: &str =
 /// or a crash is never more than this old.
 const AUTO_CHECKPOINT_TURNS: usize = 20;
 
+/// Cap on the assistant text scanned for a REPORT block. A block is at most the
+/// four [`REPORT_FIELD_BYTES`] fields plus the command that carries it, so the
+/// newest slice always holds a whole block while a worker that never writes one
+/// cannot grow the scan buffer past this bound.
+const REPORT_SCAN_BYTES: usize = REPORT_FIELD_BYTES * 5;
+
 /// Turns between repository samples of the stagnation detector.
 const STAGNATION_SAMPLE_TURNS: usize = 10;
 
 /// Turns without a repository change that force the "stop exploring" nudge.
 const STAGNATION_TURNS_LIMIT: usize = 30;
+
+/// Consecutive read-only turns after which a dispatch that already names a
+/// file to edit is told to write that edit instead of reading one more file.
+const READ_ONLY_NUDGE_TURNS: usize = 15;
+
+/// Environment override of the first read-only nudge threshold, in turns.
+const READ_ONLY_NUDGE_ENV: &str = "POOL_READ_ONLY_NUDGE_TURNS";
+
+/// Environment override of the read-only escalation threshold; defaults to
+/// twice the first threshold.
+const READ_ONLY_ESCALATE_ENV: &str = "POOL_READ_ONLY_ESCALATE_TURNS";
 
 /// Consecutive blocked repetitions of one command before the worker is parked
 /// on the orchestrator instead of being told to try something else.
@@ -77,6 +97,163 @@ const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has
 fn stagnation_nudge() -> String {
     format!(
         "No change to the repository in the last {STAGNATION_TURNS_LIMIT} turns. Stop exploring: make the edit, or ASK_ORCHESTRATOR if blocked."
+    )
+}
+
+/// Thresholds of the read-only detector: the consecutive read-only turns that
+/// earn the first nudge and the turns that earn its single escalation.
+#[derive(Debug, Clone, Copy)]
+struct ReadOnlyThresholds {
+    /// Consecutive read-only turns before the first "write the edit now" nudge.
+    first: usize,
+    /// Consecutive read-only turns before the one escalation of that streak.
+    escalate: usize,
+}
+
+/// The read-only detector's defaults: the first nudge at
+/// [`READ_ONLY_NUDGE_TURNS`] and its escalation at twice that.
+fn named_file_defaults() -> ReadOnlyThresholds {
+    ReadOnlyThresholds {
+        first: READ_ONLY_NUDGE_TURNS,
+        escalate: READ_ONLY_NUDGE_TURNS.saturating_mul(2),
+    }
+}
+
+/// Read-only thresholds for `task`, or `None` when the dispatch names no file:
+/// a worker that still has to find the code is exploring, and the stagnation
+/// detector keeps its existing timing for it.
+///
+/// The thresholds themselves are overridable through the environment, so the
+/// read-only budget can be tuned without a rebuild.
+fn read_only_thresholds(task: &str) -> Option<ReadOnlyThresholds> {
+    if !task_names_files(task) {
+        return None;
+    }
+    let defaults = named_file_defaults();
+    Some(ReadOnlyThresholds {
+        first: env_threshold(READ_ONLY_NUDGE_ENV).unwrap_or(defaults.first),
+        escalate: env_threshold(READ_ONLY_ESCALATE_ENV).unwrap_or(defaults.escalate),
+    })
+}
+
+/// Parse an environment override: a positive turn count, or `None` for an
+/// unset, unparsable or zero value, so a bad override keeps the default rather
+/// than nudging a worker on its first turn.
+fn parse_threshold(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|turns| *turns > 0)
+}
+
+/// The environment override `name`, when it holds a usable turn count.
+fn env_threshold(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(parse_threshold)
+}
+
+/// Whether the dispatch names a file or a path to edit, so the worker can act
+/// on the spec instead of searching for it.
+///
+/// A token counts as a path when it carries a dotted file extension or a
+/// directory separator; prose tokens with neither do not.
+fn task_names_files(task: &str) -> bool {
+    task.split_whitespace().any(|token| {
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
+            .trim_end_matches('.');
+        if token.len() < 3 {
+            return false;
+        }
+        if token.contains('/') {
+            return true;
+        }
+        match token.rsplit_once('.') {
+            Some((stem, ext)) => {
+                !stem.is_empty()
+                    && (2..=6).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphabetic())
+            }
+            None => false,
+        }
+    })
+}
+
+/// The read-only detector's verdict for one turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnlyNudge {
+    /// The first nudge of this streak, at the first threshold.
+    First { read_only_turns: usize },
+    /// The single escalation, at twice the first threshold.
+    Escalated { read_only_turns: usize },
+}
+
+/// Consecutive read-only turns and the nudges that streak has already earned.
+///
+/// Fed one repository sample per turn -- the same sample the stagnation
+/// detector compares against -- so "read-only" means "the worktree did not
+/// change", not "the command looked like a read".
+#[derive(Default)]
+struct ReadOnlyStreak {
+    /// Last sample seen: the baseline the next one is compared against.
+    last_sample: Option<String>,
+    /// Consecutive turns whose command left the worktree unchanged.
+    read_only_turns: usize,
+    /// The first nudge has been sent for this streak.
+    nudged: bool,
+    /// The escalation has been sent for this streak.
+    escalated: bool,
+}
+
+impl ReadOnlyStreak {
+    /// Fold one turn's repository sample in and report the nudge, if any, it
+    /// earns. The first threshold fires once per streak, the escalation once
+    /// at twice the threshold, and nothing here can fail the worker.
+    ///
+    /// `None` is a sample git could not answer: it is not evidence of progress,
+    /// so it neither extends nor resets the streak.
+    fn record(
+        &mut self,
+        sample: Option<String>,
+        limits: ReadOnlyThresholds,
+    ) -> Option<ReadOnlyNudge> {
+        let sample = sample?;
+        if self.last_sample.as_deref() != Some(sample.as_str()) {
+            self.read_only_turns = 0;
+            self.nudged = false;
+            self.escalated = false;
+            self.last_sample = Some(sample);
+            return None;
+        }
+        self.read_only_turns += 1;
+        if !self.nudged && self.read_only_turns >= limits.first {
+            self.nudged = true;
+            return Some(ReadOnlyNudge::First {
+                read_only_turns: self.read_only_turns,
+            });
+        }
+        if self.nudged && !self.escalated && self.read_only_turns >= limits.escalate {
+            self.escalated = true;
+            return Some(ReadOnlyNudge::Escalated {
+                read_only_turns: self.read_only_turns,
+            });
+        }
+        None
+    }
+}
+
+/// First read-only nudge: name the streak, which counts turns spent reading,
+/// and demand the edit or a question.
+fn read_only_nudge_text(read_only_turns: usize) -> String {
+    format!(
+        "You have read {read_only_turns} files; write the first edit now, or ASK_ORCHESTRATOR what is missing."
+    )
+}
+
+/// The single escalation of a read-only streak: it repeats the demand and says
+/// outright that exploring is not fatal, because it never is.
+fn read_only_escalation_text(read_only_turns: usize) -> String {
+    format!(
+        "Still no edit after {read_only_turns} read-only turns. Stop reading: write the change now, or ASK_ORCHESTRATOR what is missing. This is a nudge, not a failure."
     )
 }
 
@@ -168,13 +345,25 @@ pub(super) async fn shortstat_of(
 }
 
 /// Run harness git off the runtime thread before a completion can reach verification.
-async fn sync_base_for_completion(worktree: &WorktreeGuard) -> Result<BaseSync> {
+async fn sync_base_for_completion(
+    worktree: &WorktreeGuard,
+    round_base: Option<String>,
+) -> Result<BaseSync> {
     let path = worktree.path.clone();
     let repo_root = worktree.repo_root.clone();
     let branch = worktree.branch.clone();
     let base_commit = worktree.base_commit.clone();
     let base_branch = worktree.base_branch.clone();
     tokio::task::spawn_blocking(move || {
+        if let Some(round_base) = round_base {
+            return WorktreeGuard::sync_round_base_at(
+                &path,
+                &repo_root,
+                &branch,
+                &base_commit,
+                &round_base,
+            );
+        }
         WorktreeGuard::sync_base_at(
             &path,
             &repo_root,
@@ -214,6 +403,8 @@ pub(super) struct ProgressWatch {
     last_sample: Option<String>,
     /// Turns elapsed since that sample last changed.
     unchanged_turns: usize,
+    /// The read-only streak detector, fed the same per-turn sample.
+    read_only: ReadOnlyStreak,
     /// Last successful run of each heavy command, keyed by the exact
     /// command string. The completion gate reuses an entry when the same
     /// command is issued as the verify gate on an unchanged tree.
@@ -374,6 +565,36 @@ pub(super) struct TurnEngine<'a> {
     /// One ask per run: a second would let a confused model trade turns for
     /// completions that never carry one.
     pub report_asked: &'a mut bool,
+    /// The newest [`REPORT_SCAN_BYTES`] of the completion sequence's assistant
+    /// texts: the completion turn, the one follow-up it may cost, and later
+    /// replays. The REPORT block can be split across them -- the prose of one
+    /// turn and the bash command of another -- so they are scanned together
+    /// rather than one by one, but the buffer never grows past its bound.
+    pub report_text: &'a mut String,
+}
+
+/// Append one assistant message to the completion scan buffer: its prose, then
+/// its bash command with `\n` escapes unfolded. A block written as
+/// `printf 'REPORT\ndone: ...'` carries its line breaks as that two-character
+/// escape, so unfolding lets the same parser see it.
+fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) -> Option<WorkerReport> {
+    buffer.push_str(&llm_resp.content);
+    buffer.push('\n');
+    if let Some(command) = &llm_resp.command {
+        let command = command.replace("\\n", "\n");
+        buffer.push_str(&command);
+        buffer.push('\n');
+    }
+    // Parse before trimming: a block that arrives just before an oversized
+    // command is still seen. Then keep only the newest slice, at a character
+    // boundary, so a worker that never writes a block cannot grow this second
+    // conversation buffer without bound.
+    let parsed = parse_report(buffer);
+    if buffer.len() > REPORT_SCAN_BYTES {
+        let cut = buffer.ceil_char_boundary(buffer.len() - REPORT_SCAN_BYTES);
+        buffer.drain(..cut);
+    }
+    parsed
 }
 
 impl<'a> TurnEngine<'a> {
@@ -424,9 +645,9 @@ impl<'a> TurnEngine<'a> {
             self.persist_checkpoint_history(config).await;
         }
 
-        // --- Stagnation detector (implementer only, like the sentinels) ---
+        // --- Change detectors (implementer only, like the sentinels) ---
         if config.apply_sentinels {
-            self.check_stagnation().await;
+            self.check_changes(config).await;
         }
 
         // --- LLM call with error handling ---
@@ -538,6 +759,27 @@ impl<'a> TurnEngine<'a> {
         config: &TurnConfig<'_>,
         llm_resp: LlmResponse,
     ) -> Result<TurnOutcome> {
+        // The REPORT block is not guaranteed to sit in the same assistant
+        // message as the sentinel: the completion turn can carry the sentinel
+        // while the block arrives in the one follow-up, or both are written
+        // into the bash command that requests completion. Every assistant
+        // text from the completion sequence onward is scanned together.
+        if config.apply_sentinels
+            && self.report.is_none()
+            && (*self.report_asked
+                || llm_resp
+                    .command
+                    .as_deref()
+                    .is_some_and(is_completion_request))
+        {
+            // The scan returns the block the moment it appears, before the
+            // buffer trims, so a block seen before a long stretch of
+            // sentinel-less turns cannot be lost to the bound.
+            if let Some(parsed) = append_report_text(self.report_text, &llm_resp) {
+                *self.report = Some(parsed);
+            }
+        }
+
         // --- Command extraction ---
         let cmd_str = match llm_resp.command {
             Some(ref cmd) if is_completion_request(cmd) => {
@@ -902,12 +1144,13 @@ impl<'a> TurnEngine<'a> {
             *self.last_assistant_text = llm_resp.content.clone();
         }
 
-        // The completion turn must carry a REPORT block. A worker that omits
-        // one is asked exactly once, before any git work: the answer is what
-        // the orchestrator reads, so it is worth one turn and never more.
-        match (require_report, parse_report(&llm_resp.content)) {
-            (true, Some(parsed)) => *self.report = Some(parsed),
-            (true, None) if !*self.report_asked => {
+        // The completion turn must carry a REPORT block, which the response
+        // scanner stores the moment it appears. A worker that omitted one is
+        // asked exactly once, before any git work: the answer is what the
+        // orchestrator reads, so it is worth one turn and never more.
+        match (require_report, self.report.is_some()) {
+            (true, true) => {}
+            (true, false) if !*self.report_asked => {
                 *self.report_asked = true;
                 info!(
                     worker = %self.worker_id,
@@ -934,7 +1177,9 @@ impl<'a> TurnEngine<'a> {
             _ => {}
         }
 
-        let merged = match sync_base_for_completion(self.worktree).await? {
+        let round_base = super::super::steer::read_source(&self.pool.scratch, self.worker_id)
+            .and_then(|source| source.round_base);
+        let merged = match sync_base_for_completion(self.worktree, round_base).await? {
             BaseSync::Unchanged => None,
             BaseSync::Merged { branch } => {
                 self.worktree.preserve_branch = true;
@@ -1281,18 +1526,43 @@ impl<'a> TurnEngine<'a> {
         self.flush_history_log(config).await;
     }
 
-    /// Sample the worktree every [`STAGNATION_SAMPLE_TURNS`] turns and tell a
-    /// worker that stopped changing anything to make the edit or escalate.
-    async fn check_stagnation(&mut self) {
+    /// One repository sample this turn, the fingerprint both change detectors
+    /// compare against their own previous one. `None` when git could not
+    /// answer, so a failed sample is never read as "nothing changed".
+    async fn sample_repository(&self) -> Option<String> {
+        let path = self.worktree.path.clone();
+        // `git` is a blocking subprocess, so it must not run on a runtime thread.
+        tokio::task::spawn_blocking(move || repository_sample(&path))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Sample the worktree once and feed both change detectors with it.
+    ///
+    /// The sample is taken every turn when the read-only detector is active
+    /// (a dispatch that names a file to edit); otherwise it keeps the
+    /// [`STAGNATION_SAMPLE_TURNS`] cadence it has today, so a dispatch that
+    /// names no file pays nothing new.
+    async fn check_changes(&mut self, config: &TurnConfig<'_>) {
+        let read_only = read_only_thresholds(config.task);
+        let stagnation_due = *self.step > 0 && (*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS);
+        if read_only.is_none() && !stagnation_due {
+            return;
+        }
+        let sample = self.sample_repository().await;
+        self.check_stagnation(sample.clone());
+        if let Some(limits) = read_only {
+            self.check_read_only(sample, limits);
+        }
+    }
+
+    /// Tell a worker that stopped changing anything to make the edit or
+    /// escalate, sampled every [`STAGNATION_SAMPLE_TURNS`] turns.
+    fn check_stagnation(&mut self, sample: Option<String>) {
         if *self.step == 0 || !(*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS) {
             return;
         }
-        let path = self.worktree.path.clone();
-        // `git` is a blocking subprocess, so it must not run on a runtime thread.
-        let sample = tokio::task::spawn_blocking(move || repository_sample(&path))
-            .await
-            .ok()
-            .flatten();
         if self.watch.record_sample(sample) < STAGNATION_TURNS_LIMIT {
             return;
         }
@@ -1305,6 +1575,35 @@ impl<'a> TurnEngine<'a> {
         );
         self.messages
             .push(ChatMessage::text(Role::User, stagnation_nudge()));
+    }
+
+    /// Tell a worker whose worktree has not changed for a run of turns to make
+    /// its first edit, and escalate once at twice that budget.
+    ///
+    /// Only called for a dispatch whose spec already named the files to edit,
+    /// where a long read-only streak means the worker is stuck rather than
+    /// still looking for the code, so the streak is counted per turn rather
+    /// than per [`STAGNATION_SAMPLE_TURNS`] window. The detector only ever
+    /// injects guidance: it never ends the worker.
+    fn check_read_only(&mut self, sample: Option<String>, limits: ReadOnlyThresholds) {
+        let Some(nudge) = self.watch.read_only.record(sample, limits) else {
+            return;
+        };
+        self.meta.metrics.stagnation_nudges += 1;
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            read_only_turns = self.watch.read_only.read_only_turns,
+            first_threshold = limits.first,
+            "Worker has only been reading; nudging it to make the first edit"
+        );
+        let text = match nudge {
+            ReadOnlyNudge::First { read_only_turns } => read_only_nudge_text(read_only_turns),
+            ReadOnlyNudge::Escalated { read_only_turns } => {
+                read_only_escalation_text(read_only_turns)
+            }
+        };
+        self.push_message(ChatMessage::text(Role::User, text));
     }
 
     /// Run through resource admission and the bash semaphore, retaining both
@@ -1585,9 +1884,66 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TURNS_LIMIT, ProgressWatch, REPEAT_BLOCK_LIMIT, STAGNATION_SAMPLE_TURNS,
-        extension_budget, parse_shortstat,
+        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
+        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
+        STAGNATION_SAMPLE_TURNS, append_report_text, extension_budget, named_file_defaults,
+        parse_shortstat, parse_threshold, read_only_escalation_text, read_only_nudge_text,
+        read_only_thresholds, task_names_files,
     };
+
+    /// A response with no tool call and no reasoning, for scan-buffer tests.
+    fn scanned(content: &str, command: Option<&str>) -> LlmResponse {
+        LlmResponse {
+            content: content.to_string(),
+            reasoning_content: None,
+            command: command.map(str::to_string),
+            tool_calls: None,
+            tool_call_id: None,
+            invalid_utf8_lines: 0,
+        }
+    }
+
+    #[test]
+    fn the_report_scan_buffer_is_bounded_to_its_newest_bytes() {
+        let long = "界".repeat(4096);
+        let mut buffer = String::new();
+        for _ in 0..64 {
+            append_report_text(&mut buffer, &scanned(&long, Some(&"y".repeat(4096))));
+            assert!(
+                buffer.len() <= REPORT_SCAN_BYTES,
+                "the scan buffer grew past its bound: {}",
+                buffer.len()
+            );
+        }
+        // The newest message is what the scan returns, however much bounded
+        // text came before it.
+        let report = append_report_text(
+            &mut buffer,
+            &scanned(
+                "REPORT\ndone: bounded scan\nfiles: src/a.rs\ntests: cargo test: passed\nrisks: none\n",
+                None,
+            ),
+        )
+        .expect("the newest block must survive the bound");
+        assert_eq!(report.done, "bounded scan");
+        assert!(buffer.len() <= REPORT_SCAN_BYTES);
+    }
+
+    #[test]
+    fn a_report_block_split_across_messages_still_parses() {
+        let mut buffer = String::new();
+        assert_eq!(
+            append_report_text(&mut buffer, &scanned("REPORT\n", None)),
+            None
+        );
+        let report = append_report_text(
+            &mut buffer,
+            &scanned("done: split capture\nfiles: src/a.rs\n", None),
+        )
+        .expect("a block split across turns must parse");
+        assert_eq!(report.done, "split capture");
+        assert_eq!(report.files, "src/a.rs");
+    }
 
     #[test]
     fn self_grant_budget_is_half_the_dispatch_budget() {
@@ -1688,6 +2044,131 @@ mod tests {
             0,
             "a failed git call must not push a stuck worker towards the nudge"
         );
+    }
+
+    /// The read-only detector over a sequence of samples: the first nudge
+    /// lands on the threshold turn, an edit resets the streak, and the
+    /// escalation fires exactly once at twice the threshold.
+    #[test]
+    fn a_read_only_streak_nudges_at_the_threshold_and_escalates_once() {
+        let limits = ReadOnlyThresholds {
+            first: 3,
+            escalate: 6,
+        };
+        let mut streak = ReadOnlyStreak::default();
+        let same = || Some("head-a\nstat".to_string());
+        // The first sample only fixes the baseline the next one is compared to.
+        assert_eq!(streak.record(same(), limits), None);
+        for turns in 1..limits.first {
+            assert_eq!(
+                streak.record(same(), limits),
+                None,
+                "no nudge after only {turns} read-only turns"
+            );
+        }
+        assert_eq!(
+            streak.record(same(), limits),
+            Some(ReadOnlyNudge::First { read_only_turns: 3 })
+        );
+        // The first nudge is sent once, not on every following turn.
+        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(
+            streak.record(same(), limits),
+            Some(ReadOnlyNudge::Escalated { read_only_turns: 6 })
+        );
+        assert_eq!(
+            streak.record(same(), limits),
+            None,
+            "the escalation is sent once per streak"
+        );
+        // An edit resets the streak, and the next streak nudges again: the
+        // sample taken right after the edit is the new baseline.
+        assert_eq!(
+            streak.record(Some("head-a\nedit".to_string()), limits),
+            None
+        );
+        // The first of these fixes the post-edit baseline; the rest are the
+        // start of the new streak, still short of the threshold.
+        for _ in 1..=limits.first {
+            assert_eq!(streak.record(same(), limits), None);
+        }
+        assert_eq!(
+            streak.record(same(), limits),
+            Some(ReadOnlyNudge::First { read_only_turns: 3 }),
+            "after an edit the streak starts over and nudges again"
+        );
+    }
+
+    /// Both read-only nudges name the streak and offer the worker the two ways
+    /// out; the escalation says outright that exploring is not a failure.
+    #[test]
+    fn the_read_only_nudges_offer_an_edit_or_a_question() {
+        let first = read_only_nudge_text(15);
+        assert!(first.contains("read 15 files"), "got {first:?}");
+        assert!(first.contains("write the first edit now"), "got {first:?}");
+        assert!(first.contains("ASK_ORCHESTRATOR"), "got {first:?}");
+        let escalated = read_only_escalation_text(30);
+        assert!(escalated.contains("Stop reading"), "got {escalated:?}");
+        assert!(escalated.contains("ASK_ORCHESTRATOR"), "got {escalated:?}");
+        assert!(escalated.contains("not a failure"), "got {escalated:?}");
+    }
+
+    /// A sample git could not answer is not evidence of progress: it neither
+    /// extends nor resets a read-only streak.
+    #[test]
+    fn an_unreadable_sample_leaves_a_read_only_streak_alone() {
+        let limits = ReadOnlyThresholds {
+            first: 2,
+            escalate: 4,
+        };
+        let mut streak = ReadOnlyStreak::default();
+        assert_eq!(streak.record(Some("a".to_string()), limits), None);
+        assert_eq!(streak.record(None, limits), None);
+        assert_eq!(
+            streak.record(Some("a".to_string()), limits),
+            None,
+            "the streak is at one turn, not two: the failed sample did not count"
+        );
+        assert_eq!(
+            streak.record(Some("a".to_string()), limits),
+            Some(ReadOnlyNudge::First { read_only_turns: 2 })
+        );
+    }
+
+    /// A dispatch that already names the files to edit gets the read-only
+    /// detector and its earlier budget; one that names none leaves the detector
+    /// off, so the existing stagnation timing stands for it.
+    #[test]
+    fn only_a_task_that_names_files_gets_the_read_only_detector() {
+        let defaults = named_file_defaults();
+        assert_eq!(defaults.first, READ_ONLY_NUDGE_TURNS);
+        assert_eq!(defaults.escalate, 2 * READ_ONLY_NUDGE_TURNS);
+        assert!(read_only_thresholds("edit src/pool/runner/turn.rs, see `Cargo.toml`").is_some());
+        assert!(read_only_thresholds("fix the failing test").is_none());
+    }
+
+    #[test]
+    fn only_a_path_or_a_file_extension_counts_as_naming_a_file() {
+        assert!(task_names_files("rewrite src/lib.rs"));
+        assert!(task_names_files("update `Cargo.toml` and models.yaml"));
+        assert!(task_names_files("the bug is in src/pool"));
+        assert!(!task_names_files("fix the failing test"));
+        assert!(!task_names_files("e.g. rewrite the parser"));
+        assert!(!task_names_files("parse v1.2 output"));
+    }
+
+    #[test]
+    fn only_a_positive_turn_count_is_a_usable_override() {
+        assert_eq!(parse_threshold("15"), Some(15));
+        assert_eq!(parse_threshold(" 12 "), Some(12));
+        assert_eq!(
+            parse_threshold("0"),
+            None,
+            "a zero threshold would nudge on the first sample"
+        );
+        assert_eq!(parse_threshold("nonsense"), None);
+        assert_eq!(parse_threshold(""), None);
     }
 
     /// The completion gate reuses a verify run only when the command *and*

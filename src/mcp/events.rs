@@ -64,6 +64,9 @@ pub enum EventKind {
     Completed,
     /// A worker died and wants an inspection.
     Failed,
+    /// A worker spent its turn budget without completing. Its branch is
+    /// checkpointed, but it is stopped, not done.
+    Exhausted,
 }
 
 impl EventKind {
@@ -74,6 +77,7 @@ impl EventKind {
             Self::NeedsInput => "needs_input",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Exhausted => "exhausted",
         }
     }
 }
@@ -128,6 +132,9 @@ pub struct WorkerView {
     pub branch: Option<String>,
     /// Times the worker was revised after finishing.
     pub revision: usize,
+    /// Turns the worker has performed, so an exhausted worker's continuation
+    /// can name the budget it spent.
+    pub turns: usize,
 }
 
 /// One tick's view of every known worker, keyed by worker id.
@@ -307,6 +314,24 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
                 body,
                 format!(
                     "Inspect it with the worker tool: action \"status\" (then \"logs\"), worker_id \"{}\".",
+                    view.worker_id
+                ),
+            )
+        }
+        EventKind::Exhausted => {
+            let mut body = String::new();
+            if let Some(diff) = &view.outcome.diff_stat {
+                body.push_str(&format!("Diff: {diff}\n"));
+            }
+            body.push_str(&crate::pool::exhausted_next_step(
+                &view.worker_id,
+                view.turns,
+                view.branch.as_deref(),
+            ));
+            (
+                body.trim_end().to_string(),
+                format!(
+                    "Continue it with the worker tool: action \"steer\", worker_id \"{}\", message \"continue\".",
                     view.worker_id
                 ),
             )
@@ -619,11 +644,13 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             continue;
         };
         view.status = phase_status(progress.phase).to_string();
+        view.turns = progress.step;
         view.event = match progress.phase {
             WorkerPhase::Running => None,
             WorkerPhase::Paused => Some(EventKind::NeedsInput),
             WorkerPhase::Completed => Some(EventKind::Completed),
             WorkerPhase::Failed => Some(EventKind::Failed),
+            WorkerPhase::Exhausted => Some(EventKind::Exhausted),
         };
         if let Some(question) = progress.question {
             view.question = Some(question);
@@ -640,11 +667,16 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             // the completion guidance points at the branch a revision resumes.
             view.branch = crate::pool::terminal_branch(&state);
             view.revision = match &state {
-                WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
-                    *revision
-                }
+                WorkerState::Completed { revision, .. }
+                | WorkerState::Failed { revision, .. }
+                | WorkerState::Exhausted { revision, .. } => *revision,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => 0,
             };
+        }
+    }
+    for (id, view) in &mut current {
+        if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id) {
+            view.event = None;
         }
     }
     current
@@ -730,6 +762,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             RegistryStatus::Paused => Some(EventKind::NeedsInput),
             RegistryStatus::Completed => Some(EventKind::Completed),
             RegistryStatus::Failed => Some(EventKind::Failed),
+            RegistryStatus::Exhausted => Some(EventKind::Exhausted),
             // Interrupted is terminal for listing but continuable, so it is
             // not a terminal event: the worker is expected back.
             RegistryStatus::Interrupted => None,
@@ -750,8 +783,10 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
                 let (files, insertions, deletions) = crate::cli::watch::branch_diff_stat(entry)?;
                 stat_text(files, insertions, deletions)
             }),
-            // The row carries the report so a worker whose in-memory record
-            // was already evicted still says what it did.
+            // The row carries the report and its verification verdict so a
+            // worker whose in-memory record was already evicted still says
+            // what it did and whether it verified.
+            verified: entry.verified,
             report: entry.report.clone(),
             summary: entry
                 .report
@@ -765,6 +800,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
         // real branch when this process owns the worker.
         branch: None,
         revision: 0,
+        turns: entry.step,
     }
 }
 
@@ -803,6 +839,20 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             error: (!error.trim().is_empty()).then(|| quote(error)),
             diff_stat: diff_stat(metrics),
             ..Outcome::default()
+        },
+        WorkerState::Exhausted {
+            summary,
+            metrics,
+            diff,
+            report,
+            ..
+        } => Outcome {
+            summary: first_line(summary),
+            verified: None,
+            diff_stat: diff_stat(metrics),
+            error: None,
+            report: report.clone(),
+            per_file: file_stats_of_diff(diff),
         },
         WorkerState::Running { .. } | WorkerState::Paused { .. } => Outcome::default(),
     }
@@ -847,6 +897,7 @@ fn registry_status(status: RegistryStatus) -> &'static str {
         RegistryStatus::Reviewing => "reviewing",
         RegistryStatus::Completed => "completed",
         RegistryStatus::Failed => "failed",
+        RegistryStatus::Exhausted => "exhausted",
         RegistryStatus::Stopped => "stopped",
         RegistryStatus::Interrupted => "interrupted",
     }
@@ -859,6 +910,7 @@ fn phase_status(phase: WorkerPhase) -> &'static str {
         WorkerPhase::Paused => "paused",
         WorkerPhase::Completed => "completed",
         WorkerPhase::Failed => "failed",
+        WorkerPhase::Exhausted => "exhausted",
     }
 }
 
@@ -1047,6 +1099,11 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             attach_verify_tail(view, &logs);
         }
     }
+    for (id, view) in &mut views {
+        if pool.question_for_consolidator(id) {
+            view["question_for_consolidator"] = json!(true);
+        }
+    }
     views
 }
 
@@ -1078,9 +1135,30 @@ impl EventRouter {
                 self.watch_reported.remove(id);
                 self.seen.remove(id);
             }
+            if view["status"] == "paused" && view["question_for_consolidator"] == true {
+                self.watch_reported.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| {
+                        !(event["worker_id"] == *id && event["event"] == "needs_input")
+                    });
+                }
+                continue;
+            }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
             {
+                // One transition is one event, whichever view describes it:
+                // the live snapshot and the registry row of the same revision
+                // share the key `(worker id, revision, kind)` and must not be
+                // delivered twice. A stall is an episode rather than a
+                // transition, so it is never keyed this way.
+                if event["event"] != "stalled"
+                    && self.watch_reported.get(id).is_some_and(|old| {
+                        old["event"] == event["event"] && old["revision"] == event["revision"]
+                    })
+                {
+                    continue;
+                }
                 self.sequence += 1;
                 event["sequence"] = json!(self.sequence);
                 self.watch_reported.insert(id.clone(), event.clone());
@@ -1493,3 +1571,53 @@ mod verify_tail_attachment_tests {
         assert!(tail.contains("Command timed out after 600s"), "{view}");
     }
 }
+
+/// A registry row reduced to a view must carry the completion's persisted
+/// verdict, so an evicted or restarted worker's event still reports it.
+#[cfg(test)]
+mod registry_verified_tests {
+    use super::{EventKind, registry_view};
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
+
+    fn completed_row(verified: Option<bool>) -> WorkerRegistryEntry {
+        // Built through the same constructor a real write uses, so the fixture
+        // picks up fields the current build adds to a row without a literal.
+        let meta = WorkerMeta {
+            id: "w-registry".to_string(),
+            task: "persist the verdict".to_string(),
+            group: None,
+            role: WorkerRole::Worker,
+            repo_path: None,
+            owner: "owner".to_string(),
+            started_at: 0,
+            pid: 0,
+            revision: 0,
+            auto_continues: 0,
+            metrics: WorkerMetrics::default(),
+            report: None,
+            verified,
+        };
+        meta.entry(
+            "test-model",
+            RegistryStatus::Completed,
+            5,
+            10,
+            "all gates green",
+            None,
+        )
+    }
+
+    #[test]
+    fn a_completed_rows_view_carries_the_persisted_verdict() {
+        let view = registry_view(&completed_row(Some(true)));
+        assert_eq!(view.event, Some(EventKind::Completed));
+        assert_eq!(view.outcome.verified, Some(true));
+    }
+
+    #[test]
+    fn a_row_without_a_verdict_stays_unknown() {
+        assert_eq!(registry_view(&completed_row(None)).outcome.verified, None);
+    }
+}
+#[cfg(test)]
+mod event_dedup_tests;

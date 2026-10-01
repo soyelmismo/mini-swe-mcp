@@ -65,10 +65,12 @@ fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
         metrics: WorkerMetrics::default(),
         base_branch: None,
         base_commit: None,
+        head_commit: None,
         revision: 0,
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

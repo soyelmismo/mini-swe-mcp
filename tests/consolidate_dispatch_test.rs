@@ -106,9 +106,11 @@ impl Harness {
             metrics: WorkerMetrics::default(),
             base_branch: Some("master".to_string()),
             base_commit: None,
+            head_commit: None,
             revision: 0,
             auto_continues: 0,
             approved: None,
+            verified: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }

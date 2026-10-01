@@ -232,10 +232,7 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
     for line in message.lines() {
         let line = strip_markup(line);
         if !in_block {
-            if line
-                .trim_matches(['*', '_', '`', '#', '>', ' '])
-                .eq_ignore_ascii_case("REPORT")
-            {
+            if opens_report_block(&line) {
                 in_block = true;
             }
             continue;
@@ -270,6 +267,22 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
         }
     }
     (!report.is_empty()).then_some(report)
+}
+
+/// Whether `line` opens the block: the word `REPORT` alone, optionally wrapped
+/// in markdown emphasis or carried as the quoted argument of the bash command
+/// that echoes it, as in `printf 'REPORT\ndone: ...'`.
+fn opens_report_block(line: &str) -> bool {
+    let line = line.trim();
+    if line
+        .trim_matches(['*', '_', '`', '#', '>', ' '])
+        .eq_ignore_ascii_case("REPORT")
+    {
+        return true;
+    }
+    line.rsplit(['\'', '"'])
+        .next()
+        .is_some_and(|tail| tail.trim().eq_ignore_ascii_case("REPORT"))
 }
 
 /// Peel the markdown a model wraps a block in: code fences, list bullets and
@@ -452,6 +465,21 @@ mod tests {
         ] {
             assert_eq!(parse_report(absent), None, "{absent:?} carries no block");
         }
+    }
+
+    #[test]
+    fn a_report_carried_inside_a_printf_command_parses() {
+        // The block reaches the parser with its line breaks unfolded, the way
+        // `append_report_text` hands it over.
+        let command = "printf 'REPORT\\ndone: Fixed the parser\\nfiles: src/a.rs\\n' && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
+        assert_eq!(
+            parse_report(&command.replace("\\n", "\n")),
+            Some(WorkerReport {
+                done: "Fixed the parser".to_string(),
+                files: "src/a.rs".to_string(),
+                ..Default::default()
+            })
+        );
     }
 
     #[test]

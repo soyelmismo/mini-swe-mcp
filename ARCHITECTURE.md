@@ -288,6 +288,10 @@ Workers communicate status and request human/orchestrator intervention via shell
   - The worktree is sampled every 10 turns; 30 turns with no change (fingerprint: `HEAD` id
     plus `git diff --stat HEAD`, so a commit counts as progress) injects a "stop exploring:
     make the edit, or ask" nudge.
+  - A dispatch that already names the files to edit is sampled every turn instead: after
+    `POOL_READ_ONLY_NUDGE_TURNS` (default 15) read-only turns the worker is told to write
+    the first edit or ask what is missing, and once more at `POOL_READ_ONLY_ESCALATE_TURNS`
+    (default: twice the first). Any change resets the streak, and it never fails the worker.
 - **Cross-Process Steering (`steer` from another terminal)**:
   - The in-memory `pending_steer` queue and the resume channel only exist in the
     process that owns the worker, so a `steer` issued from a different shell used

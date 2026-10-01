@@ -133,10 +133,12 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         metrics: WorkerMetrics::default(),
         base_branch: Some("master".to_string()),
         base_commit: None,
+        head_commit: None,
         revision,
         auto_continues: 0,
         report: None,
         approved: None,
+        verified: None,
     }
 }
 

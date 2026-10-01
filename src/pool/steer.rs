@@ -193,3 +193,44 @@ pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
         }
     }
 }
+
+/// The last consolidator to steer a worker, and its immutable round base.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct SteerSource {
+    pub consolidator: String,
+    pub round_base: Option<String>,
+}
+
+pub(super) fn read_source(root: &ScratchRoot, id: &str) -> Option<SteerSource> {
+    serde_json::from_slice(&std::fs::read(root.join(format!("swe-wt-{id}.steer-source"))).ok()?)
+        .ok()
+}
+
+pub(super) fn write_source(
+    root: &ScratchRoot,
+    id: &str,
+    source: Option<&SteerSource>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Invalid worker id: {id}"
+    );
+    let path = root.join(format!("swe-wt-{id}.steer-source"));
+    if let Some(source) = source {
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec(source)?)?;
+        let result = std::fs::rename(&temporary, &path);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+    } else if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    Ok(())
+}

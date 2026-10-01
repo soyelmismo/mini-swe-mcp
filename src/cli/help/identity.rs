@@ -1,0 +1,2 @@
+/// `identity`: who owns a worker and which override sees everything.
+pub(super) const TEXT: &str = "A worker belongs to the agent that dispatched it: status, steer, kill, collect, logs, list and watch only ever see or act on your own workers. Your identity is derived per session and exported to the watch your shell runs, so the CLI and the MCP connection agree; `mini-swe-mcp whoami` prints it and how it was derived. The human operator's `--admin` override is the only way to act on another agent's workers (H-3).";
