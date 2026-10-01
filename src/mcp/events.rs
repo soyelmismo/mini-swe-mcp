@@ -425,6 +425,10 @@ pub(super) struct EventRouter {
     connections: BTreeMap<u64, (String, bool, mpsc::Sender<String>)>,
     watch_current: crate::cli::watch::Snapshot,
     watch_reported: crate::cli::watch::Snapshot,
+    /// Worker id -> sequence of its last event the owner saw through an
+    /// interactive verb. The sequence stays out of the payload so the
+    /// published and JSON event shapes are unchanged.
+    seen: BTreeMap<String, u64>,
     watch_history: BTreeMap<String, WatchHistory>,
     watches: Arc<WatchRegistry>,
     sequence: u64,
@@ -999,6 +1003,7 @@ impl EventRouter {
                 .is_some_and(|old| old["status"] != view["status"])
             {
                 self.watch_reported.remove(id);
+                self.seen.remove(id);
             }
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
@@ -1034,6 +1039,7 @@ impl EventRouter {
             }
         }
         self.watch_reported.retain(|id, _| views.contains_key(id));
+        self.seen.retain(|id, _| views.contains_key(id));
         self.watch_current = views;
     }
 
@@ -1132,7 +1138,7 @@ impl EventRouter {
                 if !events.iter().any(|v| v["worker_id"] == *id)
                     && let Some(v) = self.watch_reported.get(id).filter(|v| {
                         matches!(v["event"].as_str(), Some("completed" | "failed"))
-                            && v["seen"] != true
+                            && self.seen.get(id).copied() != v["sequence"].as_u64()
                             && allowed(v)
                             && crate::cli::watch::matches(v, &ids, group)
                     })
@@ -1154,8 +1160,12 @@ impl EventRouter {
         if let Some(history) = self.watch_history.get_mut(owner) {
             history.pending.retain(|v| v["worker_id"] != wid);
         }
-        if let Some(reported) = self.watch_reported.get_mut(wid) {
-            reported["seen"] = json!(true);
+        if let Some(sequence) = self
+            .watch_reported
+            .get(wid)
+            .and_then(|v| v["sequence"].as_u64())
+        {
+            self.seen.insert(wid.to_string(), sequence);
         }
     }
 
