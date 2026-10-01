@@ -949,6 +949,16 @@ mod tests {
         }
     }
 
+    async fn wait_for_queue(controller: &AdmissionController, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while controller.waiting() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("requests must reach the expected queue length");
+    }
+
     /// A completion request queued behind an exploratory one is served first
     /// when the slot frees, and the exploratory one follows.
     #[tokio::test]
@@ -974,13 +984,18 @@ mod tests {
         };
         let exploring = spawn(AdmissionClass::Exploratory, "exploring");
         // The exploratory request must be queued before the completion one.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_queue(&controller, 1).await;
         let completing = spawn(AdmissionClass::Completion, "completing");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_queue(&controller, 2).await;
         assert_eq!(controller.waiting(), 2, "both requests must be queued");
 
         drop(held);
-        let _ = tokio::join!(completing, exploring);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            completing.await.expect("completion task finishes");
+            exploring.await.expect("exploration task finishes");
+        })
+        .await
+        .expect("both queued requests must make progress");
         assert_eq!(
             *order.lock().expect("order lock"),
             vec!["completing", "exploring"],
@@ -1005,12 +1020,12 @@ mod tests {
             let controller = controller.clone();
             async move { controller.acquire(AdmissionClass::Exploratory).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_queue(&controller, 1).await;
         let completing = tokio::spawn({
             let controller = controller.clone();
             async move { controller.acquire(AdmissionClass::Completion).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_queue(&controller, 2).await;
         assert_eq!(controller.waiting(), 2);
 
         doomed.abort();

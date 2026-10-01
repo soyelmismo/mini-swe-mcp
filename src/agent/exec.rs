@@ -63,7 +63,11 @@ const NICE_FLAG: &str = "-n";
 /// `nice` level applied to every child so agent work yields to interactive work.
 const NICE_VALUE: &str = "10";
 
-/// Env var turning the heavy command's idle I/O class off (`0` disables it).
+/// Env var choosing a heavy command's I/O scheduling class.
+///
+/// `0` leaves the inherited class alone, `idle` (or its class number, `3`)
+/// opts into the idle class, and anything else — including an unset variable —
+/// keeps the best-effort default described on [`IoClass`].
 pub const HEAVY_IONICE_ENV: &str = "HUB_HEAVY_IONICE";
 
 /// `IOPRIO_CLASS_SHIFT` from `<linux/ioprio.h>`: a priority value is the class
@@ -84,8 +88,15 @@ const IOPRIO_WHO_PROCESS: i32 = 1;
 /// rather than to the top of its class.
 const IOPRIO_BE_NORMAL: i32 = 4;
 
-/// `ionice` flag selecting the idle class, for hosts without `ioprio_set`.
-const IONICE_IDLE_FLAG: &str = "-c3";
+/// Lowest best-effort level (`IOPRIO_BE_NR_LEVELS - 1`): the bottom of the
+/// class, but still a class the scheduler serves whenever the disk is free.
+const IOPRIO_BE_LOWEST: i32 = 7;
+
+/// `ionice` arguments for the default heavy class: best-effort, lowest level.
+const IONICE_HEAVY_ARGS: &str = "-c2 -n7";
+
+/// `ionice` arguments for the idle class, the opt-in heavy class.
+const IONICE_IDLE_ARGS: &str = "-c3";
 
 /// Grace period after `SIGTERM` before a timed-out group is escalated to
 /// `SIGKILL`. Long enough to flush buffers, short enough that a wedged build
@@ -187,7 +198,7 @@ impl AgentRunner {
         let io_plan = io_plan(
             heavy,
             ioprio_syscall_supported(),
-            crate::config::env_parse(HEAVY_IONICE_ENV),
+            heavy_ionice_setting(std::env::var(HEAVY_IONICE_ENV).ok().as_deref()),
         );
 
         match select_backend() {
@@ -536,15 +547,47 @@ fn configure_process(cmd: &mut Command) {
 /// The CPU side of "agent work yields to everything else" is already `nice`;
 /// this is the disk side of the same idea. A build is I/O-bound and mostly
 /// indifferent to latency, while the light commands that make up most steps
-/// (grep, sed, git, cat) are latency-bound and do almost no I/O. Demoting the
-/// first to the idle class is what keeps the second responsive when several
-/// builds saturate the disk.
+/// (grep, sed, git, cat) are latency-bound and do almost no I/O. Sending the
+/// first to the bottom of the best-effort class is what keeps the second
+/// responsive when several builds saturate the disk.
+///
+/// The idle class is deliberately *not* the default: it is only served when no
+/// best-effort or realtime queue anywhere on the host has pending I/O, so on a
+/// machine with continuous background traffic (sync clients, network mounts,
+/// browsers) an idle build can starve for minutes. Best-effort at its lowest
+/// level reduces contention without requiring every other queue to be empty.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IoClass {
     /// Best-effort at the normal level: the class an ordinary command runs in.
     BestEffort,
-    /// Idle: the disk is only used once nothing else wants it.
+    /// Best-effort at the lowest level: the default for a heavy command.
+    Heavy,
+    /// Idle: the disk is only used once nothing else wants it. Opt-in.
     Idle,
+}
+
+/// How [`HEAVY_IONICE_ENV`] configures a heavy command's I/O class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeavyIonice {
+    /// Best-effort at the lowest level: the default.
+    Lowest,
+    /// The idle class, for hosts that want it.
+    Idle,
+    /// Leave the inherited class alone.
+    Inherit,
+}
+
+/// Read [`HEAVY_IONICE_ENV`].
+///
+/// `idle` (or its class number, `3`) opts a host into the idle class, `0`
+/// disables the demotion outright, and anything else — including an unset or
+/// unparsable variable — keeps the best-effort default.
+fn heavy_ionice_setting(raw: Option<&str>) -> HeavyIonice {
+    match raw.map(str::trim) {
+        Some("0") => HeavyIonice::Inherit,
+        Some("idle") | Some("3") => HeavyIonice::Idle,
+        _ => HeavyIonice::Lowest,
+    }
 }
 
 /// How a command's child is placed in its I/O scheduling class.
@@ -552,7 +595,7 @@ enum IoClass {
 enum IoPlan {
     /// Install the class with `ioprio_set` in the child's `pre_exec` hook.
     Set(IoClass),
-    /// Wrap the command in `ionice -c3`: this host has no working `ioprio_set`.
+    /// Wrap the command in `ionice`: this host has no working `ioprio_set`.
     Wrap(IoClass),
     /// Leave the class the child inherits alone.
     Inherit,
@@ -560,26 +603,30 @@ enum IoPlan {
 
 /// Decide how `command`'s child gets its I/O scheduling class.
 ///
-/// A heavy command is demoted to the idle class so a build cannot starve the
-/// light commands that make up most steps, and `HUB_HEAVY_IONICE=0` turns that
-/// demotion off. A light command is pinned to best-effort *normal* so it can
-/// never inherit a demotion from whatever spawned it. `syscall_ok` picks the
-/// mechanism: `ioprio_set` in the child, or the `ionice -c3` wrapper on a host
+/// A heavy command is sent to the bottom of the best-effort class so a build
+/// cannot starve the light commands that make up most steps, and
+/// [`HEAVY_IONICE_ENV`] picks between that, the idle class and no demotion at
+/// all. A light command is pinned to best-effort *normal* so it can never
+/// inherit a demotion from whatever spawned it. `syscall_ok` picks the
+/// mechanism: `ioprio_set` in the child, or the `ionice` wrapper on a host
 /// where the syscall does not answer.
-fn io_plan(heavy: bool, syscall_ok: bool, heavy_ionice: Option<u8>) -> IoPlan {
-    // `HUB_HEAVY_IONICE=0` disables the feature outright: the child keeps
-    // whatever class it inherited, demotion and pinning alike.
-    if heavy && heavy_ionice == Some(0) {
-        return IoPlan::Inherit;
+fn io_plan(heavy: bool, syscall_ok: bool, ionice: HeavyIonice) -> IoPlan {
+    let class = match (heavy, ionice) {
+        (false, _) => IoClass::BestEffort,
+        // `HUB_HEAVY_IONICE=0` disables the feature outright: the child keeps
+        // whatever class it inherited, demotion and pinning alike.
+        (true, HeavyIonice::Inherit) => return IoPlan::Inherit,
+        (true, HeavyIonice::Idle) => IoClass::Idle,
+        (true, HeavyIonice::Lowest) => IoClass::Heavy,
+    };
+    if syscall_ok {
+        return IoPlan::Set(class);
     }
-    match (heavy, syscall_ok) {
-        (true, true) => IoPlan::Set(IoClass::Idle),
+    match class {
         // No `ioprio_set` on this host, so `ionice` is the only way to demote.
-        (true, false) => IoPlan::Wrap(IoClass::Idle),
-        // A light command only needs pinning where the syscall can do it;
-        // otherwise it keeps the class it inherited, which is best-effort.
-        (false, true) => IoPlan::Set(IoClass::BestEffort),
-        (false, false) => IoPlan::Inherit,
+        IoClass::Heavy | IoClass::Idle => IoPlan::Wrap(class),
+        // Nothing to demote: the child keeps the class it inherited.
+        IoClass::BestEffort => IoPlan::Inherit,
     }
 }
 
@@ -588,6 +635,7 @@ fn io_plan(heavy: bool, syscall_ok: bool, heavy_ionice: Option<u8>) -> IoPlan {
 fn ioprio_value(class: IoClass) -> i32 {
     let (class, level) = match class {
         IoClass::BestEffort => (IOPRIO_CLASS_BE, IOPRIO_BE_NORMAL),
+        IoClass::Heavy => (IOPRIO_CLASS_BE, IOPRIO_BE_LOWEST),
         // The idle class has no levels; the low bits are ignored.
         IoClass::Idle => (IOPRIO_CLASS_IDLE, 0),
     };
@@ -618,7 +666,7 @@ fn ioprio_syscall_supported() -> bool {
 
 /// Child-side hook placing the calling process in an I/O scheduling class.
 ///
-/// Best-effort by design: a kernel or a locked-down container that refuses the
+/// Tolerant by design: a kernel or a locked-down container that refuses the
 /// call leaves the inherited class rather than failing the step, because a
 /// command that runs at the wrong I/O priority still beats one that never
 /// runs.
@@ -672,15 +720,14 @@ fn apply_io_priority(_cmd: &mut Command, _class: IoClass) {}
 /// Apply the `ionice` fallback to an already-wrapped command string.
 ///
 /// `ionice` sets its own class and then execs the shell, so the whole process
-/// group inherits the idle class just as the syscall path would leave it.
+/// group inherits that class just as the syscall path would leave it.
 fn apply_io_wrapper(command: String, plan: IoPlan) -> String {
-    match plan {
-        IoPlan::Wrap(IoClass::Idle) => format!(
-            "ionice {IONICE_IDLE_FLAG} {OFFLINE_SHELL} -c {}",
-            shell_quote(&command)
-        ),
-        _ => command,
-    }
+    let args = match plan {
+        IoPlan::Wrap(IoClass::Heavy) => IONICE_HEAVY_ARGS,
+        IoPlan::Wrap(IoClass::Idle) => IONICE_IDLE_ARGS,
+        IoPlan::Wrap(IoClass::BestEffort) | IoPlan::Set(_) | IoPlan::Inherit => return command,
+    };
+    format!("ionice {args} {OFFLINE_SHELL} -c {}", shell_quote(&command))
 }
 
 /// Read-only bind for a toolchain cache directory.
@@ -1461,30 +1508,53 @@ mod tests {
 
     // ---------- I/O priority ----------
 
-    /// Which mechanism carries a command's I/O class, decided from its weight,
-    /// the host's `ioprio_set` and the operator's opt-out.
+    /// Scheduling decisions are independent of ambient environment variables.
     #[test]
     fn io_plan_demotes_heavy_commands_and_pins_light_ones() {
-        // Heavy on a host with `ioprio_set`: the idle class, set by the hook.
-        assert_eq!(io_plan(true, true, None), IoPlan::Set(IoClass::Idle));
-        // Light: best-effort normal, so a demotion is never inherited.
-        assert_eq!(io_plan(false, true, None), IoPlan::Set(IoClass::BestEffort));
-        // `HUB_HEAVY_IONICE=0` opts a heavy command out entirely.
-        assert_eq!(io_plan(true, true, Some(0)), IoPlan::Inherit);
-        // Any other value leaves the demotion on.
-        assert_eq!(io_plan(true, true, Some(1)), IoPlan::Set(IoClass::Idle));
-        // No `ioprio_set` on this host: the `ionice -c3` wrapper carries it.
-        assert_eq!(io_plan(true, false, None), IoPlan::Wrap(IoClass::Idle));
-        // The opt-out wins over the wrapper too.
-        assert_eq!(io_plan(true, false, Some(0)), IoPlan::Inherit);
-        // A light command simply keeps the class it inherited.
-        assert_eq!(io_plan(false, false, None), IoPlan::Inherit);
+        use HeavyIonice::{Idle, Inherit, Lowest};
+        let cases = [
+            (true, true, Lowest, IoPlan::Set(IoClass::Heavy)),
+            (true, false, Lowest, IoPlan::Wrap(IoClass::Heavy)),
+            (true, true, Idle, IoPlan::Set(IoClass::Idle)),
+            (true, false, Idle, IoPlan::Wrap(IoClass::Idle)),
+            (true, true, Inherit, IoPlan::Inherit),
+            (true, false, Inherit, IoPlan::Inherit),
+            (false, true, Lowest, IoPlan::Set(IoClass::BestEffort)),
+            (false, true, Idle, IoPlan::Set(IoClass::BestEffort)),
+            (false, true, Inherit, IoPlan::Set(IoClass::BestEffort)),
+            (false, false, Lowest, IoPlan::Inherit),
+        ];
+        for (heavy, supported, setting, expected) in cases {
+            assert_eq!(io_plan(heavy, supported, setting), expected);
+        }
+    }
+
+    #[test]
+    fn heavy_ionice_setting_accepts_opt_out_and_idle_opt_in() {
+        for (raw, expected) in [
+            (None, HeavyIonice::Lowest),
+            (Some(""), HeavyIonice::Lowest),
+            (Some("1"), HeavyIonice::Lowest),
+            (Some("7"), HeavyIonice::Lowest),
+            (Some("unknown"), HeavyIonice::Lowest),
+            (Some("0"), HeavyIonice::Inherit),
+            (Some(" 0 "), HeavyIonice::Inherit),
+            (Some("idle"), HeavyIonice::Idle),
+            (Some(" idle "), HeavyIonice::Idle),
+            (Some("3"), HeavyIonice::Idle),
+        ] {
+            assert_eq!(heavy_ionice_setting(raw), expected, "{raw:?}");
+        }
     }
 
     /// A priority value is the class in its high bits and the level below it,
     /// and best-effort normal is the level the kernel gives an unpinned task.
     #[test]
     fn ioprio_values_carry_the_class_and_the_level() {
+        assert_eq!(
+            ioprio_value(IoClass::Heavy),
+            (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | 7
+        );
         assert_eq!(
             ioprio_value(IoClass::Idle),
             IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT
@@ -1504,10 +1574,10 @@ mod tests {
         }
         let wrapped = apply_io_wrapper(
             "echo 'a b' | tr ' ' '_'".to_string(),
-            IoPlan::Wrap(IoClass::Idle),
+            IoPlan::Wrap(IoClass::Heavy),
         );
         assert!(
-            wrapped.starts_with("ionice -c3 bash -c "),
+            wrapped.starts_with("ionice -c2 -n7 bash -c "),
             "the wrapper must prefix the command: {wrapped}"
         );
         let mut cmd = Command::new("bash");
@@ -1519,6 +1589,8 @@ mod tests {
             "a_b",
             "the wrapped command must behave exactly as the bare one"
         );
+        let idle = apply_io_wrapper("true".into(), IoPlan::Wrap(IoClass::Idle));
+        assert!(idle.starts_with("ionice -c3 bash -c "));
         // Every other plan leaves the command string untouched.
         let plain = "echo hi".to_string();
         assert_eq!(apply_io_wrapper(plain.clone(), IoPlan::Inherit), plain);
@@ -1545,41 +1617,39 @@ mod tests {
         (rc >= 0).then_some(rc as i32)
     }
 
-    /// The class half of an I/O priority value.
-    #[cfg(unix)]
-    fn ioprio_class(value: i32) -> i32 {
-        value >> IOPRIO_CLASS_SHIFT
-    }
-
-    /// The child of a heavy command really runs in the idle I/O class, and the
-    /// child of a light one in best-effort normal: the demotion is observable
-    /// in the child, not merely decided in the parent.
+    /// Both best-effort levels and the idle opt-in are observable in the
+    /// child, not merely decided in the parent.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_inherits_the_io_class_of_its_command() {
         if !ioprio_syscall_supported() {
             return; // No `ioprio_set` here, so there is nothing to observe.
         }
-        for (heavy, expected) in [(true, IOPRIO_CLASS_IDLE), (false, IOPRIO_CLASS_BE)] {
+        for (heavy, setting, expected) in [
+            (true, HeavyIonice::Lowest, IoClass::Heavy),
+            (false, HeavyIonice::Lowest, IoClass::BestEffort),
+            (true, HeavyIonice::Idle, IoClass::Idle),
+        ] {
             let mut cmd = Command::new("sleep");
             configure_process(&mut cmd);
             cmd.arg("30");
-            let IoPlan::Set(class) = io_plan(heavy, true, None) else {
+            let IoPlan::Set(class) = io_plan(heavy, true, setting) else {
                 panic!("a syscall-capable host must plan to set the class");
             };
             apply_io_priority(&mut cmd, class);
             // `spawn` only returns once the child has exec'd, and the
             // `pre_exec` hook runs before that, so the class is already set.
-            let child = cmd.spawn().expect("sleep must spawn");
+            let mut child = cmd.spawn().expect("sleep must spawn");
             let pid = child.id().expect("the child must still be running");
             let value = ioprio_of(pid).expect("the child's ioprio must be readable");
             assert_eq!(
-                ioprio_class(value),
-                expected,
-                "a {} command's child must run in the expected I/O class",
+                value,
+                ioprio_value(expected),
+                "a {} command's child must run at the expected I/O priority",
                 if heavy { "heavy" } else { "light" }
             );
-            // `kill_on_drop` takes the child down with the guard.
+            child.kill().await.expect("kill the probe child");
+            child.wait().await.expect("reap the probe child");
         }
     }
 
