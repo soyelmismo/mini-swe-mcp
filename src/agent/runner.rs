@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::jobs::{JobHandle, JobStatus, JobWait};
+use super::jobs::{JobHandle, JobWait};
 use super::retry;
 use super::stream::{FrameOutcome, SseAccumulator};
 use super::types::{
@@ -169,14 +169,6 @@ impl AgentRunner {
     pub fn with_jobs(mut self, jobs: JobHandle) -> Self {
         self.jobs = Some(jobs);
         self
-    }
-
-    /// The worker's live background jobs, oldest first.
-    pub fn jobs(&self) -> Vec<JobStatus> {
-        self.jobs
-            .as_ref()
-            .map(|handle| handle.summaries())
-            .unwrap_or_default()
     }
 
     /// Wait for background job `id`, up to `limit`.

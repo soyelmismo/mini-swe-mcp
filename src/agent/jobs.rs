@@ -121,7 +121,10 @@ impl JobTable {
     /// Stop every job of `worker` and forget them all.
     ///
     /// Called from a `Drop`, so it only signals: each supervisor reaps its own
-    /// child and records the outcome for anyone still waiting.
+    /// child and records the outcome for anyone still waiting. The worker's
+    /// numbering restarts afterwards, which is unambiguous because none of its
+    /// jobs survives, and dropping the entry keeps the table from growing with
+    /// the number of workers that ever ran.
     pub fn kill_all(&self, worker: &str) -> usize {
         let jobs: Vec<Arc<JobState>> = lock(&self.workers)
             .remove(worker)

@@ -733,7 +733,7 @@ impl<'a> TurnEngine<'a> {
     /// The worker counts as running a command for the whole wait, so the stall
     /// detector and the watch views see a live step rather than an idle one. No
     /// bash slot and no admission permit is taken: waiting runs nothing.
-    async fn wait_on_job(&mut self, job: u64) -> (String, Option<i32>) {
+    async fn wait_on_job(&self, job: u64) -> (String, Option<i32>) {
         let _running = self.pool.command_running(self.worker_id);
         let limit = Duration::from_secs(crate::agent::jobs::wait_job_secs());
         match self.runner.wait_job(job, limit).await {
@@ -746,7 +746,7 @@ impl<'a> TurnEngine<'a> {
     }
 
     /// Stop background job `job`.
-    fn stop_job(&mut self, job: u64) -> (String, Option<i32>) {
+    fn stop_job(&self, job: u64) -> (String, Option<i32>) {
         if self.runner.kill_job(job) {
             (
                 format!("Job {job} stopped; its process group was killed."),

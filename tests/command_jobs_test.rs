@@ -99,7 +99,7 @@ async fn a_command_that_outlives_its_budget_becomes_a_job_and_keeps_running() {
     // completion gate that outlived its budget has not passed.
     assert_eq!(code, Some(124), "{output}");
 
-    let jobs = runner.jobs();
+    let jobs = handle.summaries();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(jobs[0].id, 1);
     assert!(!jobs[0].finished, "{jobs:?}");
@@ -157,7 +157,7 @@ async fn a_command_that_outlives_its_budget_becomes_a_job_and_keeps_running() {
 async fn waiting_on_a_job_reports_its_exit_code_and_the_tail_of_its_output() {
     let work = TempDir::new_in_tmp("cmdjob");
     let table = JobTable::new();
-    let (runner, _handle) = runner("w-wait", &table);
+    let (runner, handle) = runner("w-wait", &table);
 
     let (output, _) = runner
         .execute_bash(work.path(), "echo building; sleep 2; echo built; exit 3")
@@ -181,7 +181,7 @@ async fn waiting_on_a_job_reports_its_exit_code_and_the_tail_of_its_output() {
     }
 
     // A collected job leaves the list, so a finished job never accumulates.
-    assert!(runner.jobs().is_empty(), "{:?}", runner.jobs());
+    assert!(handle.summaries().is_empty(), "{:?}", handle.summaries());
     assert!(
         runner.wait_job(1, Duration::from_secs(1)).await.is_none(),
         "a collected job is gone"
@@ -193,7 +193,7 @@ async fn waiting_on_a_job_reports_its_exit_code_and_the_tail_of_its_output() {
 async fn killing_a_job_stops_it() {
     let work = TempDir::new_in_tmp("cmdjob");
     let table = JobTable::new();
-    let (runner, _handle) = runner("w-kill", &table);
+    let (runner, handle) = runner("w-kill", &table);
     let pid_file = work.path().join("job.pid");
 
     let (output, _) = runner
@@ -215,7 +215,7 @@ async fn killing_a_job_stops_it() {
         wait_for_exit(pid).await,
         "KILL_JOB must stop the job's process group"
     );
-    assert!(runner.jobs().is_empty(), "{:?}", runner.jobs());
+    assert!(handle.summaries().is_empty(), "{:?}", handle.summaries());
     assert!(
         !runner.kill_job(1),
         "a stopped job is no longer waiting to be killed"

@@ -81,7 +81,7 @@ pub use self::steer::{
 };
 
 use self::state::expired_terminal_ids;
-use crate::agent::jobs::{JobHandle, JobStatus, JobTable};
+use crate::agent::jobs::{JobHandle, JobTable};
 use crate::manifest::ModelManifest;
 use crate::worktree::{ScratchRoot, WorktreeGuard};
 
@@ -335,11 +335,6 @@ impl WorkerPool {
     /// its commands.
     pub fn job_handle(&self, worker_id: &str) -> JobHandle {
         JobHandle::new(Arc::clone(&self.jobs), worker_id)
-    }
-
-    /// The background jobs `worker_id` still has running, oldest first.
-    pub async fn worker_jobs(&self, worker_id: &str) -> Vec<JobStatus> {
-        self.jobs.summaries(worker_id)
     }
 
     /// Stop every background job of `worker_id`.

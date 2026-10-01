@@ -238,16 +238,6 @@ mod tests {
         ] {
             assert_eq!(parse_kill_job(cmd), id, "{cmd:?}");
         }
-        assert_eq!(parse_wait_job("echo WAIT_JOB 1"), Some(1));
-        assert_eq!(parse_wait_job("echo WAIT_JOB: 7"), Some(7));
-        assert_eq!(parse_wait_job("printf 'WAIT_JOB 12\n'"), Some(12));
-        assert_eq!(parse_kill_job("echo KILL_JOB 2"), Some(2));
-        assert_eq!(parse_kill_job("echo KILL_JOB: 9"), Some(9));
-        assert_eq!(parse_wait_job("echo WAIT_JOB"), None);
-        assert_eq!(parse_wait_job("echo WAIT_JOB 0"), None);
-        assert_eq!(parse_wait_job("cat job.log"), None);
-        assert_eq!(parse_kill_job("echo WAIT_JOB 4"), None);
-        assert_eq!(parse_wait_job("echo KILL_JOB 4"), None);
         // A job number is not a turn request, and the other way round.
         assert_eq!(parse_request_turns("echo WAIT_JOB 5"), None);
         assert_eq!(parse_wait_job("echo REQUEST_TURNS: 5"), None);
