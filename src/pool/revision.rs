@@ -455,6 +455,11 @@ fn remove_quietly(worker_id: &str, path: &Path) {
     }
 }
 
+/// [`retire_worker_in`] under the default scratch root.
+pub fn retire_worker(worker_id: &str) {
+    retire_worker_in(&ScratchRoot::from_env(), worker_id);
+}
+
 /// Retire every durable trace of `worker_id`: its registry row, its saved
 /// conversation and its steering mailbox.
 ///
@@ -476,7 +481,8 @@ pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u6
     let now = super::unix_timestamp();
     let mut retired = 0;
     for entry in super::load_registry_entries_read_only_in(root) {
-        if !entry.status.is_terminal() || !retention_expired(entry.updated_at, retention_secs, now) {
+        if !entry.status.is_terminal() || !retention_expired(entry.updated_at, retention_secs, now)
+        {
             continue;
         }
         retire_worker_in(root, &entry.id);
@@ -498,7 +504,11 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
 
 /// [`prune_orphan_histories`] under an explicit scratch root.
 pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize {
-    prune_orphan_histories_with_retention_in(root, repo_root, super::state::terminal_retention_secs())
+    prune_orphan_histories_with_retention_in(
+        root,
+        repo_root,
+        super::state::terminal_retention_secs(),
+    )
 }
 
 /// [`prune_orphan_histories_in`] with an explicit retention, so a caller (or a

@@ -18,9 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, LogBuffer, RegistryStatus, SteerOutcome,
-    WorkerHistory, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState,
-    append_history_message_in, history_log_path_in, load_registry_entry_in,
-    load_worker_history_in, prune_orphan_histories_with_retention_in, save_registry_entry_in,
+    WorkerHistory, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState, append_history_message_in,
+    history_log_path_in, load_registry_entry_in, load_worker_history_in,
+    prune_orphan_histories_with_retention_in, save_registry_entry_in,
 };
 
 /// A per-test scratch root, owning its directory.
@@ -33,7 +33,10 @@ impl Scratch {
     fn new(tag: &str) -> Self {
         let dir = common::TempDir::new_in_tmp(tag);
         let path = dir.path().to_path_buf();
-        Self { _dir: dir, dir: path }
+        Self {
+            _dir: dir,
+            dir: path,
+        }
     }
 
     fn root(&self) -> mini_swe_mcp::worktree::ScratchRoot {
@@ -310,11 +313,7 @@ async fn a_worker_whose_branch_is_gone_is_retired_by_prune() {
     // The branch is still there, so a prune keeps everything: an eviction is
     // not a reason to delete.
     assert_eq!(
-        prune_orphan_histories_with_retention_in(
-            &root,
-            &repo,
-            DEFAULT_TERMINAL_RETENTION_SECS
-        ),
+        prune_orphan_histories_with_retention_in(&root, &repo, DEFAULT_TERMINAL_RETENTION_SECS),
         0,
         "a worker whose branch exists is not pruned"
     );
@@ -330,11 +329,7 @@ async fn a_worker_whose_branch_is_gone_is_retired_by_prune() {
     assert!(out.status.success());
 
     assert_eq!(
-        prune_orphan_histories_with_retention_in(
-            &root,
-            &repo,
-            DEFAULT_TERMINAL_RETENTION_SECS
-        ),
+        prune_orphan_histories_with_retention_in(&root, &repo, DEFAULT_TERMINAL_RETENTION_SECS),
         1,
         "a worker whose branch is gone is retired"
     );
@@ -376,7 +371,11 @@ async fn a_worker_past_its_retention_is_retired_even_though_its_branch_remains()
     let fresh_repo = repo_with_branch("retention2", "rt2");
     durable_state(&scratch, &fresh_repo, "rt2", RegistryStatus::Completed);
     assert_eq!(
-        prune_orphan_histories_with_retention_in(&root, &fresh_repo, DEFAULT_TERMINAL_RETENTION_SECS),
+        prune_orphan_histories_with_retention_in(
+            &root,
+            &fresh_repo,
+            DEFAULT_TERMINAL_RETENTION_SECS
+        ),
         0,
         "a worker inside its retention is kept"
     );
@@ -412,13 +411,8 @@ async fn a_history_without_a_row_survives_a_prune_while_its_branch_lives() {
 }
 
 /// The two clocks are independent: the in-memory TTL is seconds, the durable
-/// retention is a week.
-#[test]
-fn the_two_clocks_are_ordered() {
-    assert!(
-        DEFAULT_TERMINAL_RETENTION_SECS > mini_swe_mcp::pool::DEFAULT_TERMINAL_TTL_SECS,
-        "the durable retention must outlast the in-memory TTL, or a reaped \
-         worker would lose its row before an orchestrator could steer it"
-    );
-    assert_eq!(DEFAULT_TERMINAL_RETENTION_SECS, 7 * 24 * 60 * 60);
-}
+/// retention is a week. The ordering is the invariant the whole rule rests on,
+/// so it is checked at compile time rather than at run time.
+const _: () =
+    assert!(DEFAULT_TERMINAL_RETENTION_SECS > mini_swe_mcp::pool::DEFAULT_TERMINAL_TTL_SECS);
+const _: () = assert!(DEFAULT_TERMINAL_RETENTION_SECS == 7 * 24 * 60 * 60);

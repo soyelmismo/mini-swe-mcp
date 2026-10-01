@@ -64,7 +64,7 @@ pub use self::revision::{
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
-    retire_expired_terminal_workers_in, retire_worker_in, save_worker_history,
+    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, save_worker_history,
     save_worker_history_in,
 };
 pub use self::runner::RunConfig;

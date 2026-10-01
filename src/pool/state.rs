@@ -388,7 +388,8 @@ mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
     use super::{
-        DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerRecord, WorkerState, expired_terminal_ids,
+        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerRecord,
+        WorkerState, expired_terminal_ids, retention_expired,
     };
     use std::collections::HashMap;
 
@@ -549,6 +550,33 @@ mod tests {
             vec!["old-done".to_string(), "old-failed".to_string()],
             "only aged terminal records may be evicted"
         );
+    }
+
+    #[test]
+    fn test_retention_expires_only_a_row_that_recorded_its_age() {
+        let now = unix_timestamp();
+        // Aged past the retention: the row goes even though its branch lives.
+        assert!(retention_expired(
+            now - DEFAULT_TERMINAL_RETENTION_SECS - 1,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
+        // Inside the retention: the row stays, so an orchestrator hours or
+        // days later still finds the worker continuable.
+        assert!(!retention_expired(
+            now - DEFAULT_TERMINAL_RETENTION_SECS + 60,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
+        // A row written before the field existed carries no age at all, and an
+        // unknown age must not be read as an ancient one.
+        assert!(!retention_expired(0, DEFAULT_TERMINAL_RETENTION_SECS, now));
+        // Clock skew is absorbed exactly as the TTL absorbs it.
+        assert!(!retention_expired(
+            now + 10_000,
+            DEFAULT_TERMINAL_RETENTION_SECS,
+            now
+        ));
     }
 
     #[test]
