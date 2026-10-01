@@ -69,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect' (final message; diff summarised unless 'full'/'files'), 'review' (one compact view of a finished worker), 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers each.",
+            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
         ),
     ),
     (
@@ -77,6 +77,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
+        ),
+    ),
+    (
+        "tasks",
+        "array",
+        DescriptionSource::Static(
+            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
         ),
     ),
     (
@@ -101,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted; the response always names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted. Required for 'status', 'steer', 'watch', 'collect', 'review', 'logs', and 'kill'.",
         ),
     ),
     (
@@ -113,26 +120,26 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker (failed, interrupted, killed): never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own (running or paused).",
+            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only watch workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
     ),
     (
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely. Prefer running `mini-swe-mcp watch` in the background.",
+            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely.",
         ),
     ),
     (
@@ -151,29 +158,27 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation, with a fresh context.",
+            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
         ),
     ),
     (
         "scope",
         "string",
         DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) is the calling agent's workers, 'all' is every agent's and needs the admin override.",
+            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
         ),
     ),
     (
         "full",
         "boolean",
-        DescriptionSource::Static(
-            "The whole diff instead of the default per-file stat. Optional for 'collect'.",
-        ),
+        DescriptionSource::Static("The whole diff. Optional for 'collect'."),
     ),
     (
         "files",
@@ -184,7 +189,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' runs every bash step in an isolated network namespace with no egress, 'allow' (default) keeps connectivity.",
+            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
         ),
     ),
 ];
@@ -250,6 +255,24 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     }
     if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
+    }
+    if name == "tasks" {
+        schema.insert(
+            "items".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "model": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "max_turns": { "type": "integer" },
+                    "verify": { "type": "string" },
+                    "group": { "type": "string" },
+                    "network": { "type": "string" },
+                },
+                "required": ["task"],
+            }),
+        );
     }
     if name == "temperature" {
         schema.insert(
@@ -412,6 +435,34 @@ mod tests {
         );
     }
 
+    /// Batch dispatch is advertised: `tasks` is an array of task objects, each
+    /// requiring `task`, and it stays optional like every other dispatch
+    /// property.
+    #[test]
+    fn tasks_property_advertises_the_batch_contract() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let tasks = &schema["properties"]["tasks"];
+
+        assert_eq!(tasks["type"], json!("array"));
+        assert_eq!(tasks["items"]["type"], json!("object"));
+        assert_eq!(tasks["items"]["required"], json!(["task"]));
+        for key in [
+            "task",
+            "model",
+            "repo_path",
+            "max_turns",
+            "verify",
+            "group",
+            "network",
+        ] {
+            assert!(
+                tasks["items"]["properties"].get(key).is_some(),
+                "the items schema must document '{key}': {tasks}"
+            );
+        }
+    }
+
     /// The tool description stays a calling contract: the waiting rule, the
     /// ownership rule, and a one-line pointer to the long-form topics.
     #[test]
@@ -467,5 +518,6 @@ mod tests {
 
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
+        assert!(text.contains("never dispatch a replacement"), "{text}");
     }
 }
