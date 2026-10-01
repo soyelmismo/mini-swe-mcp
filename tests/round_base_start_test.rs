@@ -1,7 +1,9 @@
 //! A continued worker integrates its consolidator's pinned base before turn one.
 mod common;
 
-use mini_swe_mcp::pool::{WorkerHistory, WorkerPool, WorkerState, save_worker_history_in};
+use mini_swe_mcp::pool::{
+    WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerState, save_worker_history_in,
+};
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use std::time::Duration;
 
@@ -50,19 +52,40 @@ async fn revision_start_does_not_integrate_the_moving_master_tip() {
     common::git(repo.path(), &["commit", "-m", "later master"]);
     let llm = common::fake_llm::FakeLlm::spawn("echo ASK_ORCHESTRATOR: inspect", "echo no").await;
     let pool = WorkerPool::with_scratch(1, llm.base_url().into(), "key".into(), root.clone());
-    pool.steer_with_budget("pinned", "continue".into(), Some(2))
-        .await
-        .unwrap();
-    // The actor writes attribution before delivery. The scheduled worker has
-    // not run until this test yields, so its first checkout sees this source.
-    std::fs::write(
-        root.join("swe-wt-pinned.steer-source"),
-        serde_json::to_vec(&serde_json::json!({
-            "consolidator": "actor", "round_base": base.trim(),
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let actor = WorkerMeta {
+        id: "actor".into(),
+        task: "consolidate".into(),
+        group: Some("round".into()),
+        role: mini_swe_mcp::pool::WorkerRole::Consolidate,
+        repo_path: Some(history.repo_path.clone()),
+        owner: "owner".into(),
+        started_at: 0,
+        pid: std::process::id(),
+        revision: 0,
+        auto_continues: 0,
+        metrics: WorkerMetrics::default(),
+        report: None,
+        verified: None,
+    };
+    let mut target = actor.clone();
+    target.id = "pinned".into();
+    target.role = mini_swe_mcp::pool::WorkerRole::Worker;
+    mini_swe_mcp::pool::save_registry_entry_in(
+        &root,
+        &target.entry(
+            "test-model",
+            mini_swe_mcp::pool::RegistryStatus::Completed,
+            2,
+            2,
+            "done",
+            None,
+        ),
+    );
+    std::fs::write(root.join("swe-wt-actor.round-base"), base.trim()).unwrap();
+    let observation = pool
+        .consolidate_steer(&actor, "pinned", "continue".into())
+        .await;
+    assert!(observation.contains("revising"), "{observation}");
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(
