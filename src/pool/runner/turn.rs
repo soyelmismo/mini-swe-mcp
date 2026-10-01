@@ -19,6 +19,12 @@
 //! `REQUEST_TURNS` may only add half the dispatch's budget,
 //! and every 20 turns the worktree is checkpoint-committed so a kill or a
 //! crash cannot lose the work.
+//!
+//! The read-only detector is the one guard with three steps, because a worker
+//! that ignored two nudges will ignore a third: it first demands the edit,
+//! then hands back the plan its own task spells out (see [`edit_plan`]), and
+//! finally parks the worker on the orchestrator instead of paying for more
+//! turns of reading.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -81,9 +87,41 @@ const READ_ONLY_NUDGE_TURNS: usize = 15;
 /// Environment override of the first read-only nudge threshold, in turns.
 const READ_ONLY_NUDGE_ENV: &str = "POOL_READ_ONLY_NUDGE_TURNS";
 
-/// Environment override of the read-only escalation threshold; defaults to
+/// Environment override of the threshold that carries the plan; defaults to
 /// twice the first threshold.
 const READ_ONLY_ESCALATE_ENV: &str = "POOL_READ_ONLY_ESCALATE_TURNS";
+
+/// Environment override of the threshold that parks the worker on the
+/// orchestrator; defaults to three times the first threshold.
+const READ_ONLY_PAUSE_ENV: &str = "POOL_READ_ONLY_PAUSE_TURNS";
+
+/// Files the edit plan names at most, so the nudge carrying it stays one
+/// sentence however path-heavy the dispatch is.
+const EDIT_PLAN_FILES: usize = 6;
+
+/// Identifiers the edit plan attaches to one file at most.
+const EDIT_PLAN_IDENTIFIERS: usize = 3;
+
+/// Words one backticked identifier may carry at most, which keeps a quoted
+/// sentence of prose out of the plan.
+const EDIT_PLAN_IDENTIFIER_WORDS: usize = 3;
+
+/// Bytes one identifier of the edit plan may occupy.
+const EDIT_PLAN_IDENTIFIER_BYTES: usize = 48;
+
+/// Bytes one path of the edit plan may occupy. Bounding the number of files is
+/// not enough on its own: a token with a file extension can be arbitrarily
+/// long, and the nudge that carries the plan stays one sentence only if each
+/// name in it is bounded too.
+const EDIT_PLAN_PATH_BYTES: usize = 120;
+
+/// Bytes of the dispatch the pause question quotes back, so a pause carries
+/// the spec without pasting a whole dispatch into the orchestrator's terminal.
+const TASK_QUESTION_BYTES: usize = 240;
+
+/// Distinct commands of a read-only streak the pause question quotes back, so
+/// the orchestrator sees what the worker spent its turns on.
+const READ_ONLY_RECENT_COMMANDS: usize = 4;
 
 /// Consecutive blocked repetitions of one command before the worker is parked
 /// on the orchestrator instead of being told to try something else.
@@ -101,21 +139,26 @@ fn stagnation_nudge() -> String {
 }
 
 /// Thresholds of the read-only detector: the consecutive read-only turns that
-/// earn the first nudge and the turns that earn its single escalation.
+/// earn each of its three steps.
 #[derive(Debug, Clone, Copy)]
 struct ReadOnlyThresholds {
     /// Consecutive read-only turns before the first "write the edit now" nudge.
     first: usize,
-    /// Consecutive read-only turns before the one escalation of that streak.
-    escalate: usize,
+    /// Consecutive read-only turns before the nudge that carries the plan.
+    plan: usize,
+    /// Consecutive read-only turns before the worker is parked on the
+    /// orchestrator to be told what to do.
+    pause: usize,
 }
 
 /// The read-only detector's defaults: the first nudge at
-/// [`READ_ONLY_NUDGE_TURNS`] and its escalation at twice that.
+/// [`READ_ONLY_NUDGE_TURNS`], the plan at twice that and the pause at three
+/// times.
 fn named_file_defaults() -> ReadOnlyThresholds {
     ReadOnlyThresholds {
         first: READ_ONLY_NUDGE_TURNS,
-        escalate: READ_ONLY_NUDGE_TURNS.saturating_mul(2),
+        plan: READ_ONLY_NUDGE_TURNS.saturating_mul(2),
+        pause: READ_ONLY_NUDGE_TURNS.saturating_mul(3),
     }
 }
 
@@ -132,7 +175,8 @@ fn read_only_thresholds(task: &str) -> Option<ReadOnlyThresholds> {
     let defaults = named_file_defaults();
     Some(ReadOnlyThresholds {
         first: env_threshold(READ_ONLY_NUDGE_ENV).unwrap_or(defaults.first),
-        escalate: env_threshold(READ_ONLY_ESCALATE_ENV).unwrap_or(defaults.escalate),
+        plan: env_threshold(READ_ONLY_ESCALATE_ENV).unwrap_or(defaults.plan),
+        pause: env_threshold(READ_ONLY_PAUSE_ENV).unwrap_or(defaults.pause),
     })
 }
 
@@ -157,25 +201,175 @@ fn env_threshold(name: &str) -> Option<usize> {
 /// A token counts as a path when it carries a dotted file extension or a
 /// directory separator; prose tokens with neither do not.
 fn task_names_files(task: &str) -> bool {
-    task.split_whitespace().any(|token| {
-        let token = token
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
-            .trim_end_matches('.');
-        if token.len() < 3 {
-            return false;
+    task.split_whitespace().any(is_path_token)
+}
+
+/// Whether `token` reads as a path or a file name: it carries a dotted file
+/// extension or a directory separator, and prose tokens with neither do not.
+fn is_path_token(token: &str) -> bool {
+    let token = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
+        .trim_end_matches('.');
+    if token.len() < 3 {
+        return false;
+    }
+    if token.contains('/') {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (2..=6).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphabetic())
         }
-        if token.contains('/') {
-            return true;
-        }
-        match token.rsplit_once('.') {
-            Some((stem, ext)) => {
-                !stem.is_empty()
-                    && (2..=6).contains(&ext.len())
-                    && ext.chars().all(|c| c.is_ascii_alphabetic())
+        None => false,
+    }
+}
+
+/// One file of the edit plan: the path the task named, and the identifiers
+/// quoted near it, so the plan points at a function rather than a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditPlanEntry {
+    path: String,
+    identifiers: Vec<String>,
+}
+
+/// The edit plan read back out of the dispatch: the files it names and the
+/// `fn`/type identifiers written next to them, in the order the task wrote
+/// them.
+///
+/// Pure and language-agnostic: a task in any language is mined for the paths
+/// and backticked identifiers it happens to carry.
+fn edit_plan(task: &str) -> Vec<EditPlanEntry> {
+    let mut entries: Vec<EditPlanEntry> = Vec::new();
+    // The file a backticked identifier belongs to: the last one the task named
+    // before it, so `fn foo` attaches to the file it was written next to.
+    let mut owner: Option<usize> = None;
+    // Identifiers quoted before any file was named, waiting for the first file
+    // the task writes afterwards.
+    let mut pending: Vec<String> = Vec::new();
+    // Alternating prose and quoted spans: a backticked name may carry spaces
+    // (`fn check_read_only`), so it is read between the backticks rather than
+    // token by token.
+    let mut quoted = false;
+    for span in task.split('`') {
+        if quoted {
+            quoted = false;
+            let span = span.trim();
+            // A dispatch that writes its paths in backticks names files just as
+            // plainly as one that writes them bare, so a quoted path is a file
+            // of the plan in its own right -- never an identifier of the file
+            // named before it.
+            if let Some(path) = quoted_path(span) {
+                owner = note_path(&mut entries, &path, &mut pending);
+                continue;
             }
-            None => false,
+            if let Some(index) = owner.filter(|_| !entries.is_empty()) {
+                let entry = entries.get_mut(index).expect("owner is in range");
+                if entry.identifiers.len() < EDIT_PLAN_IDENTIFIERS && is_identifier(span) {
+                    entry.identifiers.push(span.to_string());
+                }
+            } else if pending.len() < EDIT_PLAN_IDENTIFIERS && is_identifier(span) {
+                pending.push(span.to_string());
+            }
+            continue;
         }
-    })
+        quoted = true;
+        // Prose is scanned in the order it is written, so the plan lists the
+        // files as the task listed them.
+        for token in span.split_whitespace() {
+            let Some(path) = path_of(token) else { continue };
+            owner = note_path(&mut entries, &path, &mut pending);
+        }
+    }
+    entries
+}
+
+/// Record `path` as a file of the plan and report the entry it belongs to.
+///
+/// Files are kept in the order the task named them and capped, so a path past
+/// the cap is named in no entry; identifiers quoted before a file waited for
+/// it, because a task names the function and then the file it lives in as often
+/// as the other way round.
+fn note_path(
+    entries: &mut Vec<EditPlanEntry>,
+    path: &str,
+    pending: &mut Vec<String>,
+) -> Option<usize> {
+    if let Some(index) = entries.iter().position(|e| e.path == path) {
+        return Some(index);
+    }
+    if entries.len() >= EDIT_PLAN_FILES {
+        return None;
+    }
+    entries.push(EditPlanEntry {
+        path: path.to_string(),
+        identifiers: std::mem::take(pending),
+    });
+    Some(entries.len() - 1)
+}
+
+/// The path a backticked span names, or `None` when it names none.
+///
+/// A span carrying whitespace is a quoted sentence or a multi-word name, not a
+/// path, however much of it reads like one.
+fn quoted_path(span: &str) -> Option<String> {
+    if span.is_empty() || span.chars().any(char::is_whitespace) {
+        return None;
+    }
+    path_of(span)
+}
+
+/// The path a whitespace token names, or `None` when it names none. Sentence
+/// punctuation around the token is not part of the path, so `src/a.rs,` and
+/// `src/a.rs.` are both read as `src/a.rs`.
+fn path_of(token: &str) -> Option<String> {
+    let token = token
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && !"./_-".contains(c))
+        .trim_end_matches('.');
+    (token.len() <= EDIT_PLAN_PATH_BYTES && is_path_token(token)).then(|| token.to_string())
+}
+
+/// Whether a backticked span reads as an identifier -- `fn x`, a type name, a
+/// command -- rather than as a sentence of prose: it is at most a few words
+/// long and every character is one an identifier, a call or a flag is written
+/// with, so a quoted sentence of the dispatch stays out of the plan.
+///
+/// Alphanumerics are Unicode, not ASCII: the extractor is language-agnostic,
+/// and a name like `vérifier` is as ordinary in a dispatch as `verify`.
+fn is_identifier(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() || text.len() > EDIT_PLAN_IDENTIFIER_BYTES {
+        return false;
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.len() <= EDIT_PLAN_IDENTIFIER_WORDS
+        && words.iter().all(|word| {
+            word.chars()
+                .all(|c| c.is_alphanumeric() || "_-.:,()[]<>*&'!/=+".contains(c))
+        })
+}
+
+/// The plan half of the second nudge: the files and identifiers the task itself
+/// named, ready to act on. A dispatch that names a file the extractor cannot
+/// read still gets the demand, so the nudge is never a sentence with a hole in
+/// it.
+fn edit_plan_text(entries: &[EditPlanEntry]) -> String {
+    if entries.is_empty() {
+        return "Edit now. Open the file the task names and Write the first change in your next command.".to_string();
+    }
+    let files = entries
+        .iter()
+        .map(|entry| {
+            if entry.identifiers.is_empty() {
+                entry.path.clone()
+            } else {
+                format!("{} ({})", entry.path, entry.identifiers.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Edit now. Files the task names: {files}. Write the first change in your next command.")
 }
 
 /// The read-only detector's verdict for one turn.
@@ -183,8 +377,10 @@ fn task_names_files(task: &str) -> bool {
 enum ReadOnlyNudge {
     /// The first nudge of this streak, at the first threshold.
     First { read_only_turns: usize },
-    /// The single escalation, at twice the first threshold.
-    Escalated { read_only_turns: usize },
+    /// The nudge that carries the task's own plan, at the second threshold.
+    Plan { read_only_turns: usize },
+    /// The last step: park the worker on the orchestrator, at the third.
+    Pause { read_only_turns: usize },
 }
 
 /// Consecutive read-only turns and the nudges that streak has already earned.
@@ -200,14 +396,56 @@ struct ReadOnlyStreak {
     read_only_turns: usize,
     /// The first nudge has been sent for this streak.
     nudged: bool,
-    /// The escalation has been sent for this streak.
-    escalated: bool,
+    /// The plan-carrying nudge has been sent for this streak.
+    planned: bool,
+    /// The orchestrator pause has been sent for this streak.
+    paused: bool,
+    /// Summaries of the distinct commands this streak has run, oldest first,
+    /// so a pause question can say what the worker spent its turns on.
+    recent_commands: Vec<String>,
 }
 
 impl ReadOnlyStreak {
-    /// Fold one turn's repository sample in and report the nudge, if any, it
-    /// earns. The first threshold fires once per streak, the escalation once
-    /// at twice the threshold, and nothing here can fail the worker.
+    /// Remember one command of the streak, keeping the newest few distinct
+    /// summaries: the pause question quotes them back, and an unbounded list
+    /// would grow with every turn a worker only reads.
+    ///
+    /// Folded in by [`ProgressWatch::register_command`], the one place the
+    /// repetition detector sees each command too, rather than at execution
+    /// time.
+    fn note_command(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        let summary = summarize_command(command);
+        if let Some(index) = self.recent_commands.iter().position(|c| *c == summary) {
+            // Move it to the newest slot instead of duplicating it: a loop
+            // over the same two reads stays a two-command summary.
+            self.recent_commands.remove(index);
+        } else {
+            while self.recent_commands.len() >= READ_ONLY_RECENT_COMMANDS {
+                self.recent_commands.remove(0);
+            }
+        }
+        self.recent_commands.push(summary);
+    }
+
+    /// What this streak read, as one clause for the pause question.
+    fn read_summary(&self) -> String {
+        if self.recent_commands.is_empty() {
+            return "no command recorded".to_string();
+        }
+        self.recent_commands.join("; ")
+    }
+}
+
+impl ReadOnlyStreak {
+    /// Fold one turn's repository sample in, remember the command the turn
+    /// ran, and report the nudge, if any, the streak has earned. Each of the
+    /// three thresholds fires once per streak and in order, so a streak of
+    /// unchanged worktree reaches the plan and then the pause no matter where
+    /// its thresholds sit.
     ///
     /// `None` is a sample git could not answer: it is not evidence of progress,
     /// so it neither extends nor resets the streak.
@@ -220,7 +458,9 @@ impl ReadOnlyStreak {
         if self.last_sample.as_deref() != Some(sample.as_str()) {
             self.read_only_turns = 0;
             self.nudged = false;
-            self.escalated = false;
+            self.planned = false;
+            self.paused = false;
+            self.recent_commands.clear();
             self.last_sample = Some(sample);
             return None;
         }
@@ -231,9 +471,15 @@ impl ReadOnlyStreak {
                 read_only_turns: self.read_only_turns,
             });
         }
-        if self.nudged && !self.escalated && self.read_only_turns >= limits.escalate {
-            self.escalated = true;
-            return Some(ReadOnlyNudge::Escalated {
+        if self.nudged && !self.planned && self.read_only_turns >= limits.plan {
+            self.planned = true;
+            return Some(ReadOnlyNudge::Plan {
+                read_only_turns: self.read_only_turns,
+            });
+        }
+        if self.planned && !self.paused && self.read_only_turns >= limits.pause {
+            self.paused = true;
+            return Some(ReadOnlyNudge::Pause {
                 read_only_turns: self.read_only_turns,
             });
         }
@@ -249,12 +495,40 @@ fn read_only_nudge_text(read_only_turns: usize) -> String {
     )
 }
 
-/// The single escalation of a read-only streak: it repeats the demand and says
-/// outright that exploring is not fatal, because it never is.
-fn read_only_escalation_text(read_only_turns: usize) -> String {
+/// The second nudge of a read-only streak: the demand, plus the plan the task
+/// itself spells out, because a worker that kept reading past the first nudge
+/// is not short of permission but of a next step.
+fn read_only_plan_text(read_only_turns: usize, plan: &str) -> String {
+    format!("Still no edit after {read_only_turns} read-only turns. {plan}")
+}
+
+/// The last step of a read-only streak: the question parked on the orchestrator,
+/// naming what the worker read and that it has not edited, so the decision is
+/// taken off the worker's own turn budget.
+fn read_only_pause_question(read_only_turns: usize, task: &str, read: &str) -> String {
     format!(
-        "Still no edit after {read_only_turns} read-only turns. Stop reading: write the change now, or ASK_ORCHESTRATOR what is missing. This is a nudge, not a failure."
+        "No edit after {read_only_turns} read-only turns. Read so far: {read}. Task: {}. The worker is still exploring and has not written a change; it was handed the plan its task names. Decide: point it at the first edit, or steer it elsewhere.",
+        summarized_task(task)
     )
+}
+
+/// The task trimmed to one line of [`TASK_QUESTION_BYTES`], so a pause
+/// question carries the spec without pasting a whole dispatch into the
+/// orchestrator's terminal.
+fn summarized_task(task: &str) -> String {
+    // The question supplies its own punctuation, so a trailing full stop on the
+    // dispatch would make a doubled one.
+    let one_line = task
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches('.')
+        .to_string();
+    if one_line.len() <= TASK_QUESTION_BYTES {
+        return one_line;
+    }
+    let cut = one_line.floor_char_boundary(TASK_QUESTION_BYTES.saturating_sub(3));
+    format!("{}...", &one_line[..cut])
 }
 
 /// Turns a worker may self-grant through `REQUEST_TURNS`: half of the budget
@@ -416,6 +690,10 @@ impl ProgressWatch {
     /// turns it repeats, or `None` when it is a fresh command.
     fn register_command(&mut self, command: &str) -> Option<usize> {
         let command = command.trim();
+        // The read-only detector is folded at the top of the next turn, so this
+        // turn's command is noted here: a pause raised on that turn has to
+        // report what the worker actually read.
+        self.read_only.note_command(command);
         if self.last_command.as_deref() == Some(command) {
             self.repeat_blocks += 1;
             Some(self.repeat_blocks)
@@ -647,7 +925,7 @@ impl<'a> TurnEngine<'a> {
 
         // --- Change detectors (implementer only, like the sentinels) ---
         if config.apply_sentinels {
-            self.check_changes(config).await;
+            self.check_changes(config).await?;
         }
 
         // --- LLM call with error handling ---
@@ -1544,17 +1822,18 @@ impl<'a> TurnEngine<'a> {
     /// (a dispatch that names a file to edit); otherwise it keeps the
     /// [`STAGNATION_SAMPLE_TURNS`] cadence it has today, so a dispatch that
     /// names no file pays nothing new.
-    async fn check_changes(&mut self, config: &TurnConfig<'_>) {
+    async fn check_changes(&mut self, config: &TurnConfig<'_>) -> Result<()> {
         let read_only = read_only_thresholds(config.task);
         let stagnation_due = *self.step > 0 && (*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS);
         if read_only.is_none() && !stagnation_due {
-            return;
+            return Ok(());
         }
         let sample = self.sample_repository().await;
         self.check_stagnation(sample.clone());
         if let Some(limits) = read_only {
-            self.check_read_only(sample, limits);
+            self.check_read_only(config, sample, limits).await?;
         }
+        Ok(())
     }
 
     /// Tell a worker that stopped changing anything to make the edit or
@@ -1578,32 +1857,92 @@ impl<'a> TurnEngine<'a> {
     }
 
     /// Tell a worker whose worktree has not changed for a run of turns to make
-    /// its first edit, and escalate once at twice that budget.
+    /// its first edit, hand it the plan its own task spells out when the first
+    /// nudge is ignored, and park it on the orchestrator when that is ignored
+    /// too.
     ///
     /// Only called for a dispatch whose spec already named the files to edit,
     /// where a long read-only streak means the worker is stuck rather than
     /// still looking for the code, so the streak is counted per turn rather
-    /// than per [`STAGNATION_SAMPLE_TURNS`] window. The detector only ever
-    /// injects guidance: it never ends the worker.
-    fn check_read_only(&mut self, sample: Option<String>, limits: ReadOnlyThresholds) {
+    /// than per [`STAGNATION_SAMPLE_TURNS`] window. The first two steps only
+    /// inject guidance; the third hands the decision to the orchestrator,
+    /// because a worker that has already ignored two nudges will not read a
+    /// third.
+    async fn check_read_only(
+        &mut self,
+        config: &TurnConfig<'_>,
+        sample: Option<String>,
+        limits: ReadOnlyThresholds,
+    ) -> Result<()> {
         let Some(nudge) = self.watch.read_only.record(sample, limits) else {
-            return;
+            return Ok(());
         };
         self.meta.metrics.stagnation_nudges += 1;
+        let read_only_turns = self.watch.read_only.read_only_turns;
         warn!(
             worker = %self.worker_id,
             step = *self.step,
-            read_only_turns = self.watch.read_only.read_only_turns,
+            read_only_turns,
             first_threshold = limits.first,
-            "Worker has only been reading; nudging it to make the first edit"
+            "Worker has only been reading; escalating past the nudge"
         );
-        let text = match nudge {
-            ReadOnlyNudge::First { read_only_turns } => read_only_nudge_text(read_only_turns),
-            ReadOnlyNudge::Escalated { read_only_turns } => {
-                read_only_escalation_text(read_only_turns)
+        match nudge {
+            ReadOnlyNudge::First { read_only_turns } => {
+                let text = read_only_nudge_text(read_only_turns);
+                self.push_message(ChatMessage::text(Role::User, text));
             }
+            ReadOnlyNudge::Plan { read_only_turns } => {
+                let plan = edit_plan_text(&edit_plan(config.task));
+                self.push_message(ChatMessage::text(
+                    Role::User,
+                    read_only_plan_text(read_only_turns, &plan),
+                ));
+            }
+            ReadOnlyNudge::Pause { read_only_turns } => {
+                let question = read_only_pause_question(
+                    read_only_turns,
+                    config.task,
+                    &self.watch.read_only.read_summary(),
+                );
+                self.pause_on_read_only(config, &question).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Park a worker whose second nudge was ignored and wait for the
+    /// orchestrator's decision, then hand that decision to the worker as
+    /// guidance for the turn after it.
+    async fn pause_on_read_only(&mut self, config: &TurnConfig<'_>, question: &str) -> Result<()> {
+        self.meta.metrics.loop_pauses += 1;
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: &format!("paused_read_only: {question}"),
+                model: config.model,
+                meta: self.meta,
+            })
+            .await?;
+        let Some(answer) = answer else {
+            return Ok(());
         };
-        self.push_message(ChatMessage::text(Role::User, text));
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            msg = %answer,
+            "Worker resumed from read-only pause by orchestrator guidance"
+        );
+        if !answer.trim().is_empty() && answer.trim() != "resume" {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Run through resource admission and the bash semaphore, retaining both
@@ -1884,11 +2223,12 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
-        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
-        STAGNATION_SAMPLE_TURNS, append_report_text, extension_budget, named_file_defaults,
-        parse_shortstat, parse_threshold, read_only_escalation_text, read_only_nudge_text,
-        read_only_thresholds, task_names_files,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch,
+        READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
+        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, named_file_defaults,
+        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
+        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2046,14 +2386,15 @@ mod tests {
         );
     }
 
-    /// The read-only detector over a sequence of samples: the first nudge
-    /// lands on the threshold turn, an edit resets the streak, and the
-    /// escalation fires exactly once at twice the threshold.
+    /// The read-only detector over a sequence of samples: each of its three
+    /// steps lands on its threshold turn exactly once, an edit resets the
+    /// streak, and the next streak starts over from the first nudge.
     #[test]
-    fn a_read_only_streak_nudges_at_the_threshold_and_escalates_once() {
+    fn a_read_only_streak_walks_its_three_steps_once_each() {
         let limits = ReadOnlyThresholds {
             first: 3,
-            escalate: 6,
+            plan: 6,
+            pause: 9,
         };
         let mut streak = ReadOnlyStreak::default();
         let same = || Some("head-a\nstat".to_string());
@@ -2075,12 +2416,25 @@ mod tests {
         assert_eq!(streak.record(same(), limits), None);
         assert_eq!(
             streak.record(same(), limits),
-            Some(ReadOnlyNudge::Escalated { read_only_turns: 6 })
+            Some(ReadOnlyNudge::Plan { read_only_turns: 6 }),
+            "the second threshold carries the plan"
+        );
+        for turns in 7..limits.pause {
+            assert_eq!(
+                streak.record(same(), limits),
+                None,
+                "no pause after only {turns} read-only turns"
+            );
+        }
+        assert_eq!(
+            streak.record(same(), limits),
+            Some(ReadOnlyNudge::Pause { read_only_turns: 9 }),
+            "the third threshold parks the worker on the orchestrator"
         );
         assert_eq!(
             streak.record(same(), limits),
             None,
-            "the escalation is sent once per streak"
+            "the pause is sent once per streak"
         );
         // An edit resets the streak, and the next streak nudges again: the
         // sample taken right after the edit is the new baseline.
@@ -2100,18 +2454,39 @@ mod tests {
         );
     }
 
-    /// Both read-only nudges name the streak and offer the worker the two ways
-    /// out; the escalation says outright that exploring is not a failure.
+    /// The first read-only nudge names the streak and offers the worker the
+    /// two ways out.
     #[test]
-    fn the_read_only_nudges_offer_an_edit_or_a_question() {
+    fn the_first_read_only_nudge_offers_an_edit_or_a_question() {
         let first = read_only_nudge_text(15);
         assert!(first.contains("read 15 files"), "got {first:?}");
         assert!(first.contains("write the first edit now"), "got {first:?}");
         assert!(first.contains("ASK_ORCHESTRATOR"), "got {first:?}");
-        let escalated = read_only_escalation_text(30);
-        assert!(escalated.contains("Stop reading"), "got {escalated:?}");
-        assert!(escalated.contains("ASK_ORCHESTRATOR"), "got {escalated:?}");
-        assert!(escalated.contains("not a failure"), "got {escalated:?}");
+    }
+
+    /// The pause question is the third step's whole output: it names the streak,
+    /// quotes back what the worker read, and hands the decision to the
+    /// orchestrator instead of letting it read on.
+    #[test]
+    fn the_read_only_pause_question_hands_the_decision_to_the_orchestrator() {
+        let question = read_only_pause_question(
+            45,
+            "Fix the guard in src/pool/runner/turn.rs",
+            "grep -rn nudge src/; sed -n 1,80p src/pool/runner/turn.rs",
+        );
+        assert!(question.contains("45 read-only turns"), "got {question:?}");
+        assert!(
+            question.contains("grep -rn nudge src/"),
+            "the orchestrator is not told what the worker read: {question:?}"
+        );
+        assert!(
+            question.contains("has not written a change"),
+            "got {question:?}"
+        );
+        assert!(
+            question.contains("src/pool/runner/turn.rs"),
+            "got {question:?}"
+        );
     }
 
     /// A sample git could not answer is not evidence of progress: it neither
@@ -2120,7 +2495,8 @@ mod tests {
     fn an_unreadable_sample_leaves_a_read_only_streak_alone() {
         let limits = ReadOnlyThresholds {
             first: 2,
-            escalate: 4,
+            plan: 4,
+            pause: 6,
         };
         let mut streak = ReadOnlyStreak::default();
         assert_eq!(streak.record(Some("a".to_string()), limits), None);
@@ -2136,6 +2512,162 @@ mod tests {
         );
     }
 
+    /// The plan is read out of the dispatch the way a dispatch is written:
+    /// a path, then the identifiers quoted next to it, in order and deduped.
+    #[test]
+    fn the_edit_plan_names_the_files_and_identifiers_the_task_writes() {
+        let task = "TASK: [harness-E27] In src/pool/runner/turn.rs, add the plan \
+                    to the second read-only nudge; the detector is `record` and \
+                    the text is `read_only_nudge_text`. Then update tests/pool_test.rs.";
+        let plan = edit_plan(task);
+        assert_eq!(plan.len(), 2, "got {plan:?}");
+        assert_eq!(plan[0].path, "src/pool/runner/turn.rs");
+        assert_eq!(plan[0].identifiers, ["record", "read_only_nudge_text"]);
+        assert_eq!(plan[1].path, "tests/pool_test.rs");
+        assert!(plan[1].identifiers.is_empty(), "got {plan:?}");
+    }
+
+    /// A dispatch writes its paths in backticks about as often as bare, and a
+    /// quoted path names a file of the plan exactly as a bare one does -- it is
+    /// never mistaken for an identifier of the file named before it.
+    #[test]
+    fn a_backticked_path_names_a_file_of_the_plan() {
+        let plan = edit_plan("edit `src/a.rs` and `app/main.py`, then `src/a.rs` again");
+        assert_eq!(
+            plan.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["src/a.rs", "app/main.py"],
+            "a quoted path must be a file, deduplicated and in the order written"
+        );
+        assert!(
+            plan.iter().all(|e| e.identifiers.is_empty()),
+            "a quoted path is a file, not an identifier: {plan:?}"
+        );
+        // A quoted path still owns the identifiers written after it.
+        let owned = edit_plan("touch `src/a.rs` and `fn helper`");
+        assert_eq!(owned[0].path, "src/a.rs");
+        assert_eq!(owned[0].identifiers, ["fn helper"]);
+        // A quoted span carrying whitespace is a name or a sentence, not a
+        // path, so it stays an identifier.
+        let named = edit_plan("call `src/a.rs` from `fn main`");
+        assert_eq!(named[0].identifiers, ["fn main"]);
+    }
+
+    /// A plan is bounded per name as well as per file count: an arbitrarily
+    /// long token with a file extension cannot drag a wall of text into the
+    /// nudge, and a name outside ASCII is read the same way an ASCII one is.
+    #[test]
+    fn the_edit_plan_bounds_each_name_and_reads_non_ascii_names() {
+        // Bounded per file count, but each name is long enough to matter.
+        let long_name = format!("src/{}.rs", "a".repeat(400));
+        let plan = edit_plan(&format!("edit {long_name}"));
+        assert!(
+            plan.is_empty(),
+            "a path past the byte cap must not enter the plan: {} bytes",
+            long_name.len()
+        );
+        let just_over = format!("src/{}.rs", "b".repeat(EDIT_PLAN_PATH_BYTES));
+        assert!(
+            just_over.len() > EDIT_PLAN_PATH_BYTES,
+            "the fixture must actually exceed the cap"
+        );
+        assert!(edit_plan(&format!("edit {just_over}")).is_empty());
+
+        // A non-ASCII path and identifier are ordinary names, not prose.
+        let unicode = edit_plan("mettre à jour `src/données.rs` : `fn vérifier`");
+        assert_eq!(unicode[0].path, "src/données.rs");
+        assert_eq!(unicode[0].identifiers, ["fn vérifier"]);
+    }
+
+    /// The extractor is language-agnostic: it mines whatever paths and
+    /// backticked names a task carries, and bounds both, so a path-heavy or a
+    /// prose-heavy dispatch cannot grow the nudge without limit.
+    #[test]
+    fn the_edit_plan_is_bounded_and_language_agnostic() {
+        let many: String = (0..20).map(|i| format!("edit src/mod{i}.rs ")).collect();
+        let plan = edit_plan(&many);
+        assert_eq!(plan.len(), EDIT_PLAN_FILES, "got {} entries", plan.len());
+        // Names beyond the per-file cap are dropped, not all of them kept.
+        let many_names = "edit a.rs: `one` `two` `three` `four` `five`";
+        assert_eq!(
+            edit_plan(many_names)[0].identifiers,
+            ["one", "two", "three"]
+        );
+        // A task names the function before the file it lives in as often as the
+        // other way round, so a leading identifier attaches to the file after it.
+        let leading = edit_plan("add the plan to `fn check_read_only` in src/lib.rs.");
+        assert_eq!(leading[0].path, "src/lib.rs");
+        assert_eq!(leading[0].identifiers, ["fn check_read_only"]);
+        // A quoted sentence of prose is not an identifier.
+        let prose = "fix a.rs: `the parser drops the last token when it sees one`";
+        assert!(
+            edit_plan(prose)[0].identifiers.is_empty(),
+            "prose leaked into the plan: {:?}",
+            edit_plan(prose)
+        );
+        // A task that names identifiers but no file has no plan to hand back.
+        assert!(edit_plan("change `read_only_nudge_text` to be louder").is_empty());
+        // Every language's file names come out the same way.
+        let multi = "tweak src/a.rs, app/main.py and web/index.ts";
+        assert_eq!(
+            edit_plan(multi)
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.rs", "app/main.py", "web/index.ts"]
+        );
+    }
+
+    /// The second nudge carries the plan in the form the task asked for, and
+    /// an identifier rides along with the file it was written next to.
+    #[test]
+    fn the_plan_nudge_reads_as_one_editable_sentence() {
+        let plan = edit_plan("edit src/pool/runner/turn.rs, `fn check_read_only`");
+        let text = read_only_plan_text(30, &edit_plan_text(&plan));
+        assert!(text.contains("Edit now."), "got {text:?}");
+        assert!(
+            text.contains("Files the task names: src/pool/runner/turn.rs (fn check_read_only)."),
+            "got {text:?}"
+        );
+        assert!(
+            text.ends_with("Write the first change in your next command."),
+            "got {text:?}"
+        );
+        assert!(text.contains("30 read-only turns"), "got {text:?}");
+    }
+
+    /// A task whose paths the extractor cannot read still gets a whole second
+    /// nudge, not a sentence with an empty list in it.
+    #[test]
+    fn an_unreadable_task_still_gets_a_whole_plan_nudge() {
+        let text = read_only_plan_text(30, &edit_plan_text(&edit_plan("fix the failing test")));
+        assert!(!text.contains("task names: ."), "got {text:?}");
+        assert!(text.contains("Edit now."), "got {text:?}");
+        assert!(
+            text.ends_with("Write the first change in your next command."),
+            "got {text:?}"
+        );
+    }
+
+    /// The dispatch quoted into a pause question is trimmed to a length a
+    /// terminal can show, and a short one is left whole.
+    #[test]
+    fn a_pause_question_quotes_a_bounded_dispatch() {
+        assert_eq!(summarized_task("fix src/a.rs"), "fix src/a.rs");
+        // A dispatch ending in a full stop must not double it: the question
+        // supplies its own punctuation.
+        assert_eq!(summarized_task("fix src/a.rs."), "fix src/a.rs");
+        let long: String = std::iter::repeat_n("word", 200)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let trimmed = summarized_task(&long);
+        assert!(
+            trimmed.len() <= TASK_QUESTION_BYTES,
+            "got {}",
+            trimmed.len()
+        );
+        assert!(trimmed.ends_with("..."), "got {trimmed:?}");
+    }
+
     /// A dispatch that already names the files to edit gets the read-only
     /// detector and its earlier budget; one that names none leaves the detector
     /// off, so the existing stagnation timing stands for it.
@@ -2143,7 +2675,8 @@ mod tests {
     fn only_a_task_that_names_files_gets_the_read_only_detector() {
         let defaults = named_file_defaults();
         assert_eq!(defaults.first, READ_ONLY_NUDGE_TURNS);
-        assert_eq!(defaults.escalate, 2 * READ_ONLY_NUDGE_TURNS);
+        assert_eq!(defaults.plan, 2 * READ_ONLY_NUDGE_TURNS);
+        assert_eq!(defaults.pause, 3 * READ_ONLY_NUDGE_TURNS);
         assert!(read_only_thresholds("edit src/pool/runner/turn.rs, see `Cargo.toml`").is_some());
         assert!(read_only_thresholds("fix the failing test").is_none());
     }

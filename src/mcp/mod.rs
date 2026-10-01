@@ -15,7 +15,7 @@
 //! * `server` — [`McpServer`] itself: construction, the `initialize`
 //!   handshake, the stdio run loop and the shared wait loop.
 
-mod events;
+pub(crate) mod events;
 mod handlers;
 mod protocol;
 mod schema;

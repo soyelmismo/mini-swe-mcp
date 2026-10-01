@@ -167,6 +167,27 @@ pub struct WorkerRegistryEntry {
     /// written before the flag was recorded readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// Workers whose branches a consolidator merged into its own branch, in
+    /// merge order. Recorded on the consolidator's row because that row is the
+    /// only durable record of the round it integrated: when the consolidator
+    /// itself is merged, every worker it absorbed is fully integrated too and
+    /// is retired with it.
+    ///
+    /// `#[serde(default)]` keeps a row written before consolidators recorded
+    /// their round readable; such a consolidator falls back to the sweep, which
+    /// proves each worker's branch is merged by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrated: Vec<String>,
+    /// The operator asked to keep this worker's branch (`merge --no-delete`).
+    ///
+    /// Durable, unlike a one-off sweep exemption: the retirement sweep skips a
+    /// row that carries it while the branch still exists, so the explicit
+    /// decision survives the sweep that runs seconds after the merge and every
+    /// later pass. Once the branch is gone -- deleted by hand, or merged again
+    /// without `--no-delete` -- the flag protects nothing and the worker retires
+    /// normally.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_branch: bool,
 }
 
 impl WorkerRegistryEntry {
@@ -204,6 +225,8 @@ impl WorkerRegistryEntry {
             report: None,
             approved: None,
             verified: None,
+            integrated: Vec::new(),
+            keep_branch: false,
         }
     }
 }
@@ -306,6 +329,8 @@ impl WorkerMeta {
             report: self.report.clone(),
             approved: None,
             verified: self.verified,
+            integrated: Vec::new(),
+            keep_branch: false,
         }
     }
 
@@ -373,6 +398,36 @@ impl RegistryWriter {
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
     pub fn save(&mut self, entry: WorkerRegistryEntry) {
+        // A consolidator records the round it integrated on its own row, and
+        // that list is written by a *different* code path than the status
+        // updates. Every status write rebuilds the row from `WorkerMeta`, which
+        // knows nothing about the round, so merging the two halves here is what
+        // makes the list survive the consolidator's own completion: without it,
+        // the very next step would erase the round and the workers it names
+        // could never be retired. The writer is the single choke point every
+        // registry write passes through, so this is the one place that has to
+        // know.
+        let mut entry = entry;
+        // Merge, never replace: a status write rebuilds the row from
+        // `WorkerMeta`, which knows nothing about the round or the operator's
+        // keep decision. The *union* of the writer's cache and the row on disk
+        // is used, not the cache alone, so a round (or a second merge) recorded
+        // by another process while this one held its own stale cache is not
+        // lost -- preferring the cache would silently drop it.
+        // *Both* sources are unioned, not just the first that answers: the cache
+        // holds what this writer wrote, and the disk holds what another process
+        // wrote meanwhile (a later `CONSOLIDATE_MERGE`, an operator's keep). A
+        // cache-first fallback would drop the disk-only additions.
+        let cached = self.rows.get(&entry.id).cloned();
+        let on_disk = super::load_registry_entry_in(&self.root, &entry.id);
+        for known in [cached, on_disk].into_iter().flatten() {
+            for id in known.integrated {
+                if !entry.integrated.contains(&id) {
+                    entry.integrated.push(id);
+                }
+            }
+            entry.keep_branch |= known.keep_branch;
+        }
         let now = Instant::now();
         let transition = self
             .rows

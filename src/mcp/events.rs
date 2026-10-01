@@ -484,6 +484,54 @@ impl Drop for WatchGuard {
 
 /// File name of the persisted per-owner acknowledged watch positions.
 const WATCH_ACKS_FILE: &str = "watch_acks.json";
+
+/// Drop every acknowledged watch position that names `worker_id`.
+///
+/// The file is rewritten atomically at 0600, and a store that is missing or
+/// unreadable is left exactly as it is: dropping positions only ever costs a
+/// replay, so a failed write must never fail a retirement. Called when a
+/// worker is retired, because its events can never fire again and a stale
+/// entry would otherwise pin a key in the bounded store forever.
+pub(crate) fn forget_watch_acks(dir: &Path, worker_id: &str) {
+    let path = dir.join(WATCH_ACKS_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut positions) =
+        serde_json::from_str::<BTreeMap<String, BTreeMap<String, AckPosition>>>(&text)
+    else {
+        return;
+    };
+    if !positions
+        .values()
+        .any(|workers| workers.contains_key(worker_id))
+    {
+        return;
+    }
+    for workers in positions.values_mut() {
+        workers.remove(worker_id);
+    }
+    positions.retain(|_, workers| !workers.is_empty());
+    let Ok(rendered) = serde_json::to_string(&positions) else {
+        return;
+    };
+    write_private_atomic(&path, rendered.as_bytes());
+}
+
+/// Replace `path` with `bytes` at mode 0600, atomically.
+///
+/// Shared with [`AckStore::persist`] so the ack store has exactly one writer
+/// and one permission story.
+fn write_private_atomic(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
 /// How many owners the persisted store keeps, least recently
 /// acknowledged evicted first.
 const MAX_ACK_OWNERS: usize = 1024;
@@ -594,6 +642,22 @@ impl AckStore {
         self.persist();
     }
 
+    /// Drop every position that names `worker_id`, in memory and on disk.
+    ///
+    /// The in-memory map is edited *first*, under the router's own lock, so the
+    /// next `persist` from any other owner cannot resurrect the entry this
+    /// removed. A separate file-only edit would race that persist and lose.
+    fn forget(&mut self, worker_id: &str) {
+        let mut dropped = false;
+        for workers in self.positions.values_mut() {
+            dropped |= workers.remove(worker_id).is_some();
+        }
+        self.positions.retain(|_, workers| !workers.is_empty());
+        if dropped {
+            self.persist();
+        }
+    }
+
     /// Keep the store bounded, evicting the least recently acknowledged
     /// owner, then the least recently acknowledged worker of every owner.
     fn trim(&mut self) {
@@ -633,7 +697,6 @@ impl AckStore {
 
     /// Write the store atomically at 0600. A failure is logged, never fatal.
     fn persist(&self) {
-        use std::os::unix::fs::PermissionsExt;
         let Some(path) = &self.path else {
             return;
         };
@@ -653,13 +716,7 @@ impl AckStore {
         let Ok(text) = serde_json::to_string(&positions) else {
             return;
         };
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, text.as_bytes()).is_ok() {
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-            if std::fs::rename(&tmp, path).is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
+        write_private_atomic(path, text.as_bytes());
     }
 }
 
@@ -711,6 +768,28 @@ impl EventRouter {
             }
         }
         self.connections.insert(ctx.id, (agent, ctx.is_admin(), tx));
+    }
+
+    /// Forget every trace of a retired `worker_id`.
+    ///
+    /// Called on the router's own lock, so the in-memory store and its file
+    /// cannot drift: the edit happens between two `persist` calls rather than
+    /// racing one. It drops the *whole* replay state, not only the acknowledged
+    /// positions: a queued or already-reported event for a retired worker would
+    /// otherwise be delivered to a session that starts after the retirement,
+    /// telling its owner to review work that is already in the base branch.
+    pub(super) fn forget_worker(&mut self, worker_id: &str) {
+        self.acks.forget(worker_id);
+        self.seen.remove(worker_id);
+        self.watch_reported.remove(worker_id);
+        self.watch_current.remove(worker_id);
+        self.latest
+            .retain(|(_, event)| event.worker_id != worker_id);
+        for history in self.watch_history.values_mut() {
+            history
+                .pending
+                .retain(|event| event["worker_id"] != worker_id);
+        }
     }
 
     pub(super) fn remove(&mut self, id: u64) {

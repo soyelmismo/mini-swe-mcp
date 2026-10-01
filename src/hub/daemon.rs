@@ -445,6 +445,49 @@ impl HubServer {
             Err(e) => error!(error = %e, "Hub recovery task failed"),
         }
 
+        // Every already-integrated worker leaves nothing behind: its branch is
+        // in the base branch, so branch, row, history, mailbox, steer-source and
+        // watch acknowledgements go now. Runs before the resumed workers are
+        // listed, so a worker that is still awaiting integration stays visible
+        // while an integrated one is gone.
+        let root = self.server.pool().scratch_root().clone();
+        let ack_dir = self.config.paths().dir().to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir))
+        })
+        .await
+        {
+            Ok(sweep)
+                if !sweep.workers.is_empty()
+                    || !sweep.orphan_workers.is_empty()
+                    || sweep.orphans > 0 =>
+            {
+                // The file edit above is not enough on its own: the event
+                // router may already hold the store in memory, and its next
+                // `persist` would rewrite the very entries just removed. Forget
+                // them through the router, on its own lock, so memory and file
+                // agree whichever was loaded first.
+                for id in sweep.workers.iter().chain(sweep.orphan_workers.iter()) {
+                    self.server.forget_retired_worker(id).await;
+                }
+                info!(
+                    workers = sweep.workers.len(),
+                    orphans = sweep.orphans,
+                    "Retired integrated workers and orphan leftovers"
+                );
+                append_log(
+                    &self.config.paths().log(),
+                    &format!(
+                        "retired {} integrated worker(s) and {} orphan file(s)",
+                        sweep.workers.len(),
+                        sweep.orphans
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => error!(error = %e, "Retirement sweep failed"),
+        }
+
         // Every interrupted worker with a surviving conversation is continued
         // automatically: it stopped because the hub did, not because it could
         // not go on. Capped per worker so a worker the hub keeps losing is left
