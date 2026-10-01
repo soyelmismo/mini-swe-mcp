@@ -210,7 +210,7 @@ impl McpServer {
         tx: Option<&mpsc::Sender<String>>,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        match action {
+        let result = match action {
             "manifest" => self.handle_manifest(),
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args, ctx).await,
@@ -224,7 +224,17 @@ impl McpServer {
             "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
+        };
+        // Looking at or acting on a worker is the owner having seen it: drop
+        // that worker's queued watch events so a later watch does not replay
+        // them as "while you were not watching".
+        if matches!(action, "status" | "logs" | "collect" | "kill" | "steer")
+            && result.is_ok()
+            && let Ok(wid) = Self::get_worker_id(args, action)
+        {
+            self.hub_events.lock().await.mark_seen(&ctx.agent(), wid);
         }
+        result
     }
 
     /// Owner label of `wid` for a payload: the recorded agent, or a marker for
@@ -616,10 +626,10 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
-        let wid = Self::get_worker_id(args, "review")?;
-        self.require_owner(wid, ctx).await?;
-        let state = self.pool.get_worker_state(wid).await;
-        let entry = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid);
+        let wid = self.resolve_worker_id(args, "review", ctx).await?;
+        self.require_owner(&wid, ctx).await?;
+        let state = self.pool.get_worker_state(&wid).await;
+        let entry = crate::pool::load_registry_entry_in(self.pool.scratch_root(), &wid);
         if state.is_none() && entry.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
@@ -674,14 +684,14 @@ impl McpServer {
         let verify_tail = if verified == Some(true) {
             None
         } else {
-            match self.pool.get_worker_logs(wid).await {
+            match self.pool.get_worker_logs(&wid).await {
                 Some(logs) => verify_tail(&logs.tail(VERIFY_TAIL_STEPS)),
                 None => None,
             }
         };
         Ok(json!({
             "worker_id": wid,
-            "owner": self.owner_of(wid).await,
+            "owner": self.owner_of(&wid).await,
             "task": first_line(entry.as_ref().map(|entry| entry.task.as_str()).unwrap_or_default()),
             "state": state_name(state.as_ref(), entry.as_ref()),
             "verified": verified,
@@ -691,7 +701,7 @@ impl McpServer {
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
-            "next_command": next_command(wid, &branch, merge.as_ref()),
+            "next_command": next_command(&wid, &branch, merge.as_ref()),
         }))
     }
 

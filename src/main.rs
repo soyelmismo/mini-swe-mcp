@@ -70,6 +70,24 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
+    // `help <topic>` prints the long-form guidance the MCP tool description
+    // points at, so an agent fetches one concern without paying for all of
+    // them in every session's context. It needs no key and no daemon.
+    if action_of(&cli_args) == Some("help") {
+        match cli_args.get(2).map(String::as_str) {
+            None => print_help(),
+            Some(topic) => match mini_swe_mcp::cli::help::topic_text(topic) {
+                Some(text) => println!("{text}"),
+                None => {
+                    eprintln!("Unknown help topic: {topic}");
+                    eprintln!("Topics: {}", mini_swe_mcp::cli::help::TOPICS.join(", "));
+                    std::process::exit(2);
+                }
+            },
+        }
+        return Ok(());
+    }
+
     if action_of(&cli_args) == Some("watch") {
         let code = mini_swe_mcp::cli::watch::run(&cli_args, json_output, admin).await?;
         std::process::exit(code);
@@ -265,7 +283,13 @@ fn print_help() {
     println!("           Run the shared hub in the foreground.");
     println!("  whoami");
     println!("           Print this session's agent identity and how it was derived.");
-    println!("\nWorkflow:\n{}", mini_swe_mcp::cli::watch::WORKFLOW);
+    println!("  help <topic>");
+    println!("           Long-form guidance on one concern (see Topics below).");
+    println!("\nTopics:");
+    println!(
+        "  mini-swe-mcp help <topic>   {}",
+        mini_swe_mcp::cli::help::TOPICS.join(", ")
+    );
     println!("\nFlags:");
     println!("{}", mini_swe_mcp::cli::HELP_FLAGS);
 }
