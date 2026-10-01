@@ -11,8 +11,9 @@ pub mod stream;
 pub mod types;
 
 pub use env::{
-    ALLOWED_VARS, CARGO_HOME_VAR, RUSTUP_HOME_VAR, TOOLCHAIN_VARS, apply_clean_environment_cmd,
-    build_clean_environment, host_cargo_home, resolve_cargo_home,
+    ALLOWED_VARS, AMBIENT_ENV_MAX_BYTES, CARGO_HOME_VAR, RUSTUP_HOME_VAR, TOOLCHAIN_VARS,
+    ambient_environment_snapshot, apply_clean_environment_cmd, build_clean_environment,
+    host_cargo_home, is_secret_name, resolve_cargo_home, sanitize_ambient_value,
 };
 pub use exec::{has_unshare, wrap_network_command};
 pub use retry::{DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries};

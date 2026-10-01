@@ -379,6 +379,18 @@ async fn dispatch_and_wait(
     review_after: Option<String>,
     verify: Option<String>,
 ) -> (WorkerPool, String, WorkerState) {
+    dispatch_and_wait_with_env(base_url, repo, max_turns, review_after, verify, Vec::new()).await
+}
+
+/// [`dispatch_and_wait`] with an explicit dispatcher ambient environment.
+async fn dispatch_and_wait_with_env(
+    base_url: &str,
+    repo: &Path,
+    max_turns: usize,
+    review_after: Option<String>,
+    verify: Option<String>,
+    client_env: Vec<(String, String)>,
+) -> (WorkerPool, String, WorkerState) {
     let pool = WorkerPool::new(1, base_url.to_string(), "test-key".to_string());
     let worker_id = pool
         .dispatch(
@@ -392,6 +404,7 @@ async fn dispatch_and_wait(
             review_after,
             false,
             verify,
+            client_env,
         )
         .await
         .expect("dispatch the worker");
@@ -899,6 +912,7 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
             None,
             false,
             None,
+            Vec::new(),
         )
         .await
         .expect("dispatch the worker");
@@ -1101,6 +1115,7 @@ async fn killing_a_worker_checkpoints_its_uncommitted_work() {
             None,
             false,
             None,
+            Vec::new(),
         )
         .await
         .expect("dispatch the worker");

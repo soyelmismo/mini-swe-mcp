@@ -33,7 +33,7 @@ mod buffer;
 mod clock;
 mod fair;
 mod registry;
-pub(crate) mod revision;
+pub mod revision;
 mod runner;
 mod state;
 mod steer;
@@ -355,6 +355,11 @@ impl WorkerPool {
     /// The owner is the agent identity of the connection that dispatched it
     /// and is recorded on both the in-memory record and the registry row, so
     /// ownership survives a process restart (H-3).
+    ///
+    /// `client_env` is the dispatcher's ambient environment, already filtered
+    /// by the sandbox's secret filter: it is layered on top of the canonical
+    /// sandbox environment by the differential verify gate, so a suite that
+    /// only passes in the orchestrator's shell is caught by the worker itself.
     #[allow(clippy::too_many_arguments)]
     pub async fn dispatch(
         &self,
@@ -368,6 +373,7 @@ impl WorkerPool {
         review_after: Option<String>,
         network_offline: bool,
         verify: Option<String>,
+        client_env: Vec<(String, String)>,
     ) -> Result<String> {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
@@ -456,6 +462,7 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            client_env,
             resume_messages: None,
             resume_base_commit: None,
             resume_base_branch: None,
@@ -1138,7 +1145,52 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
     if repo_path.join("pyproject.toml").is_file() || repo_path.join("pytest.ini").is_file() {
         return Some("pytest -q".to_string());
     }
+    // One manifest per ecosystem, in the order a polyglot repository is most
+    // likely to mean: each probe is a single file-exists check, so adding an
+    // ecosystem costs nothing when its files are absent.
+    if repo_path.join("go.mod").is_file() {
+        return Some("go test ./...".to_string());
+    }
+    if repo_path.join("pom.xml").is_file() {
+        return Some("mvn -q test".to_string());
+    }
+    if repo_path.join("build.gradle").is_file() || repo_path.join("build.gradle.kts").is_file() {
+        return Some("gradle test".to_string());
+    }
+    if repo_path.join("Makefile").is_file() || repo_path.join("makefile").is_file() {
+        return Some("make test".to_string());
+    }
+    // A lockfile without a `package.json` test script still means npm: the
+    // manifest probe above already declined a repo with no test script, so this
+    // is the "the ecosystem is here, the gate is whatever npm runs" fallback.
+    for manifest in [
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "yarn.lock",
+    ] {
+        if repo_path.join(manifest).is_file() {
+            return Some("npm test".to_string());
+        }
+    }
+    for manifest in ["setup.py", "setup.cfg", "tox.ini", "requirements.txt"] {
+        if repo_path.join(manifest).is_file() {
+            return Some("pytest -q".to_string());
+        }
+    }
+    if has_extension(repo_path, "csproj") || repo_path.join("global.json").is_file() {
+        return Some("dotnet test".to_string());
+    }
     None
+}
+
+/// Whether `dir` holds a file with the given extension.
+fn has_extension(dir: &Path, extension: &str) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == extension))
+    })
 }
 
 #[cfg(test)]
@@ -1196,6 +1248,64 @@ mod verify_detection_tests {
     fn a_bare_repository_is_not_gated() {
         let dir = scratch("bare");
         assert_eq!(detect_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate is language-agnostic: every common ecosystem resolves to that
+    /// ecosystem's own test command, and none of them assumes Rust.
+    #[test]
+    fn every_common_ecosystem_is_detected() {
+        for (file, expected) in [
+            ("go.mod", "go test ./..."),
+            ("pom.xml", "mvn -q test"),
+            ("build.gradle", "gradle test"),
+            ("build.gradle.kts", "gradle test"),
+            ("Makefile", "make test"),
+            ("makefile", "make test"),
+            ("setup.py", "pytest -q"),
+            ("tox.ini", "pytest -q"),
+            ("requirements.txt", "pytest -q"),
+            ("package-lock.json", "npm test"),
+            ("pnpm-lock.yaml", "npm test"),
+            ("yarn.lock", "npm test"),
+        ] {
+            let dir = scratch(file);
+            std::fs::write(dir.join(file), "{}\n").unwrap();
+            assert_eq!(
+                detect_verify_command(&dir).as_deref(),
+                Some(expected),
+                "{file} must select {expected}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_dotnet_project_is_detected() {
+        let dir = scratch("dotnet");
+        std::fs::write(dir.join("app.csproj"), "<Project/>\n").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("dotnet test"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("dotnet-global");
+        std::fs::write(dir.join("global.json"), "{}\n").unwrap();
+        assert_eq!(detect_verify_command(&dir).as_deref(), Some("dotnet test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository that carries several ecosystems is gated on the first the
+    /// detector recognises, so the choice is deterministic rather than
+    /// dependent on directory iteration order.
+    #[test]
+    fn detection_is_deterministic_for_a_polyglot_repository() {
+        let dir = scratch("polyglot");
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(
+            detect_verify_command(&dir).as_deref(),
+            Some("pytest -q"),
+            "the python manifest is probed before go, and the order is fixed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

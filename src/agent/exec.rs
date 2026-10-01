@@ -195,10 +195,21 @@ impl AgentRunner {
 
         // Cleared environment + strict allow-list first, so no ambient
         // credential from the operator's shell reaches the model. Build/cache
-        // variables are layered on top afterwards.
+        // variables are layered on top afterwards, then the per-command
+        // overlay (the differential verify gate's divergent environment), so
+        // the divergent values win over every default.
         apply_sanitized_environment(&mut cmd, dir);
         apply_build_env(&mut cmd, target_dir.as_deref(), &tmp_dir, &parallelism);
         crate::cache::apply_shared_cache_env(&mut cmd);
+        for (name, value) in &self.extra_env {
+            // The overlay is the variant-B environment: credential-bearing
+            // names are refused here as well, so a tampered snapshot can never
+            // ride the extra env into a child.
+            if crate::agent::env::is_secret_name(name) {
+                continue;
+            }
+            cmd.env(name, value);
+        }
 
         run_with_timeout(&mut cmd, timeout_secs).await
     }
@@ -1249,6 +1260,48 @@ mod tests {
         let out = blocked_by_guardrail("outside the worktree");
         assert!(out.contains("COMMAND BLOCKED BY WORKTREE GUARDRAIL"));
         assert!(out.contains("outside the worktree"));
+    }
+
+    /// The per-command overlay must reach the child: the differential verify
+    /// gate replays the same command in the dispatcher's ambient environment,
+    /// so an overlay that is dropped would make variant B indistinguishable
+    /// from variant A.
+    #[test]
+    fn extra_env_reaches_the_child() {
+        crate::agent::env::with_env_lock(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(extra_env_probe());
+        });
+    }
+
+    async fn extra_env_probe() {
+        let tmp = crate::worktree::swe_base_dir().join(format!(
+            "extra-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let runner = runner().with_extra_env(vec![
+            ("SWE_EXTRA_ENV_PROBE".to_string(), "present".to_string()),
+            ("HOME".to_string(), "/tmp".to_string()),
+        ]);
+        let (out, code) = runner
+            .execute_bash(&tmp, "printf '%s-%s' \"$SWE_EXTRA_ENV_PROBE\" \"$HOME\"")
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "command failed: {out:?}");
+        assert_eq!(
+            out.trim(),
+            "present-/tmp",
+            "the overlay must reach the child: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
