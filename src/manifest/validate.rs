@@ -47,6 +47,17 @@ impl ModelManifest {
             ));
         }
 
+        // `strongest` is looked up by alias too, so a dangling reference would
+        // silently leave the consolidator on the dispatch default.
+        if let Some(name) = &self.strongest
+            && !self.models.contains_key(name.trim())
+        {
+            warnings.push(format!(
+                "strongest model \"{name}\" not found in models; it will be ignored and the \
+                 dispatch default used"
+            ));
+        }
+
         // Duplicate ids are ambiguous for id-based resolution. The policy in
         // `resolve_model` is first-alias-wins (sorted by alias), so the
         // resolution is stable, but the manifest is still ambiguous and the user
@@ -162,6 +173,9 @@ impl ModelManifest {
     pub fn normalize(mut self) -> Self {
         self.default = self
             .default
+            .filter(|name| self.models.contains_key(name.trim()));
+        self.strongest = self
+            .strongest
             .filter(|name| self.models.contains_key(name.trim()));
 
         for def in self.models.values_mut() {

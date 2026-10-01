@@ -39,6 +39,7 @@ mod clock;
 mod fair;
 mod registry;
 pub mod revision;
+pub mod round;
 mod runner;
 mod state;
 mod steer;
@@ -62,6 +63,7 @@ pub use self::registry::{
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
     save_registry_entry, save_registry_entry_in,
 };
+pub use self::round::{RoundManifest, RoundRow, RoundWorker, round_manifest_for};
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
     WorkerHistory, append_history_message, append_history_message_in, ensure_base_branch,

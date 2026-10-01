@@ -176,6 +176,14 @@ pub struct ModelDefinition {
 pub struct ModelManifest {
     #[serde(default)]
     pub default: Option<String>,
+    /// Alias of the manifest's strongest tier, when one is marked.
+    ///
+    /// A consolidator integrates a whole round, so it runs on the deepest
+    /// model the manifest declares rather than on the fast executor the
+    /// dispatch default names. `None` for a manifest that marks none, which
+    /// keeps the dispatch default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strongest: Option<String>,
     #[serde(default)]
     pub models: HashMap<String, ModelDefinition>,
 }
@@ -214,6 +222,7 @@ impl Default for ModelManifest {
 
         Self {
             default: Some(BUILTIN_DEFAULT_MODEL.to_string()),
+            strongest: None,
             models,
         }
     }

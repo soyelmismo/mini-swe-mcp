@@ -154,6 +154,19 @@ impl ModelManifest {
         )
     }
 
+    /// Alias of the manifest's strongest tier, when the manifest marks one.
+    ///
+    /// A consolidator integrates a whole round, so it runs on the deepest model
+    /// the manifest declares rather than on the fast executor the dispatch
+    /// default names. `None` when the manifest marks none (or names an alias it
+    /// does not define), which leaves the dispatch default in place.
+    pub fn strongest_alias(&self) -> Option<&str> {
+        self.strongest
+            .as_deref()
+            .map(str::trim)
+            .filter(|alias| self.models.contains_key(*alias))
+    }
+
     /// Resolve the *alias* that owns `model`, whether `model` is already an alias
     /// or a full model id.
     ///
