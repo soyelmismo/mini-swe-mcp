@@ -168,6 +168,7 @@ impl WorkerPool {
         // the engine's report state is a sink here.
         let mut report = None;
         let mut report_asked = false;
+        let mut report_text = String::new();
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -205,6 +206,7 @@ impl WorkerPool {
                 watch: &mut watch,
                 report: &mut report,
                 report_asked: &mut report_asked,
+                report_text: &mut report_text,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { .. } => {

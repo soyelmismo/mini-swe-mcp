@@ -374,6 +374,25 @@ pub(super) struct TurnEngine<'a> {
     /// One ask per run: a second would let a confused model trade turns for
     /// completions that never carry one.
     pub report_asked: &'a mut bool,
+    /// The assistant texts of the completion sequence: the completion turn,
+    /// the one follow-up it may cost, and every later replay. The REPORT block
+    /// can be split across them -- the prose of one turn and the bash command
+    /// of another -- so they are scanned together rather than one by one.
+    pub report_text: &'a mut String,
+}
+
+/// Append one assistant message to the completion scan buffer: its prose, then
+/// its bash command with `\n` escapes unfolded. A block written as
+/// `printf 'REPORT\ndone: ...'` carries its line breaks as that two-character
+/// escape, so unfolding lets the same parser see it.
+fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) {
+    buffer.push_str(&llm_resp.content);
+    buffer.push('\n');
+    if let Some(command) = &llm_resp.command {
+        let command = command.replace("\\n", "\n");
+        buffer.push_str(&command);
+        buffer.push('\n');
+    }
 }
 
 impl<'a> TurnEngine<'a> {
@@ -538,6 +557,21 @@ impl<'a> TurnEngine<'a> {
         config: &TurnConfig<'_>,
         llm_resp: LlmResponse,
     ) -> Result<TurnOutcome> {
+        // The REPORT block is not guaranteed to sit in the same assistant
+        // message as the sentinel: the completion turn can carry the sentinel
+        // while the block arrives in the one follow-up, or both are written
+        // into the bash command that requests completion. Every assistant
+        // text from the completion sequence onward is scanned together.
+        if config.apply_sentinels
+            && (*self.report_asked
+                || llm_resp
+                    .command
+                    .as_deref()
+                    .is_some_and(is_completion_request))
+        {
+            append_report_text(self.report_text, &llm_resp);
+        }
+
         // --- Command extraction ---
         let cmd_str = match llm_resp.command {
             Some(ref cmd) if is_completion_request(cmd) => {
@@ -905,7 +939,7 @@ impl<'a> TurnEngine<'a> {
         // The completion turn must carry a REPORT block. A worker that omits
         // one is asked exactly once, before any git work: the answer is what
         // the orchestrator reads, so it is worth one turn and never more.
-        match (require_report, parse_report(&llm_resp.content)) {
+        match (require_report, parse_report(self.report_text)) {
             (true, Some(parsed)) => *self.report = Some(parsed),
             (true, None) if !*self.report_asked => {
                 *self.report_asked = true;
