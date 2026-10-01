@@ -925,7 +925,7 @@ impl<'a> TurnEngine<'a> {
             // (with the requests ahead of it) so the stall detector skips it.
             let _waiting = self
                 .pool
-                .wait_for_build_slot(&self.worker_id, self.pool.admission.waiting() + 1);
+                .wait_for_build_slot(self.worker_id, self.pool.admission.waiting() + 1);
             Some(self.pool.admission.acquire().await)
         } else {
             None
