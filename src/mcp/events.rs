@@ -1710,16 +1710,6 @@ pub(super) async fn watch_request(
 mod watch_stall_regression_tests {
     use super::*;
 
-    /// Removes a temporary directory when it goes out of scope, so a
-    /// failing assertion still cleans up the scratch it created.
-    struct CleanupDir<'a>(&'a std::path::Path);
-
-    impl Drop for CleanupDir<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(self.0);
-        }
-    }
-
     fn view(step: usize) -> serde_json::Value {
         json!({"worker_id":"stall-probe", "owner":"owner", "status":"running",
             "step":step, "revision":0, "last_step_at":crate::pool::unix_timestamp().saturating_sub(601),
