@@ -5,56 +5,42 @@
 //! stopped for *any* reason is continued with `steer` on the same id and
 //! branch, and that `failed` only means "this cannot continue by itself".
 
+mod common;
+
 use std::path::Path;
 
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerHistory, WorkerPool, append_history_message, history_log_path,
-    load_worker_history, save_registry_entry,
+    RegistryStatus, WorkerHistory, WorkerPool, append_history_message_in, history_log_path_in,
+    load_worker_history_in, save_registry_entry_in,
 };
 
-/// Serializes the tests that override `SWE_TEMP_DIR`: the variable is
-/// process-global, so only one test may point it at its own scratch dir.
-static SWE_TEMP_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// A scratch base dir with `SWE_TEMP_DIR` pointed at it for this test only.
+/// A per-test scratch root, owning its directory.
+///
+/// Every pool and every registry/history/steer call in this file resolves
+/// under it, so no test writes to the real registry under `swe_base_dir()`.
 struct Scratch {
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _dir: common::TempDir,
     dir: std::path::PathBuf,
 }
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let _guard = SWE_TEMP_DIR_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "swe-cont-{tag}-{}-{}-{n}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        // SAFETY: this test owns the variable for its whole lifetime and no
-        // other test in this binary reads it concurrently.
-        unsafe { std::env::set_var("SWE_TEMP_DIR", &dir) };
-        Self { _guard, dir }
+        let dir = common::TempDir::new_in_tmp(tag);
+        let path = dir.path().to_path_buf();
+        Self {
+            _dir: dir,
+            dir: path,
+        }
     }
 
     fn path(&self) -> &Path {
         &self.dir
     }
-}
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        unsafe { std::env::remove_var("SWE_TEMP_DIR") };
-        let _ = std::fs::remove_dir_all(&self.dir);
+    /// The root, as the `*_in` helpers and `WorkerPool::with_scratch` want it.
+    fn root(&self) -> mini_swe_mcp::worktree::ScratchRoot {
+        mini_swe_mcp::worktree::ScratchRoot::new(&self.dir)
     }
 }
 
@@ -155,16 +141,17 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
 #[test]
 fn the_append_only_log_survives_a_torn_last_line() {
     let scratch = Scratch::new("torn");
+    let root = scratch.root();
     let repo = repo_with_branch("torn", "torn1");
     let meta = history("torn1", &repo);
 
     // One line per message, as the turn loop pushes them.
     for msg in &meta.messages {
-        append_history_message("torn1", &meta, msg).expect("append");
+        append_history_message_in(&root, "torn1", &meta, msg).expect("append");
     }
 
     // Simulate a crash mid-append: the last line is torn.
-    let path = history_log_path("torn1");
+    let path = history_log_path_in(&root, "torn1");
     let raw = std::fs::read_to_string(&path).unwrap();
     let lines: Vec<&str> = raw.lines().collect();
     assert_eq!(lines.len(), 5, "metadata plus four messages");
@@ -177,7 +164,8 @@ fn the_append_only_log_survives_a_torn_last_line() {
     std::fs::write(&path, torn).unwrap();
 
     // The reload keeps everything before the torn line and never fails.
-    let reloaded = load_worker_history("torn1").expect("a torn last line must not fail the reload");
+    let reloaded =
+        load_worker_history_in(&root, "torn1").expect("a torn last line must not fail the reload");
     assert_eq!(
         reloaded.messages.len(),
         3,
@@ -195,13 +183,14 @@ fn the_append_only_log_survives_a_torn_last_line() {
 #[test]
 fn the_log_is_append_only_and_never_rewritten() {
     let scratch = Scratch::new("append");
+    let root = scratch.root();
     let repo = repo_with_branch("append", "app1");
     let meta = history("app1", &repo);
-    let path = history_log_path("app1");
+    let path = history_log_path_in(&root, "app1");
 
-    append_history_message("app1", &meta, &meta.messages[0]).unwrap();
+    append_history_message_in(&root, "app1", &meta, &meta.messages[0]).unwrap();
     let first = std::fs::read_to_string(&path).unwrap();
-    append_history_message("app1", &meta, &meta.messages[1]).unwrap();
+    append_history_message_in(&root, "app1", &meta, &meta.messages[1]).unwrap();
     let second = std::fs::read_to_string(&path).unwrap();
 
     assert!(
@@ -216,6 +205,7 @@ fn the_log_is_append_only_and_never_rewritten() {
 #[test]
 fn a_legacy_whole_file_history_is_still_read() {
     let scratch = Scratch::new("legacy");
+    let root = scratch.root();
     let repo = repo_with_branch("legacy", "leg1");
     let meta = history("leg1", &repo);
     let raw = serde_json::to_string(&meta).unwrap();
@@ -225,10 +215,11 @@ fn a_legacy_whole_file_history_is_still_read() {
     )
     .unwrap();
 
-    let loaded = load_worker_history("leg1").expect("the legacy whole-file form is still read");
+    let loaded =
+        load_worker_history_in(&root, "leg1").expect("the legacy whole-file form is still read");
     assert_eq!(loaded.messages.len(), 4);
     assert!(
-        !history_log_path("leg1").exists(),
+        !history_log_path_in(&root, "leg1").exists(),
         "no log is created by a read"
     );
     let _ = std::fs::remove_dir_all(&repo);
@@ -238,14 +229,15 @@ fn a_legacy_whole_file_history_is_still_read() {
 #[tokio::test]
 async fn steer_on_a_failed_worker_with_history_continues_with_the_continue_prefix() {
     let scratch = Scratch::new("warm");
+    let root = scratch.root();
     let repo = repo_with_branch("warm", "warm1");
     let meta = history("warm1", &repo);
     for msg in &meta.messages {
-        append_history_message("warm1", &meta, msg).unwrap();
+        append_history_message_in(&root, "warm1", &meta, msg).unwrap();
     }
-    save_registry_entry(&row("warm1", &repo, RegistryStatus::Failed));
+    save_registry_entry_in(&root, &row("warm1", &repo, RegistryStatus::Failed));
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
     let outcome = pool
         .steer("warm1", "the retry logic still drops the last page".into())
         .await
@@ -262,7 +254,7 @@ async fn steer_on_a_failed_worker_with_history_continues_with_the_continue_prefi
 
     // The continuation message names the reason, so the model knows what it is
     // picking up from.
-    let reloaded = load_worker_history("warm1").unwrap();
+    let reloaded = load_worker_history_in(&root, "warm1").unwrap();
     let last = reloaded.messages.last().unwrap();
     let text = serde_json::to_value(last).unwrap();
     let content = text["content"].as_str().unwrap();
@@ -281,11 +273,12 @@ async fn steer_on_a_failed_worker_with_history_continues_with_the_continue_prefi
 #[tokio::test]
 async fn steer_on_a_worker_without_history_continues_cold_on_the_same_branch() {
     let scratch = Scratch::new("cold");
+    let root = scratch.root();
     let repo = repo_with_branch("cold", "cold1");
     // No history at all: a legacy worker whose conversation was never saved.
-    save_registry_entry(&row("cold1", &repo, RegistryStatus::Failed));
+    save_registry_entry_in(&root, &row("cold1", &repo, RegistryStatus::Failed));
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
     let outcome = pool
         .steer("cold1", "keep going".into())
         .await
@@ -302,7 +295,7 @@ async fn steer_on_a_worker_without_history_continues_cold_on_the_same_branch() {
 
     // The fresh conversation names the original task, the branch that already
     // holds the previous attempt's work, and the steer message.
-    let reloaded = load_worker_history("cold1").unwrap();
+    let reloaded = load_worker_history_in(&root, "cold1").unwrap();
     assert_eq!(reloaded.branch, "worker-cold1");
     let content = serde_json::to_value(&reloaded.messages[1]).unwrap();
     let content = content["content"].as_str().unwrap();
@@ -325,8 +318,9 @@ async fn steer_on_a_worker_without_history_continues_cold_on_the_same_branch() {
 #[tokio::test]
 async fn a_missing_branch_is_the_only_cold_continuation_error() {
     let scratch = Scratch::new("nobranch");
+    let root = scratch.root();
     let repo = repo_with_branch("nobranch", "gone1");
-    save_registry_entry(&row("gone1", &repo, RegistryStatus::Failed));
+    save_registry_entry_in(&root, &row("gone1", &repo, RegistryStatus::Failed));
     // The branch is gone: nothing a continuation can work around.
     let out = std::process::Command::new("git")
         .current_dir(&repo)
@@ -335,7 +329,7 @@ async fn a_missing_branch_is_the_only_cold_continuation_error() {
         .unwrap();
     assert!(out.status.success());
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
     let err = pool.steer("gone1", "keep going".into()).await.unwrap_err();
     assert!(
         err.to_string()
@@ -349,12 +343,13 @@ async fn a_missing_branch_is_the_only_cold_continuation_error() {
 #[test]
 fn a_history_without_a_base_branch_gets_one_detected_on_continuation() {
     let scratch = Scratch::new("basebranch");
+    let root = scratch.root();
     let repo = repo_with_branch("basebranch", "bb1");
     let mut meta = history("bb1", &repo);
     // A history saved before base-branch tracking existed.
     meta.base_branch = None;
     for msg in &meta.messages {
-        append_history_message("bb1", &meta, msg).unwrap();
+        append_history_message_in(&root, "bb1", &meta, msg).unwrap();
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -382,14 +377,15 @@ fn the_auto_continue_cap_is_three() {
 #[test]
 fn the_auto_continue_budget_counts_down_from_the_cap() {
     let scratch = Scratch::new("budget");
+    let root = scratch.root();
     let repo = repo_with_branch("budget", "bud1");
     let mut meta = history("bud1", &repo);
     for msg in &meta.messages {
-        append_history_message("bud1", &meta, msg).unwrap();
+        append_history_message_in(&root, "bud1", &meta, msg).unwrap();
     }
-    save_registry_entry(&row("bud1", &repo, RegistryStatus::Interrupted));
+    save_registry_entry_in(&root, &row("bud1", &repo, RegistryStatus::Interrupted));
 
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".into(), root.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -407,9 +403,9 @@ fn the_auto_continue_budget_counts_down_from_the_cap() {
         meta.auto_continues += 1;
         spent += 1;
         // The counter lives in the history metadata, so it survives a restart.
-        std::fs::remove_file(history_log_path("bud1")).unwrap();
+        std::fs::remove_file(history_log_path_in(&root, "bud1")).unwrap();
         for msg in &meta.messages {
-            append_history_message("bud1", &meta, msg).unwrap();
+            append_history_message_in(&root, "bud1", &meta, msg).unwrap();
         }
     }
     assert_eq!(spent, mini_swe_mcp::pool::MAX_AUTO_CONTINUES);
@@ -427,7 +423,7 @@ fn the_auto_continue_budget_counts_down_from_the_cap() {
         outcome,
         mini_swe_mcp::pool::SteerOutcome::Continuing { cold: false, .. }
     ));
-    let reloaded = load_worker_history("bud1").unwrap();
+    let reloaded = load_worker_history_in(&root, "bud1").unwrap();
     let last = serde_json::to_value(reloaded.messages.last().unwrap()).unwrap();
     assert!(
         last["content"]

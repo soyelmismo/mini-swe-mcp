@@ -108,8 +108,15 @@ impl Raw {
 }
 
 async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let scratch = common::TempDir::new_in_tmp("watch-pool");
+    let pool = WorkerPool::with_scratch(
+        4,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(ModelManifest::default()));
+    let _scratch = scratch;
     for record in records {
         pool.__test_insert_worker(record).await;
     }
@@ -377,8 +384,15 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
 fn tool_description_carries_the_orchestrator_guidelines() {
     let manifest = ModelManifest::default();
     let server = McpServer::new(
-        WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string())
-            .with_manifest(Arc::new(manifest)),
+        WorkerPool::with_scratch(
+            1,
+            "http://localhost:1".to_string(),
+            "k".to_string(),
+            mini_swe_mcp::worktree::ScratchRoot::new(
+                common::TempDir::new_in_tmp("watch-tools").path(),
+            ),
+        )
+        .with_manifest(Arc::new(manifest)),
         "m".to_string(),
     );
     let text = serde_json::to_string(&server.tools_list()).expect("list");

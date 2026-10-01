@@ -39,17 +39,90 @@ pub fn swe_base_dir() -> PathBuf {
     }
 }
 
-/// All directories that can host `swe-wt-*` / `swe-target-*` scratch data.
+/// The scratch root every per-worker path is resolved under.
 ///
-/// Yielded at most once each: `swe_base_dir()` frequently *is* the system temp
-/// dir, and sweeping it twice used to re-scan the same tree (audit §07).
-pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![swe_base_dir()];
-    let tmp = std::env::temp_dir();
-    if !dirs.contains(&tmp) {
-        dirs.push(tmp);
+/// Resolved once, when a pool is built: [`WorkerPool`](crate::pool::WorkerPool)
+/// holds one for its lifetime instead of re-reading `SWE_TEMP_DIR` on every
+/// call, so two pools in one process can never resolve different roots
+/// mid-run. The free functions in `pool` stay thin wrappers over
+/// [`ScratchRoot::from_env`], which is what the CLI, the monitor and the hub
+/// daemon use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScratchRoot {
+    root: PathBuf,
+    /// Directories swept alongside `root`. Only the default resolution sweeps
+    /// the system temp dir, so an injected root sees exactly its own rows and
+    /// never another pool's.
+    extra: Vec<PathBuf>,
+}
+
+impl ScratchRoot {
+    /// Resolve the default root exactly as [`swe_base_dir`] does.
+    pub fn from_env() -> Self {
+        let root = swe_base_dir();
+        let mut extra = Vec::new();
+        let tmp = std::env::temp_dir();
+        if tmp != root {
+            extra.push(tmp);
+        }
+        Self { root, extra }
     }
-    dirs
+
+    /// An explicit root, sweeping nothing but itself.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            extra: Vec::new(),
+        }
+    }
+
+    /// A root over an already-resolved set of scratch directories: the first
+    /// is the root, the rest are swept alongside it.
+    pub fn from_dirs(dirs: &[PathBuf]) -> Self {
+        let root = dirs.first().cloned().unwrap_or_else(swe_base_dir);
+        let extra = dirs
+            .iter()
+            .skip(1)
+            .filter(|dir| **dir != root)
+            .cloned()
+            .collect();
+        Self { root, extra }
+    }
+
+    /// The root itself, which every per-worker path is built under.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// `rel` resolved under this root.
+    pub fn join(&self, rel: impl AsRef<Path>) -> PathBuf {
+        self.root.join(rel)
+    }
+
+    /// Every directory that can host this root's scratch data.
+    ///
+    /// Yielded at most once each: the root frequently *is* the system temp
+    /// dir, and sweeping it twice used to re-scan the same tree (audit §07).
+    pub fn base_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.root.clone()];
+        for dir in &self.extra {
+            if !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
+        dirs
+    }
+}
+
+impl Default for ScratchRoot {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// All directories that can host `swe-wt-*` / `swe-target-*` scratch data.
+pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
+    ScratchRoot::from_env().base_dirs()
 }
 
 /// Run `git` in `dir`, attaching the operation to the error when spawning fails.
@@ -92,8 +165,13 @@ pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
 
 /// Delete private scratch and legacy targets, never shared build dirs.
 pub(crate) fn remove_target_dirs(wt_path: &Path) {
+    remove_target_dirs_in(&ScratchRoot::from_env(), wt_path)
+}
+
+/// [`remove_target_dirs`] under an explicit scratch root.
+pub(crate) fn remove_target_dirs_in(root: &ScratchRoot, wt_path: &Path) {
     if let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) {
-        for base in swe_base_dirs() {
+        for base in root.base_dirs() {
             force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
             force_remove_dir(&base.join(format!("swe-tmp-{wt_name}")));
         }

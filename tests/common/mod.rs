@@ -81,6 +81,53 @@ pub fn unique_suffix(tag: &str) -> String {
 }
 
 // ----------
+// Isolated scratch roots
+// ----------
+
+/// A pool over its own temporary scratch root, plus the root itself.
+///
+/// In-process tests must never touch the real registry under `swe_base_dir()`
+/// (`SWE_TEMP_DIR` or `/var/tmp`): tests in one binary run in parallel threads
+/// and share ids such as `h3-mine`/`agent-a`, so one test sees or removes
+/// another's rows. Every pool a test builds goes through this helper, and the
+/// returned [`TempDir`] must be kept alive for the pool's whole lifetime.
+pub struct IsolatedPool {
+    /// The pool under test, filing every row, mailbox and history file under
+    /// the scratch root.
+    pub pool: mini_swe_mcp::pool::WorkerPool,
+    /// Owns the scratch root; dropping it removes the directory.
+    pub scratch: TempDir,
+}
+
+impl IsolatedPool {
+    /// A pool with `max_concurrent` slots over a fresh temporary root.
+    pub fn new(max_concurrent: usize, tag: &str) -> Self {
+        let scratch = TempDir::new_in_tmp(tag);
+        let root = mini_swe_mcp::worktree::ScratchRoot::new(scratch.path());
+        let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+            max_concurrent,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            root,
+        );
+        Self { pool, scratch }
+    }
+
+    /// A pool over a fresh temporary root, without the wrapper.
+    ///
+    /// The returned [`TempDir`] must stay alive for the pool's lifetime.
+    pub fn pool(max_concurrent: usize, tag: &str) -> (mini_swe_mcp::pool::WorkerPool, TempDir) {
+        let owned = Self::new(max_concurrent, tag);
+        (owned.pool, owned.scratch)
+    }
+
+    /// The pool's scratch root, for the `*_in` registry/history/steer helpers.
+    pub fn root(&self) -> mini_swe_mcp::worktree::ScratchRoot {
+        mini_swe_mcp::worktree::ScratchRoot::new(self.scratch.path())
+    }
+}
+
+// ----------
 // Scratch directories
 // ----------
 
