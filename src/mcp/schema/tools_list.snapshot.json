@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.",
+      "description": "Git-worktree workers. mini-swe-mcp watch: run it again after each event. Only own workers, admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge discard identity sandbox env consolidate.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -18,6 +18,7 @@
               "logs",
               "list",
               "kill",
+              "discard",
               "reap",
               "manifest",
               "prune",
