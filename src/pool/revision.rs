@@ -139,7 +139,12 @@ pub struct WorkerHistory {
 
 /// Path of the conversation file for `worker_id` (0600, beside the mailbox).
 pub fn history_path(worker_id: &str) -> PathBuf {
-    crate::worktree::swe_base_dir().join(format!("swe-wt-{worker_id}.history.json"))
+    history_path_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`history_path`] under an explicit scratch root.
+pub fn history_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    root.join(format!("swe-wt-{worker_id}.history.json"))
 }
 
 /// Path of the append-only conversation log for `worker_id`.
@@ -148,7 +153,12 @@ pub fn history_path(worker_id: &str) -> PathBuf {
 /// line is one message as it is pushed, so the durable conversation grows one
 /// line at a time instead of being rewritten whole.
 pub fn history_log_path(worker_id: &str) -> PathBuf {
-    crate::worktree::swe_base_dir().join(format!("swe-wt-{worker_id}.history.jsonl"))
+    history_log_path_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`history_log_path`] under an explicit scratch root.
+pub fn history_log_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    root.join(format!("swe-wt-{worker_id}.history.jsonl"))
 }
 
 /// Append one message to `worker_id`'s conversation log, creating it with the
@@ -163,7 +173,17 @@ pub fn append_history_message(
     meta: &WorkerHistory,
     message: &ChatMessage,
 ) -> Result<()> {
-    let path = history_log_path(worker_id);
+    append_history_message_in(&ScratchRoot::from_env(), worker_id, meta, message)
+}
+
+/// [`append_history_message`] under an explicit scratch root.
+pub fn append_history_message_in(
+    root: &ScratchRoot,
+    worker_id: &str,
+    meta: &WorkerHistory,
+    message: &ChatMessage,
+) -> Result<()> {
+    let path = history_log_path_in(root, worker_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create history dir {}", parent.display()))?;
@@ -201,7 +221,12 @@ pub fn append_history_message(
 /// dropped and the messages before it are kept, so a reload never fails on
 /// the one line a crash was in the middle of writing.
 pub fn load_worker_history_log(worker_id: &str) -> Result<WorkerHistory> {
-    let path = history_log_path(worker_id);
+    load_worker_history_log_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`load_worker_history_log`] under an explicit scratch root.
+pub fn load_worker_history_log_in(root: &ScratchRoot, worker_id: &str) -> Result<WorkerHistory> {
+    let path = history_log_path_in(root, worker_id);
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No saved conversation for worker {worker_id} at {}; it cannot be revised",
@@ -254,7 +279,16 @@ pub fn load_worker_history_log(worker_id: &str) -> Result<WorkerHistory> {
 /// is chmodded *before* the first byte lands; the rename is then what commits
 /// the record. `swe_base_dir()` is not world-writable by construction.
 pub fn save_worker_history(worker_id: &str, history: &WorkerHistory) -> Result<()> {
-    let path = history_path(worker_id);
+    save_worker_history_in(&ScratchRoot::from_env(), worker_id, history)
+}
+
+/// [`save_worker_history`] under an explicit scratch root.
+pub fn save_worker_history_in(
+    root: &ScratchRoot,
+    worker_id: &str,
+    history: &WorkerHistory,
+) -> Result<()> {
+    let path = history_path_in(root, worker_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create history dir {}", parent.display()))?;
@@ -308,10 +342,15 @@ pub fn is_replayable(messages: &[ChatMessage]) -> bool {
 /// `.history.json` is still read for a worker an older build wrote and no
 /// newer run has appended to.
 pub fn load_worker_history(worker_id: &str) -> Result<WorkerHistory> {
-    if history_log_path(worker_id).is_file() {
-        return load_worker_history_log(worker_id);
+    load_worker_history_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`load_worker_history`] under an explicit scratch root.
+pub fn load_worker_history_in(root: &ScratchRoot, worker_id: &str) -> Result<WorkerHistory> {
+    if history_log_path_in(root, worker_id).is_file() {
+        return load_worker_history_log_in(root, worker_id);
     }
-    let path = history_path(worker_id);
+    let path = history_path_in(root, worker_id);
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "No saved conversation for worker {worker_id} at {}; it cannot be revised",
@@ -338,7 +377,12 @@ pub fn load_worker_history(worker_id: &str) -> Result<WorkerHistory> {
 /// Every known base dir is swept: a `SWE_TEMP_DIR` that moved is not a reason
 /// to leak an owner-only file carrying tool output.
 pub fn remove_worker_history(worker_id: &str) {
-    for base in crate::worktree::swe_base_dirs() {
+    remove_worker_history_in(&ScratchRoot::from_env(), worker_id);
+}
+
+/// [`remove_worker_history`] under an explicit scratch root.
+pub fn remove_worker_history_in(root: &ScratchRoot, worker_id: &str) {
+    for base in root.base_dirs() {
         let path = base.join(format!("swe-wt-{worker_id}.history.json"));
         remove_quietly(worker_id, &path);
         let path = base.join(format!("swe-wt-{worker_id}.history.jsonl"));
@@ -365,6 +409,11 @@ fn remove_quietly(worker_id: &str, path: &Path) {
 /// A finished worker has no worktree left, so the worktree sweep of `prune`
 /// never reaches its history file; this is the sweep that does.
 pub fn prune_orphan_histories(repo_root: &Path) -> usize {
+    prune_orphan_histories_in(&ScratchRoot::from_env(), repo_root)
+}
+
+/// [`prune_orphan_histories`] under an explicit scratch root.
+pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize {
     /// The two fields the sweep needs, without parsing the conversation.
     #[derive(Deserialize)]
     struct Owner {
@@ -375,7 +424,7 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
         return 0;
     };
     let mut removed = 0;
-    for base in crate::worktree::swe_base_dirs() {
+    for base in root.base_dirs() {
         let Ok(entries) = std::fs::read_dir(&base) else {
             continue;
         };
@@ -412,7 +461,7 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
             )
             .is_ok_and(|out| out.status.success());
             if !branch_exists {
-                remove_worker_history(id);
+                remove_worker_history_in(root, id);
                 removed += 1;
             }
         }
@@ -421,6 +470,7 @@ pub fn prune_orphan_histories(repo_root: &Path) -> usize {
 }
 
 use super::runner::WorkerLaunchConfig;
+use crate::worktree::ScratchRoot;
 
 /// What [`WorkerPool::steer_with_budget`] actually did, so the reply can only
 /// claim what happened.
@@ -473,13 +523,13 @@ impl super::WorkerPool {
         message: String,
         revision_turns: Option<usize>,
     ) -> anyhow::Result<SteerOutcome> {
-        match super::load_worker_history(id) {
+        match super::load_worker_history_in(&self.scratch, id) {
             Ok(mut history) => {
                 let repo_path = std::path::PathBuf::from(&history.repo_path);
                 // A history from before base-branch tracking would never sync
                 // the base before completing; detect and store it now.
                 let detected = ensure_base_branch(&mut history, &repo_path).await;
-                let reason = super::load_registry_entry(id)
+                let reason = super::load_registry_entry_in(&self.scratch, id)
                     .map(|e| e.status)
                     .unwrap_or(super::RegistryStatus::Stopped);
                 let prefix = match reason {
@@ -516,14 +566,15 @@ impl super::WorkerPool {
         let base_branch = base_branch.to_string();
         let id = id.to_string();
         let _ = tokio::task::spawn_blocking(move || {
-            let Some(mut entry) = super::load_registry_entry(&id) else {
+            let root = self.scratch.clone();
+            let Some(mut entry) = super::load_registry_entry_in(&root, &id) else {
                 return;
             };
             if entry.base_branch.as_deref() == Some(base_branch.as_str()) {
                 return;
             }
             entry.base_branch = Some(base_branch);
-            super::save_registry_entry(&entry);
+            super::save_registry_entry_in(&root, &entry);
         })
         .await;
     }
@@ -541,7 +592,7 @@ impl super::WorkerPool {
         message: String,
         revision_turns: Option<usize>,
     ) -> anyhow::Result<SteerOutcome> {
-        let entry = super::load_registry_entry(id).with_context(|| {
+        let entry = super::load_registry_entry_in(&self.scratch, id).with_context(|| {
             format!(
                 "Worker {id} has no saved conversation and no registry row, so it cannot be continued"
             )
@@ -653,7 +704,7 @@ impl super::WorkerPool {
         message: String,
         revision_turns: Option<usize>,
     ) -> anyhow::Result<()> {
-        let mut history = super::load_worker_history(id)?;
+        let mut history = super::load_worker_history_in(&self.scratch, id)?;
         let repo_path = std::path::PathBuf::from(&history.repo_path);
         // A history from before base-branch tracking would never sync the base
         // before completing; detect and store it here too.
@@ -742,11 +793,11 @@ impl super::WorkerPool {
         // line; a cold one writes its whole fresh conversation. This happens
         // before the relaunch is visible anywhere, so the conversation is never
         // behind the record that points at it.
-        let already = super::load_worker_history_log(id)
+        let already = super::load_worker_history_log_in(&self.scratch, id)
             .map(|logged| logged.messages.len())
             .unwrap_or(0);
         for message in history.messages.iter().skip(already) {
-            if let Err(e) = super::append_history_message(id, &history, message) {
+            if let Err(e) = super::append_history_message_in(&self.scratch, id, &history, message) {
                 tracing::warn!(
                     worker = %id,
                     error = %e,
@@ -889,7 +940,7 @@ impl super::WorkerPool {
                 w.handle = Some(handle);
             }
         }
-        super::save_registry_entry(&row);
+        super::save_registry_entry_in(&self.scratch, &row);
         tracing::info!(worker = %id, revision, max_turns, "Worker revision started");
         Ok(SteerOutcome::Continuing {
             revision,

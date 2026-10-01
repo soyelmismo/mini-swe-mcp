@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
+use crate::worktree::ScratchRoot;
+
 /// One orchestrator message as it is stored in a mailbox.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SteerRecord {
@@ -61,12 +63,21 @@ struct SteerRecord {
 /// Public so the CLI can report exactly where a cross-process steer was
 /// deposited.
 pub fn steer_path(worker_id: &str) -> PathBuf {
-    crate::worktree::swe_base_dir().join(format!("swe-wt-{worker_id}.steer"))
+    steer_path_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`steer_path`] under an explicit scratch root.
+pub fn steer_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    root.join(format!("swe-wt-{worker_id}.steer"))
 }
 
 /// Path the mailbox is renamed to while a drainer reads it.
 fn claim_path(worker_id: &str) -> PathBuf {
-    let path = steer_path(worker_id);
+    claim_path_in(&ScratchRoot::from_env(), worker_id)
+}
+
+fn claim_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    let path = steer_path_in(root, worker_id);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.claim", std::process::id()));
     path.with_file_name(name)
@@ -78,7 +89,16 @@ fn claim_path(worker_id: &str) -> PathBuf {
 /// Returns the path written, or an error the caller can surface: a steer that
 /// cannot be queued must be reported, never silently dropped.
 pub fn write_steer_message(worker_id: &str, message: &str) -> std::io::Result<PathBuf> {
-    let path = steer_path(worker_id);
+    write_steer_message_in(&ScratchRoot::from_env(), worker_id, message)
+}
+
+/// [`write_steer_message`] under an explicit scratch root.
+pub fn write_steer_message_in(
+    root: &ScratchRoot,
+    worker_id: &str,
+    message: &str,
+) -> std::io::Result<PathBuf> {
+    let path = steer_path_in(root, worker_id);
     let record = SteerRecord {
         message: message.to_string(),
         sent_at: super::unix_timestamp(),
@@ -104,11 +124,16 @@ pub fn write_steer_message(worker_id: &str, message: &str) -> std::io::Result<Pa
 /// so one corrupt line cannot strand the worker and the rest of the guidance
 /// still arrives.
 pub fn drain_steer_messages(worker_id: &str) -> Vec<String> {
-    let path = steer_path(worker_id);
+    drain_steer_messages_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`drain_steer_messages`] under an explicit scratch root.
+pub fn drain_steer_messages_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
+    let path = steer_path_in(root, worker_id);
     if !path.exists() {
         return Vec::new();
     }
-    let claim = claim_path(worker_id);
+    let claim = claim_path_in(root, worker_id);
     // Claim the current generation atomically. A losing racer observes
     // `NotFound` here and simply finds nothing to drain.
     if let Err(e) = std::fs::rename(&path, &claim) {
@@ -153,7 +178,12 @@ fn read_records(claim: &Path) -> Vec<String> {
 /// *new* worker reusing the id would later pick up as phantom guidance. Both
 /// paths are removed regardless of which one exists.
 pub fn remove_steer_file(worker_id: &str) {
-    for path in [steer_path(worker_id), claim_path(worker_id)] {
+    remove_steer_file_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`remove_steer_file`] under an explicit scratch root.
+pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
+    for path in [steer_path_in(root, worker_id), claim_path_in(root, worker_id)] {
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 debug!(worker = %worker_id, path = %path.display(), "Removed steering mailbox")

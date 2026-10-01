@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::state::WorkerMetrics;
+use crate::worktree::ScratchRoot;
 
 /// Lifecycle status of a worker, as recorded in the on-disk registry.
 ///
@@ -184,6 +185,9 @@ impl WorkerMeta {
     }
 
     /// Persist one status update for this worker, unconditionally.
+    ///
+    /// Files the row under the default scratch root; a pool routes its own
+    /// writes through [`RegistryWriter`], which carries the pool's root.
     pub fn save_status(
         &self,
         model: &str,
@@ -218,13 +222,28 @@ const STEP_WRITE_INTERVAL: Duration = Duration::from_secs(3);
 /// `WorkerMeta` at hand, the loop owning it is being aborted) can still end
 /// that worker's row on a terminal status. The map is bounded by the number of
 /// live workers: entries leave with `collect` and `reap`.
-#[derive(Default)]
 pub struct RegistryWriter {
     rows: HashMap<String, WorkerRegistryEntry>,
     last_write: HashMap<String, Instant>,
+    /// The scratch root this writer's rows are filed under.
+    root: ScratchRoot,
 }
 
 impl RegistryWriter {
+    /// A writer that files every row under `root`.
+    pub fn new(root: ScratchRoot) -> Self {
+        Self {
+            rows: HashMap::new(),
+            last_write: HashMap::new(),
+            root,
+        }
+    }
+
+    /// The scratch root this writer files under.
+    pub fn root(&self) -> &ScratchRoot {
+        &self.root
+    }
+
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
     pub fn save(&mut self, entry: WorkerRegistryEntry) {
@@ -243,7 +262,7 @@ impl RegistryWriter {
         }
         self.last_write.insert(entry.id.clone(), now);
         self.rows.insert(entry.id.clone(), entry.clone());
-        save_registry_entry(&entry);
+        save_registry_entry_in(&self.root, &entry);
     }
 
     /// The row last written for `worker_id`, if this process wrote one.
@@ -278,11 +297,21 @@ pub fn extract_group(task: &str) -> Option<String> {
 }
 
 pub fn registry_dir() -> PathBuf {
-    crate::worktree::swe_base_dir().join("swe-registry")
+    registry_dir_in(&ScratchRoot::from_env())
+}
+
+/// [`registry_dir`] under an explicit scratch root.
+pub fn registry_dir_in(root: &ScratchRoot) -> PathBuf {
+    root.join("swe-registry")
 }
 
 pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
-    let dir = registry_dir();
+    save_registry_entry_in(&ScratchRoot::from_env(), entry);
+}
+
+/// [`save_registry_entry`] under an explicit scratch root.
+pub fn save_registry_entry_in(root: &ScratchRoot, entry: &WorkerRegistryEntry) {
+    let dir = registry_dir_in(root);
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.json", entry.id));
     if let Ok(json) = serde_json::to_string(entry) {
@@ -291,19 +320,23 @@ pub fn save_registry_entry(entry: &WorkerRegistryEntry) {
 }
 
 pub fn remove_registry_entry(worker_id: &str) {
-    for dir in crate::worktree::swe_base_dirs() {
+    remove_registry_entry_in(&ScratchRoot::from_env(), worker_id);
+}
+
+/// [`remove_registry_entry`] under an explicit scratch root.
+pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) {
+    for dir in root.base_dirs() {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         let _ = std::fs::remove_file(path);
     }
 }
 
 fn worktree_exists(worker_id: &str) -> bool {
-    for base in crate::worktree::swe_base_dirs() {
-        if base.join(format!("swe-wt-{worker_id}")).is_dir() {
-            return true;
-        }
-    }
-    false
+    worktree_exists_in(&ScratchRoot::from_env(), worker_id)
+}
+
+fn worktree_exists_in(root: &ScratchRoot, worker_id: &str) -> bool {
+    root.join(format!("swe-wt-{worker_id}")).is_dir()
 }
 
 fn branch_exists(
@@ -348,7 +381,12 @@ fn branch_exists(
 /// so the fast view agrees with the dashboard about liveness without ever
 /// deleting a row or shelling out to git.
 pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
-    raw_registry_entries()
+    load_registry_entries_read_only_in(&ScratchRoot::from_env())
+}
+
+/// [`load_registry_entries_read_only`] under an explicit scratch root.
+pub fn load_registry_entries_read_only_in(root: &ScratchRoot) -> Vec<WorkerRegistryEntry> {
+    raw_registry_entries_in(root)
         .map(|(_, mut entry)| {
             if entry.status.is_live() && !crate::worktree::is_process_alive(entry.pid) {
                 entry.status = RegistryStatus::Stopped;
@@ -359,8 +397,14 @@ pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
 }
 
 fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
+    raw_registry_entries_in(&ScratchRoot::from_env())
+}
+
+fn raw_registry_entries_in(
+    root: &ScratchRoot,
+) -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
     let mut seen = std::collections::HashSet::new();
-    crate::worktree::swe_base_dirs()
+    root.base_dirs()
         .into_iter()
         .flat_map(|base| {
             std::fs::read_dir(base.join("swe-registry"))
@@ -401,17 +445,34 @@ fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)
 /// Read at daemon startup to decide which workers to continue: the row is
 /// terminal for listing but its branch and conversation are intact.
 pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
-    raw_registry_entries()
+    interrupted_registry_entries_in(&ScratchRoot::from_env())
+}
+
+/// [`interrupted_registry_entries`] under an explicit scratch root.
+pub(crate) fn interrupted_registry_entries_in(root: &ScratchRoot) -> Vec<WorkerRegistryEntry> {
+    raw_registry_entries_in(root)
         .map(|(_, entry)| entry)
         .filter(|e| e.status == RegistryStatus::Interrupted)
         .collect()
 }
 
 pub(crate) fn recover_orphaned_workers() -> usize {
-    recover_entries(raw_registry_entries())
+    recover_orphaned_workers_in(&ScratchRoot::from_env())
+}
+
+/// [`recover_orphaned_workers`] under an explicit scratch root.
+pub(crate) fn recover_orphaned_workers_in(root: &ScratchRoot) -> usize {
+    recover_entries_in(root, raw_registry_entries_in(root))
 }
 
 fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEntry)>) -> usize {
+    recover_entries_in(&ScratchRoot::from_env(), entries)
+}
+
+fn recover_entries_in(
+    root: &ScratchRoot,
+    entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEntry)>,
+) -> usize {
     let mut recovered = 0;
     for (path, mut entry) in entries {
         if !entry.status.is_live()
@@ -424,8 +485,7 @@ fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEnt
         // grandparent: the registry may live anywhere, and the target/scratch
         // cleanup below resolves through `swe_base_dir()` the same way teardown
         // does, so the two must agree on where the worktree was.
-        let base = crate::worktree::swe_base_dir();
-        let checkout = base.join(format!("swe-wt-{}", entry.id));
+        let checkout = root.join(format!("swe-wt-{}", entry.id));
         // The orphan's commands may have detached themselves from every process
         // group (`setsid cmd &`, a double fork), so nothing but their working
         // directory still ties them to the worker that is gone. The sweep runs
@@ -485,6 +545,11 @@ fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEnt
 }
 
 pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
+    load_all_registry_entries_in(&ScratchRoot::from_env())
+}
+
+/// [`load_all_registry_entries`] under an explicit scratch root.
+pub fn load_all_registry_entries_in(root: &ScratchRoot) -> Vec<WorkerRegistryEntry> {
     let mut entries = Vec::new();
     let mut branches_by_repo: std::collections::HashMap<
         PathBuf,
@@ -493,13 +558,13 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
 
     // The directory scan, parsing and id dedupe live in [`raw_registry_entries`];
     // this loader only adds liveness normalisation and terminal-row pruning.
-    for (path, mut item) in raw_registry_entries() {
+    for (path, mut item) in raw_registry_entries_in(root) {
         if item.status.is_live() && !crate::worktree::is_process_alive(item.pid) {
             item.status = RegistryStatus::Stopped;
         }
 
         if item.status.is_terminal()
-            && !worktree_exists(&item.id)
+            && !worktree_exists_in(root, &item.id)
             && !branch_exists(&item, &mut branches_by_repo)
         {
             let _ = std::fs::remove_file(&path);
@@ -516,7 +581,15 @@ pub fn load_all_registry_entries() -> Vec<WorkerRegistryEntry> {
 /// [`load_all_registry_entries`] does: a `running`/`paused`/`reviewing` row
 /// whose pid is dead is reported as `stopped`.
 pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
-    for dir in crate::worktree::swe_base_dirs() {
+    load_registry_entry_in(&ScratchRoot::from_env(), worker_id)
+}
+
+/// [`load_registry_entry`] under an explicit scratch root.
+pub fn load_registry_entry_in(
+    root: &ScratchRoot,
+    worker_id: &str,
+) -> Option<WorkerRegistryEntry> {
+    for dir in root.base_dirs() {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
         if let Ok(content) = std::fs::read_to_string(&path)
             && let Ok(mut item) = serde_json::from_str::<WorkerRegistryEntry>(&content)
@@ -533,7 +606,7 @@ pub fn load_registry_entry(worker_id: &str) -> Option<WorkerRegistryEntry> {
 #[cfg(test)]
 mod recovery_cleanup_tests {
     use super::*;
-    use crate::worktree::{pid_file_for, swe_base_dir};
+    use crate::worktree::pid_file_for;
 
     /// A pid that is certainly dead: a child that has already exited, so
     /// `is_process_alive` reports it dead and the sweep treats the row as an
@@ -578,9 +651,13 @@ mod recovery_cleanup_tests {
     /// lease behind, and every hub restart would leak another pair.
     #[test]
     fn recovery_removes_the_orphans_target_dir_and_pid_file() {
-        // The real base dir, because the sweep's cleanup resolves the target
-        // and scratch paths through `swe_base_dir()` exactly as teardown does.
-        let base = swe_base_dir();
+        // A private root, so the sweep cannot touch the real registry.
+        let base = std::env::temp_dir().join(format!(
+            "swe-recovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let root = ScratchRoot::new(&base);
         let id = format!("recovery-{}", uuid::Uuid::new_v4().simple());
         let worktree = base.join(format!("swe-wt-{id}"));
         let target = base.join(format!("swe-target-swe-wt-{id}"));
@@ -597,7 +674,8 @@ mod recovery_cleanup_tests {
         let row = orphan_row(&id);
         std::fs::write(&path, serde_json::to_vec(&row).unwrap()).unwrap();
 
-        let recovered = recover_entries([(path.clone(), row)]);
+        let recovered = recover_entries_in(&root, [(path.clone(), row)]);
+        let _ = std::fs::remove_dir_all(&base);
         assert_eq!(recovered, 1, "the orphan row must be recovered");
         let row: WorkerRegistryEntry =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

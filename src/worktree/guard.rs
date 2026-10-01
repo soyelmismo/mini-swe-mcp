@@ -8,6 +8,7 @@
 
 use super::{
     force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs, swe_base_dir,
+    ScratchRoot,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -188,6 +189,16 @@ impl WorktreeGuard {
     /// Errors when the branch is gone -- the orchestrator must know the branch
     /// it reviewed no longer exists instead of silently restarting elsewhere.
     pub fn reopen(repo_root: &Path, worker_id: &str, base_commit: &str) -> Result<Self> {
+        Self::reopen_in(&ScratchRoot::from_env(), repo_root, worker_id, base_commit)
+    }
+
+    /// [`WorktreeGuard::reopen`] under an explicit scratch root.
+    pub fn reopen_in(
+        root: &ScratchRoot,
+        repo_root: &Path,
+        worker_id: &str,
+        base_commit: &str,
+    ) -> Result<Self> {
         let worker_id = sanitize_worker_id(worker_id);
         let branch = format!("worker-{worker_id}");
         if branch_ref(repo_root, &branch).is_none() {
@@ -196,6 +207,7 @@ impl WorktreeGuard {
             );
         }
         Self::checkout(
+            root,
             repo_root,
             &worker_id,
             &branch,
@@ -206,11 +218,16 @@ impl WorktreeGuard {
     }
 
     pub fn new(repo_root: &Path, worker_id: &str) -> Result<Self> {
+        Self::new_in(&ScratchRoot::from_env(), repo_root, worker_id)
+    }
+
+    /// [`WorktreeGuard::new`] under an explicit scratch root.
+    pub fn new_in(root: &ScratchRoot, repo_root: &Path, worker_id: &str) -> Result<Self> {
         // Branch and directory names derive from the *sanitized* id, so they
         // can never describe different worktrees nor escape `swe_base_dir()`.
         let worker_id = sanitize_worker_id(worker_id);
         let branch = format!("worker-{worker_id}");
-        let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
+        let path = root.join(format!("swe-wt-{worker_id}"));
 
         // Ensure target directory and branch don't exist. `worktree prune` is
         // deliberately not called here: `prune_stale_worktrees` owns a single
@@ -239,6 +256,7 @@ impl WorktreeGuard {
             .to_string();
 
         let mut guard = Self::checkout(
+            root,
             repo_root,
             &worker_id,
             &branch,
@@ -261,6 +279,7 @@ impl WorktreeGuard {
     /// `base_commit` is recorded as the diff base without re-reading `HEAD` of
     /// the repo root, which may have moved on since the original run.
     fn checkout(
+        root: &ScratchRoot,
         repo_root: &Path,
         worker_id: &str,
         branch: &str,
@@ -268,7 +287,7 @@ impl WorktreeGuard {
         base_commit: &str,
         fresh_branch: bool,
     ) -> Result<Self> {
-        let path = swe_base_dir().join(format!("swe-wt-{worker_id}"));
+        let path = root.join(format!("swe-wt-{worker_id}"));
 
         // A revision never leaves a stale checkout behind: the finished run's
         // `Drop` removed it, but a crashed run may not have, and `worktree add`

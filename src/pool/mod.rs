@@ -51,14 +51,18 @@ pub use self::clock::unix_timestamp;
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
-    load_all_registry_entries, load_registry_entries_read_only, load_registry_entry, registry_dir,
-    registry_owner_label, remove_registry_entry, save_registry_entry,
+    load_all_registry_entries, load_all_registry_entries_in, load_registry_entries_read_only,
+    load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in,
+    registry_dir, registry_dir_in, registry_owner_label, remove_registry_entry,
+    remove_registry_entry_in, save_registry_entry, save_registry_entry_in,
 };
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
-    WorkerHistory, append_history_message, ensure_base_branch, history_log_path, history_path,
-    is_replayable, load_worker_history, load_worker_history_log, prune_orphan_histories,
-    remove_worker_history, save_worker_history,
+    WorkerHistory, append_history_message, append_history_message_in, ensure_base_branch,
+    history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
+    load_worker_history, load_worker_history_in, load_worker_history_log,
+    load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
+    remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
@@ -70,11 +74,14 @@ pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
     WorkerProgress, WorkerRecord, WorkerState,
 };
-pub use self::steer::{drain_steer_messages, remove_steer_file, steer_path, write_steer_message};
+pub use self::steer::{
+    drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
+    steer_path, steer_path_in, write_steer_message, write_steer_message_in,
+};
 
 use self::state::expired_terminal_ids;
 use crate::manifest::ModelManifest;
-use crate::worktree::WorktreeGuard;
+use crate::worktree::{ScratchRoot, WorktreeGuard};
 
 /// Rebuild the conversation a request sends: compaction applied on top of the
 /// append-only log.
@@ -101,6 +108,18 @@ fn registry_row_live_elsewhere(id: &str) -> bool {
             && e.pid != std::process::id()
             && crate::worktree::is_process_alive(e.pid)
     })
+}
+
+impl WorkerPool {
+    /// Whether `id`'s registry row is live in a process other than this one,
+    /// read under this pool's scratch root.
+    fn registry_row_live_elsewhere(&self, id: &str) -> bool {
+        load_registry_entry_in(&self.scratch, id).is_some_and(|e| {
+            e.status.is_live()
+                && e.pid != std::process::id()
+                && crate::worktree::is_process_alive(e.pid)
+        })
+    }
 }
 
 /// Guidance appended to every terminal payload and channel event.
@@ -136,6 +155,10 @@ pub struct WorkerPool {
     workers: Arc<RwLock<HashMap<String, WorkerRecord>>>,
     changes: watch::Sender<u64>,
     registry: Arc<std::sync::Mutex<registry::RegistryWriter>>,
+    /// The scratch root every per-worker path is resolved under. Resolved
+    /// once at construction so the pool never re-reads `SWE_TEMP_DIR`
+    /// mid-run; cloned (not re-resolved) by every pool method.
+    scratch: ScratchRoot,
     /// Checkout directory of every live worker. The `WorktreeGuard` stays the
     /// owner of the worktree itself; the pool only needs to know *where* a
     /// worker works so `kill` can commit what it leaves behind before the
@@ -152,6 +175,26 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     pub fn new(max_concurrent: usize, api_base: String, api_key: String) -> Self {
+        Self::with_scratch(
+            max_concurrent,
+            api_base,
+            api_key,
+            ScratchRoot::from_env(),
+        )
+    }
+
+    /// [`WorkerPool::new`] under an explicit scratch root.
+    ///
+    /// Tests build one pool per temporary root, so in-process tests that run
+    /// in parallel threads never share registry rows, mailboxes or history
+    /// files. Production callers use [`WorkerPool::new`], which resolves the
+    /// same root from the process environment once, at construction time.
+    pub fn with_scratch(
+        max_concurrent: usize,
+        api_base: String,
+        api_key: String,
+        scratch: ScratchRoot,
+    ) -> Self {
         // Heavy commands are dosed by the admission controller: a slot only
         // when the host can take another build, and a job count divided over
         // the builds already running.
@@ -185,20 +228,29 @@ impl WorkerPool {
             worker_slots = max_concurrent,
             "Worker slots, bash semaphore and heavy-command admission controller initialized"
         );
+        let registry = Arc::new(std::sync::Mutex::new(registry::RegistryWriter::new(
+            scratch.clone(),
+        )));
         Self {
             worker_slots: fair::FairScheduler::new(max_concurrent),
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
-            registry: Arc::new(std::sync::Mutex::new(registry::RegistryWriter::default())),
+            registry,
             worktrees: Arc::new(RwLock::new(HashMap::new())),
             api_base,
             api_key,
             log_policy,
             terminal_ttl,
             manifest: Arc::new(ModelManifest::default()),
+            scratch,
         }
+
+    /// The scratch root this pool resolves every per-worker path under.
+    pub fn scratch_root(&self) -> &ScratchRoot {
+        &self.scratch
+    }
     }
 
     /// Subscribe before reading state so a concurrent change cannot be missed.
@@ -292,7 +344,7 @@ impl WorkerPool {
         let expired = expired_terminal_ids(lock, ttl);
         for id in &expired {
             lock.remove(id);
-            remove_registry_entry(id);
+            remove_registry_entry_in(&self.scratch, id);
             self.registry
                 .lock()
                 .expect("registry lock poisoned")
@@ -473,7 +525,7 @@ impl WorkerPool {
             }
             return false;
         }
-        load_registry_entry(id).is_some_and(|e| e.status.is_terminal())
+        load_registry_entry_in(&self.scratch, id).is_some_and(|e| e.status.is_terminal())
     }
 
     /// Cheap snapshot of a worker's step history.
@@ -626,7 +678,9 @@ impl WorkerPool {
                 }));
             }
         }
-        let registry = load_all_registry_entries().into_iter().filter(|e| {
+        let registry = load_all_registry_entries_in(&self.scratch)
+            .into_iter()
+            .filter(|e| {
             !seen.contains(&e.id) && owner.is_none_or(|owner| e.owner.as_deref() == Some(owner))
         });
         rows.extend(registry.map(|e| {
@@ -666,9 +720,9 @@ impl WorkerPool {
         }
         // A finished worker the reaper dropped is still revisable, so its
         // saved conversation still names who may steer it.
-        let owner = match load_registry_entry(id) {
+        let owner = match load_registry_entry_in(&self.scratch, id) {
             Some(entry) => entry.owner,
-            None => load_worker_history(id).ok()?.owner,
+            None => load_worker_history_in(&self.scratch, id).ok()?.owner,
         };
         Some(owner.map_or(WorkerOwner::Unattributed, WorkerOwner::Agent))
     }
@@ -738,10 +792,11 @@ impl WorkerPool {
                 // Not in this process. The mailbox is only for a worker whose
                 // registry row is live in another process: writing to one
                 // nobody reads would silently swallow the guidance.
-                if registry_row_live_elsewhere(id) {
+                if self.registry_row_live_elsewhere(id) {
                     // Queue it in the on-disk mailbox for the owning process
                     // (a blocking write, so outside the lock).
-                    let path = write_steer_message(id, &message).map_err(|e| {
+                    let root = self.scratch.clone();
+                    let path = write_steer_message_in(&root, id, &message).map_err(|e| {
                         anyhow::anyhow!("Worker {id} is not in this process and its steering mailbox could not be written: {e}")
                     })?;
                     info!(
@@ -824,7 +879,7 @@ impl WorkerPool {
     /// only a candidate when its conversation survived, because a cold
     /// continuation is the orchestrator's call, not an automatic one.
     pub async fn interrupted_workers(&self) -> Vec<String> {
-        crate::pool::registry::interrupted_registry_entries()
+        crate::pool::registry::interrupted_registry_entries_in(&self.scratch)
             .into_iter()
             .map(|e| e.id)
             .collect()
@@ -841,10 +896,10 @@ impl WorkerPool {
 
     /// Automatic continuations `id` has already spent.
     async fn auto_continues_spent(&self, id: &str) -> usize {
-        crate::pool::load_worker_history(id)
+        crate::pool::load_worker_history_in(&self.scratch, id)
             .map(|h| h.auto_continues)
             .unwrap_or_else(|_| {
-                crate::pool::load_registry_entry(id)
+                crate::pool::load_registry_entry_in(&self.scratch, id)
                     .map(|e| e.auto_continues)
                     .unwrap_or(0)
             })
@@ -857,14 +912,15 @@ impl WorkerPool {
     pub async fn count_auto_continue(&self, id: &str) {
         let spent = self.auto_continues_spent(id).await + 1;
         let id_owned = id.to_string();
+        let root = self.scratch.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(mut history) = crate::pool::load_worker_history(&id_owned) {
+            if let Ok(mut history) = crate::pool::load_worker_history_in(&root, &id_owned) {
                 history.auto_continues = spent;
-                let _ = crate::pool::save_worker_history(&id_owned, &history);
+                let _ = crate::pool::save_worker_history_in(&root, &id_owned, &history);
             }
-            if let Some(mut entry) = crate::pool::load_registry_entry(&id_owned) {
+            if let Some(mut entry) = crate::pool::load_registry_entry_in(&root, &id_owned) {
                 entry.auto_continues = spent;
-                crate::pool::save_registry_entry(&entry);
+                crate::pool::save_registry_entry_in(&root, &entry);
             }
         })
         .await;
