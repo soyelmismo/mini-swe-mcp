@@ -588,7 +588,8 @@ async fn a_retired_worker_leaves_the_live_list() {
         resume_tx: None,
         handle: None,
         revision: 0,
-    });
+    })
+    .await;
 
     let listed: Vec<String> = pool
         .list_workers()
