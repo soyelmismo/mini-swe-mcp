@@ -55,7 +55,10 @@ pub use self::buffer::{
     MAX_LOG_OUTPUT_BYTES, MAX_RETAINED_LOGS_CEILING, build_step_log, clamp_string, emit_view,
 };
 pub use self::clock::unix_timestamp;
-pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
+pub use self::merge::{
+    MergeApprovedReport, MergeApprovedRequest, MergeReport, MergeRequest, MergedWorker,
+    SkippedWorker, merge_approved, merge_approved_in, merge_worker, merge_worker_in,
+};
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerApproval, WorkerMeta, WorkerRegistryEntry,

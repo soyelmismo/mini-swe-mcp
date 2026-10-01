@@ -59,7 +59,15 @@ pub fn tool_args(
             }
         }
         "collect" | "kill" | "logs" | "review" | "status" | "merge" => {
-            if cli_args.len() > 2 {
+            if action == "merge" && flag_index(cli_args, &["--approved"]).is_some() {
+                tool_args.insert("approved".into(), Value::Bool(true));
+                if let Some(i) = flag_index(cli_args, &["--group", "-g"]) {
+                    let group = cli_args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--group needs a value"))?;
+                    tool_args.insert("group".into(), Value::String(group.clone()));
+                }
+            } else if cli_args.len() > 2 {
                 tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
             }
             if action == "collect" {
@@ -403,6 +411,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!mine.contains_key("scope"), "{mine:?}");
+    }
+
+    /// `merge --approved [--group <g>]` is the batch form: no worker id, the
+    /// whole round's approved workers instead.
+    #[test]
+    fn test_merge_approved_flag_maps_to_the_batch_arguments() {
+        let batch = tool_args(
+            "merge",
+            &args(&["mini-swe-mcp", "merge", "--approved", "--group", "round-1"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(batch["action"], "merge");
+        assert_eq!(batch["approved"], true);
+        assert_eq!(batch["group"], "round-1");
+        assert!(
+            !batch.contains_key("worker_id"),
+            "a batch names no single worker: {batch:?}"
+        );
+
+        let every_group = tool_args(
+            "merge",
+            &args(&["mini-swe-mcp", "merge", "--approved"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(every_group["approved"], true);
+        assert!(!every_group.contains_key("group"), "{every_group:?}");
+
+        // The single-worker form is unchanged.
+        let one = tool_args("merge", &args(&["mini-swe-mcp", "merge", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(one["worker_id"], "w1");
+        assert!(!one.contains_key("approved"), "{one:?}");
     }
 
     #[test]

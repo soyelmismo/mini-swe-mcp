@@ -201,6 +201,16 @@ pub fn parse_consolidate_merge(cmd: &str) -> Option<Vec<String>> {
 /// adds a fifth line still parses.
 const REPORT_KEYS: [&str; 4] = ["done", "files", "tests", "risks"];
 
+/// The byte budget of one parsed report field.
+///
+/// A completion is read at every `status`/`collect`/`watch`, so a single
+/// rogue field must not bloat the in-memory record, the registry row, the
+/// channel payload or the rendered notification. The same
+/// [`crate::pool::clamp_string`] helper the step log already uses caps the
+/// value: the truncation marker is charged against the budget, and the cut
+/// never splits a UTF-8 code point.
+pub const REPORT_FIELD_BYTES: usize = 4096;
+
 /// The one follow-up the harness sends when a completion turn carries no
 /// report: the block, then the sentinel again.
 pub const REPORT_FOLLOWUP: &str = "Reply with the REPORT block only, then the completion sentinel";
@@ -256,7 +266,7 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
             _ => &mut report.risks,
         };
         if slot.is_empty() {
-            slot.push_str(value);
+            slot.push_str(&crate::pool::clamp_string(value, REPORT_FIELD_BYTES));
         }
     }
     (!report.is_empty()).then_some(report)
@@ -365,9 +375,9 @@ pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-        parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
-        parse_request_turns, parse_wait_job, summarize_command,
+        REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
+        parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
+        parse_report, parse_request_turns, parse_wait_job, summarize_command,
     };
     use crate::pool::WorkerReport;
 
@@ -393,6 +403,32 @@ mod tests {
         assert_eq!(report.files, "src/a.rs");
         assert_eq!(report.tests, "cargo test: passed");
         assert_eq!(report.risks, "none");
+    }
+
+    #[test]
+    fn oversized_utf8_report_fields_are_bounded_without_splitting_characters() {
+        // 4 KiB * 3 bytes/code point, then doubled: even a 16 KiB test stays
+        // well above the budget, so the test exercises truncation, not a
+        // coincidence of the input.
+        let value = "界🦀é".repeat(2000);
+        let message =
+            format!("REPORT\ndone: {value}\nfiles: {value}\ntests: {value}\nrisks: {value}");
+        let report = parse_report(&message).expect("oversized fields still parse");
+        for field in [&report.done, &report.files, &report.tests, &report.risks] {
+            assert!(
+                field.len() <= REPORT_FIELD_BYTES,
+                "field retained {} bytes, budget {}",
+                field.len(),
+                REPORT_FIELD_BYTES
+            );
+            let (head, marker) = field.split_once("... [").expect("a truncation marker");
+            assert!(!head.is_empty(), "a byte always remains before the marker");
+            assert!(
+                value.starts_with(head),
+                "only complete UTF-8 characters survive"
+            );
+            assert!(marker.ends_with("bytes truncated]"));
+        }
     }
 
     #[test]

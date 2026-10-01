@@ -90,9 +90,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "task",
         "string",
-        DescriptionSource::Static(
-            "ONE focused concern: files in scope and the acceptance gate. Required for 'dispatch'.",
-        ),
+        DescriptionSource::Static("ONE focused concern: files in scope and the acceptance gate."),
     ),
     (
         "tasks",
@@ -123,7 +121,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'): a unique 3+ char prefix or 'last'. Required for every verb that targets one worker.",
+            "Target worker (alias 'id'): a unique 3+ char prefix or 'last'; required for verbs that target one.",
         ),
     ),
     (
@@ -135,20 +133,22 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch (prefixes and 'last' as for 'worker_id'); omitted watches every worker you own.",
+            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only workers of this group."),
+        DescriptionSource::Static(
+            "Only workers of this group. For 'watch' and 'merge --approved'.",
+        ),
     ),
     (
         "role",
@@ -161,14 +161,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch'; on expiry it returns {status:'no_event'}. Omit to wait indefinitely.",
+            "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
         ),
     ),
     (
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash turns (overrides the manifest default); on 'steer' the fresh budget when continuing a stopped worker.",
+            "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.",
         ),
     ),
     (
@@ -187,15 +187,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before completion is honoured (e.g. 'cargo test'); omit to auto-detect, pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
         ),
     ),
     (
         "scope",
         "string",
-        DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) or 'all' (needs the admin override).",
-        ),
+        DescriptionSource::Static("'list' scope: 'mine' (default) or 'all' (admin)."),
     ),
     (
         "full",
@@ -218,8 +216,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' isolates every bash step (no egress), 'allow' (default) keeps connectivity.",
+            "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.",
         ),
+    ),
+    (
+        "approved",
+        "boolean",
+        DescriptionSource::Static("Merge every approved worker."),
     ),
     (
         "keep_branch",

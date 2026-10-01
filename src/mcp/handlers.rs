@@ -1428,6 +1428,11 @@ impl McpServer {
         args: &Value,
         ctx: &super::server::ConnectionContext,
     ) -> Result<Value> {
+        // `merge --approved` lands a whole round with one gate: no worker id,
+        // the caller's approved workers (optionally one group) instead.
+        if args.get("approved").and_then(|v| v.as_bool()) == Some(true) {
+            return self.merge_approved(args, ctx).await;
+        }
         let wid = Self::get_worker_id(args, "merge")?;
         self.require_owner(wid, ctx).await?;
         // A worker this process owns carries its verify verdict in memory; a
@@ -1466,6 +1471,64 @@ impl McpServer {
             "gate": if report.gate_ran { "ran" } else { "skipped" },
             "gate_command": report.gate_command,
             "branch_deleted": report.branch_deleted,
+            "cleaned": report.cleaned,
+        }))
+    }
+
+    /// Land every approved worker of the caller (optionally one group) with a
+    /// single gate.
+    ///
+    /// The selection is owner-scoped exactly like `list`: another agent's
+    /// approved workers are never in the batch, and the admin override is the
+    /// only way to see every owner's. The whole sequence -- compose, one gate,
+    /// one `--no-ff` merge per worker, cleanup -- is one blocking unit in
+    /// [`crate::pool::merge`], so it runs off the runtime thread.
+    async fn merge_approved(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let group = args
+            .get("group")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let group_echo = group.clone();
+        let owner = if ctx.is_admin() {
+            None
+        } else {
+            Some(ctx.agent().to_string())
+        };
+        let root = self.pool.scratch_root().clone();
+        let admission = self.pool.admission();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::pool::merge_approved_in(
+                &root,
+                &crate::pool::MergeApprovedRequest {
+                    owner: owner.as_deref(),
+                    group: group.as_deref(),
+                    admission: Some(admission),
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("batch merge task failed: {e}"))??;
+        Ok(json!({
+            "approved": true,
+            "group": group_echo,
+            "base_branch": report.base_branch,
+            "repo_path": report.repo_path,
+            "merged": report
+                .merged
+                .iter()
+                .map(|m| json!({"worker_id": m.worker_id, "commit": m.commit}))
+                .collect::<Vec<_>>(),
+            "skipped": report
+                .skipped
+                .iter()
+                .map(|s| json!({"worker_id": s.worker_id, "files": s.files, "steer": s.steer}))
+                .collect::<Vec<_>>(),
+            "gate_command": report.gate_command,
+            "gate_duration_ms": report.gate_duration_ms,
             "cleaned": report.cleaned,
         }))
     }
@@ -1717,27 +1780,6 @@ fn numstat_count(field: &str) -> Option<usize> {
 /// reading the same shape.
 pub(super) type DiffFileStat = crate::pool::FileStat;
 
-/// Whether a requested path names the file a diff section is about.
-///
-/// Exact after normalisation, or a whole-component suffix of it, so `--file
-/// a.rs` still finds `src/a.rs`.
-fn same_diff_path(requested: &str, actual: &str) -> bool {
-    let requested = normalize_diff_path(requested);
-    let actual = normalize_diff_path(actual);
-    actual == requested
-        || (!requested.is_empty()
-            && actual.len() > requested.len()
-            && actual.ends_with(&requested)
-            && actual[..actual.len() - requested.len()].ends_with('/'))
-}
-
-/// Per-file `(path, insertions, deletions)` of a unified diff, read by the
-/// shared parser in [`crate::pool`] so a review payload and a completion event
-/// count the same hunks the same way.
-fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
-    crate::pool::file_stats_of_diff(diff)
-}
-
 /// Which part of a change a path belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PathKind {
@@ -1870,6 +1912,11 @@ fn diff_file_summaries(diff: &str) -> Vec<DiffFileSummary> {
         .collect()
 }
 
+/// Per-file `(path, insertions, deletions)` of a unified diff.
+fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
+    crate::pool::file_stats_of_diff(diff)
+}
+
 /// The sections of `diff` whose path classifies as `kind`, rejoined.
 fn diff_of_kind(diff: &str, kind: PathKind) -> String {
     crate::pool::diff_sections_of(diff)
@@ -1918,7 +1965,11 @@ fn docs_value(summaries: &[DiffFileSummary]) -> Value {
 fn diff_of_files(diff: &str, files: &[String]) -> String {
     crate::pool::diff_sections_of(diff)
         .into_iter()
-        .filter(|(path, _)| files.iter().any(|file| same_diff_path(file, path)))
+        .filter(|(path, _)| {
+            files
+                .iter()
+                .any(|file| crate::pool::same_diff_path(file, path))
+        })
         .map(|(_, section)| section)
         .collect()
 }

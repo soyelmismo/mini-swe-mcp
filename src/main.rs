@@ -281,6 +281,9 @@ fn print_help() {
     println!("  merge <worker_id> [--no-delete]");
     println!("           Merge a finished worker's branch into its base branch: trial merge,");
     println!("           verify gate on the merge result, then merge --no-ff and clean up.");
+    println!("  merge --approved [--group <group>]");
+    println!("           Land every approved worker of a group with ONE gate on the combined");
+    println!("           result: a conflicting worker is skipped, the rest merge with --no-ff.");
     println!("  reap");
     println!("           Evict expired terminal worker records.");
     println!("  prune");
