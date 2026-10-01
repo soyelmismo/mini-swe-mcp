@@ -23,11 +23,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-
-static TAG: AtomicU64 = AtomicU64::new(0);
 
 /// One host process, as the identity names it.
 const HOST: &str = "host:opencode:730:12";
@@ -41,15 +38,9 @@ const TAB_B: &str = "host:opencode:730:12/session:tab-b";
 /// Mode 0700: the client side resolves a watch token through `hub_dir()`, which
 /// refuses a directory that is group or world accessible.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "swe-session-test-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos(),
-        TAG.fetch_add(1, Ordering::Relaxed)
-    ));
+    // Short leaf: this directory holds `hub.sock`, and `sun_path` is capped at
+    // `SUN_LEN`, so a deep `TMPDIR` must still leave room for the socket.
+    let dir = std::env::temp_dir().join(format!("swe-{}", common::unique_token("session")));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch hub dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))

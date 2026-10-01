@@ -131,6 +131,30 @@ impl IsolatedPool {
 // Scratch directories
 // ----------
 
+/// A short, collision-resistant leaf name for a scratch directory.
+///
+/// Tests bind Unix sockets inside these directories and `sun_path` is capped at
+/// `SUN_LEN` (~108 bytes), so the leaf must stay short: a deep `TMPDIR` still
+/// has to leave room for the `<dir>/hub.sock` child. The original `tag`, pid,
+/// clock and a counter are folded into one 12-hex token rather than spelled
+/// out, keeping the name bounded no matter how long the tag is.
+pub fn unique_token(tag: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the unix epoch")
+        .as_nanos();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        tag,
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    )
+        .hash(&mut hasher);
+    format!("{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+}
+
 /// A uniquely named scratch directory that removes itself on drop.
 pub struct TempDir {
     path: PathBuf,
@@ -139,7 +163,7 @@ pub struct TempDir {
 impl TempDir {
     /// Create (clearing any stale entry first) a scratch directory under `base`.
     pub fn new(base: &Path, tag: &str) -> Self {
-        let path = base.join(format!("swe-test-{tag}-{}", unique_suffix("dir")));
+        let path = base.join(format!("swe-{}", unique_token(tag)));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("failed to create temp dir {}: {e}", path.display()));

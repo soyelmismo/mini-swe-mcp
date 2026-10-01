@@ -15,23 +15,14 @@ use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, Wor
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-static TAG: AtomicU64 = AtomicU64::new(0);
-
 /// A scratch hub directory, removed when the test ends.
 fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "swe-identity-test-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos(),
-        TAG.fetch_add(1, Ordering::Relaxed)
-    ));
+    // Short leaf: this directory holds `hub.sock`, and `sun_path` is capped at
+    // `SUN_LEN`, so a deep `TMPDIR` must still leave room for the socket.
+    let dir = std::env::temp_dir().join(format!("swe-{}", common::unique_token("identity")));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch hub dir");
     dir
