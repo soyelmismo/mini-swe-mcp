@@ -1168,7 +1168,7 @@ pub(super) async fn watch_request(
     pool: &WorkerPool,
     router: &Arc<Mutex<EventRouter>>,
     ctx: &super::server::ConnectionContext,
-    params: serde_json::Value,
+    mut params: serde_json::Value,
     ack: bool,
 ) -> anyhow::Result<serde_json::Value> {
     if ack {
@@ -1177,6 +1177,21 @@ pub(super) async fn watch_request(
             .await
             .acknowledge_watch(ctx, params["sequence"].as_u64().unwrap_or(0));
         return Ok(json!({}));
+    }
+    // Resolve each id (prefix, or `last`) before the snapshot, so the
+    // `hub/watch` route the CLI uses accepts them exactly like the MCP
+    // `watch` action does. The caller's ownership is what scopes the search.
+    if params.get("worker_ids").is_some() {
+        let mut resolved = Vec::new();
+        for needle in params["worker_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            resolved.push(pool.resolve_worker_id(needle, &ctx.agent()).await?);
+        }
+        params["worker_ids"] = json!(resolved);
     }
     let snapshot = watch_snapshot(pool).await;
     let mut guard = router.lock().await;
