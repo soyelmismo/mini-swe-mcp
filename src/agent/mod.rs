@@ -3,6 +3,7 @@
 pub mod env;
 pub mod exec;
 pub mod intercept;
+pub mod jobs;
 pub mod reap;
 pub mod retry;
 pub mod runner;
@@ -16,6 +17,10 @@ pub use env::{
     host_cargo_home, is_secret_name, resolve_cargo_home, sanitize_ambient_value,
 };
 pub use exec::{has_unshare, wrap_network_command};
+pub use jobs::{
+    DEFAULT_JOB_MAX_SECS, DEFAULT_WAIT_JOB_SECS, JobEnd, JobHandle, JobOutcome, JobState,
+    JobStatus, JobTable, JobWait, job_max_secs, wait_job_secs,
+};
 pub use retry::{DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries};
 pub use runner::AgentRunner;
 pub use sandbox::{

@@ -4,7 +4,8 @@
 //! subagent only ever emits an ordinary `echo`/`printf` command, and the
 //! parsers here are the single place that decides whether that command carries
 //! a control signal ([`parse_request_turns`] for a turn-budget extension,
-//! [`parse_ask_orchestrator`] for a blocking question,
+//! [`parse_ask_orchestrator`] for a blocking question, [`parse_wait_job`] and
+//! [`parse_kill_job`] for a background job,
 //! [`parse_consolidate_merge`] for a consolidator's branch integration,
 //! [`parse_consolidate_steer`] for routing a failure back to the worker that
 //! owns it, [`parse_consolidate_wait`] for blocking until that group stops) or
@@ -127,6 +128,46 @@ pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
     None
 }
 
+/// `echo "WAIT_JOB: <n>"` → the background job to block on.
+///
+/// Echo/`printf` form only, like every other sentinel: the job number is the
+/// first integer after the keyword, so `printf 'WAIT_JOB %d' 1` parses too.
+/// A missing or zero number yields `None`, which the loop answers with "no
+/// such job" rather than waiting on nothing.
+pub fn parse_wait_job(cmd: &str) -> Option<u64> {
+    parse_job_id(cmd, "WAIT_JOB")
+}
+
+/// `echo "KILL_JOB: <n>"` → the background job to stop.
+pub fn parse_kill_job(cmd: &str) -> Option<u64> {
+    parse_job_id(cmd, "KILL_JOB")
+}
+
+/// The job number an `echo`/`printf` of `keyword <n>` names.
+///
+/// Shared by both job sentinels so they cannot disagree about what a job
+/// number looks like. The keyword must appear in an `echo`/`printf` command,
+/// which keeps a `grep -rn WAIT_JOB` or a heredoc fixture from being read as a
+/// request to wait.
+fn parse_job_id(cmd: &str, keyword: &str) -> Option<u64> {
+    let trimmed = cmd.trim();
+    if (trimmed.starts_with("echo") || trimmed.starts_with("printf"))
+        && let Some(pos) = trimmed.find(keyword)
+    {
+        let num_str: String = trimmed[pos + keyword.len()..]
+            .chars()
+            .skip_while(|c| c.is_whitespace() || *c == ':')
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(n) = num_str.parse::<u64>()
+            && n > 0
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// `echo/printf "CONSOLIDATE_MERGE <id> ..."` → the workers to integrate.
 ///
 /// Only a consolidator interprets this sentinel: for an ordinary worker the
@@ -233,7 +274,8 @@ pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
 mod tests {
     use super::{
         is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-        parse_consolidate_steer, parse_consolidate_wait, parse_request_turns, summarize_command,
+        parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
+        parse_wait_job, summarize_command,
     };
 
     #[test]
@@ -358,6 +400,32 @@ mod tests {
         assert_eq!(parse_request_turns("cat file.rs"), None);
         assert_eq!(parse_request_turns("echo nothing"), None);
         assert_eq!(parse_request_turns("echo REQUEST_TURNS: 0"), None);
+    }
+
+    #[test]
+    fn test_parse_job_sentinels() {
+        for (cmd, id) in [
+            ("echo WAIT_JOB 1", Some(1)),
+            ("echo WAIT_JOB: 7", Some(7)),
+            ("printf 'WAIT_JOB 12\n'", Some(12)),
+            ("echo WAIT_JOB", None),
+            ("echo WAIT_JOB 0", None),
+            ("cat job.log", None),
+            ("grep -rn WAIT_JOB src/", None),
+        ] {
+            assert_eq!(parse_wait_job(cmd), id, "{cmd:?}");
+        }
+        for (cmd, id) in [
+            ("echo KILL_JOB 2", Some(2)),
+            ("echo KILL_JOB: 9", Some(9)),
+            ("echo KILL_JOB", None),
+            ("echo WAIT_JOB 4", None),
+        ] {
+            assert_eq!(parse_kill_job(cmd), id, "{cmd:?}");
+        }
+        // A job number is not a turn request, and the other way round.
+        assert_eq!(parse_request_turns("echo WAIT_JOB 5"), None);
+        assert_eq!(parse_wait_job("echo REQUEST_TURNS: 5"), None);
     }
 
     #[test]

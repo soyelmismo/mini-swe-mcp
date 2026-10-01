@@ -205,12 +205,10 @@ impl Daemon {
         // Where the daemon will listen, derived exactly as the product derives
         // it: a filesystem socket when one fits, otherwise the short private
         // directory or the abstract socket it falls back to.
-        let endpoint = mini_swe_mcp::hub::HubPaths::new(dir.to_path_buf()).endpoint();
+        let paths = HubPaths::new(dir.to_path_buf());
+        let endpoint = paths.endpoint();
         let server = server();
-        let daemon = HubServer::new(
-            server.clone(),
-            HubConfig::new(HubPaths::new(dir.clone()), 60),
-        );
+        let daemon = HubServer::new(server.clone(), HubConfig::new(paths, 60));
         let task = tokio::spawn(async move {
             let _ = daemon.run().await;
         });

@@ -123,7 +123,10 @@ impl WorkerPool {
             reviewer_model.clone(),
             temperature,
         )
-        .with_network_offline(network_offline);
+        .with_network_offline(network_offline)
+        // The reviewer shares the worker's job table, so a job it backgrounds
+        // is confined and stopped exactly like the implementer's.
+        .with_jobs(self.job_handle(&worker_id));
 
         let manifest = self.manifest();
         let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);

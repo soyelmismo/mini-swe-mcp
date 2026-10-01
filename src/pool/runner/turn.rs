@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -40,7 +41,8 @@ use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_request_turns, summarize_command,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
+    parse_wait_job, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -601,6 +603,26 @@ impl<'a> TurnEngine<'a> {
             "Subagent step"
         );
 
+        // --- Background job sentinels ---
+        // Handled before the repetition detector: waiting on a job is the
+        // sanctioned alternative to sleep-polling, so a second `WAIT_JOB` for
+        // the same job is a legitimate follow-up rather than a repeated
+        // command, and neither sentinel runs a bash step.
+        if config.apply_sentinels {
+            if let Some(job) = parse_kill_job(&cmd_str) {
+                let (output, code) = self.stop_job(job);
+                return self
+                    .record_command_result(&llm_resp, &label, output, code)
+                    .await;
+            }
+            if let Some(job) = parse_wait_job(&cmd_str) {
+                let (output, code) = self.wait_on_job(job).await;
+                return self
+                    .record_command_result(&llm_resp, &label, output, code)
+                    .await;
+            }
+        }
+
         // --- Repetition detector ---
         // Re-issuing the identical command is not progress: running it again
         // burns a turn and returns the output the history already carries, so
@@ -646,24 +668,24 @@ impl<'a> TurnEngine<'a> {
                     .pool
                     .consolidate_merge(self.meta, self.worktree, &ids)
                     .await;
-                return Ok(self
-                    .consolidator_reply(&label, merged.observation, merged.integrated, llm_resp)
-                    .await);
+                return self
+                    .consolidator_reply(&label, merged.observation, merged.integrated, &llm_resp)
+                    .await;
             }
             // A steer routes a failure or a conflict back to the worker that
             // owns it, exactly as the orchestrator's own steer would.
             if let Some((id, message)) = parse_consolidate_steer(&cmd_str) {
                 let observation = self.pool.consolidate_steer(self.meta, &id, message).await;
-                return Ok(self
-                    .consolidator_reply(&label, observation, false, llm_resp)
-                    .await);
+                return self
+                    .consolidator_reply(&label, observation, false, &llm_resp)
+                    .await;
             }
             // A wait blocks until the group stops, spending no turn on it.
             if let Some((ids, timeout)) = parse_consolidate_wait(&cmd_str) {
                 let observation = self.pool.consolidate_wait(self.meta, &ids, timeout).await;
-                return Ok(self
-                    .consolidator_reply(&label, observation, false, llm_resp)
-                    .await);
+                return self
+                    .consolidator_reply(&label, observation, false, &llm_resp)
+                    .await;
             }
         }
 
@@ -747,6 +769,22 @@ impl<'a> TurnEngine<'a> {
             );
         }
 
+        self.record_command_result(&llm_resp, &label, output, code)
+            .await
+    }
+
+    /// Record one answered turn: the tool result the model sees, the bounded
+    /// step log and the durable history append.
+    ///
+    /// Shared by an executed command and by the job sentinels, which answer a
+    /// turn without running bash, so all three reach the history the same way.
+    async fn record_command_result(
+        &mut self,
+        llm_resp: &LlmResponse,
+        label: &str,
+        output: String,
+        code: Option<i32>,
+    ) -> Result<TurnOutcome> {
         let output_text = format!(
             "{COMMAND_OUTPUT_PREFIX}{}):\n```\n{}\n```",
             code.unwrap_or(-1),
@@ -756,7 +794,7 @@ impl<'a> TurnEngine<'a> {
         // The log entry is built *after* `output_text` so `output` is moved
         // rather than cloned, and both text fields are clamped to a hard
         // ceiling.
-        let step_log = build_step_log(*self.step, &label, output, code);
+        let step_log = build_step_log(*self.step, label, output, code);
 
         {
             let mut lock = self.pool.workers.write().await;
@@ -766,9 +804,12 @@ impl<'a> TurnEngine<'a> {
         }
 
         self.push_exchange(
-            llm_resp.content,
-            llm_resp.reasoning_content,
-            llm_resp.tool_calls.zip(llm_resp.tool_call_id),
+            llm_resp.content.clone(),
+            llm_resp.reasoning_content.clone(),
+            llm_resp
+                .tool_calls
+                .clone()
+                .zip(llm_resp.tool_call_id.clone()),
             output_text,
         );
 
@@ -776,8 +817,8 @@ impl<'a> TurnEngine<'a> {
     }
 
     /// Answer a harness-mediated consolidator verb: the observation stands in
-    /// for the bash output, the step is logged as an ordinary exit-0 step, and
-    /// the loop continues without spending a sandbox turn on it.
+    /// for the bash output, so the step is recorded as an ordinary exit-0 step
+    /// and the loop continues without spending a sandbox turn on it.
     ///
     /// `preserve` keeps the consolidator's branch past this guard's cleanup,
     /// which only a merge that landed other workers' commits needs.
@@ -786,26 +827,45 @@ impl<'a> TurnEngine<'a> {
         label: &str,
         observation: String,
         preserve: bool,
-        llm_resp: LlmResponse,
-    ) -> TurnOutcome {
+        llm_resp: &LlmResponse,
+    ) -> Result<TurnOutcome> {
         if preserve {
             self.worktree.preserve_branch = true;
         }
-        let output_text = format!("{COMMAND_OUTPUT_PREFIX}0):\n```\n{observation}\n```");
-        let step_log = build_step_log(*self.step, label, observation, Some(0));
-        {
-            let mut lock = self.pool.workers.write().await;
-            if let Some(w) = lock.get_mut(self.worker_id) {
-                w.logs.push(step_log);
-            }
+        self.record_command_result(llm_resp, label, observation, Some(0))
+            .await
+    }
+
+    /// Block on background job `job` for one `WAIT_JOB` budget.
+    ///
+    /// The worker counts as running a command for the whole wait, so the stall
+    /// detector and the watch views see a live step rather than an idle one. No
+    /// bash slot and no admission permit is taken: waiting runs nothing.
+    async fn wait_on_job(&self, job: u64) -> (String, Option<i32>) {
+        let _running = self.pool.command_running(self.worker_id);
+        let limit = Duration::from_secs(crate::agent::jobs::wait_job_secs());
+        match self.runner.wait_job(job, limit).await {
+            Some(wait) => wait.report(job),
+            None => (
+                format!("No job {job} is running; it already ended or never existed."),
+                Some(1),
+            ),
         }
-        self.push_exchange(
-            llm_resp.content,
-            llm_resp.reasoning_content,
-            llm_resp.tool_calls.zip(llm_resp.tool_call_id),
-            output_text,
-        );
-        TurnOutcome::Continue
+    }
+
+    /// Stop background job `job`.
+    fn stop_job(&self, job: u64) -> (String, Option<i32>) {
+        if self.runner.kill_job(job) {
+            (
+                format!("Job {job} stopped; its process group was killed."),
+                Some(0),
+            )
+        } else {
+            (
+                format!("No job {job} is running; it already ended or never existed."),
+                Some(1),
+            )
+        }
     }
 
     /// Handle a completion sentinel: run the verify gate (if any) and either
@@ -1232,6 +1292,12 @@ impl<'a> TurnEngine<'a> {
         extra_env: Vec<(String, String)>,
     ) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
+        // A completion-class command is a harness gate -- the completion verify
+        // or its divergent variant -- not the model's own work. It must never
+        // become a background job nobody waits on, and its budget is the
+        // absolute job ceiling rather than the step timeout, so a slow gate
+        // simply takes longer and its real exit code decides.
+        let gate = matches!(class, AdmissionClass::Completion);
         let build_permit = if heavy {
             // A queued command is not inactivity, including completion gates.
             let _waiting = self
@@ -1248,6 +1314,11 @@ impl<'a> TurnEngine<'a> {
             .await
             .context("Bash semaphore closed")?;
         let mut runner = self.runner.clone();
+        if gate {
+            runner = runner
+                .without_job_conversion()
+                .with_command_timeout(crate::agent::jobs::job_max_secs());
+        }
         if let Some(permit) = &build_permit {
             runner = runner.with_build_jobs(permit.jobs());
         }
@@ -1260,7 +1331,16 @@ impl<'a> TurnEngine<'a> {
             self.worktree.leased_build_dir().map(Path::to_path_buf)
         };
         let _running = self.pool.command_running(self.worker_id);
-        runner.execute_bash(&self.worktree.path, command).await
+        let (output, code) = runner.execute_bash(&self.worktree.path, command).await?;
+        // A command that outlived its budget is now a background job, and the
+        // build slot it was admitted under moves into the job: a job never
+        // outlives the admission it was granted.
+        if let Some(job) = runner.take_last_job_id()
+            && let Some(permit) = build_permit
+        {
+            runner.attach_job_guard(job, Box::new(permit));
+        }
+        Ok((output, code))
     }
 
     /// Only an exit-zero run on a stable source tree certifies reusable content.

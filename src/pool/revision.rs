@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{ChatMessage, Role};
 
+use super::state::retention_expired;
+use super::steer::remove_steer_file_in;
+
 /// Prefix of the user message a revision appends after the reloaded history.
 ///
 /// Kept in one place so the pool, the MCP schema text and the tests agree on
@@ -455,17 +458,69 @@ fn remove_quietly(worker_id: &str, path: &Path) {
     }
 }
 
+/// [`retire_worker_in`] under the default scratch root.
+pub fn retire_worker(worker_id: &str) {
+    retire_worker_in(&ScratchRoot::from_env(), worker_id);
+}
+
+/// Retire every durable trace of `worker_id`: its registry row, its saved
+/// conversation and its steering mailbox.
+///
+/// The one deletion path, so a row can never outlive the conversation it names
+/// (or the other way round) and leave a half-known worker behind.
+pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
+    remove_worker_history_in(root, worker_id);
+    remove_steer_file_in(root, worker_id);
+    super::remove_registry_entry_in(root, worker_id);
+}
+
+/// Retire the durable state of every terminal worker whose retention expired.
+///
+/// Age-based and repository-agnostic: a worker whose branch still exists keeps
+/// its row and its conversation until this retention runs out, which is what
+/// lets an orchestrator continue a worker it finished days ago. Returns how
+/// many workers were retired.
+pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u64) -> usize {
+    let now = super::unix_timestamp();
+    let mut retired = 0;
+    for entry in super::load_registry_entries_read_only_in(root) {
+        if !entry.status.is_terminal() || !retention_expired(entry.updated_at, retention_secs, now)
+        {
+            continue;
+        }
+        retire_worker_in(root, &entry.id);
+        retired += 1;
+    }
+    retired
+}
+
 /// Delete the saved conversations of `repo_root`'s workers whose branch is
 /// gone (merged and deleted, or pruned): nothing can revise them any more.
 ///
 /// A finished worker has no worktree left, so the worktree sweep of `prune`
-/// never reaches its history file; this is the sweep that does.
+/// never reaches its history file; this is the sweep that does. A worker whose
+/// branch survives is kept unless its retention expired, so a finished worker
+/// stays continuable for as long as its branch does.
 pub fn prune_orphan_histories(repo_root: &Path) -> usize {
     prune_orphan_histories_in(&ScratchRoot::from_env(), repo_root)
 }
 
 /// [`prune_orphan_histories`] under an explicit scratch root.
 pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize {
+    prune_orphan_histories_with_retention_in(
+        root,
+        repo_root,
+        super::state::terminal_retention_secs(),
+    )
+}
+
+/// [`prune_orphan_histories_in`] with an explicit retention, so a caller (or a
+/// test) can name the age instead of reading the environment.
+pub fn prune_orphan_histories_with_retention_in(
+    root: &ScratchRoot,
+    repo_root: &Path,
+    retention_secs: u64,
+) -> usize {
     /// The two fields the sweep needs, without parsing the conversation.
     #[derive(Deserialize)]
     struct Owner {
@@ -475,6 +530,7 @@ pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize 
     let Ok(repo) = repo_root.canonicalize() else {
         return 0;
     };
+    let now = super::unix_timestamp();
     let mut removed = 0;
     for base in root.base_dirs() {
         let Ok(entries) = std::fs::read_dir(&base) else {
@@ -512,8 +568,12 @@ pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize 
                 &["rev-parse", "--verify", "--quiet", &reference],
             )
             .is_ok_and(|out| out.status.success());
-            if !branch_exists {
-                remove_worker_history_in(root, id);
+            // The branch is gone, or it outlived its retention: either way the
+            // worker cannot be continued any more, so the whole trace goes.
+            let expired = super::load_registry_entry_in(root, id)
+                .is_some_and(|entry| retention_expired(entry.updated_at, retention_secs, now));
+            if !branch_exists || expired {
+                retire_worker_in(root, id);
                 removed += 1;
             }
         }

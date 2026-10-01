@@ -16,7 +16,7 @@ use crate::manifest::ModelManifest;
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
     "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
-    "manifest", "prune",
+    "manifest", "prune", "merge",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -47,7 +47,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, identity, sandbox, env.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs' when you have no shell. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -68,9 +68,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static(
-            "Action to perform: 'dispatch', 'status', 'steer', 'watch', 'collect', 'review', 'logs', 'list', 'kill', 'reap', 'manifest' or 'prune'.",
-        ),
+        DescriptionSource::Static("Action to perform; see `mini-swe-mcp help <topic>`."),
     ),
     (
         "task",
@@ -198,6 +196,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static(
             "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
         ),
+    ),
+    (
+        "keep_branch",
+        "boolean",
+        DescriptionSource::Static("Keep the branch."),
     ),
 ];
 
