@@ -50,8 +50,8 @@ mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_request_turns,
-    summarize_command,
+    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_kill_job,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
@@ -121,6 +121,31 @@ impl SteerFileGuard {
 impl Drop for SteerFileGuard {
     fn drop(&mut self) {
         remove_steer_file_in(&self.root, &self.worker_id);
+    }
+}
+
+/// Stops a worker's background jobs when the worker ends.
+///
+/// Held for the whole of [`WorkerPool::run_phases`], which returns from a dozen
+/// places: a job that outlived its worker would keep running with the build slot
+/// and the build dir the command was admitted with. A `Drop` impl cannot be
+/// forgotten on a new early return, and it runs before the worktree guard is
+/// dropped, while the directories the process-group sweep matches on still
+/// exist.
+struct JobGuard<'a> {
+    pool: &'a WorkerPool,
+    worker_id: &'a str,
+}
+
+impl Drop for JobGuard<'_> {
+    fn drop(&mut self) {
+        let stopped = self.pool.end_worker_jobs(self.worker_id);
+        if stopped > 0 {
+            info!(
+                worker = %self.worker_id,
+                stopped, "Stopped the background jobs of a finished worker"
+            );
+        }
     }
 }
 
@@ -326,7 +351,14 @@ impl WorkerPool {
             model.clone(),
             temperature,
         )
-        .with_network_offline(network_offline);
+        .with_network_offline(network_offline)
+        // A command that outlives its budget becomes one of this worker's
+        // background jobs, so the runner needs the worker's job table.
+        .with_jobs(self.job_handle(worker_id));
+        let _jobs = JobGuard {
+            pool: self,
+            worker_id,
+        };
 
         let mut step = 0;
         let mut current_max_turns = max_turns;

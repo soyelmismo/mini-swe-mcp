@@ -180,7 +180,24 @@ impl JobHandle {
         self.table.get(&self.worker, id)
     }
 
+    /// Wait for this worker's job `id`, up to `limit`.
+    ///
+    /// `None` when there is no such job. A job whose outcome has just been
+    /// delivered leaves the table, so a finished job is listed until the worker
+    /// has collected it and never accumulates past that.
+    pub async fn wait(&self, id: u64, limit: Duration) -> Option<JobWait> {
+        let job = self.table.get(&self.worker, id)?;
+        let wait = job.wait(limit).await;
+        if matches!(wait, JobWait::Finished { .. }) {
+            self.table.forget(&self.worker, id);
+        }
+        Some(wait)
+    }
+
     /// Stop this worker's job `id`; `false` when no such job is live.
+    ///
+    /// The job leaves the table at once: `KILL_JOB` is itself the answer, and
+    /// the supervisor still reaps the group and releases what the job held.
     pub fn kill(&self, id: u64) -> bool {
         let Some(job) = self.table.get(&self.worker, id) else {
             return false;
@@ -448,7 +465,7 @@ impl JobWait {
 }
 
 /// One background job as the worker's status lists it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobStatus {
     /// Job number the worker waits on.
     pub id: u64,

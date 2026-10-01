@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 
 use crate::agent::AgentStepLog;
+use crate::agent::jobs::JobStatus;
 
 use super::buffer::{LogBuffer, LogStats};
 use super::unix_timestamp;

@@ -69,7 +69,7 @@ pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_request_turns, summarize_command,
+    parse_kill_job, parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,

@@ -184,8 +184,7 @@ impl AgentRunner {
     /// `None` when this runner has no job `id`, which is how the caller tells
     /// "no such job" from "the job is still running".
     pub async fn wait_job(&self, id: u64, limit: Duration) -> Option<JobWait> {
-        let job = self.jobs.as_ref()?.job(id)?;
-        Some(job.wait(limit).await)
+        self.jobs.as_ref()?.wait(id, limit).await
     }
 
     /// Stop background job `id`; `false` when this runner has no such job.
