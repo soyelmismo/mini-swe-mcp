@@ -1635,6 +1635,7 @@ fn channel_frames_carry_content_and_valid_meta_keys() {
 /// never normalizes it to `stopped`.
 fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
+        approved: None,
         id: worker_id.to_string(),
         pid: std::process::id(),
         task: String::from("channel smoke test"),

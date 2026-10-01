@@ -75,6 +75,7 @@ impl Harness {
     /// The registry row a finished worker leaves behind.
     fn completed_row(&self, worker_id: &str, owner: &str, group: Option<&str>, role: WorkerRole) {
         let entry = WorkerRegistryEntry {
+            approved: None,
             id: worker_id.to_string(),
             pid: std::process::id(),
             task: "do the work".to_string(),

@@ -948,6 +948,7 @@ impl super::WorkerPool {
         // The row that makes the revision visible to registry readers before
         // its first turn writes one; built before the conversation moves out.
         let row = super::WorkerRegistryEntry {
+            approved: None,
             id: id.to_string(),
             pid: std::process::id(),
             task: history.task.clone(),

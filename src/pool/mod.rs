@@ -1821,6 +1821,7 @@ mod consolidate_delegation_tests {
     /// A target worker's registry row, as its own dispatch wrote it.
     fn target(id: &str, owner: &str, group: &str, role: WorkerRole) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
+            approved: None,
             id: id.to_string(),
             pid: std::process::id(),
             task: "do the work".to_string(),

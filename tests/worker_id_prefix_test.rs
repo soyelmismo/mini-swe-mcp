@@ -47,6 +47,7 @@ fn running_worker(id: &str, owner: &str) -> WorkerRecord {
 /// A running registry row owned by `owner`, dispatched at `started_at`.
 fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
+        approved: None,
         id: id.to_string(),
         pid: std::process::id(),
         task: "task".to_string(),

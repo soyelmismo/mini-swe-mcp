@@ -1095,6 +1095,7 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
 /// A registry row for a worker owned by a live process elsewhere.
 fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
+        approved: None,
         id: id.to_string(),
         pid,
         task: "t".into(),
@@ -1121,6 +1122,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
 /// A registry row with every counter moved, as a finished run would write it.
 fn measured_entry() -> WorkerRegistryEntry {
     WorkerRegistryEntry {
+        approved: None,
         id: "m1".into(),
         pid: 42,
         task: "t".into(),

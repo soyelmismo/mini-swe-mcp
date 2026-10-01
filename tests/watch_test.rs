@@ -1264,6 +1264,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
     common::git(&repo, &["checkout", "-q", "main"]);
 
     let entry = WorkerRegistryEntry {
+        approved: None,
         id: "w-gone".to_string(),
         pid: std::process::id(),
         task: "fix the parser".to_string(),

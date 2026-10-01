@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::admission::{AdmissionClass, AdmissionController};
-use super::registry::load_registry_entry_in;
+use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
 use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
 use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
@@ -211,11 +211,7 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
             resolved.branch, resolved.base_branch
         )
     })?;
-    let commit = git(repo, "rev-parse", &["rev-parse", "--short", "HEAD"])
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    let commit = head_commit(repo);
 
     let (branch_deleted, cleaned) =
         cleanup(root, worker_id, repo, &resolved.branch, req.keep_branch);
@@ -231,6 +227,15 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
         branch_deleted,
         cleaned,
     })
+}
+
+/// Abbreviated commit `repo` currently has checked out.
+fn head_commit(repo: &Path) -> String {
+    git(repo, "rev-parse", &["rev-parse", "--short", "HEAD"])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Everything the merge needs about one worker, read from disk.
@@ -350,16 +355,24 @@ enum MergeTree {
 }
 
 /// Trial-merge `branch` into `base` with `git merge-tree --write-tree`.
+fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<MergeTree> {
+    merge_tree_with(repo, &[], base, branch)
+}
+
+/// Trial-merge `theirs` into `ours` with `git merge-tree --write-tree`.
+///
+/// `options` are the extra flags the caller needs -- a batch composes a branch
+/// on top of an already merged tree, so it names the merge base explicitly.
 ///
 /// Exit status 0 is a clean merge, 1 is a conflict list; anything else is a git
 /// failure (unknown ref, unsupported option) and is reported verbatim rather
 /// than guessed at.
-fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<MergeTree> {
-    let out = git(
-        repo,
-        "merge-tree",
-        &["merge-tree", "--write-tree", "--name-only", base, branch],
-    )?;
+fn merge_tree_with(repo: &Path, options: &[&str], ours: &str, theirs: &str) -> Result<MergeTree> {
+    let mut args: Vec<&str> = vec!["merge-tree", "--write-tree", "--name-only"];
+    args.extend_from_slice(options);
+    args.push(ours);
+    args.push(theirs);
+    let out = git(repo, "merge-tree", &args)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut lines = stdout.lines();
     // Line one is always the tree oid; the conflict list follows it, then a
@@ -370,7 +383,7 @@ fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<MergeTree> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "git merge-tree produced no merge tree for {branch} into {base}: {}",
+                "git merge-tree produced no merge tree for {theirs} into {ours}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )
         })?
@@ -387,7 +400,7 @@ fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<MergeTree> {
         return Ok(MergeTree::Conflicts(files));
     }
     anyhow::bail!(
-        "git merge-tree {base} {branch} failed ({}): {}",
+        "git merge-tree {ours} {theirs} failed ({}): {}",
         out.status
             .code()
             .map(|c| c.to_string())
@@ -480,7 +493,30 @@ fn run_gate(
     req: &MergeRequest<'_>,
     client_env: &[(String, String)],
 ) -> Result<()> {
-    let gate_dir = root.join(format!("swe-merge-{worker_id}"));
+    let (code, text) = run_gate_result(root, worker_id, repo, tree, command, req, client_env)?;
+    if code == Some(0) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "verify gate failed on the merge result of worker {worker_id} ({command}, exit {}):\n{}",
+        code.map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string()),
+        tail(&text, GATE_TAIL_LINES)
+    );
+}
+
+/// [`run_gate`] without the verdict: the exit code and the bounded output, so a
+/// batch can gate its combined tree once and still report the failing tail.
+fn run_gate_result(
+    root: &ScratchRoot,
+    label: &str,
+    repo: &Path,
+    tree: &str,
+    command: &str,
+    req: &MergeRequest<'_>,
+    client_env: &[(String, String)],
+) -> Result<(Option<i32>, String)> {
+    let gate_dir = root.join(format!("swe-merge-{label}"));
     force_remove_dir(&gate_dir);
     let created = git(
         repo,
@@ -498,7 +534,7 @@ fn run_gate(
         force_remove_dir(&gate_dir);
         return Err(e).with_context(|| {
             format!(
-                "could not create a gate worktree for worker {worker_id} under the scratch root"
+                "could not create a gate worktree for {label} under the scratch root"
             )
         });
     }
@@ -509,24 +545,16 @@ fn run_gate(
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .context("could not start the verify gate's runtime")?;
-            runtime.block_on(run_gate_confined(repo, &gate_dir, command, req, client_env))
+                .context("could not start the verify gate's runtime");
+            runtime
+                .and_then(|runtime| runtime.block_on(run_gate_confined(repo, &gate_dir, command, req, client_env)))
         }
         Err(e) => Err(e).with_context(|| {
-            format!("could not materialise the merge result for worker {worker_id}")
+            format!("could not materialise the merge result for {label}")
         }),
     };
     reclaim_gate_worktree(root, repo, &gate_dir);
-    let (code, text) = gate?;
-    if code == Some(0) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "verify gate failed on the merge result of worker {worker_id} ({command}, exit {}):\n{}",
-        code.map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string()),
-        tail(&text, GATE_TAIL_LINES)
-    );
+    gate
 }
 
 /// Run the gate command confined, admitted and with a leased build directory.
@@ -677,4 +705,441 @@ fn cleanup(
         cleaned.push("worktree leftovers removed".to_string());
     }
     (branch_deleted, cleaned)
+}
+
+// ----------
+// Batch merge: one gate for a whole round of approved workers
+// ----------
+
+/// One batch merge request, resolved against one scratch root.
+pub struct MergeApprovedRequest<'a> {
+    /// The agent whose approved workers may be merged (H-3). `None` is the
+    /// admin override: every owner's approved workers.
+    pub owner: Option<&'a str>,
+    /// Only the approved workers of this group.
+    pub group: Option<&'a str>,
+    /// The pool's admission controller, so the batch's single gate competes for
+    /// the host's heavy-command budget like any worker's. `None` for a caller
+    /// with no pool: the gate still runs confined, only the budget is not
+    /// reserved.
+    pub admission: Option<AdmissionController>,
+}
+
+/// One approved worker whose branch landed.
+#[derive(Debug, Clone)]
+pub struct MergedWorker {
+    pub worker_id: String,
+    /// Abbreviated commit that worker's merge produced.
+    pub commit: String,
+}
+
+/// One approved worker skipped because its branch does not compose.
+#[derive(Debug, Clone)]
+pub struct SkippedWorker {
+    pub worker_id: String,
+    /// The files that conflict, in the order git reported them.
+    pub files: Vec<String>,
+}
+
+/// What a batch merge did, in the words the CLI prints.
+#[derive(Debug, Clone)]
+pub struct MergeApprovedReport {
+    /// The workers whose branch landed, in merge order.
+    pub merged: Vec<MergedWorker>,
+    /// The workers skipped because their branch conflicts.
+    pub skipped: Vec<SkippedWorker>,
+    /// The one command the batch gated on.
+    pub gate_command: Option<String>,
+    /// How long that gate took, in milliseconds.
+    pub gate_duration_ms: u128,
+    /// The branch every worker landed on.
+    pub base_branch: String,
+    /// Repository the merges happened in.
+    pub repo_path: PathBuf,
+    /// Human-readable list of what the per-worker cleanup reclaimed.
+    pub cleaned: Vec<String>,
+}
+
+/// [`merge_approved_in`] over the default scratch root.
+pub fn merge_approved(req: &MergeApprovedRequest<'_>) -> Result<MergeApprovedReport> {
+    merge_approved_in(&ScratchRoot::from_env(), req)
+}
+
+/// Land every approved worker of a round with one gate, or refuse.
+///
+/// The orchestrator gates a round, not a worker: this selects the caller's
+/// completed workers that carry an approval (optionally one group), composes
+/// their branches into a single tree, runs the shared verify gate on that tree
+/// once and -- only if it passes -- merges each branch with `--no-ff` and
+/// cleans up after it. A branch that conflicts is skipped and reported rather
+/// than failing the round; a failing gate merges nothing at all.
+///
+/// Every refusal is taken before the first merge, so a refused batch changes
+/// neither the repository nor any worker's files.
+pub fn merge_approved_in(
+    root: &ScratchRoot,
+    req: &MergeApprovedRequest<'_>,
+) -> Result<MergeApprovedReport> {
+    let ids = approved_workers(root, req)?;
+    if ids.is_empty() {
+        anyhow::bail!(
+            "no completed worker of yours carries an approval{}; approve the ones to land first",
+            group_clause(req.group)
+        );
+    }
+    let mut resolved: Vec<(String, Resolved)> = Vec::new();
+    for id in &ids {
+        resolved.push((id.clone(), resolve(root, id)?));
+    }
+    let repo = resolved[0].1.repo.clone();
+    let base_branch = resolved[0].1.base_branch.clone();
+    for (id, other) in &resolved[1..] {
+        if other.repo != repo || other.base_branch != base_branch {
+            anyhow::bail!(
+                "worker {id} records base branch {} in {}, not {} in {}; merge each repository's \
+                 approved workers in its own batch",
+                other.base_branch,
+                other.repo.display(),
+                base_branch,
+                repo.display()
+            );
+        }
+    }
+    let repo = repo.as_path();
+
+    // The checkout refusals `merge <id>` takes, before anything is written.
+    let checked_out = checked_out_branch(repo);
+    if checked_out.as_deref() != Some(base_branch.as_str()) {
+        anyhow::bail!(
+            "{} has {} checked out, not the workers' base branch {}; check out {} first \
+             (the merge never moves HEAD for you)",
+            repo.display(),
+            checked_out.unwrap_or_else(|| "a detached HEAD".to_string()),
+            base_branch,
+            base_branch
+        );
+    }
+    let mut touched: Vec<String> = Vec::new();
+    for (_, worker) in &resolved {
+        for path in touched_files(repo, &base_branch, &worker.branch)? {
+            if !touched.contains(&path) {
+                touched.push(path);
+            }
+        }
+    }
+    let dirty = dirty_paths(repo)?;
+    let blocked: Vec<String> = touched
+        .iter()
+        .filter(|path| dirty.contains(path))
+        .cloned()
+        .collect();
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "{} has uncommitted change(s) in file(s) this merge would touch: {}. \
+             Commit or stash them first; untouched files are left alone",
+            repo.display(),
+            blocked.join(", ")
+        );
+    }
+
+    // Compose the round: each branch on top of the previous result, so the gate
+    // sees the batch as the one tree it would produce.
+    let base_tree = tree_of(repo, &base_branch);
+    let mut composed: Option<String> = None;
+    let mut included: Vec<&(String, Resolved)> = Vec::new();
+    let mut skipped: Vec<SkippedWorker> = Vec::new();
+    for worker in &resolved {
+        let branch = worker.1.branch.as_str();
+        let trial = match &composed {
+            // The first branch is merged exactly as `merge <id>` merges it.
+            None => merge_tree(repo, &base_branch, branch)?,
+            // The rest are merged onto the composed tree, with the point the
+            // branch forked from the base as the merge base: the same three-way
+            // merge a sequential `git merge` would compute.
+            Some(tree) => {
+                let forked = merge_base_of(repo, &base_branch, branch)
+                    .or_else(|| base_tree.clone())
+                    .unwrap_or_else(|| tree.clone());
+                merge_tree_with(
+                    repo,
+                    &["--merge-base", &forked],
+                    tree,
+                    branch,
+                )?
+            }
+        };
+        match trial {
+            MergeTree::Clean(tree) => {
+                composed = Some(tree);
+                included.push(worker);
+            }
+            MergeTree::Conflicts(files) => skipped.push(SkippedWorker {
+                worker_id: worker.0.clone(),
+                files,
+            }),
+        }
+    }
+    if included.is_empty() {
+        let hints: Vec<String> = skipped.iter().map(steer_hint).collect();
+        anyhow::bail!(
+            "no approved worker's branch composes into {}: {}",
+            base_branch,
+            hints.join("; ")
+        );
+    }
+
+    // One gate for the whole batch, on the combined tree.
+    let gate_command = shared_gate_command(repo, &included)?;
+    let gate_req = MergeRequest {
+        worker_id: "approved",
+        verified: None,
+        keep_branch: false,
+        admission: req.admission.clone(),
+    };
+    // The gate replays the dispatcher's filtered environment; a round's workers
+    // share it, so the first included worker's copy is the batch's.
+    let client_env = included[0].1.client_env.clone();
+    let started = std::time::Instant::now();
+    let (code, text) = run_gate_result(
+        root,
+        "approved",
+        repo,
+        composed.as_deref().unwrap_or_default(),
+        &gate_command,
+        &gate_req,
+        &client_env,
+    )?;
+    let gate_duration_ms = started.elapsed().as_millis();
+    if code != Some(0) {
+        let landed: Vec<&str> = included.iter().map(|(id, _)| id.as_str()).collect();
+        anyhow::bail!(
+            "verify gate failed on the combined merge result of {} ({gate_command}, exit {}):\n{}\n{}",
+            landed.join(", "),
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            tail(&text, GATE_TAIL_LINES),
+            attribute_failures(&text, repo, &base_branch, &included),
+        );
+    }
+
+    let mut merged: Vec<MergedWorker> = Vec::new();
+    let mut cleaned: Vec<String> = Vec::new();
+    for (id, worker) in &included {
+        let subject = merge_subject(&worker.task, id);
+        git(
+            repo,
+            "merge --no-ff",
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                &subject,
+                &worker.branch,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "git merge --no-ff {} into {} failed",
+                worker.branch, base_branch
+            )
+        })?;
+        let commit = head_commit(repo);
+        let (_, worker_cleaned) = cleanup(root, id, repo, &worker.branch, false);
+        cleaned.extend(worker_cleaned);
+        merged.push(MergedWorker {
+            worker_id: id.clone(),
+            commit,
+        });
+    }
+
+    Ok(MergeApprovedReport {
+        merged,
+        skipped,
+        gate_command: Some(gate_command),
+        gate_duration_ms,
+        base_branch,
+        repo_path: repo.to_path_buf(),
+        cleaned,
+    })
+}
+
+/// The caller's completed, approved workers, in approval order.
+///
+/// The registry is the only cross-process view of the pool, so the selection
+/// reads it: a worker this process still owns and one another process merged
+/// into its row are both seen here. Ties on the approval stamp fall back to the
+/// id, so the order is deterministic.
+fn approved_workers(root: &ScratchRoot, req: &MergeApprovedRequest<'_>) -> Result<Vec<String>> {
+    let mut rows: Vec<(u64, String)> = load_all_registry_entries_in(root)
+        .into_iter()
+        .filter(|entry| entry.status == RegistryStatus::Completed)
+        .filter(|entry| entry.approved.is_some())
+        .filter(|entry| req.owner.is_none_or(|owner| entry.owner.as_deref() == Some(owner)))
+        .filter(|entry| req.group.is_none_or(|group| entry.group.as_deref() == Some(group)))
+        .map(|entry| {
+            (
+                entry.approved.as_ref().map(|a| a.at).unwrap_or_default(),
+                entry.id,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(rows.into_iter().map(|(_, id)| id).collect())
+}
+
+/// `group` as a clause of a refusal, so the message names what was looked for.
+fn group_clause(group: Option<&str>) -> String {
+    match group {
+        Some(group) => format!(" in group {group}"),
+        None => String::new(),
+    }
+}
+
+/// The tree `branch` points at, when it resolves.
+fn tree_of(repo: &Path, branch: &str) -> Option<String> {
+    git(repo, "rev-parse", &["rev-parse", &format!("{branch}^{{tree}}")])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The commit `branch` forked from `base` at, when they share history.
+fn merge_base_of(repo: &Path, base: &str, branch: &str) -> Option<String> {
+    git(repo, "merge-base", &["merge-base", base, branch])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The one command the batch gates on.
+///
+/// The verify command the workers recorded, when they recorded the same one;
+/// otherwise the auto-detected project gate. A round shares one acceptance
+/// criterion, so a batch with neither is refused rather than landed ungated.
+fn shared_gate_command(repo: &Path, included: &[&(String, Resolved)]) -> Result<String> {
+    let mut recorded: Vec<&str> = Vec::new();
+    for (_, worker) in included {
+        if let Some(command) = worker.verify.as_deref()
+            && !recorded.contains(&command)
+        {
+            recorded.push(command);
+        }
+    }
+    recorded
+        .first()
+        .filter(|_| recorded.len() == 1)
+        .map(|command| (*command).to_string())
+        .or_else(|| super::detect_verify_command(repo))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the approved workers record no verify command they agree on and none could be \
+                 detected for {}; pass one with steer, or merge by hand",
+                repo.display()
+            )
+        })
+}
+
+/// The steer that sends a skipped worker's conflicts back to it.
+fn steer_hint(skipped: &SkippedWorker) -> String {
+    format!(
+        "{} skipped (conflicts in {}); steer {} \"merge conflicts in {}\"",
+        skipped.worker_id,
+        skipped.files.join(", "),
+        skipped.worker_id,
+        skipped.files.join(", ")
+    )
+}
+
+/// Attribute the files a failing gate named to the workers whose branch touched
+/// them.
+///
+/// A gate names a file as `path:line`; the worker whose branch touched it is the
+/// one to steer. A file several workers touched is an interaction point: no
+/// single branch is wrong, so the orchestrator has to decide between them.
+fn attribute_failures(
+    text: &str,
+    repo: &Path,
+    base_branch: &str,
+    included: &[&(String, Resolved)],
+) -> String {
+    let mut owners: Vec<(String, Vec<String>)> = Vec::new();
+    for (id, worker) in included {
+        let Ok(files) = touched_files(repo, base_branch, &worker.branch) else {
+            continue;
+        };
+        for path in files {
+            match owners.iter_mut().find(|(known, _)| *known == path) {
+                Some((_, ids)) => {
+                    if !ids.contains(id) {
+                        ids.push(id.clone());
+                    }
+                }
+                None => owners.push((path, vec![id.clone()])),
+            }
+        }
+    }
+    let known: Vec<String> = owners.iter().map(|(path, _)| path.clone()).collect();
+    let named = files_named_in(text, &known);
+    if named.is_empty() {
+        return "no file the failure names was touched by a worker in this batch".to_string();
+    }
+    let mut lines = vec!["the failing files and the workers whose branch touched them:".to_string()];
+    for path in named {
+        let ids = &owners
+            .iter()
+            .find(|(known, _)| *known == path)
+            .expect("a named file is one the owners map holds")
+            .1;
+        if ids.len() > 1 {
+            lines.push(format!(
+                "  {path}: {} (interaction point: several workers touched it)",
+                ids.join(", ")
+            ));
+        } else {
+            lines.push(format!("  {path}: {}", ids[0]));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The paths `text` names, restricted to `known`.
+///
+/// A gate names a file as `path:line`; a bare token that is exactly a file the
+/// batch touches counts too, so a message that prints only the path still
+/// attributes. Anything else in the output is prose and is ignored, which is
+/// what keeps the attribution to files a worker really changed.
+fn files_named_in(text: &str, known: &[String]) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | '`' | ',' | ';'
+                    | '*' | '=' | '|'
+            )
+        });
+        let token = token.trim_start_matches(['-', '>']);
+        let candidate = path_of(token);
+        if known.iter().any(|path| path == candidate) && !named.iter().any(|path| path == candidate)
+        {
+            named.push(candidate.to_string());
+        }
+    }
+    named
+}
+
+/// The path part of a `path:line` token, or the token itself when it names no
+/// line.
+fn path_of(token: &str) -> &str {
+    let Some((head, rest)) = token.split_once(':') else {
+        return token;
+    };
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    // `path:12` and `path:12:5` are a location; `note:text` is not.
+    if digits > 0 && (rest.len() == digits || rest.as_bytes()[digits] == b':') {
+        head
+    } else {
+        token
+    }
 }
