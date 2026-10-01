@@ -73,7 +73,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "task",
         "string",
         DescriptionSource::Static(
-            "ONE focused concern, naming the files in scope and the acceptance gate. Avoid parallel workers with overlapping files. Required for 'dispatch'.",
+            "ONE focused concern, naming the files in scope and the acceptance gate. Dispatch independent tasks in parallel: many workers at once is the intended use, and each integrates the latest base branch before completing. Split work so two workers do not rewrite the same function at once. Required for 'dispatch'.",
         ),
     ),
     (
