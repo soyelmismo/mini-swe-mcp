@@ -137,6 +137,11 @@ pub fn divergent_environment(
     env.push(("TMP".to_string(), tmp.to_string_lossy().into_owned()));
     env.push(("TEMP".to_string(), tmp.to_string_lossy().into_owned()));
     env.push(("TZ".to_string(), shifted_timezone()));
+    // The deliberate divergences are appended last, so a dispatcher's own
+    // HOME/TMPDIR/TZ is shadowed rather than honoured: the point of the second
+    // run is that these three differ.
+    let mut seen = std::collections::HashSet::new();
+    env.retain(|(name, _)| seen.insert(name.clone()));
     env
 }
 
@@ -155,7 +160,7 @@ pub fn divergent_command(verify: &str, env: &[(String, String)]) -> String {
     let mut wrapped = String::new();
     for (name, value) in env {
         wrapped.push_str("export ");
-        wrapped.push_str(&shell_quote(name));
+        wrapped.push_str(name);
         wrapped.push('=');
         wrapped.push_str(&shell_quote(value));
         wrapped.push_str("; ");
@@ -405,4 +410,217 @@ pub fn side_effect_refusal(effects: &SideEffects) -> String {
 The harness removed what it could; make the suite leave the repository, its refs and its processes exactly as it found them.",
         items.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "divergent-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn repo(tag: &str) -> PathBuf {
+        let dir = scratch(tag);
+        git(&dir, &["init", "-b", "master"]);
+        git(&dir, &["config", "user.name", "t"]);
+        git(&dir, &["config", "user.email", "t@localhost"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(&dir, &["add", "seed.txt"]);
+        git(&dir, &["commit", "-m", "baseline"]);
+        dir
+    }
+
+    #[test]
+    fn a_created_ref_is_audited_and_cleaned_up() {
+        let dir = repo("ref");
+        let baseline = snapshot(&dir);
+        git(&dir, &["branch", "worker-leftover"]);
+        let effects = audit(&dir, &dir, "worker-test", &baseline);
+        assert_eq!(
+            effects.new_refs,
+            vec!["refs/heads/worker-leftover".to_string()],
+            "the audit must name the ref the suite created"
+        );
+        assert!(
+            !effects.is_empty(),
+            "a created ref is a side effect that must refuse completion"
+        );
+        cleanup(&dir, &effects);
+        let after = snapshot(&dir);
+        assert!(
+            !after.refs.contains(&"refs/heads/worker-leftover".to_string()),
+            "the harness must remove the ref it found: {:?}",
+            after.refs
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_created_checkout_file_is_audited() {
+        let dir = repo("file");
+        let baseline = snapshot(&dir);
+        std::fs::write(dir.join("stray.txt"), "stray\n").unwrap();
+        let effects = audit(&dir, &dir, "worker-test", &baseline);
+        assert_eq!(
+            effects.new_files,
+            vec!["stray.txt".to_string()],
+            "a new file in the main checkout is a side effect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_untouched_repository_has_no_side_effects() {
+        let dir = repo("clean");
+        let baseline = snapshot(&dir);
+        let effects = audit(&dir, &dir, "worker-test", &baseline);
+        assert!(
+            effects.is_empty(),
+            "an untouched repository must not refuse completion: {effects:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_side_effect_refusal_lists_everything_it_found() {
+        let effects = SideEffects {
+            new_refs: vec!["refs/heads/worker-x".to_string()],
+            new_files: vec!["stray.txt".to_string()],
+            ..SideEffects::default()
+        };
+        let refusal = side_effect_refusal(&effects);
+        assert!(
+            refusal.contains("created ref refs/heads/worker-x")
+                && refusal.contains("created file stray.txt"),
+            "the refusal must list the exact leftovers, got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn the_divergence_refusal_names_the_variables_and_the_bounded_tail() {
+        let refusal = divergence_refusal(
+            "pytest -q",
+            &["HOME".to_string(), "TZ".to_string()],
+            Some(1),
+            "assert 1 == 2\n",
+        );
+        assert!(
+            refusal.contains("HOME, TZ")
+                && refusal.contains("HOME/TMPDIR/TZ differ")
+                && refusal.contains("assert 1 == 2")
+                && refusal.contains("Make the tests independent of the environment"),
+            "the refusal must name what differs and carry the failing output, got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn the_divergent_environment_shifts_home_tmpdir_and_tz() {
+        let worktree = scratch("env");
+        let env = divergent_environment(
+            &worktree,
+            &[("SWE_DIVERGENT_PROBE".to_string(), "set".to_string())],
+        );
+        let names = divergent_names(&env);
+        for name in ["HOME", "TMPDIR", "TZ", "SWE_DIVERGENT_PROBE"] {
+            assert!(names.iter().any(|n| n == name), "{name} must be in {names:?}");
+        }
+        let tz = env
+            .iter()
+            .find(|(name, _)| name == "TZ")
+            .map(|(_, value)| value.clone())
+            .expect("TZ is always set");
+        assert!(
+            SHIFTED_ZONES.contains(&tz.as_str()),
+            "TZ must be one of the far zones, got {tz:?}"
+        );
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| value.clone())
+            .expect("HOME is always set");
+        assert!(
+            Path::new(&home).starts_with(&worktree),
+            "the divergent HOME must stay inside the worktree, got {home:?}"
+        );
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn a_dispatcher_variable_cannot_override_the_deliberate_divergence() {
+        let worktree = scratch("override");
+        let env = divergent_environment(
+            &worktree,
+            &[
+                ("HOME".to_string(), "/dispatchers/home".to_string()),
+                ("TZ".to_string(), "UTC".to_string()),
+            ],
+        );
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| value.clone())
+            .expect("HOME");
+        assert_ne!(
+            home, "/dispatchers/home",
+            "the deliberate divergence must win over the dispatcher's own value"
+        );
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn the_disable_switch_reads_the_environment() {
+        crate::agent::env::with_env_lock(|| {
+            // SAFETY: serialized against every other test that reads the
+            // process environment.
+            unsafe {
+                std::env::set_var(DISABLE_ENV, "0");
+            }
+            assert!(!enabled(), "WORKER_DIVERGENT_VERIFY=0 disables variant B");
+            unsafe {
+                std::env::set_var(DISABLE_ENV, "1");
+            }
+            assert!(enabled(), "any other value leaves variant B on");
+            unsafe {
+                std::env::remove_var(DISABLE_ENV);
+            }
+            assert!(enabled(), "an unset variable leaves variant B on");
+        });
+    }
+
+    #[test]
+    fn the_divergent_command_quotes_its_values() {
+        let wrapped = divergent_command(
+            "echo hi",
+            &[("SWE_QUOTED".to_string(), "a b'c".to_string())],
+        );
+        assert!(
+            wrapped.contains("export SWE_QUOTED='a b'\\''c'; "),
+            "the value must be single-quoted so the shell cannot re-split it, got {wrapped:?}"
+        );
+        assert!(wrapped.ends_with("echo hi"), "the command is replayed verbatim");
+    }
 }

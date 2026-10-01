@@ -280,61 +280,9 @@ async fn a_hermetic_suite_completes_verified() {
     }
 }
 
-/// A suite that creates a git branch in the repo is refused, and the branch
-/// is removed.
-#[tokio::test]
-async fn a_suite_that_creates_a_branch_is_refused_and_cleaned_up() {
-    let repo = TestRepo::new("branch");
-    let server = SentinelServer::spawn().await;
-    // Idempotent: the refusal replays the gate, so the second run must pass
-    // the same way the first did rather than fail on an existing branch.
-    let verify = "git branch -f worker-leftover-branch && echo branched";
-    let (pool, worker_id) = dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
-    let refusal = wait_for_refusal(&pool, &worker_id, "must clean up").await;
-    assert!(
-        refusal.contains("refs/heads/worker-leftover-branch"),
-        "the refusal must name the created ref, got {refusal:?}"
-    );
-    let output = Command::new("git")
-        .current_dir(repo.path())
-        .args(["for-each-ref", "--format=%(refname)"])
-        .output()
-        .expect("list refs");
-    let refs = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !refs.contains("refs/heads/worker-leftover-branch"),
-        "the harness must remove the branch the suite created: {refs}"
-    );
-    let _ = pool.kill(&worker_id).await;
-}
-
-/// `WORKER_DIVERGENT_VERIFY=0` skips variant B: the same ambient-dependent
-/// suite now completes.
-#[tokio::test]
-async fn disabling_variant_b_lets_an_ambient_suite_complete() {
-    let repo = TestRepo::new("disabled");
-    let server = SentinelServer::spawn().await;
-    unsafe {
-        std::env::set_var("WORKER_DIVERGENT_VERIFY", "0");
-    }
-    let verify = "test -z \"$SWE_DIVERGENT_DISABLED_VAR\"";
-    let (pool, worker_id) = dispatch_verify(
-        &server.base_url,
-        repo.path(),
-        verify,
-        vec![("SWE_DIVERGENT_DISABLED_VAR".to_string(), "set".to_string())],
-    )
-    .await;
-    let state = wait_for_terminal(&pool, &worker_id).await;
-    unsafe {
-        std::env::remove_var("WORKER_DIVERGENT_VERIFY");
-    }
-    match state {
-        WorkerState::Completed { .. } => {}
-        other => panic!("with variant B disabled the suite must complete, got {other:?}"),
-    }
-}
-
+/// The disable switch is unit-tested in the crate: it reads a process-global
+/// variable, so exercising it here would race the sibling tests that expect
+/// variant B to run.
 /// Secrets from the client environment never reach the worker: a variable
 /// matching the secret filter is absent in variant B.
 #[tokio::test]
