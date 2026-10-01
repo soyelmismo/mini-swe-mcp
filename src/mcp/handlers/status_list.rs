@@ -227,7 +227,9 @@ fn compact_status_details(
             details.insert("verified".into(), json!(verified));
             details.insert("revision".into(), json!(revision));
         }
-        crate::pool::WorkerState::Failed { error, revision, .. } => {
+        crate::pool::WorkerState::Failed {
+            error, revision, ..
+        } => {
             details.insert("error".into(), json!(error));
             details.insert("revision".into(), json!(revision));
         }
@@ -292,7 +294,7 @@ fn state_metrics(state: &crate::pool::WorkerState) -> Option<crate::pool::Worker
     match state {
         crate::pool::WorkerState::Completed { metrics, .. }
         | crate::pool::WorkerState::Failed { metrics, .. }
-        | crate::pool::WorkerState::Exhausted { metrics, .. } => Some(metrics.clone()),
+        | crate::pool::WorkerState::Exhausted { metrics, .. } => Some(*metrics),
         crate::pool::WorkerState::Running { .. } | crate::pool::WorkerState::Paused { .. } => None,
     }
 }

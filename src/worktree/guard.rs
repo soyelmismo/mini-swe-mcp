@@ -1242,9 +1242,7 @@ fn copy_dir_all(
             // Only the worker's own output is collected. A seeded file whose
             // content still matches is not the worker's artifact, so reporting
             // it would inflate every completion view with pre-existing files.
-            if !inherited
-                && let (Some(rel), Some(fingerprint)) = (rel, fingerprint)
-            {
+            if !inherited && let (Some(rel), Some(fingerprint)) = (rel, fingerprint) {
                 collected.insert(rel, fingerprint);
             }
         }
