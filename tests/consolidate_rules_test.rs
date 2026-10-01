@@ -20,6 +20,7 @@ fn actor() -> WorkerMeta {
         auto_continues: 0,
         metrics: WorkerMetrics::default(),
         report: None,
+        verified: None,
     }
 }
 
