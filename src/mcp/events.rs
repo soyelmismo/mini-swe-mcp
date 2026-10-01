@@ -1083,6 +1083,18 @@ impl EventRouter {
             if let Some(mut event) =
                 crate::cli::watch::select_event(view, self.watch_reported.get(id), now)
             {
+                // One transition is one event, whichever view describes it:
+                // the live snapshot and the registry row of the same revision
+                // share the key `(worker id, revision, kind)` and must not be
+                // delivered twice. A stall is an episode rather than a
+                // transition, so it is never keyed this way.
+                if event["event"] != "stalled"
+                    && self.watch_reported.get(id).is_some_and(|old| {
+                        old["event"] == event["event"] && old["revision"] == event["revision"]
+                    })
+                {
+                    continue;
+                }
                 self.sequence += 1;
                 event["sequence"] = json!(self.sequence);
                 self.watch_reported.insert(id.clone(), event.clone());
@@ -1543,3 +1555,5 @@ mod registry_verified_tests {
         assert_eq!(registry_view(&completed_row(None)).outcome.verified, None);
     }
 }
+#[cfg(test)]
+mod event_dedup_tests;

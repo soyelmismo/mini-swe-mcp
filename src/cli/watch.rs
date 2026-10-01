@@ -109,7 +109,7 @@ fn registry_snapshot_row(entry: &WorkerRegistryEntry, now: u64) -> Value {
         "status":match entry.status { crate::pool::RegistryStatus::Running=>"running", crate::pool::RegistryStatus::Paused=>"paused", crate::pool::RegistryStatus::Reviewing=>"reviewing", crate::pool::RegistryStatus::Completed=>"completed", crate::pool::RegistryStatus::Failed=>"failed", crate::pool::RegistryStatus::Stopped=>"stopped", crate::pool::RegistryStatus::Interrupted=>"interrupted" }.to_string(),
         "step":entry.step, "turns":entry.step, "max_turns":entry.max_turns,
         "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
-        "metrics":entry.metrics, "branch":null, "revision":0, "summary":null,
+        "metrics":entry.metrics, "branch":null, "revision":entry.revision, "summary":null,
         "task":clamp_string(entry.task.lines().next().unwrap_or(""), 500),
         "verified":entry.verified, "report":entry.report,
         "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
