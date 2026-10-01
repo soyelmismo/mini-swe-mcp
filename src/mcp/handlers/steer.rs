@@ -73,7 +73,7 @@ impl McpServer {
                 "status": status,
                 "message": format!("{message}. Use watch for the next event."),
             });
-            Self::with_watch_command(&mut payload, ctx);
+            self.with_watch_command(&mut payload, ctx).await;
             return Ok(payload);
         }
         if matches!(outcome, SteerOutcome::Resumed) {
@@ -82,7 +82,7 @@ impl McpServer {
                 "status": "resumed",
                 "message": "Worker resumed with your steering instruction. Use watch for the next event."
             });
-            Self::with_watch_command(&mut payload, ctx);
+            self.with_watch_command(&mut payload, ctx).await;
             return Ok(payload);
         }
         let mut payload = json!({
@@ -90,7 +90,7 @@ impl McpServer {
             "status": "steered",
             "message": "Steering instruction queued for next turn. Use watch for the next event."
         });
-        Self::with_watch_command(&mut payload, ctx);
+        self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
 
