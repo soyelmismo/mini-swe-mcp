@@ -35,7 +35,10 @@
 //! runs the command unconfined with a warning.
 
 use anyhow::{Context, Result};
-use std::hash::{DefaultHasher, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -247,28 +250,57 @@ impl AgentRunner {
 /// fingerprint that could not be taken is never read as "unchanged".
 pub(crate) fn tree_fingerprint(dir: &Path) -> Option<String> {
     let head = crate::worktree::git(dir, "rev-parse HEAD", &["rev-parse", "HEAD"]).ok()?;
-    let diff =
-        crate::worktree::git(dir, "diff HEAD --binary", &["diff", "HEAD", "--binary"]).ok()?;
+    let diff = crate::worktree::git(
+        dir,
+        "diff HEAD --binary",
+        &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary"],
+    )
+    .ok()?;
     let others = crate::worktree::git(
         dir,
         "ls-files --others --exclude-standard",
-        &["ls-files", "--others", "--exclude-standard"],
+        &["ls-files", "--others", "--exclude-standard", "-z"],
     )
     .ok()?;
     if !head.status.success() || !diff.status.success() || !others.status.success() {
         return None;
     }
     let mut hasher = DefaultHasher::new();
-    hasher.write(String::from_utf8_lossy(&head.stdout).trim().as_bytes());
-    hasher.write(&diff.stdout);
-    for name in String::from_utf8_lossy(&others.stdout).lines() {
-        hasher.write(name.as_bytes());
-        // An untracked file's bytes are part of the tree's content: git
-        // tracks no prior version to diff, so an edit to one is caught by
-        // hashing the file itself rather than by the tracked diff.
-        match std::fs::read(dir.join(name)) {
-            Ok(bytes) => hasher.write(&bytes),
-            Err(_) => hasher.write(b"\0unreadable"),
+    head.stdout.hash(&mut hasher);
+    diff.stdout.hash(&mut hasher);
+    let mut names: Vec<_> = others
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    names.sort_unstable();
+    let mut buffer = [0; 8192];
+    for name in names {
+        name.hash(&mut hasher);
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        metadata.permissions().mode().hash(&mut hasher);
+        if metadata.file_type().is_symlink() {
+            std::fs::read_link(&path)
+                .ok()?
+                .as_os_str()
+                .as_bytes()
+                .hash(&mut hasher);
+        } else if metadata.is_file() {
+            // Stream large untracked files rather than allocating their contents.
+            let mut file = std::fs::File::open(path).ok()?;
+            let mut size = 0u64;
+            loop {
+                let count = file.read(&mut buffer).ok()?;
+                if count == 0 {
+                    break;
+                }
+                hasher.write(&buffer[..count]);
+                size += count as u64;
+            }
+            size.hash(&mut hasher);
+        } else {
+            return None;
         }
     }
     Some(format!("{:016x}", hasher.finish()))

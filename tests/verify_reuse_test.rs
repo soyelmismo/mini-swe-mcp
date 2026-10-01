@@ -8,9 +8,9 @@
 //! (the canonical run) is skipped, while variant B and the side-effect audit
 //! still run, because B is what A cannot prove.
 //!
-//! The verify command here counts its own executions in a worktree file, so
-//! the committed counter proves how many times it ran: two with reuse (the
-//! worker's own turn plus variant B), three without (a fresh variant A too).
+//! The reuse is disclosed to the model in the completion turn, so the durable
+//! history carries a "verify reused from step N" note exactly when the gate
+//! skipped a fresh variant A -- and carries nothing of the sort when it ran.
 
 mod common;
 
@@ -20,15 +20,10 @@ use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 
 const TEST_OWNER: &str = "verify-reuse";
 
-/// A heavy command that appends to a worktree counter and then exits zero.
-///
-/// `rustc --version` makes the whole command heavy (so the gate records it),
-/// and the counter is the observable side effect: it lives in the worktree, so
-/// it is committed to the worker's branch and readable after the run, and it
-/// does not touch the shared repository the side-effect audit watches.
-fn counting_verify() -> String {
-    "n=$(cat vcount 2>/dev/null || echo 0); echo $((n+1)) > vcount; rustc --version".to_string()
-}
+/// A heavy command that reads the tree but never writes it, so its pass
+/// certifies a stable tree and is eligible for reuse. `rustc --version` is the
+/// heavy segment; it exits zero and touches no file.
+const VERIFY: &str = "rustc --version";
 
 fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
@@ -41,20 +36,6 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-fn git_capture(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// A throwaway git repository the worker is dispatched against.
@@ -101,22 +82,33 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     panic!("worker {worker_id} did not reach a terminal state");
 }
 
-/// A worker that runs the verify command itself and then completes must have
-/// the gate reuse that run: the committed counter reads two (its own turn plus
-/// variant B), not three (which a fresh variant A would make it).
-#[tokio::test]
-async fn a_passed_gate_on_an_unchanged_tree_is_reused() {
-    let repo = TestRepo::new("reuse");
-    let verify = counting_verify();
-    // Turn 1 runs the verify command; turn 2 is a no-op that leaves the tree
-    // unchanged; turn 3 completes.
-    let llm = common::fake_llm::FakeLlm::spawn(&verify, "echo done").await;
+/// The durable history log for a worker under `root`, as one string.
+fn history_of(root: &mini_swe_mcp::worktree::ScratchRoot, worker_id: &str) -> String {
+    let path = mini_swe_mcp::pool::revision::history_log_path_in(root, worker_id);
+    std::fs::read_to_string(&path).unwrap_or_default()
+}
 
+/// Run a scripted worker over an isolated repository, registry and history.
+///
+/// `first` and `second` are the worker's own turns (the gate command, then a
+/// no-op or a tree change); `verify` is the gate the completion reuses; `env`
+/// is the dispatcher's ambient snapshot for variant B.
+async fn exercise(
+    first: &str,
+    second: &str,
+    verify: &str,
+    env: Vec<(String, String)>,
+) -> (WorkerState, String) {
+    let repo = TestRepo::new("gate");
+    let llm = common::fake_llm::FakeLlm::spawn(first, second).await;
     let scratch = common::TempDir::new_in_tmp("vreuse-pool");
     let root = mini_swe_mcp::worktree::ScratchRoot::new(scratch.path());
-    let pool =
-        WorkerPool::with_scratch(1, llm.base_url().to_string(), "test-key".to_string(), root);
-
+    let pool = WorkerPool::with_scratch(
+        1,
+        llm.base_url().to_string(),
+        "test-key".to_string(),
+        root.clone(),
+    );
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -128,30 +120,113 @@ async fn a_passed_gate_on_an_unchanged_tree_is_reused() {
             Some("verify-reuse".to_string()),
             None,
             false,
-            Some(verify),
-            Vec::new(),
+            Some(verify.to_string()),
+            env,
         )
         .await
-        .expect("dispatch the worker");
-
+        .expect("dispatch worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
-    match state {
-        WorkerState::Completed { verified, .. } => assert_eq!(
-            verified,
-            Some(true),
-            "the reused gate must still complete the worker verified"
+    let history = history_of(&root, &worker_id);
+    (state, history)
+}
+
+fn assert_verified(state: &WorkerState) {
+    assert!(
+        matches!(
+            state,
+            WorkerState::Completed {
+                verified: Some(true),
+                ..
+            }
         ),
-        other => panic!("worker must complete, got {other:?}"),
-    }
-
-    let branch = format!("worker-{worker_id}");
-    let count = git_capture(repo.path(), &["show", &format!("{branch}:vcount")]);
-    assert_eq!(
-        count, "2",
-        "the gate must reuse the worker's own passing run: variant A is skipped, \
-         so the command ran once for the worker and once for variant B (got {count})"
+        "expected verified completion: {state:?}"
     );
+}
 
-    // The scratch root outlives the assertions so the pool's files stay put.
-    drop(scratch);
+/// A worker that runs the verify command itself and then completes must have
+/// the gate reuse that run: the history carries the "verify reused" note,
+/// proving the canonical run was skipped.
+#[tokio::test]
+async fn a_passed_gate_on_an_unchanged_tree_is_reused() {
+    let (state, history) = exercise(VERIFY, "echo done", VERIFY, Vec::new()).await;
+    assert_verified(&state);
+    assert!(
+        history.contains("verify reused from step 1"),
+        "the completion turn must disclose the reuse, got history:\n{history}"
+    );
+}
+
+/// A file changed between the worker's run and completion moves the tree
+/// fingerprint, so the gate runs variant A afresh instead of reusing.
+#[tokio::test]
+async fn a_changed_file_runs_canonical_verification_again() {
+    let (state, history) = exercise(VERIFY, "echo changed >> README.md", VERIFY, Vec::new()).await;
+    assert_verified(&state);
+    assert!(
+        !history.contains("verify reused"),
+        "a changed tree must not be reused, got history:\n{history}"
+    );
+}
+
+/// A completion whose verify command differs from the one the worker ran has
+/// no recorded success to reuse, so variant A runs.
+#[tokio::test]
+async fn a_different_command_runs_canonical_verification_again() {
+    let (state, history) =
+        exercise(VERIFY, "echo done", "rustc --version && true", Vec::new()).await;
+    assert_verified(&state);
+    assert!(
+        !history.contains("verify reused"),
+        "a different command must not be reused, got history:\n{history}"
+    );
+}
+
+/// A command whose earlier run failed is never recorded, so the gate runs it
+/// afresh rather than reusing a pass that never happened.
+#[tokio::test]
+async fn a_failed_prior_run_is_not_reused() {
+    let verify = "rustc --version && test -f ready";
+    let (state, history) = exercise(verify, "touch ready", verify, Vec::new()).await;
+    assert_verified(&state);
+    assert!(
+        history.contains("exit code: 1"),
+        "the worker's own run must have failed first, got history:\n{history}"
+    );
+    assert!(
+        !history.contains("verify reused"),
+        "a failed run must not be reused, got history:\n{history}"
+    );
+}
+
+/// Reusing variant A must not skip variant B: a command that only passes in the
+/// canonical environment is still caught, so the completion is refused even
+/// though A was reused.
+#[tokio::test]
+async fn reuse_does_not_skip_divergent_verification() {
+    let verify = "rustc --version && test -z \"$SWE_REUSE_PROBE\"";
+    let (state, history) = exercise(
+        verify,
+        "echo done",
+        verify,
+        vec![("SWE_REUSE_PROBE".to_string(), "set".to_string())],
+    )
+    .await;
+    assert!(
+        history.contains("verify reused from step 1"),
+        "the canonical run must be reused, got history:\n{history}"
+    );
+    assert!(
+        history.contains("orchestrator's environment"),
+        "variant B must still run and refuse, got history:\n{history}"
+    );
+    assert!(
+        !matches!(
+            state,
+            WorkerState::Completed {
+                verified: Some(true),
+                ..
+            }
+        ),
+        "variant B's failure must not verify the completion: {state:?}"
+    );
 }

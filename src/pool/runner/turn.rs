@@ -187,20 +187,17 @@ async fn sync_base_for_completion(worktree: &WorktreeGuard) -> Result<BaseSync> 
 /// A recorded successful run of a heavy command, so the completion gate can
 /// reuse it on an unchanged tree instead of recompiling and re-testing.
 struct VerifySuccess {
-    /// Worktree fingerprint taken right after the run succeeded.
+    /// Worktree fingerprint unchanged across the successful run.
     fingerprint: String,
     /// Step the run succeeded on, named in the "verify reused" log.
     step: usize,
 }
 
-/// Bound on distinct heavy commands whose last success is remembered.
-///
-/// A worker runs at most a few dozen distinct heavy commands, and the turn
-/// ceiling already bounds the count; this cap keeps a pathological loop
-/// from holding the map open and makes the bound explicit.
-const VERIFY_SUCCESS_LIMIT: usize = 32;
+/// Keep at most one record per permitted turn.
+const VERIFY_SUCCESS_LIMIT: usize = MAX_TURNS_LIMIT;
 
-/// Cross-turn state of the two loop detectors.
+/// Cross-turn state of the two loop detectors, plus the last successful run
+/// of each heavy command the completion gate can reuse.
 ///
 /// Owned by the phase loop and lent to every turn, because `TurnEngine` is
 /// rebuilt once per turn and a detector that lived in it would reset each time.
@@ -743,6 +740,10 @@ impl<'a> TurnEngine<'a> {
 
     /// Handle a completion sentinel: run the verify gate (if any) and either
     /// complete or push the failure back to the model for another turn.
+    ///
+    /// A verify command whose last run passed on the current tree is reused
+    /// instead of re-run: variant A is skipped and the reuse is disclosed to
+    /// the model, while variant B and the side-effect audit still run.
     async fn handle_completion(&mut self, llm_resp: &LlmResponse) -> Result<TurnOutcome> {
         info!(
             worker = %self.worker_id,
@@ -809,6 +810,13 @@ impl<'a> TurnEngine<'a> {
                     from_step = step,
                     "verify reused from step {step}"
                 );
+                // Disclose the reuse in the durable history so the model (and a
+                // reviewer replaying it) never reads a reused pass as a fresh
+                // one; the note is flushed at the completion boundary.
+                let note = format!(
+                    "verify reused from step {step}: canonical variant A was not rerun (identical command and tree). Variant B and the side-effect audit still apply."
+                );
+                self.push_message(ChatMessage::text(Role::User, note));
                 (String::new(), Some(0))
             }
             None => self.run_gated(verify).await?,
@@ -859,8 +867,9 @@ impl<'a> TurnEngine<'a> {
         Ok(TurnOutcome::Continue)
     }
 
-    /// Finish a completion whose canonical verify run passed: audit what it
-    /// left behind, then re-run the same command in the divergent environment.
+    /// Finish a completion whose canonical verify passed -- freshly or reused:
+    /// audit what it left behind, then re-run the same command in the
+    /// divergent environment.
     ///
     /// Variant B runs only after A passed and only at completion, so a worker
     /// that is still iterating pays no second-verify cost. Either refusal
@@ -1182,58 +1191,52 @@ impl<'a> TurnEngine<'a> {
         } else {
             self.worktree.leased_build_dir().map(Path::to_path_buf)
         };
+        let before = if heavy {
+            self.current_fingerprint().await
+        } else {
+            None
+        };
+        // Invalidate before execution so errors and cancellation cannot preserve a stale pass.
+        self.watch.invalidate_verify_success(command);
         let result = runner.execute_bash(&self.worktree.path, command).await;
         if heavy {
-            self.update_verify_success(command, &result).await;
+            self.update_verify_success(command, &result, before).await;
         }
         result
     }
 
-    /// Record or drop the reuse entry for a heavy `command` from its result.
-    ///
-    /// A pass is remembered with the tree it produced, so the completion gate
-    /// can reuse it on an unchanged tree instead of recompiling and re-testing
-    /// the same bytes. A failure drops any earlier pass: a command that has
-    /// since failed no longer describes the tree, so the gate must re-run it.
-    /// A fingerprint that could not be taken records nothing, so an unknown
-    /// tree state is never reused.
+    /// Only an exit-zero run on a stable source tree certifies reusable content.
     async fn update_verify_success(
         &mut self,
         command: &str,
         result: &Result<(String, Option<i32>)>,
+        before: Option<String>,
     ) {
-        if !matches!(result, Ok((_, Some(0)))) {
-            self.watch.invalidate_verify_success(command);
-            return;
+        if matches!(result, Ok((_, Some(0))))
+            && let Some(before) = before
+            && self.current_fingerprint().await.as_ref() == Some(&before)
+        {
+            self.watch
+                .record_verify_success(command.to_string(), before, *self.step);
         }
+    }
+
+    async fn current_fingerprint(&self) -> Option<String> {
         let path = self.worktree.path.clone();
-        let Some(fingerprint) = tokio::task::spawn_blocking(move || tree_fingerprint(&path))
+        tokio::task::spawn_blocking(move || tree_fingerprint(&path))
             .await
             .ok()
             .flatten()
-        else {
-            return;
-        };
-        self.watch
-            .record_verify_success(command.to_string(), fingerprint, *self.step);
     }
 
     /// The step a recorded successful run of `verify` can be reused from on
     /// the current tree, or `None` to run variant A. The fingerprint is only
     /// taken when the command has a recorded success, so a worker that never
     /// ran its gate pays nothing here.
-    async fn reusable_verify_step(&mut self, verify: &str) -> Option<usize> {
-        // Only pay for the fingerprint when the command has a recorded
-        // success to compare against.
-        if !self.watch.verify_success.contains_key(verify) {
-            return None;
-        }
-        let path = self.worktree.path.clone();
-        let current = tokio::task::spawn_blocking(move || tree_fingerprint(&path))
-            .await
-            .ok()
-            .flatten()?;
-        self.watch.reusable_verify_step(verify, &current)
+    async fn reusable_verify_step(&self, verify: &str) -> Option<usize> {
+        self.watch.verify_success.get(verify)?;
+        self.watch
+            .reusable_verify_step(verify, &self.current_fingerprint().await?)
     }
 
     /// Record one executed exchange in the history: an assistant turn that
