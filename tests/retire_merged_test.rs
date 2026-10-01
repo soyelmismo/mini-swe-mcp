@@ -1095,3 +1095,89 @@ async fn an_already_pruned_row_is_still_reported_retired_with_its_ack_cleared() 
     );
     events.abort();
 }
+
+/// The post-merge sweep clears an orphan worker's acknowledgement.
+///
+/// An orphan has no row and no branch, so the merge report can never name it and
+/// the registry cannot be asked about it later: the only place its id exists is
+/// the sweep's reclaimed-orphan list. If that list is not chained into the
+/// retirement, the worker keeps its acknowledged position and replay state after
+/// its last file has been deleted.
+#[tokio::test]
+async fn the_post_merge_sweep_clears_a_reclaimed_orphans_acknowledgement() {
+    let f = Fixture::new("retire-orphan-ack");
+    // A merged worker, so the merge has something to do and runs a real sweep.
+    f.commit_on_worker_branch("oa-main", "oa.txt", "main work\n");
+    f.record_with_verify("oa-main", Some("true"));
+    // The merge is owner-checked, so the merged worker needs its owner.
+    let mut row = mini_swe_mcp::pool::load_registry_entry_in(&f.root(), "oa-main").unwrap();
+    row.owner = Some("agent-a".to_string());
+    save_registry_entry_in(&f.root(), &row);
+
+    // A second, still-listed worker in the same repository. The orphan scan
+    // probes the repositories the registry names, so the repository must still
+    // be known after the merge deletes its own row -- which is the normal case
+    // in a pool with more than one worker.
+    f.commit_on_worker_branch("oa-live", "oa-live.txt", "live work\n");
+    f.record_with_verify("oa-live", Some("true"));
+    save_registry_entry_in(
+        &f.root(),
+        &WorkerRegistryEntry {
+            status: mini_swe_mcp::pool::RegistryStatus::Completed,
+            step: 1,
+            owner: Some("agent-a".to_string()),
+            repo_path: Some(f.repo().to_string_lossy().into_owned()),
+            base_branch: Some("main".to_string()),
+            ..WorkerRegistryEntry::test_row("oa-live", "agent-a")
+        },
+    );
+
+    // The orphan: a companion file only, no row and no branch anywhere.
+    write(
+        f.scratch.path(),
+        "swe-wt-oa-gone.steer",
+        "guidance for nobody\n",
+    );
+
+    let hub = f.scratch.path().join("hub");
+    std::fs::create_dir_all(&hub).unwrap();
+    std::fs::write(
+        hub.join("watch_acks.json"),
+        r#"{"agent-a":{"oa-gone":{"revision":1,"event":"completed"}}}"#,
+    )
+    .unwrap();
+
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    let server = mini_swe_mcp::mcp::McpServer::new(pool.clone(), "agent-a".to_string());
+    let events = server.start_hub_events(Some(&hub)).await;
+    let mut ctx = mini_swe_mcp::mcp::ConnectionContext::stdio();
+    ctx.agent_id = Some("agent-a".to_string());
+    server
+        .execute_tool_for(
+            "worker",
+            serde_json::json!({"action": "merge", "worker_id": "oa-main"}),
+            &ctx,
+        )
+        .await
+        .expect("the merge must succeed");
+
+    assert!(
+        !f.scratch.path().join("swe-wt-oa-gone.steer").exists(),
+        "the orphan's file must be reclaimed by the post-merge sweep"
+    );
+    let acked: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hub.join("watch_acks.json")).unwrap()).unwrap();
+    assert!(
+        acked
+            .get("agent-a")
+            .and_then(|a| a.get("oa-gone"))
+            .is_none(),
+        "a reclaimed orphan must lose its acknowledgement too: {acked}"
+    );
+    events.abort();
+}
