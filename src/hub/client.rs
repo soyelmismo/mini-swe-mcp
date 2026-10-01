@@ -343,7 +343,15 @@ async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
         let daemon = reply["version"].as_str().unwrap_or("");
         let daemon_build = &reply["build"];
         if supersedes(&version, &build, daemon, daemon_build) {
-            if !reply["busy"].as_bool().unwrap_or(true) && attempt == 0 {
+            // An idle daemon is replaced on the spot: this client stops it and
+            // starts its own replacement. One that cannot be replaced now is
+            // offered a planned handover instead, so it picks the newer build
+            // up at its first quiet moment. An idle daemon is never offered
+            // one: the client replaces it directly, and a handover there
+            // would only stop and respawn the fresh replacement for no gain —
+            // a daemon no reaper has a pid for.
+            let mut offer_handover = reply["busy"].as_bool().unwrap_or(true);
+            if !offer_handover && attempt == 0 {
                 match client.request("hub/shutdown", json!({})).await {
                     Ok(_) => {
                         // The reply precedes teardown. Wait for EOF, not merely
@@ -371,11 +379,16 @@ async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
                     }
                     Err(_) => {
                         // A dispatch may have made the daemon busy since hello.
+                        eprintln!("DBG shutdown failed, offering handover");
+                        offer_handover = true;
                     }
                 }
             }
             // Older hubs may not implement planned handover; keep their warning.
-            let _ = client.request("hub/handover", json!({})).await;
+            if offer_handover {
+                eprintln!("DBG offering handover attempt={attempt} busy={}", reply["busy"]);
+                let _ = client.request("hub/handover", json!({})).await;
+            }
             warn_newer_once(
                 &hub_dir()?,
                 build["id"].as_str().unwrap_or(&version),
