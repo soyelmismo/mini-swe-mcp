@@ -206,7 +206,7 @@ pub fn append_history_message(
 /// dispatch that created it and every later continuation reads the same
 /// counter again. The message lines are copied through untouched; only line
 /// one is replaced, atomically, so a reader never sees a half-written log.
-pub fn save_history_metadata(worker_id: &str, meta: &WorkerHistory) -> Result<()> {
+fn save_history_metadata(worker_id: &str, meta: &WorkerHistory) -> Result<()> {
     let path = history_log_path(worker_id);
     let mut meta = meta.clone();
     meta.messages.clear();

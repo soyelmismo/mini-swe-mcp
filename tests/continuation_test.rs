@@ -612,14 +612,14 @@ fn three_continuations_number_one_two_three() {
             "the final completion payload must carry the last revision"
         );
 
-        // The reaper (or `collect`) drops the record and its registry row, so
-        // a reaped worker is its durable log and nothing else: the counter must
-        // still advance from there instead of restarting at one.
+        // `collect` evicts the record and a `prune` retires the registry row,
+        // so a reaped worker can be its durable log and nothing else: the
+        // counter must still advance from there instead of restarting at one.
         assert!(
             pool.collect(id).await.is_some(),
             "collecting the terminal worker evicts it from the pool"
         );
-        // A pruned row leaves the durable log as the only copy of the counter.
+        // With the row gone the log is the only copy of the counter.
         remove_registry_entry(id);
         assert!(
             load_registry_entry(id).is_none(),
