@@ -169,6 +169,16 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static(super::handlers::dispatch::VERIFY_DESCRIPTION),
     ),
     (
+        "consolidate",
+        "boolean",
+        DescriptionSource::Static(super::handlers::dispatch::AUTO_CONSOLIDATE_DESCRIPTION),
+    ),
+    (
+        "consolidate_verify",
+        "string",
+        DescriptionSource::Static("Full gate for the automatic consolidator; omitted means auto-detect."),
+    ),
+    (
         "scope",
         "string",
         DescriptionSource::Static("'list' scope: 'mine' (default) or 'all' (admin)."),
@@ -269,6 +279,9 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
             Value::String(LIST_SCOPES[0].to_string()),
         );
     }
+    if name == "consolidate" {
+        schema.insert("type".to_string(), json!(["boolean", "string"]));
+    }
     if name == "max_turns" {
         schema.insert("minimum".to_string(), Value::from(1));
         schema.insert(
@@ -293,6 +306,8 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     "repo_path": { "type": "string" },
                     "max_turns": { "type": "integer" },
                     "verify": { "type": "string" },
+                    "consolidate": { "type": ["boolean", "string"] },
+                    "consolidate_verify": { "type": "string" },
                     "group": { "type": "string" },
                     "network": { "type": "string" },
                 },

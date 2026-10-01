@@ -313,6 +313,8 @@ impl McpServer {
         "group",
         "network",
         "verify",
+        "consolidate",
+        "consolidate_verify",
     ];
 
     /// How many not-ready workers a `consolidate` refusal names before it

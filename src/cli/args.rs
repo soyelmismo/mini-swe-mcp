@@ -19,7 +19,7 @@ mod target;
 pub use dispatch::parse_batch_tasks;
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] [--quiet] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin; --quiet prints only the worker id(s))";
+pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--consolidate[=<model>]] [--consolidate-verify <cmd>] [--offline] [--verify <cmd>] [--quiet] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin; --quiet prints only the worker id(s))";
 
 /// Consolidate usage line, shared by `--help` and the missing-group error.
 pub const CONSOLIDATE_USAGE: &str =
@@ -108,6 +108,13 @@ fn collect_dispatch_flags(
                 tool_args.insert("network".into(), Value::String("offline".into()));
             }
             "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
+            "--consolidate" => {
+                tool_args.insert("consolidate".into(), Value::Bool(true));
+            }
+            flag if flag.starts_with("--consolidate=") => {
+                tool_args.insert("consolidate".into(), Value::String(flag[14..].into()));
+            }
+            "--consolidate-verify" => take_value(cli_args, &mut i, tool_args, "consolidate_verify"),
             // `--role <role>` selects the dispatch authority: the default
             // worker, or the round's consolidator.
             "--role" => take_value(cli_args, &mut i, tool_args, "role"),

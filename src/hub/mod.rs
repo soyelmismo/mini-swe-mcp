@@ -19,6 +19,7 @@
 //! its session, so the daemon mints it one token per identity and hands it out
 //! as the `watch_command` of every dispatch and steer answer.
 
+pub(crate) mod auto_consolidate;
 pub mod client;
 mod daemon;
 pub mod identity;
