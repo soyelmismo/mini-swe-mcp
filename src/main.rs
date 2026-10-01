@@ -241,7 +241,7 @@ fn print_result(action: &str, result: &serde_json::Value, json_output: bool) -> 
 }
 
 fn print_help() {
-    use mini_swe_mcp::cli::args::DISPATCH_USAGE;
+    use mini_swe_mcp::cli::args::{CONSOLIDATE_USAGE, DISPATCH_USAGE};
 
     println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: mini-swe-mcp [--stdio | [--json] [--admin] <action> [args...]]");
@@ -265,6 +265,11 @@ fn print_help() {
     println!("           Recent commands and their output.");
     println!("  steer <worker_id> <message> [--max-turns <n>]");
     println!("           Correct a completed worker or continue a stopped one.");
+    println!("  consolidate {CONSOLIDATE_USAGE}");
+    println!(
+        "           Integrate one group's round: merge the finished branches, run the full gate"
+    );
+    println!("           once, route each failure to its owner, review every diff, and report.");
     println!("  list [--all]");
     println!("           Workers you own; --all (with --admin) lists every agent's.");
     println!("  kill <worker_id>");

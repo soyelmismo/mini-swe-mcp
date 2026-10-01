@@ -953,6 +953,17 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             if let Some(started) = progress.command_started_at {
                 view["command_started_at"] = json!(started);
             }
+            // A command that outlived its budget keeps running as a background
+            // job the worker waits on, so it belongs in the status view.
+            if !progress.jobs.is_empty() {
+                view["jobs"] = json!(
+                    progress
+                        .jobs
+                        .iter()
+                        .map(|job| job.label())
+                        .collect::<Vec<_>>()
+                );
+            }
             // list_workers supplies a summary without cloning the multi-megabyte diff.
             if progress.phase != WorkerPhase::Running {
                 let details = &row["state"];

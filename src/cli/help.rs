@@ -19,7 +19,16 @@ pub const HELP_FLAGS: &str = concat!(
 /// here, one concern per topic, so an agent can fetch exactly what it needs
 /// without paying for all of it in every session's context.
 pub const TOPICS: &[&str] = &[
-    "workflow", "watch", "steer", "review", "collect", "merge", "identity", "sandbox", "env",
+    "workflow",
+    "watch",
+    "steer",
+    "review",
+    "collect",
+    "merge",
+    "identity",
+    "sandbox",
+    "env",
+    "consolidate",
 ];
 
 /// Text of one help topic, or `None` for an unknown topic.
@@ -34,6 +43,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "identity" => IDENTITY,
         "sandbox" => SANDBOX,
         "env" => ENV,
+        "consolidate" => CONSOLIDATE,
         _ => return None,
     })
 }
@@ -65,6 +75,9 @@ const SANDBOX: &str = "Each dispatch runs in its own Git worktree on a worker-<i
 /// `env`: the startup environment variables.
 const ENV: &str = "Read at startup: OPENAI_API_KEY (required to dispatch), OPENAI_API_BASE (default https://api.openai.com/v1), DEFAULT_MODEL (the default model alias), MODELS_FILE (the models catalog), MINI_SWE_NO_DAEMON=1 (serve MCP in-process instead of through the hub), MINI_SWE_AGENT_ID (pin the session's agent identity), and MINI_SWE_WATCH_TOKEN (set by a dispatch so the watch its shell runs is attributed to your session). A .env file is loaded first.";
 
+/// `consolidate`: the round workflow an orchestrator runs at the end of a round.
+const CONSOLIDATE: &str = "A consolidated round has two kinds of worker. Dispatch the group's tasks as usual, but give every worker the CHEAP gate -- fmt, lint or type-check, and the tests of the files it touched -- never the full suite. When they are done, dispatch exactly ONE consolidator for the group: `mini-swe-mcp consolidate --group <g>` (MCP action 'consolidate', same 'group'). Set `strongest: <alias>` in models.yaml to pick the consolidator model; if absent, it uses the dispatch default. Pass `--model <m>` to override. It merges the completed branches, runs the project's FULL gate once, sends each file-attributable failure back to the worker that owns it (CONSOLIDATE_STEER) and waits for it (CONSOLIDATE_WAIT), fixes cross-worker interaction errors itself, reviews every diff, and finishes with a one-line-per-worker report. Read that report, then merge ONLY the consolidator's branch: it already carries the whole round.";
+
 #[cfg(test)]
 mod tests {
     use super::{HELP_FLAGS, TOPICS, topic_text};
@@ -93,7 +106,7 @@ mod tests {
     /// not, so `help <topic>` can refuse it with the available list.
     #[test]
     fn every_topic_has_text_and_unknown_ones_do_not() {
-        assert_eq!(TOPICS.len(), 9);
+        assert_eq!(TOPICS.len(), 10);
         for topic in TOPICS {
             let text = topic_text(topic).unwrap_or_else(|| panic!("'{topic}' has no text"));
             assert!(!text.trim().is_empty(), "'{topic}' is empty");
@@ -167,6 +180,27 @@ mod tests {
             assert!(
                 text.contains(needle),
                 "the collect topic must mention {needle}: {text}"
+            );
+        }
+    }
+
+    /// `consolidate` teaches the round workflow: the cheap worker gate, the one
+    /// consolidator per group, the report, and the single branch to merge.
+    #[test]
+    fn consolidate_topic_teaches_the_round_workflow() {
+        let text = topic_text("consolidate").expect("consolidate topic");
+        for needle in [
+            "CHEAP gate",
+            "ONE consolidator",
+            "mini-swe-mcp consolidate --group",
+            "FULL gate",
+            "CONSOLIDATE_STEER",
+            "CONSOLIDATE_WAIT",
+            "merge ONLY the consolidator's branch",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the consolidate topic must mention {needle}: {text}"
             );
         }
     }
