@@ -31,7 +31,9 @@ use anyhow::{Context, Result};
 
 use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
-use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
+use super::revision::{
+    RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_with,
+};
 use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
 
@@ -682,11 +684,23 @@ fn merge_subject(task: &str, worker_id: &str) -> String {
     format!("Merge worker-{worker_id}: {clamped}")
 }
 
-/// Post-merge cleanup: the worktree leftovers, the branch and the history file.
+/// Post-merge retirement: the merged worker leaves nothing behind at all.
 ///
-/// Reuses the same helpers the prune sweep uses, so a merged worker leaves
-/// exactly what a pruned one does. The registry row survives: `status` and
-/// `collect` still answer about the run, and `reap` expires it on its own TTL.
+/// A merged worker is fully integrated -- its commits are in the base branch --
+/// so nothing of it is needed any more. The merge therefore calls the one
+/// shared [`retire_worker_with`] rather than picking which leftovers to drop:
+/// branch, registry row, history, steering mailbox and steer-source, watch
+/// acknowledgements, and the worktree, scratch and build directories it held go
+/// together, so `list` shows only live and awaiting-integration workers without
+/// any hiding logic.
+///
+/// `--no-delete` is the one exception: the operator asked to keep the branch, so
+/// the branch stays and only the scratch traces are reclaimed. A sweep does not
+/// see a branch that outlived its merge and therefore leaves that worker alone
+/// until the branch itself goes.
+///
+/// Returns whether the branch was deleted and what was reclaimed, in the words
+/// the CLI prints.
 fn cleanup(
     root: &ScratchRoot,
     worker_id: &str,
@@ -694,25 +708,26 @@ fn cleanup(
     branch: &str,
     keep_branch: bool,
 ) -> (bool, Vec<String>) {
-    // The worktree goes first: a leftover that is still registered would make
-    // the branch undeletable, and `git worktree prune` clears the registration
-    // once its directory is gone.
     let worktree = root.join(format!("swe-wt-{worker_id}"));
     let reclaimed = worktree.exists();
-    if reclaimed {
-        force_remove_dir(&worktree);
-        remove_target_dirs_in(root, &worktree);
-        let _ = git(repo, "worktree prune", &["worktree", "prune"]);
-    }
     let branch_deleted = !keep_branch
         && git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
-    remove_worker_history_in(root, worker_id);
+    retire_worker_with(
+        root,
+        worker_id,
+        &RetireContext {
+            repo: Some(repo),
+            ack_dir: None,
+        },
+    );
 
     let mut cleaned = Vec::new();
     if branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
+    } else if keep_branch {
+        cleaned.push(format!("branch {branch} kept (--no-delete)"));
     }
-    cleaned.push("history file removed".to_string());
+    cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());
     if reclaimed {
         cleaned.push("worktree leftovers removed".to_string());
     }

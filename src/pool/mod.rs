@@ -69,14 +69,15 @@ pub use self::registry::{
     save_registry_entry, save_registry_entry_in,
 };
 pub use self::revision::{
-    CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
-    WorkerHistory, append_history_message, append_history_message_in, ensure_base_branch,
-    history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
-    load_worker_history, load_worker_history_in, load_worker_history_log,
+    CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, RetireContext,
+    RetireSweep, SteerOutcome, WorkerHistory, append_history_message, append_history_message_in,
+    ensure_base_branch, history_log_path, history_log_path_in, history_path, history_path_in,
+    is_replayable, load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
     remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
-    retire_worker, retire_worker_in, save_worker_history, save_worker_history_in,
+    retire_worker, retire_worker_in, retire_worker_with, save_worker_history, save_worker_history_in,
+    sweep_retired_workers, sweep_retired_workers_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
