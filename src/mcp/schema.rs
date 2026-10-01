@@ -193,7 +193,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "keep_branch",
         "boolean",
-        DescriptionSource::Static("Keep merge branch (--no-delete)."),
+        DescriptionSource::Static("Keep the branch."),
     ),
 ];
 
