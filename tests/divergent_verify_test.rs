@@ -156,20 +156,40 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     panic!("worker {worker_id} did not reach a terminal state");
 }
 
-/// The user messages of the last request the worker made: a refused
-/// completion replays the turn with the refusal as the newest one.
-async fn last_user_messages(pool: &WorkerPool, worker_id: &str) -> Vec<String> {
-    let logs = pool.get_worker_logs(worker_id).await.unwrap_or_default();
-    let _ = logs;
-    // The refusal is pushed into the conversation, which the history log
-    // carries: read it back from the durable log.
-    let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    raw.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|value| value["role"] == serde_json::json!("user"))
-        .filter_map(|value| value["content"].as_str().map(str::to_string))
-        .collect()
+/// Wait until the refusal `needle` appears in the worker's durable history
+/// log, or panic after the deadline. A refused completion replays the turn
+/// with the refusal as the `tool` answer to the completion call, so the log
+/// carries it even while the worker keeps running.
+async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> String {
+    for _ in 0..600 {
+        let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            for line in raw.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(content) = value["content"].as_str() {
+                    if content.contains(needle) {
+                        return content.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(state) = pool.get_worker_state(worker_id).await {
+            if matches!(
+                state,
+                WorkerState::Completed { .. } | WorkerState::Failed { .. }
+            ) {
+                let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                panic!(
+                    "worker {worker_id} finished before refusing with {needle:?}: {state:?}\n--- log ---\n{raw}"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("worker {worker_id} never refused with {needle:?}");
 }
 
 /// Dispatch one worker with an explicit verify command and ambient snapshot.
@@ -215,16 +235,9 @@ async fn an_ambient_variable_failure_is_refused_with_the_variable_named() {
         vec![("SWE_DIVERGENT_PROBE_VAR".to_string(), "set".to_string())],
     )
     .await;
-    let state = wait_for_terminal(&pool, &worker_id).await;
+    let refusal = wait_for_refusal(&pool, &worker_id, "clean environment").await;
     assert!(
-        matches!(state, WorkerState::Running { .. } | WorkerState::Paused { .. }),
-        "the worker must be refused, not completed, got {state:?}"
-    );
-    let users = last_user_messages(&pool, &worker_id).await;
-    let refusal = users.last().cloned().unwrap_or_default();
-    assert!(
-        refusal.contains("clean environment")
-            && refusal.contains("orchestrator's environment")
+        refusal.contains("orchestrator's environment")
             && refusal.contains("SWE_DIVERGENT_PROBE_VAR"),
         "the refusal must name the differing variable, got {refusal:?}"
     );
@@ -236,18 +249,13 @@ async fn an_ambient_variable_failure_is_refused_with_the_variable_named() {
 async fn a_timezone_dependent_suite_is_refused() {
     let repo = TestRepo::new("tz");
     let server = SentinelServer::spawn().await;
-    // The canonical environment sets no TZ (UTC); variant B shifts it far.
-    let verify = "test \"$(date +%Z)\" = \"UTC\"";
+    // The canonical environment keeps the host's own zone; variant B shifts it
+    // to one of the two far zones, so the suite passes in A and fails in B.
+    let verify = "test \"$TZ\" != \"Pacific/Kiritimati\" && test \"$TZ\" != \"Etc/GMT+12\"";
     let (pool, worker_id) = dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
-    let state = wait_for_terminal(&pool, &worker_id).await;
+    let refusal = wait_for_refusal(&pool, &worker_id, "clean environment").await;
     assert!(
-        matches!(state, WorkerState::Running { .. } | WorkerState::Paused { .. }),
-        "the worker must be refused, not completed, got {state:?}"
-    );
-    let users = last_user_messages(&pool, &worker_id).await;
-    let refusal = users.last().cloned().unwrap_or_default();
-    assert!(
-        refusal.contains("clean environment") && refusal.contains("HOME/TMPDIR/TZ differ"),
+        refusal.contains("HOME/TMPDIR/TZ differ"),
         "the refusal must state that HOME/TMPDIR/TZ differ, got {refusal:?}"
     );
     let _ = pool.kill(&worker_id).await;
@@ -278,17 +286,13 @@ async fn a_hermetic_suite_completes_verified() {
 async fn a_suite_that_creates_a_branch_is_refused_and_cleaned_up() {
     let repo = TestRepo::new("branch");
     let server = SentinelServer::spawn().await;
-    let verify = "git branch worker-leftover-branch && echo branched";
+    // Idempotent: the refusal replays the gate, so the second run must pass
+    // the same way the first did rather than fail on an existing branch.
+    let verify = "git branch -f worker-leftover-branch && echo branched";
     let (pool, worker_id) = dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
-    let state = wait_for_terminal(&pool, &worker_id).await;
+    let refusal = wait_for_refusal(&pool, &worker_id, "must clean up").await;
     assert!(
-        matches!(state, WorkerState::Running { .. } | WorkerState::Paused { .. }),
-        "the worker must be refused, not completed, got {state:?}"
-    );
-    let users = last_user_messages(&pool, &worker_id).await;
-    let refusal = users.last().cloned().unwrap_or_default();
-    assert!(
-        refusal.contains("must clean up") && refusal.contains("refs/heads/worker-leftover-branch"),
+        refusal.contains("refs/heads/worker-leftover-branch"),
         "the refusal must name the created ref, got {refusal:?}"
     );
     let output = Command::new("git")

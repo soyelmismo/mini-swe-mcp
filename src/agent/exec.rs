@@ -1231,6 +1231,44 @@ mod tests {
     }
 
     #[test]
+    /// The per-command overlay must reach the child: the differential verify
+    /// gate replays the same command in the dispatcher's ambient environment,
+    /// so an overlay that is dropped would make variant B indistinguishable
+    /// from variant A.
+    #[test]
+    fn extra_env_reaches_the_child() {
+        crate::agent::env::with_env_lock(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(extra_env_probe());
+        });
+    }
+
+    async fn extra_env_probe() {
+        let tmp = crate::worktree::swe_base_dir().join(format!(
+            "extra-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let runner = runner().with_extra_env(vec![
+            ("SWE_EXTRA_ENV_PROBE".to_string(), "present".to_string()),
+            ("HOME".to_string(), "/tmp".to_string()),
+        ]);
+        let (out, code) = runner
+            .execute_bash(&tmp, "printf '%s-%s' \"$SWE_EXTRA_ENV_PROBE\" \"$HOME\"")
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "command failed: {out:?}");
+        assert_eq!(out.trim(), "present-/tmp", "the overlay must reach the child: {out:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn combine_streams_joins_both_streams_and_truncates() {
         // Both streams non-empty: stdout, the separator, then stderr.
         assert_eq!(
