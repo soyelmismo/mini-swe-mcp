@@ -552,14 +552,12 @@ impl McpServer {
                 .to_owned();
             let stats = diff_file_stats(&diff);
             // The diff is the one field that can be arbitrarily large, so it
-            // leaves the payload only when it was asked for, and then only for
-            // the files that were named.
+            // leaves the payload unless it was asked for — whole, or narrowed
+            // to the files that were named.
             if let Some(details) = state.pointer_mut("/details").and_then(Value::as_object_mut) {
-                if full {
-                    if !files.is_empty() {
-                        details.insert("diff".to_string(), json!(diff_of_files(&diff, &files)));
-                    }
-                } else {
+                if !files.is_empty() {
+                    details.insert("diff".to_string(), json!(diff_of_files(&diff, &files)));
+                } else if !full {
                     details.remove("diff");
                 }
             }
@@ -1180,14 +1178,20 @@ fn merge_check(repo: &std::path::Path, base_branch: &str, branch: &str) -> Optio
         Some(1) => {
             check.clean = Some(false);
             // The conflicted file list follows the tree oid, one
-            // `<mode> <oid> <stage>\t<path>` line per path, and stops at the
-            // blank line that introduces the informational messages.
-            check.conflicts = String::from_utf8_lossy(&output.stdout)
+            // `<mode> <oid> <stage>\t<path>` line per stage of a path, and
+            // stops at the blank line that introduces the informational
+            // messages. A path therefore appears once per stage it conflicts
+            // in, so the list is deduplicated in the order git reported it.
+            for path in String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .skip(1)
                 .take_while(|line| !line.is_empty())
                 .filter_map(|line| line.rsplit('\t').next().map(str::to_string))
-                .collect();
+            {
+                if !check.conflicts.contains(&path) {
+                    check.conflicts.push(path);
+                }
+            }
         }
         _ => {
             check.error = Some(format!(
@@ -1421,6 +1425,7 @@ impl LogView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentStepLog;
 
     /// An omitted `timeout_secs` means "wait indefinitely"; a non-integer one
     /// is a hard error, because a dropped deadline is the unbounded hang the
@@ -1571,5 +1576,178 @@ mod tests {
             .expect("default must apply"),
             "an undeclared policy must fall back to allow"
         );
+    }
+
+    /// A diff split into sections keeps every file, and the counts come from the
+    /// hunks alone: an added line that itself starts with `+` and a removed line
+    /// that starts with `--` are content, not headers.
+    #[test]
+    fn diff_sections_count_hunk_lines_only() {
+        let diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "index 111..222 100644\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " context\n",
+            "-removed\n",
+            "++added line that starts with a plus\n",
+            "--removed line that starts with two dashes\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "new file mode 100644\n",
+            "index 000..333\n",
+            "--- /dev/null\n",
+            "+++ b/two.rs\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+first\n",
+            "+second\n",
+        );
+        let stats = diff_file_stats(diff);
+        assert_eq!(
+            stats,
+            vec![
+                DiffFileStat {
+                    path: "one.rs".to_string(),
+                    insertions: 1,
+                    deletions: 2,
+                },
+                DiffFileStat {
+                    path: "two.rs".to_string(),
+                    insertions: 2,
+                    deletions: 0,
+                },
+            ]
+        );
+        let stat = diff_stat_value(&stats);
+        assert_eq!(stat["files"], 2);
+        assert_eq!(stat["insertions"], 3);
+        assert_eq!(stat["deletions"], 2);
+        assert_eq!(stat["per_file"][1]["path"], "two.rs");
+    }
+
+    /// A binary file carries no line counts, but it is still a file that changed.
+    #[test]
+    fn a_binary_file_counts_as_a_file_with_no_lines() {
+        let diff = concat!(
+            "diff --git a/logo.png b/logo.png\n",
+            "index 111..222 100644\n",
+            "Binary files a/logo.png and b/logo.png differ\n",
+        );
+        assert_eq!(
+            diff_file_stats(diff),
+            vec![DiffFileStat {
+                path: "logo.png".to_string(),
+                insertions: 0,
+                deletions: 0,
+            }]
+        );
+    }
+
+    /// `files` selects sections by path, and a bare name still finds the file
+    /// inside a directory.
+    #[test]
+    fn diff_of_files_matches_a_path_or_a_component_suffix() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/b.rs b/b.rs\n",
+            "--- a/b.rs\n",
+            "+++ b/b.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        assert_eq!(diff_of_files(diff, &["src/a.rs".to_string()]).lines().count(), 5);
+        assert_eq!(diff_of_files(diff, &["a.rs".to_string()]).lines().count(), 5);
+        assert_eq!(diff_of_files(diff, &["b.rs".to_string()]).lines().count(), 5);
+        assert!(diff_of_files(diff, &["nope.rs".to_string()]).is_empty());
+    }
+
+    /// `git diff --numstat` is read as the same per-file stat the in-memory diff
+    /// produces, and a binary file (`-`) counts as neither.
+    #[test]
+    fn numstat_is_read_as_the_same_per_file_stat() {
+        assert_eq!(
+            parse_numstat("3\t1\tsrc/a.rs\n-\t-\tlogo.png\n"),
+            vec![
+                DiffFileStat {
+                    path: "src/a.rs".to_string(),
+                    insertions: 3,
+                    deletions: 1,
+                },
+                DiffFileStat {
+                    path: "logo.png".to_string(),
+                    insertions: 0,
+                    deletions: 0,
+                },
+            ]
+        );
+    }
+
+    /// The next command acts on the merge answer: merge a clean branch, send the
+    /// conflicts back to the worker that owns them.
+    #[test]
+    fn next_command_follows_the_merge_answer() {
+        let clean = MergeCheck {
+            base_branch: "master".to_string(),
+            clean: Some(true),
+            conflicts: Vec::new(),
+            error: None,
+        };
+        assert_eq!(next_command("w1", "worker-w1", Some(&clean)), "git merge worker-w1");
+
+        let mut conflicting = clean;
+        conflicting.clean = Some(false);
+        conflicting.conflicts = vec!["a.rs".to_string(), "b.rs".to_string()];
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&conflicting)),
+            "mini-swe-mcp steer w1 \"resolve the merge conflicts with master: a.rs, b.rs\""
+        );
+
+        let unknown = MergeCheck {
+            base_branch: "master".to_string(),
+            clean: None,
+            conflicts: Vec::new(),
+            error: Some("git merge-tree failed".to_string()),
+        };
+        assert_eq!(
+            next_command("w1", "worker-w1", Some(&unknown)),
+            "git merge worker-w1"
+        );
+        assert_eq!(
+            next_command("w1", "worker-w1", None),
+            "git merge-tree --write-tree <base-branch> worker-w1"
+        );
+    }
+
+    /// A review carries the first line of the task and the tail of the verify
+    /// that failed, never the whole log.
+    #[test]
+    fn the_review_view_is_bounded() {
+        assert_eq!(first_line("Fix the parser\nand its docs"), "Fix the parser");
+        assert_eq!(first_line("   \n  padded  "), "padded");
+
+        let build = AgentStepLog {
+            step: 1,
+            command: "cargo build".to_string(),
+            output: "warning: unused".to_string(),
+            exit_code: Some(0),
+        };
+        let verify = AgentStepLog {
+            step: 2,
+            command: "[verify] cargo test".to_string(),
+            output: "test a ... FAILED\nassertion failed".to_string(),
+            exit_code: Some(101),
+        };
+        let logs = vec![&build, &verify];
+        assert_eq!(
+            verify_tail(&logs).expect("a failed verify must be shown"),
+            "test a ... FAILED\nassertion failed"
+        );
+        assert_eq!(verify_tail(&logs[..1]), None);
     }
 }

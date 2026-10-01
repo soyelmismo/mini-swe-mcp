@@ -5,7 +5,7 @@
 //! callers share one validation and rendering implementation.
 
 use anyhow::Result;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
 pub const DISPATCH_USAGE: &str = "dispatch <task> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate)";
@@ -287,6 +287,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.len(), 1);
+    }
+
+    /// `review <id>` is a read like `status`: one positional, no flags.
+    #[test]
+    fn test_review_maps_its_positional_worker_id() {
+        let out = tool_args("review", &args(&["mini-swe-mcp", "review", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out["action"], "review");
+        assert_eq!(out["worker_id"], "w1");
+    }
+
+    /// `--full` and `--file` are the CLI spelling of the `collect` tool
+    /// arguments, so the diff scope has exactly one implementation.
+    #[test]
+    fn test_collect_flags_map_to_the_diff_scope_arguments() {
+        let plain = tool_args("collect", &args(&["mini-swe-mcp", "collect", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert!(!plain.contains_key("full"), "{plain:?}");
+        assert!(!plain.contains_key("files"), "{plain:?}");
+
+        let full = tool_args(
+            "collect",
+            &args(&["mini-swe-mcp", "collect", "w1", "--full"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(full["full"], true);
+
+        let files = tool_args(
+            "collect",
+            &args(&[
+                "mini-swe-mcp",
+                "collect",
+                "w1",
+                "--file",
+                "src/a.rs",
+                "--file",
+                "b.rs",
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(files["files"], json!(["src/a.rs", "b.rs"]));
     }
 
     #[test]
