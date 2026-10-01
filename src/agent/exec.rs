@@ -1720,10 +1720,23 @@ mod tests {
         let started = std::time::Instant::now();
         let (out, code) = runner()
             .with_command_timeout(1)
-            .execute_bash(&tmp, "echo BEFORE-LEAK; (setsid sleep 300 &); sleep 300")
+            .execute_bash(
+                &tmp,
+                "echo BEFORE-LEAK; (setsid sleep 300 & echo $! > leaked.pid); sleep 300",
+            )
             .await
             .expect("a leaked pipe must not turn the timeout into a hang");
         let elapsed = started.elapsed();
+        // The detached sleeper is the point of the test, but it must not
+        // outlive it: the harness audit rightly reports a suite that leaves
+        // processes behind.
+        if let Some(pid) = std::fs::read_to_string(tmp.join("leaked.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // SAFETY: `kill` takes plain integers; a stale pid only yields ESRCH.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
 
         assert_eq!(code, Some(TIMEOUT_EXIT_CODE), "{out:?}");
         assert!(
