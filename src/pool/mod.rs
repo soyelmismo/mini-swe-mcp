@@ -430,22 +430,30 @@ impl WorkerPool {
         self.log_policy
     }
 
-    /// Evict terminal worker records whose TTL expired, and retire the durable
-    /// state of the workers whose retention ran out.
+    /// Evict terminal worker records whose TTL expired. Fresh terminal records
+    /// are deliberately kept so a subsequent `collect` / `wait: true` still
+    /// finds them (audit 07, R3).
     ///
-    /// The in-memory eviction bounds *memory* only: a reaped record leaves its
-    /// registry row and its saved conversation in place, so a finished worker
-    /// stays steerable for as long as its branch does (audit 07, R3). Fresh
-    /// terminal records are deliberately kept so a subsequent `collect` /
-    /// `wait: true` still finds them.
+    /// The eviction bounds *memory* only: a reaped record leaves its registry
+    /// row and its saved conversation in place, so a finished worker stays
+    /// steerable for as long as its branch does. Those are retired by
+    /// [`WorkerPool::retire_expired_terminal_workers`], never from here.
     pub async fn reap(&self) -> Vec<String> {
         let expired = {
             let mut lock = self.workers.write().await;
             self.reap_locked(&mut lock)
         };
         self.forget_worktrees(&expired).await;
-        // Age-based, and independent of the in-memory records: a worker whose
-        // branch remains keeps its row and history until this retention ends.
+        expired
+    }
+
+    /// Retire the durable state of every terminal worker whose retention ran
+    /// out: its registry row, its saved conversation and its steering mailbox.
+    ///
+    /// Age-based and independent of the in-memory records, so a worker whose
+    /// branch remains keeps everything until this retention ends. Returns how
+    /// many workers were retired.
+    pub async fn retire_expired_terminal_workers(&self) -> usize {
         let root = self.scratch.clone();
         let retention = terminal_retention_secs();
         let retired = tokio::task::spawn_blocking(move || {
@@ -460,7 +468,7 @@ impl WorkerPool {
                 "Retired terminal workers past their retention"
             );
         }
-        expired
+        retired
     }
 
     /// Drop the worktree paths of workers whose records are gone.
@@ -1516,16 +1524,27 @@ impl WorkerPool {
     }
 }
 
-/// Spawn the background reaper that evicts expired terminal worker records.
+/// Spawn the background reaper that evicts expired terminal worker records
+/// and, on a much slower cadence, retires the durable state of the workers
+/// whose retention ran out.
 ///
 /// Kept in the library so the server can start it from `run_stdio` without
 /// depending on `main.rs`.
 pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(30);
+        // The durable retention is a week, so sweeping it needs no such
+        // cadence: one registry scan per hour rather than one per tick.
+        let retention_every = 120u32;
+        let mut since_retention = 0u32;
         loop {
             tokio::time::sleep(interval).await;
             pool.reap().await;
+            since_retention += 1;
+            if since_retention >= retention_every {
+                since_retention = 0;
+                pool.retire_expired_terminal_workers().await;
+            }
         }
     })
 }
