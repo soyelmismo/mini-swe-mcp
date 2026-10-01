@@ -136,12 +136,6 @@ pub struct TempDir {
     path: PathBuf,
 }
 
-/// Short, stable base for test scratch directories; see [`TempDir::new_in_tmp`].
-fn scratch_base() -> &'static Path {
-    static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BASE.get_or_init(mini_swe_mcp::worktree::swe_base_dir)
-}
-
 impl TempDir {
     /// Create (clearing any stale entry first) a scratch directory under `base`.
     pub fn new(base: &Path, tag: &str) -> Self {
@@ -156,11 +150,10 @@ impl TempDir {
     ///
     /// Deliberately not the raw `TMPDIR`: the hub tests bind a Unix socket
     /// inside these directories, and a long `TMPDIR` would push the socket path
-    /// past `SUN_LEN`. The short base is resolved once (see [`scratch_base`])
-    /// so `watch_test` repointing `SWE_TEMP_DIR` at its registry cannot nest
-    /// later scratch directories inside it.
+    /// past `SUN_LEN`. [`mini_swe_mcp::worktree::swe_base_dir`] makes the same
+    /// short-base choice the daemon itself does.
     pub fn new_in_tmp(tag: &str) -> Self {
-        Self::new(scratch_base(), tag)
+        Self::new(&mini_swe_mcp::worktree::swe_base_dir(), tag)
     }
 
     pub fn path(&self) -> &Path {
