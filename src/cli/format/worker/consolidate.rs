@@ -228,6 +228,8 @@ interaction points (touched by more than one worker):
             state: "Completed".to_string(),
             verified: Some(true),
             task: title.to_string(),
+            // A body the compact render must keep out of the summary.
+            full_task: format!("{title}\nfull body"),
             files: vec!["src/a.rs".to_string()],
         };
         let manifest = RoundManifest {

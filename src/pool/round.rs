@@ -47,8 +47,13 @@ pub struct RoundWorker {
     /// worker left no `worker-<id>` branch behind.
     pub state: String,
     pub verified: Option<bool>,
-    /// First line of the worker's task.
+    /// First line of the worker's task, as the compact manifest renders it.
     pub task: String,
+    /// The worker's whole task, as the registry recorded it, for the
+    /// consolidator's scope review. Bounded when rendered (see
+    /// [`RoundManifest::render_full_tasks`]), never part of the compact
+    /// [`RoundManifest::render`].
+    pub full_task: String,
     /// Files the branch touched, relative to the base branch.
     pub files: Vec<String>,
 }
@@ -82,14 +87,23 @@ impl RoundManifest {
     /// because "run the full gate" is only actionable once it names a command.
     pub fn task_text(&self, verify: Option<&str>) -> String {
         let gate = verify.unwrap_or("(none detected: run the project's own checks)");
-        format!(
+        let mut out = format!(
             "Consolidate the round in group {}: integrate the finished branches, run the \
              full gate once, route what you cannot own back to its owner, review every diff, \
-             and report.\n\n{}\nFull gate for this round: `{gate}`\n\n{}",
+             and report.\n\n{}\n",
             self.group,
             self.render(),
+        );
+        let full_tasks = self.render_full_tasks();
+        if !full_tasks.is_empty() {
+            let _ = writeln!(out, "{full_tasks}");
+        }
+        let _ = write!(
+            out,
+            "Full gate for this round: `{gate}`\n\n{}",
             crate::agent::CONSOLIDATOR_INSTRUCTIONS
-        )
+        );
+        out
     }
 
     /// Render the manifest as the text embedded in the consolidator's task.
@@ -127,6 +141,74 @@ impl RoundManifest {
         }
         out
     }
+
+    /// The full task of every worker of the round, bounded, in a section
+    /// deliberately separate from the compact [`Self::render`].
+    ///
+    /// The compact manifest keeps each task's first line so the orchestrator
+    /// can diff two rounds by eye; the consolidator judges whether each diff
+    /// respected its task's scope and so needs the whole text. Every worker
+    /// listed (ready first, then not ready) contributes one entry, each task
+    /// bounded by [`FULL_TASK_BUDGET`] with a `[truncated]` marker when it is
+    /// cut, and the whole section bounded by [`FULL_TASKS_BUDGET`] so a verbose
+    /// round cannot flood the prompt; work left out by the section budget is
+    /// counted rather than silently dropped.
+    ///
+    /// Returns an empty string when the round lists no worker, so a caller can
+    /// splice it unconditionally.
+    pub fn render_full_tasks(&self) -> String {
+        if self.ready.is_empty() && self.not_ready.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the \
+             worker's own text below; the manifest above keeps only each task's first \
+             line):\n",
+        );
+        let mut remaining = FULL_TASKS_BUDGET.saturating_sub(out.len());
+        let mut omitted = 0usize;
+        for worker in self.ready.iter().chain(self.not_ready.iter()) {
+            let task = bound_task(&worker.full_task, FULL_TASK_BUDGET);
+            let entry = format!("### {}:\n{task}\n", worker.id);
+            if entry.len() > remaining {
+                omitted += 1;
+                continue;
+            }
+            out.push_str(&entry);
+            remaining -= entry.len();
+        }
+        if omitted > 0 {
+            let _ = writeln!(
+                out,
+                "({omitted} further worker task(s) omitted: section budget reached)"
+            );
+        }
+        out
+    }
+}
+
+/// Byte budget for one worker's full task in [`RoundManifest::render_full_tasks`],
+/// truncation marker included.
+const FULL_TASK_BUDGET: usize = 4 * 1024;
+
+/// Overall byte budget for the full-task section, so a round of many verbose
+/// workers cannot flood the consolidator's prompt.
+const FULL_TASKS_BUDGET: usize = 16 * 1024;
+
+/// Marker appended to a task cut to [`FULL_TASK_BUDGET`].
+const TASK_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+/// Bound `task` to `budget` bytes, appending [`TASK_TRUNCATION_MARKER`] when it
+/// is cut, never splitting a UTF-8 code point and never exceeding `budget`.
+fn bound_task(task: &str, budget: usize) -> String {
+    if task.len() <= budget {
+        return task.to_string();
+    }
+    if budget <= TASK_TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let cut = task.floor_char_boundary(budget - TASK_TRUNCATION_MARKER.len());
+    format!("{}{TASK_TRUNCATION_MARKER}", &task[..cut])
 }
 
 /// One worker's lines: identity, state, verification, task heading, files.
@@ -187,6 +269,7 @@ pub async fn build(
                 state: row.status.display_name().to_string(),
                 verified: row.verified,
                 task: first_line(&row.task),
+                full_task: row.task,
                 files: Vec::new(),
             })
             .collect();
@@ -231,6 +314,7 @@ pub async fn build(
             state,
             verified: row.verified,
             task: first_line(&row.task),
+            full_task: row.task,
             files: files.clone(),
         };
         if exists && row.status == RegistryStatus::Completed {
