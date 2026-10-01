@@ -54,7 +54,7 @@ mini-swe-mcp dispatch "fix the flaky retry test in src/retry.rs; gate: cargo tes
 - `--offline` — no outbound network during the run.
 - `--verify <cmd>` — command the worker must pass before completing (auto-detected otherwise).
 
-Write the task as ONE focused concern with the files in scope and an acceptance gate. Avoid parallel workers whose scopes share files.
+Write the task as ONE focused concern with the files in scope and an acceptance gate. Dispatch independent tasks in parallel -- many workers at once is the intended use; each worker integrates the latest base branch and resolves conflicts before completing. Split work so two workers do not rewrite the same function at the same time.
 
 ### 2. watch
 
