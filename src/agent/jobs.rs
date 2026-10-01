@@ -137,13 +137,7 @@ impl JobTable {
     pub fn summaries(&self, worker: &str) -> Vec<JobStatus> {
         lock(&self.workers)
             .get(worker)
-            .map(|entry| {
-                entry
-                    .jobs
-                    .iter()
-                    .map(|(id, job)| job.status(*id))
-                    .collect()
-            })
+            .map(|entry| entry.jobs.iter().map(|(id, job)| job.status(*id)).collect())
             .unwrap_or_default()
     }
 }
@@ -286,7 +280,14 @@ impl JobState {
     /// a job that outlives its step never outlives the build slot it was
     /// admitted with.
     pub fn retain(&self, guard: Box<dyn Any + Send>) {
-        lock(&self.inner).guards.push(guard);
+        let mut inner = lock(&self.inner);
+        if inner.outcome.is_some() {
+            // The job is already reaped, so whatever it held is already
+            // released: this guard must not outlive it.
+            drop(guard);
+            return;
+        }
+        inner.guards.push(guard);
     }
 
     /// Stop the job's whole process group.
@@ -374,7 +375,9 @@ impl JobState {
                 outcome,
                 output: self.tail(),
             },
-            None => JobWait::Running { output: self.tail() },
+            None => JobWait::Running {
+                output: self.tail(),
+            },
         }
     }
 
@@ -480,11 +483,7 @@ pub struct JobStatus {
 impl JobStatus {
     /// The one-line form a status view shows.
     pub fn label(&self) -> String {
-        let state = if self.finished {
-            "finished"
-        } else {
-            "running"
-        };
+        let state = if self.finished { "finished" } else { "running" };
         format!(
             "job {}: {} ({state}, {}s)",
             self.id, self.command, self.elapsed_secs

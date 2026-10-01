@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::TempDir;
+use mini_swe_mcp::agent::AgentRunner;
 use mini_swe_mcp::agent::jobs::{JobHandle, JobTable, JobWait};
-use mini_swe_mcp::agent::{AgentRunner, parse_kill_job, parse_wait_job};
+use mini_swe_mcp::pool::{parse_kill_job, parse_wait_job};
 
 /// A runner whose commands outlive a one-second budget, filing its jobs under
 /// `worker` in `table`.
@@ -90,7 +91,13 @@ async fn a_command_that_outlives_its_budget_becomes_a_job_and_keeps_running() {
     assert!(output.contains("job 1"), "{output}");
     assert!(output.contains("WAIT_JOB 1"), "{output}");
     assert!(output.contains("KILL_JOB 1"), "{output}");
-    assert_eq!(code, Some(0), "{output}");
+    assert!(
+        output.contains("still running"),
+        "the command must be reported as still running, not as finished: {output}"
+    );
+    // The timeout's exit code, not 0: the command has not finished, so a
+    // completion gate that outlived its budget has not passed.
+    assert_eq!(code, Some(124), "{output}");
 
     let jobs = runner.jobs();
     assert_eq!(jobs.len(), 1, "{jobs:?}");
@@ -118,9 +125,26 @@ async fn a_command_that_outlives_its_budget_becomes_a_job_and_keeps_running() {
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     while std::fs::read_to_string(&log).is_ok_and(|text| !text.contains("starting")) {
-        assert!(Instant::now() < deadline, "the job log never filled: {log:?}");
+        assert!(
+            Instant::now() < deadline,
+            "the job log never filled: {log:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    // A wait that runs out of budget reports the job as still running rather
+    // than blocking the turn forever.
+    let wait = runner
+        .wait_job(1, Duration::from_millis(200))
+        .await
+        .expect("job 1 is live");
+    let (report, code) = wait.report(1);
+    assert!(report.contains("still running"), "{report}");
+    assert_eq!(code, Some(0), "{report}");
+    assert!(
+        matches!(wait, JobWait::Running { .. }),
+        "the per-call budget must not wait for the job: {wait:?}"
+    );
 
     // Leave nothing running behind the test.
     assert!(runner.kill_job(1));
@@ -181,7 +205,10 @@ async fn killing_a_job_stops_it() {
         .expect("a command that outlives its budget must still be spawned");
     assert!(output.contains("job 1"), "{output}");
     let pid = job_pid(&pid_file).await;
-    assert!(process_alive(pid), "job 1 must be running before it is killed");
+    assert!(
+        process_alive(pid),
+        "job 1 must be running before it is killed"
+    );
 
     assert!(runner.kill_job(1), "job 1 must be killable");
     assert!(
@@ -212,7 +239,10 @@ async fn a_job_dies_with_its_worker() {
         .expect("a command that outlives its budget must still be spawned");
     assert!(output.contains("job 1"), "{output}");
     let pid = job_pid(&pid_file).await;
-    assert!(process_alive(pid), "job 1 must be running while its worker is");
+    assert!(
+        process_alive(pid),
+        "job 1 must be running while its worker is"
+    );
 
     // What the worker's teardown does when the worker ends, however it ends.
     assert_eq!(table.kill_all("w-ended"), 1);

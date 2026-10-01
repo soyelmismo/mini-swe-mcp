@@ -18,8 +18,8 @@ pub use env::{
 };
 pub use exec::{has_unshare, wrap_network_command};
 pub use jobs::{
-    DEFAULT_JOB_MAX_SECS, DEFAULT_WAIT_JOB_SECS, JobEnd, JobHandle, JobOutcome, JobState, JobStatus,
-    JobTable, JobWait, job_max_secs, wait_job_secs,
+    DEFAULT_JOB_MAX_SECS, DEFAULT_WAIT_JOB_SECS, JobEnd, JobHandle, JobOutcome, JobState,
+    JobStatus, JobTable, JobWait, job_max_secs, wait_job_secs,
 };
 pub use retry::{DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY, max_llm_retries};
 pub use runner::AgentRunner;

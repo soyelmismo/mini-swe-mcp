@@ -300,7 +300,7 @@ impl AgentRunner {
         match run_with_timeout(&mut cmd, timeout_secs, job_log_dir.as_deref()).await? {
             RunOutcome::Finished { output, code } => Ok((output, code)),
             RunOutcome::Backgrounded(backgrounded) => {
-                Ok(self.continue_as_job(backgrounded, command).await)
+                Ok(self.continue_as_job(*backgrounded, command).await)
             }
         }
     }
@@ -310,7 +310,11 @@ impl AgentRunner {
     /// With a job table the command keeps running as job `<n>`, which the
     /// worker can wait on or stop; without one there is nobody to wait on it,
     /// so it is stopped here and reported as the timeout it is.
-    async fn continue_as_job(&self, backgrounded: Backgrounded, command: &str) -> (String, Option<i32>) {
+    async fn continue_as_job(
+        &self,
+        backgrounded: Backgrounded,
+        command: &str,
+    ) -> (String, Option<i32>) {
         let Backgrounded {
             pid,
             mut child,
@@ -342,7 +346,13 @@ impl AgentRunner {
             log = %log.display(),
             "Command outlived its budget; continuing as a background job"
         );
-        (backgrounded_message(id, timeout_secs, &log), Some(0))
+        // Reported with the timeout's exit code, not 0: the command has not
+        // finished, and a completion gate that outlived its budget has not
+        // passed.
+        (
+            backgrounded_message(id, timeout_secs, &log),
+            Some(TIMEOUT_EXIT_CODE),
+        )
     }
 }
 
@@ -1042,7 +1052,10 @@ enum RunOutcome {
     /// The command ended within its budget.
     Finished { output: String, code: Option<i32> },
     /// The command outlived its budget and is still running in its own group.
-    Backgrounded(Backgrounded),
+    ///
+    /// Boxed: the pipes and the guard dwarf the finished output, and this value
+    /// is moved once per command.
+    Backgrounded(Box<Backgrounded>),
 }
 
 /// A command that outlived its budget, still running in its own process group.
@@ -1133,7 +1146,7 @@ async fn run_with_timeout(
         // turns it into a background job, so the group guard stands down only
         // once someone has taken the group over, and the pipes keep draining
         // into the job's log.
-        Err(_elapsed) => Ok(RunOutcome::Backgrounded(Backgrounded {
+        Err(_elapsed) => Ok(RunOutcome::Backgrounded(Box::new(Backgrounded {
             pid: child_pid,
             child,
             out: out_buf,
@@ -1141,7 +1154,7 @@ async fn run_with_timeout(
             timeout_secs,
             log: job_log.unwrap_or_else(|| PathBuf::from("job.log")),
             guard: group_guard,
-        })),
+        }))),
     }
 }
 
