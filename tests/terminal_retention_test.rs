@@ -391,11 +391,16 @@ async fn a_worker_whose_branch_is_gone_is_kept_through_its_grace_then_retired() 
 /// worktree it owns) is finished before the test tears down the repo.
 async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
     for _ in 0..600 {
-        if let Some(state) = pool.get_worker_state(id).await {
-            match state {
-                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
-                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
-            }
+        if let Some(state) = pool.get_worker_state(id).await
+            && matches!(
+                state,
+                WorkerState::Completed { .. }
+                    | WorkerState::Failed { .. }
+                    | WorkerState::Exhausted { .. }
+            )
+            && !pool.scratch_root().join(format!("swe-wt-{id}")).exists()
+        {
+            return state;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

@@ -117,5 +117,12 @@ async fn revision_start_does_not_integrate_the_moving_master_tip() {
     );
     assert!(files.contains("round-file"), "{files}");
     assert!(!files.contains("outside-round"), "{files}");
-    pool.kill("pinned").await;
+    assert!(pool.kill("pinned").await);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while root.join("swe-wt-pinned").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker teardown finishes before temporary roots are removed");
 }
