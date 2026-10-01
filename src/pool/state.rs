@@ -72,6 +72,54 @@ impl WorkerMetrics {
     }
 }
 
+/// The structured report a worker writes in its completion turn.
+///
+/// A completion used to be read off the first line of the worker's last chat
+/// message, which is whatever the model happened to say last ("Now I'll make
+/// the edits."), so every consumer had to shell out to `git diff` to learn
+/// what the run actually did. The four lines below are the contract instead:
+/// the worker states them before the completion sentinel and the harness
+/// carries them from the completion turn to the registry row, so a `status`,
+/// `collect` or `watch` event answers without a second call.
+///
+/// Every field is optional and bounded: a worker that omits a line still
+/// completes (the harness falls back to today's summary), and a report is
+/// never allowed to grow into a second document.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerReport {
+    /// One line: what changed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done: String,
+    /// Paths changed, comma-separated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub files: String,
+    /// The commands run and their result, one line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tests: String,
+    /// Security, contract or behaviour risks, or `none`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub risks: String,
+}
+
+impl WorkerReport {
+    /// Whether the report says anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.done.is_empty()
+            && self.files.is_empty()
+            && self.tests.is_empty()
+            && self.risks.is_empty()
+    }
+
+    /// The paths the report names, split on commas and trimmed.
+    pub fn file_paths(&self) -> Vec<&str> {
+        self.files
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
@@ -103,6 +151,10 @@ pub enum WorkerState {
         /// tell the first answer from a corrected one.
         #[serde(default)]
         revision: usize,
+        /// The structured report of the completion turn, `None` when the
+        /// worker never supplied one (the summary stays the fallback).
+        #[serde(default)]
+        report: Option<WorkerReport>,
     },
     Failed {
         error: String,
@@ -160,6 +212,7 @@ impl WorkerState {
                 verified,
                 metrics,
                 revision,
+                report,
                 ..
             } => serde_json::json!({
                 "status": "Completed",
@@ -171,6 +224,7 @@ impl WorkerState {
                 "verified": verified,
                 "metrics": metrics,
                 "revision": revision,
+                "report": report,
             }),
             WorkerState::Failed {
                 error,

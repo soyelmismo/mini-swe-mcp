@@ -153,6 +153,95 @@ pub fn parse_consolidate_merge(cmd: &str) -> Option<Vec<String>> {
     tokens.then_some(ids)
 }
 
+/// The four keys of a completion report, in the order the system prompt asks
+/// for them. A line whose key is not one of these is ignored, so a worker that
+/// adds a fifth line still parses.
+const REPORT_KEYS: [&str; 4] = ["done", "files", "tests", "risks"];
+
+/// The one follow-up the harness sends when a completion turn carries no
+/// report: the block, then the sentinel again.
+pub const REPORT_FOLLOWUP: &str = "Reply with the REPORT block only, then the completion sentinel";
+
+/// Parse the `REPORT` block out of a completion message.
+///
+/// The block is the worker's structured answer, so the parser is deliberately
+/// forgiving about everything that is not the content: a markdown fence around
+/// the block, `-`/`*`/`1.` bullets, a trailing colon after the key, and any
+/// capitalisation of the key. The first line that is exactly `REPORT` (modulo
+/// fences and bullets) opens the block; the keys that follow fill it, and a
+/// `None` result means "no block", never "an empty block".
+///
+/// Keys are matched case-insensitively and only the first occurrence of each
+/// wins, so a worker that repeats a line cannot rewrite an earlier answer.
+pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
+    let mut report = super::super::WorkerReport::default();
+    let mut in_block = false;
+    for line in message.lines() {
+        let line = strip_markup(line);
+        if !in_block {
+            if line.eq_ignore_ascii_case("REPORT") {
+                in_block = true;
+            }
+            continue;
+        }
+        // A blank line ends the block only once a key has been read: a worker
+        // that spaces its lines out is not a worker that stopped reporting.
+        if line.is_empty() {
+            if report.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if !REPORT_KEYS.contains(&key.as_str()) || value.is_empty() {
+            continue;
+        }
+        let slot = match key.as_str() {
+            "done" => &mut report.done,
+            "files" => &mut report.files,
+            "tests" => &mut report.tests,
+            _ => &mut report.risks,
+        };
+        if slot.is_empty() {
+            slot.push_str(value);
+        }
+    }
+    (!report.is_empty()).then_some(report)
+}
+
+/// Peel the markdown a model wraps a block in: code fences, list bullets and
+/// the emphasis markers around a key.
+fn strip_markup(line: &str) -> String {
+    let line = line.trim();
+    let line = line
+        .strip_prefix("```")
+        .unwrap_or(line)
+        .trim_start_matches('`')
+        .trim();
+    let line = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .unwrap_or(line)
+        .trim();
+    // A numbered bullet: `1. done: ...`.
+    let line = match line.find(|c: char| c.is_ascii_digit()) {
+        Some(start) => {
+            let rest = &line[start..];
+            match rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
+                Some(end) if end > 0 => rest[end..].trim_start(),
+                _ => line,
+            }
+        }
+        None => line,
+    };
+    line.trim_matches(['*', '_', '`', '#', '>']).trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

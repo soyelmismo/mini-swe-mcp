@@ -76,12 +76,13 @@ pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_consolidate_merge, parse_request_turns, summarize_command,
+    COMPLETION_SENTINEL, REPORT_FOLLOWUP, WorkerLaunchConfig, is_completion_request,
+    parse_ask_orchestrator, parse_consolidate_merge, parse_report, parse_request_turns,
+    summarize_command,
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerState,
+    WorkerProgress, WorkerRecord, WorkerReport, WorkerState,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
