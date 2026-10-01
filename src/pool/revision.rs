@@ -199,6 +199,36 @@ pub fn append_history_message(
     Ok(())
 }
 
+/// Rewrite the metadata line (line one) of `worker_id`'s conversation log.
+///
+/// A continuation changes `revision` and the turn budget but appends only
+/// message lines, so without this the log keeps naming the revision of the
+/// dispatch that created it and every later continuation reads the same
+/// counter again. The message lines are copied through untouched; only line
+/// one is replaced, atomically, so a reader never sees a half-written log.
+pub fn save_history_metadata(worker_id: &str, meta: &WorkerHistory) -> Result<()> {
+    let path = history_log_path(worker_id);
+    let mut meta = meta.clone();
+    meta.messages.clear();
+    let line = serde_json::to_string(&meta).context("Could not serialize history metadata")?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Could not read history log {}", path.display()));
+        }
+    };
+    let mut payload = line;
+    payload.push('\n');
+    // Skip the stale metadata line; every line after it is a message.
+    for message_line in existing.lines().skip(1) {
+        payload.push_str(message_line);
+        payload.push('\n');
+    }
+    write_private_atomic(&path, payload.as_bytes())
+}
+
 /// Load the conversation log, tolerating a torn last line.
 ///
 /// A crash mid-append leaves a partial JSON object behind; that line is
@@ -259,21 +289,32 @@ pub fn load_worker_history_log(worker_id: &str) -> Result<WorkerHistory> {
 /// the record. `swe_base_dir()` is not world-writable by construction.
 pub fn save_worker_history(worker_id: &str, history: &WorkerHistory) -> Result<()> {
     let path = history_path(worker_id);
+    let json = serde_json::to_string(history).context("Could not serialize worker history")?;
+    write_private_atomic(&path, json.as_bytes())
+}
+
+/// Replace `path` with `bytes` through an owner-only staging file and a
+/// rename, so a reader never observes a half-written record.
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Could not create history dir {}", parent.display()))?;
     }
     let mut staging = path.as_os_str().to_os_string();
-    staging.push(format!(".{}.{}.tmp", std::process::id(), history.revision));
+    staging.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let staging = PathBuf::from(staging);
 
     let file = std::fs::File::create(&staging)
         .with_context(|| format!("Could not create history file {}", staging.display()))?;
     restrict_to_owner(&staging)?;
-    let json = serde_json::to_string(history).context("Could not serialize worker history")?;
-    std::io::Write::write_all(&mut { file }, json.as_bytes())
+    std::io::Write::write_all(&mut { file }, bytes)
         .with_context(|| format!("Could not write history file {}", staging.display()))?;
-    std::fs::rename(&staging, &path)
+    std::fs::rename(&staging, path)
         .with_context(|| format!("Could not commit history file {}", path.display()))?;
     Ok(())
 }
@@ -739,8 +780,26 @@ impl super::WorkerPool {
                 format!("{prefix}\n{message}"),
             ));
         }
+        // Three stores carry the counter and any of them can lag: the log's
+        // metadata line is written once at dispatch, the registry row is the
+        // only copy a reaped worker leaves, and the in-process record is what
+        // a running worker updates. Bump the highest, so a stale copy can
+        // never make a continuation repeat the previous number.
+        let persisted = {
+            let in_memory = self
+                .workers
+                .read()
+                .await
+                .get(id)
+                .map(|w| w.revision)
+                .unwrap_or(0);
+            let registry = super::load_registry_entry(id)
+                .map(|e| e.revision)
+                .unwrap_or(0);
+            history.revision.max(in_memory).max(registry)
+        };
         history.max_turns = max_turns;
-        history.revision += 1;
+        history.revision = persisted + 1;
         let revision = history.revision;
         // Append the messages the log does not have yet, so a worker relaunched
         // from it replays the same conversation. A warm continuation adds one
@@ -758,6 +817,17 @@ impl super::WorkerPool {
                     "Could not append the continuation message to the history log"
                 );
             }
+        }
+
+        // The log's metadata line still names the dispatch's revision; rewrite
+        // it with the counter bumped above so the *next* continuation reads N,
+        // not the stale N-1.
+        if let Err(e) = save_history_metadata(id, &history) {
+            tracing::warn!(
+                worker = %id,
+                error = %e,
+                "Could not persist the revision counter to the history log"
+            );
         }
 
         // A registry-only worker has no record here yet: register it so the
