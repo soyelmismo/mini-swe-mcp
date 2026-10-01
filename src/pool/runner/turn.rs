@@ -28,6 +28,7 @@ use crate::manifest::MAX_TURNS_LIMIT;
 use crate::worktree::{BaseSync, WorktreeGuard, git};
 
 use super::super::WorkerPool;
+use super::super::admission::AdmissionClass;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::super::revision::{WorkerHistory, append_history_message_in};
@@ -575,7 +576,9 @@ impl<'a> TurnEngine<'a> {
         }
 
         // --- Execute command with semaphores ---
-        let (output, code) = self.run_gated(&cmd_str).await?;
+        let (output, code) = self
+            .run_gated(&cmd_str, AdmissionClass::Exploratory)
+            .await?;
 
         // --- Orchestrator control sentinels (implementer only) ---
         if config.apply_sentinels {
@@ -738,7 +741,7 @@ impl<'a> TurnEngine<'a> {
         // The side-effect baseline is taken before the gate runs, so both the
         // canonical run and the divergent run are audited against it.
         let gate_baseline = super::divergent::snapshot(&self.worktree.repo_root);
-        let (output, code) = self.run_gated(verify).await?;
+        let (output, code) = self.run_gated(verify, AdmissionClass::Completion).await?;
 
         let exit = code.unwrap_or(-1);
         if exit == 0 {
@@ -836,7 +839,7 @@ impl<'a> TurnEngine<'a> {
             "Running divergent verify variant B"
         );
         let (output_b, code_b) = self
-            .run_gated_with_env(verify, divergent_env.clone())
+            .run_gated_with_env(verify, AdmissionClass::Completion, divergent_env.clone())
             .await?;
         tracing::info!(
             worker = %self.worker_id,
@@ -1016,57 +1019,31 @@ impl<'a> TurnEngine<'a> {
             .push(ChatMessage::text(Role::User, stagnation_nudge()));
     }
 
-    /// Run `command` through the worker's semaphores: heavy commands are
-    /// admitted by the resource-aware controller, every command takes a bash
-    /// slot.
-    ///
-    /// A granted heavy command also carries the job count the controller
-    /// divided over the builds already running, which rides on a runner clone
-    /// for this one command; a light command keeps the default parallelism.
-    /// [`run_gated`] with an environment overlay layered on top of the
-    /// sanitized environment (see [`AgentRunner::with_extra_env`]).
+    /// Run through resource admission and the bash semaphore, retaining both
+    /// permits until execution finishes or is cancelled.
+    async fn run_gated(
+        &mut self,
+        command: &str,
+        class: AdmissionClass,
+    ) -> Result<(String, Option<i32>)> {
+        self.run_gated_with_env(command, class, Vec::new()).await
+    }
+
+    /// Shared execution path for exploratory commands and both completion
+    /// variants; the overlay wins over the sanitized environment defaults.
     async fn run_gated_with_env(
         &mut self,
         command: &str,
+        class: AdmissionClass,
         extra_env: Vec<(String, String)>,
     ) -> Result<(String, Option<i32>)> {
         let heavy = crate::agent::is_heavy_command(command);
         let build_permit = if heavy {
-            Some(self.pool.admission.acquire().await)
-        } else {
-            None
-        };
-        let _bash_permit = self
-            .pool
-            .bash_semaphore
-            .acquire()
-            .await
-            .context("Bash semaphore closed")?;
-        let mut runner = self.runner.clone();
-        if let Some(permit) = &build_permit {
-            runner = runner.with_build_jobs(permit.jobs());
-        }
-        // The overlay is applied after the job count, so a divergent
-        // environment can never be dropped by a builder-chain reorder.
-        runner = runner.with_extra_env(extra_env);
-        runner.build_target_dir = if heavy {
-            self.worktree.build_dir().await
-        } else {
-            self.worktree.leased_build_dir().map(Path::to_path_buf)
-        };
-        let _running = self.pool.command_running(self.worker_id);
-        runner.execute_bash(&self.worktree.path, command).await
-    }
-
-    async fn run_gated(&mut self, command: &str) -> Result<(String, Option<i32>)> {
-        let heavy = crate::agent::is_heavy_command(command);
-        let build_permit = if heavy {
-            // A queued heavy command is not worker inactivity: publish the wait
-            // (with the requests ahead of it) so the stall detector skips it.
+            // A queued command is not inactivity, including completion gates.
             let _waiting = self
                 .pool
                 .wait_for_build_slot(self.worker_id, self.pool.admission.waiting() + 1);
-            Some(self.pool.admission.acquire().await)
+            Some(self.pool.admission.acquire(class).await)
         } else {
             None
         };
@@ -1078,13 +1055,11 @@ impl<'a> TurnEngine<'a> {
             .context("Bash semaphore closed")?;
         let mut runner = self.runner.clone();
         if let Some(permit) = &build_permit {
-            // The admission slot still doses CPU, but it no longer picks the
-            // directory: the worker leases one build dir for its whole lifetime.
             runner = runner.with_build_jobs(permit.jobs());
         }
-        // The worker's exclusive build dir: a heavy command leases one on
-        // first use, and a light command reuses it when there is one (and
-        // otherwise builds in the worktree, as before).
+        runner = runner.with_extra_env(extra_env);
+        // Heavy commands lease the worker's build dir on first use; light
+        // commands reuse it without allocating another lease.
         runner.build_target_dir = if heavy {
             self.worktree.build_dir().await
         } else {
