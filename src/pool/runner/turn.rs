@@ -195,7 +195,7 @@ fn env_threshold(name: &str) -> Option<usize> {
 /// A token counts as a path when it carries a dotted file extension or a
 /// directory separator; prose tokens with neither do not.
 fn task_names_files(task: &str) -> bool {
-    task.split_whitespace().any(|token| is_path_token(token))
+    task.split_whitespace().any(is_path_token)
 }
 
 /// Whether `token` reads as a path or a file name: it carries a dotted file
@@ -212,7 +212,9 @@ fn is_path_token(token: &str) -> bool {
     }
     match token.rsplit_once('.') {
         Some((stem, ext)) => {
-            !stem.is_empty() && (2..=6).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphabetic())
+            !stem.is_empty()
+                && (2..=6).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphabetic())
         }
         None => false,
     }
@@ -261,9 +263,7 @@ fn edit_plan(task: &str) -> Vec<EditPlanEntry> {
         // files as the task listed them.
         for token in span.split_whitespace() {
             let Some(path) = path_of(token) else { continue };
-            if entries.len() < EDIT_PLAN_FILES
-                && !entries.iter().any(|e| e.path == path)
-            {
+            if entries.len() < EDIT_PLAN_FILES && !entries.iter().any(|e| e.path == path) {
                 entries.push(EditPlanEntry {
                     path: path.clone(),
                     identifiers: Vec::new(),
@@ -303,8 +303,13 @@ fn is_identifier(text: &str) -> bool {
 }
 
 /// The plan half of the second nudge: the files and identifiers the task itself
-/// named, ready to act on.
+/// named, ready to act on. A dispatch that names a file the extractor cannot
+/// read still gets the demand, so the nudge is never a sentence with a hole in
+/// it.
 fn edit_plan_text(entries: &[EditPlanEntry]) -> String {
+    if entries.is_empty() {
+        return "Edit now. Open the file the task names and Write the first change in your next command.".to_string();
+    }
     let files = entries
         .iter()
         .map(|entry| {
@@ -316,9 +321,7 @@ fn edit_plan_text(entries: &[EditPlanEntry]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "Edit now. Files the task names: {files}. Write the first change in your next command."
-    )
+    format!("Edit now. Files the task names: {files}. Write the first change in your next command.")
 }
 
 /// The read-only detector's verdict for one turn.
@@ -441,9 +444,7 @@ fn read_only_nudge_text(read_only_turns: usize) -> String {
 /// itself spells out, because a worker that kept reading past the first nudge
 /// is not short of permission but of a next step.
 fn read_only_plan_text(read_only_turns: usize, plan: &str) -> String {
-    format!(
-        "Still no edit after {read_only_turns} read-only turns. {plan}"
-    )
+    format!("Still no edit after {read_only_turns} read-only turns. {plan}")
 }
 
 /// The last step of a read-only streak: the question parked on the orchestrator,
@@ -1847,11 +1848,7 @@ impl<'a> TurnEngine<'a> {
     /// Park a worker whose second nudge was ignored and wait for the
     /// orchestrator's decision, then hand that decision to the worker as
     /// guidance for the turn after it.
-    async fn pause_on_read_only(
-        &mut self,
-        config: &TurnConfig<'_>,
-        question: &str,
-    ) -> Result<()> {
+    async fn pause_on_read_only(&mut self, config: &TurnConfig<'_>, question: &str) -> Result<()> {
         self.meta.metrics.loop_pauses += 1;
         let answer = self
             .pool
@@ -2161,13 +2158,12 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
-        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
-        EDIT_PLAN_FILES, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text,
-        extension_budget, named_file_defaults,
-        edit_plan, edit_plan_text, parse_shortstat, parse_threshold, read_only_nudge_text,
-        read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
-        task_names_files,
+        EDIT_PLAN_FILES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS,
+        REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
+        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
+        edit_plan_text, extension_budget, named_file_defaults, parse_shortstat, parse_threshold,
+        read_only_nudge_text, read_only_pause_question, read_only_plan_text, read_only_thresholds,
+        summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2418,8 +2414,14 @@ mod tests {
             question.contains("grep -rn nudge src/"),
             "the orchestrator is not told what the worker read: {question:?}"
         );
-        assert!(question.contains("has not written a change"), "got {question:?}");
-        assert!(question.contains("src/pool/runner/turn.rs"), "got {question:?}");
+        assert!(
+            question.contains("has not written a change"),
+            "got {question:?}"
+        );
+        assert!(
+            question.contains("src/pool/runner/turn.rs"),
+            "got {question:?}"
+        );
     }
 
     /// A sample git could not answer is not evidence of progress: it neither
@@ -2512,6 +2514,19 @@ mod tests {
         assert!(text.contains("30 read-only turns"), "got {text:?}");
     }
 
+    /// A task whose paths the extractor cannot read still gets a whole second
+    /// nudge, not a sentence with an empty list in it.
+    #[test]
+    fn an_unreadable_task_still_gets_a_whole_plan_nudge() {
+        let text = read_only_plan_text(30, &edit_plan_text(&edit_plan("fix the failing test")));
+        assert!(!text.contains("task names: ."), "got {text:?}");
+        assert!(text.contains("Edit now."), "got {text:?}");
+        assert!(
+            text.ends_with("Write the first change in your next command."),
+            "got {text:?}"
+        );
+    }
+
     /// The dispatch quoted into a pause question is trimmed to a length a
     /// terminal can show, and a short one is left whole.
     #[test]
@@ -2521,7 +2536,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let trimmed = summarized_task(&long);
-        assert!(trimmed.len() <= TASK_QUESTION_BYTES, "got {}", trimmed.len());
+        assert!(
+            trimmed.len() <= TASK_QUESTION_BYTES,
+            "got {}",
+            trimmed.len()
+        );
         assert!(trimmed.ends_with("..."), "got {trimmed:?}");
     }
 
