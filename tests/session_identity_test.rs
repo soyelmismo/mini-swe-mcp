@@ -750,14 +750,14 @@ fn a_shell_with_no_session_variable_keeps_its_host_identity() {
 /// the hub directory the daemon keeps it in.
 #[test]
 fn a_watch_token_in_the_environment_names_the_dispatching_session() {
-    let dir = scratch_dir();
-    let store = WatchTokens::new(dir.clone());
+    let dir = common::TempDir::own(scratch_dir());
+    let store = WatchTokens::new(dir.to_path_buf());
     let token = store
         .token_for(TAB_A)
         .expect("mint a token for the session");
     assert_eq!(store.identity_of(&token).as_deref(), Some(TAB_A));
 
-    let stdout = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &token)], Some(&dir));
+    let stdout = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &token)], Some(dir.path()));
     assert_eq!(
         stdout.lines().next(),
         Some(format!("agent {TAB_A}").as_str()),
@@ -769,7 +769,10 @@ fn a_watch_token_in_the_environment_names_the_dispatching_session() {
     );
 
     // An unknown token is not an identity, so the host answers instead.
-    let unknown = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &"a".repeat(32))], Some(&dir));
+    let unknown = whoami_with(
+        &[("MINI_SWE_WATCH_TOKEN", &"a".repeat(32))],
+        Some(dir.path()),
+    );
     assert_eq!(
         unknown.lines().next(),
         Some(format!("agent {}", common::host_of_this_process()).as_str()),

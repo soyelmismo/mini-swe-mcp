@@ -214,6 +214,39 @@ pub async fn connect_endpoint(endpoint: &HubEndpoint) -> std::io::Result<UnixStr
     }
 }
 
+/// Removes a hub socket that lives outside its hub directory, taking the short
+/// fallback directory that holds it with it.
+///
+/// The daemon drops this guard on every exit path, so a caller that aborts the
+/// `run` future (rather than letting it shut down) still leaves no socket or
+/// fallback directory behind.
+struct FallbackSocketGuard {
+    socket: PathBuf,
+    fallback_dir: Option<PathBuf>,
+}
+
+impl FallbackSocketGuard {
+    fn new(socket: &Path, hub_dir: &Path) -> Self {
+        let fallback_dir = socket
+            .parent()
+            .filter(|parent| *parent != hub_dir)
+            .map(Path::to_path_buf);
+        Self {
+            socket: socket.to_path_buf(),
+            fallback_dir,
+        }
+    }
+}
+
+impl Drop for FallbackSocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+        if let Some(dir) = &self.fallback_dir {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 /// Bind a hub endpoint (a filesystem socket is restricted to 0600).
 fn bind_endpoint(endpoint: &HubEndpoint) -> Result<UnixListener> {
     match endpoint {
@@ -466,6 +499,11 @@ impl HubServer {
         // A socket left behind by a killed daemon would make `bind` fail with
         // "address already in use"; the lock proves nobody owns it now.
         let socket = paths.socket();
+        // A socket the hub dir is too deep to hold is filed in a short private
+        // directory of its own. Tie that directory's life to this future so an
+        // abort (a test dropping the daemon task) removes it, not only the
+        // graceful shutdown path below.
+        let _socket_cleanup = FallbackSocketGuard::new(&socket, paths.dir());
         let _ = std::fs::remove_file(&socket);
         let endpoint = paths.endpoint();
         let listener = bind_endpoint(&endpoint)?;
