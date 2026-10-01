@@ -14,9 +14,9 @@ use std::time::Duration;
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerHistory, WorkerMetrics, WorkerPool, WorkerRegistryEntry, WorkerRole,
-    WorkerState, append_history_message_in, load_registry_entry_in, save_registry_entry_in,
-    unix_timestamp,
+    RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRegistryEntry,
+    WorkerRole, WorkerState, append_history_message_in, load_registry_entry_in,
+    save_registry_entry_in, unix_timestamp,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
@@ -88,31 +88,28 @@ fn row(
     status: RegistryStatus,
     verified: Option<bool>,
 ) -> WorkerRegistryEntry {
-    WorkerRegistryEntry {
+    // Built through the same constructor a real write uses, so the fixture
+    // picks up fields the current build adds to a row without a literal here.
+    let meta = WorkerMeta {
         id: id.to_string(),
-        pid: std::process::id(),
         task: format!("task for {id}"),
-        model: "test-model".to_string(),
-        status,
-        step: 4,
-        max_turns: 10,
-        last_command: "cargo test".to_string(),
-        question: None,
-        repo_path: Some(repo.to_string_lossy().into_owned()),
-        started_at: 0,
-        updated_at: unix_timestamp(),
         group: Some(GROUP.to_string()),
         role: WorkerRole::Worker,
-        owner: Some(OWNER.to_string()),
-        metrics: WorkerMetrics::default(),
-        base_branch: Some("master".to_string()),
-        base_commit: Some("base".to_string()),
+        repo_path: Some(repo.to_string_lossy().into_owned()),
+        owner: OWNER.to_string(),
+        started_at: 0,
+        pid: std::process::id(),
         revision: 0,
         auto_continues: 0,
+        metrics: WorkerMetrics::default(),
         report: None,
-        approved: None,
         verified,
-    }
+    };
+    let mut entry = meta.entry("test-model", status, 4, 10, "cargo test", None);
+    entry.base_branch = Some("master".to_string());
+    entry.base_commit = Some("base".to_string());
+    entry.updated_at = unix_timestamp();
+    entry
 }
 
 /// A replayable conversation for `id`, so a revision resumes rather than rebuilds.
@@ -149,8 +146,11 @@ async fn wait_for_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(id).await {
             match state {
-                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
+                // Completed, Failed, Exhausted and any future terminal state
+                // return at once, so a wrong outcome fails the assertion
+                // instead of spinning until the poll budget runs out.
+                _ => return state,
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

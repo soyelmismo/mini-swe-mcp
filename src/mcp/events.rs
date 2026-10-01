@@ -1577,35 +1577,34 @@ mod verify_tail_attachment_tests {
 #[cfg(test)]
 mod registry_verified_tests {
     use super::{EventKind, registry_view};
-    use crate::pool::{RegistryStatus, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRegistryEntry, WorkerRole};
 
     fn completed_row(verified: Option<bool>) -> WorkerRegistryEntry {
-        WorkerRegistryEntry {
+        // Built through the same constructor a real write uses, so the fixture
+        // picks up fields the current build adds to a row without a literal.
+        let meta = WorkerMeta {
             id: "w-registry".to_string(),
-            pid: 0,
             task: "persist the verdict".to_string(),
-            model: "test-model".to_string(),
-            status: RegistryStatus::Completed,
-            step: 5,
-            max_turns: 10,
-            last_command: "all gates green".to_string(),
-            question: None,
-            repo_path: None,
-            started_at: 0,
-            updated_at: 0,
             group: None,
             role: WorkerRole::Worker,
-            owner: Some("owner".to_string()),
-            metrics: WorkerMetrics::default(),
-            base_branch: None,
-            base_commit: None,
-            head_commit: None,
+            repo_path: None,
+            owner: "owner".to_string(),
+            started_at: 0,
+            pid: 0,
             revision: 0,
             auto_continues: 0,
+            metrics: WorkerMetrics::default(),
             report: None,
-            approved: None,
             verified,
-        }
+        };
+        meta.entry(
+            "test-model",
+            RegistryStatus::Completed,
+            5,
+            10,
+            "all gates green",
+            None,
+        )
     }
 
     #[test]
