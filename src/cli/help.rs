@@ -19,7 +19,7 @@ pub const HELP_FLAGS: &str = concat!(
 /// here, one concern per topic, so an agent can fetch exactly what it needs
 /// without paying for all of it in every session's context.
 pub const TOPICS: &[&str] = &[
-    "workflow", "watch", "steer", "review", "collect", "merge", "identity", "sandbox", "env",
+    "workflow", "watch", "steer", "review", "collect", "identity", "sandbox", "env",
 ];
 
 /// Text of one help topic, or `None` for an unknown topic.
@@ -135,6 +135,38 @@ mod tests {
             assert!(
                 text.contains(needle),
                 "the watch topic must mention {needle}: {text}"
+            );
+        }
+    }
+
+    /// `review` is the verb that answers "what do I do with this branch", so
+    /// its topic names the merge check, its read-only nature and the command it
+    /// ends with.
+    #[test]
+    fn review_topic_teaches_the_compact_view() {
+        let text = topic_text("review").expect("review topic");
+        for needle in [
+            "mini-swe-mcp review",
+            "git merge-tree --write-tree",
+            "never evicts",
+            "steer",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the review topic must mention {needle}: {text}"
+            );
+        }
+    }
+
+    /// `collect` documents the diff scope, because the default reply no longer
+    /// carries the diff at all.
+    #[test]
+    fn collect_topic_teaches_the_diff_scope() {
+        let text = topic_text("collect").expect("collect topic");
+        for needle in ["--full", "--file", "per-file diff stat"] {
+            assert!(
+                text.contains(needle),
+                "the collect topic must mention {needle}: {text}"
             );
         }
     }

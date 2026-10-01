@@ -13,7 +13,7 @@
 //! The renderers themselves are split by what they describe:
 //!
 //! * `worker` — the per-worker inspection verbs: `status`, `collect`, `review`,
-//!   `logs`, `dispatch`, `steer`, `watch`, `kill`, `reap`, `merge`, plus the shared
+//!   `logs`, `dispatch`, `steer`, `watch`, `kill`, `reap`, plus the shared
 //!   `log_counters_line` helper that keeps step-log truncation visible (audit 07, R7) and the
 //!   `health_line` that keeps a run's quality measurable.
 //! * `catalog` — the system-catalog verbs: `manifest`, `list`, `prune`.
@@ -68,8 +68,13 @@ mod tests {
             ("status", "Worker: w", r#"{"worker_id":"w"}"#),
             (
                 "collect",
-                "Worker w: No git diff produced.",
+                "Worker w: no diff measured",
                 r#"{"worker_id":"w"}"#,
+            ),
+            (
+                "review",
+                "Worker w (Completed) revision 0",
+                r#"{"worker_id":"w","state":"Completed"}"#,
             ),
             ("logs", "Worker w step logs", r#"{"worker_id":"w"}"#),
             ("reap", "✓ No expired", r#"{"reaped":0}"#),

@@ -172,6 +172,12 @@ impl TempDir {
         Self::new(&mini_swe_mcp::worktree::swe_base_dir(), tag)
     }
 
+    /// Own a scratch directory the caller has already created, removing it on
+    /// drop. The caller keeps responsibility for creating it.
+    pub fn own(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -189,6 +195,26 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         // Best effort: a leftover directory must never fail an otherwise good test.
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
     }
 }
 

@@ -16,6 +16,7 @@ use crate::manifest::ModelManifest;
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
     "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
+    "dispatch", "status", "steer", "watch", "collect", "review", "logs", "list", "kill", "reap",
     "manifest", "prune", "merge",
 ];
 
@@ -68,7 +69,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static("Action; see `mini-swe-mcp help <topic>`."),
+        DescriptionSource::Static("Action to perform; see `mini-swe-mcp help <topic>`."),
     ),
     (
         "task",

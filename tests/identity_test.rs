@@ -8,7 +8,7 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer};
+use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, connect_endpoint};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::{CLI_CLIENT_NAME, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
@@ -55,18 +55,17 @@ fn server() -> Arc<McpServer> {
 
 /// Wait until `endpoint` accepts a connection, or panic.
 ///
-/// The endpoint is derived exactly as the product's client derives it. A deep
-/// scratch directory pushes the hub onto a short fallback directory or onto a
-/// Linux abstract socket, and polling the filesystem path alone would wait for
-/// a file that never appears - which is what made this test depend on `TMPDIR`.
+/// The endpoint is derived the way the product derives it, so the wait holds
+/// whether the daemon bound a filesystem socket, moved it to a short private
+/// directory, or fell back to an abstract one.
 async fn wait_for_endpoint(endpoint: &HubEndpoint) {
     for _ in 0..100 {
-        if mini_swe_mcp::hub::connect_endpoint(endpoint).await.is_ok() {
+        if connect_endpoint(endpoint).await.is_ok() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("hub endpoint {endpoint:?} never came up");
+    panic!("hub socket {endpoint} never came up");
 }
 
 /// A synthetic running worker owned by `owner`, as if that agent had
@@ -100,7 +99,7 @@ struct Client {
 
 impl Client {
     async fn connect(endpoint: &HubEndpoint) -> Self {
-        let stream = mini_swe_mcp::hub::connect_endpoint(endpoint)
+        let stream = connect_endpoint(endpoint)
             .await
             .expect("connect to hub socket");
         let (reader, writer) = stream.into_split();
@@ -203,6 +202,9 @@ struct Daemon {
 impl Daemon {
     async fn start() -> Self {
         let dir = scratch_dir();
+        // Where the daemon will listen, derived exactly as the product derives
+        // it: a filesystem socket when one fits, otherwise the short private
+        // directory or the abstract socket it falls back to.
         let paths = HubPaths::new(dir.to_path_buf());
         let endpoint = paths.endpoint();
         let server = server();

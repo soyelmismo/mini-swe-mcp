@@ -14,7 +14,9 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens};
+use mini_swe_mcp::hub::{
+    HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens, connect_endpoint,
+};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::{CLI_CLIENT_NAME, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
@@ -73,21 +75,19 @@ fn server() -> Arc<McpServer> {
     Arc::new(McpServer::new(pool, "test-model".to_string()))
 }
 
-/// Wait until `path` accepts a connection, or panic.
 /// Wait until `endpoint` accepts a connection, or panic.
 ///
-/// The endpoint is derived exactly as the product's client derives it: a deep
-/// scratch directory moves the hub onto a short fallback directory or onto a
-/// Linux abstract socket, and polling the filesystem path alone would wait for
-/// a file that never appears.
+/// The endpoint is derived the way the product derives it, so the wait holds
+/// whether the daemon bound a filesystem socket, moved it to a short private
+/// directory, or fell back to an abstract one.
 async fn wait_for_endpoint(endpoint: &HubEndpoint) {
     for _ in 0..100 {
-        if mini_swe_mcp::hub::connect_endpoint(endpoint).await.is_ok() {
+        if connect_endpoint(endpoint).await.is_ok() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("hub endpoint {endpoint:?} never came up");
+    panic!("hub socket {endpoint} never came up");
 }
 
 /// A synthetic running worker owned by `owner`, as if that agent had
@@ -121,7 +121,7 @@ struct Client {
 
 impl Client {
     async fn connect(endpoint: &HubEndpoint) -> Self {
-        let stream = mini_swe_mcp::hub::connect_endpoint(endpoint)
+        let stream = connect_endpoint(endpoint)
             .await
             .expect("connect to hub socket");
         let (reader, writer) = stream.into_split();
@@ -261,6 +261,9 @@ impl Daemon {
     /// Start a daemon on `dir`: the seam a restart is tested through, since the
     /// tokens must survive it.
     async fn start_in(dir: PathBuf) -> Self {
+        // Where the daemon will listen, derived exactly as the product derives
+        // it: a filesystem socket when one fits, otherwise the short private
+        // directory or the abstract socket it falls back to.
         let paths = HubPaths::new(dir.to_path_buf());
         let endpoint = paths.endpoint();
         let server = server();
@@ -745,14 +748,14 @@ fn a_shell_with_no_session_variable_keeps_its_host_identity() {
 /// the hub directory the daemon keeps it in.
 #[test]
 fn a_watch_token_in_the_environment_names_the_dispatching_session() {
-    let dir = scratch_dir();
-    let store = WatchTokens::new(dir.clone());
+    let dir = common::TempDir::own(scratch_dir());
+    let store = WatchTokens::new(dir.to_path_buf());
     let token = store
         .token_for(TAB_A)
         .expect("mint a token for the session");
     assert_eq!(store.identity_of(&token).as_deref(), Some(TAB_A));
 
-    let stdout = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &token)], Some(&dir));
+    let stdout = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &token)], Some(dir.path()));
     assert_eq!(
         stdout.lines().next(),
         Some(format!("agent {TAB_A}").as_str()),
@@ -764,7 +767,10 @@ fn a_watch_token_in_the_environment_names_the_dispatching_session() {
     );
 
     // An unknown token is not an identity, so the host answers instead.
-    let unknown = whoami_with(&[("MINI_SWE_WATCH_TOKEN", &"a".repeat(32))], Some(&dir));
+    let unknown = whoami_with(
+        &[("MINI_SWE_WATCH_TOKEN", &"a".repeat(32))],
+        Some(dir.path()),
+    );
     assert_eq!(
         unknown.lines().next(),
         Some(format!("agent {}", common::host_of_this_process()).as_str()),

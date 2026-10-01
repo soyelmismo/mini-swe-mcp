@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::admission::AdmissionController;
+use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::load_registry_entry_in;
 use super::revision::{WorkerHistory, load_worker_history_log_in, remove_worker_history_in};
 use crate::agent::AgentRunner;
@@ -565,7 +565,9 @@ async fn run_gate_confined(
     // The heavy slot is held for the whole gate run and released on every exit
     // path, including a refusal, because the permit is a guard.
     let _permit = match &req.admission {
-        Some(controller) => Some(controller.acquire().await),
+        // The gate is a completion verification, so it queues in that class
+        // and is preferred over a worker still exploring.
+        Some(controller) => Some(controller.acquire(AdmissionClass::Completion).await),
         None => None,
     };
 
