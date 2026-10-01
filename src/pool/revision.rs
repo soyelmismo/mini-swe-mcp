@@ -616,6 +616,7 @@ impl super::WorkerPool {
             branch: branch.clone(),
             network_offline: false,
             verify: None,
+            client_env: Vec::new(),
             max_turns,
             review_after: None,
             revision: entry.revision,

@@ -40,6 +40,7 @@ use super::state::WorkerState;
 use super::steer::remove_steer_file;
 use super::{WorkerPool, unix_timestamp};
 
+pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
 mod review;

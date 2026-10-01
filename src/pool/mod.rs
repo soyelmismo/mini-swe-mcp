@@ -1094,7 +1094,55 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
     if repo_path.join("pyproject.toml").is_file() || repo_path.join("pytest.ini").is_file() {
         return Some("pytest -q".to_string());
     }
+    // One manifest per ecosystem, in the order a polyglot repository is most
+    // likely to mean: each probe is a single file-exists check, so adding an
+    // ecosystem costs nothing when its files are absent.
+    if repo_path.join("go.mod").is_file() {
+        return Some("go test ./...".to_string());
+    }
+    if repo_path.join("pom.xml").is_file() {
+        return Some("mvn -q test".to_string());
+    }
+    if repo_path.join("build.gradle").is_file() || repo_path.join("build.gradle.kts").is_file() {
+        return Some("gradle test".to_string());
+    }
+    if repo_path.join("Makefile").is_file() || repo_path.join("makefile").is_file() {
+        return Some("make test".to_string());
+    }
+    // A lockfile without a `package.json` test script still means npm: the
+    // manifest probe above already declined a repo with no test script, so this
+    // is the "the ecosystem is here, the gate is whatever npm runs" fallback.
+    for manifest in [
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "yarn.lock",
+    ] {
+        if repo_path.join(manifest).is_file() {
+            return Some("npm test".to_string());
+        }
+    }
+    for manifest in ["setup.py", "setup.cfg", "tox.ini"] {
+        if repo_path.join(manifest).is_file() {
+            return Some("pytest -q".to_string());
+        }
+    }
+    if has_extension(repo_path, "csproj") || repo_path.join("global.json").is_file() {
+        return Some("dotnet test".to_string());
+    }
     None
+}
+
+/// Whether `dir` holds a file with the given extension.
+fn has_extension(dir: &Path, extension: &str) -> bool {
+    std::fs::read_dir(dir).map_or(false, |entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == extension)
+        })
+    })
 }
 
 #[cfg(test)]

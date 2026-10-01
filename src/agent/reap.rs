@@ -53,13 +53,43 @@ const MAX_ANCESTORS: usize = 64;
 /// what makes it safe to run from a `Drop`: a worker's teardown already blocks
 /// on `git`, and half a second more is the price of not leaving a build behind.
 pub(crate) fn sweep_worker_processes(worker_id: &str, dirs: &[PathBuf]) -> usize {
-    sweep_owned_processes(worker_id, dirs, std::process::id())
+    sweep_owned_processes(worker_id, dirs, std::process::id()).len()
 }
 
-fn sweep_owned_processes(worker_id: &str, dirs: &[PathBuf], hub_pid: u32) -> usize {
+/// One process the sweep had to kill, named for the report that names it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReapedProcess {
+    pub pid: u32,
+    pub command: String,
+}
+
+/// [`sweep_worker_processes`] with every killed process named, so the
+/// side-effect audit can tell the model exactly what it left running.
+pub(crate) fn sweep_worker_processes_named(
+    worker_id: &str,
+    dirs: &[PathBuf],
+) -> Vec<ReapedProcess> {
+    let targets = sweep_owned_processes(worker_id, dirs, std::process::id());
+    targets
+        .iter()
+        .map(|pid| ReapedProcess {
+            pid: *pid,
+            command: comm_of(*pid),
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/comm`, or the empty string when it is no longer readable.
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn sweep_owned_processes(worker_id: &str, dirs: &[PathBuf], hub_pid: u32) -> Vec<u32> {
     let targets = owned_processes_in_dirs(dirs, hub_pid);
     if targets.is_empty() {
-        return 0;
+        return targets;
     }
     for pid in &targets {
         signal_pid(*pid, libc::SIGTERM);
@@ -79,7 +109,7 @@ fn sweep_owned_processes(worker_id: &str, dirs: &[PathBuf], hub_pid: u32) -> usi
         count = targets.len(),
         "Killed processes left running in the worker's directories"
     );
-    targets.len()
+    targets
 }
 
 /// The directories a worker's commands may run in, derived from its worktree
