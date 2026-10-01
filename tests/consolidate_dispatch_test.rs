@@ -448,7 +448,8 @@ fn the_consolidator_task_carries_full_worker_tasks_bounded() {
     h.worker_branch(&scoped, &[("scoped.txt", "scoped\n")]);
     h.worker_branch(&verbose, &[("verbose.txt", "verbose\n")]);
 
-    let scoped_task = "Keep the header line.\nRemove nothing the task asked for.\nScope: src/lib.rs only.";
+    let scoped_task =
+        "Keep the header line.\nRemove nothing the task asked for.\nScope: src/lib.rs only.";
     h.row(
         &scoped,
         scoped_task,
@@ -457,7 +458,10 @@ fn the_consolidator_task_carries_full_worker_tasks_bounded() {
         Some(GROUP),
     );
     // One short heading and a body well past the 4 KiB per-worker budget.
-    let verbose_task = format!("verbose heading\n{}\nTAIL-OF-VERBOSE-TASK", "v".repeat(8 * 1024));
+    let verbose_task = format!(
+        "verbose heading\n{}\nTAIL-OF-VERBOSE-TASK",
+        "v".repeat(8 * 1024)
+    );
     h.row(
         &verbose,
         &verbose_task,
@@ -512,7 +516,8 @@ fn the_consolidator_task_carries_full_worker_tasks_bounded() {
         );
     }
     assert!(
-        !compact.contains(&"v".repeat(64)) && !compact.contains("FULL TASKS OF THE ROUND'S WORKERS"),
+        !compact.contains(&"v".repeat(64))
+            && !compact.contains("FULL TASKS OF THE ROUND'S WORKERS"),
         "the full-task section lives only in the task, never in the compact round text: {compact}"
     );
 }
