@@ -35,6 +35,7 @@
 //! runs the command unconfined with a warning.
 
 use anyhow::{Context, Result};
+use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -232,6 +233,44 @@ impl AgentRunner {
 
         run_with_timeout(&mut cmd, timeout_secs).await
     }
+}
+
+/// Fingerprint the worktree content from git's view, so a step can report
+/// the exact tree it ran on.
+///
+/// The fingerprint is the `HEAD` commit, the binary diff of every tracked
+/// change, and the untracked non-ignored files each hashed with its bytes.
+/// It changes whenever any file a suite could observe changes -- a tracked
+/// edit, a new commit, or a created or edited untracked file -- and stays
+/// identical otherwise, which is what lets the completion gate reuse a
+/// verify run on an unchanged tree. `None` when git could not answer, so a
+/// fingerprint that could not be taken is never read as "unchanged".
+pub(crate) fn tree_fingerprint(dir: &Path) -> Option<String> {
+    let head = crate::worktree::git(dir, "rev-parse HEAD", &["rev-parse", "HEAD"]).ok()?;
+    let diff = crate::worktree::git(dir, "diff HEAD --binary", &["diff", "HEAD", "--binary"]).ok()?;
+    let others = crate::worktree::git(
+        dir,
+        "ls-files --others --exclude-standard",
+        &["ls-files", "--others", "--exclude-standard"],
+    )
+    .ok()?;
+    if !head.status.success() || !diff.status.success() || !others.status.success() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    hasher.write(String::from_utf8_lossy(&head.stdout).trim().as_bytes());
+    hasher.write(&diff.stdout);
+    for name in String::from_utf8_lossy(&others.stdout).lines() {
+        hasher.write(name.as_bytes());
+        // An untracked file's bytes are part of the tree's content: git
+        // tracks no prior version to diff, so an edit to one is caught by
+        // hashing the file itself rather than by the tracked diff.
+        match std::fs::read(dir.join(name)) {
+            Ok(bytes) => hasher.write(&bytes),
+            Err(_) => hasher.write(b"\0unreadable"),
+        }
+    }
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 /// Message shown to the model when an interceptor blocks a command.
@@ -2399,5 +2438,96 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             rendered.iter().any(|a| a == "bwrap"),
             "bwrap must still lead the argv: {rendered:?}"
         );
+    }
+
+    /// The tree fingerprint the completion gate reuses a verify run on.
+    mod fingerprint {
+        use crate::agent::tree_fingerprint;
+        use std::path::{Path, PathBuf};
+
+        fn git(dir: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn repo(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "exec-fp-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-b", "master"]);
+            git(&dir, &["config", "user.name", "t"]);
+            git(&dir, &["config", "user.email", "t@localhost"]);
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            git(&dir, &["add", "seed.txt"]);
+            git(&dir, &["commit", "-m", "baseline"]);
+            dir
+        }
+
+        #[test]
+        fn an_unchanged_tree_fingerprints_identically() {
+            let dir = repo("stable");
+            let a = tree_fingerprint(&dir).expect("fingerprint");
+            let b = tree_fingerprint(&dir).expect("fingerprint");
+            assert_eq!(a, b, "an unchanged tree must fingerprint identically");
+        }
+
+        /// An untracked file is part of the tree's content even though git
+        /// tracks no prior version of it to diff, so both creating one and
+        /// editing it must move the fingerprint.
+        #[test]
+        fn an_untracked_file_moves_the_fingerprint() {
+            let dir = repo("untracked");
+            let before = tree_fingerprint(&dir).expect("fingerprint before");
+
+            std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
+            let after_new = tree_fingerprint(&dir).expect("fingerprint after new file");
+            assert_ne!(
+                before, after_new,
+                "a new untracked file must move the fingerprint"
+            );
+
+            std::fs::write(dir.join("new.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+            let after_edit = tree_fingerprint(&dir).expect("fingerprint after edit");
+            assert_ne!(
+                after_new, after_edit,
+                "editing an untracked file must move the fingerprint"
+            );
+        }
+
+        /// A directory git cannot read as a repository yields no
+        /// fingerprint, so the gate re-runs rather than reusing an unknown.
+        #[test]
+        fn a_directory_that_is_not_a_repository_has_no_fingerprint() {
+            let dir = std::env::temp_dir().join(format!(
+                "exec-fp-nonrepo-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert_eq!(
+                tree_fingerprint(&dir),
+                None,
+                "a non-repository must yield no fingerprint, never a stable one"
+            );
+        }
     }
 }
