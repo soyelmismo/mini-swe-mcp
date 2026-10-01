@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use super::daemon::hub_lock_held;
@@ -20,6 +20,25 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
+    spawn_daemon(&paths, &std::env::current_exe()?)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut delay = Duration::from_millis(20);
+    loop {
+        match super::daemon::connect_endpoint(&paths.endpoint()).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+        delay = (delay * 2).min(Duration::from_millis(250));
+    }
+}
+
+/// Start a detached daemon; both auto-start and handover use this path.
+pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -27,9 +46,10 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(paths.log())
         .context("Could not open hub log")?;
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(exe);
     command
         .arg("daemon")
+        .env("SWE_HUB_DIR", paths.dir())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
@@ -49,19 +69,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         let _ = child.wait().await;
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut delay = Duration::from_millis(20);
-    loop {
-        match super::daemon::connect_endpoint(&paths.endpoint()).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
-            }
-            Err(_) => {}
-        }
-        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
-        delay = (delay * 2).min(Duration::from_millis(250));
-    }
+    Ok(())
 }
 
 /// Announce this process to the daemon.
@@ -215,7 +223,7 @@ fn newer(client: &str, daemon: &str) -> bool {
 /// decide, so a rebuilt binary replaces an idle hub built before it. A daemon
 /// that reports no `build` predates the build handshake and is judged on the
 /// release alone.
-fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) -> bool {
+pub(crate) fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) -> bool {
     if version != daemon && newer(version, daemon) {
         return true;
     }
@@ -228,6 +236,31 @@ fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) 
         (Some(id), Some(ts), Some(daemon_id), Some(daemon_ts)) => id != daemon_id && ts > daemon_ts,
         _ => false,
     }
+}
+
+/// Env var overriding how long a busy daemon waits for a quiet moment before
+/// it hands over anyway.
+pub const HANDOVER_DEADLINE_ENV: &str = "HUB_HANDOVER_SECS";
+
+/// Default handover deadline: long enough for a build to finish, short enough
+/// that a daemon busy all day still picks up the newer build.
+pub const DEFAULT_HANDOVER_SECS: u64 = 15 * 60;
+
+/// Bounds on the handover deadline, so a request can neither cut a running
+/// command off nor park the daemon forever.
+const MIN_HANDOVER_SECS: u64 = 1;
+const MAX_HANDOVER_SECS: u64 = 24 * 60 * 60;
+
+/// How long a handover waits for a quiet moment before it happens anyway.
+///
+/// The env var is the operator's default; a `hub/handover` request may name its
+/// own, clamped to [`MIN_HANDOVER_SECS`]..=[`MAX_HANDOVER_SECS`].
+pub(crate) fn handover_deadline(requested: Option<u64>) -> Duration {
+    let secs = requested
+        .or_else(|| crate::config::env_parse(HANDOVER_DEADLINE_ENV))
+        .unwrap_or(DEFAULT_HANDOVER_SECS)
+        .clamp(MIN_HANDOVER_SECS, MAX_HANDOVER_SECS);
+    Duration::from_secs(secs)
 }
 
 /// File in the hub directory remembering which (client build, hub build)
@@ -276,6 +309,10 @@ fn label(version: &str, build: &Value) -> String {
 
 /// Negotiate once, replacing only an older idle daemon. The retry is bounded.
 async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
+    negotiated_identity(cli, hello_params(admin, &client_version(), &client_build())).await
+}
+
+async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
     let version = client_version();
     let build = client_build();
     for attempt in 0..2 {
@@ -289,14 +326,13 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
         // host process they walked up to; the CLI additionally answers the
         // `initialize` the daemon expects from it below, and a client that
         // names no host at all keeps the `cli`/`clientInfo` fallback.
-        let params = hello_params(admin, &version, &build);
         let reply = match client.request("hub/hello", params.clone()).await {
             Ok(reply) => reply,
             // A daemon from before the version handshake only knows hello as
             // a notification: announce the identity that way and keep going,
             // since it cannot be asked to step aside either.
             Err(error) if error.to_string().starts_with("Method not found") => {
-                client.notify("hub/hello", params).await?;
+                client.notify("hub/hello", params.clone()).await?;
                 eprintln!(
                     "[mini-swe] The running hub predates the version handshake; restart it when idle to pick up {version}."
                 );
@@ -338,6 +374,8 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                     }
                 }
             }
+            // Older hubs may not implement planned handover; keep their warning.
+            let _ = client.request("hub/handover", json!({})).await;
             warn_newer_once(
                 &hub_dir()?,
                 build["id"].as_str().unwrap_or(&version),
@@ -365,40 +403,105 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
     unreachable!("the second negotiation always returns")
 }
 
-/// Forward bytes unchanged with fixed-size buffers and immediate output flushes.
-async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    mut reader: R,
-    mut writer: W,
-) -> Result<()> {
-    let mut buffer = [0; 8192];
+/// Read complete input frames into a bounded queue across daemon reconnects.
+async fn pump_stdin(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<()> {
+    let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let count = reader.read(&mut buffer).await?;
+        let mut frame = Vec::new();
+        let count = (&mut stdin)
+            .take(1024 * 1024 + 1)
+            .read_until(b'\n', &mut frame)
+            .await?;
         if count == 0 {
             return Ok(());
         }
-        writer.write_all(&buffer[..count]).await?;
-        writer.flush().await?;
+        anyhow::ensure!(frame.len() <= 1024 * 1024, "MCP request exceeds 1 MiB");
+        if tx.send(frame).await.is_err() {
+            return Ok(());
+        }
     }
 }
 
-/// Proxy stdio until either input closes. The daemon owns all MCP semantics.
-pub async fn proxy_stdio() -> Result<()> {
-    let client = negotiated(false, false).await?;
-    let buffered = client.stream.buffer().to_vec();
-    let (reader, writer) = client.stream.into_inner().into_split();
-    let output = async move {
-        let mut stdout = tokio::io::stdout();
-        for frame in client.notifications {
-            stdout.write_all(&frame).await?;
-        }
-        stdout.write_all(&buffered).await?;
-        stdout.flush().await?;
-        forward(reader, stdout).await
-    };
-    tokio::select! {
-        result = forward(tokio::io::stdin(), writer) => result,
-        result = output => result,
+/// Answer each request sent to a lost daemon once, without replaying side effects.
+async fn answer_cut_requests<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    pending: &mut std::collections::BTreeMap<String, Value>,
+) -> Result<()> {
+    for (_, id) in std::mem::take(pending) {
+        let frame = json!({"jsonrpc":"2.0", "id":id, "error": {
+            "code":-32000, "message":"Hub restarted; retry the request",
+            "data":{"retryable":true}}});
+        stdout.write_all(format!("{frame}\n").as_bytes()).await?;
     }
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// Follow daemon restarts, preserving identity and failing only requests in flight.
+pub async fn proxy_stdio() -> Result<()> {
+    let mut identity = hello_params(false, &client_version(), &client_build());
+    if identity["agent_id"].is_null()
+        && identity["host_id"].is_null()
+        && identity["session_id"].is_null()
+        && identity["watch_token"].is_null()
+    {
+        identity["agent_id"] = json!(format!("proxy:{}", uuid::Uuid::new_v4()));
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let input = tokio::spawn(pump_stdin(tx));
+    let mut pending = std::collections::BTreeMap::new();
+    let mut initialize: Option<Value> = None;
+    let mut stdout = tokio::io::stdout();
+    let result = async {
+        loop {
+            let mut client = negotiated_identity(false, identity.clone()).await?;
+            if let Some(params) = &initialize {
+                client.request("initialize", params.clone()).await?;
+            }
+            for frame in client.notifications.drain(..) {
+                stdout.write_all(&frame).await?;
+            }
+            stdout.flush().await?;
+            // Retain partial reply bytes across cancelled reads in select.
+            let mut reply = Vec::new();
+            loop {
+                tokio::select! {
+                    frame = rx.recv(), if pending.len() < 128 => {
+                        let Some(frame) = frame else { return Ok::<(), anyhow::Error>(()); };
+                        if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                            if value["method"] == "initialize" {
+                                initialize = Some(value["params"].clone());
+                            }
+                            if let Some(id) = value.get("id") {
+                                pending.insert(id.to_string(), id.clone());
+                            }
+                        }
+                        if client.stream.get_mut().write_all(&frame).await.is_err() { break; }
+                    }
+                    count = async {
+                        (&mut client.stream).take(32 * 1024 * 1024 + 1 - reply.len() as u64)
+                            .read_until(b'\n', &mut reply).await
+                    } => {
+                        match count {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        anyhow::ensure!(reply.len() <= 32 * 1024 * 1024, "Hub frame exceeds 32 MiB");
+                        if let Ok(value) = serde_json::from_slice::<Value>(&reply)
+                            && let Some(id) = value.get("id") {
+                            pending.remove(&id.to_string());
+                        }
+                        stdout.write_all(&reply).await?;
+                        stdout.flush().await?;
+                        reply.clear();
+                    }
+                }
+            }
+            answer_cut_requests(&mut stdout, &mut pending).await?;
+        }
+    }.await;
+    input.abort();
+    result
 }
 
 /// Sequential CLI requests, ignoring asynchronous MCP event notifications.

@@ -634,6 +634,30 @@ async fn registry_fallback(
     polling(opts, json_output, admin).await
 }
 
+/// Whether `error` means the daemon went away rather than refused the request.
+///
+/// A handover — or any daemon restart — closes the connection underneath a
+/// long-lived watch. The watch follows the daemon instead of ending, so a
+/// planned stop is invisible to whoever is watching.
+fn daemon_went_away(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Hub closed the connection")
+        || message.contains("Connection reset by peer")
+        || message.contains("Broken pipe")
+}
+
+/// How many times a watch follows a daemon that keeps going away before it
+/// reports the failure instead of reconnecting forever.
+const MAX_WATCH_RECONNECTS: usize = 16;
+
+/// Re-dial the hub after it went away, announcing the same identity again.
+///
+/// The caller marks the next snapshot `initial`, so the events the watch missed
+/// while the daemon was down are replayed rather than lost.
+async fn reconnect(admin: bool) -> Result<crate::hub::HubClient> {
+    crate::hub::HubClient::connect_as_admin(admin).await
+}
+
 /// End a watch with no further event to show. Exit 0 is reserved for a watch
 /// that already printed one; otherwise name why and exit non-zero.
 fn end_watch(printed_event: bool, watched_any: bool) -> i32 {
@@ -672,12 +696,21 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut initial = true;
     let mut watched_any = false;
     let mut printed_event = false;
-    loop {
+    let mut reconnects = 0usize;
+    'watch: loop {
         let response = match client
             .watch_snapshot(&ids, opts.group.as_deref(), initial)
             .await
         {
             Ok(value) => value,
+            Err(error) if daemon_went_away(&error) => {
+                // The daemon restarted under this watch: follow it, and ask for
+                // the missed events again on the new connection.
+                client = follow(&mut reconnects, admin).await?;
+                initial = true;
+                ids = opts.ids.clone();
+                continue;
+            }
             Err(error) if error.to_string().contains("a watch is already running") => {
                 println!("{error}");
                 return Ok(5);
@@ -713,9 +746,18 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         print_events(&events, json_output, opts.follow, opts.verbose)?;
         printed_event |= !events.is_empty();
         for event in &events {
-            client
+            if let Err(error) = client
                 .watch_ack(event["sequence"].as_u64().unwrap_or(0))
-                .await?;
+                .await
+            {
+                if daemon_went_away(&error) {
+                    client = follow(&mut reconnects, admin).await?;
+                    initial = true;
+                    ids = opts.ids.clone();
+                    continue 'watch;
+                }
+                return Err(error);
+            }
         }
         // Every missed event came back in this one reply, so a non-following
         // caller leaves as soon as it has been caught up.
@@ -738,9 +780,28 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // Notifications wake the consumer promptly. The next snapshot request
         // repairs channel overflow from the owner's bounded, unacknowledged backlog.
         if let Ok(result) = tokio::time::timeout(wait, client.next_watch_notification()).await {
-            result?;
+            match result {
+                Ok(()) => {}
+                Err(error) if daemon_went_away(&error) => {
+                    client = follow(&mut reconnects, admin).await?;
+                    initial = true;
+                    ids = opts.ids.clone();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
+}
+
+/// Follow a daemon that went away, or give up once it has happened too often.
+async fn follow(reconnects: &mut usize, admin: bool) -> Result<crate::hub::HubClient> {
+    *reconnects += 1;
+    anyhow::ensure!(
+        *reconnects <= MAX_WATCH_RECONNECTS,
+        "The hub went away {reconnects} times; restart the watch"
+    );
+    reconnect(admin).await
 }
 
 async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
