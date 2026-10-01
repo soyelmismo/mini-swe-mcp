@@ -707,14 +707,16 @@ impl McpServer {
             // A registry-only terminal row (collected worker, restarted hub)
             // carries the same review guidance as the live path.
             let branch = format!("worker-{wid}");
-            let next_step = match entry.status {
-                crate::pool::RegistryStatus::Exhausted => Some(crate::pool::exhausted_next_step(
+            let next_step = if entry.status == crate::pool::RegistryStatus::Exhausted {
+                Some(crate::pool::exhausted_next_step(
                     wid,
                     entry.step,
                     Some(branch.as_str()),
-                )),
-                status if status.is_terminal() => Some(crate::pool::next_step_for(None)),
-                _ => None,
+                ))
+            } else if entry.status.is_terminal() {
+                Some(crate::pool::next_step_for(None))
+            } else {
+                None
             };
             Ok(json!({
                 "worker_id": wid,
@@ -996,7 +998,7 @@ impl McpServer {
             "branch": branch,
             "merge": merge,
             "next_command": if let Some(turns) = exhausted_turns(state.as_ref(), entry.as_ref()) {
-                exhausted_continue_command(&wid, turns)
+                crate::pool::exhausted_continue_command(&wid, turns)
             } else {
                 next_command(&wid, &branch, merge.as_ref())
             },
@@ -1623,14 +1625,6 @@ fn exhausted_turns(
             .filter(|entry| entry.status == crate::pool::RegistryStatus::Exhausted)
             .map(|entry| entry.step),
     }
-}
-
-/// The command that continues an exhausted worker with a fresh turn budget.
-fn exhausted_continue_command(wid: &str, turns: usize) -> String {
-    format!(
-        "mini-swe-mcp steer {wid} \"continue\" --max-turns {}",
-        turns.max(1)
-    )
 }
 
 /// The lifecycle name of a worker, from its live state when it still has one

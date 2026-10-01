@@ -89,8 +89,8 @@ pub use self::runner::{
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat,
-    TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED, WorkerMetrics, WorkerOwner, WorkerPhase,
-    WorkerProgress, WorkerRecord, WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
+    TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress,
+    WorkerRecord, WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
     normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
 };
 pub use self::steer::{
@@ -172,14 +172,23 @@ pub fn next_step_for(branch: Option<&str>) -> String {
 /// completion, but the worker is stopped, not done, so the only next action is
 /// to continue it with a fresh budget rather than to review and merge it.
 pub fn exhausted_next_step(id: &str, turns: usize, branch: Option<&str>) -> String {
-    let budget = turns.max(1);
     let on = branch
         .map(|branch| format!(" on branch {branch}"))
         .unwrap_or_default();
     format!(
-        "Stopped, not done: it spent its {budget}-turn budget without completing{on}. \
-         Its work is checkpointed. Continue it with a fresh budget: \
-         mini-swe-mcp steer {id} \"continue\" --max-turns {budget}."
+        "Stopped, not done: it spent its {}-turn budget without completing{on}. \
+         Its work is checkpointed. Continue it with a fresh budget: {}",
+        turns.max(1),
+        exhausted_continue_command(id, turns),
+    )
+}
+
+/// The command that continues a worker whose turn budget ran out: the same
+/// branch, the same conversation, a fresh budget.
+pub fn exhausted_continue_command(id: &str, turns: usize) -> String {
+    format!(
+        "mini-swe-mcp steer {id} \"continue\" --max-turns {}",
+        turns.max(1)
     )
 }
 

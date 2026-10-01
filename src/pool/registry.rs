@@ -43,11 +43,7 @@ impl RegistryStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed
-                | Self::Failed
-                | Self::Exhausted
-                | Self::Stopped
-                | Self::Interrupted
+            Self::Completed | Self::Failed | Self::Exhausted | Self::Stopped | Self::Interrupted
         )
     }
 

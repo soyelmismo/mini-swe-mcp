@@ -90,8 +90,10 @@ pub fn registry_snapshot(entry: &WorkerRegistryEntry, now: u64) -> Value {
     // A torn-down worktree means the row's metrics were sampled while the worker
     // still lived: fall back to the branch it left behind, but never overwrite a
     // measured diff with a guess.
-    if matches!(view["status"].as_str(), Some("completed" | "failed" | "exhausted"))
-        && view["metrics"]["diff_files"].as_u64().unwrap_or(0) == 0
+    if matches!(
+        view["status"].as_str(),
+        Some("completed" | "failed" | "exhausted")
+    ) && view["metrics"]["diff_files"].as_u64().unwrap_or(0) == 0
         && view["metrics"]["diff_insertions"].as_u64().unwrap_or(0) == 0
         && view["metrics"]["diff_deletions"].as_u64().unwrap_or(0) == 0
         && let Some((files, insertions, deletions)) = branch_diff_stat(entry)

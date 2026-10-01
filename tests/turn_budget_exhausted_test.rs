@@ -265,7 +265,9 @@ async fn exhausted_worker_is_not_ready_for_the_round_manifest() {
         .unwrap_or_else(|| panic!("it must be listed not ready: {}", manifest.render()));
     assert_eq!(not_ready.state, "Exhausted");
     assert!(
-        manifest.render().contains("ready (completed, branch not yet merged):\n  (none)"),
+        manifest
+            .render()
+            .contains("ready (completed, branch not yet merged):\n  (none)"),
         "the ready section must be empty: {}",
         manifest.render()
     );
