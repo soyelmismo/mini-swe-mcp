@@ -68,6 +68,42 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// PID alone is not enough: several tests in one binary, or one test re-run
 /// concurrently, would otherwise share a scratch directory and then delete
 /// each other's state.
+/// A scratch path that may hold a Unix socket.
+///
+/// `hub.sock` cannot exceed `SUN_LEN`, so a deep `TMPDIR` gives way to a short
+/// checkout-local `.tmp-*` path (gitignored) instead of an unbindable socket.
+pub fn socket_scratch_path(name: &str) -> PathBuf {
+    let tmp = std::env::temp_dir();
+    const SOCKET_PATH_BUDGET: usize = 70;
+    if tmp.as_os_str().len() <= SOCKET_PATH_BUDGET {
+        return tmp.join(name);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(".tmp-{name}"))
+}
+
+/// A six-character base36 token, unique per process and instant.
+///
+/// Scratch directory names appear in Unix socket paths, so they stay short:
+/// the tag and this token are all a name gets.
+fn short_token() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the unix epoch")
+        .as_nanos();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut n = (nanos as u64)
+        ^ ((nanos >> 64) as u64).rotate_left(21)
+        ^ u64::from(std::process::id()).rotate_left(37)
+        ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(6);
+    for _ in 0..6 {
+        out.push(ALPHABET[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    out
+}
+
 pub fn unique_suffix(tag: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,16 +175,23 @@ pub struct TempDir {
 impl TempDir {
     /// Create (clearing any stale entry first) a scratch directory under `base`.
     pub fn new(base: &Path, tag: &str) -> Self {
-        let path = base.join(format!("swe-test-{tag}-{}", unique_suffix("dir")));
+        Self::create(base.join(format!("swe-{tag}-{}", short_token())))
+    }
+
+    /// Create a scratch directory under the system temp dir.
+    ///
+    /// Some callers bind a `hub.sock` under the returned directory and a Unix
+    /// socket path is capped at `SUN_LEN`, so a deep `TMPDIR` falls back to a
+    /// short checkout-local `.tmp-*` directory instead.
+    pub fn new_in_tmp(tag: &str) -> Self {
+        Self::create(socket_scratch_path(&format!("swe-{tag}-{}", short_token())))
+    }
+
+    fn create(path: PathBuf) -> Self {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)
             .unwrap_or_else(|e| panic!("failed to create temp dir {}: {e}", path.display()));
         Self { path }
-    }
-
-    /// Create a scratch directory under the system temp dir.
-    pub fn new_in_tmp(tag: &str) -> Self {
-        Self::new(&std::env::temp_dir(), tag)
     }
 
     pub fn path(&self) -> &Path {
