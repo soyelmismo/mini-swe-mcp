@@ -473,7 +473,14 @@ fn read_only_pause_question(read_only_turns: usize, task: &str, read: &str) -> S
 /// question carries the spec without pasting a whole dispatch into the
 /// orchestrator's terminal.
 fn summarized_task(task: &str) -> String {
-    let one_line = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The question supplies its own punctuation, so a trailing full stop on the
+    // dispatch would make a doubled one.
+    let one_line = task
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches('.')
+        .to_string();
     if one_line.len() <= TASK_QUESTION_BYTES {
         return one_line;
     }
@@ -2552,6 +2559,9 @@ mod tests {
     #[test]
     fn a_pause_question_quotes_a_bounded_dispatch() {
         assert_eq!(summarized_task("fix src/a.rs"), "fix src/a.rs");
+        // A dispatch ending in a full stop must not double it: the question
+        // supplies its own punctuation.
+        assert_eq!(summarized_task("fix src/a.rs."), "fix src/a.rs");
         let long: String = std::iter::repeat_n("word", 200)
             .collect::<Vec<_>>()
             .join(" ");
