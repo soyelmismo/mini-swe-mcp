@@ -172,10 +172,29 @@ fn worker_ancestry(
 fn login_boundary(comm: &str) -> bool {
     matches!(
         comm,
-        "sshd" | "sshd-session" | "login" | "agetty" | "getty" | "su" | "sudo"
-            | "xterm" | "uxterm" | "konsole" | "gnome-terminal-" | "gnome-terminal"
-            | "kgx" | "xfce4-terminal" | "mate-terminal" | "alacritty" | "kitty"
-            | "wezterm-gui" | "foot" | "urxvt" | "rxvt" | "tmux: server" | "screen"
+        "sshd"
+            | "sshd-session"
+            | "login"
+            | "agetty"
+            | "getty"
+            | "su"
+            | "sudo"
+            | "xterm"
+            | "uxterm"
+            | "konsole"
+            | "gnome-terminal-"
+            | "gnome-terminal"
+            | "kgx"
+            | "xfce4-terminal"
+            | "mate-terminal"
+            | "alacritty"
+            | "kitty"
+            | "wezterm-gui"
+            | "foot"
+            | "urxvt"
+            | "rxvt"
+            | "tmux: server"
+            | "screen"
     )
 }
 
@@ -454,6 +473,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A double-forked orphan in the worker's directories is killed: once its
+    /// parents are gone it is adopted by init or the user's service manager,
+    /// which is exactly the leak the sweep exists for.
+    #[test]
+    fn a_reparented_orphan_inside_the_directories_is_killed() {
+        let dir = worker_dir("orphan");
+        let pid_file = dir.join("orphan.pid");
+        // The helper double-forks and exits at once, so the sleeper is
+        // reparented to init or the service manager before the sweep runs.
+        let mut helper = Command::new("bash")
+            .args([
+                "-c",
+                &format!("setsid sleep 300 & echo $! > {}", pid_file.display()),
+            ])
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the helper must spawn");
+        let _ = helper.wait();
+        let orphan = wait_for_pid(&pid_file);
+        // The helper is gone, so the sleeper is reparented before the sweep.
+        for _ in 0..200 {
+            if parent_pid(orphan).is_some_and(|p| p != helper.id()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        await_process_in(&dir);
+
+        let dirs = [dir.clone()];
+        let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
+
+        assert_eq!(killed, 1, "the reparented orphan must be signalled");
+        for _ in 0..100 {
+            if !pid_is_alive(orphan) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_is_alive(orphan),
+            "the sweep must leave no orphan behind in the worker's directories"
+        );
+        assert!(owned_processes_in_dirs(&dirs, std::process::id()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A process outside the worker's directories is never signalled, and the
     /// sweep reports nothing.
     #[test]
@@ -507,6 +575,10 @@ mod tests {
     /// The "user shell" is a `setsid` session leader, which is exactly how a
     /// terminal the operator opened by hand appears from the outside: its child
     /// is adopted by the user's service manager, never by this worker's hub.
+    ///
+    /// The hub here is a pid that is not on the shell's ancestry at all, which
+    /// is what makes the shell unrelated: a real hub would be the daemon the
+    /// operator started, and this terminal would sit beside it, not below it.
     #[test]
     fn a_process_from_an_unrelated_parent_survives_the_sweep() {
         let dir = worker_dir("unrelated");
@@ -516,8 +588,11 @@ mod tests {
         let child_pid = wait_for_pid(&pid_file);
         await_process_in(&dir);
 
+        // The hub is a process that is *not* an ancestor of the shell: the
+        // shell's own ancestry never passes through it, so the sweep must find
+        // nothing to kill.
         let dirs = [dir.clone()];
-        let killed = sweep_owned_processes("worker-test", &dirs, std::process::id());
+        let killed = sweep_owned_processes("worker-test", &dirs, child_pid + 1);
 
         assert_eq!(
             killed, 0,
