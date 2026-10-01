@@ -102,7 +102,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'). Any unique prefix of at least 3 characters, or 'last' for your most recently dispatched worker, is accepted; the response always names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'logs', and 'kill'.",
+            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works, and the reply names the full ID. Required for 'status', 'steer', 'watch', 'collect', 'logs', 'kill'.",
         ),
     ),
     (
@@ -121,7 +121,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch. Each accepts the same prefixes and 'last' as 'worker_id'; omitted watches every worker you own (running or paused).",
+            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own (running or paused).",
         ),
     ),
     (
@@ -140,7 +140,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action. On expiry it returns {status:'no_event'} so you can call 'watch' again; omit to wait indefinitely. Prefer running `mini-swe-mcp watch` in the background.",
+            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely. Prefer `mini-swe-mcp watch` in the background.",
         ),
     ),
     (
@@ -166,7 +166,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect from the repository layout; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo clippy --all-targets -- -D warnings && cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
         ),
     ),
     (
@@ -203,9 +203,6 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     .collect(),
             ),
         );
-    }
-    if name == "role" {
-        schema.insert("enum".to_string(), json!(["worker", "consolidate"]));
     }
     if name == "network" {
         schema.insert(

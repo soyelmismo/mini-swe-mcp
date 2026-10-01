@@ -10,7 +10,7 @@ mod common;
 
 use common::{IsolatedPool, TempDir, git, git_ref_exists, unique_suffix};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerMeta, WorkerMetrics, WorkerRegistryEntry, WorkerRole, WorkerPool,
+    RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRegistryEntry, WorkerRole,
     load_registry_entry_in, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
@@ -175,7 +175,12 @@ fn two_clean_branches_merge_and_a_conflict_stops_the_run() {
         &h.pool.pool,
         &meta,
         &guard,
-        &[first.clone(), second.clone(), conflicting.clone(), last.clone()],
+        &[
+            first.clone(),
+            second.clone(),
+            conflicting.clone(),
+            last.clone(),
+        ],
     );
 
     assert!(
