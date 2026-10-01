@@ -40,6 +40,7 @@ use super::state::WorkerState;
 use super::steer::remove_steer_file;
 use super::{WorkerPool, unix_timestamp};
 
+pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
 mod review;
@@ -64,6 +65,8 @@ pub struct RunConfig<'a> {
     pub network_offline: bool,
     pub verify: Option<&'a str>,
     pub repo_path_str: &'a str,
+    /// The dispatcher's ambient environment for the differential verify run.
+    pub client_env: &'a [(String, String)],
 }
 
 /// Everything the execution loop needs to start one worker.
@@ -80,6 +83,10 @@ pub struct WorkerLaunchConfig {
     /// Optional shell command run through the same bash path before a
     /// completion sentinel is honoured. `None` disables the gate.
     pub verify: Option<String>,
+    /// The dispatcher's ambient environment, filtered by the sandbox's secret
+    /// filter. The differential verify gate layers it on top of the canonical
+    /// sandbox environment for the second run of the verify command.
+    pub client_env: Vec<(String, String)>,
     /// Conversation a revision continues: the finished worker's history plus
     /// the orchestrator's revision request. `None` starts a fresh dispatch,
     /// which builds its own system prompt and task message.
@@ -153,6 +160,7 @@ impl WorkerPool {
             review_after,
             network_offline,
             verify,
+            client_env,
             resume_messages,
             resume_base_commit,
             resume_base_branch,
@@ -227,6 +235,7 @@ impl WorkerPool {
             branch: worktree.branch.clone(),
             network_offline,
             verify: verify.clone(),
+            client_env: client_env.clone(),
             max_turns,
             review_after: review_after.clone(),
             revision: meta.revision,
@@ -258,6 +267,7 @@ impl WorkerPool {
                 network_offline,
                 verify: verify.as_deref(),
                 repo_path_str: &repo_path_str,
+                client_env: &client_env,
             },
             meta,
             &mut worktree,
@@ -300,6 +310,7 @@ impl WorkerPool {
         let review_after = config.review_after.clone();
         let network_offline = config.network_offline;
         let verify = config.verify.map(|v| v.to_string());
+        let client_env = config.client_env.to_vec();
         let repo_path_str = config.repo_path_str.to_string();
 
         let runner = AgentRunner::new(
@@ -346,6 +357,7 @@ impl WorkerPool {
                 last_assistant_text: &mut last_assistant_text,
                 consecutive_no_cmd: &mut consecutive_no_cmd,
                 verify: verify.as_deref(),
+                client_env: &client_env,
                 dispatch_max_turns: max_turns,
                 watch: &mut watch,
             };

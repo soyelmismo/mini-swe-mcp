@@ -118,6 +118,10 @@ pub struct WorkerHistory {
     pub network_offline: bool,
     /// `None` disables the verify gate, exactly as on dispatch.
     pub verify: Option<String>,
+    /// The dispatcher's filtered ambient environment for the differential
+    /// verify gate. Absent in files written before the gate existed.
+    #[serde(default)]
+    pub client_env: Vec<(String, String)>,
     pub max_turns: usize,
     pub review_after: Option<String>,
     /// Revision counter as of the run that wrote the file.
@@ -612,6 +616,7 @@ impl super::WorkerPool {
             branch: branch.clone(),
             network_offline: false,
             verify: None,
+            client_env: Vec::new(),
             max_turns,
             review_after: None,
             revision: entry.revision,
@@ -861,6 +866,10 @@ impl super::WorkerPool {
             review_after: history.review_after.clone(),
             network_offline: history.network_offline,
             verify: history.verify.clone(),
+            // A revision re-runs the same differential gate: the snapshot is
+            // the one the original dispatch carried, so the check stays
+            // deterministic even when the revising connection differs.
+            client_env: history.client_env.clone(),
             resume_messages: Some(std::mem::take(&mut history.messages)),
             resume_base_commit: Some(base_commit.clone()),
             resume_base_branch: history.base_branch.clone(),

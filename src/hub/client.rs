@@ -129,7 +129,62 @@ fn hello_params(admin: bool, version: &str, build: &Value) -> Value {
            "session_id": identity::session_from_env(),
            "watch_token": std::env::var(identity::WATCH_TOKEN_ENV).ok(),
            "pid": std::process::id(), "version": version, "build": build,
-           "cwd": std::env::current_dir().ok(), "admin": admin})
+           "cwd": std::env::current_dir().ok(), "admin": admin,
+           "ambient_env": ambient_env_frame()})
+}
+
+/// The caller's filtered environment for the `hub/hello` handshake.
+///
+/// Built with the same secret filter the sandbox applies to children
+/// ([`crate::agent::env::is_secret_name`]), so a key or token never crosses
+/// the wire; bounded to [`crate::agent::env::AMBIENT_ENV_MAX_BYTES`] whole
+/// variables, so a pathological shell cannot grow the handshake frame.
+fn ambient_env_frame() -> Value {
+    let pairs = crate::agent::env::ambient_environment_snapshot();
+    serde_json::to_value(
+        pairs
+            .iter()
+            .map(|(k, v)| json!({"name": k, "value": v}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(Value::Null)
+}
+
+/// Decode an `ambient_env` handshake frame into whole variables.
+///
+/// The client and the daemon both apply the secret filter, so a frame that was
+/// tampered with (or built by an older client) is still safe to store: any
+/// credential-bearing name is dropped here as well.
+pub fn decode_ambient_env(frame: &Value) -> Vec<(String, String)> {
+    let Some(items) = frame.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for item in items {
+        let (Some(name), Some(value)) = (
+            item.get("name").and_then(Value::as_str),
+            item.get("value").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        // The same value filter the client applied, so a frame that was
+        // tampered with (or built by an older client) still cannot carry a
+        // credential under an innocent name.
+        let Some(value) = crate::agent::env::sanitize_ambient_value(name, value) else {
+            continue;
+        };
+        let cost = name.len() + value.len() + 2;
+        if total + cost > crate::agent::env::AMBIENT_ENV_MAX_BYTES {
+            break;
+        }
+        total += cost;
+        out.push((name.to_string(), value));
+    }
+    out
 }
 
 /// Compare release versions numerically; prereleases precede the same release.
