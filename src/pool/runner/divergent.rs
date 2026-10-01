@@ -219,8 +219,14 @@ pub fn audit(
     baseline: &SideEffectBaseline,
 ) -> SideEffects {
     let mut effects = SideEffects {
-        new_refs: added(&baseline.refs, &refs_of(repo_root)),
-        new_worktrees: added(&baseline.worktrees, &worktrees_of(repo_root)),
+        new_refs: added(&baseline.refs, &refs_of(repo_root))
+            .into_iter()
+            .filter(|reference| !is_hub_managed_ref(reference))
+            .collect(),
+        new_worktrees: added(&baseline.worktrees, &worktrees_of(repo_root))
+            .into_iter()
+            .filter(|worktree| !is_hub_managed_worktree(worktree))
+            .collect(),
         new_files: added(&baseline.files, &checkout_files(repo_root)),
         ..SideEffects::default()
     };
@@ -236,20 +242,27 @@ pub fn audit(
     effects
 }
 
-/// Remove what the gate left behind: the refs it created and the processes it
-/// left running. The harness owns this cleanup so the next worker - and the
-/// repository the orchestrator reviews - starts clean.
-pub fn cleanup(repo_root: &Path, effects: &SideEffects) {
-    for reference in &effects.new_refs {
-        let _ = crate::worktree::git(repo_root, "update-ref", &["update-ref", "-d", reference]);
-    }
-    for worktree in &effects.new_worktrees {
-        let _ = crate::worktree::git(
-            repo_root,
-            "worktree remove",
-            &["worktree", "remove", "--force", worktree],
-        );
-    }
+/// Remove what the gate left behind.
+///
+/// Refs and worktrees are only REPORTED, never deleted: the repository is
+/// shared with the hub (which creates a `worker-<id>` branch and worktree for
+/// every dispatch) and with the operator, so something that appeared during
+/// this gate cannot be attributed to this suite with certainty, and deleting
+/// it destroyed a concurrently dispatched worker's checkout. Processes are
+/// handled by the reap sweep, which only touches this worker's directories.
+pub fn cleanup(_repo_root: &Path, _effects: &SideEffects) {}
+
+/// A ref the hub itself creates for a worker (`refs/heads/worker-<id>`).
+fn is_hub_managed_ref(reference: &str) -> bool {
+    reference.starts_with("refs/heads/worker-")
+}
+
+/// A worktree the hub itself creates for a worker (`.../swe-wt-<id>`).
+fn is_hub_managed_worktree(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("swe-wt-"))
 }
 
 /// Every ref in the shared repository, as `refs/...` names.
@@ -488,28 +501,26 @@ mod tests {
     }
 
     #[test]
-    fn a_created_ref_is_audited_and_cleaned_up() {
+    fn a_created_ref_is_reported_but_never_deleted() {
         let dir = repo("ref");
         let baseline = snapshot(&dir);
-        git(&dir, &["branch", "worker-leftover"]);
+        git(&dir, &["branch", "leftover-branch"]);
         let effects = audit(&dir, &dir, "worker-test", &baseline);
         assert_eq!(
             effects.new_refs,
-            vec!["refs/heads/worker-leftover".to_string()],
-            "the audit must name the ref the suite created"
+            vec!["refs/heads/leftover-branch".to_string()],
+            "the audit must name a ref that appeared during the gate"
         );
         assert!(
             !effects.is_empty(),
             "a created ref is a side effect that must refuse completion"
         );
         cleanup(&dir, &effects);
-        let after = snapshot(&dir);
         assert!(
-            !after
+            snapshot(&dir)
                 .refs
-                .contains(&"refs/heads/worker-leftover".to_string()),
-            "the harness must remove the ref it found: {:?}",
-            after.refs
+                .contains(&"refs/heads/leftover-branch".to_string()),
+            "refs are reported, never deleted: the repository is shared"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -524,6 +535,34 @@ mod tests {
             effects.new_files,
             vec!["stray.txt".to_string()],
             "a new file in the main checkout is a side effect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hub creates `worker-<id>` branches and `swe-wt-<id>` worktrees for
+    /// workers dispatched while this gate runs: they are not this suite's side
+    /// effects, and nothing is ever deleted on their account.
+    #[test]
+    fn concurrent_hub_branches_are_neither_reported_nor_deleted() {
+        let dir = repo("concurrent");
+        let baseline = snapshot(&dir);
+        let out = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["branch", "worker-concurrent1"])
+            .output()
+            .expect("create a hub-style branch");
+        assert!(out.status.success());
+        let effects = audit(&dir, &dir, "worker-test", &baseline);
+        assert!(effects.new_refs.is_empty(), "{effects:?}");
+        cleanup(&dir, &effects);
+        let out = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["rev-parse", "--verify", "refs/heads/worker-concurrent1"])
+            .output()
+            .expect("check the branch");
+        assert!(
+            out.status.success(),
+            "the concurrent worker's branch must survive"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
