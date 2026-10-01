@@ -1402,14 +1402,7 @@ impl EventRouter {
                         .and_then(|v| v["sequence"].as_u64())
                         .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
             };
-            crate::cli::watch::round_event(
-                &self.watch_current,
-                &ids,
-                group,
-                now,
-                fresh,
-                &allowed,
-            )
+            crate::cli::watch::round_event(&self.watch_current, &ids, group, now, fresh, allowed)
         };
         // Reserve the identity's one watch slot before the round is
         // acknowledged: a second watch must be refused, never let a
@@ -1436,31 +1429,15 @@ impl EventRouter {
         let selected: std::collections::BTreeSet<String> = self
             .watch_current
             .values()
-            .filter(|v| {
-                ctx.is_admin()
-                    || (v["owner"] == owner && v["owner"] != "unattributed")
-            })
+            .filter(|v| ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed"))
             .filter(|v| crate::cli::watch::matches(v, ids, group))
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
-        for (agent, history) in &mut self.watch_history {
-            if !ctx.is_admin() && *agent != owner {
-                continue;
-            }
-            history.pending.retain(|v| {
-                v["worker_id"]
-                    .as_str()
-                    .is_none_or(|id| !selected.contains(id))
-            });
-        }
+        // Route every acknowledgement through `mark_seen`, the one
+        // implementation of "the owner saw this worker's event", so
+        // a round and a direct interaction leave the same state.
         for id in &selected {
-            if let Some(sequence) = self
-                .watch_reported
-                .get(id)
-                .and_then(|v| v["sequence"].as_u64())
-            {
-                self.seen.insert(id.clone(), sequence);
-            }
+            self.mark_seen(&owner, id);
         }
     }
 

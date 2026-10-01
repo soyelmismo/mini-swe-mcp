@@ -465,7 +465,11 @@ fn the_cli_all_flag_needs_a_group_or_ids() {
 async fn a_round_stays_inside_its_caller_ownership() {
     let isolated = common::IsolatedPool::new(4, "watch-all-own");
     for id in ["own-1", "other-1"] {
-        let owner = if id.starts_with("own-") { OWNER } else { "agent-b" };
+        let owner = if id.starts_with("own-") {
+            OWNER
+        } else {
+            "agent-b"
+        };
         pool_add_running_owned(&isolated.pool, id, owner).await;
         set_completed_owned(&isolated.pool, id, owner).await;
     }
@@ -489,7 +493,10 @@ async fn a_round_stays_inside_its_caller_ownership() {
     assert_eq!(events.len(), 1, "{result}");
     let workers = events[0]["workers"].as_array().expect("workers");
     assert_eq!(
-        workers.iter().map(|w| w["worker_id"].as_str()).collect::<Vec<_>>(),
+        workers
+            .iter()
+            .map(|w| w["worker_id"].as_str())
+            .collect::<Vec<_>>(),
         vec![Some("own-1")],
         "only the caller's worker is listed: {result}"
     );
@@ -510,8 +517,7 @@ async fn a_round_stays_inside_its_caller_ownership() {
         .expect("agent-b's watch must answer");
     assert_eq!(replay["status"], "event", "{replay}");
     assert_eq!(
-        replay["events"][0]["worker_id"],
-        "other-1",
+        replay["events"][0]["worker_id"], "other-1",
         "the round must not mark the other agent's worker seen: {replay}"
     );
 }
