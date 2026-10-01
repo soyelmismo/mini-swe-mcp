@@ -481,6 +481,19 @@ impl McpServer {
             .get("group")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let role = match args.get("role") {
+            None => crate::pool::WorkerRole::Worker,
+            Some(Value::String(role)) if role == "worker" => crate::pool::WorkerRole::Worker,
+            Some(Value::String(role)) if role == "consolidate" => {
+                crate::pool::WorkerRole::Consolidate
+            }
+            _ => anyhow::bail!("role must be 'worker' or 'consolidate'"),
+        };
+        if role == crate::pool::WorkerRole::Consolidate
+            && group.as_deref().is_none_or(|g| g.trim().is_empty())
+        {
+            anyhow::bail!("role 'consolidate' requires 'group'");
+        }
         let review_after = args.get("review_after").and_then(|v| v.as_str()).map(|s| {
             let (resolved, _, _) = self.manifest.resolve_model(s);
             resolved
@@ -499,7 +512,7 @@ impl McpServer {
         let admission = self.admit_worker().await?;
         let wid = self
             .pool
-            .dispatch(
+            .dispatch_with_role(
                 agent.clone(),
                 task,
                 resolved_model,
@@ -511,6 +524,7 @@ impl McpServer {
                 network_offline,
                 verify,
                 ctx.client_env.clone(),
+                role,
             )
             .await?;
         drop(admission);

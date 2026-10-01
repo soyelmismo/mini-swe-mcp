@@ -1647,6 +1647,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         started_at: 0,
         updated_at: 0,
         group: Some(String::from("backend")),
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         repo_path: None,
         owner: Some(String::from("registry-owner")),
         metrics: WorkerMetrics::default(),

@@ -52,6 +52,7 @@ fn history(worker_id: &str, repo: &Path) -> WorkerHistory {
     WorkerHistory {
         task: "fix the parser".to_string(),
         group: None,
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         model: "test-model".to_string(),
         temperature: None,
         repo_path: repo.to_string_lossy().to_string(),
@@ -123,6 +124,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         pid: std::process::id(),
         task: "fix the parser".to_string(),
         group: None,
+        role: mini_swe_mcp::pool::WorkerRole::Worker,
         model: "test-model".to_string(),
         status,
         step: 4,
