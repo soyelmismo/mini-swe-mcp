@@ -250,6 +250,14 @@ fn edit_plan(task: &str) -> Vec<EditPlanEntry> {
         if quoted {
             quoted = false;
             let span = span.trim();
+            // A dispatch that writes its paths in backticks names files just as
+            // plainly as one that writes them bare, so a quoted path is a file
+            // of the plan in its own right -- never an identifier of the file
+            // named before it.
+            if let Some(path) = quoted_path(span) {
+                owner = note_path(&mut entries, &path, &mut pending);
+                continue;
+            }
             if let Some(index) = owner.filter(|_| !entries.is_empty()) {
                 let entry = entries.get_mut(index).expect("owner is in range");
                 if entry.identifiers.len() < EDIT_PLAN_IDENTIFIERS && is_identifier(span) {
@@ -265,19 +273,45 @@ fn edit_plan(task: &str) -> Vec<EditPlanEntry> {
         // files as the task listed them.
         for token in span.split_whitespace() {
             let Some(path) = path_of(token) else { continue };
-            if entries.len() < EDIT_PLAN_FILES && !entries.iter().any(|e| e.path == path) {
-                // Identifiers quoted before this file in the same clause were
-                // waiting for it: a task names the function and then the file
-                // it lives in as often as the other way round.
-                entries.push(EditPlanEntry {
-                    path: path.clone(),
-                    identifiers: std::mem::take(&mut pending),
-                });
-            }
-            owner = entries.iter().position(|e| e.path == path);
+            owner = note_path(&mut entries, &path, &mut pending);
         }
     }
     entries
+}
+
+/// Record `path` as a file of the plan and report the entry it belongs to.
+///
+/// Files are kept in the order the task named them and capped, so a path past
+/// the cap is named in no entry; identifiers quoted before a file waited for
+/// it, because a task names the function and then the file it lives in as often
+/// as the other way round.
+fn note_path(
+    entries: &mut Vec<EditPlanEntry>,
+    path: &str,
+    pending: &mut Vec<String>,
+) -> Option<usize> {
+    if let Some(index) = entries.iter().position(|e| e.path == path) {
+        return Some(index);
+    }
+    if entries.len() >= EDIT_PLAN_FILES {
+        return None;
+    }
+    entries.push(EditPlanEntry {
+        path: path.to_string(),
+        identifiers: std::mem::take(pending),
+    });
+    Some(entries.len() - 1)
+}
+
+/// The path a backticked span names, or `None` when it names none.
+///
+/// A span carrying whitespace is a quoted sentence or a multi-word name, not a
+/// path, however much of it reads like one.
+fn quoted_path(span: &str) -> Option<String> {
+    if span.is_empty() || span.chars().any(char::is_whitespace) {
+        return None;
+    }
+    path_of(span)
 }
 
 /// The path a whitespace token names, or `None` when it names none. Sentence
@@ -2482,6 +2516,31 @@ mod tests {
         assert_eq!(plan[0].identifiers, ["record", "read_only_nudge_text"]);
         assert_eq!(plan[1].path, "tests/pool_test.rs");
         assert!(plan[1].identifiers.is_empty(), "got {plan:?}");
+    }
+
+    /// A dispatch writes its paths in backticks about as often as bare, and a
+    /// quoted path names a file of the plan exactly as a bare one does -- it is
+    /// never mistaken for an identifier of the file named before it.
+    #[test]
+    fn a_backticked_path_names_a_file_of_the_plan() {
+        let plan = edit_plan("edit `src/a.rs` and `app/main.py`, then `src/a.rs` again");
+        assert_eq!(
+            plan.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["src/a.rs", "app/main.py"],
+            "a quoted path must be a file, deduplicated and in the order written"
+        );
+        assert!(
+            plan.iter().all(|e| e.identifiers.is_empty()),
+            "a quoted path is a file, not an identifier: {plan:?}"
+        );
+        // A quoted path still owns the identifiers written after it.
+        let owned = edit_plan("touch `src/a.rs` and `fn helper`");
+        assert_eq!(owned[0].path, "src/a.rs");
+        assert_eq!(owned[0].identifiers, ["fn helper"]);
+        // A quoted span carrying whitespace is a name or a sentence, not a
+        // path, so it stays an identifier.
+        let named = edit_plan("call `src/a.rs` from `fn main`");
+        assert_eq!(named[0].identifiers, ["fn main"]);
     }
 
     /// The extractor is language-agnostic: it mines whatever paths and

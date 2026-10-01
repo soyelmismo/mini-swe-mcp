@@ -3,10 +3,9 @@
 //! -- demand the edit, hand back the plan the task spells out, then park on the
 //! orchestrator -- instead of spending its whole budget on reads.
 //!
-//! The thresholds are pulled down through the pool's own environment overrides
-//! so a test reaches all three steps in a handful of turns. Those overrides are
-//! process-global, so every test here takes one lock around them and none of
-//! them runs in parallel with another that reads them.
+//! The thresholds are the defaults the pool ships (15, 30 and 45 read-only
+//! turns), so these tests read no environment and no other test can observe
+//! their effect: they pay for that with a turn budget sized to reach all three.
 
 mod common;
 
@@ -26,58 +25,17 @@ use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerMetrics, WorkerPool, WorkerS
 /// is under test, not the per-agent ownership check.
 const TEST_OWNER: &str = "test-agent";
 
+/// The read-only turn the third step fires on: the default pause threshold is
+/// three times the default nudge threshold of 15. The tests below read these
+/// defaults rather than overriding them through the environment, so they leave
+/// no process-global state behind for another test to observe.
+const PAUSE_TURN: usize = 45;
+
 /// The dispatch under test. It names a file and a function, which is what arms
 /// the read-only detector and what the plan half of the escalation quotes back.
 const TASK: &str = "Add the plan to `fn check_read_only` in src/lib.rs.";
 
 /// The three read-only thresholds, pulled down so the whole escalation runs
-/// inside a handful of turns.
-///
-/// Restored on drop, and held for the life of one test: the overrides are
-/// process-global, so every test that reads them takes this guard first and
-/// none of them runs in parallel with another that does.
-static THRESHOLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The overrides this binary sets, and the values it sets them to: the nudge at
-/// two turns, the plan at three and the pause at four.
-const THRESHOLD_NAMES: [&str; 3] = [
-    "POOL_READ_ONLY_NUDGE_TURNS",
-    "POOL_READ_ONLY_ESCALATE_TURNS",
-    "POOL_READ_ONLY_PAUSE_TURNS",
-];
-
-struct Thresholds {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-impl Thresholds {
-    fn lower() -> Self {
-        let lock = THRESHOLD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let saved = THRESHOLD_NAMES
-            .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
-            .collect();
-        for (name, value) in THRESHOLD_NAMES.iter().zip(["2", "3", "4"]) {
-            unsafe { std::env::set_var(name, value) };
-        }
-        Self { _lock: lock, saved }
-    }
-}
-
-impl Drop for Thresholds {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-    }
-}
-
 /// A read-only turn: a command that leaves the worktree exactly as it found it,
 /// so the detector keeps counting the streak.
 fn read_turn(n: usize) -> String {
@@ -363,11 +321,11 @@ async fn dispatch(pool: &WorkerPool, repo: &Path, max_turns: usize) -> String {
 /// orchestrator with a question naming what it read.
 #[tokio::test]
 async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
-    let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("escalate");
-    // More read turns than the pause threshold, so the worker is still reading
-    // when it parks and has turns left to answer the orchestrator.
-    let mut turns: Vec<String> = (1..=14)
+    // The default thresholds nudge at 15 read-only turns, carry the plan at 30
+    // and park at 45, so the script reads past all three and leaves turns over
+    // for the worker to answer the orchestrator.
+    let mut turns: Vec<String> = (1..=PAUSE_TURN + 4)
         .map(|n| bash_turn(&format!("call_{n}"), &read_turn(n)))
         .collect();
     turns.push(completion_turn("call_done"));
@@ -381,7 +339,7 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
         mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
     );
     let _scratch = scratch;
-    let worker_id = dispatch(&pool, repo.path(), 20).await;
+    let worker_id = dispatch(&pool, repo.path(), PAUSE_TURN + 12).await;
 
     let question = wait_for_paused(&pool, &worker_id)
         .await
@@ -440,8 +398,9 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
 /// names no file never reaches any of the three steps.
 #[tokio::test]
 async fn a_worker_that_edits_after_the_nudge_never_reaches_the_pause() {
-    let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("edits");
+    // Two edits: enough for the worktree sample to change twice, so the
+    // read-only streak never reaches even its first threshold.
     let server = ScriptedServer::spawn(vec![
         bash_turn("call_1", &edit_turn(1)),
         bash_turn("call_2", &edit_turn(2)),
