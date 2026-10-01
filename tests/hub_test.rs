@@ -1708,11 +1708,27 @@ async fn newer_clients_warn_once_and_keep_a_busy_daemon() {
     );
     assert!(dir.join("hub.sock").exists());
 
+    // The same (client build, hub build) pair stays quiet on the next command:
+    // remembering it is what stops the warning repeating every command.
+    let repeat = command.output().await.unwrap();
+    assert!(repeat.status.success());
+    let repeat_stderr = String::from_utf8(repeat.stderr).unwrap();
+    assert_eq!(
+        repeat_stderr
+            .lines()
+            .filter(|line| line.contains("is newer than hub"))
+            .count(),
+        0,
+        "{repeat_stderr}"
+    );
+
     let mut proxy = tokio::process::Command::new(common::binary_path());
     proxy
         .arg("--stdio")
         .env("SWE_HUB_DIR", &dir)
         .env("MINI_SWE_FAKE_VERSION", "99.0.0")
+        // A distinct client build is a distinct pair, so this run warns again.
+        .env("MINI_SWE_FAKE_BUILD_TS", "18446744073709551615")
         .env("ENV_FILE", "/nonexistent-mini-swe-env")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

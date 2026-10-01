@@ -230,6 +230,42 @@ fn supersedes(version: &str, build: &Value, daemon: &str, daemon_build: &Value) 
     }
 }
 
+/// File in the hub directory remembering which (client build, hub build)
+/// pairs have already warned.
+const NEWER_WARNING_FILE: &str = "newer-warnings";
+
+/// Print the "client newer than hub" warning unless this exact build pair has
+/// already warned from `dir`.
+///
+/// A long-lived daemon that cannot step aside would otherwise repeat the line
+/// on every CLI command for hours. The record is best-effort: an unreadable or
+/// unwritable file makes the warning repeat rather than disappear.
+fn warn_newer_once(dir: &std::path::Path, client_id: &str, daemon_id: &str, message: &str) {
+    let pair = format!("{client_id} {daemon_id}");
+    let path = dir.join(NEWER_WARNING_FILE);
+    let known = std::fs::read_to_string(&path).unwrap_or_default();
+    if known.lines().any(|line| line == pair) {
+        return;
+    }
+    eprintln!("{message}");
+    // Bound the file: only recent mismatches are worth remembering.
+    let mut lines: Vec<&str> = known.lines().collect();
+    lines.push(&pair);
+    if lines.len() > 32 {
+        lines.drain(..lines.len() - 32);
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, body.as_bytes()));
+}
+
 /// How one side of the handshake names itself when they have to be told apart.
 fn label(version: &str, build: &Value) -> String {
     match build["id"].as_str() {
@@ -302,10 +338,15 @@ async fn negotiated(admin: bool, cli: bool) -> Result<HubClient> {
                     }
                 }
             }
-            eprintln!(
-                "[mini-swe] Client {} is newer than hub {}; continuing with the existing daemon (busy or replacement unavailable).",
-                label(&version, &build),
-                label(daemon, daemon_build)
+            warn_newer_once(
+                &hub_dir()?,
+                build["id"].as_str().unwrap_or(&version),
+                daemon_build["id"].as_str().unwrap_or(daemon),
+                &format!(
+                    "[mini-swe] Client {} is newer than hub {}; continuing with the existing daemon (busy or replacement unavailable).",
+                    label(&version, &build),
+                    label(daemon, daemon_build)
+                ),
             );
         }
         if cli {

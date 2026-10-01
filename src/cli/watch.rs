@@ -17,6 +17,9 @@ pub struct Options {
     pub ids: BTreeSet<String>,
     pub group: Option<String>,
     pub follow: bool,
+    /// Print the full event body (long next-step guidance, every command).
+    /// `--json` stays complete regardless of this flag.
+    pub verbose: bool,
     pub timeout: Option<Duration>,
 }
 impl Options {
@@ -26,6 +29,7 @@ impl Options {
         while i < args.len() {
             match args[i].as_str() {
                 "--follow" => out.follow = true,
+                "--verbose" => out.verbose = true,
                 "--group" | "--timeout" => {
                     let flag = &args[i];
                     i += 1;
@@ -253,15 +257,97 @@ pub(crate) fn commands(v: &Value) -> Vec<String> {
 pub const MISSED_HEADING: &str = "While you were not watching:";
 
 pub fn render(v: &Value) -> String {
+    render_with(v, false)
+}
+
+/// The complete event body: the long next-step guidance and every suggested
+/// command. `watch --verbose` and the `--json` payload keep this detail.
+pub fn render_verbose(v: &Value) -> String {
+    render_with(v, true)
+}
+
+/// One event, compact by default and complete under [`render_verbose`].
+pub fn render_with(v: &Value, verbose: bool) -> String {
     if v["missed"] == true {
-        format!("{MISSED_HEADING}\n{}", render_event(v))
+        format!("{MISSED_HEADING}\n{}", render_event(v, verbose))
     } else {
-        render_event(v)
+        render_event(v, verbose)
     }
 }
 
 /// One event body, without the heading a whole missed batch shares.
-fn render_event(v: &Value) -> String {
+fn render_event(v: &Value, verbose: bool) -> String {
+    if verbose {
+        return render_event_verbose(v);
+    }
+    let text = |key: &str| v[key].as_str().unwrap_or("unknown");
+    // A registry row carries no branch, but every worker commits to its own
+    // `worker-<id>` branch, so name that instead of admitting we do not know.
+    let branch = v["branch"]
+        .as_str()
+        .map_or_else(|| format!("worker-{}", text("worker_id")), str::to_string);
+    let event = text("event");
+    let mut out = String::new();
+    if let Some(dropped) = v["dropped_events"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{dropped} older events dropped (backlog limit 100).\n"
+        ));
+    }
+    // The headline carries what decides the next move: the outcome, its
+    // verification, its size, and a one-line summary.
+    let verified = v["verified"]
+        .as_bool()
+        .map_or_else(String::new, |ok| format!(" | Verified: {ok}"));
+    let diff = matches!(event, "completed" | "failed").then(|| {
+        format!(
+            " | Diff: {} files, +{} -{}",
+            v["diff_stat"]["files"], v["diff_stat"]["insertions"], v["diff_stat"]["deletions"]
+        )
+    });
+    let summary = match event {
+        "completed" => one_line(v["summary"].as_str()).unwrap_or_else(|| "done".to_string()),
+        "failed" => one_line(v["error"].as_str()).unwrap_or_else(|| "failed".to_string()),
+        "needs_input" => {
+            one_line(v["question"].as_str()).unwrap_or_else(|| "needs input".to_string())
+        }
+        _ => format!("no step for {}s", v["time_since_last_step"]),
+    };
+    out.push_str(&format!(
+        "{} {}{}{} | {}\n",
+        text("worker_id"),
+        event,
+        verified,
+        diff.as_deref().unwrap_or(""),
+        summary
+    ));
+    out.push_str(&format!(
+        "branch {} | step {}/{} | elapsed {}s | {}\n",
+        branch,
+        v["step"],
+        v["max_turns"],
+        v["elapsed"],
+        text("task")
+    ));
+    if let Some(command) = primary_command(v) {
+        out.push_str(&format!("$ {command}\n"));
+    }
+    out.trim_end().to_string()
+}
+
+/// First non-empty line of a payload text field, bounded for a one-line event.
+fn one_line(value: Option<&str>) -> Option<String> {
+    let line = value?.lines().next()?.trim();
+    (!line.is_empty()).then(|| clamp_string(line, 200))
+}
+
+/// The one command a compact event suggests: the steer that resumes the
+/// worker. The diff, verify and merge commands stay in the verbose body.
+fn primary_command(v: &Value) -> Option<String> {
+    commands(v).into_iter().find(|cmd| cmd.contains(" steer "))
+}
+
+/// The full event body, as `watch --verbose` and the JSON payload show it.
+fn render_event_verbose(v: &Value) -> String {
     let text = |key: &str| v[key].as_str().unwrap_or("unknown");
     // A registry row carries no branch, but every worker commits to its own
     // `worker-<id>` branch, so name that instead of admitting we do not know.
@@ -339,8 +425,8 @@ fn render_event(v: &Value) -> String {
 
 /// Print one batch of events: the missed heading once, then every event body,
 /// so a single `watch` call catches the caller up completely.
-fn print_events(events: &[Value], json_output: bool, follow: bool) -> Result<()> {
-    print_events_to(&mut std::io::stdout(), events, json_output, follow)
+fn print_events(events: &[Value], json_output: bool, follow: bool, verbose: bool) -> Result<()> {
+    print_events_to(&mut std::io::stdout(), events, json_output, follow, verbose)
 }
 
 /// [`print_events`] against an explicit sink, so the batch layout is testable.
@@ -349,6 +435,7 @@ fn print_events_to(
     events: &[Value],
     json_output: bool,
     follow: bool,
+    verbose: bool,
 ) -> Result<()> {
     if json_output {
         for event in events {
@@ -361,7 +448,7 @@ fn print_events_to(
         write!(out, "{MISSED_HEADING}{}", if follow { " | " } else { "\n" })?;
     }
     for event in events {
-        let body = render_event(event);
+        let body = render_event(event, verbose);
         writeln!(
             out,
             "{}",
@@ -512,7 +599,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         if initial && explicit && ids.is_empty() && events.is_empty() {
             return Ok(end_watch(false, false));
         }
-        print_events(&events, json_output, opts.follow)?;
+        print_events(&events, json_output, opts.follow, opts.verbose)?;
         printed_event |= !events.is_empty();
         for event in &events {
             client
@@ -627,7 +714,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
                 events.push(event);
             }
         }
-        print_events(&events, json_output, opts.follow)?;
+        print_events(&events, json_output, opts.follow, opts.verbose)?;
         printed_event |= !events.is_empty();
         if !events.is_empty() && !opts.follow {
             return Ok(0);
@@ -705,18 +792,80 @@ mod tests {
         assert!(select_event(&state("completed", 3, metrics, 100, 10), Some(&done), 110).is_none());
         let out = render(&done);
         assert!(
-            out.contains("mini-swe-mcp steer") && out.contains("git diff"),
-            "{out}"
+            out.contains("mini-swe-mcp steer") && !out.contains("git diff"),
+            "the compact body suggests one interaction: {out}"
         );
-        let text = render(
-            &select_event(
-                &state("running", 2, repeated, 100, 10),
-                Some(&state("running", 2, metrics, 100, 10)),
-                110,
-            )
-            .unwrap(),
+        assert!(
+            render_verbose(&done).contains("git diff"),
+            "verbose keeps every command"
         );
-        assert!(text.contains("mini-swe-mcp kill"), "{text}");
+        let stalled = select_event(
+            &state("running", 2, repeated, 100, 10),
+            Some(&state("running", 2, metrics, 100, 10)),
+            110,
+        )
+        .unwrap();
+        let text = render(&stalled);
+        assert!(
+            text.contains("mini-swe-mcp steer") && !text.contains("mini-swe-mcp kill"),
+            "the compact body suggests one interaction: {text}"
+        );
+        assert!(
+            render_verbose(&stalled).contains("mini-swe-mcp kill"),
+            "verbose keeps kill"
+        );
+    }
+
+    /// The default body is the three lines an orchestrator has to read: the
+    /// headline, the worker's progress, and one command. The long guidance and
+    /// the remaining commands wait for `--verbose`.
+    #[test]
+    fn compact_events_carry_a_headline_a_one_line_summary_and_one_command() {
+        let done = select_event(
+            &state("completed", 3, WorkerMetrics::default(), 100, 10),
+            None,
+            110,
+        )
+        .unwrap();
+        let compact = render(&done);
+        assert_eq!(compact.lines().count(), 3, "{compact}");
+        assert!(compact.contains("w completed"), "{compact}");
+        assert!(compact.contains("Verified: true"), "{compact}");
+        assert!(compact.contains("Diff: 0 files, +0 -0"), "{compact}");
+        assert!(compact.contains("Done."), "{compact}");
+        assert!(compact.contains("mini-swe-mcp steer"), "{compact}");
+        assert!(!compact.contains("Review the diff"), "{compact}");
+
+        let verbose = render_verbose(&done);
+        assert!(verbose.contains("Review the diff"), "{verbose}");
+        assert!(verbose.contains("git diff HEAD...'worker-w'"), "{verbose}");
+        assert!(verbose.contains("Diff: 0 files, +0 -0"), "{verbose}");
+    }
+
+    /// `--json` is the complete machine-readable contract: it must not shrink
+    /// when the human-facing body does.
+    #[test]
+    fn json_output_stays_complete_and_ignores_verbose() {
+        let event = select_event(
+            &state("completed", 3, WorkerMetrics::default(), 100, 10),
+            None,
+            110,
+        )
+        .unwrap();
+        let mut plain = Vec::new();
+        print_events_to(&mut plain, std::slice::from_ref(&event), true, false, false).unwrap();
+        let mut verbose = Vec::new();
+        print_events_to(&mut verbose, &[event], true, false, true).unwrap();
+        assert_eq!(plain, verbose, "the JSON body is verbose-independent");
+        let printed: Value = serde_json::from_slice(&plain).unwrap();
+        assert!(printed["commands"].is_array(), "{printed}");
+        assert!(
+            printed["next_step"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Review"),
+            "{printed}"
+        );
     }
 
     /// A stall is one episode: the worker taking another step while still idle
@@ -779,7 +928,7 @@ mod replay_batch_tests {
     fn a_missed_batch_shares_one_heading_and_prints_every_event() {
         let batch = vec![missed("w-one", "First."), missed("w-two", "Second.")];
         let mut out = Vec::new();
-        print_events_to(&mut out, &batch, false, false).expect("print");
+        print_events_to(&mut out, &batch, false, false, false).expect("print");
         let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
         assert!(
@@ -794,7 +943,14 @@ mod replay_batch_tests {
         let live = json!({"worker_id": "w-live", "event": "needs_input", "question": "go on?",
             "owner": "cli"});
         let mut out = Vec::new();
-        print_events_to(&mut out, &[missed("w-old", "Late."), live], false, false).expect("print");
+        print_events_to(
+            &mut out,
+            &[missed("w-old", "Late."), live],
+            false,
+            false,
+            false,
+        )
+        .expect("print");
         let text = String::from_utf8(out).expect("utf8");
         assert_eq!(text.matches(MISSED_HEADING).count(), 1, "{text}");
         assert!(text.contains("Late.") && text.contains("go on?"), "{text}");

@@ -302,6 +302,74 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
     let _ = task.await;
 }
 
+/// An interactive verb (here `status`) is the owner having seen the worker:
+/// the event it queued must not replay on the next watch.
+#[tokio::test]
+async fn an_interaction_marks_the_workers_events_seen() {
+    isolate_registry();
+    let dir = common::TempDir::new_in_tmp("wseen");
+    let server = pool_with(vec![record(
+        "w-seen",
+        "agent-a",
+        WorkerState::Completed {
+            turns: 2,
+            diff: String::new(),
+            summary: "Fixed.".to_string(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: Some("worker-w-seen".to_string()),
+            verified: Some(true),
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+        },
+    )])
+    .await;
+    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let task = tokio::spawn(async move { daemon.run().await });
+    wait_for_socket(&dir.path().join("hub.sock")).await;
+
+    let mut owner = Raw::connect(&dir.path().join("hub.sock")).await;
+    owner
+        .request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
+        .await;
+    // Let the daemon's 1 s watch loop observe the terminal worker first.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let reply = owner
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
+        .await;
+    let events = reply["result"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(events.len(), 1, "the terminal event is queued: {reply:?}");
+    // Deliberately no ack: the event is still pending for this owner.
+    let status = owner
+        .request(
+            "tools/call",
+            serde_json::json!({"name": "worker",
+                "arguments": {"action": "status", "worker_id": "w-seen"}}),
+        )
+        .await;
+    assert!(status.get("error").is_none(), "{status:?}");
+    let reply = owner
+        .request(
+            "hub/watch",
+            serde_json::json!({"worker_ids": [], "group": null, "initial": true}),
+        )
+        .await;
+    assert_eq!(
+        reply["result"]["events"],
+        serde_json::json!([]),
+        "seen events must not replay: {reply:?}"
+    );
+
+    task.abort();
+    let _ = task.await;
+}
+
 #[test]
 fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     let exe = common::binary_path();
@@ -343,7 +411,7 @@ fn watch_cli_exits_2_on_timeout_and_3_when_nothing_to_watch() {
     )
     .expect("row");
     std::fs::create_dir_all(swe.path().join("swe-wt-w-cli")).expect("preserved worktree");
-    let output = run(&["watch", "w-cli"]);
+    let output = run(&["watch", "w-cli", "--verbose"]);
     assert_eq!(
         output.status.code(),
         Some(0),

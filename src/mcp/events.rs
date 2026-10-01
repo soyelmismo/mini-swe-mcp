@@ -1132,6 +1132,7 @@ impl EventRouter {
                 if !events.iter().any(|v| v["worker_id"] == *id)
                     && let Some(v) = self.watch_reported.get(id).filter(|v| {
                         matches!(v["event"].as_str(), Some("completed" | "failed"))
+                            && v["seen"] != true
                             && allowed(v)
                             && crate::cli::watch::matches(v, &ids, group)
                     })
@@ -1141,6 +1142,21 @@ impl EventRouter {
             }
         }
         Ok(json!({"watching":watching,"events":events}))
+    }
+
+    /// Forget `owner`'s queued events for `wid` and mark its last reported
+    /// event seen.
+    ///
+    /// An interaction (status, logs, collect, kill, steer) is the owner
+    /// looking at the worker directly, so a later watch must not replay those
+    /// events as "while you were not watching".
+    pub(super) fn mark_seen(&mut self, owner: &str, wid: &str) {
+        if let Some(history) = self.watch_history.get_mut(owner) {
+            history.pending.retain(|v| v["worker_id"] != wid);
+        }
+        if let Some(reported) = self.watch_reported.get_mut(wid) {
+            reported["seen"] = json!(true);
+        }
     }
 
     fn acknowledge_watch(&mut self, ctx: &super::server::ConnectionContext, sequence: u64) {
@@ -1221,6 +1237,49 @@ mod watch_stall_regression_tests {
             .watch_reply(&ctx, &json!({"worker_ids":["stall-probe"], "initial":true}))
             .unwrap();
         assert_eq!(reply["events"][0]["step"], 162);
+    }
+}
+
+#[cfg(test)]
+mod mark_seen_tests {
+    use super::*;
+
+    fn completed(id: &str) -> serde_json::Value {
+        json!({"worker_id":id, "owner":"owner", "status":"completed", "step":2,
+            "revision":0, "verified":true, "branch":format!("worker-{id}"),
+            "metrics":crate::pool::WorkerMetrics::default()})
+    }
+
+    /// An interactive verb is the owner looking at the worker, so its queued
+    /// event must not come back as "while you were not watching".
+    #[test]
+    fn an_interaction_drops_the_pending_event_and_its_initial_replay() {
+        let mut router = EventRouter::default();
+        router.observe_watch([("w".to_string(), completed("w"))].into());
+        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let params = json!({"worker_ids":[], "initial":true});
+        let first = router.watch_reply(&ctx, &params).unwrap();
+        assert_eq!(first["events"][0]["event"], "completed", "{first}");
+        assert_eq!(
+            router.watch_history["owner"].pending.len(),
+            1,
+            "no ack, so the event is still queued"
+        );
+
+        router.mark_seen("owner", "w");
+        assert!(router.watch_history["owner"].pending.is_empty());
+        let second = router.watch_reply(&ctx, &params).unwrap();
+        assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
+        // The explicit-id path replays the last reported terminal event; it
+        // must respect the seen mark too.
+        let explicit = router
+            .watch_reply(&ctx, &json!({"worker_ids":["w"], "initial":true}))
+            .unwrap();
+        assert!(
+            explicit["events"].as_array().unwrap().is_empty(),
+            "{explicit}"
+        );
     }
 }
 
