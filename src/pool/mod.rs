@@ -76,8 +76,8 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
     remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
-    retire_worker, retire_worker_in, retire_worker_with, save_worker_history, save_worker_history_in,
-    sweep_retired_workers, sweep_retired_workers_in,
+    retire_worker, retire_worker_in, retire_worker_with, save_worker_history,
+    save_worker_history_in, sweep_retired_workers, sweep_retired_workers_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
@@ -1312,13 +1312,7 @@ impl WorkerPool {
             let base_commit = worktree.base_commit.clone();
             let for_merge = target.clone();
             let merged = tokio::task::spawn_blocking(move || {
-                WorktreeGuard::merge_branch_at(
-                    &path,
-                    &repo_root,
-                    &branch,
-                    &base_commit,
-                    &for_merge,
-                )
+                WorktreeGuard::merge_branch_at(&path, &repo_root, &branch, &base_commit, &for_merge)
             })
             .await;
             match merged {

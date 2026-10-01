@@ -526,10 +526,7 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     // releases when the worker's guard drops, which is what frees the directory
     // for the next worker; the warm directory stays, to be reclaimed by the
     // build-dir sweep once it is idle.
-    if let Some(repo) = ctx
-        .repo
-        .filter(|repo| repo.is_dir() && !ctx.keep_branch)
-    {
+    if let Some(repo) = ctx.repo.filter(|repo| repo.is_dir() && !ctx.keep_branch) {
         let _ = crate::worktree::git(repo, "worktree prune", &["worktree", "prune"]);
         // `git branch -D` refuses a branch a worktree still has checked out;
         // the prune above just released it. An already-absent branch is not an
@@ -608,10 +605,7 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
             continue;
         };
-        repos
-            .entry(repo.to_path_buf())
-            .or_default()
-            .push(entry);
+        repos.entry(repo.to_path_buf()).or_default().push(entry);
     }
     for (repo, entries) in &repos {
         let ctx = RetireContext {
@@ -659,11 +653,10 @@ fn is_merged_branch(repo: &Path, branch: &str, base_branch: Option<&str>) -> boo
 /// branch is unreachable: nothing can dispatch, steer, revise or collect it, so
 /// it is space nobody will ever read.
 fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
-    let live: std::collections::HashSet<String> =
-        super::load_registry_entries_read_only_in(root)
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
+    let live: std::collections::HashSet<String> = super::load_registry_entries_read_only_in(root)
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
     let mut removed = 0;
     for base in root.base_dirs() {
         let Ok(entries) = std::fs::read_dir(&base) else {
@@ -674,16 +667,13 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            let Some(id) = name
-                .strip_prefix("swe-wt-")
-                .and_then(|rest| {
-                    rest.strip_suffix(".history.jsonl")
-                        .or_else(|| rest.strip_suffix(".history.json"))
-                        .or_else(|| rest.strip_suffix(".steer"))
-                        .or_else(|| rest.strip_suffix(".steer-source"))
-                        .or_else(|| rest.strip_suffix(".round-base"))
-                })
-            else {
+            let Some(id) = name.strip_prefix("swe-wt-").and_then(|rest| {
+                rest.strip_suffix(".history.jsonl")
+                    .or_else(|| rest.strip_suffix(".history.json"))
+                    .or_else(|| rest.strip_suffix(".steer"))
+                    .or_else(|| rest.strip_suffix(".steer-source"))
+                    .or_else(|| rest.strip_suffix(".round-base"))
+            }) else {
                 continue;
             };
             // A live row keeps its files, whether or not its branch survives.

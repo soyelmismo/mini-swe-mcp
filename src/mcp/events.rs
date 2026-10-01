@@ -502,7 +502,10 @@ pub(crate) fn forget_watch_acks(dir: &Path, worker_id: &str) {
     else {
         return;
     };
-    if !positions.values().any(|workers| workers.contains_key(worker_id)) {
+    if !positions
+        .values()
+        .any(|workers| workers.contains_key(worker_id))
+    {
         return;
     }
     for workers in positions.values_mut() {

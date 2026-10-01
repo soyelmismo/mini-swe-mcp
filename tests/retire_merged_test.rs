@@ -73,9 +73,7 @@ impl Fixture {
             model: "test".to_string(),
             temperature: None,
             repo_path: self.repo().to_string_lossy().into_owned(),
-            base_commit: git(self.repo(), &["rev-parse", "HEAD"])
-                .trim()
-                .to_string(),
+            base_commit: git(self.repo(), &["rev-parse", "HEAD"]).trim().to_string(),
             base_branch: Some("main".to_string()),
             branch: format!("worker-{id}"),
             network_offline: false,
@@ -112,7 +110,7 @@ impl Fixture {
         write(
             self.scratch.path(),
             &format!("swe-wt-{id}.steer-source"),
-            &format!("{{\"consolidator\":\"c1\",\"base\":\"abc123\"}}\n"),
+            "{\"consolidator\":\"c1\",\"base\":\"abc123\"}\n",
         );
     }
 
@@ -176,11 +174,7 @@ fn merge_retires_everything_of_the_worker() {
     std::fs::create_dir_all(worktree.join("nested")).unwrap();
     write(&worktree, "nested/junk.txt", "junk\n");
     std::fs::create_dir_all(f.scratch.path().join("swe-target-swe-wt-w1")).unwrap();
-    write(
-        f.scratch.path(),
-        "swe-target-swe-wt-w1/build.o",
-        "junk\n",
-    );
+    write(f.scratch.path(), "swe-target-swe-wt-w1/build.o", "junk\n");
     write(f.scratch.path(), "swe-wt-w1.steer", "guidance\n");
 
     f.merge("w1").expect("a clean merge must succeed");
@@ -223,8 +217,14 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
     }
     // The consolidator integrates both, so its branch carries their commits.
     f.commit_on_worker_branch("cons", "cons.txt", "consolidated\n");
-    git(f.repo(), &["merge", "--no-ff", "-m", "integrate a", "worker-c-a"]);
-    git(f.repo(), &["merge", "--no-ff", "-m", "integrate b", "worker-c-b"]);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate a", "worker-c-a"],
+    );
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate b", "worker-c-b"],
+    );
 
     // Its row records the round it integrated, and its history names a gate so
     // the merge has one to run.
@@ -241,7 +241,8 @@ fn merging_a_consolidator_retires_the_workers_it_integrated() {
     save_registry_entry_in(&f.root(), &row);
     f.write_steer_source("cons");
 
-    f.merge("cons").expect("a clean consolidator merge must succeed");
+    f.merge("cons")
+        .expect("a clean consolidator merge must succeed");
 
     for id in ["cons", "c-a", "c-b"] {
         assert!(
@@ -272,7 +273,10 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
     //    main job. Its branch is deleted, which the sweep proves for itself.
     f.commit_on_worker_branch("m1", "m1.txt", "m1\n");
     f.record("m1");
-    git(f.repo(), &["merge", "--no-ff", "-m", "integrate m1", "worker-m1"]);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate m1", "worker-m1"],
+    );
 
     // 2. A completed worker still awaiting integration: nothing may touch it.
     f.commit_on_worker_branch("u1", "u1.txt", "u1\n");
@@ -318,7 +322,10 @@ fn the_sweep_retires_merged_workers_and_orphan_histories_only() {
     // The unmerged completed worker is untouched: still listed, still
     // steerable, branch intact.
     assert!(f.row_exists("u1"), "an unmerged worker must keep its row");
-    assert!(f.history_exists("u1"), "an unmerged worker keeps its history");
+    assert!(
+        f.history_exists("u1"),
+        "an unmerged worker keeps its history"
+    );
     assert!(
         git_ref_exists(f.repo(), "worker-u1"),
         "an unmerged worker must keep its branch"
