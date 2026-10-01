@@ -1830,7 +1830,8 @@ impl EventRouter {
         group: Option<&str>,
     ) {
         let owner = ctx.agent();
-        let reported = group.map(|name| [name.to_string()].into_iter().collect());
+        let reported: Option<std::collections::BTreeSet<String>> =
+            group.map(|name| [name.to_string()].into_iter().collect());
         let selected: std::collections::BTreeSet<String> = self
             .watch_current
             .values()

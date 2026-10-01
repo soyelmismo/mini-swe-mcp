@@ -193,11 +193,9 @@ impl McpServer {
 pub(in crate::mcp) const WORKER_IDS_DESCRIPTION: &str =
     "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.";
 
-pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
-    "Only workers of this group, or of several groups as an array (one watch covers them all). For 'watch' and 'merge --approved'.";
+pub(in crate::mcp) const GROUP_DESCRIPTION: &str = "Only workers of this group, or of several groups as an array (one watch covers them all). For 'watch' and 'merge --approved'.";
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str =
     "Watch deadline seconds; expiry: no_event.";
 
-pub(in crate::mcp) const ALL_DESCRIPTION: &str =
-    "Watch whole rounds as one event each: it answers as soon as any selected round has fully stopped, or as soon as one worker needs input or fails, and lists that round's workers. Without 'group' or worker_ids it covers every live group of yours.";
+pub(in crate::mcp) const ALL_DESCRIPTION: &str = "Watch whole rounds as one event each, listing the round that stops or needs input; without 'group' or worker_ids, every live group of yours.";

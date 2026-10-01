@@ -787,9 +787,9 @@ pub fn round_event(
     fresh: impl Fn(&str) -> bool,
     allowed: impl Fn(&Value) -> bool,
 ) -> Option<Value> {
-    let mut best: Option<(bool, String, Vec<&Value>)> = None;
-    for (group, selected) in rounds(current, ids, groups, &allowed) {
-        let Some(all_stopped) = round_outcome(&selected, now, &fresh) else {
+    let mut best: Option<Round> = None;
+    for round in rounds(current, ids, groups, &allowed) {
+        let Some(all_stopped) = round_ready(&round.workers, now, &fresh) else {
             continue;
         };
         // A finished round outranks an early return: it is the answer, while a
@@ -797,16 +797,23 @@ pub fn round_event(
         // to the first group by name, so every poll ranks the rounds alike.
         let outranks = match &best {
             None => true,
-            Some((stopped, best_group, _)) => {
-                all_stopped && !*stopped || *best_group > group
-            }
+            Some(best) => all_stopped && !best.all_stopped || best.group > round.group,
         };
         if outranks {
-            best = Some((all_stopped, group, selected));
+            best = Some(Round {
+                all_stopped,
+                group: round.group,
+                workers: round.workers,
+            });
         }
     }
-    let (all_stopped, group, selected) = best?;
-    Some(round_payload(&selected, &group, now, all_stopped))
+    let best = best?;
+    Some(round_payload(
+        &best.workers,
+        &best.group,
+        now,
+        best.all_stopped,
+    ))
 }
 
 /// The caller's rounds, each one name and the workers of that group alone.
@@ -815,20 +822,19 @@ pub fn round_event(
 /// back by a sibling round that is still running. An empty group selection
 /// means every live group of the caller, which is what `--all` without a
 /// `--group` flag asks for.
-fn rounds(
-    current: &Snapshot,
+fn rounds<'a>(
+    current: &'a Snapshot,
     ids: &BTreeSet<String>,
     groups: &BTreeSet<String>,
     allowed: &impl Fn(&Value) -> bool,
-) -> Vec<(String, Vec<&Value>)> {
+) -> Vec<Round<'a>> {
     let selected = |v: &Value| {
         allowed(v)
             && matches(v, ids, groups)
             && v["steered_by_consolidator"] != true
             && v["question_for_consolidator"] != true
     };
-    let mut by_group: std::collections::BTreeMap<String, Vec<&Value>> =
-        std::collections::BTreeMap::new();
+    let mut by_group: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     for view in current.values().filter(|v| selected(v)) {
         if let Some(group) = view["group"].as_str() {
             by_group.entry(group.to_string()).or_default().push(view);
@@ -839,20 +845,30 @@ fn rounds(
     if !groups.is_empty() {
         by_group.retain(|group, workers| {
             !workers.is_empty()
-                || current.values().any(|v| {
-                    allowed(v) && v["group"].as_str().is_some_and(|name| name == group)
-                })
+                || current
+                    .values()
+                    .any(|v| allowed(v) && v["group"].as_str().is_some_and(|name| name == group))
         });
     }
-    by_group.into_iter().collect()
+    by_group
+        .into_iter()
+        .map(|(group, workers)| Round {
+            all_stopped: false,
+            group,
+            workers,
+        })
+        .collect()
+}
+
+/// One group of the snapshot, with the workers the round is made of.
+struct Round<'a> {
+    all_stopped: bool,
+    group: String,
+    workers: Vec<&'a Value>,
 }
 
 /// Whether the round is over, or `None` while it keeps waiting.
-fn round_outcome(
-    selected: &[&Value],
-    now: u64,
-    fresh: &impl Fn(&str) -> bool,
-) -> Option<bool> {
+fn round_ready(selected: &[&Value], now: u64, fresh: &impl Fn(&str) -> bool) -> Option<bool> {
     if selected.is_empty() {
         return None;
     }
