@@ -8,11 +8,14 @@
 mod common;
 
 use std::path::Path;
+use std::time::Duration;
 
 use mini_swe_mcp::agent::{ChatMessage, Role};
+use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
-    RegistryStatus, WorkerHistory, WorkerPool, append_history_message_in, history_log_path_in,
-    load_worker_history_in, save_registry_entry_in,
+    LogBuffer, RegistryStatus, WorkerHistory, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState,
+    append_history_message_in, history_log_path_in, load_registry_entry_in, load_worker_history_in,
+    remove_registry_entry_in, save_registry_entry_in,
 };
 
 /// A per-test scratch root, owning its directory.
@@ -459,4 +462,204 @@ fn a_transient_llm_error_never_marks_the_worker_failed() {
         failures <= 1,
         "the turn engine must not fail a worker on a transient LLM error"
     );
+}
+
+/// A worker that reaches a terminal state, or a panic after the deadline.
+async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
+    for _ in 0..600 {
+        if let Some(state) = pool.get_worker_state(id).await {
+            match state {
+                WorkerState::Completed { .. } | WorkerState::Failed { .. } => return state,
+                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("worker {id} never reached a terminal state");
+}
+
+/// The revision a payload carries, from whichever terminal state it is in.
+fn payload_revision(state: &WorkerState) -> Option<usize> {
+    match state {
+        WorkerState::Completed { revision, .. } | WorkerState::Failed { revision, .. } => {
+            Some(*revision)
+        }
+        WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
+    }
+}
+
+/// The revision counter advances on every continuation, not just the first.
+///
+/// The counter is read from three stores (the log metadata line, the registry
+/// row and the in-process record) and any of them can lag; a stale read made
+/// the second and third steer of one worker report revision 1 again. Steer one
+/// stopped worker three times and watch the reply, the payload and the durable
+/// history count 1, 2, 3.
+#[test]
+fn three_continuations_number_one_two_three() {
+    let scratch = Scratch::new("three-revisions");
+    let root = scratch.root();
+    let id = "rev3x";
+    let repo = repo_with_branch("three-revisions", id);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // A fake LLM that finishes every turn with the completion sentinel, so
+        // each revision reaches a terminal state and the next steer continues
+        // it instead of queueing behind a running one.
+        let llm = common::fake_llm::FakeLlm::spawn("ls -la", "ls -la").await;
+        let pool =
+            WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone());
+        let server = McpServer::new(pool.clone(), "ninja".to_string());
+
+        // What a completed dispatch leaves behind: a log whose metadata line
+        // names revision 0 and a terminal record owned by this connection.
+        let mut meta = history(id, &repo);
+        meta.revision = 0;
+        meta.owner = Some(LOCAL_AGENT.to_string());
+        // The real base commit, so the preserved branch keeps its commits when
+        // the revision's worktree is torn down.
+        meta.base_commit = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "master"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .expect("rev-parse master");
+        for message in &meta.messages {
+            append_history_message_in(&root, id, &meta, message).expect("seed the history log");
+        }
+        pool.__test_insert_worker(WorkerRecord {
+            id: id.to_string(),
+            task: meta.task.clone(),
+            model: meta.model.clone(),
+            owner: LOCAL_AGENT.to_string(),
+            state: WorkerState::Completed {
+                turns: 1,
+                diff: String::new(),
+                summary: "did what it could".to_string(),
+                completed_at: 0,
+                artifacts: Vec::new(),
+                branch: Some(format!("worker-{id}")),
+                verified: None,
+                metrics: WorkerMetrics::default(),
+                revision: 0,
+            },
+            metrics: WorkerMetrics::default(),
+            logs: LogBuffer::new(),
+            pending_steer: Vec::new(),
+            resume_tx: None,
+            handle: None,
+            revision: 0,
+        })
+        .await;
+
+        // Steer the same stopped worker three times, letting each revision
+        // finish before the next steer, and record what every surface reported.
+        let mut replies = Vec::new();
+        let mut payloads = Vec::new();
+        let mut histories = Vec::new();
+        for n in 1..=3 {
+            let reply = server
+                .execute_tool(
+                    "worker",
+                    serde_json::json!({
+                        "action": "steer",
+                        "worker_id": id,
+                        "message": format!("carry on ({n})"),
+                    }),
+                )
+                .await
+                .expect("steering a stopped worker must start a continuation");
+            assert_eq!(reply["status"], "revising", "reply: {reply}");
+            replies.push(reply["message"].as_str().unwrap_or_default().to_string());
+            payloads.push(
+                load_registry_entry_in(&root, id)
+                    .expect("registry row")
+                    .revision,
+            );
+            histories.push(load_worker_history_in(&root, id).expect("history").revision);
+            wait_until_terminal(&pool, id).await;
+        }
+
+        for (n, reply) in replies.iter().enumerate() {
+            let revision = n + 1;
+            assert!(
+                reply.starts_with(&format!("Revision {revision} started")),
+                "the reply must name revision {revision}, got: {reply}"
+            );
+        }
+        assert_eq!(
+            payloads,
+            vec![1, 2, 3],
+            "the payload of each continuation must be its revision"
+        );
+        assert_eq!(
+            histories,
+            vec![1, 2, 3],
+            "the durable history must advance with each continuation"
+        );
+        assert_eq!(
+            load_registry_entry_in(&root, id)
+                .expect("registry row")
+                .revision,
+            3,
+            "the final registry row must carry the last revision"
+        );
+        assert_eq!(
+            payload_revision(&pool.get_worker_state(id).await.expect("record")),
+            Some(3),
+            "the final completion payload must carry the last revision"
+        );
+
+        // `collect` evicts the record and a `prune` retires the registry row,
+        // so a reaped worker can be its durable log and nothing else: the
+        // counter must still advance from there instead of restarting at one.
+        assert!(
+            pool.collect(id).await.is_some(),
+            "collecting the terminal worker evicts it from the pool"
+        );
+        // With the row gone the log is the only copy of the counter.
+        remove_registry_entry_in(&root, id);
+        assert!(
+            load_registry_entry_in(&root, id).is_none(),
+            "the row is gone, so only the saved conversation can name the revision"
+        );
+        let reply = server
+            .execute_tool(
+                "worker",
+                serde_json::json!({
+                    "action": "steer",
+                    "worker_id": id,
+                    "message": "one more",
+                }),
+            )
+            .await
+            .expect("a reaped worker with a saved conversation is still continuable");
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Revision 4 started"),
+            "a continuation after a reap must advance the counter: {reply}"
+        );
+        assert_eq!(
+            load_worker_history_in(&root, id).expect("history").revision,
+            4,
+            "the log alone must carry the counter after a reap"
+        );
+        assert_eq!(
+            load_registry_entry_in(&root, id)
+                .expect("fresh registry row")
+                .revision,
+            4,
+            "the continuation re-registers the worker at its revision"
+        );
+        wait_until_terminal(&pool, id).await;
+    });
+
+    let _ = std::fs::remove_dir_all(&repo);
+    drop(scratch);
 }
