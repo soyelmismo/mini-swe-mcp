@@ -20,11 +20,13 @@ static TAG: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch hub directory, removed when the test ends.
 fn scratch_dir() -> PathBuf {
-    // Short enough that `hub.sock`, bound below in several tests, stays under
-    // `SUN_LEN` even when the environment's `TMPDIR` is deep.
-    let dir = common::socket_scratch_path(&format!(
-        "swe-hub-{}-{}",
+    let dir = std::env::temp_dir().join(format!(
+        "swe-hub-test-{}-{}-{}",
         std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos(),
         TAG.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&dir);
@@ -999,7 +1001,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
 
     let root = common::TempDir::new_in_tmp("hub-checkpoint-revision");
     // Unix socket paths are bounded by sockaddr_un, unlike scratch paths.
-    let hub = common::socket_scratch_path(&format!("h5-{}", std::process::id()));
+    let hub = std::env::temp_dir().join(format!("h5-{}", std::process::id()));
     std::fs::create_dir_all(&hub).unwrap();
     let swe = root.subdir("swe");
     let repo = root.subdir("repo");
