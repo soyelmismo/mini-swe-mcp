@@ -229,6 +229,12 @@ pub struct RegistryWriter {
     root: ScratchRoot,
 }
 
+impl Default for RegistryWriter {
+    fn default() -> Self {
+        Self::new(ScratchRoot::from_env())
+    }
+}
+
 impl RegistryWriter {
     /// A writer that files every row under `root`.
     pub fn new(root: ScratchRoot) -> Self {
@@ -239,10 +245,6 @@ impl RegistryWriter {
         }
     }
 
-    /// The scratch root this writer files under.
-    pub fn root(&self) -> &ScratchRoot {
-        &self.root
-    }
 
     /// Write `entry`, unless it is a step-only update inside the throttle
     /// window of a row that already says the same thing.
@@ -331,10 +333,6 @@ pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) {
     }
 }
 
-fn worktree_exists(worker_id: &str) -> bool {
-    worktree_exists_in(&ScratchRoot::from_env(), worker_id)
-}
-
 fn worktree_exists_in(root: &ScratchRoot, worker_id: &str) -> bool {
     root.join(format!("swe-wt-{worker_id}")).is_dir()
 }
@@ -387,6 +385,7 @@ pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {
 /// [`load_registry_entries_read_only`] under an explicit scratch root.
 pub fn load_registry_entries_read_only_in(root: &ScratchRoot) -> Vec<WorkerRegistryEntry> {
     raw_registry_entries_in(root)
+        .into_iter()
         .map(|(_, mut entry)| {
             if entry.status.is_live() && !crate::worktree::is_process_alive(entry.pid) {
                 entry.status = RegistryStatus::Stopped;
@@ -396,13 +395,7 @@ pub fn load_registry_entries_read_only_in(root: &ScratchRoot) -> Vec<WorkerRegis
         .collect()
 }
 
-fn raw_registry_entries() -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
-    raw_registry_entries_in(&ScratchRoot::from_env())
-}
-
-fn raw_registry_entries_in(
-    root: &ScratchRoot,
-) -> impl Iterator<Item = (PathBuf, WorkerRegistryEntry)> {
+fn raw_registry_entries_in(root: &ScratchRoot) -> Vec<(PathBuf, WorkerRegistryEntry)> {
     let mut seen = std::collections::HashSet::new();
     root.base_dirs()
         .into_iter()
@@ -432,6 +425,7 @@ fn raw_registry_entries_in(
             }
             Some((path, entry))
         })
+        .collect()
 }
 
 /// Rewrite the dead rows of a crashed hub into interrupted ones before serving.
@@ -444,13 +438,10 @@ fn raw_registry_entries_in(
 ///
 /// Read at daemon startup to decide which workers to continue: the row is
 /// terminal for listing but its branch and conversation are intact.
-pub(crate) fn interrupted_registry_entries() -> Vec<WorkerRegistryEntry> {
-    interrupted_registry_entries_in(&ScratchRoot::from_env())
-}
-
 /// [`interrupted_registry_entries`] under an explicit scratch root.
 pub(crate) fn interrupted_registry_entries_in(root: &ScratchRoot) -> Vec<WorkerRegistryEntry> {
     raw_registry_entries_in(root)
+        .into_iter()
         .map(|(_, entry)| entry)
         .filter(|e| e.status == RegistryStatus::Interrupted)
         .collect()
@@ -463,10 +454,6 @@ pub(crate) fn recover_orphaned_workers() -> usize {
 /// [`recover_orphaned_workers`] under an explicit scratch root.
 pub(crate) fn recover_orphaned_workers_in(root: &ScratchRoot) -> usize {
     recover_entries_in(root, raw_registry_entries_in(root))
-}
-
-fn recover_entries(entries: impl IntoIterator<Item = (PathBuf, WorkerRegistryEntry)>) -> usize {
-    recover_entries_in(&ScratchRoot::from_env(), entries)
 }
 
 fn recover_entries_in(

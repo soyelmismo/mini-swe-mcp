@@ -30,9 +30,9 @@ use crate::worktree::{BaseSync, WorktreeGuard, git};
 use super::super::WorkerPool;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta};
-use super::super::revision::{WorkerHistory, append_history_message};
+use super::super::revision::{WorkerHistory, append_history_message_in};
 use super::super::state::WorkerState;
-use super::super::steer::drain_steer_messages;
+use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
@@ -312,7 +312,7 @@ impl<'a> TurnEngine<'a> {
     pub(super) async fn run_turn(&mut self, config: &TurnConfig<'_>) -> Result<TurnOutcome> {
         // --- Steering drain ---
         let mut steer_msgs = self.pool.take_pending_steer(self.worker_id).await;
-        let remote = drain_steer_messages(self.worker_id);
+        let remote = drain_steer_messages_in(&self.pool.scratch, self.worker_id);
         if !remote.is_empty() {
             info!(
                 worker = %self.worker_id,
@@ -1001,10 +1001,11 @@ impl<'a> TurnEngine<'a> {
         let meta = self.history_meta(config);
         let pending = std::mem::take(&mut self.unsaved_messages);
         let worker_id = self.worker_id.to_string();
+        let root = self.pool.scratch.clone();
         let step = *self.step;
         if let Err(e) = tokio::task::spawn_blocking(move || {
             for msg in &pending {
-                append_history_message(&worker_id, &meta, msg)?;
+                append_history_message_in(&root, &worker_id, &meta, msg)?;
             }
             Ok::<(), anyhow::Error>(())
         })

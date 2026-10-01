@@ -102,6 +102,7 @@ pub fn compact_for_request(
 /// The on-disk steer mailbox is only written for such a worker: a row whose
 /// pid is dead (or is this process, which already holds the worker map) has
 /// nobody to drain it, so the message continues the worker instead.
+#[allow(dead_code)]
 fn registry_row_live_elsewhere(id: &str) -> bool {
     load_registry_entry(id).is_some_and(|e| {
         e.status.is_live()
@@ -246,11 +247,11 @@ impl WorkerPool {
             manifest: Arc::new(ModelManifest::default()),
             scratch,
         }
+    }
 
     /// The scratch root this pool resolves every per-worker path under.
     pub fn scratch_root(&self) -> &ScratchRoot {
         &self.scratch
-    }
     }
 
     /// Subscribe before reading state so a concurrent change cannot be missed.

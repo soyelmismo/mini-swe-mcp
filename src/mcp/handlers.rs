@@ -418,7 +418,7 @@ impl McpServer {
                 "state": state,
                 "next_step": next_step,
             }))
-        } else if let Some(entry) = crate::pool::load_registry_entry(wid) {
+        } else if let Some(entry) = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid) {
             let state_name = entry.status.display_name();
             // A registry-only terminal row (collected worker, restarted hub)
             // carries the same review guidance as the live path.
@@ -597,7 +597,7 @@ impl McpServer {
         let killed = self.pool.kill(wid).await;
         if killed {
             Ok(json!({ "worker_id": wid, "killed": true }))
-        } else if let Some(entry) = crate::pool::load_registry_entry(wid)
+        } else if let Some(entry) = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
             && crate::worktree::is_process_alive(entry.pid)
         {
             #[cfg(unix)]

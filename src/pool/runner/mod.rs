@@ -35,9 +35,10 @@ use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
 use super::registry::{RegistryStatus, WorkerMeta};
-use super::revision::{WorkerHistory, append_history_message};
+use crate::worktree::ScratchRoot;
+use super::revision::{WorkerHistory, append_history_message_in};
 use super::state::WorkerState;
-use super::steer::remove_steer_file;
+use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
 
 pub(crate) mod history;
@@ -99,17 +100,20 @@ pub struct WorkerLaunchConfig {
 /// error), and a `remove_steer_file` call in each of them is exactly the kind
 /// of duplication that rots. A `Drop` impl cannot be forgotten on a new early
 /// return.
-struct SteerFileGuard(String);
+struct SteerFileGuard {
+    root: ScratchRoot,
+    worker_id: String,
+}
 
 impl SteerFileGuard {
-    fn new(worker_id: String) -> Self {
-        Self(worker_id)
+    fn new(root: ScratchRoot, worker_id: String) -> Self {
+        Self { root, worker_id }
     }
 }
 
 impl Drop for SteerFileGuard {
     fn drop(&mut self) {
-        remove_steer_file(&self.0);
+        remove_steer_file_in(&self.root, &self.worker_id);
     }
 }
 
@@ -166,7 +170,7 @@ impl WorkerPool {
         // Dropped on *every* exit path -- completion, error, cancellation -- so
         // a finished worker never leaves a mailbox behind for a future worker
         // reusing the id to inherit as phantom guidance.
-        let _steer_cleanup = SteerFileGuard::new(worker_id.clone());
+        let _steer_cleanup = SteerFileGuard::new(self.scratch.clone(), worker_id.clone());
 
         // A revision re-attaches to the branch the previous run committed to,
         // so the worker keeps its id, its checkpoints and its diff base; a
@@ -175,13 +179,15 @@ impl WorkerPool {
         let resume_base_commit = resume_base_commit.clone();
         let repo_path_owned = repo_path.clone();
         let worker_id_owned = worker_id.clone();
+        let scratch = self.scratch.clone();
         let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
             Some(base) => {
-                let mut guard = WorktreeGuard::reopen(&repo_path_owned, &worker_id_owned, base)?;
+                let mut guard =
+                    WorktreeGuard::reopen_in(&scratch, &repo_path_owned, &worker_id_owned, base)?;
                 guard.base_branch = resume_base_branch;
                 Ok(guard)
             }
-            None => WorktreeGuard::new(&repo_path_owned, &worker_id_owned),
+            None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned),
         })
         .await
         .context("Worktree checkout task failed")??;
@@ -234,8 +240,9 @@ impl WorkerPool {
             owner: Some(meta.owner.clone()),
             messages: Vec::new(),
         };
-        if !super::revision::history_log_path(&worker_id).exists()
-            && let Err(e) = Self::append_history_messages(&worker_id, &opening_meta, &messages)
+        if !super::revision::history_log_path_in(&self.scratch, &worker_id).exists()
+            && let Err(e) =
+                self.append_history_messages(&worker_id, &opening_meta, &messages)
         {
             warn!(
                 worker = %worker_id,
@@ -271,12 +278,13 @@ impl WorkerPool {
     /// Append `messages` to `worker_id`'s history log, creating it with the
     /// metadata line when it does not exist yet.
     fn append_history_messages(
+        &self,
         worker_id: &str,
         meta: &WorkerHistory,
         messages: &[ChatMessage],
     ) -> anyhow::Result<()> {
         for msg in messages {
-            append_history_message(worker_id, meta, msg)?;
+            append_history_message_in(&self.scratch, worker_id, meta, msg)?;
         }
         Ok(())
     }

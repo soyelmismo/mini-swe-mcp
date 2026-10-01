@@ -420,7 +420,7 @@ pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize 
         repo_path: String,
         branch: String,
     }
-    let Ok(root) = repo_root.canonicalize() else {
+    let Ok(repo) = repo_root.canonicalize() else {
         return 0;
     };
     let mut removed = 0;
@@ -450,12 +450,12 @@ pub fn prune_orphan_histories_in(root: &ScratchRoot, repo_root: &Path) -> usize 
             }) else {
                 continue;
             };
-            if Path::new(&owner.repo_path).canonicalize().ok().as_deref() != Some(root.as_path()) {
+            if Path::new(&owner.repo_path).canonicalize().ok().as_deref() != Some(repo.as_path()) {
                 continue;
             }
             let reference = format!("refs/heads/{}", owner.branch);
             let branch_exists = crate::worktree::git(
-                &root,
+                &repo,
                 "rev-parse",
                 &["rev-parse", "--verify", "--quiet", &reference],
             )
@@ -565,8 +565,8 @@ impl super::WorkerPool {
     async fn record_base_branch(&self, id: &str, base_branch: &str) {
         let base_branch = base_branch.to_string();
         let id = id.to_string();
+        let root = self.scratch.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let root = self.scratch.clone();
             let Some(mut entry) = super::load_registry_entry_in(&root, &id) else {
                 return;
             };

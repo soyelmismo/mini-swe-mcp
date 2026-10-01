@@ -71,11 +71,6 @@ pub fn steer_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
     root.join(format!("swe-wt-{worker_id}.steer"))
 }
 
-/// Path the mailbox is renamed to while a drainer reads it.
-fn claim_path(worker_id: &str) -> PathBuf {
-    claim_path_in(&ScratchRoot::from_env(), worker_id)
-}
-
 fn claim_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
     let path = steer_path_in(root, worker_id);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
