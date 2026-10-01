@@ -704,6 +704,18 @@ impl WorkerPool {
             revision: 0,
         };
 
+        if role == WorkerRole::Consolidate {
+            let repo = repo_path.clone();
+            let base = tokio::task::spawn_blocking(move || {
+                crate::worktree::git(&repo, "record round base", &["rev-parse", "HEAD"])
+            })
+            .await??;
+            anyhow::ensure!(base.status.success(), "Cannot record consolidator round base");
+            std::fs::write(
+                self.scratch.join(format!("swe-wt-{worker_id}.round-base")),
+                base.stdout,
+            )?;
+        }
         self.save_status(
             &meta,
             &model,
@@ -1276,7 +1288,14 @@ impl WorkerPool {
         if let Err(reason) = check_consolidate_delegation(actor, &entry) {
             return format!("{id} refused: {reason}");
         }
-        match self.steer_relaunchable(&target, message).await {
+        let round_base = std::fs::read_to_string(
+            self.scratch.join(format!("swe-wt-{}.round-base", actor.id)),
+        )
+        .ok()
+        .map(|base| base.trim().to_string())
+        .or_else(|| load_worker_history_in(&self.scratch, &actor.id).ok().map(|h| h.base_commit));
+        let source = steer::SteerSource { consolidator: actor.id.clone(), round_base };
+        match self.steer_relaunchable(&target, message, source).await {
             Ok(outcome) => format!(
                 "{target} {} (revision {})",
                 outcome.verb(),
@@ -1583,8 +1602,9 @@ impl WorkerPool {
         &'a self,
         id: &'a str,
         message: String,
+        source: steer::SteerSource,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<SteerOutcome>> + Send + 'a>> {
-        Box::pin(self.steer(id, message))
+        Box::pin(self.steer_from(id, message, None, Some(source)))
     }
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
@@ -1595,6 +1615,38 @@ impl WorkerPool {
     /// worker was `Queued` or `Resumed`, a stopped one was `Continuing` -- as
     /// a revision of its saved conversation, or cold when none survived.
     pub async fn steer_with_budget(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+    ) -> Result<SteerOutcome> {
+        self.steer_from(id, message, revision_turns, None).await
+    }
+
+    async fn steer_from(
+        &self,
+        id: &str,
+        message: String,
+        revision_turns: Option<usize>,
+        source: Option<steer::SteerSource>,
+    ) -> Result<SteerOutcome> {
+        // Record before delivery: the resumed worker can immediately pause again.
+        let previous = steer::read_source(&self.scratch, id);
+        steer::write_source(&self.scratch, id, source.as_ref())?;
+        let result = self.deliver_steer(id, message, revision_turns).await;
+        if result.is_err() {
+            steer::write_source(&self.scratch, id, previous.as_ref())?;
+        }
+        self.notify_change();
+        result
+    }
+
+    /// Whether a paused worker's answer belongs to its last steering consolidator.
+    pub fn question_for_consolidator(&self, id: &str) -> bool {
+        steer::read_source(&self.scratch, id).is_some()
+    }
+
+    async fn deliver_steer(
         &self,
         id: &str,
         message: String,
