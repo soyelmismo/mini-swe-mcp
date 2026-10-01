@@ -27,6 +27,10 @@ pub enum RegistryStatus {
     Reviewing,
     Completed,
     Failed,
+    /// The worker ran out of turns before it completed. Terminal and
+    /// continuable: its branch is checkpointed, but it must not be integrated
+    /// as a finished contribution.
+    Exhausted,
     Stopped,
     /// A hub crash interrupted a live worker. Terminal for listing -- its
     /// uptime is frozen -- but continuable: its branch and its conversation
@@ -39,7 +43,11 @@ impl RegistryStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Stopped | Self::Interrupted
+            Self::Completed
+                | Self::Failed
+                | Self::Exhausted
+                | Self::Stopped
+                | Self::Interrupted
         )
     }
 
@@ -56,6 +64,7 @@ impl RegistryStatus {
             Self::Reviewing => "Reviewing",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
+            Self::Exhausted => "Exhausted",
             Self::Stopped => "Stopped",
             Self::Interrupted => "Interrupted",
         }

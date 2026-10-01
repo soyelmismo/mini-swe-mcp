@@ -48,7 +48,7 @@ pub fn format_status_line(entries: &[WorkerRegistryEntry], now: u64) -> String {
             RegistryStatus::Paused => 1,
             RegistryStatus::Completed => 2,
             RegistryStatus::Failed => 3,
-            RegistryStatus::Stopped => 4,
+            RegistryStatus::Exhausted | RegistryStatus::Stopped => 4,
             RegistryStatus::Interrupted => 5,
         };
         counts[index] += 1;
@@ -606,6 +606,7 @@ struct RepoGroup<'a> {
     reviewing: usize,
     completed: usize,
     failed: usize,
+    exhausted: usize,
     stopped: usize,
 }
 
@@ -619,6 +620,7 @@ impl<'a> RepoGroup<'a> {
             reviewing: 0,
             completed: 0,
             failed: 0,
+            exhausted: 0,
             stopped: 0,
         }
     }
@@ -631,6 +633,7 @@ impl<'a> RepoGroup<'a> {
             RegistryStatus::Reviewing => self.reviewing += 1,
             RegistryStatus::Completed => self.completed += 1,
             RegistryStatus::Failed => self.failed += 1,
+            RegistryStatus::Exhausted => self.exhausted += 1,
             RegistryStatus::Stopped => self.stopped += 1,
             RegistryStatus::Interrupted => self.stopped += 1,
         }
@@ -651,6 +654,7 @@ impl<'a> RepoGroup<'a> {
             ("reviewing", self.reviewing, MAGENTA),
             ("completed", self.completed, BLUE),
             ("failed", self.failed, RED),
+            ("exhausted", self.exhausted, DIM),
             ("stopped", self.stopped, DIM),
         ]
         .into_iter()
@@ -682,6 +686,7 @@ pub fn render_dashboard_with_width(
     let mut paused = 0;
     let mut completed = 0;
     let mut failed = 0;
+    let mut exhausted = 0;
     let mut stopped = 0;
     let mut reviewing = 0;
 
@@ -697,6 +702,7 @@ pub fn render_dashboard_with_width(
             RegistryStatus::Reviewing => reviewing += 1,
             RegistryStatus::Completed => completed += 1,
             RegistryStatus::Failed => failed += 1,
+            RegistryStatus::Exhausted => exhausted += 1,
             RegistryStatus::Stopped => stopped += 1,
             RegistryStatus::Interrupted => stopped += 1,
         }
@@ -735,6 +741,7 @@ pub fn render_dashboard_with_width(
             ("Reviewing", reviewing.to_string(), MAGENTA),
             ("Completed", completed.to_string(), BLUE),
             ("Failed", failed.to_string(), RED),
+            ("Exhausted", exhausted.to_string(), DIM),
             ("Stopped", stopped.to_string(), DIM),
             ("Total", total.to_string(), BOLD),
             ("Repos", repos.len().to_string(), BOLD),

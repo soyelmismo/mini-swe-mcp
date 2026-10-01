@@ -724,6 +724,21 @@ mod tests {
             .step(),
             3
         );
+        assert_eq!(
+            WorkerState::Exhausted {
+                turns: 7,
+                diff: String::new(),
+                summary: String::new(),
+                stopped_at: 0,
+                artifacts: Vec::new(),
+                branch: None,
+                metrics: WorkerMetrics::default(),
+                revision: 0,
+                report: None,
+            }
+            .step(),
+            7
+        );
     }
 
     #[test]
@@ -811,9 +826,12 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
         };
+        let exhausted = exhausted_at(1_700_000_002);
         assert!(!matches!(running, WorkerState::Completed { .. }));
         assert!(matches!(completed, WorkerState::Completed { .. }));
         assert!(matches!(failed, WorkerState::Failed { .. }));
+        assert!(matches!(exhausted, WorkerState::Exhausted { .. }));
+        assert_eq!(record_with(exhausted).terminal_at(), Some(1_700_000_002));
     }
 
     fn record_with(state: WorkerState) -> WorkerRecord {
@@ -857,6 +875,20 @@ mod tests {
         }
     }
 
+    fn exhausted_at(when: u64) -> WorkerState {
+        WorkerState::Exhausted {
+            turns: 1,
+            diff: String::new(),
+            summary: String::new(),
+            stopped_at: when,
+            artifacts: Vec::new(),
+            branch: None,
+            metrics: WorkerMetrics::default(),
+            revision: 0,
+            report: None,
+        }
+    }
+
     // ----------
     // Terminal-record TTL (audit 07, R3)
     // ----------
@@ -867,6 +899,10 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert("old-done".to_string(), record_with(completed_at(now - 400)));
         workers.insert("old-failed".to_string(), record_with(failed_at(now - 400)));
+        workers.insert(
+            "old-exhausted".to_string(),
+            record_with(exhausted_at(now - 400)),
+        );
         workers.insert("fresh-done".to_string(), record_with(completed_at(now)));
         workers.insert(
             "running".to_string(),
@@ -888,7 +924,11 @@ mod tests {
         let expired = expired_terminal_ids(&workers, DEFAULT_TERMINAL_TTL_SECS);
         assert_eq!(
             expired,
-            vec!["old-done".to_string(), "old-failed".to_string()],
+            vec![
+                "old-done".to_string(),
+                "old-exhausted".to_string(),
+                "old-failed".to_string()
+            ],
             "only aged terminal records may be evicted"
         );
     }
