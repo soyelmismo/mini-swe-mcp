@@ -582,6 +582,39 @@ pub fn retention_expired(updated_at: u64, retention_secs: u64, now: u64) -> bool
     updated_at != 0 && now.saturating_sub(updated_at) >= retention_secs
 }
 
+/// Default grace period (seconds) a worker's row and saved conversation are
+/// kept after its branch disappears.
+///
+/// A merged worker branch is pruned on the next dispatch, but the orchestrator
+/// may still revert that merge (a failing batch gate) and continue the worker,
+/// so its row and conversation outlive the branch for this long before the
+/// orphan sweep retires them. Overridable through `WORKER_RETIRED_GRACE_SECS`.
+pub const DEFAULT_WORKER_RETIRED_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// The retired grace an operator configured, or
+/// [`DEFAULT_WORKER_RETIRED_GRACE_SECS`].
+///
+/// Read from the environment on each call, exactly like
+/// [`terminal_retention_secs`]: a non-positive or unparseable value falls back
+/// to the default rather than to "retire everything now".
+pub fn worker_retired_grace_secs() -> u64 {
+    std::env::var("WORKER_RETIRED_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_WORKER_RETIRED_GRACE_SECS)
+}
+
+/// Whether a row last written at `updated_at` is still inside the grace period
+/// during which it survives its branch's disappearance.
+///
+/// A row that never recorded an age (`updated_at` of zero, written before the
+/// field existed) is *kept*: an unknown age must not be read as an ancient one,
+/// exactly as [`retention_expired`]. A zero `grace_secs` retires immediately.
+pub fn within_retired_grace(updated_at: u64, grace_secs: u64, now: u64) -> bool {
+    updated_at == 0 || now.saturating_sub(updated_at) < grace_secs
+}
+
 /// Ids of `Completed`/`Failed` records that reached the terminal TTL (audit 07, R3).
 ///
 /// * A `Running`/`Paused` record is *never* expired, whatever its age.

@@ -74,9 +74,9 @@ pub use self::revision::{
     history_log_path, history_log_path_in, history_path, history_path_in, is_replayable,
     load_worker_history, load_worker_history_in, load_worker_history_log,
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
-    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, save_worker_history,
-    save_worker_history_in,
+    prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
+    remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
+    retire_worker, retire_worker_in, save_worker_history, save_worker_history_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
@@ -88,10 +88,11 @@ pub use self::runner::{
     parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat,
-    TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord,
-    WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
-    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
+    DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner,
+    WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport, WorkerState, churn_line,
+    diff_sections_of, file_stats_of_diff, normalize_diff_path, retention_expired, same_diff_path,
+    terminal_retention_secs, within_retired_grace, worker_retired_grace_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
