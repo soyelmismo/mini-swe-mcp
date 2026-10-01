@@ -13,8 +13,8 @@ pub fn format_status(val: &serde_json::Value) -> String {
     out.push_str(&format!("State: {tag}\n"));
     let field = |key: &str| details.and_then(|d| d.get(key));
 
-    // One line for the progress clock: the step against its budget, then how
-    // long the worker has run and which revision it is.
+    // One line for the progress clock: the step against its budget and how
+    // long the worker has run.
     let mut progress = Vec::new();
     if let Some(step) = field("step")
         .or_else(|| field("turns"))

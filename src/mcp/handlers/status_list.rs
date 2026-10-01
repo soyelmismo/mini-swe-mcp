@@ -72,6 +72,13 @@ impl McpServer {
             } else {
                 None
             };
+            // A terminal row stopped the clock at its last write; a live row is
+            // still running, so it is measured to now.
+            let elapsed = if entry.status.is_terminal() {
+                entry.updated_at.saturating_sub(entry.started_at)
+            } else {
+                crate::pool::unix_timestamp().saturating_sub(entry.started_at)
+            };
             Ok(json!({
                 "worker_id": wid,
                 "owner": crate::pool::registry_owner_label(&entry),
@@ -92,6 +99,7 @@ impl McpServer {
                         "question": entry.question,
                         "pid": entry.pid,
                         "started_at": entry.started_at,
+                        "elapsed": elapsed,
                         "metrics": entry.metrics,
                     }
                 },
@@ -219,6 +227,7 @@ fn compact_status_details(
             branch,
             verified,
             revision,
+            report,
             ..
         } => {
             details.insert("summary".into(), json!(summary));
@@ -226,6 +235,9 @@ fn compact_status_details(
             details.insert("branch".into(), json!(branch));
             details.insert("verified".into(), json!(verified));
             details.insert("revision".into(), json!(revision));
+            // The report is a handful of fields, not the diff: it travels so a
+            // live completion answers the same question its registry row does.
+            details.insert("report".into(), json!(report));
         }
         crate::pool::WorkerState::Failed {
             error, revision, ..
@@ -238,6 +250,7 @@ fn compact_status_details(
             artifacts,
             branch,
             revision,
+            report,
             ..
         } => {
             details.insert("summary".into(), json!(summary));
@@ -245,6 +258,7 @@ fn compact_status_details(
             details.insert("branch".into(), json!(branch));
             details.insert("revision".into(), json!(revision));
             details.insert("reason".into(), json!(crate::pool::TURN_BUDGET_EXHAUSTED));
+            details.insert("report".into(), json!(report));
         }
     }
     Value::Object(details)
