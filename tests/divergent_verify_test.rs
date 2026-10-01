@@ -313,6 +313,33 @@ async fn secrets_never_reach_variant_b() {
             .any(|(name, _)| name == "SWE_DIVERGENT_API_TOKEN_CHECK"),
         "secret names must be dropped by the daemon-side decode as well"
     );
+    // A credential can hide in a *value* under an innocent name: the daemon
+    // applies the same value filter, so a tampered frame cannot smuggle one in.
+    let decoded = mini_swe_mcp::hub::decode_ambient_env(&serde_json::json!([
+        {"name": "SWE_DIVERGENT_URL_CHECK", "value": "postgres://app:hunter2@db.internal:5432/prod"},
+        {"name": "SWE_DIVERGENT_PROXY_CHECK", "value": "http://user:s3cret@proxy.internal:8080"},
+        {"name": "SWE_DIVERGENT_BLOB_CHECK", "value": "-----BEGIN RSA PRIVATE KEY-----"},
+    ]));
+    assert!(
+        !decoded
+            .iter()
+            .any(|(name, _)| name == "SWE_DIVERGENT_URL_CHECK"),
+        "a credentialed URL must not survive the daemon-side decode"
+    );
+    assert!(
+        !decoded
+            .iter()
+            .any(|(name, _)| name == "SWE_DIVERGENT_BLOB_CHECK"),
+        "a PEM block must not survive the daemon-side decode"
+    );
+    assert_eq!(
+        decoded
+            .iter()
+            .find(|(name, _)| name == "SWE_DIVERGENT_PROXY_CHECK")
+            .map(|(_, value)| value.as_str()),
+        None,
+        "a non-proxy name carrying proxy credentials is dropped whole"
+    );
 
     // And end to end: a suite that fails when the secret is visible passes,
     // because variant B never sees it.

@@ -295,6 +295,129 @@ pub fn is_secret_name(name: &str) -> bool {
         .any(|marker| upper.contains(marker))
 }
 
+/// Variable names that carry a proxy endpoint, where the userinfo is
+/// redacted rather than the whole value dropped.
+///
+/// A proxy setting is useful to the differential run even without its
+/// credentials - it still points at the right host and port - so only the
+/// `user:password@` part is stripped.
+const PROXY_VAR_NAMES: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "NO_PROXY",
+];
+
+/// Shortest run of token characters that marks a value as a credential.
+///
+/// A 32-character run of `[A-Za-z0-9_-]` is the shape every API key, git token
+/// and session id has, and no legitimate configuration value is a single
+/// unbroken run of that length: paths, URLs and locale names all carry a
+/// separator inside them.
+const TOKEN_RUN_MIN: usize = 32;
+
+/// Whether `value` is a URL whose userinfo carries a password.
+///
+/// `scheme://user:password@host` is how a proxy, a database and a git remote
+/// all embed a credential; the scheme is validated so an ordinary value that
+/// merely contains `://` is not mistaken for one.
+fn url_userinfo_has_password(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    scheme_ok
+        && rest
+            .split_once('@')
+            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+}
+
+/// Strip the `user:password@` userinfo from a URL, keeping the endpoint.
+fn redact_url_userinfo(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    match rest.split_once('@') {
+        Some((_, host)) => format!("{scheme}://{host}"),
+        None => value.to_string(),
+    }
+}
+
+/// Whether `value` is a bearer token, a JWT or a PEM block.
+///
+/// All three are credentials that arrive under an innocent name: an
+/// `Authorization` header value, a signed session cookie, a private key pasted
+/// into a variable. Each has a shape that no configuration value has.
+fn looks_like_credential_blob(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.starts_with("-----BEGIN") {
+        return true;
+    }
+    // JWT: three base64url segments, the first two of which decode to JSON
+    // objects (hence the `eyJ` prefix of `{"`).
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() == 3
+        && trimmed.starts_with("eyJ")
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        })
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether `value` contains an unbroken run of at least
+/// [`TOKEN_RUN_MIN`] token characters.
+fn has_long_token_run(value: &str) -> bool {
+    let mut run = 0usize;
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+            run += 1;
+            if run >= TOKEN_RUN_MIN {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// Whether `name` is a proxy variable, compared case-insensitively.
+fn is_proxy_name(name: &str) -> bool {
+    PROXY_VAR_NAMES
+        .iter()
+        .any(|proxy| name.eq_ignore_ascii_case(proxy))
+}
+
+/// The value `name`/`value` may contribute to an ambient snapshot.
+///
+/// `None` drops the variable entirely; `Some` carries a possibly redacted
+/// value. A name that is credential-bearing is dropped before its value is
+/// ever inspected, and a value that *is* a credential is dropped (or, for a
+/// proxy, reduced to its endpoint) whatever its name is - a password under
+/// `DATABASE_URL` or a token under `BUILD_ID` must not travel either.
+pub fn sanitize_ambient_value(name: &str, value: &str) -> Option<String> {
+    if is_secret_name(name) {
+        return None;
+    }
+    if url_userinfo_has_password(value) {
+        return is_proxy_name(name).then(|| redact_url_userinfo(value));
+    }
+    if looks_like_credential_blob(value) || has_long_token_run(value) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// The caller's environment, filtered for transport to the daemon.
 ///
 /// Every variable of this process that is not credential-bearing
@@ -310,11 +433,8 @@ pub fn ambient_environment_snapshot() -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.to_string_lossy().into_owned();
-            if is_secret_name(&name) {
-                return None;
-            }
             let value = value.to_string_lossy().into_owned();
-            (!value.is_empty()).then_some((name, value))
+            sanitize_ambient_value(&name, &value).map(|value| (name, value))
         })
         .collect();
     pairs.sort();
@@ -720,11 +840,18 @@ mod tests {
         unsafe {
             std::env::set_var("SWE_AMBIENT_PLAIN_TEST", "hello");
             std::env::set_var("SWE_AMBIENT_SECRET_TOKEN_TEST", "must-not-travel");
+            std::env::set_var(
+                "SWE_AMBIENT_URL_TEST",
+                "postgres://app:hunter2@db.internal:5432/prod",
+            );
+            std::env::set_var("http_proxy", "http://user:s3cret@proxy.internal:8080");
         }
         let snapshot = ambient_environment_snapshot();
         unsafe {
             std::env::remove_var("SWE_AMBIENT_PLAIN_TEST");
             std::env::remove_var("SWE_AMBIENT_SECRET_TOKEN_TEST");
+            std::env::remove_var("SWE_AMBIENT_URL_TEST");
+            std::env::remove_var("http_proxy");
         }
         assert!(
             snapshot
@@ -737,6 +864,18 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k == "SWE_AMBIENT_SECRET_TOKEN_TEST"),
             "secret names must not survive the snapshot"
+        );
+        assert!(
+            !snapshot.iter().any(|(k, _)| k == "SWE_AMBIENT_URL_TEST"),
+            "a credentialed URL under an innocent name must not survive the snapshot"
+        );
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(k, _)| k == "http_proxy")
+                .map(|(_, v)| v.as_str()),
+            Some("http://proxy.internal:8080"),
+            "a proxy keeps its endpoint and loses its password"
         );
     }
 

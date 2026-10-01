@@ -171,15 +171,18 @@ pub fn decode_ambient_env(frame: &Value) -> Vec<(String, String)> {
         if name.is_empty() || value.is_empty() {
             continue;
         }
-        if crate::agent::env::is_secret_name(name) {
+        // The same value filter the client applied, so a frame that was
+        // tampered with (or built by an older client) still cannot carry a
+        // credential under an innocent name.
+        let Some(value) = crate::agent::env::sanitize_ambient_value(name, value) else {
             continue;
-        }
+        };
         let cost = name.len() + value.len() + 2;
         if total + cost > crate::agent::env::AMBIENT_ENV_MAX_BYTES {
             break;
         }
         total += cost;
-        out.push((name.to_string(), value.to_string()));
+        out.push((name.to_string(), value));
     }
     out
 }
