@@ -150,9 +150,10 @@ impl RoundManifest {
     /// respected its task's scope and so needs the whole text. Every worker
     /// listed (ready first, then not ready) contributes one entry, each task
     /// bounded by [`FULL_TASK_BUDGET`] with a `[truncated]` marker when it is
-    /// cut, and the whole section bounded by [`FULL_TASKS_BUDGET`] so a verbose
-    /// round cannot flood the prompt; work left out by the section budget is
-    /// counted rather than silently dropped.
+    /// cut, and the whole section — the omitted-count footer included,
+    /// when one is written — bounded by [`FULL_TASKS_BUDGET`] bytes, so
+    /// a verbose round cannot flood the prompt; work the budget leaves
+    /// out is counted rather than silently dropped.
     ///
     /// Returns an empty string when the round lists no worker, so a caller can
     /// splice it unconditionally.
@@ -165,7 +166,19 @@ impl RoundManifest {
              worker's own text below; the manifest above keeps only each task's first \
              line):\n",
         );
-        let mut remaining = FULL_TASKS_BUDGET.saturating_sub(out.len());
+        // The section ends with the omitted-count footer whenever any
+        // worker is left out, so the footer's bytes are part of the
+        // budget: entries stop `FOOTER_BUDGET` early, at a whole
+        // worker, and the finished section (footer included) is at
+        // most `FULL_TASKS_BUDGET` bytes.
+        let footer = format!(
+            "({} further worker task(s) omitted: section budget reached)\n",
+            self.ready.len() + self.not_ready.len()
+        );
+        let footer = footer.len().min(FOOTER_BUDGET);
+        let mut remaining = FULL_TASKS_BUDGET
+            .saturating_sub(out.len())
+            .saturating_sub(footer);
         let mut omitted = 0usize;
         for worker in self.ready.iter().chain(self.not_ready.iter()) {
             let task = bound_task(&worker.full_task, FULL_TASK_BUDGET);
@@ -192,8 +205,15 @@ impl RoundManifest {
 const FULL_TASK_BUDGET: usize = 4 * 1024;
 
 /// Overall byte budget for the full-task section, so a round of many verbose
-/// workers cannot flood the consolidator's prompt.
+/// workers cannot flood the consolidator's prompt. The section never
+/// exceeds it, omitted-count footer included.
 const FULL_TASKS_BUDGET: usize = 16 * 1024;
+
+/// Ceiling for the omitted-count footer the section ends with. The
+/// count is bounded by the round's worker list, so the real footer is
+/// rarely this long; reserving the ceiling keeps the entry budget
+/// valid for every count.
+const FOOTER_BUDGET: usize = 128;
 
 /// Marker appended to a task cut to [`FULL_TASK_BUDGET`].
 const TASK_TRUNCATION_MARKER: &str = "\n[truncated]";
@@ -382,4 +402,91 @@ fn touched_files(repo: &Path, base: &str, branch: &str) -> Vec<String> {
 /// Run a git probe that answers with its exit status alone.
 fn git_ok(repo: &Path, args: &[&str]) -> bool {
     crate::worktree::git(repo, args[0], args).is_ok_and(|output| output.status.success())
+}
+
+#[cfg(test)]
+mod round_tests {
+    use super::*;
+
+    /// A worker row for the section's bounds: one that always needs
+    /// its per-worker truncation, and one heading-only task.
+    fn worker(id: &str, full_task: &str) -> RoundWorker {
+        RoundWorker {
+            id: id.to_string(),
+            state: "Completed".to_string(),
+            verified: None,
+            task: first_line(full_task),
+            full_task: full_task.to_string(),
+            files: Vec::new(),
+        }
+    }
+
+    /// The whole section, footer included, stays inside the documented
+    /// budget: the omitted-count footer is reserved space, not a
+    /// suffix that pushes the section past the cap.
+    #[test]
+    fn the_full_task_section_never_exceeds_its_budget() {
+        let many = RoundManifest {
+            group: "g".to_string(),
+            base_branch: None,
+            ready: (0..8)
+                .map(|i| {
+                    worker(
+                        &format!("w{i}"),
+                        &format!("heading {i}\n{}", "z".repeat(4 * 1024)),
+                    )
+                })
+                .collect(),
+            not_ready: Vec::new(),
+            interaction_points: Vec::new(),
+        };
+        let section = many.render_full_tasks();
+        assert!(
+            section.contains("omitted"),
+            "a round this size must leave workers out: {section}"
+        );
+        assert!(
+            section.len() <= FULL_TASKS_BUDGET,
+            "the footer is reserved space, not an addition: {} bytes over {}: {}",
+            section.len().saturating_sub(FULL_TASKS_BUDGET),
+            FULL_TASKS_BUDGET,
+            &section[section.len().saturating_sub(160).min(section.len())..],
+        );
+    }
+
+    /// A section with nothing omitted carries no footer and stays
+    /// bounded too.
+    #[test]
+    fn the_full_task_section_without_omissions_has_no_footer() {
+        let small = RoundManifest {
+            group: "g".to_string(),
+            base_branch: None,
+            ready: vec![worker("w1", "one task\nbody")],
+            not_ready: Vec::new(),
+            interaction_points: Vec::new(),
+        };
+        let section = small.render_full_tasks();
+        assert_eq!(
+            section,
+            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the worker's own text below; the manifest above keeps only each task's first line):\n### w1:\none task\nbody\n",
+            "{section}"
+        );
+        assert!(section.len() <= FULL_TASKS_BUDGET);
+    }
+
+    /// The per-worker bound holds exactly at the budget and never
+    /// splits a code point: a task one byte over keeps its marker.
+    #[test]
+    fn a_task_is_bounded_per_worker_without_splitting_a_code_point() {
+        let exact = "a".repeat(FULL_TASK_BUDGET);
+        assert_eq!(bound_task(&exact, FULL_TASK_BUDGET), exact);
+        let over = format!("{exact}b");
+        let bounded = bound_task(&over, FULL_TASK_BUDGET);
+        assert!(
+            bounded.ends_with(TASK_TRUNCATION_MARKER),
+            "an oversized task must be marked: {bounded}"
+        );
+        assert!(bounded.len() <= FULL_TASK_BUDGET, "{bounded}");
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
 }
