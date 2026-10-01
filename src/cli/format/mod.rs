@@ -13,7 +13,7 @@
 //! The renderers themselves are split by what they describe:
 //!
 //! * `worker` — the per-worker inspection verbs: `status`, `collect`, `review`,
-//!   `logs`, `dispatch`, `steer`, `watch`, `kill`, `reap`, plus the shared
+//!   `logs`, `dispatch`, `consolidate`, `steer`, `watch`, `kill`, `reap`, plus the shared
 //!   `log_counters_line` helper that keeps step-log truncation visible (audit 07, R7) and the
 //!   `health_line` that keeps a run's quality measurable.
 //! * `catalog` — the system-catalog verbs: `manifest`, `list`, `prune`.
@@ -27,8 +27,8 @@ mod worker;
 
 pub use self::catalog::{format_list, format_manifest, format_prune};
 pub use self::worker::{
-    format_collect, format_dispatch, format_kill, format_logs, format_merge, format_reap,
-    format_review, format_status, format_steer, health_line, log_counters_line,
+    format_collect, format_consolidate, format_dispatch, format_kill, format_logs, format_merge,
+    format_reap, format_review, format_status, format_steer, health_line, log_counters_line,
 };
 
 /// Render `val` for `action`, falling back to pretty JSON for actions with no
@@ -44,6 +44,7 @@ pub fn format_output(action: &str, val: &serde_json::Value) -> String {
         "logs" => format_logs(val),
         "reap" => format_reap(val),
         "dispatch" => format_dispatch(val),
+        "consolidate" => format_consolidate(val),
         "steer" => format_steer(val),
         "kill" => format_kill(val),
         "merge" => format_merge(val),
@@ -88,6 +89,11 @@ mod tests {
                 "kill",
                 "Worker w was not running.",
                 r#"{"worker_id":"w","killed":false}"#,
+            ),
+            (
+                "consolidate",
+                "Consolidator w dispatched for group g: 0 ready, 0 not ready, 0 interaction points",
+                r#"{"worker_id":"w","group":"g"}"#,
             ),
         ];
         for (action, needle, json) in cases {
