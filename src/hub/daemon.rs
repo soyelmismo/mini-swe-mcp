@@ -75,6 +75,16 @@ const DEFAULT_IDLE_SECS: u64 = 600;
 /// How often the idle watchdog re-checks the daemon's liveness.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Artificial delay before startup recovery, from the environment.
+///
+/// It exists only so a test can hold recovery open long enough to observe a
+/// client being served while it runs; production never sets it.
+fn recovery_delay() -> Duration {
+    crate::config::env_parse::<u64>("MINI_SWE_HUB_RECOVERY_DELAY_MS")
+        .map(Duration::from_millis)
+        .unwrap_or_default()
+}
+
 /// How long a starting daemon waits for a predecessor to release `hub.lock`
 /// after the predecessor removed its socket.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -407,6 +417,44 @@ impl HubServer {
         resumed
     }
 
+    /// Recover the previous hub's workers and auto-continue them, then open
+    /// the recovery gate.
+    ///
+    /// Runs concurrently with the accept loop: the gate stays closed until the
+    /// pool reflects the recovered registry, so a worker-state request that
+    /// arrives first waits instead of reading a half-recovered pool.
+    async fn recover_and_resume(&self) {
+        let delay = recovery_delay();
+        if !delay.is_zero() {
+            info!(?delay, "Delaying startup recovery (test hook)");
+            tokio::time::sleep(delay).await;
+        }
+        match tokio::task::spawn_blocking(crate::pool::recover_orphaned_workers).await {
+            Ok(recovered) => {
+                info!(workers = recovered, "Recovered orphaned hub workers");
+                append_log(
+                    &self.config.paths().log(),
+                    &format!("recovered {recovered} orphaned workers"),
+                );
+            }
+            Err(e) => error!(error = %e, "Hub recovery task failed"),
+        }
+
+        // Every interrupted worker with a surviving conversation is continued
+        // automatically: it stopped because the hub did, not because it could
+        // not go on. Capped per worker so a worker the hub keeps losing is left
+        // to the orchestrator instead of being restarted forever.
+        let resumed = self.auto_resume_interrupted().await;
+        if resumed > 0 {
+            info!(workers = resumed, "Auto-continued interrupted workers");
+            append_log(
+                &self.config.paths().log(),
+                &format!("auto-continued {resumed} workers"),
+            );
+        }
+        self.server.finish_recovery();
+    }
+
     /// Wait out a predecessor that removed `hub.sock` but still holds
     /// `hub.lock`.
     ///
@@ -457,30 +505,19 @@ impl HubServer {
         // graceful shutdown path below.
         let _socket_cleanup = FallbackSocketGuard::new(&socket, paths.dir());
         let _ = std::fs::remove_file(&socket);
-        let recovered = tokio::task::spawn_blocking(crate::pool::recover_orphaned_workers)
-            .await
-            .context("Hub recovery task failed")?;
-        info!(workers = recovered, "Recovered orphaned hub workers");
-        append_log(
-            &paths.log(),
-            &format!("recovered {recovered} orphaned workers"),
-        );
-
-        // Every interrupted worker with a surviving conversation is continued
-        // automatically: it stopped because the hub did, not because it could
-        // not go on. Capped per worker so a worker the hub keeps losing is left
-        // to the orchestrator instead of being restarted forever.
-        let resumed = self.auto_resume_interrupted().await;
-        if resumed > 0 {
-            info!(workers = resumed, "Auto-continued interrupted workers");
-            append_log(&paths.log(), &format!("auto-continued {resumed} workers"));
-        }
-
         let endpoint = paths.endpoint();
         let listener = bind_endpoint(&endpoint)?;
 
         info!(socket = %endpoint, idle_secs = self.config.idle_secs(), "Hub daemon listening");
         append_log(&paths.log(), "listening");
+
+        // Recovery - the git salvage of every orphaned worktree - can take
+        // seconds with many workers, so it runs concurrently with serving
+        // instead of before the socket exists. The gate keeps worker-state
+        // requests correct meanwhile: they wait until the pool is recovered.
+        self.server.begin_recovery();
+        let recovering = self.clone();
+        let recovery_task = tokio::spawn(async move { recovering.recover_and_resume().await });
 
         let events = self.server.start_hub_events().await;
         let mut shutdown = self.server.subscribe_shutdown();
@@ -531,6 +568,7 @@ impl HubServer {
         }
 
         idle_task.abort();
+        recovery_task.abort();
         reaper.abort();
         events.abort();
         let killed = self.server.pool().kill_all().await;

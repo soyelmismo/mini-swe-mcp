@@ -47,26 +47,46 @@ async fn wait_for_socket(path: &Path) {
     panic!("hub socket {} never came up", path.display());
 }
 
+/// One worker's registry row, panicking on a missing or malformed file.
+fn read_registry_row(registry: &Path, wid: &str) -> mini_swe_mcp::pool::WorkerRegistryEntry {
+    let path = registry.join(format!("{wid}.json"));
+    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+}
+
 /// Wait until the worker's registry row reports `status`, or return the last
 /// row read at the deadline.
 ///
-/// The hub recovers orphans before it binds its socket, but a child of the
-/// killed hub can keep the previous listener alive, so [`wait_for_socket`] may
-/// return while the row still carries its pre-crash status: poll for the write.
+/// The daemon binds its socket before startup recovery finishes, so
+/// [`wait_for_socket`] may return while the row still carries its pre-crash
+/// status: poll for the write.
 async fn wait_for_registry_status(
     registry: &Path,
     wid: &str,
     status: mini_swe_mcp::pool::RegistryStatus,
 ) -> mini_swe_mcp::pool::WorkerRegistryEntry {
-    let path = registry.join(format!("{wid}.json"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let row: mini_swe_mcp::pool::WorkerRegistryEntry =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let row = read_registry_row(registry, wid);
         if row.status == status || std::time::Instant::now() >= deadline {
             return row;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Blocking [`wait_for_registry_status`] for the synchronous daemon tests.
+fn wait_for_registry_status_blocking(
+    registry: &Path,
+    wid: &str,
+    status: mini_swe_mcp::pool::RegistryStatus,
+) -> mini_swe_mcp::pool::WorkerRegistryEntry {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let row = read_registry_row(registry, wid);
+        if row.status == status || std::time::Instant::now() >= deadline {
+            return row;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -820,7 +840,7 @@ async fn a_hub_connection_only_controls_its_own_workers() {
 /// saved history survives for a later revision.
 #[test]
 fn daemon_recovers_an_orphaned_worker_on_startup() {
-    use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry};
+    use mini_swe_mcp::pool::RegistryStatus;
     use std::process::{Command, Stdio};
 
     fn git(repo: &Path, args: &[&str]) {
@@ -943,11 +963,13 @@ fn daemon_recovers_an_orphaned_worker_on_startup() {
             .exists(),
         "daemon must listen after recovery"
     );
-    let entry: WorkerRegistryEntry = serde_json::from_slice(
-        &std::fs::read(swe.join("swe-registry").join(format!("{wid}.json")))
-            .expect("the orphan row survives recovery"),
-    )
-    .expect("registry JSON");
+    // The daemon listens before recovery finishes, so poll for the rewrite
+    // instead of reading the row the moment the socket appears.
+    let entry = wait_for_registry_status_blocking(
+        &swe.join("swe-registry"),
+        wid,
+        RegistryStatus::Interrupted,
+    );
     // Interrupted, not failed: the worker stopped because the hub did, so it is
     // terminal for listing but continuable with `steer`.
     assert_eq!(

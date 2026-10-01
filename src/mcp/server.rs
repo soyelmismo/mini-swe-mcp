@@ -44,6 +44,45 @@ pub struct McpServer {
     /// client can tell a rebuilt binary from the daemon already serving.
     daemon_build: Arc<Value>,
     hub_shutdown_gate: Arc<RwLock<bool>>,
+    /// Closed by the hub daemon while startup recovery runs; see
+    /// [`RecoveryGate`].
+    recovery: Arc<RecoveryGate>,
+}
+
+/// A one-way readiness gate for hub startup recovery.
+///
+/// Worker-state requests wait on it so a client that connected before the
+/// daemon finished recovering orphaned workers observes the recovered pool
+/// rather than a half-recovered one. It is open from construction: only the
+/// hub daemon closes it (see [`McpServer::begin_recovery`]), so the stdio
+/// transport and in-process callers never wait.
+struct RecoveryGate {
+    ready: watch::Sender<bool>,
+}
+
+impl RecoveryGate {
+    /// A gate that is already open, so a non-daemon caller never waits.
+    fn open() -> Self {
+        Self {
+            ready: watch::channel(true).0,
+        }
+    }
+
+    /// Close the gate: worker-state requests wait until [`Self::finish`].
+    fn begin(&self) {
+        self.ready.send_replace(false);
+    }
+
+    /// Open the gate and release every waiter.
+    fn finish(&self) {
+        self.ready.send_replace(true);
+    }
+
+    /// Wait until the gate is open.
+    async fn wait(&self) {
+        let mut ready = self.ready.subscribe();
+        let _ = ready.wait_for(|open| *open).await;
+    }
 }
 
 /// `clientInfo.name` the CLI sends in its `initialize` handshake.
@@ -233,6 +272,7 @@ impl McpServer {
             daemon_version: Arc::from(env!("CARGO_PKG_VERSION")),
             daemon_build: Arc::new(build_identity()),
             hub_shutdown_gate: Arc::new(RwLock::new(false)),
+            recovery: Arc::new(RecoveryGate::open()),
         }
     }
 
@@ -466,6 +506,12 @@ impl McpServer {
     ) -> JsonRpcResponse {
         trace!(connection = ctx.id, method = %req.method, "Dispatching JSON-RPC request");
         let id = req.id_or_null().map(|v| v.to_owned());
+        // Startup recovery runs concurrently with accepting connections, so a
+        // request that reads worker state waits for it; handshakes and
+        // liveness do not.
+        if needs_recovery(&req) {
+            self.recovery.wait().await;
+        }
         match req.method.as_str() {
             "ping" => JsonRpcResponse::ok(id, json!({})),
             "hub/watch" | "hub/watch/ack" => {
@@ -566,6 +612,18 @@ impl McpServer {
     /// Subscribe to an idle shutdown requested through the hub transport.
     pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
         self.shutdown.subscribe()
+    }
+
+    /// Close the recovery gate before accepting hub connections; see
+    /// [`RecoveryGate`].
+    pub fn begin_recovery(&self) {
+        self.recovery.begin();
+    }
+
+    /// Open the recovery gate, releasing the worker-state requests that
+    /// arrived while startup recovery ran.
+    pub fn finish_recovery(&self) {
+        self.recovery.finish();
     }
 
     /// The pool this server dispatches into.
@@ -883,6 +941,18 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
             return Ok(Some(oversized));
         }
     }
+}
+
+/// Whether `req` reads worker state that startup recovery fills in.
+///
+/// `tools/call` covers every `worker` verb, and `hub/watch` streams worker
+/// events, so both have to see the recovered pool. The handshake, `ping`,
+/// `tools/list` and the protocol document do not.
+fn needs_recovery(req: &JsonRpcRequest) -> bool {
+    matches!(
+        req.method.as_str(),
+        "tools/call" | "hub/watch" | "hub/watch/ack"
+    )
 }
 
 #[cfg(test)]
