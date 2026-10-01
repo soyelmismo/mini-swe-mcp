@@ -215,6 +215,8 @@ impl WorkerPool {
         let repo_path_owned = repo_path.clone();
         let worker_id_owned = worker_id.clone();
         let scratch = self.scratch.clone();
+        let round_base =
+            super::steer::read_source(&scratch, &worker_id).and_then(|source| source.round_base);
         let (mut worktree, initial_sync) =
             tokio::task::spawn_blocking(move || match &resume_base_commit {
                 Some(base) => {
@@ -225,13 +227,22 @@ impl WorkerPool {
                         base,
                     )?;
                     guard.base_branch = resume_base_branch;
-                    let sync = WorktreeGuard::sync_base_at(
-                        &guard.path,
-                        &guard.repo_root,
-                        &guard.branch,
-                        &guard.base_commit,
-                        guard.base_branch.as_deref(),
-                    )?;
+                    let sync = match round_base {
+                        Some(base) => WorktreeGuard::sync_round_base_at(
+                            &guard.path,
+                            &guard.repo_root,
+                            &guard.branch,
+                            &guard.base_commit,
+                            &base,
+                        ),
+                        None => WorktreeGuard::sync_base_at(
+                            &guard.path,
+                            &guard.repo_root,
+                            &guard.branch,
+                            &guard.base_commit,
+                            guard.base_branch.as_deref(),
+                        ),
+                    }?;
                     Ok((guard, sync))
                 }
                 None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned)

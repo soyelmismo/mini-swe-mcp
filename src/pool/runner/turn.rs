@@ -1884,10 +1884,11 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
-        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, extension_budget,
-        append_report_text, named_file_defaults, parse_shortstat, parse_threshold, read_only_escalation_text,
-        read_only_nudge_text, read_only_thresholds, task_names_files,
+        LlmResponse, MAX_TURNS_LIMIT, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
+        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
+        STAGNATION_SAMPLE_TURNS, append_report_text, extension_budget, named_file_defaults,
+        parse_shortstat, parse_threshold, read_only_escalation_text, read_only_nudge_text,
+        read_only_thresholds, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
