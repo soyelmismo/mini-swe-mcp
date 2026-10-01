@@ -50,8 +50,10 @@ mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
 pub use self::sentinels::{
-    COMPLETION_SENTINEL, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_kill_job, parse_request_turns, parse_wait_job, summarize_command,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
+    parse_wait_job, summarize_command,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns

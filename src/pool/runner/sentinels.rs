@@ -6,8 +6,10 @@
 //! a control signal ([`parse_request_turns`] for a turn-budget extension,
 //! [`parse_ask_orchestrator`] for a blocking question, [`parse_wait_job`] and
 //! [`parse_kill_job`] for a background job,
-//! [`parse_consolidate_merge`] for a consolidator's branch integration) or is
-//! just work.
+//! [`parse_consolidate_merge`] for a consolidator's branch integration,
+//! [`parse_consolidate_steer`] for routing a failure back to the worker that
+//! owns it, [`parse_consolidate_wait`] for blocking until that group stops) or
+//! is just work.
 //!
 //! [`summarize_command`] lives here too because it is the same "read a bash
 //! command" concern: it renders the bounded one-line label the registry, the
@@ -194,11 +196,86 @@ pub fn parse_consolidate_merge(cmd: &str) -> Option<Vec<String>> {
     tokens.then_some(ids)
 }
 
+/// Deadline of a `CONSOLIDATE_WAIT` that names none, and the ceiling on one
+/// that does.
+///
+/// A consolidator that waits without `timeout=` gives its group fifteen
+/// minutes; one that asks for longer is capped at an hour, so a wait can never
+/// outlive the turn it is spent inside.
+pub const CONSOLIDATE_WAIT_DEFAULT_SECS: u64 = 900;
+pub const CONSOLIDATE_WAIT_MAX_SECS: u64 = 3600;
+
+/// `echo/printf "CONSOLIDATE_STEER <id> <message...>"` → the worker to steer
+/// and the message, verbatim.
+///
+/// Only a consolidator interprets this sentinel: for an ordinary worker the
+/// identical command stays plain bash. Everything after the id is the message,
+/// spaces and quotes included, so a correction reaches the worker the way the
+/// consolidator wrote it; a request with no message is not a request.
+pub fn parse_consolidate_steer(cmd: &str) -> Option<(String, String)> {
+    let trimmed = cmd.trim();
+    let arg = trimmed
+        .strip_prefix("echo ")
+        .or_else(|| trimmed.strip_prefix("printf "))?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches("\\n");
+    // The sentinel must be a whole word: `CONSOLIDATE_STEERED` is not a request.
+    let rest = arg.strip_prefix("CONSOLIDATE_STEER")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (id, message) = rest.trim_start().split_once(char::is_whitespace)?;
+    let message = message.trim();
+    let id_is_token = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    (!message.is_empty() && id_is_token).then(|| (id.to_string(), message.to_string()))
+}
+
+/// `echo/printf "CONSOLIDATE_WAIT <id> [<id> ...] [timeout=<secs>]"` → the
+/// workers to wait on and the deadline in seconds, when one was given.
+///
+/// Only a consolidator interprets this sentinel. The optional `timeout=` is a
+/// trailing word; the caller clamps it to [`CONSOLIDATE_WAIT_MAX_SECS`]. Ids
+/// are validated as tokens, exactly as [`parse_consolidate_merge`] validates
+/// them, so a grep of the sentinel is never a request.
+pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
+    let trimmed = cmd.trim();
+    let arg = trimmed
+        .strip_prefix("echo ")
+        .or_else(|| trimmed.strip_prefix("printf "))?
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_end_matches("\\n");
+    let mut words = arg.split_whitespace();
+    if words.next()? != "CONSOLIDATE_WAIT" {
+        return None;
+    }
+    let mut ids = Vec::new();
+    let mut timeout = None;
+    for word in words {
+        if let Some(secs) = word.strip_prefix("timeout=") {
+            timeout = Some(secs.parse::<u64>().ok()?);
+        } else if word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            ids.push(word.to_string());
+        } else {
+            return None;
+        }
+    }
+    (!ids.is_empty()).then_some((ids, timeout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_completion_request, parse_ask_orchestrator, parse_consolidate_merge, parse_kill_job,
-        parse_request_turns, parse_wait_job, summarize_command,
+        is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+        parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
+        parse_wait_job, summarize_command,
     };
 
     #[test]
@@ -223,6 +300,59 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_consolidate_merge(no), None, "{no:?} is not a request");
+        }
+    }
+
+    #[test]
+    fn consolidate_steer_takes_the_id_and_the_verbatim_message() {
+        let (id, message) =
+            parse_consolidate_steer("echo CONSOLIDATE_STEER w1 fix the \"quoted\" name").unwrap();
+        assert_eq!(id, "w1");
+        assert_eq!(message, "fix the \"quoted\" name");
+
+        let (id, message) =
+            parse_consolidate_steer("printf 'CONSOLIDATE_STEER abc-1 revert it\\n'").unwrap();
+        assert_eq!(id, "abc-1");
+        assert_eq!(message, "revert it");
+
+        for no in [
+            "echo ordinary text",
+            "grep -rn CONSOLIDATE_STEER src/",
+            "echo CONSOLIDATE_STEER w1",
+            "echo CONSOLIDATE_STEERED w1 fix it",
+            "echo other CONSOLIDATE_STEER w1 fix it",
+            "",
+        ] {
+            assert_eq!(parse_consolidate_steer(no), None, "{no:?} is not a request");
+        }
+    }
+
+    #[test]
+    fn consolidate_wait_parses_ids_and_the_optional_timeout() {
+        let (ids, timeout) = parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 w3").unwrap();
+        assert_eq!(ids, vec!["w1", "w2", "w3"]);
+        assert_eq!(timeout, None);
+
+        let (ids, timeout) =
+            parse_consolidate_wait("echo CONSOLIDATE_WAIT w1 w2 timeout=120").unwrap();
+        assert_eq!(ids, vec!["w1", "w2"]);
+        assert_eq!(timeout, Some(120));
+
+        let (ids, timeout) =
+            parse_consolidate_wait("printf 'CONSOLIDATE_WAIT w1 timeout=0\\n'").unwrap();
+        assert_eq!(ids, vec!["w1"]);
+        assert_eq!(timeout, Some(0));
+
+        for no in [
+            "echo ordinary text",
+            "grep -rn CONSOLIDATE_WAIT src/",
+            "echo CONSOLIDATE_WAIT",
+            "echo CONSOLIDATE_WAIT timeout=30",
+            "echo CONSOLIDATE_WAIT w1 timeout=soon",
+            "echo CONSOLIDATE_WAITED w1",
+            "",
+        ] {
+            assert_eq!(parse_consolidate_wait(no), None, "{no:?} is not a request");
         }
     }
 

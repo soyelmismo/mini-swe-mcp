@@ -78,9 +78,10 @@ pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator,
-    parse_consolidate_merge, parse_kill_job, parse_request_turns, parse_wait_job,
-    summarize_command,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
+    parse_wait_job, summarize_command,
 };
 pub use self::state::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics,
@@ -92,6 +93,7 @@ pub use self::steer::{
     steer_path, steer_path_in, write_steer_message, write_steer_message_in,
 };
 
+use self::revision::outcome_revision;
 use self::state::expired_terminal_ids;
 use crate::agent::jobs::{JobHandle, JobTable};
 use crate::manifest::ModelManifest;
@@ -167,6 +169,22 @@ pub fn terminal_branch(state: &WorkerState) -> Option<String> {
             None
         }
     }
+}
+
+/// The `verified` / `unverified` tag a completed worker's wait line carries.
+fn verified_label(verified: Option<bool>) -> &'static str {
+    match verified {
+        Some(true) => "verified",
+        _ => "unverified",
+    }
+}
+
+/// One line of a stopped worker's reason: the first line only, the failed row's
+/// `error: ` label stripped, clamped to a fixed byte budget so a stack trace
+/// cannot flood the observation.
+fn stop_reason(text: &str) -> String {
+    let first = text.lines().next().unwrap_or("").trim();
+    clamp_string(first.strip_prefix("error: ").unwrap_or(first).trim(), 200)
 }
 
 /// Clears a worker's heavy-slot wait when the slot is granted or the wait is
@@ -1107,6 +1125,160 @@ impl WorkerPool {
         }
     }
 
+    /// Route a failure or a conflict back to the worker that owns it.
+    ///
+    /// One `CONSOLIDATE_STEER` request: the target is resolved, checked against
+    /// [`check_consolidate_delegation`], then steered exactly as the orchestrator
+    /// would -- a live worker takes the message on its next step, a stopped one
+    /// is continued on its own id and branch. The consolidator's owner is the
+    /// acting agent throughout, so the guidance can never arrive from -- or be
+    /// aimed at -- another owner.
+    pub async fn consolidate_steer(&self, actor: &WorkerMeta, id: &str, message: String) -> String {
+        let target = match self.resolve_worker_id(id, &actor.owner).await {
+            Ok(target) => target,
+            Err(e) => return format!("{id} refused: {e}"),
+        };
+        let Some(entry) = self.worker_row(&target).await else {
+            return format!("{id} refused: no such worker");
+        };
+        if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+            return format!("{id} refused: {reason}");
+        }
+        match self.steer_relaunchable(&target, message).await {
+            Ok(outcome) => format!(
+                "{target} {} (revision {})",
+                outcome.verb(),
+                outcome_revision(&outcome)
+            ),
+            Err(e) => format!("{target} refused: {e}"),
+        }
+    }
+
+    /// Block until every named worker has stopped, or the deadline passes.
+    ///
+    /// One `CONSOLIDATE_WAIT` request. Each id is resolved and delegation-
+    /// checked up front, so a refused id is reported immediately instead of
+    /// after the wait. The wait spends no turn and holds the caller's
+    /// [`command_running`](WorkerPool::command_running) mark, so the stall
+    /// detector reads a long wait as work rather than as a hung step.
+    pub async fn consolidate_wait(
+        &self,
+        actor: &WorkerMeta,
+        ids: &[String],
+        timeout_secs: Option<u64>,
+    ) -> String {
+        // One slot per requested id, in request order: a refusal fills it now,
+        // a waited-on id fills it once its worker has stopped.
+        let mut lines: Vec<Option<String>> = Vec::with_capacity(ids.len());
+        let mut waited: Vec<(usize, String)> = Vec::new();
+        for id in ids {
+            let target = match self.resolve_worker_id(id, &actor.owner).await {
+                Ok(target) => target,
+                Err(e) => {
+                    lines.push(Some(format!("{id} refused: {e}")));
+                    continue;
+                }
+            };
+            let Some(entry) = self.worker_row(&target).await else {
+                lines.push(Some(format!("{id} refused: no such worker")));
+                continue;
+            };
+            if let Err(reason) = check_consolidate_delegation(actor, &entry) {
+                lines.push(Some(format!("{id} refused: {reason}")));
+                continue;
+            }
+            lines.push(None);
+            waited.push((lines.len() - 1, target));
+        }
+
+        let timeout = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(CONSOLIDATE_WAIT_DEFAULT_SECS)
+                .min(CONSOLIDATE_WAIT_MAX_SECS),
+        );
+        // Held for the whole wait: the consolidator is running a command as far
+        // as the stall detector is concerned.
+        let _running = self.command_running(&actor.id);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut changes = self.subscribe_changes();
+        let mut timed_out = false;
+        loop {
+            let mut pending = false;
+            for (_, id) in &waited {
+                if !self.is_stopped(id).await {
+                    pending = true;
+                    break;
+                }
+            }
+            if !pending {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                timed_out = true;
+                break;
+            }
+            // The pool's change channel wakes this the moment a worker stops;
+            // the tick only bounds how long a missed wake-up can stall it.
+            tokio::select! {
+                _ = changes.changed() => {}
+                _ = tokio::time::sleep((deadline - now).min(Duration::from_secs(1))) => {}
+            }
+        }
+        for (slot, id) in &waited {
+            lines[*slot] = Some(self.stopped_line(id, timed_out, timeout.as_secs()).await);
+        }
+        lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
+    }
+
+    /// Whether `id` has stopped: completed, failed, killed, interrupted, or
+    /// parked waiting for an answer. A worker still `Reviewing` is live.
+    async fn is_stopped(&self, id: &str) -> bool {
+        if let Some(state) = self.get_worker_state(id).await {
+            return !matches!(state, WorkerState::Running { .. });
+        }
+        load_registry_entry_in(&self.scratch, id)
+            .is_some_and(|e| e.status.is_terminal() || e.status == RegistryStatus::Paused)
+    }
+
+    /// One compact line for a waited-on worker: its state, whether it verified
+    /// its work, and the one-line error or question that stopped it.
+    ///
+    /// The live record carries the `verified` flag; a worker that survives only
+    /// as a registry row reports its status alone.
+    async fn stopped_line(&self, id: &str, timed_out: bool, timeout_secs: u64) -> String {
+        if let Some(state) = self.get_worker_state(id).await {
+            return match &state {
+                WorkerState::Running { .. } if timed_out => {
+                    format!("{id} running (still running after {timeout_secs}s)")
+                }
+                WorkerState::Running { .. } => format!("{id} running"),
+                WorkerState::Paused { question, .. } => {
+                    format!("{id} paused: {}", stop_reason(question))
+                }
+                WorkerState::Completed { verified, .. } => {
+                    format!("{id} completed {}", verified_label(*verified))
+                }
+                WorkerState::Failed { error, .. } => format!("{id} failed: {}", stop_reason(error)),
+            };
+        }
+        let Some(entry) = load_registry_entry_in(&self.scratch, id) else {
+            return format!("{id} stopped (no registry row)");
+        };
+        let status = entry.status.display_name().to_lowercase();
+        match entry.status {
+            RegistryStatus::Failed => format!("{id} failed: {}", stop_reason(&entry.last_command)),
+            RegistryStatus::Paused => format!(
+                "{id} paused: {}",
+                stop_reason(entry.question.as_deref().unwrap_or_default())
+            ),
+            RegistryStatus::Running | RegistryStatus::Reviewing if timed_out => {
+                format!("{id} {status} (still running after {timeout_secs}s)")
+            }
+            _ => format!("{id} {status}"),
+        }
+    }
+
     /// Resolve a caller-supplied worker reference among `owner`'s own workers.
     ///
     /// Accepts the full id, `last` (the caller's most recently dispatched
@@ -1267,6 +1439,20 @@ impl WorkerPool {
     /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
     pub async fn steer(&self, id: &str, message: String) -> Result<SteerOutcome> {
         self.steer_with_budget(id, message, None).await
+    }
+
+    /// [`WorkerPool::steer`] with the relaunched loop's future type erased.
+    ///
+    /// Steering a stopped worker relaunches its loop, and a consolidator's own
+    /// turn awaits that steer -- so the loop's future type would otherwise
+    /// depend on itself and have no resolvable size. Erasing it behind a
+    /// `dyn Future` keeps the awaiting turn a plain, finite type.
+    fn steer_relaunchable<'a>(
+        &'a self,
+        id: &'a str,
+        message: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<SteerOutcome>> + Send + 'a>> {
+        Box::pin(self.steer(id, message))
     }
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
