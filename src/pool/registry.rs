@@ -81,6 +81,21 @@ pub enum WorkerRole {
     Consolidate,
 }
 
+/// The orchestrator's verdict on a completed worker.
+///
+/// Recorded in the worker's registry row so it outlives the in-memory record
+/// `collect` evicts; a new revision drops it, because a changed branch needs a
+/// fresh review. The batch merge reads it too, and lands the workers in the
+/// order the stamps were recorded in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerApproval {
+    /// Unix time the worker was approved.
+    pub at: u64,
+    /// Optional note the orchestrator left with the approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
     pub id: String,
@@ -132,6 +147,10 @@ pub struct WorkerRegistryEntry {
     /// still be able to say what the run did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<WorkerReport>,
+    /// The orchestrator's approval of the completed worker, or `None` while it
+    /// is unreviewed. Persisted so it survives the in-memory eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<WorkerApproval>,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -205,6 +224,7 @@ impl WorkerMeta {
             revision: self.revision,
             auto_continues: self.auto_continues,
             report: self.report.clone(),
+            approved: None,
         }
     }
 
@@ -682,6 +702,7 @@ mod recovery_cleanup_tests {
             revision: 0,
             auto_continues: 0,
             report: None,
+            approved: None,
         }
     }
 

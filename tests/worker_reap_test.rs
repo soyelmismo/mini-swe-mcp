@@ -8,6 +8,8 @@
 //! step, the second survives the step and is taken down by the worker-end
 //! sweep, and nothing outside the worker's directories is ever signalled.
 
+mod common;
+
 use mini_swe_mcp::agent::AgentRunner;
 use mini_swe_mcp::agent::reap::processes_in_dirs;
 use mini_swe_mcp::worktree::{WorktreeGuard, swe_base_dir};
@@ -85,6 +87,9 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
+        // A worker leases build directories keyed by this repo's hash; they are
+        // filed next to the scratch base, so removing the repo has to take them.
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -126,6 +131,9 @@ async fn await_empty(dir: &Path) {
 #[tokio::test]
 async fn a_backgrounded_job_dies_with_its_step() {
     let dir = unique_dir("step");
+    // The runner files a private `swe-tmp-<leaf>` scratch beside the worktree;
+    // owning the worktree removes that companion with it.
+    let _scratch = common::TempDir::own(dir.clone());
 
     let (out, code) = runner()
         .execute_bash(&dir, "sleep 300 & echo started")

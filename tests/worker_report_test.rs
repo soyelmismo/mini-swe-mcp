@@ -455,6 +455,7 @@ async fn report_survives_eviction_in_status_review_and_collect() {
         risks: "none".into(),
     };
     let entry = WorkerRegistryEntry {
+        approved: None,
         id: "evicted-report".into(),
         pid: std::process::id(),
         task: "probe".into(),

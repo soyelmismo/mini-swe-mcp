@@ -21,6 +21,8 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "watch",
     "collect",
     "review",
+    "approve",
+    "unapprove",
     "logs",
     "list",
     "kill",
@@ -49,6 +51,9 @@ pub const LIST_SCOPES: &[&str] = &["mine", "all"];
 /// `scope` value that lists every agent's workers.
 pub const LIST_SCOPE_ALL: &str = "all";
 
+/// Accepted values of the `review` `diff` property, default first.
+pub const REVIEW_DIFF_SCOPES: &[&str] = &["code", "all", "none"];
+
 /// Policy applied when a `tools/call` omits the optional `network` property.
 ///
 /// Backwards compatible: a client that never heard of the property keeps the
@@ -59,7 +64,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage autonomous SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background, or the 'watch' action bounded by 'timeout_secs'. You only see or act on your own workers; the admin override excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "Manage SWE mini-agents in isolated Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see or act on your own workers; admin excepted. `mini-swe-mcp help <topic>` covers workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -85,22 +90,20 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "task",
         "string",
-        DescriptionSource::Static(
-            "ONE focused concern: the files in scope and the acceptance gate. Required for 'dispatch'.",
-        ),
+        DescriptionSource::Static("ONE focused concern: files in scope and the acceptance gate."),
     ),
     (
         "tasks",
         "array",
         DescriptionSource::Static(
-            "Batch dispatch: list of {task, model?, ...} objects, one worker each; top-level values are defaults.",
+            "Batch dispatch: one {task, model?, ...} object per worker; top-level values are defaults.",
         ),
     ),
     (
         "repo_path",
         "string",
         DescriptionSource::Static(
-            "Absolute path to repository root (alias: 'path'). Required for 'dispatch'.",
+            "Absolute repository root (alias: 'path'). Required for 'dispatch'.",
         ),
     ),
     (
@@ -118,7 +121,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_id",
         "string",
         DescriptionSource::Static(
-            "Target worker ID (alias: 'id'); a unique prefix of 3+ characters or 'last' works. Required for every verb that targets one worker.",
+            "Target worker (alias 'id'): a unique 3+ char prefix or 'last'; required for verbs that target one.",
         ),
     ),
     (
@@ -130,20 +133,22 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "message",
         "string",
         DescriptionSource::Static(
-            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the fresh budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
         ),
     ),
     (
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own.",
+            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
         ),
     ),
     (
         "group",
         "string",
-        DescriptionSource::Static("Only workers of this group. Optional for 'watch'."),
+        DescriptionSource::Static(
+            "Only workers of this group. For 'watch' and 'merge --approved'.",
+        ),
     ),
     (
         "role",
@@ -156,58 +161,68 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely.",
+            "Deadline in seconds for the blocking 'watch'; on expiry {status:'no_event'}.",
         ),
     ),
     (
         "max_turns",
         "integer",
         DescriptionSource::Static(
-            "Maximum bash exploration turns (overrides the manifest default). On 'steer', the fresh budget when continuing a stopped worker.",
+            "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.",
         ),
     ),
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model sampling temperature (overrides the manifest default)."),
+        DescriptionSource::Static("Model temperature (overrides the default)."),
     ),
     (
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
+            "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
         ),
     ),
     (
         "scope",
         "string",
-        DescriptionSource::Static(
-            "Listing scope for 'list': 'mine' (default) or 'all' (every agent's; needs the admin override).",
-        ),
+        DescriptionSource::Static("'list' scope: 'mine' (default) or 'all' (admin)."),
     ),
     (
         "full",
         "boolean",
-        DescriptionSource::Static("The whole diff. Optional for 'collect'."),
+        DescriptionSource::Static("The whole diff for 'collect'."),
     ),
     (
         "files",
         "array",
-        DescriptionSource::Static("Paths whose diff to return. Optional for 'collect'."),
+        DescriptionSource::Static("Paths whose diff 'collect' returns."),
+    ),
+    (
+        "diff",
+        "string",
+        DescriptionSource::Static(
+            "Diff scope for 'review': 'code' (default) hides tests, 'all' shows everything, 'none' hides it.",
+        ),
     ),
     (
         "network",
         "string",
         DescriptionSource::Static(
-            "Network policy: 'offline' isolates every bash step with no egress, 'allow' (default) keeps connectivity.",
+            "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.",
         ),
+    ),
+    (
+        "approved",
+        "boolean",
+        DescriptionSource::Static("Merge every approved worker."),
     ),
     (
         "keep_branch",
@@ -248,6 +263,21 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
         schema.insert(
             "default".to_string(),
             Value::String(NETWORK_DEFAULT.to_string()),
+        );
+    }
+    if name == "diff" {
+        schema.insert(
+            "enum".to_string(),
+            Value::Array(
+                REVIEW_DIFF_SCOPES
+                    .iter()
+                    .map(|scope| Value::String((*scope).to_string()))
+                    .collect(),
+            ),
+        );
+        schema.insert(
+            "default".to_string(),
+            Value::String(REVIEW_DIFF_SCOPES[0].to_string()),
         );
     }
     if name == "scope" {
@@ -498,6 +528,7 @@ mod tests {
 
         for needle in [
             "mini-swe-mcp watch",
+            "run it again after each event",
             "mini-swe-mcp help <topic>",
             "own workers",
         ] {
@@ -541,5 +572,18 @@ mod tests {
         assert!(text.contains("steer"), "{text}");
         assert!(text.contains("own branch"), "{text}");
         assert!(text.contains("never dispatch a replacement"), "{text}");
+    }
+    /// The `diff` property advertises the three documented review scopes, with
+    /// the default first so a client can read it off the schema.
+    #[test]
+    fn diff_property_advertises_the_review_scopes() {
+        let tools_list = build_tools_list(&ModelManifest::default());
+        let schema = worker_schema(&tools_list);
+        let diff = &schema["properties"]["diff"];
+
+        assert_eq!(diff["type"], json!("string"));
+        assert_eq!(diff["enum"], json!(["code", "all", "none"]));
+        assert_eq!(diff["default"], json!("code"));
+        assert!(REVIEW_DIFF_SCOPES.contains(&"none"));
     }
 }

@@ -1118,6 +1118,7 @@ fn live_row_elsewhere(id: &str, pid: u32) -> WorkerRegistryEntry {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     }
 }
 
@@ -1157,6 +1158,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             diff_insertions: 120,
             diff_deletions: 340,
         },
+        approved: None,
     }
 }
 

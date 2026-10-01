@@ -258,9 +258,13 @@ fn print_help() {
     println!("  collect <worker_id> [--full] [--file <path>]");
     println!("           Final message with a per-file diff stat; --full adds the whole diff,");
     println!("           --file narrows it to one path (repeatable).");
-    println!("  review <worker_id>");
-    println!("           One compact view of a finished worker: task, verification, per-file");
-    println!("           diff stat, and whether its branch still merges into the base branch.");
+    println!("  review <worker_id> [--diff code|all|none]");
+    println!("           One compact view of a finished worker: task, verification, the code");
+    println!("           diff, per-file stat, tests summarised, and whether it still merges.");
+    println!("  approve <worker_id> [\"note\"]");
+    println!("           Record your verdict on a completed worker (owner-only).");
+    println!("  unapprove <worker_id>");
+    println!("           Withdraw that approval.");
     println!("  logs <worker_id>");
     println!("           Recent commands and their output.");
     println!("  steer <worker_id> <message> [--max-turns <n>]");
@@ -277,6 +281,9 @@ fn print_help() {
     println!("  merge <worker_id> [--no-delete]");
     println!("           Merge a finished worker's branch into its base branch: trial merge,");
     println!("           verify gate on the merge result, then merge --no-ff and clean up.");
+    println!("  merge --approved [--group <group>]");
+    println!("           Land every approved worker of a group with ONE gate on the combined");
+    println!("           result: a conflicting worker is skipped, the rest merge with --no-ff.");
     println!("  reap");
     println!("           Evict expired terminal worker records.");
     println!("  prune");

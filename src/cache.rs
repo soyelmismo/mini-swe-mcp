@@ -318,6 +318,28 @@ pub(crate) fn build_dir(repo: &Path, index: usize) -> anyhow::Result<PathBuf> {
     Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-{index}", repo_key(repo)?)))
 }
 
+/// Remove every build directory leased for `repo`.
+///
+/// A temporary repository is deleted with the worker that used it, but its
+/// leased build directories are filed under the *repository's* key in the
+/// scratch base and would otherwise outlive it: a [`BuildDirLease`] only marks
+/// the directory reusable, it never deletes it. Removing a temporary repo
+/// therefore has to take its leases with it.
+pub fn remove_build_dir_leases(repo: &Path) {
+    let Ok(key) = repo_key(repo) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(crate::worktree::swe_base_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if build_dir_repo(&path) == Some(key.as_str()) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 fn build_dir_repo(path: &Path) -> Option<&str> {
     let name = path.file_name()?.to_str()?.strip_prefix("swe-target-")?;
     let (repo, index) = name.split_once('-')?;
