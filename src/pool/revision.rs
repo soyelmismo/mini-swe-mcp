@@ -30,6 +30,39 @@ use crate::agent::{ChatMessage, Role};
 use super::state::{retention_expired, within_retired_grace};
 use super::steer::remove_steer_file_in;
 
+/// The branch and commit a dispatch measured its diff against, as the two
+/// probes [`detect_base_branch`] and [`detect_base_commit`] answer them.
+///
+/// Both ends of the pool need the same pair: the worktree guard detects it when
+/// it creates `worker-<id>`, and a registry row that names no base must fall
+/// back on it to prove a branch merged. Asking git twice instead would let the
+/// two drift apart, so the pair is one answer.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BaseFacts {
+    /// Branch checked out when the repository was read. `None` for a detached
+    /// `HEAD`: there is no branch to sync or to prove an ancestry against.
+    pub branch: Option<String>,
+    /// Commit the worker's branch would be created from.
+    pub commit: Option<String>,
+}
+
+/// Detect the base branch and base commit of `repo_path` in one blocking call.
+///
+/// Both probes are read-only and independent, so a failure of either leaves
+/// only that fact unknown: a caller that needs one records the other rather than
+/// losing both to a single detached or unborn `HEAD`.
+pub(crate) fn detect_base_facts(repo_path: &Path) -> BaseFacts {
+    let commit_out = crate::worktree::git(repo_path, "rev-parse HEAD", &["rev-parse", "HEAD"]);
+    let commit = commit_out
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    BaseFacts {
+        branch: detect_base_branch(repo_path),
+        commit,
+    }
+}
+
 /// Prefix of the user message a revision appends after the reloaded history.
 ///
 /// Kept in one place so the pool, the MCP schema text and the tests agree on
@@ -101,7 +134,7 @@ pub async fn ensure_base_branch(
 pub const DEFAULT_REVISION_TURNS: usize = 60;
 
 /// The metadata a finished run leaves behind so a later steer can relaunch it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkerHistory {
     /// Dispatch authority, preserved across warm and cold continuations.
     #[serde(default)]
@@ -670,8 +703,19 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
             continue;
         };
-        let Some(base) = entry.base_branch.clone().filter(|base| !base.is_empty()) else {
-            continue;
+        // A row written before base-branch tracking names no base, and without
+        // one the sweep could not prove the worker integrated -- which is how a
+        // whole pool of merged workers stayed on the books. The repository's own
+        // checked-out branch is the base such a row was dispatched against, so
+        // detect it and group by it. Detection is the same positive proof the
+        // ancestry test itself is: it reads git, never assumes a branch name,
+        // and a repository that cannot answer retires nothing.
+        let base = match entry.base_branch.clone().filter(|base| !base.is_empty()) {
+            Some(base) => base,
+            None => match detect_base_branch(repo) {
+                Some(base) if !base.is_empty() => base,
+                _ => continue,
+            },
         };
         // A kept branch is a durable operator instruction, not a one-off pass:
         // leave the whole worker alone while its branch still lives.
@@ -1570,6 +1614,8 @@ impl super::WorkerPool {
             group: history.group.clone(),
             role: history.role,
             repo_path: Some(history.repo_path.clone()),
+            base_branch: history.base_branch.clone(),
+            base_commit: Some(history.base_commit.clone()),
             started_at: now,
             pid: std::process::id(),
             metrics: super::WorkerMetrics::default(),
