@@ -27,7 +27,6 @@ use tracing::{debug, warn};
 
 use crate::agent::{ChatMessage, Role};
 
-use super::registry::WorkerRegistryEntry;
 use super::state::{retention_expired, within_retired_grace};
 use super::steer::remove_steer_file_in;
 
@@ -822,8 +821,10 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
             files.push((id.to_string(), path));
         }
     }
-    let mut branches: std::collections::HashMap<PathBuf, Option<std::collections::HashSet<String>>> =
-        std::collections::HashMap::new();
+    let mut branches: std::collections::HashMap<
+        PathBuf,
+        Option<std::collections::HashSet<String>>,
+    > = std::collections::HashMap::new();
     let mut removed = 0;
     for (id, path) in files {
         if live.contains(&id) {

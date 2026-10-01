@@ -414,12 +414,13 @@ impl RegistryWriter {
         // is used, not the cache alone, so a round (or a second merge) recorded
         // by another process while this one held its own stale cache is not
         // lost -- preferring the cache would silently drop it.
-        let known = self
-            .rows
-            .get(&entry.id)
-            .cloned()
-            .or_else(|| super::load_registry_entry_in(&self.root, &entry.id));
-        if let Some(known) = known {
+        // *Both* sources are unioned, not just the first that answers: the cache
+        // holds what this writer wrote, and the disk holds what another process
+        // wrote meanwhile (a later `CONSOLIDATE_MERGE`, an operator's keep). A
+        // cache-first fallback would drop the disk-only additions.
+        let cached = self.rows.get(&entry.id).cloned();
+        let on_disk = super::load_registry_entry_in(&self.root, &entry.id);
+        for known in [cached, on_disk].into_iter().flatten() {
             for id in known.integrated {
                 if !entry.integrated.contains(&id) {
                     entry.integrated.push(id);
