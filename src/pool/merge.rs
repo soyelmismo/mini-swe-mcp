@@ -541,6 +541,17 @@ async fn run_gate_confined(
     req: &MergeRequest<'_>,
     client_env: &[(String, String)],
 ) -> Result<(Option<i32>, String)> {
+    // Fail closed: the gate replays model-written code, so a host that can
+    // confine nothing at all refuses the merge instead of running it as the
+    // user. A worker's own step may degrade with a warning; a merge is the one
+    // place that must not.
+    if crate::agent::exec::select_backend() == crate::agent::exec::SandboxBackend::Unconfined {
+        anyhow::bail!(
+            "no sandbox is available on this host (neither Landlock/seccomp nor bubblewrap), \
+             so the verify gate cannot run confined; refusing to merge worker's branch"
+        );
+    }
+
     // A build directory leased from the repository's pool: warm for the next
     // build, and never a fresh multi-gigabyte `target/` inside a worktree that
     // is about to be deleted.
