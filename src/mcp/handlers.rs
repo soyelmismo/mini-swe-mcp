@@ -575,10 +575,13 @@ impl McpServer {
                 )),
                 _ => None,
             };
+            let approved = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
+                .and_then(|entry| entry.approved);
             Ok(json!({
                 "worker_id": wid,
                 "owner": self.owner_of(wid).await,
                 "state": state,
+                "approved": approved,
                 "next_step": next_step,
             }))
         } else if let Some(entry) =
@@ -610,6 +613,7 @@ impl McpServer {
                         "metrics": entry.metrics,
                     }
                 },
+                "approved": entry.approved,
                 "next_step": next_step,
             }))
         } else {

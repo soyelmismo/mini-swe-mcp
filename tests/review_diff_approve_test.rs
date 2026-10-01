@@ -138,7 +138,11 @@ fn registry_row(
         last_command: "cargo test".to_string(),
         question: None,
         started_at: 0,
-        updated_at: 0,
+        // Fresh, so the terminal-TTL filter in `list` still shows the row.
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
         group: None,
         role: WorkerRole::Worker,
         repo_path: repo.map(|repo| repo.to_string_lossy().into_owned()),
@@ -256,16 +260,13 @@ async fn review_diff_all_shows_everything_and_none_withholds_it() {
 async fn approve_records_the_verdict_on_a_completed_worker() {
     let owned = IsolatedPool::new(4, "approve-ok");
     let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
-    // Only a registry row: the worker was never in this process's memory, which
-    // is what a collected (evicted) worker looks like.
+    // A branch, so `list`'s terminal-row pruning keeps the row: the worker was
+    // never in this process's memory, which is what a collected worker looks
+    // like.
+    let repo = repo_with_branch("ok", "approve-ok");
     save_registry_entry_in(
         &owned.root(),
-        &registry_row(
-            "approve-ok",
-            RegistryStatus::Completed,
-            OWNER,
-            Some(Path::new("/nonexistent")),
-        ),
+        &registry_row("approve-ok", RegistryStatus::Completed, OWNER, Some(&repo)),
     );
 
     let payload = server
@@ -287,6 +288,28 @@ async fn approve_records_the_verdict_on_a_completed_worker() {
     let reviewed = review_with(&server, "approve-ok", Some("none")).await;
     assert_eq!(reviewed["approved"]["note"], "looks right");
 
+    // `status` and `list` report the same verdict.
+    let status = server
+        .execute_tool_for(
+            "worker",
+            json!({ "action": "status", "worker_id": "approve-ok" }),
+            &owner_context(),
+        )
+        .await
+        .expect("status answers for the owner");
+    assert_eq!(status["approved"]["note"], "looks right");
+    let listed = server
+        .execute_tool_for("worker", json!({ "action": "list" }), &owner_context())
+        .await
+        .expect("list answers for the owner");
+    let row = listed["workers"]
+        .as_array()
+        .expect("workers is an array")
+        .iter()
+        .find(|row| row["id"] == "approve-ok")
+        .expect("the approved worker is listed");
+    assert_eq!(row["approved"]["note"], "looks right");
+
     // `unapprove` removes it again.
     server
         .execute_tool_for(
@@ -303,6 +326,7 @@ async fn approve_records_the_verdict_on_a_completed_worker() {
             .is_none(),
         "unapprove must clear the verdict"
     );
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// `approve` refuses a worker that is still running.
