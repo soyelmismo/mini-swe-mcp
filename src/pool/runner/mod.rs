@@ -215,17 +215,30 @@ impl WorkerPool {
         let repo_path_owned = repo_path.clone();
         let worker_id_owned = worker_id.clone();
         let scratch = self.scratch.clone();
-        let mut worktree = tokio::task::spawn_blocking(move || match &resume_base_commit {
-            Some(base) => {
-                let mut guard =
-                    WorktreeGuard::reopen_in(&scratch, &repo_path_owned, &worker_id_owned, base)?;
-                guard.base_branch = resume_base_branch;
-                Ok(guard)
-            }
-            None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned),
-        })
-        .await
-        .context("Worktree checkout task failed")??;
+        let (mut worktree, initial_sync) =
+            tokio::task::spawn_blocking(move || match &resume_base_commit {
+                Some(base) => {
+                    let mut guard = WorktreeGuard::reopen_in(
+                        &scratch,
+                        &repo_path_owned,
+                        &worker_id_owned,
+                        base,
+                    )?;
+                    guard.base_branch = resume_base_branch;
+                    let sync = WorktreeGuard::sync_base_at(
+                        &guard.path,
+                        &guard.repo_root,
+                        &guard.branch,
+                        &guard.base_commit,
+                        guard.base_branch.as_deref(),
+                    )?;
+                    Ok((guard, sync))
+                }
+                None => WorktreeGuard::new_in(&scratch, &repo_path_owned, &worker_id_owned)
+                    .map(|guard| (guard, crate::worktree::BaseSync::Unchanged)),
+            })
+            .await
+            .context("Worktree checkout task failed")??;
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -285,6 +298,18 @@ impl WorkerPool {
                 error = %e,
                 "Could not persist the worker conversation; this worker can no longer be revised"
             );
+        }
+
+        if let crate::worktree::BaseSync::Conflicts { branch, files } = initial_sync {
+            let notice = ChatMessage::text(
+                Role::User,
+                format!(
+                    "BASE INTEGRATION pending with {branch}. Remaining conflicted files: {}. Resolve the markers and request completion; the harness will re-check them.",
+                    files.join(", ")
+                ),
+            );
+            append_history_message_in(&self.scratch, &worker_id, &opening_meta, &notice)?;
+            messages.push(notice);
         }
 
         // The conversation is durable one line per message (see

@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Unversioned dirs copied into a fresh worktree (readable without git
 /// tracking) and synced back on the way out.
@@ -438,8 +438,24 @@ impl WorktreeGuard {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// Whether this checkout has an unfinished merge.
+    /// Whether this checkout has a live merge or a committed pending integration.
     pub fn merge_in_progress_at(path: &Path) -> Result<bool> {
+        if Self::git_merge_in_progress_at(path)? {
+            return Ok(true);
+        }
+        // The WIP merge already contains the base parent. Its durable trailer
+        // keeps completion gated even after worktree metadata is reclaimed.
+        let message = checked_git(
+            path,
+            "read pending integration",
+            &["log", "-1", "--format=%B"],
+        )?;
+        Ok(String::from_utf8_lossy(&message.stdout)
+            .lines()
+            .any(|line| line == "Worker-Pending-Base-Integration: true"))
+    }
+
+    fn git_merge_in_progress_at(path: &Path) -> Result<bool> {
         Ok(git(
             path,
             "rev-parse MERGE_HEAD",
@@ -549,6 +565,31 @@ impl WorktreeGuard {
         if !Self::merge_in_progress_at(path)? {
             return Ok(PendingMerge::None);
         }
+        let files = Self::conflict_markers_at(path)?;
+        if !files.is_empty() {
+            return Ok(PendingMerge::Conflicts(files));
+        }
+        checked_git(path, "add resolved merge", &["add", "-A"])?;
+        if Self::git_merge_in_progress_at(path)? {
+            checked_git(
+                path,
+                "commit resolved merge",
+                &[
+                    "-c",
+                    "user.name=mini-swe",
+                    "-c",
+                    "user.email=mini-swe@localhost",
+                    "commit",
+                    "--no-edit",
+                ],
+            )?;
+        } else {
+            Self::commit_staged_at(path, "worker: resolve pending base integration")?;
+        }
+        Ok(PendingMerge::Concluded)
+    }
+
+    fn conflict_markers_at(path: &Path) -> Result<Vec<String>> {
         // Git searches working-tree content even when the index is unmerged.
         let markers = git(
             path,
@@ -567,30 +608,38 @@ impl WorktreeGuard {
             ],
         )?;
         match markers.status.code() {
-            Some(0) => Ok(PendingMerge::Conflicts(nul_paths(&markers.stdout))),
-            Some(1) => {
-                // The model resolved the markers: the harness concludes the
-                // merge it started, exactly as a completion does.
-                checked_git(path, "add resolved merge", &["add", "-A"])?;
-                checked_git(
-                    path,
-                    "commit resolved merge",
-                    &[
-                        "-c",
-                        "user.name=mini-swe",
-                        "-c",
-                        "user.email=mini-swe@localhost",
-                        "commit",
-                        "--no-edit",
-                    ],
-                )?;
-                Ok(PendingMerge::Concluded)
-            }
+            Some(0) => Ok(nul_paths(&markers.stdout)),
+            Some(1) => Ok(Vec::new()),
             _ => anyhow::bail!(
                 "Could not check conflict markers: {}",
                 String::from_utf8_lossy(&markers.stderr).trim()
             ),
         }
+    }
+
+    /// Preserve a pending integration without treating its markers as resolved.
+    fn preserve_pending_integration_at(path: &Path) -> Result<()> {
+        if !Self::merge_in_progress_at(path)? {
+            return Ok(());
+        }
+        let files = Self::conflict_markers_at(path)?;
+        let dirty = checked_git(
+            path,
+            "status pending integration",
+            &["status", "--porcelain"],
+        )?;
+        if !Self::git_merge_in_progress_at(path)? && dirty.stdout.is_empty() {
+            return Ok(());
+        }
+        checked_git(path, "stage pending integration", &["add", "-A"])?;
+        Self::commit_staged_at(
+            path,
+            &format!(
+                "worker: WIP base integration (unresolved: {})\n\nWorker-Pending-Base-Integration: true",
+                files.join(", ")
+            ),
+        )?;
+        Ok(())
     }
 
     /// Merge `reference` into the checkout at `path`, on the harness.
@@ -826,6 +875,11 @@ impl WorktreeGuard {
             return Ok(false);
         }
 
+        Self::commit_staged_at(path, message)?;
+        Ok(true)
+    }
+
+    fn commit_staged_at(path: &Path, message: &str) -> Result<()> {
         // Commit with fallback credentials so lack of git config never errors.
         let commit_out = git(
             path,
@@ -836,6 +890,7 @@ impl WorktreeGuard {
                 "-c",
                 "user.email=mini-swe@localhost",
                 "commit",
+                "--allow-empty",
                 "-m",
                 message,
             ],
@@ -844,7 +899,7 @@ impl WorktreeGuard {
             let stderr = String::from_utf8_lossy(&commit_out.stderr);
             anyhow::bail!("git commit failed: {}", stderr.trim());
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Commit all dirty changes in the worktree to preserve work in git history,
@@ -946,6 +1001,12 @@ impl Drop for WorktreeGuard {
         // tree that is about to be salvaged.
         let dirs = self.worker_process_dirs();
         crate::agent::reap::sweep_worker_processes(&self.worker_id(), &dirs);
+
+        // Teardown must retain partially resolved hunks on every exit path.
+        if let Err(e) = Self::preserve_pending_integration_at(&self.path) {
+            warn!(path = %self.path.display(), error = %e, "Keeping worktree after integration salvage failed");
+            return;
+        }
 
         let pid_file = pid_file_for(&self.path);
 
