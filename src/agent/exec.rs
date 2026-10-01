@@ -1337,12 +1337,17 @@ mod tests {
     /// operator did not set, so debug info and backtraces stay complete.
     #[test]
     fn worker_build_debug_suppresses_the_diet_defaults() {
-        let keep_debug =
-            |name: &str| (name == WORKER_BUILD_DEBUG_VAR).then(|| std::ffi::OsString::from("1"));
+        let keep_debug = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("1")),
+            _ => None,
+        };
         assert!(cargo_artifact_diet(&keep_debug).is_empty());
 
         // Only `1` is the opt-out; any other value keeps the diet.
-        let zero = |name: &str| (name == WORKER_BUILD_DEBUG_VAR).then(|| "0".into());
+        let zero = |name: &str| match name {
+            WORKER_BUILD_DEBUG_VAR => Some(std::ffi::OsString::from("0")),
+            _ => None,
+        };
         assert_eq!(cargo_artifact_diet(&zero).len(), 3);
 
         // An explicitly exported Cargo value still rides along.
