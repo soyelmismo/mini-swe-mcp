@@ -1,5 +1,5 @@
 /// `watch`: the process that wakes the orchestrator when a worker needs it.
-pub(super) const TEXT: &str = "Run `mini-swe-mcp watch` exactly as printed, using the host's own background mechanism (e.g. a background shell task) - no redirection, no trailing `&`, no wrapper: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, and the host wakes you with the finished task's output; missed events are replayed first. After every event, run it again. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
+pub(super) const TEXT: &str = "Run `mini-swe-mcp watch` exactly as printed, using the host's own background mechanism (e.g. a background shell task) - no redirection, no trailing `&`, no wrapper: it blocks until the next actionable event - completion, failure, a question, or a stall - prints it and exits, and the host wakes you with the finished task's output; missed events are replayed first. After every event, run it again. A watch with no worker ids follows every worker you own, including any dispatched after it starts (--group still filters). One watch runs per session: a second is refused (exit 5) so the first is the one the next event wakes. Claude Code sessions started with channels enabled also receive the same events as push notifications. For a whole round, run `mini-swe-mcp watch --group <g> --all` (MCP action 'watch', `all: true` with `group` or explicit ids): it answers with ONE event once every selected worker has stopped - one compact line per worker: id, outcome, verification and the report's done: line - or earlier as soon as one worker needs input or fails, since those need you. Stalls are not reported in --all mode unless a worker goes 20 minutes without a step; the consolidator handles ordinary stalls. The round acknowledges its workers, so a later plain watch does not replay them. An agent with no shell can call the 'watch' action instead, passing timeout_secs below its host's tool deadline and calling it again on no_event.";
 
 #[cfg(test)]
 mod tests {
@@ -17,6 +17,9 @@ mod tests {
             "timeout_secs",
             "no_event",
             "push notifications",
+            "--group <g> --all",
+            "all: true",
+            "20 minutes",
         ] {
             assert!(
                 text.contains(needle),

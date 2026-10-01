@@ -1388,7 +1388,7 @@ impl EventRouter {
         let pending: BTreeSet<String> = self
             .watch_history
             .iter()
-            .filter(|(agent, _)| ctx.is_admin() || *agent == owner)
+            .filter(|(agent, _)| ctx.is_admin() || agent.as_str() == owner)
             .flat_map(|(_, history)| history.pending.iter())
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
