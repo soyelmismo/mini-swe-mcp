@@ -114,7 +114,6 @@ fn history(worker_id: &str, repo: &Path) -> WorkerHistory {
 /// A registry row for `id` in `status`, as a stopped run leaves one behind.
 fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::WorkerRegistryEntry {
     mini_swe_mcp::pool::WorkerRegistryEntry {
-        approved: None,
         id: id.to_string(),
         pid: std::process::id(),
         role: mini_swe_mcp::pool::WorkerRole::Worker,
@@ -136,6 +135,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         base_commit: Some("base".into()),
         revision: 1,
         auto_continues: 0,
+        approved: None,
     }
 }
 

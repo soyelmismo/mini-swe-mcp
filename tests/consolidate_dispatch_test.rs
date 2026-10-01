@@ -87,7 +87,6 @@ impl Harness {
         group: Option<&str>,
     ) {
         let entry = WorkerRegistryEntry {
-            approved: None,
             id: worker_id.to_string(),
             pid: std::process::id(),
             task: task.to_string(),
@@ -108,6 +107,7 @@ impl Harness {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            approved: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }

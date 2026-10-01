@@ -1092,7 +1092,6 @@ mod tests {
 
         fn build(self) -> WorkerRegistryEntry {
             WorkerRegistryEntry {
-                approved: None,
                 id: self.id.into(),
                 pid: 1234,
                 task: self.task,
@@ -1113,13 +1112,13 @@ mod tests {
                 base_commit: None,
                 revision: 0,
                 auto_continues: 0,
+                approved: None,
             }
         }
     }
 
     fn line_entry(id: &str, status: RegistryStatus, updated_at: u64) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            approved: None,
             id: id.into(),
             pid: 1234,
             task: "task".into(),
@@ -1140,6 +1139,7 @@ mod tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            approved: None,
         }
     }
 

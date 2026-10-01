@@ -81,19 +81,23 @@ pub enum WorkerRole {
     Consolidate,
 }
 
-/// A recorded approval, shared with the approve action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The orchestrator's verdict on a completed worker.
+///
+/// Recorded in the worker's registry row so it outlives the in-memory record
+/// `collect` evicts; a new revision drops it, because a changed branch needs a
+/// fresh review. The batch merge reads it too, and lands the workers in the
+/// order the stamps were recorded in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerApproval {
-    /// Unix seconds the approval was recorded at; the batch merges in this order.
+    /// Unix time the worker was approved.
     pub at: u64,
+    /// Optional note the orchestrator left with the approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved: Option<WorkerApproval>,
     pub id: String,
     pub pid: u32,
     pub task: String,
@@ -137,6 +141,10 @@ pub struct WorkerRegistryEntry {
     /// worker, capped at [`super::MAX_AUTO_CONTINUES`].
     #[serde(default)]
     pub auto_continues: usize,
+    /// The orchestrator's approval of the completed worker, or `None` while it
+    /// is unreviewed. Persisted so it survives the in-memory eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<WorkerApproval>,
 }
 
 /// The immutable per-worker fields shared by every registry write for a worker.
@@ -186,7 +194,6 @@ impl WorkerMeta {
         question: Option<String>,
     ) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            approved: None,
             id: self.id.clone(),
             pid: self.pid,
             task: self.task.clone(),
@@ -207,6 +214,7 @@ impl WorkerMeta {
             base_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
+            approved: None,
         }
     }
 
@@ -663,7 +671,6 @@ mod recovery_cleanup_tests {
     /// hub crash.
     fn orphan_row(id: &str) -> WorkerRegistryEntry {
         WorkerRegistryEntry {
-            approved: None,
             id: id.to_string(),
             pid: dead_pid(),
             task: "orphan".to_string(),
@@ -684,6 +691,7 @@ mod recovery_cleanup_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            approved: None,
         }
     }
 

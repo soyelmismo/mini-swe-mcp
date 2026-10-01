@@ -254,6 +254,9 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
+        // A worker leases build directories keyed by this repo's hash; they are
+        // filed next to the scratch base, so removing the repo has to take them.
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -378,7 +381,7 @@ async fn dispatch_and_wait(
     max_turns: usize,
     review_after: Option<String>,
     verify: Option<String>,
-) -> (WorkerPool, String, WorkerState) {
+) -> (WorkerPool, String, WorkerState, common::TempDir) {
     dispatch_and_wait_with_env(base_url, repo, max_turns, review_after, verify, Vec::new()).await
 }
 
@@ -390,17 +393,16 @@ async fn dispatch_and_wait_with_env(
     review_after: Option<String>,
     verify: Option<String>,
     client_env: Vec<(String, String)>,
-) -> (WorkerPool, String, WorkerState) {
-    // The scratch root outlives this call: the caller inspects the worker's
-    // history file after the run, so the directory must still be there.
+) -> (WorkerPool, String, WorkerState, common::TempDir) {
+    // The caller owns the scratch root: the one test that inspects the
+    // worker's history file after the run keeps it alive, every other caller
+    // drops it (with its worktrees) when the returned tuple goes out of scope.
     let scratch = common::TempDir::new_in_tmp("loop-pool");
-    let path = scratch.path().to_path_buf();
-    std::mem::forget(scratch);
     let pool = WorkerPool::with_scratch(
         1,
         base_url.to_string(),
         "test-key".to_string(),
-        mini_swe_mcp::worktree::ScratchRoot::new(path),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
     );
     let worker_id = pool
         .dispatch(
@@ -419,7 +421,7 @@ async fn dispatch_and_wait_with_env(
         .await
         .expect("dispatch the worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
-    (pool, worker_id, state)
+    (pool, worker_id, state, scratch)
 }
 
 // ----------
@@ -440,7 +442,7 @@ async fn implementer_replays_the_unparseable_tool_call_turn_with_its_reasoning()
     ])
     .await;
 
-    let (pool, worker_id, state) =
+    let (pool, worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     match state {
@@ -520,7 +522,7 @@ async fn implementer_replays_a_prose_only_turn_before_the_error_message() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     assert!(
@@ -579,7 +581,7 @@ async fn the_parse_error_quotes_at_most_two_hundred_argument_bytes() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -626,7 +628,7 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
     ])
     .await;
 
-    let (pool, worker_id, state) = dispatch_and_wait(
+    let (pool, worker_id, state, _scratch) = dispatch_and_wait(
         &server.base_url,
         repo.path(),
         5,
@@ -694,7 +696,7 @@ async fn verify_gate_passes_and_worker_completes() {
     let server =
         ScriptedSseServer::spawn(vec![ScriptedSseServer::completion_turn("call_done")]).await;
 
-    let (_pool, _worker_id, state) = dispatch_and_wait(
+    let (_pool, _worker_id, state, _scratch) = dispatch_and_wait(
         &server.base_url,
         repo.path(),
         5,
@@ -730,7 +732,7 @@ async fn verify_gate_fails_then_passes_after_fix_turn() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) = dispatch_and_wait(
+    let (_pool, _worker_id, state, _scratch) = dispatch_and_wait(
         &server.base_url,
         repo.path(),
         5,
@@ -792,7 +794,7 @@ async fn verify_gate_exhausts_after_three_failures() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) = dispatch_and_wait(
+    let (_pool, _worker_id, state, _scratch) = dispatch_and_wait(
         &server.base_url,
         repo.path(),
         5,
@@ -851,7 +853,7 @@ async fn a_repeated_command_is_answered_without_being_executed() {
     ])
     .await;
 
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -980,7 +982,7 @@ async fn a_turn_extension_within_the_budget_extends_the_loop() {
     .await;
 
     // Budget 4, so half of it (2 turns) may be self-granted: 6 turns in total.
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -1023,7 +1025,7 @@ async fn a_turn_extension_beyond_the_budget_is_refused() {
     .await;
 
     // Budget 4, so 40 more turns is far past the 2 turns it may self-grant.
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -1071,7 +1073,7 @@ async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
         .collect();
     let server = ScriptedSseServer::spawn(script).await;
 
-    let (_pool, worker_id, state) =
+    let (_pool, worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 25, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -1200,7 +1202,7 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
         .collect();
     let server = ScriptedSseServer::spawn(script).await;
 
-    let (_pool, _worker_id, state) =
+    let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
     assert!(
         matches!(state, WorkerState::Completed { .. }),
@@ -1263,7 +1265,7 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
         .collect();
     script.push(ScriptedSseServer::completion_turn("call_done"));
     let server = ScriptedSseServer::spawn(script).await;
-    let (pool, worker_id, state) =
+    let (pool, worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
     assert!(matches!(state, WorkerState::Completed { .. }), "{state:?}");
     let requests = server.requests.all().await;

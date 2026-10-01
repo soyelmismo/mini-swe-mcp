@@ -1008,7 +1008,6 @@ impl super::WorkerPool {
         // The row that makes the revision visible to registry readers before
         // its first turn writes one; built before the conversation moves out.
         let row = super::WorkerRegistryEntry {
-            approved: None,
             id: id.to_string(),
             pid: std::process::id(),
             task: history.task.clone(),
@@ -1029,6 +1028,9 @@ impl super::WorkerPool {
             revision,
             auto_continues: history.auto_continues,
             owner: Some(owner.clone()),
+            // A revision changes the branch, so the previous review no longer
+            // applies: drop any approval this row carried.
+            approved: None,
         };
 
         let pool = self.clone();

@@ -58,7 +58,6 @@ impl Harness {
 /// The registry row a target worker leaves behind.
 fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        approved: None,
         id: id.to_string(),
         pid: std::process::id(),
         task: "do the work".to_string(),
@@ -79,6 +78,7 @@ fn worker_row(id: &str, owner: &str, status: RegistryStatus) -> WorkerRegistryEn
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     }
 }
 

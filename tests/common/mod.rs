@@ -23,6 +23,7 @@
 pub mod fake_llm;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -193,6 +194,11 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // A worktree's private scratch and its leased build directories are
+        // filed next to the scratch base, keyed by the worktree leaf and by the
+        // repository hash, so removing the tree alone leaves them behind.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.path);
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.path);
         // Best effort: a leftover directory must never fail an otherwise good test.
         let _ = std::fs::remove_dir_all(&self.path);
     }
@@ -216,6 +222,49 @@ impl AsRef<std::ffi::OsStr> for TempDir {
     fn as_ref(&self) -> &std::ffi::OsStr {
         self.path.as_os_str()
     }
+}
+
+// ----------
+// Process-lifetime scratch
+// ----------
+
+/// Scratch directories removed when the test binary exits.
+static PROCESS_SCRATCH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+unsafe extern "C" {
+    /// Registered with libc so a directory that must outlive every test in the
+    /// binary still leaves nothing behind when the binary exits.
+    fn atexit(handler: extern "C" fn()) -> i32;
+}
+
+extern "C" fn remove_process_scratch() {
+    let paths = PROCESS_SCRATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in paths.iter() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+/// A scratch directory that lives for the whole test binary.
+///
+/// Some tests point process-global state (`SWE_TEMP_DIR`, the registry) at a
+/// directory every sibling test in the binary needs, so one test's [`TempDir`]
+/// must not own it. Registering the directory with `atexit` gives it the
+/// binary's lifetime while still leaving nothing behind.
+pub fn process_temp_dir(tag: &str) -> PathBuf {
+    let path = mini_swe_mcp::worktree::swe_base_dir().join(scratch_name(tag));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path)
+        .unwrap_or_else(|e| panic!("create process scratch {}: {e}", path.display()));
+    PROCESS_SCRATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.clone());
+    // SAFETY: the handler only locks a static and removes directories, so it is
+    // safe to run from `atexit`.
+    unsafe { atexit(remove_process_scratch) };
+    path
 }
 
 // ----------

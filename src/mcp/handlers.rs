@@ -218,6 +218,8 @@ impl McpServer {
             "status" => self.handle_status(args, ctx).await,
             "collect" => self.handle_collect(args, ctx).await,
             "review" => self.handle_review(args, ctx).await,
+            "approve" => self.handle_approve(args, ctx).await,
+            "unapprove" => self.handle_unapprove(args, ctx).await,
             "logs" => self.handle_logs(args, ctx).await,
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
@@ -682,10 +684,13 @@ impl McpServer {
                 )),
                 _ => None,
             };
+            let approved = crate::pool::load_registry_entry_in(self.pool.scratch_root(), wid)
+                .and_then(|entry| entry.approved);
             Ok(json!({
                 "worker_id": wid,
                 "owner": self.owner_of(wid).await,
                 "state": state,
+                "approved": approved,
                 "next_step": next_step,
             }))
         } else if let Some(entry) =
@@ -717,6 +722,7 @@ impl McpServer {
                         "metrics": entry.metrics,
                     }
                 },
+                "approved": entry.approved,
                 "next_step": next_step,
             }))
         } else {
@@ -867,6 +873,7 @@ impl McpServer {
     ) -> Result<Value> {
         let wid = self.resolve_worker_id(args, "review", ctx).await?;
         self.require_owner(&wid, ctx).await?;
+        let scope = Self::get_review_diff_scope(args)?;
         let state = self.pool.get_worker_state(&wid).await;
         let entry = crate::pool::load_registry_entry_in(self.pool.scratch_root(), &wid);
         if state.is_none() && entry.is_none() {
@@ -890,7 +897,7 @@ impl McpServer {
                     .and_then(crate::pool::revision::detect_base_branch)
             });
         // A live worker's diff is the exact text it produced; a collected one
-        // has only its branch left, so its stat is measured from that.
+        // has only its branch left, so its change is measured from that.
         let live_diff = match &state {
             Some(crate::pool::WorkerState::Completed { diff, .. }) => Some(diff.clone()),
             _ => None,
@@ -899,23 +906,37 @@ impl McpServer {
             .clone()
             .zip(base_branch.clone())
             .map(|(repo, base)| (repo, base, branch.clone()));
-        let (stats, merge) = match tokio::task::spawn_blocking(move || {
+        let (stats, summaries, merge, raw_diff) = match tokio::task::spawn_blocking(move || {
             let Some((repo, base, branch)) = probe else {
-                return (Vec::new(), None);
+                // No repository recorded: a live worker still carries its own
+                // diff, so the change can be classified even without git.
+                return match live_diff {
+                    Some(diff) => {
+                        let summaries = diff_file_summaries(&diff);
+                        let stats = diff_file_stats(&diff);
+                        (stats, summaries, None, diff)
+                    }
+                    None => (Vec::new(), Vec::new(), None, String::new()),
+                };
             };
             let merge = merge_check(&repo, &base, &branch);
+            let text = match &live_diff {
+                Some(diff) => diff.clone(),
+                None => branch_diff(&repo, &base, &branch),
+            };
             let stats = match &live_diff {
                 Some(diff) => diff_file_stats(diff),
                 None => branch_file_stats(&repo, &base, &branch),
             };
-            (stats, merge)
+            let summaries = diff_file_summaries(&text);
+            (stats, summaries, merge, text)
         })
         .await
         {
             Ok(probed) => probed,
             Err(err) => {
                 tracing::warn!("review probe for worker {wid} could not run: {err}");
-                (Vec::new(), None)
+                (Vec::new(), Vec::new(), None, String::new())
             }
         };
         // A worker that never verified is exactly the one whose verify output
@@ -928,6 +949,17 @@ impl McpServer {
                 .await
                 .and_then(|logs| super::events::verify_tail_of(&logs.tail(VERIFY_TAIL_STEPS)))
         };
+        // Test files are summarised rather than shown, so the diff stays code
+        // by default; `all` shows everything and `none` withholds it.
+        let shown = match scope {
+            ReviewDiffScope::None => String::new(),
+            ReviewDiffScope::All => raw_diff,
+            ReviewDiffScope::Code => diff_of_kind(&raw_diff, PathKind::Code),
+        };
+        let diff = match scope {
+            ReviewDiffScope::None => Value::Null,
+            _ => Value::String(crate::agent::truncate_output(&shown)),
+        };
         Ok(json!({
             "worker_id": wid,
             "owner": self.owner_of(&wid).await,
@@ -935,12 +967,74 @@ impl McpServer {
             "state": state_name(state.as_ref(), entry.as_ref()),
             "verified": verified,
             "verify_tail": verify_tail,
+            "approved": entry.as_ref().and_then(|entry| entry.approved.clone()),
+            "diff_scope": scope.name(),
+            "diff": diff,
             "diff_stat": diff_stat_value(&stats),
+            "test_files": test_files_value(&summaries),
+            "docs": docs_value(&summaries),
             "summary": summary,
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
             "next_command": next_command(&wid, &branch, merge.as_ref()),
+        }))
+    }
+
+    /// Parse the optional `diff` argument of `review`: which part of the change
+    /// to show. Defaults to the code diff, which is what a reviewer reads.
+    fn get_review_diff_scope(args: &Value) -> Result<ReviewDiffScope> {
+        match args.get("diff") {
+            None => Ok(ReviewDiffScope::Code),
+            Some(value) => match value.as_str() {
+                Some("code") => Ok(ReviewDiffScope::Code),
+                Some("all") => Ok(ReviewDiffScope::All),
+                Some("none") => Ok(ReviewDiffScope::None),
+                _ => anyhow::bail!("'diff' must be one of: code, all, none"),
+            },
+        }
+    }
+
+    /// `approve` action: the orchestrator signs off a completed worker.
+    ///
+    /// Owner-only like `collect`. The verdict is written to the registry row so
+    /// it outlives the in-memory record `collect` evicts; steering the worker
+    /// into a new revision drops it, because a changed branch needs a new
+    /// review.
+    async fn handle_approve(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let wid = self.resolve_worker_id(args, "approve", ctx).await?;
+        self.require_owner(&wid, ctx).await?;
+        let note = args
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_owned);
+        let approved = self.pool.approve(&wid, note).await?;
+        Ok(json!({
+            "worker_id": wid,
+            "status": "approved",
+            "approved": approved,
+        }))
+    }
+
+    /// `unapprove` action: withdraw a completed worker's approval.
+    async fn handle_unapprove(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let wid = self.resolve_worker_id(args, "unapprove", ctx).await?;
+        self.require_owner(&wid, ctx).await?;
+        self.pool.unapprove(&wid).await?;
+        Ok(json!({
+            "worker_id": wid,
+            "status": "unapproved",
+            "approved": Value::Null,
         }))
     }
 
@@ -1436,6 +1530,28 @@ impl McpServer {
     }
 }
 
+/// Which part of a worker's change `review` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewDiffScope {
+    /// Only the code diff; test files are summarised and docs listed.
+    Code,
+    /// The whole diff, test and doc churn included.
+    All,
+    /// No diff at all.
+    None,
+}
+
+impl ReviewDiffScope {
+    /// The wire name of the scope.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
+}
+
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
 
@@ -1571,25 +1687,26 @@ pub(super) struct MergeCheck {
     pub(super) error: Option<String>,
 }
 
+/// The merge-base commit `branch` shares with `base_branch`, or `None` when
+/// git cannot name one.
+fn merge_base(repo: &std::path::Path, base_branch: &str, branch: &str) -> Option<String> {
+    let output =
+        crate::worktree::git(repo, "merge-base", &["merge-base", base_branch, branch]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
 /// Per-file diff stat of `branch` against its merge-base with `base_branch`.
 ///
 /// The branch is what the orchestrator merges, so it is measured against the
 /// base tip it will land on — the same range `git diff --shortstat` reports.
 fn branch_file_stats(repo: &std::path::Path, base_branch: &str, branch: &str) -> Vec<DiffFileStat> {
-    let Ok(merge_base) =
-        crate::worktree::git(repo, "merge-base", &["merge-base", base_branch, branch])
-    else {
+    let Some(base) = merge_base(repo, base_branch, branch) else {
         return Vec::new();
     };
-    if !merge_base.status.success() {
-        return Vec::new();
-    }
-    let base = String::from_utf8_lossy(&merge_base.stdout)
-        .trim()
-        .to_string();
-    if base.is_empty() {
-        return Vec::new();
-    }
     let range = format!("{base}...{branch}");
     let Ok(output) = crate::worktree::git(repo, "diff --numstat", &["diff", "--numstat", &range])
     else {
@@ -1599,6 +1716,21 @@ fn branch_file_stats(repo: &std::path::Path, base_branch: &str, branch: &str) ->
         return Vec::new();
     }
     parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The whole unified diff of `branch` against its merge-base with
+/// `base_branch`, so a collected worker's code diff can still be shown.
+fn branch_diff(repo: &std::path::Path, base_branch: &str, branch: &str) -> String {
+    let Some(base) = merge_base(repo, base_branch, branch) else {
+        return String::new();
+    };
+    let range = format!("{base}...{branch}");
+    match crate::worktree::git(repo, "diff", &["diff", &range]) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Read `git diff --numstat` output: `<added>\t<deleted>\t<path>` per line,
@@ -1736,34 +1868,192 @@ fn diff_git_path(header: &str) -> Option<String> {
     Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
 }
 
-/// Per-file `(path, insertions, deletions)` of a unified diff.
+/// Which part of a change a path belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PathKind {
+    Code,
+    Test,
+    Doc,
+}
+
+/// Directory components that mark a file as a test wherever it lives.
+const TEST_DIRS: &[&str] = &["tests", "test", "__tests__", "spec"];
+/// Filename tails that mark a file as a test whatever its directory.
+const TEST_NAME_TAILS: &[&str] = &["_test.", "_spec.", ".test.", ".spec."];
+/// Directory components that mark a file as documentation.
+const DOC_DIRS: &[&str] = &["docs"];
+/// Filename tails that mark a file as documentation.
+const DOC_EXTENSIONS: &[&str] = &[".md", ".rst", ".txt"];
+
+/// Classify one diff path as code, test or doc.
+///
+/// One small table, applied in order: a test directory or a `*_test.*` style
+/// name wins over a documentation extension, so `tests/README.md` is a test.
+fn classify_path(path: &str) -> PathKind {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let has_dir = |dir: &str| path.split('/').any(|part| part == dir);
+    if TEST_DIRS.iter().any(|dir| has_dir(dir))
+        || TEST_NAME_TAILS.iter().any(|tail| file.contains(tail))
+        || (file.starts_with("test_") && file.ends_with(".py"))
+    {
+        return PathKind::Test;
+    }
+    if DOC_DIRS.iter().any(|dir| has_dir(dir))
+        || DOC_EXTENSIONS.iter().any(|ext| file.ends_with(ext))
+    {
+        return PathKind::Doc;
+    }
+    PathKind::Code
+}
+
+/// Declarations that each start one test case, language-agnostically.
+///
+/// `#[test]`/`#[tokio::test]` are the Rust forms, `fn test_`/`def test_` the
+/// function forms, `it(`/`test(`/`describe(` the JS ones and `@Test`/
+/// `func Test` the JVM and Swift/Go ones.
+const TEST_CASE_PATTERNS: &[&str] = &[
+    "#[test]",
+    "#[tokio::test]",
+    "fn test_",
+    "def test_",
+    "it(",
+    "test(",
+    "describe(",
+    "@Test",
+    "func Test",
+];
+
+/// How many test cases one changed line declares.
+fn count_test_cases(line: &str) -> usize {
+    TEST_CASE_PATTERNS
+        .iter()
+        .filter(|pattern| contains_at_word_start(line, pattern))
+        .count()
+}
+
+/// Whether `line` contains `pattern` at a word start, so `it(` does not match
+/// inside an identifier such as `unit(`.
+fn contains_at_word_start(line: &str, pattern: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = line[from..].find(pattern) {
+        let idx = from + at;
+        let boundary = idx == 0
+            || !line[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if boundary {
+            return true;
+        }
+        from = idx + pattern.len();
+    }
+    false
+}
+
+/// One file's share of a diff, including the test cases its changed lines
+/// declare and how the path classifies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiffFileSummary {
+    pub(super) path: String,
+    pub(super) insertions: usize,
+    pub(super) deletions: usize,
+    pub(super) added_cases: usize,
+    pub(super) removed_cases: usize,
+    pub(super) kind: PathKind,
+}
+
+/// Per-file summaries of a unified diff.
 ///
 /// Only hunk lines are counted, and a hunk starts at its `@@` header, so the
 /// `---`/`+++` headers and an added line that itself starts with `+` are never
 /// mistaken for a change.
-fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
+fn diff_file_summaries(diff: &str) -> Vec<DiffFileSummary> {
     diff_sections(diff)
         .into_iter()
         .map(|(path, section)| {
+            let kind = classify_path(&path);
             let mut insertions = 0;
             let mut deletions = 0;
+            let mut added_cases = 0;
+            let mut removed_cases = 0;
             let mut in_hunks = false;
             for line in section.lines() {
                 if line.starts_with("@@") {
                     in_hunks = true;
                 } else if in_hunks && line.starts_with('+') {
                     insertions += 1;
+                    added_cases += count_test_cases(line.get(1..).unwrap_or_default());
                 } else if in_hunks && line.starts_with('-') {
                     deletions += 1;
+                    removed_cases += count_test_cases(line.get(1..).unwrap_or_default());
                 }
             }
-            DiffFileStat {
+            DiffFileSummary {
                 path,
                 insertions,
                 deletions,
+                added_cases,
+                removed_cases,
+                kind,
             }
         })
         .collect()
+}
+
+/// Per-file `(path, insertions, deletions)` of a unified diff.
+fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
+    diff_file_summaries(diff)
+        .into_iter()
+        .map(|summary| DiffFileStat {
+            path: summary.path,
+            insertions: summary.insertions,
+            deletions: summary.deletions,
+        })
+        .collect()
+}
+
+/// The sections of `diff` whose path classifies as `kind`, rejoined.
+fn diff_of_kind(diff: &str, kind: PathKind) -> String {
+    diff_sections(diff)
+        .into_iter()
+        .filter(|(path, _)| classify_path(path) == kind)
+        .map(|(_, section)| section)
+        .collect()
+}
+
+/// The `test_files` payload: one entry per test file, naming the test cases
+/// its added and removed lines declare.
+fn test_files_value(summaries: &[DiffFileSummary]) -> Value {
+    Value::Array(
+        summaries
+            .iter()
+            .filter(|summary| summary.kind == PathKind::Test)
+            .map(|summary| {
+                json!({
+                    "path": summary.path,
+                    "added_cases": summary.added_cases,
+                    "removed_cases": summary.removed_cases,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The `docs` payload: one entry per documentation file with its +/ counts.
+fn docs_value(summaries: &[DiffFileSummary]) -> Value {
+    Value::Array(
+        summaries
+            .iter()
+            .filter(|summary| summary.kind == PathKind::Doc)
+            .map(|summary| {
+                json!({
+                    "path": summary.path,
+                    "insertions": summary.insertions,
+                    "deletions": summary.deletions,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The sections of `diff` that touch any of `files`, rejoined.
@@ -2169,5 +2459,106 @@ mod tests {
             "test a ... FAILED\nassertion failed"
         );
         assert_eq!(crate::mcp::events::verify_tail_of(&logs[..1]), None);
+    }
+    /// The path classifier is one table: a test directory or a test-style name
+    /// beats a documentation extension, so `tests/README.md` is a test.
+    #[test]
+    fn classify_path_sorts_code_tests_and_docs() {
+        for (path, kind) in [
+            ("src/parser.rs", PathKind::Code),
+            ("src/main.py", PathKind::Code),
+            ("tests/integration.rs", PathKind::Test),
+            ("test/cli_test.go", PathKind::Test),
+            ("app/__tests__/x.js", PathKind::Test),
+            ("spec/models_spec.rb", PathKind::Test),
+            ("src/serde_test.rs", PathKind::Test),
+            ("scripts/test_smoke.py", PathKind::Test),
+            ("web/widget.spec.ts", PathKind::Test),
+            ("src/thing.test.ts", PathKind::Test),
+            ("README.md", PathKind::Doc),
+            ("docs/design.rst", PathKind::Doc),
+            ("notes.txt", PathKind::Doc),
+            ("tests/README.md", PathKind::Test),
+        ] {
+            assert_eq!(classify_path(path), kind, "wrong kind for {path}");
+        }
+    }
+
+    /// The counter is language-agnostic: every documented declaration earns one
+    /// case, and an identifier that merely contains a pattern earns none.
+    #[test]
+    fn count_test_cases_reads_every_declaration() {
+        for line in [
+            "#[test]",
+            "    #[tokio::test]",
+            "fn test_parses() {",
+            "def test_parses(self):",
+            "it(`adds`)",
+            "test('adds', () => {})",
+            "describe('parser', () => {",
+            "    @Test",
+            "func TestParse(t *testing.T) {",
+        ] {
+            assert_eq!(count_test_cases(line), 1, "missed a case in {line:?}");
+        }
+        for line in [
+            "// a comment about tests",
+            "fn parses() {",
+            "let unit = 1;",
+            "let submit = 2;",
+        ] {
+            assert_eq!(count_test_cases(line), 0, "false positive in {line:?}");
+        }
+    }
+
+    /// Test-case churn is measured from the changed hunk lines only, and each
+    /// summary keeps the path's classification.
+    #[test]
+    fn diff_summaries_count_cases_and_classify() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/tests/a_test.rs b/tests/a_test.rs\n",
+            "--- a/tests/a_test.rs\n",
+            "+++ b/tests/a_test.rs\n",
+            "@@ -1,2 +1,3 @@\n",
+            "-#[test]\n",
+            "-fn test_old() {}\n",
+            "+#[test]\n",
+            "+fn test_new() {}\n",
+            "+#[test]\n",
+        );
+        let summaries = diff_file_summaries(diff);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].kind, PathKind::Code);
+        assert_eq!(summaries[0].added_cases, 0);
+        let test = &summaries[1];
+        assert_eq!(test.kind, PathKind::Test);
+        assert_eq!(test.added_cases, 3);
+        assert_eq!(test.removed_cases, 2);
+        assert_eq!(diff_of_kind(diff, PathKind::Code).lines().count(), 6);
+    }
+
+    /// `review --diff` accepts exactly the three documented scopes and defaults
+    /// to the code diff.
+    #[test]
+    fn review_diff_scope_defaults_to_code_and_rejects_typos() {
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({})).expect("absent is the default"),
+            ReviewDiffScope::Code
+        );
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({ "diff": "all" })).unwrap(),
+            ReviewDiffScope::All
+        );
+        assert_eq!(
+            McpServer::get_review_diff_scope(&json!({ "diff": "none" })).unwrap(),
+            ReviewDiffScope::None
+        );
+        assert!(McpServer::get_review_diff_scope(&json!({ "diff": "everything" })).is_err());
     }
 }

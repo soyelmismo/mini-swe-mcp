@@ -86,7 +86,6 @@ impl Fixture {
     /// Write the registry row the merge's "still running" check reads.
     fn record_status(&self, id: &str, status: RegistryStatus) {
         let entry = WorkerRegistryEntry {
-            approved: None,
             id: id.to_string(),
             pid: std::process::id(),
             task: format!("do the {id} work"),
@@ -107,6 +106,7 @@ impl Fixture {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            approved: None,
         };
         save_registry_entry_in(&self.root(), &entry);
     }

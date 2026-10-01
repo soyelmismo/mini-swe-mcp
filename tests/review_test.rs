@@ -114,7 +114,6 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
 /// coalescing writer would have left it.
 fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
     WorkerRegistryEntry {
-        approved: None,
         id: id.to_string(),
         pid: std::process::id(),
         task: "Fix the parser\nand its docs".to_string(),
@@ -135,6 +134,7 @@ fn registry_row(id: &str, repo: &Path, revision: usize) -> WorkerRegistryEntry {
         base_commit: None,
         revision,
         auto_continues: 0,
+        approved: None,
     }
 }
 
