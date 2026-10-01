@@ -30,11 +30,22 @@ const TEST_OWNER: &str = "test-agent";
 /// the read-only detector and what the plan half of the escalation quotes back.
 const TASK: &str = "Add the plan to `fn check_read_only` in src/lib.rs.";
 
-/// Environment overrides that pull all three read-only thresholds down to two,
-/// three and four turns, so the whole escalation runs inside one dispatch.
+/// The three read-only thresholds, pulled down so the whole escalation runs
+/// inside a handful of turns.
 ///
-/// Scoped to this process by a lock the other test binaries do not share, and
-/// restored by [`Thresholds`] on drop: nothing outside this test reads them.
+/// Restored on drop, and held for the life of one test: the overrides are
+/// process-global, so every test that reads them takes this guard first and
+/// none of them runs in parallel with another that does.
+static THRESHOLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The overrides this binary sets, and the values it sets them to: the nudge at
+/// two turns, the plan at three and the pause at four.
+const THRESHOLD_NAMES: [&str; 3] = [
+    "POOL_READ_ONLY_NUDGE_TURNS",
+    "POOL_READ_ONLY_ESCALATE_TURNS",
+    "POOL_READ_ONLY_PAUSE_TURNS",
+];
+
 struct Thresholds {
     _lock: std::sync::MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<String>)>,
@@ -42,22 +53,18 @@ struct Thresholds {
 
 impl Thresholds {
     fn lower() -> Self {
-        let lock = Box::leak(Box::new(std::sync::Mutex::new(())));
-        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let names = [
-            "POOL_READ_ONLY_NUDGE_TURNS",
-            "POOL_READ_ONLY_ESCALATE_TURNS",
-            "POOL_READ_ONLY_PAUSE_TURNS",
-        ];
-        let saved = names
+        let lock = THRESHOLD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = THRESHOLD_NAMES
             .iter()
             .map(|name| (*name, std::env::var(name).ok()))
             .collect();
-        for (name, value) in [(names[0], "2"), (names[1], "3"), (names[2], "4")] {
+        for (name, value) in THRESHOLD_NAMES.iter().zip(["2", "3", "4"]) {
             unsafe { std::env::set_var(name, value) };
         }
         Self {
-            _lock: guard,
+            _lock: lock,
             saved,
         }
     }
@@ -80,6 +87,12 @@ fn read_turn(n: usize) -> String {
     format!("sed -n '1,{}p' README.md", n % 3 + 1)
 }
 
+/// An editing turn: a command that grows the file, so the worktree sample
+/// changes and the read-only streak starts over.
+fn edit_turn(n: usize) -> String {
+    format!("printf 'x{n}\\n' >> lib.rs")
+}
+
 // ----------
 // Scripted SSE server
 // ----------
@@ -93,9 +106,10 @@ struct ScriptedServer {
 
 impl ScriptedServer {
     /// Answer each turn with the next scripted body, and once the script runs
-    /// out keep answering `fallback`: a worker steered past its script must
-    /// still get an answer every turn instead of hanging on a silent socket.
-    async fn spawn(turns: Vec<String>, fallback: String) -> Self {
+    /// out keep editing with a distinct command: a worker steered past its
+    /// script must still get an answer every turn instead of hanging on a
+    /// silent socket.
+    async fn spawn(turns: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the scripted server on loopback");
@@ -103,7 +117,6 @@ impl ScriptedServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         tokio::spawn(async move {
-            let fallback = fallback;
             let mut next = 0usize;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -112,7 +125,10 @@ impl ScriptedServer {
                 let requests = captured.clone();
                 let turn = match turns.get(next) {
                     Some(turn) => turn.clone(),
-                    None => fallback.clone(),
+                    // Past the script the worker keeps editing, one distinct
+                    // command per turn: the fallback never repeats, so the
+                    // repetition guard is not what the test measures.
+                    None => bash_turn(&format!("call_tail_{next}"), &edit_turn(next)),
                 };
                 next += 1;
                 tokio::spawn(async move {
@@ -157,8 +173,30 @@ fn bash_turn(call_id: &str, command: &str) -> String {
 }
 
 /// The completion turn, carrying the REPORT block the system prompt requires.
+/// The completion turn. Its prose carries the REPORT block the system prompt
+/// requires, so the scripted worker is a compliant one and the harness never
+/// spends a turn asking for a report it would not get.
 fn completion_turn(call_id: &str) -> String {
-    bash_turn(call_id, &format!("echo {COMPLETION_SENTINEL}"))
+    completion_with_report(call_id, "REPORT\ndone: scripted completion\nfiles: lib.rs\ntests: none\nrisks: none")
+}
+
+fn completion_with_report(call_id: &str, report: &str) -> String {
+    let arguments = json!({ "command": format!("echo {COMPLETION_SENTINEL}") }).to_string();
+    format!(
+        "data: {}\n\n",
+        json!({
+            "choices": [{
+                "delta": {
+                    "content": report,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "function": { "name": "bash", "arguments": arguments }
+                    }]
+                }
+            }]
+        })
+    )
 }
 
 async fn write_sse(socket: &mut TcpStream, turn: &str) {
@@ -345,7 +383,7 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
         .map(|n| bash_turn(&format!("call_{n}"), &read_turn(n)))
         .collect();
     turns.push(completion_turn("call_done"));
-    let server = ScriptedServer::spawn(turns, bash_turn("call_tail", "cat README.md")).await;
+    let server = ScriptedServer::spawn(turns).await;
 
     let scratch = common::TempDir::new_in_tmp("read-only-pool");
     let pool = WorkerPool::with_scratch(
@@ -416,16 +454,11 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
 async fn a_worker_that_edits_after_the_nudge_never_reaches_the_pause() {
     let _thresholds = Thresholds::lower();
     let repo = TestRepo::new("edits");
-    let server = ScriptedServer::spawn(
-        vec![
-            bash_turn("call_1", &read_turn(1)),
-            bash_turn("call_2", &read_turn(2)),
-            bash_turn("call_3", "printf 'x\\n' >> lib.rs"),
-            bash_turn("call_4", &read_turn(4)),
-            completion_turn("call_done"),
-        ],
-        bash_turn("call_tail", "cat README.md"),
-    )
+    let server = ScriptedServer::spawn(vec![
+        bash_turn("call_1", &edit_turn(1)),
+        bash_turn("call_2", &edit_turn(2)),
+        completion_turn("call_done"),
+    ])
     .await;
 
     let scratch = common::TempDir::new_in_tmp("read-only-pool");
