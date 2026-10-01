@@ -15,6 +15,8 @@
 //! byte ceilings, and the emission budget that keeps a single response small
 //! (see `audits/opt_07_step_log_memory.md`).
 
+mod common;
+
 use serde_json::json;
 use std::io::Write;
 
@@ -287,82 +289,69 @@ fn test_summarize_command_short_multibyte_is_untouched() {
 // Cross-process steering mailbox
 // ----------
 
-/// `SWE_TEMP_DIR` is process-global, so every test that redirects the mailbox
-/// root has to run alone. `RUST_TEST_THREADS` caps the harness at two threads,
-/// but the mutex is what actually serialises them (a test that raced would
-/// silently observe another test's base dir).
-static SWE_TEMP_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// A unique scratch root under the system temp dir, for `SWE_TEMP_DIR`.
+/// A unique scratch root under the system temp dir, for a pool's registry,
+/// mailbox and history files.
 ///
 /// Mirrors the worktree naming so the real `swe_base_dir()` resolution path
-/// (including the `swe-wt-` prefix) is exercised rather than a stub.
-fn scratch_dir(tag: &str) -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = format!(
-        "swe-wt-test-{tag}-{}-{}-{n}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let dir = std::env::temp_dir().join(&unique);
-    std::fs::create_dir_all(&dir).expect("create scratch base dir");
-    dir.to_string_lossy().into_owned()
+/// (including the `swe-wt-` prefix) is exercised rather than a stub. The
+/// directory is removed when the returned guard drops, so the suite leaves
+/// nothing behind in the real registry.
+struct ScratchRootGuard {
+    path: std::path::PathBuf,
 }
 
-/// Sets `SWE_TEMP_DIR` for its lifetime and holds the global mailbox lock.
-///
-/// Restoring the previous value on drop matters: the rest of the suite asserts
-/// against the default base dir and would otherwise inherit a stale override.
-struct ScopedTempDir {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    previous: Option<String>,
-}
+impl ScratchRootGuard {
+    fn new(tag: &str) -> Self {
+        let path = common::TempDir::new_in_tmp(tag).path().to_path_buf();
+        Self { path }
+    }
 
-impl ScopedTempDir {
-    fn set(dir: &str) -> Self {
-        let guard = SWE_TEMP_DIR_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var("SWE_TEMP_DIR").ok();
-        // SAFETY: the mailbox lock above means no other test reads or writes
-        // this variable while it is overridden, and the pool's own tests are
-        // the only consumers of the base dir in this binary.
-        unsafe { std::env::set_var("SWE_TEMP_DIR", dir) };
-        Self {
-            _guard: guard,
-            previous,
-        }
+    /// The root, as the `*_in` registry, history and steer helpers want it.
+    fn root(&self) -> mini_swe_mcp::worktree::ScratchRoot {
+        mini_swe_mcp::worktree::ScratchRoot::new(&self.path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
-impl Drop for ScopedTempDir {
+impl Drop for ScratchRootGuard {
     fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => unsafe { std::env::set_var("SWE_TEMP_DIR", v) },
-            None => unsafe { std::env::remove_var("SWE_TEMP_DIR") },
-        }
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+// ----------
+// Cross-process steering mailbox
+// ----------
+
+/// A unique scratch root under the system temp dir, for a pool's registry,
+/// mailbox and history files.
+///
+/// Mirrors the worktree naming so the real `swe_base_dir()` resolution path
+/// (including the `swe-wt-` prefix) is exercised rather than a stub. The
+/// directory is removed when the returned guard drops, so the suite leaves
+/// nothing behind in the real registry.
+// ----------
+// Cross-process steering mailbox
+// ----------
 
 #[test]
 fn steer_mailbox_uses_the_documented_path_and_json_lines() {
-    let dir = scratch_dir("steer-path");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-path");
+    let dir = scratch.path().to_path_buf();
 
     // The path is a sibling of the worktree, so one `ls` shows every worker
     // and `prune` reclaims both together.
-    let path = mini_swe_mcp::pool::steer_path("abc123");
+    let path = mini_swe_mcp::pool::steer_path_in(&scratch.root(), "abc123");
     assert_eq!(
         path,
         std::path::PathBuf::from(&dir).join("swe-wt-abc123.steer")
     );
 
-    mini_swe_mcp::pool::write_steer_message("abc123", "first").unwrap();
-    mini_swe_mcp::pool::write_steer_message("abc123", "second").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "abc123", "first").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "abc123", "second").unwrap();
 
     // One JSON object per line, each carrying the sender pid: the format is
     // self-delimiting, so a multi-line message cannot corrupt its neighbours.
@@ -380,43 +369,43 @@ fn steer_mailbox_uses_the_documented_path_and_json_lines() {
 
 #[test]
 fn steer_mailbox_drain_returns_messages_in_order_and_empties_the_file() {
-    let dir = scratch_dir("steer-drain");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-drain");
+    let dir = scratch.path().to_path_buf();
 
-    mini_swe_mcp::pool::write_steer_message("d1", "one").unwrap();
-    mini_swe_mcp::pool::write_steer_message("d1", "two").unwrap();
-    mini_swe_mcp::pool::write_steer_message("d1", "three").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "d1", "one").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "d1", "two").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "d1", "three").unwrap();
 
     assert_eq!(
-        mini_swe_mcp::pool::drain_steer_messages("d1"),
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "d1"),
         vec!["one", "two", "three"],
         "arrival order must be preserved"
     );
     // Draining twice must not re-deliver: guidance is consumed exactly once.
-    assert!(mini_swe_mcp::pool::drain_steer_messages("d1").is_empty());
-    assert!(!mini_swe_mcp::pool::steer_path("d1").exists());
+    assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "d1").is_empty());
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "d1").exists());
 
     // A worker nobody ever steered drains empty rather than erroring.
-    assert!(mini_swe_mcp::pool::drain_steer_messages("never-steered").is_empty());
+    assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "never-steered").is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
-    let dir = scratch_dir("steer-multiline");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-multiline");
+    let dir = scratch.path().to_path_buf();
 
     // The real reason the format is JSON lines rather than raw text: a pasted
     // stack trace or a diff hunk contains newlines, and a line-oriented plain
     // format would split one message into several truncated ones.
     let patch = "diff --git a/x b/x\n-old\n+new";
     let unicode = "corrige la lógica de parseo — ñandú ☕ 日本語";
-    mini_swe_mcp::pool::write_steer_message("m1", patch).unwrap();
-    mini_swe_mcp::pool::write_steer_message("m1", unicode).unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "m1", patch).unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "m1", unicode).unwrap();
 
     assert_eq!(
-        mini_swe_mcp::pool::drain_steer_messages("m1"),
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"),
         vec![patch.to_string(), unicode.to_string()]
     );
 
@@ -425,23 +414,23 @@ fn steer_mailbox_preserves_multiline_and_unicode_payloads() {
 
 #[test]
 fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
-    let dir = scratch_dir("steer-corrupt");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-corrupt");
+    let dir = scratch.path().to_path_buf();
 
-    mini_swe_mcp::pool::write_steer_message("c1", "good one").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "c1", "good one").unwrap();
     // A truncated write, or a hand-edited file, leaves an unparsable line.
     std::fs::OpenOptions::new()
         .append(true)
-        .open(mini_swe_mcp::pool::steer_path("c1"))
+        .open(mini_swe_mcp::pool::steer_path_in(&scratch.root(), "c1"))
         .unwrap()
         .write_all(b"{not json at all\n")
         .unwrap();
-    mini_swe_mcp::pool::write_steer_message("c1", "good two").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "c1", "good two").unwrap();
 
     // The bad line is skipped; the guidance either side of it still arrives,
     // because a single corrupt record must not wedge the worker's turn loop.
     assert_eq!(
-        mini_swe_mcp::pool::drain_steer_messages("c1"),
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "c1"),
         vec!["good one", "good two"]
     );
 
@@ -450,15 +439,15 @@ fn steer_mailbox_survives_a_corrupt_line_without_stranding_the_worker() {
 
 #[test]
 fn steer_mailbox_drain_claims_the_file_so_two_readers_never_both_win() {
-    let dir = scratch_dir("steer-claim");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-claim");
+    let dir = scratch.path().to_path_buf();
 
-    mini_swe_mcp::pool::write_steer_message("r1", "deliver me once").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "r1", "deliver me once").unwrap();
 
     // The drain renames before it reads, so the implementer loop and the review
     // loop can never deliver the same message twice.
-    let first = mini_swe_mcp::pool::drain_steer_messages("r1");
-    let second = mini_swe_mcp::pool::drain_steer_messages("r1");
+    let first = mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "r1");
+    let second = mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "r1");
     assert_eq!(first, vec!["deliver me once"]);
     assert!(
         second.is_empty(),
@@ -479,42 +468,42 @@ fn steer_mailbox_drain_claims_the_file_so_two_readers_never_both_win() {
 
 #[test]
 fn steer_mailbox_late_arrival_after_a_drain_is_picked_up_next_time() {
-    let dir = scratch_dir("steer-late");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-late");
+    let dir = scratch.path().to_path_buf();
 
-    mini_swe_mcp::pool::write_steer_message("l1", "early").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "l1", "early").unwrap();
     assert_eq!(
-        mini_swe_mcp::pool::drain_steer_messages("l1"),
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "l1"),
         vec!["early"]
     );
 
     // A steer that lands *after* the rename recreated the original path; it
     // must wait for the next drain rather than being lost in the claim.
-    mini_swe_mcp::pool::write_steer_message("l1", "late").unwrap();
-    assert_eq!(mini_swe_mcp::pool::drain_steer_messages("l1"), vec!["late"]);
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "l1", "late").unwrap();
+    assert_eq!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "l1"), vec!["late"]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn removing_the_steer_file_clears_the_mailbox_and_its_claim() {
-    let dir = scratch_dir("steer-remove");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-remove");
+    let dir = scratch.path().to_path_buf();
 
-    mini_swe_mcp::pool::write_steer_message("x1", "guidance").unwrap();
-    assert!(mini_swe_mcp::pool::steer_path("x1").is_file());
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "x1", "guidance").unwrap();
+    assert!(mini_swe_mcp::pool::steer_path_in(&scratch.root(), "x1").is_file());
 
     // Worker exit: a finished worker must not leave a mailbox that a future
     // worker reusing the id would pick up as phantom guidance.
-    mini_swe_mcp::pool::remove_steer_file("x1");
-    assert!(!mini_swe_mcp::pool::steer_path("x1").exists());
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "x1");
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "x1").exists());
     assert!(
-        mini_swe_mcp::pool::drain_steer_messages("x1").is_empty(),
+        mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "x1").is_empty(),
         "no guidance may survive the worker's exit"
     );
 
     // Removing a mailbox that was never created is a no-op, not an error.
-    mini_swe_mcp::pool::remove_steer_file("never-existed");
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "never-existed");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -525,19 +514,19 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
     // a `steer` this process handled, and the mailbox for one it did not. Both
     // must reach the turn -- dropping either would make cross-process steering
     // unreliable exactly when the local path is also in use.
-    let dir = scratch_dir("steer-merge");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-merge");
+    let dir = scratch.path().to_path_buf();
 
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     pool.__test_insert_worker(running_worker("m1")).await;
 
     // Local guidance (this process) and remote guidance (another process).
     pool.steer("m1", "from this process".into()).await.unwrap();
-    mini_swe_mcp::pool::write_steer_message("m1", "from another process").unwrap();
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "m1", "from another process").unwrap();
 
     // `take_pending_steer` is the loop's read of the in-memory half.
     let mut seen = pool.take_pending_steer("m1").await;
-    seen.extend(mini_swe_mcp::pool::drain_steer_messages("m1"));
+    seen.extend(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"));
 
     assert!(seen.contains(&"from this process".to_string()));
     assert!(seen.contains(&"from another process".to_string()));
@@ -549,7 +538,7 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
     // A second turn finds nothing left to inject -- guidance is consumed, not
     // replayed on every subsequent turn.
     let mut again = pool.take_pending_steer("m1").await;
-    again.extend(mini_swe_mcp::pool::drain_steer_messages("m1"));
+    again.extend(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "m1"));
     assert!(again.is_empty(), "guidance was re-delivered: {again:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -559,11 +548,11 @@ async fn the_step_loop_sees_both_local_and_cross_process_guidance() {
 async fn draining_the_mailbox_for_an_unknown_worker_is_a_no_op() {
     // The loop drains on every turn of a worker that may never have been
     // steered; that must be silent, and must not create a mailbox either.
-    let dir = scratch_dir("steer-drain-unknown");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-drain-unknown");
+    let dir = scratch.path().to_path_buf();
 
-    assert!(mini_swe_mcp::pool::drain_steer_messages("ghost").is_empty());
-    assert!(!mini_swe_mcp::pool::steer_path("ghost").exists());
+    assert!(mini_swe_mcp::pool::drain_steer_messages_in(&scratch.root(), "ghost").is_empty());
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "ghost").exists());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -696,9 +685,14 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
     // The mailbox is for a worker whose registry row is live in another
     // process: an id with no live row is continued here instead, and a mailbox
     // nobody reads is never written.
-    let dir = scratch_dir("steer-live-row-mailbox");
-    let pool = WorkerPool::new(1, "http://x".into(), "k".into());
-    let guard = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-live-row-mailbox");
+    let dir = scratch.path().to_path_buf();
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://x".into(),
+        "k".into(),
+        scratch.root(),
+    );
 
     // A live pid in another process: the row's owner is alive, so the message
     // is queued for it rather than continued here.
@@ -707,11 +701,11 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
         .spawn()
         .expect("spawn a stand-in owner");
     let row = live_row_elsewhere("remote", owner.id());
-    mini_swe_mcp::pool::save_registry_entry(&row);
+    mini_swe_mcp::pool::save_registry_entry_in(&scratch.root(), &row);
     pool.steer("remote", "focus on the parser".into())
         .await
         .unwrap();
-    let path = mini_swe_mcp::pool::steer_path("remote");
+    let path = mini_swe_mcp::pool::steer_path_in(&scratch.root(), "remote");
     assert!(path.is_file(), "the message must be queued, not dropped");
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(raw.contains("focus on the parser"));
@@ -726,7 +720,7 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
         "the error must name the worker, got: {err}"
     );
     assert!(
-        !mini_swe_mcp::pool::steer_path("nope").exists(),
+        !mini_swe_mcp::pool::steer_path_in(&scratch.root(), "nope").exists(),
         "no mailbox may be written for a dead owner"
     );
 
@@ -734,7 +728,7 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
     // leaving no mailbox behind.
     pool.__test_insert_worker(running_worker("local")).await;
     pool.steer("local", "in memory".into()).await.unwrap();
-    assert!(!mini_swe_mcp::pool::steer_path("local").exists());
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "local").exists());
 
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
@@ -744,8 +738,8 @@ async fn steer_uses_the_mailbox_only_for_a_live_row_in_another_process() {
 async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
     // A finished worker with no saved conversation cannot be revised: the
     // error names the missing history file, not just the worker.
-    let dir = scratch_dir("steer-finished-no-history");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-finished-no-history");
+    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
 
     let mut done = running_worker("w4");
@@ -1074,25 +1068,25 @@ fn the_exit_guard_contract_clears_the_mailbox_on_every_worker_exit_path() {
     // duplication that rots, so cleanup is a `Drop` guard. This pins the
     // contract that guard depends on: a mailbox left behind is always reclaimed,
     // whether the worker succeeded or failed, and never leaks a claim file.
-    let dir = scratch_dir("steer-exit-guard");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-exit-guard");
+    let dir = scratch.path().to_path_buf();
 
     // A worker that ran, got steered from another process, and finished.
-    mini_swe_mcp::pool::write_steer_message("g1", "guidance").unwrap();
-    assert!(mini_swe_mcp::pool::steer_path("g1").is_file());
-    mini_swe_mcp::pool::remove_steer_file("g1");
-    assert!(!mini_swe_mcp::pool::steer_path("g1").exists());
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "g1", "guidance").unwrap();
+    assert!(mini_swe_mcp::pool::steer_path_in(&scratch.root(), "g1").is_file());
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "g1");
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "g1").exists());
 
     // Same for a worker that dies mid-run: the guard fires on the error path
     // too, so a crashed worker's guidance cannot be inherited later.
-    mini_swe_mcp::pool::write_steer_message("g2", "guidance").unwrap();
-    mini_swe_mcp::pool::remove_steer_file("g2");
-    assert!(!mini_swe_mcp::pool::steer_path("g2").exists());
+    mini_swe_mcp::pool::write_steer_message_in(&scratch.root(), "g2", "guidance").unwrap();
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "g2");
+    assert!(!mini_swe_mcp::pool::steer_path_in(&scratch.root(), "g2").exists());
 
     // Cleanup is idempotent: an already-removed mailbox must not turn a
     // successful worker exit into an error (the guard's Drop ignores errors).
-    mini_swe_mcp::pool::remove_steer_file("g2");
-    mini_swe_mcp::pool::remove_steer_file("never-existed");
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "g2");
+    mini_swe_mcp::pool::remove_steer_file_in(&scratch.root(), "never-existed");
 
     // Nothing at all is left in the scratch base afterwards.
     let leftovers: Vec<String> = std::fs::read_dir(&dir)
@@ -1339,12 +1333,12 @@ fn scratch_repo(tag: &str) -> std::path::PathBuf {
 
 #[test]
 fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
-    let dir = scratch_dir("history-roundtrip");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("history-roundtrip");
+    let dir = scratch.path().to_path_buf();
 
     let repo = scratch_repo("history-roundtrip");
     let history = sample_history(&repo, "abc123", "worker-rev1");
-    mini_swe_mcp::pool::save_worker_history("rev1", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "rev1", &history).expect("save history");
 
     let mut legacy = serde_json::to_value(&history).unwrap();
     assert_eq!(legacy["base_branch"], "master");
@@ -1356,7 +1350,7 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
     );
 
     // Atomic write, owner-only permissions, beside the mailbox.
-    let path = mini_swe_mcp::pool::history_path("rev1");
+    let path = mini_swe_mcp::pool::history_path_in(&scratch.root(), "rev1");
     assert!(path.is_file(), "history file must exist at {path:?}");
     #[cfg(unix)]
     {
@@ -1369,7 +1363,7 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
         assert_eq!(mode, 0o600, "history file must be owner-only, got {mode:o}");
     }
 
-    let loaded = mini_swe_mcp::pool::load_worker_history("rev1").expect("reload history");
+    let loaded = mini_swe_mcp::pool::load_worker_history_in(&scratch.root(), "rev1").expect("reload history");
     assert_eq!(loaded.task, "fix the parser");
     assert_eq!(loaded.branch, "worker-rev1");
     assert_eq!(loaded.messages.len(), 4);
@@ -1391,8 +1385,8 @@ fn history_file_round_trips_and_rejects_an_unreplayable_conversation() {
 /// (merged and deleted) and keeps one whose branch can still be revised.
 #[test]
 fn prune_retires_histories_whose_branch_is_gone() {
-    let dir = scratch_dir("history-orphans");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("history-orphans");
+    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("history-orphans");
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
@@ -1403,9 +1397,9 @@ fn prune_retires_histories_whose_branch_is_gone() {
         assert!(out.status.success(), "git {args:?}");
     };
     git(&["branch", "worker-alive"]);
-    mini_swe_mcp::pool::save_worker_history("alive", &sample_history(&repo, "abc", "worker-alive"))
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "alive", &sample_history(&repo, "abc", "worker-alive"))
         .expect("save the revisable history");
-    mini_swe_mcp::pool::save_worker_history(
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), 
         "merged",
         &sample_history(&repo, "abc", "worker-merged"),
     )
@@ -1413,11 +1407,11 @@ fn prune_retires_histories_whose_branch_is_gone() {
 
     assert_eq!(mini_swe_mcp::pool::prune_orphan_histories(&repo), 1);
     assert!(
-        mini_swe_mcp::pool::history_path("alive").is_file(),
+        mini_swe_mcp::pool::history_path_in(&scratch.root(), "alive").is_file(),
         "a live branch keeps its history"
     );
     assert!(
-        !mini_swe_mcp::pool::history_path("merged").exists(),
+        !mini_swe_mcp::pool::history_path_in(&scratch.root(), "merged").exists(),
         "a deleted branch loses it"
     );
 
@@ -1430,12 +1424,12 @@ fn prune_retires_histories_whose_branch_is_gone() {
 /// still owned: its saved conversation names the agent that may revise it.
 #[tokio::test]
 async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
-    let dir = scratch_dir("history-owner");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("history-owner");
+    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("history-owner");
     let mut history = sample_history(&repo, "abc", "worker-reaped");
     history.owner = Some("agent-x".to_string());
-    mini_swe_mcp::pool::save_worker_history("reaped", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "reaped", &history).expect("save history");
 
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     assert_eq!(
@@ -1454,8 +1448,8 @@ async fn a_reaped_worker_is_owned_by_the_agent_its_history_names() {
 async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // A finished worker steered with corrections restarts on its preserved
     // branch with the revision message appended to the reloaded history.
-    let dir = scratch_dir("steer-revision");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-revision");
+    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("steer-revision");
 
     // Create the preserved branch the finished run left behind.
@@ -1501,7 +1495,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
     // The finished run's history file is what the revision reloads.
     let mut history = sample_history(&repo, &base, branch);
     history.branch = branch.to_string();
-    mini_swe_mcp::pool::save_worker_history("revwork", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "revwork", &history).expect("save history");
 
     pool.steer("revwork", "also handle empty input".into())
         .await
@@ -1569,8 +1563,8 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     // Collection evicts the record but the worker becomes registry-only, not
     // unrevisable: the history file must survive it (only prune retires
     // it), so a later steer can still revise the same id and branch.
-    let dir = scratch_dir("collect-keeps-history");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("collect-keeps-history");
+    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("collect-keeps-history");
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     let mut done = running_worker("keep1");
@@ -1587,10 +1581,10 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
     };
     pool.__test_insert_worker(done).await;
     let history = sample_history(&repo, "abc123", "worker-keep1");
-    mini_swe_mcp::pool::save_worker_history("keep1", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "keep1", &history).expect("save history");
     pool.collect("keep1").await.expect("collect the worker");
     assert!(
-        mini_swe_mcp::pool::history_path("keep1").is_file(),
+        mini_swe_mcp::pool::history_path_in(&scratch.root(), "keep1").is_file(),
         "collect must not delete the history file; only prune retires it"
     );
     mini_swe_mcp::pool::remove_worker_history("keep1");
@@ -1602,8 +1596,8 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
 async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     // The branch the orchestrator reviewed is gone: the error names the
     // branch, not just the worker.
-    let dir = scratch_dir("steer-missing-branch");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("steer-missing-branch");
+    let dir = scratch.path().to_path_buf();
     let repo = scratch_repo("steer-missing-branch");
 
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
@@ -1622,7 +1616,7 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
     pool.__test_insert_worker(done).await;
     // No `worker-gonework` branch was ever created in the scratch repo.
     let history = sample_history(&repo, "abc123", "worker-gonework");
-    mini_swe_mcp::pool::save_worker_history("gonework", &history).expect("save history");
+    mini_swe_mcp::pool::save_worker_history_in(&scratch.root(), "gonework", &history).expect("save history");
 
     let err = pool.steer("gonework", "fix it".into()).await.unwrap_err();
     assert!(
@@ -1664,8 +1658,8 @@ async fn change_subscription_fires_on_every_state_change() {
 /// Step-only registry updates coalesce; a status transition writes at once.
 #[tokio::test]
 async fn step_only_registry_updates_coalesce_to_one_write() {
-    let dir = scratch_dir("h5a-reg");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("h5a-reg");
+    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::new(1, "http://x".into(), "k".into());
     let meta = mini_swe_mcp::pool::WorkerMeta {
         id: "h5a-reg".into(),
@@ -1926,8 +1920,8 @@ fn owned_worker(id: &str, owner: &str) -> WorkerRecord {
 /// travels with every row.
 #[tokio::test]
 async fn listing_is_scoped_to_the_owning_agent() {
-    let dir = scratch_dir("h3-list-inmemory");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("h3-list-inmemory");
+    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::new(4, "http://x".into(), "k".into());
     pool.__test_insert_worker(owned_worker("h3-mine", "agent-a"))
         .await;
@@ -1957,13 +1951,13 @@ async fn listing_is_scoped_to_the_owning_agent() {
 /// registry, and the same scoping applies to those rows.
 #[tokio::test]
 async fn listing_is_scoped_across_processes_through_the_registry() {
-    let dir = scratch_dir("h3-list-registry");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("h3-list-registry");
+    let dir = scratch.path().to_path_buf();
     let mut row = measured_entry();
     row.id = "h3-reg".to_string();
     row.status = RegistryStatus::Running;
     row.owner = Some("agent-a".to_string());
-    mini_swe_mcp::pool::save_registry_entry(&row);
+    mini_swe_mcp::pool::save_registry_entry_in(&scratch.root(), &row);
     let pool = WorkerPool::new(4, "http://x".into(), "k".into());
 
     let mine = pool.list_workers_of("agent-a").await;
@@ -1983,8 +1977,8 @@ async fn listing_is_scoped_across_processes_through_the_registry() {
 /// tracked is attributed to nobody.
 #[tokio::test]
 async fn worker_ownership_falls_back_to_the_registry_row() {
-    let dir = scratch_dir("h3-owner-fallback");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("h3-owner-fallback");
+    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::new(4, "http://x".into(), "k".into());
 
     assert_eq!(pool.worker_owner("h3-nobody").await, None);
@@ -1993,7 +1987,7 @@ async fn worker_ownership_falls_back_to_the_registry_row() {
     row.id = "h3-foreign".to_string();
     row.status = RegistryStatus::Running;
     row.owner = Some("agent-a".to_string());
-    mini_swe_mcp::pool::save_registry_entry(&row);
+    mini_swe_mcp::pool::save_registry_entry_in(&scratch.root(), &row);
     assert_eq!(
         pool.worker_owner("h3-foreign").await,
         Some(mini_swe_mcp::pool::WorkerOwner::Agent(
@@ -2003,7 +1997,7 @@ async fn worker_ownership_falls_back_to_the_registry_row() {
 
     row.id = "h3-ancient".to_string();
     row.owner = None;
-    mini_swe_mcp::pool::save_registry_entry(&row);
+    mini_swe_mcp::pool::save_registry_entry_in(&scratch.root(), &row);
     assert_eq!(
         pool.worker_owner("h3-ancient").await,
         Some(mini_swe_mcp::pool::WorkerOwner::Unattributed),
@@ -2032,8 +2026,8 @@ fn a_registry_row_without_an_owner_still_parses() {
 /// makes it a fairness gate rather than a global limit.
 #[tokio::test]
 async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
-    let dir = scratch_dir("h3-cap-count");
-    let _scope = ScopedTempDir::set(&dir);
+    let scratch = ScratchRootGuard::new("h3-cap-count");
+    let dir = scratch.path().to_path_buf();
     let pool = WorkerPool::new(8, "http://x".into(), "k".into());
     pool.__test_insert_worker(owned_worker("h3-a1", "agent-a"))
         .await;

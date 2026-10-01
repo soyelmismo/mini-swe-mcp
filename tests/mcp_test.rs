@@ -1735,7 +1735,7 @@ fn owned_server() -> (IsolatedPool, McpServer) {
 /// `logs` stay readable by anyone.
 #[tokio::test]
 async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
-    let (pool, server) = owned_server();
+    let (owned, server) = owned_server();
     owned.pool.__test_insert_worker(owned_worker("h3-foreign", "agent-a"))
         .await;
     let agent_b = agent_context("agent-b");
@@ -1818,7 +1818,7 @@ async fn an_agent_cannot_act_on_another_agents_worker_but_can_read_it() {
 /// The operator's `--admin` connection is the one caller allowed past the check.
 #[tokio::test]
 async fn an_admin_connection_bypasses_the_ownership_check() {
-    let (pool, server) = owned_server();
+    let (owned, server) = owned_server();
     owned.pool.__test_insert_worker(owned_worker("h3-admin", "agent-a"))
         .await;
 
@@ -1936,7 +1936,7 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 /// refused, and the error names the workers already running.
 #[tokio::test]
 async fn a_dispatch_past_the_per_agent_cap_is_refused() {
-    let (pool, server) = owned_server();
+    let (owned, server) = owned_server();
     owned.pool.__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
         .await;
     let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
@@ -1959,7 +1959,7 @@ async fn a_dispatch_past_the_per_agent_cap_is_refused() {
     assert!(message.contains("MAX_WORKERS_PER_AGENT=1"), "{message}");
     assert!(message.contains("h3-cap"), "{message}");
     // The refusal happened before the dispatch, so no second worker was started.
-    assert_eq!(pool.active_worker_count().await, 1);
+    assert_eq!(owned.pool.active_worker_count().await, 1);
 }
 
 // ----------
@@ -2282,10 +2282,14 @@ async fn watch_action_answers_no_event_on_an_expired_deadline() {
 /// `watch`, and `list` shows it only to its owner.
 #[tokio::test]
 async fn an_agent_cannot_read_another_agents_worker() {
-    let (pool, server) = owned_server();
-    pool.__test_insert_worker(owned_worker("h11-mine", "agent-a"))
+    let (owned, server) = owned_server();
+    owned
+        .pool
+        .__test_insert_worker(owned_worker("h11-mine", "agent-a"))
         .await;
-    pool.__test_insert_worker(owned_worker("h11-theirs", "agent-b"))
+    owned
+        .pool
+        .__test_insert_worker(owned_worker("h11-theirs", "agent-b"))
         .await;
 
     for arguments in [
