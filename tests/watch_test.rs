@@ -1162,3 +1162,184 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
     let text = watch::render(&event);
     assert!(text.contains("Diff: 2 files, +2 -0"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// An older hub that answers `hub/watch` without the fields this client reads
+// must not look like an empty watch set: the client says so and polls the
+// registry, where the same workers still report.
+// ---------------------------------------------------------------------------
+
+/// A hub that speaks the version handshake and `hub/watch`, but answers the
+/// watch with the pre-`watching` reply shape.
+async fn fake_old_hub(socket: PathBuf) {
+    let _ = std::fs::remove_file(&socket);
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake hub");
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                // Notifications carry no id and need no reply.
+                let Some(id) = request.get("id").cloned() else {
+                    continue;
+                };
+                let result = match request["method"].as_str() {
+                    Some("hub/hello") => {
+                        serde_json::json!({"version": "999.0.0", "build": null, "busy": false})
+                    }
+                    // The old shape: no `watching`, only `events`.
+                    Some("hub/watch") => serde_json::json!({"events": []}),
+                    _ => serde_json::json!({}),
+                };
+                let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+                if write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = write.flush().await;
+            }
+        });
+    }
+}
+
+fn run_watch_via(hub: &Path, swe: &Path, args: &[&str]) -> std::process::Output {
+    common::binary_command(&common::binary_path())
+        .args(args)
+        .env("SWE_HUB_DIR", hub)
+        .env("SWE_TEMP_DIR", swe)
+        .env("TMPDIR", swe)
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env("OPENAI_API_KEY", "test-key-not-used")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .output()
+        .expect("run watch")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_hub_watch_reply_falls_back_to_the_registry() {
+    let hub = common::TempDir::new_in_tmp("watch-old-hub");
+    let swe = common::TempDir::new_in_tmp("watch-old-swe");
+    let registry = swe.subdir("swe-registry");
+    let socket = paths(hub.path()).socket();
+    let fake = tokio::spawn(fake_old_hub(socket.clone()));
+    wait_for_socket(&socket).await;
+
+    // Nothing in the registry: the fallback must still say why it stopped.
+    let (hub_dir, swe_dir) = (hub.path().to_path_buf(), swe.path().to_path_buf());
+    let output = tokio::task::spawn_blocking(move || {
+        run_watch_via(&hub_dir, &swe_dir, &["watch", "--timeout", "1"])
+    })
+    .await
+    .expect("the run task stays alive");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("falling back to registry polling"),
+        "{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
+    assert!(stdout.contains("nothing to watch"), "{stdout}");
+
+    // A synthetic registry row is still reported by the polling path. Its
+    // worktree keeps the terminal row from being pruned before the poll.
+    let owner = common::host_of_this_process();
+    let _ = swe.subdir("swe-wt-w-synth");
+    std::fs::write(
+        registry.join("w-synth.json"),
+        serde_json::json!({
+            "id": "w-synth", "pid": std::process::id(), "task": "watch probe",
+            "model": "test", "status": "completed", "step": 2, "max_turns": 10,
+            "last_command": "cargo test", "started_at": 1, "updated_at": 2,
+            "owner": owner,
+        })
+        .to_string(),
+    )
+    .expect("synthetic row");
+    let (hub_dir, swe_dir) = (hub.path().to_path_buf(), swe.path().to_path_buf());
+    let output = tokio::task::spawn_blocking(move || {
+        run_watch_via(&hub_dir, &swe_dir, &["watch", "w-synth"])
+    })
+    .await
+    .expect("the run task stays alive");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("w-synth") && stdout.contains("completed"),
+        "{stdout}"
+    );
+
+    fake.abort();
+    let _ = fake.await;
+}
+
+/// A watch whose workers disappear before any event fires must not end as a
+/// silent success: it names why and exits non-zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_polling_watch_never_exits_zero_silently() {
+    let dir = common::TempDir::new_in_tmp("watch-drain");
+    let registry = dir.subdir("swe-registry");
+    let now = mini_swe_mcp::pool::unix_timestamp();
+    std::fs::write(
+        registry.join("w-drain.json"),
+        serde_json::json!({
+            "id": "w-drain", "pid": std::process::id(), "task": "watch probe",
+            "model": "test", "status": "running", "step": 1, "max_turns": 10,
+            "last_command": "cargo test", "started_at": 1, "updated_at": now,
+            "owner": common::host_of_this_process(),
+        })
+        .to_string(),
+    )
+    .expect("running row");
+
+    let child = common::binary_command(&common::binary_path())
+        .args(["watch", "w-drain"])
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .env("SWE_TEMP_DIR", dir.path())
+        .env("TMPDIR", dir.path())
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .env_remove("OPENAI_API_KEY")
+        .env(
+            "MODELS_FILE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the watch");
+    // Let the first poll see the running worker, then tear it away.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    std::fs::remove_file(registry.join("w-drain.json")).expect("remove the row");
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    .expect("a drained watch must end")
+    .expect("the wait task stays alive")
+    .expect("child output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a watch that never printed an event must not exit 0: {stdout}"
+    );
+    assert!(!stdout.trim().is_empty(), "the exit must say why: {stdout}");
+}

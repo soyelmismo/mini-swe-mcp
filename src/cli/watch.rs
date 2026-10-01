@@ -411,6 +411,46 @@ pub fn matches(view: &Value, ids: &BTreeSet<String>, group: Option<&str>) -> boo
         && group.is_none_or(|g| view["group"] == g)
 }
 
+/// A hub that predates `hub/watch` cannot stream events at all.
+const NO_WATCH_NOTICE: &str =
+    "[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling.";
+
+/// A hub whose `hub/watch` reply predates the fields this client reads.
+const OLD_WATCH_REPLY_NOTICE: &str = "[mini-swe] The running hub's 'hub/watch' reply lacks fields this client needs; falling back to registry polling.";
+
+/// A `hub/watch` reply carries the fields this client reads: a missing
+/// `watching` is an older hub, not a genuine empty watch set.
+fn watch_reply_has_fields(response: &Value) -> bool {
+    response.get("watching").is_some_and(Value::is_array)
+        && response.get("events").is_some_and(Value::is_array)
+}
+
+/// Read the registry the way `MINI_SWE_NO_DAEMON=1` does, announcing why.
+async fn registry_fallback(
+    opts: Options,
+    json_output: bool,
+    admin: bool,
+    notice: &str,
+) -> Result<i32> {
+    eprintln!("{notice}");
+    polling(opts, json_output, admin).await
+}
+
+/// End a watch with no further event to show. Exit 0 is reserved for a watch
+/// that already printed one; otherwise name why and exit non-zero.
+fn end_watch(printed_event: bool, watched_any: bool) -> i32 {
+    if printed_event {
+        return 0;
+    }
+    if watched_any {
+        println!("no event");
+        2
+    } else {
+        println!("nothing to watch");
+        3
+    }
+}
+
 pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32> {
     let opts = Options::parse(args)?;
     if std::env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
@@ -421,10 +461,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // A hub that predates `hub/watch` cannot stream events; the registry
         // poll sees the same workers, just a second late.
         Err(error) if error.to_string().contains("Method not found") => {
-            eprintln!(
-                "[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling."
-            );
-            return polling(opts, json_output, admin).await;
+            return registry_fallback(opts, json_output, admin, NO_WATCH_NOTICE).await;
         }
         Err(error) => return Err(error),
     };
@@ -436,6 +473,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut ids = opts.ids.clone();
     let mut initial = true;
     let mut watched_any = false;
+    let mut printed_event = false;
     loop {
         let response = match client
             .watch_snapshot(&ids, opts.group.as_deref(), initial)
@@ -451,13 +489,13 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
                 return Ok(4);
             }
             Err(error) if error.to_string().contains("Method not found") => {
-                eprintln!(
-                    "[mini-swe] The running hub predates 'hub/watch'; falling back to registry polling."
-                );
-                return polling(opts, json_output, admin).await;
+                return registry_fallback(opts, json_output, admin, NO_WATCH_NOTICE).await;
             }
             Err(error) => return Err(error),
         };
+        if !watch_reply_has_fields(&response) {
+            return registry_fallback(opts, json_output, admin, OLD_WATCH_REPLY_NOTICE).await;
+        }
         let watching: BTreeSet<String> = response["watching"]
             .as_array()
             .into_iter()
@@ -472,10 +510,10 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         }
         let events = response["events"].as_array().cloned().unwrap_or_default();
         if initial && explicit && ids.is_empty() && events.is_empty() {
-            println!("nothing to watch");
-            return Ok(3);
+            return Ok(end_watch(false, false));
         }
         print_events(&events, json_output, opts.follow)?;
+        printed_event |= !events.is_empty();
         for event in &events {
             client
                 .watch_ack(event["sequence"].as_u64().unwrap_or(0))
@@ -488,17 +526,12 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         }
         initial = false;
         if watching.is_empty() && (explicit || watched_any) {
-            return Ok(0);
+            return Ok(end_watch(printed_event, watched_any));
         }
         let wait = match opts.timeout {
             Some(timeout) => {
                 let Some(left) = timeout.checked_sub(started.elapsed()) else {
-                    if watched_any {
-                        println!("no event");
-                        return Ok(2);
-                    }
-                    println!("nothing to watch");
-                    return Ok(3);
+                    return Ok(end_watch(printed_event, watched_any));
                 };
                 left.min(Duration::from_secs(1))
             }
@@ -527,6 +560,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
     let mut ignored: BTreeSet<String> = BTreeSet::new();
     let mut initial = true;
     let mut watched_any = false;
+    let mut printed_event = false;
     loop {
         let now = crate::pool::unix_timestamp();
         let mut current: Snapshot = crate::pool::load_all_registry_entries()
@@ -594,6 +628,7 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
             }
         }
         print_events(&events, json_output, opts.follow)?;
+        printed_event |= !events.is_empty();
         if !events.is_empty() && !opts.follow {
             return Ok(0);
         }
@@ -602,19 +637,14 @@ async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
         }
         ids.retain(|id| current.get(id).is_some_and(|v| !terminal(v)));
         if ids.is_empty() && (explicit || watched_any) {
-            return Ok(0);
+            return Ok(end_watch(printed_event, watched_any));
         }
         previous = current;
         if opts
             .timeout
             .is_some_and(|timeout| started.elapsed() >= timeout)
         {
-            if watched_any {
-                println!("no event");
-                return Ok(2);
-            }
-            println!("nothing to watch");
-            return Ok(3);
+            return Ok(end_watch(printed_event, watched_any));
         }
         tokio::time::sleep(
             opts.timeout
