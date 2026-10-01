@@ -1848,7 +1848,7 @@ mod watch_stall_regression_tests {
         let mut store = AckStore::default();
         // The oldest acknowledgment in the whole store.
         store.record("long-lived", "w-first", 1, "completed");
-        for i in 0..(MAX_ACK_OWNERS - 2) {
+        for i in 0..(MAX_ACK_OWNERS - 1) {
             store.record(&format!("filler-{i:05}"), "w", 1, "completed");
         }
         // The newest acknowledgment, so this owner is the most
