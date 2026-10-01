@@ -113,6 +113,14 @@ impl IsolatedPool {
         Self { pool, scratch }
     }
 
+    /// A pool over a fresh temporary root, without the wrapper.
+    ///
+    /// The returned [`TempDir`] must stay alive for the pool's lifetime.
+    pub fn pool(max_concurrent: usize, tag: &str) -> (mini_swe_mcp::pool::WorkerPool, TempDir) {
+        let owned = Self::new(max_concurrent, tag);
+        (owned.pool, owned.scratch)
+    }
+
     /// The pool's scratch root, for the `*_in` registry/history/steer helpers.
     pub fn root(&self) -> mini_swe_mcp::worktree::ScratchRoot {
         mini_swe_mcp::worktree::ScratchRoot::new(self.scratch.path())
