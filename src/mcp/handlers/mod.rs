@@ -41,6 +41,8 @@ use review::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod watch_command_tests;
 
 impl McpServer {
     /// Shared argument extraction and progress reporting, defined next to the
