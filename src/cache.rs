@@ -33,6 +33,10 @@ pub struct CacheDirs {
     pub pnpm_store: PathBuf,
     pub go_build: PathBuf,
     pub go_mod: PathBuf,
+    /// Maven's local repository, `~/.m2/repository` by default.
+    pub maven: PathBuf,
+    /// Gradle's user home, `~/.gradle` by default: caches plus wrapper dists.
+    pub gradle: PathBuf,
 }
 
 impl CacheDirs {
@@ -48,6 +52,8 @@ impl CacheDirs {
             pnpm_store: root.join("node").join("pnpm-store"),
             go_build: root.join("go").join("build"),
             go_mod: root.join("go").join("mod"),
+            maven: root.join("java").join("m2"),
+            gradle: root.join("java").join("gradle"),
             root,
         }
     }
@@ -64,6 +70,8 @@ impl CacheDirs {
         let _ = std::fs::create_dir_all(&self.pnpm_store);
         let _ = std::fs::create_dir_all(&self.go_build);
         let _ = std::fs::create_dir_all(&self.go_mod);
+        let _ = std::fs::create_dir_all(&self.maven);
+        let _ = std::fs::create_dir_all(&self.gradle);
     }
 }
 
@@ -336,7 +344,7 @@ fn build_dir_lock_path(dir: &Path) -> PathBuf {
 /// lease the same directory while this worker is live, and the sweep sees the
 /// directory as busy. Dropping the guard releases the directory for a later
 /// worker, which then inherits its warm dependency cache.
-pub(crate) struct BuildDirLease {
+pub struct BuildDirLease {
     dir: PathBuf,
     lock: std::fs::File,
 }
@@ -344,7 +352,7 @@ pub(crate) struct BuildDirLease {
 impl BuildDirLease {
     /// Lease the lowest-indexed free directory of `repo`, creating a new one
     /// when every directory the repository already has is live.
-    pub(crate) fn acquire(repo: &Path) -> std::io::Result<Self> {
+    pub fn acquire(repo: &Path) -> std::io::Result<Self> {
         let base = crate::worktree::swe_base_dir();
         std::fs::create_dir_all(&base)?;
         // The sweep lock keeps eviction from removing a directory between the
@@ -368,7 +376,7 @@ impl BuildDirLease {
     }
 
     /// The directory this worker builds in.
-    pub(crate) fn dir(&self) -> &Path {
+    pub fn dir(&self) -> &Path {
         &self.dir
     }
 
