@@ -1073,7 +1073,7 @@ impl WorkerPool {
         if let Err(reason) = check_consolidate_delegation(actor, &entry) {
             return format!("{id} refused: {reason}");
         }
-        match self.steer(&target, message).await {
+        match self.steer_relaunchable(&target, message).await {
             Ok(outcome) => format!(
                 "{target} {} (revision {})",
                 outcome.verb(),
@@ -1368,6 +1368,20 @@ impl WorkerPool {
     /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
     pub async fn steer(&self, id: &str, message: String) -> Result<SteerOutcome> {
         self.steer_with_budget(id, message, None).await
+    }
+
+    /// [`WorkerPool::steer`] with the relaunched loop's future type erased.
+    ///
+    /// Steering a stopped worker relaunches its loop, and a consolidator's own
+    /// turn awaits that steer -- so the loop's future type would otherwise
+    /// depend on itself and have no resolvable size. Erasing it behind a
+    /// `dyn Future` keeps the awaiting turn a plain, finite type.
+    fn steer_relaunchable<'a>(
+        &'a self,
+        id: &'a str,
+        message: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<SteerOutcome>> + Send + 'a>> {
+        Box::pin(self.steer(id, message))
     }
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
