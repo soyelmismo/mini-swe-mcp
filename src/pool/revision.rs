@@ -520,6 +520,12 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
         crate::worktree::force_remove_dir(&worktree);
     }
     crate::worktree::remove_target_dirs_in(root, &worktree);
+    // The worker's build-directory *lease* is deliberately not touched here: the
+    // directories are filed per repository, not per worker, and are shared by
+    // every live worker of that repository. The lease itself is a guard that
+    // releases when the worker's guard drops, which is what frees the directory
+    // for the next worker; the warm directory stays, to be reclaimed by the
+    // build-dir sweep once it is idle.
     if let Some(repo) = ctx
         .repo
         .filter(|repo| repo.is_dir() && !ctx.keep_branch)
@@ -529,12 +535,6 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
         // the prune above just released it. An already-absent branch is not an
         // error: the end state is the same.
         let _ = crate::worktree::git(repo, "branch -D", &["branch", "-D", &branch]);
-        // A temporary repository is deleted with its worker, but its leased
-        // build directories are filed under the repository key and would
-        // otherwise outlive it.
-        if repo.starts_with(std::env::temp_dir()) {
-            crate::cache::remove_build_dir_leases(repo);
-        }
     }
     for suffix in ["steer-source", "round-base"] {
         let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
