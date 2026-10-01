@@ -160,13 +160,10 @@ async fn write_sse(socket: &mut TcpStream, turn: Option<&str>) {
         return;
     }
     if let Some(turn) = turn {
-        for _ in 0..8 {
-            if socket.write_all(turn.as_bytes()).await.is_err() {
-                return;
-            }
-            let _ = socket.flush().await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        if socket.write_all(turn.as_bytes()).await.is_err() {
+            return;
         }
+        let _ = socket.flush().await;
         let _ = socket.write_all(b"data: [DONE]\n\n").await;
     }
     let _ = socket.flush().await;
@@ -372,10 +369,14 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
             .iter()
             .any(|m| m.contains("Edit now.") && m.contains("src/lib.rs (fn check_read_only)"))
     });
-    assert!(
-        plan_seen,
-        "the second nudge must carry the plan the task names"
-    );
+    if !plan_seen {
+        let all: Vec<String> = requests
+            .iter()
+            .flat_map(|r| user_messages(r))
+            .filter(|m| m.contains("read-only") || m.contains("Edit now"))
+            .collect();
+        panic!("plan missing; relevant user messages: {all:#?}");
+    }
 
     // The orchestrator decides, and the worker carries on from its answer.
     pool.steer(&worker_id, "write the edit in lib.rs now".to_string())
