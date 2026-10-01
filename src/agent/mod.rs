@@ -1,5 +1,6 @@
 //! Agent subsystem: LLM transport, command interception, and execution.
 
+pub mod consolidate;
 pub mod env;
 pub mod exec;
 pub mod intercept;
@@ -10,6 +11,7 @@ pub mod sandbox;
 pub mod stream;
 pub mod types;
 
+pub use consolidate::CONSOLIDATOR_INSTRUCTIONS;
 pub use env::{
     ALLOWED_VARS, AMBIENT_ENV_MAX_BYTES, CARGO_HOME_VAR, RUSTUP_HOME_VAR, TOOLCHAIN_VARS,
     ambient_environment_snapshot, apply_clean_environment_cmd, build_clean_environment,

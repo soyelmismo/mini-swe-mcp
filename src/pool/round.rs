@@ -74,6 +74,24 @@ impl RoundManifest {
         !self.ready.is_empty()
     }
 
+    /// The task a consolidator is dispatched with.
+    ///
+    /// Three parts, in the order the model needs them: what the round holds,
+    /// the one gate it must run, and the procedure it follows (see
+    /// [`crate::agent::CONSOLIDATOR_INSTRUCTIONS`]). The gate is spelled out
+    /// because "run the full gate" is only actionable once it names a command.
+    pub fn task_text(&self, verify: Option<&str>) -> String {
+        let gate = verify.unwrap_or("(none detected: run the project's own checks)");
+        format!(
+            "Consolidate the round in group {}: integrate the finished branches, run the \
+             full gate once, route what you cannot own back to its owner, review every diff, \
+             and report.\n\n{}\nFull gate for this round: `{gate}`\n\n{}",
+            self.group,
+            self.render(),
+            crate::agent::CONSOLIDATOR_INSTRUCTIONS
+        )
+    }
+
     /// Render the manifest as the text embedded in the consolidator's task.
     ///
     /// One block per section, workers in id order, so the model reads the same
@@ -168,7 +186,7 @@ pub async fn build(
                 id: row.id,
                 state: row.status.display_name().to_string(),
                 verified: row.verified,
-                task: crate::mcp::handlers::first_line(&row.task),
+                task: first_line(&row.task),
                 files: Vec::new(),
             })
             .collect();
@@ -212,7 +230,7 @@ pub async fn build(
             id: row.id.clone(),
             state,
             verified: row.verified,
-            task: crate::mcp::handlers::first_line(&row.task),
+            task: first_line(&row.task),
             files: files.clone(),
         };
         if exists && row.status == RegistryStatus::Completed {
@@ -229,6 +247,16 @@ pub async fn build(
         .filter(|(_, workers)| workers.len() > 1)
         .collect();
     manifest
+}
+
+/// The first line of a task that says something: an agent writes a heading and
+/// a body, and only the heading belongs in a compact view.
+pub(crate) fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Whether the repository still carries `branch`.

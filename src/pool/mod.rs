@@ -63,7 +63,7 @@ pub use self::registry::{
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
     save_registry_entry, save_registry_entry_in,
 };
-pub use self::round::{RoundManifest, RoundRow, RoundWorker, round_manifest_for};
+pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, SteerOutcome,
     WorkerHistory, append_history_message, append_history_message_in, ensure_base_branch,
@@ -955,6 +955,67 @@ impl WorkerPool {
         }
         load_registry_entry_in(&self.scratch, id)
             .is_some_and(|entry| entry.status == RegistryStatus::Completed)
+    }
+
+    /// The round `owner` is about to consolidate in `group`.
+    ///
+    /// Every row of the caller's own workers in that group, in the shape
+    /// [`round::build`] probes the repository with. The registry is the only
+    /// cross-process record of a group, so a worker this process never
+    /// dispatched (a hub restart, another connection) is still listed; the
+    /// in-process state is consulted only for the verification outcome, which
+    /// no registry row carries.
+    ///
+    /// `repo` is the repository the dispatch will run in, used when the rows
+    /// name none.
+    pub async fn round_manifest(
+        &self,
+        owner: &str,
+        group: &str,
+        repo: &Path,
+    ) -> RoundManifest {
+        let mut rows: Vec<RoundRow> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut repo_hint: Option<PathBuf> = None;
+        let mut base_hint: Option<String> = None;
+        let mut entries: Vec<WorkerRegistryEntry> =
+            load_all_registry_entries_in(&self.scratch)
+                .into_iter()
+                .filter(|entry| {
+                    entry.owner.as_deref() == Some(owner)
+                        && entry.group.as_deref() == Some(group)
+                        && entry.role == WorkerRole::Worker
+                })
+                .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        for entry in entries {
+            if !seen.insert(entry.id.clone()) {
+                continue;
+            }
+            if repo_hint.is_none() {
+                repo_hint = entry.repo_path.as_deref().map(PathBuf::from);
+            }
+            if base_hint.is_none() {
+                base_hint = entry.base_branch.clone();
+            }
+            let verified = match self.get_worker_state(&entry.id).await {
+                Some(WorkerState::Completed { verified, .. }) => verified,
+                _ => None,
+            };
+            rows.push(RoundRow {
+                id: entry.id,
+                task: entry.task,
+                status: entry.status,
+                verified,
+            });
+        }
+        round::build(
+            group,
+            base_hint,
+            Some(repo_hint.unwrap_or_else(|| repo.to_path_buf())),
+            rows,
+        )
+        .await
     }
 
     /// Integrate the named workers' branches into a consolidator's worktree.
