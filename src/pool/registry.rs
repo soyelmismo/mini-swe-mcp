@@ -681,6 +681,7 @@ mod recovery_cleanup_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            report: None,
         }
     }
 

@@ -1130,6 +1130,7 @@ mod tests {
             question: None,
             started_at: 1000,
             updated_at,
+            report: None,
             group: None,
             role: crate::pool::WorkerRole::Worker,
             repo_path: None,

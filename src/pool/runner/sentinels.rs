@@ -179,7 +179,10 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
     for line in message.lines() {
         let line = strip_markup(line);
         if !in_block {
-            if line.eq_ignore_ascii_case("REPORT") {
+            if line
+                .trim_matches(['*', '_', '`', '#', '>', ' '])
+                .eq_ignore_ascii_case("REPORT")
+            {
                 in_block = true;
             }
             continue;
@@ -195,7 +198,10 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let key = key.trim().to_ascii_lowercase();
+        let key = key
+            .trim()
+            .trim_matches(['*', '_', '`', '#'])
+            .to_ascii_lowercase();
         let value = value.trim();
         if !REPORT_KEYS.contains(&key.as_str()) || value.is_empty() {
             continue;
@@ -214,42 +220,89 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
 }
 
 /// Peel the markdown a model wraps a block in: code fences, list bullets and
-/// the emphasis markers around a key.
+/// the heading or emphasis markers around the key.
+///
+/// Only the *markers* are removed, never the content: a value that happens to
+/// contain a digit (`cargo test: 4 passed`) must survive untouched, which is
+/// why a numbered bullet is recognised by its leading digits rather than by
+/// the first digit anywhere on the line.
 fn strip_markup(line: &str) -> String {
-    let line = line.trim();
-    let line = line
-        .strip_prefix("```")
-        .unwrap_or(line)
-        .trim_start_matches('`')
-        .trim();
-    let line = line
-        .strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("+ "))
-        .unwrap_or(line)
-        .trim();
-    // A numbered bullet: `1. done: ...`.
-    let line = match line.find(|c: char| c.is_ascii_digit()) {
-        Some(start) => {
-            let rest = &line[start..];
-            match rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
-                Some(end) if end > 0 => rest[end..].trim_start(),
-                _ => line,
-            }
+    let mut line = line.trim().trim_matches('`').trim();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            line = rest.trim();
+            break;
         }
-        None => line,
-    };
-    line.trim_matches(['*', '_', '`', '#', '>'])
-        .trim()
-        .to_string()
+    }
+    // A numbered bullet: `1. done: ...` or `1) done: ...`.
+    if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit())
+        && let Some(sep) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))
+    {
+        line = sep.trim();
+    }
+    line.trim_start_matches(['#', '>', '*', '_']).trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-        parse_request_turns, summarize_command,
+        REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
+        parse_report, parse_request_turns, summarize_command,
     };
+    use crate::pool::WorkerReport;
+
+    #[test]
+    fn a_plain_report_block_yields_all_four_lines() {
+        let message = "All done.\n\nREPORT\ndone: Fixed the parser\nfiles: src/a.rs, src/b.rs\ntests: cargo test: passed\nrisks: none\n\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
+        assert_eq!(
+            parse_report(message),
+            Some(WorkerReport {
+                done: "Fixed the parser".to_string(),
+                files: "src/a.rs, src/b.rs".to_string(),
+                tests: "cargo test: passed".to_string(),
+                risks: "none".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_fenced_and_bulleted_report_block_still_parses() {
+        let message = "```\nREPORT\n- DONE: Fixed the parser\n* Files: src/a.rs\n1. tests: cargo test: passed\n- risks: none\n```";
+        let report = parse_report(message).expect("a fenced block must parse");
+        assert_eq!(report.done, "Fixed the parser");
+        assert_eq!(report.files, "src/a.rs");
+        assert_eq!(report.tests, "cargo test: passed");
+        assert_eq!(report.risks, "none");
+    }
+
+    #[test]
+    fn a_report_block_with_missing_keys_keeps_what_it_has() {
+        let message = "REPORT\ndone: Fixed the parser\nrisks: changes the wire format";
+        let report = parse_report(message).expect("a partial block must parse");
+        assert_eq!(report.done, "Fixed the parser");
+        assert_eq!(report.risks, "changes the wire format");
+        assert!(report.files.is_empty(), "{report:?}");
+        assert!(report.tests.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_message_without_a_report_block_has_no_report() {
+        for absent in [
+            "Now I'll make the edits.",
+            "## Summary",
+            "REPORT",
+            "done: Fixed the parser\nfiles: src/a.rs",
+            "",
+        ] {
+            assert_eq!(parse_report(absent), None, "{absent:?} carries no block");
+        }
+    }
+
+    #[test]
+    fn the_follow_up_asks_for_the_block_and_nothing_else() {
+        assert!(REPORT_FOLLOWUP.contains("REPORT"));
+        assert!(REPORT_FOLLOWUP.contains("completion sentinel"));
+    }
 
     #[test]
     fn consolidate_merge_requires_an_echo_of_the_sentinel() {
