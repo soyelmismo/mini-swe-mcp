@@ -1,8 +1,11 @@
 //! Durable, owner-scoped automatic rounds. Short synchronous transactions only:
 //! no state guard is held while dispatching or waiting on a worker. A dispatch
 //! guard suppresses eligibility during a whole batch, including cancellation.
+//! Launch claims are owner/group-scoped: same-round dispatches wait for the
+//! claim, but unrelated dispatches never wait for a consolidator's admission.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -26,13 +29,20 @@ pub(crate) struct AutoConsolidate {
 }
 struct State {
     rows: Vec<Round>,
-    dispatches: usize,
-    launching: bool,
+    dispatches: HashMap<(String, String), usize>,
+    launching: HashSet<(String, String)>,
 }
-pub(crate) struct DispatchGuard(Arc<AutoConsolidate>);
+pub(crate) struct DispatchGuard(Arc<AutoConsolidate>, Vec<(String, String)>);
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().dispatches -= 1;
+        let mut state = self.0.state.lock().unwrap();
+        for key in &self.1 {
+            let count = state.dispatches.get_mut(key).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                state.dispatches.remove(key);
+            }
+        }
     }
 }
 impl AutoConsolidate {
@@ -48,8 +58,8 @@ impl AutoConsolidate {
             changed: tokio::sync::Notify::new(),
             state: Mutex::new(State {
                 rows,
-                dispatches: 0,
-                launching: false,
+                dispatches: HashMap::new(),
+                launching: HashSet::new(),
             }),
         }))
     }
@@ -59,14 +69,19 @@ impl AutoConsolidate {
         std::fs::rename(tmp, &self.file)?;
         Ok(())
     }
-    pub async fn dispatch_guard(self: &Arc<Self>) -> DispatchGuard {
+    pub async fn dispatch_guard(self: &Arc<Self>, keys: Vec<(String, String)>) -> DispatchGuard {
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            // Register before checking the claim, so its release cannot be lost.
+            notified.as_mut().enable();
             {
                 let mut state = self.state.lock().unwrap();
-                if !state.launching {
-                    state.dispatches += 1;
-                    return DispatchGuard(self.clone());
+                if keys.iter().all(|key| !state.launching.contains(key)) {
+                    for key in &keys {
+                        *state.dispatches.entry(key.clone()).or_default() += 1;
+                    }
+                    return DispatchGuard(self.clone(), keys);
                 }
             }
             notified.await;
@@ -110,14 +125,22 @@ impl AutoConsolidate {
     }
     pub fn candidates(&self) -> Vec<Round> {
         let state = self.state.lock().unwrap();
-        if state.dispatches != 0 || state.launching {
-            return Vec::new();
-        }
-        state.rows.iter().filter(|r| !r.consumed).cloned().collect()
+        state
+            .rows
+            .iter()
+            .filter(|r| {
+                let key = (r.owner.clone(), r.group.clone());
+                !r.consumed
+                    && !state.dispatches.contains_key(&key)
+                    && !state.launching.contains(&key)
+            })
+            .cloned()
+            .collect()
     }
     pub fn claim(self: &Arc<Self>, round: &Round) -> Option<LaunchGuard> {
         let mut state = self.state.lock().unwrap();
-        if state.dispatches != 0 || state.launching {
+        let key = (round.owner.clone(), round.group.clone());
+        if state.dispatches.contains_key(&key) || state.launching.contains(&key) {
             return None;
         }
         if !state.rows.iter().any(|r| {
@@ -128,8 +151,8 @@ impl AutoConsolidate {
         }) {
             return None;
         }
-        state.launching = true;
-        Some(LaunchGuard(self.clone()))
+        state.launching.insert(key.clone());
+        Some(LaunchGuard(self.clone(), key))
     }
     pub fn consume(&self, round: &Round) -> Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -141,10 +164,14 @@ impl AutoConsolidate {
         self.save(&state.rows)
     }
 }
-pub(crate) struct LaunchGuard(Arc<AutoConsolidate>);
+pub(crate) struct LaunchGuard(Arc<AutoConsolidate>, (String, String));
 impl Drop for LaunchGuard {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().launching = false;
+        self.0.state.lock().unwrap().launching.remove(&self.1);
         self.0.changed.notify_waiters();
     }
 }
+
+#[cfg(test)]
+#[path = "auto_consolidate_tests.rs"]
+mod tests;

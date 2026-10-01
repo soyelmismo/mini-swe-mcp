@@ -64,7 +64,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Manage SWE mini-agents in Git worktrees. Wait with `mini-swe-mcp watch` in the background and run it again after each event, or the 'watch' action with 'timeout_secs'. You only see your own workers; admin excepted. `mini-swe-mcp help <topic>`: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "SWE workers in Git worktrees. Use mini-swe-mcp watch; run it again after each event. MCP: watch with timeout_secs. Only your own workers; admin excepted. mini-swe-mcp help <topic>: workflow, watch, steer, review, collect, merge, identity, sandbox, env, consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -181,9 +181,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static(
-            "Full gate for the automatic consolidator; omitted means auto-detect.",
-        ),
+        DescriptionSource::Static("Automatic consolidator's full gate; default: auto-detect."),
     ),
     (
         "scope",
@@ -547,8 +545,7 @@ mod tests {
     }
 
     /// Regression budget: this payload is context every MCP agent pays on
-    /// every session. Retain the pre-trim reduction plus a 350-byte allowance
-    /// for the two automatic-consolidation properties and their batch entries.
+    /// every session, so it must stay at least 40% below the pre-trim size.
     #[test]
     fn tools_list_stays_within_its_context_budget() {
         let tools_list = build_tools_list(&ModelManifest::default());
@@ -556,8 +553,8 @@ mod tests {
             .expect("tools/list serialises")
             .len();
         assert!(
-            bytes <= TOOLS_LIST_BASELINE_BYTES * 6 / 10 + 350,
-            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload plus 350 bytes"
+            bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
+            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload"
         );
     }
 
