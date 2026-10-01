@@ -677,6 +677,17 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
     for (id, view) in &mut current {
         if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id) {
             view.event = None;
+        } else if matches!(
+            view.event,
+            Some(EventKind::Completed | EventKind::Failed | EventKind::Exhausted)
+        ) && pool.steered_by_live_consolidator(id).await
+        {
+            // The consolidator that steered this worker is blocked in
+            // `CONSOLIDATE_WAIT` on exactly this stop, so the owner's watch
+            // stays quiet until the round is over (or the consolidator died):
+            // the owner sees the worker again once the source names no live
+            // consolidator.
+            view.event = None;
         }
     }
     current
@@ -1103,6 +1114,9 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         if pool.question_for_consolidator(id) {
             view["question_for_consolidator"] = json!(true);
         }
+        if pool.steered_by_live_consolidator(id).await {
+            view["steered_by_consolidator"] = json!(true);
+        }
     }
     views
 }
@@ -1141,6 +1155,18 @@ impl EventRouter {
                     history.pending.retain(|event| {
                         !(event["worker_id"] == *id && event["event"] == "needs_input")
                     });
+                }
+                continue;
+            }
+            // A consolidator that steered this worker waits on its stop; every
+            // event of the worker -- completed, failed, exhausted, stalled --
+            // belongs to that consolidator, not the owner's watch. Skipping one
+            // also drops what is queued, so a duplicate never leaks through.
+            if view["steered_by_consolidator"] == true {
+                self.watch_reported.remove(id);
+                self.seen.remove(id);
+                for history in self.watch_history.values_mut() {
+                    history.pending.retain(|event| event["worker_id"] != *id);
                 }
                 continue;
             }
