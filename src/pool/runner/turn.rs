@@ -1176,6 +1176,7 @@ impl<'a> TurnEngine<'a> {
         WorkerHistory {
             task: config.task.to_string(),
             group: self.meta.group.clone(),
+            role: self.meta.role,
             model: config.model.to_string(),
             temperature: config.temperature,
             repo_path: self

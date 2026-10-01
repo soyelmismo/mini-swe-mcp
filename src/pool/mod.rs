@@ -51,7 +51,7 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub(crate) use self::registry::recover_orphaned_workers;
 pub use self::registry::{
-    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, extract_group,
+    RegistryStatus, UNATTRIBUTED_OWNER, WorkerMeta, WorkerRegistryEntry, WorkerRole, extract_group,
     load_all_registry_entries, load_all_registry_entries_in, load_registry_entries_read_only,
     load_registry_entries_read_only_in, load_registry_entry, load_registry_entry_in, registry_dir,
     registry_dir_in, registry_owner_label, remove_registry_entry, remove_registry_entry_in,
@@ -501,6 +501,30 @@ impl WorkerPool {
         verify: Option<String>,
         client_env: Vec<(String, String)>,
     ) -> Result<String> {
+        self.dispatch_with_role(owner, task, model, temperature, repo_path, max_turns,
+            group, review_after, network_offline, verify, client_env, WorkerRole::Worker).await
+    }
+
+    /// Dispatch with explicit authority; consolidators require an explicit group.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_with_role(
+        &self,
+        owner: String,
+        task: String,
+        model: String,
+        temperature: Option<f32>,
+        repo_path: PathBuf,
+        max_turns: usize,
+        group: Option<String>,
+        review_after: Option<String>,
+        network_offline: bool,
+        verify: Option<String>,
+        client_env: Vec<(String, String)>,
+        role: WorkerRole,
+    ) -> Result<String> {
+        if role == WorkerRole::Consolidate && group.as_deref().is_none_or(|g| g.trim().is_empty()) {
+            anyhow::bail!("role 'consolidate' requires 'group'");
+        }
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
         let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
@@ -515,6 +539,7 @@ impl WorkerPool {
             id: worker_id.clone(),
             task: task.clone(),
             group: Some(resolved_group.clone()),
+            role,
             repo_path: Some(repo_path_str.clone()),
             owner: owner.clone(),
             started_at: now,

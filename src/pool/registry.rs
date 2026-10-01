@@ -2,7 +2,8 @@
 //!
 //! Registry rows are the only cross-process view of the pool: `list_workers`,
 //! the monitor and crash recovery all read them, so a row must be written on
-//! every state transition and removed exactly once.
+//! every state transition and removed exactly once. The dispatch role persists
+//! across steering and cold continuations.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -71,6 +72,15 @@ pub fn registry_owner_label(entry: &WorkerRegistryEntry) -> &str {
     entry.owner.as_deref().unwrap_or(UNATTRIBUTED_OWNER)
 }
 
+/// Dispatch authority: consolidators integrate only their owner's group.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerRole {
+    #[default]
+    Worker,
+    Consolidate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRegistryEntry {
     pub id: String,
@@ -87,6 +97,8 @@ pub struct WorkerRegistryEntry {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default)]
+    pub role: WorkerRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
     /// Agent identity that dispatched the worker. `None` on a row written
@@ -125,6 +137,7 @@ pub struct WorkerMeta {
     pub id: String,
     pub task: String,
     pub group: Option<String>,
+    pub role: WorkerRole,
     pub repo_path: Option<String>,
     /// Agent identity owning this worker, copied into every row this meta
     /// writes — including the review phase's, which keeps one worker.
@@ -174,6 +187,7 @@ impl WorkerMeta {
             started_at: self.started_at,
             updated_at: super::unix_timestamp(),
             group: self.group.clone(),
+            role: self.role,
             repo_path: self.repo_path.clone(),
             owner: Some(self.owner.clone()),
             metrics: self.metrics,
@@ -619,6 +633,7 @@ mod recovery_cleanup_tests {
             started_at: 0,
             updated_at: 0,
             group: None,
+            role: WorkerRole::Worker,
             repo_path: None,
             owner: Some("agent-a".to_string()),
             metrics: WorkerMetrics::default(),

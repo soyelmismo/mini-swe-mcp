@@ -233,6 +233,7 @@ impl WorkerPool {
         let opening_meta = WorkerHistory {
             task: task.clone(),
             group: meta.group.clone(),
+            role: meta.role,
             model: model.clone(),
             temperature,
             repo_path: repo_path_str.clone(),

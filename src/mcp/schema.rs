@@ -2,7 +2,8 @@
 //!
 //! Everything an MCP client sees in `tools/list` derives from the tables below,
 //! so the schema can never drift from what the dispatcher in
-//! [`crate::mcp::handlers`] actually implements.
+//! [`crate::mcp::handlers`] actually implements. The optional consolidate role
+//! delegates integration within the dispatch group.
 
 use serde_json::{Map, Value, json};
 use std::borrow::Cow;
@@ -129,6 +130,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         DescriptionSource::Static("Only watch workers of this group. Optional for 'watch'."),
     ),
     (
+        "role",
+        "string",
+        DescriptionSource::Static("'consolidate': integrate this group's completed workers (requires 'group')"),
+    ),
+    (
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
@@ -195,6 +201,10 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
                     .collect(),
             ),
         );
+    }
+    if name == "role" {
+        schema.insert("enum".into(), json!(["worker", "consolidate"]));
+        schema.insert("default".into(), json!("worker"));
     }
     if name == "network" {
         schema.insert(
