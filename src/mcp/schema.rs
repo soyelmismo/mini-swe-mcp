@@ -26,6 +26,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "logs",
     "list",
     "kill",
+    "discard",
     "reap",
     "manifest",
     "prune",
