@@ -157,31 +157,6 @@ fn divergent_dir(worktree: &Path, name: &str) -> PathBuf {
     worktree.join("target").join("divergent").join(name)
 }
 
-/// Wrap `verify` so it runs with `env` layered on top of the canonical one.
-///
-/// The command is replayed verbatim behind an `export` of the divergent
-/// variables: the worker's own bash path still applies the sandbox, the
-/// timeout, the guardrails and the build environment, so variant B is the same
-/// execution as variant A with a different environment and nothing else.
-pub fn divergent_command(verify: &str, env: &[(String, String)]) -> String {
-    let mut wrapped = String::new();
-    for (name, value) in env {
-        wrapped.push_str("export ");
-        wrapped.push_str(name);
-        wrapped.push('=');
-        wrapped.push_str(&shell_quote(value));
-        wrapped.push_str("; ");
-    }
-    wrapped.push_str(verify);
-    wrapped
-}
-
-/// Single-quote `value` for `bash -c`, so a divergent value is never
-/// re-interpreted by the shell that runs the gate.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
-
 /// The names variant B changes relative to the canonical environment.
 pub fn divergent_names(env: &[(String, String)]) -> Vec<String> {
     let mut names: Vec<String> = env.iter().map(|(name, _)| name.clone()).collect();
@@ -292,7 +267,11 @@ fn refs_of(repo_root: &Path) -> Vec<String> {
 
 /// Every registered worktree path in the shared repository.
 fn worktrees_of(repo_root: &Path) -> Vec<String> {
-    let output = crate::worktree::git(repo_root, "worktree list", &["worktree", "list", "--porcelain"]);
+    let output = crate::worktree::git(
+        repo_root,
+        "worktree list",
+        &["worktree", "list", "--porcelain"],
+    );
     match output {
         Ok(out) if out.status.success() => out
             .stdout
@@ -405,7 +384,9 @@ pub fn side_effect_refusal(effects: &SideEffects) -> String {
         items.push(format!("left process {process}"));
     }
     for file in &effects.new_files {
-        items.push(format!("created file {file} in the repository's main checkout"));
+        items.push(format!(
+            "created file {file} in the repository's main checkout"
+        ));
     }
     let truncation = if effects.truncated {
         " (list truncated; there is more)"
@@ -479,7 +460,9 @@ mod tests {
         cleanup(&dir, &effects);
         let after = snapshot(&dir);
         assert!(
-            !after.refs.contains(&"refs/heads/worker-leftover".to_string()),
+            !after
+                .refs
+                .contains(&"refs/heads/worker-leftover".to_string()),
             "the harness must remove the ref it found: {:?}",
             after.refs
         );
@@ -553,7 +536,10 @@ mod tests {
         );
         let names = divergent_names(&env);
         for name in ["HOME", "TMPDIR", "TZ", "SWE_DIVERGENT_PROBE"] {
-            assert!(names.iter().any(|n| n == name), "{name} must be in {names:?}");
+            assert!(
+                names.iter().any(|n| n == name),
+                "{name} must be in {names:?}"
+            );
         }
         let tz = env
             .iter()
@@ -618,16 +604,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn the_divergent_command_quotes_its_values() {
-        let wrapped = divergent_command(
-            "echo hi",
-            &[("SWE_QUOTED".to_string(), "a b'c".to_string())],
-        );
-        assert!(
-            wrapped.contains("export SWE_QUOTED='a b'\\''c'; "),
-            "the value must be single-quoted so the shell cannot re-split it, got {wrapped:?}"
-        );
-        assert!(wrapped.ends_with("echo hi"), "the command is replayed verbatim");
-    }
 }

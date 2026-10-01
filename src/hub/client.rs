@@ -141,8 +141,13 @@ fn hello_params(admin: bool, version: &str, build: &Value) -> Value {
 /// variables, so a pathological shell cannot grow the handshake frame.
 fn ambient_env_frame() -> Value {
     let pairs = crate::agent::env::ambient_environment_snapshot();
-    serde_json::to_value(pairs.iter().map(|(k, v)| json!({"name": k, "value": v})).collect::<Vec<_>>())
-        .unwrap_or(Value::Null)
+    serde_json::to_value(
+        pairs
+            .iter()
+            .map(|(k, v)| json!({"name": k, "value": v}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(Value::Null)
 }
 
 /// Decode an `ambient_env` handshake frame into whole variables.

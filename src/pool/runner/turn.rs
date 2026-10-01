@@ -828,7 +828,8 @@ impl<'a> TurnEngine<'a> {
                 verified: Some(true),
             });
         }
-        let divergent_env = super::divergent::divergent_environment(&worktree_path, self.client_env);
+        let divergent_env =
+            super::divergent::divergent_environment(&worktree_path, self.client_env);
         tracing::info!(
             worker = %self.worker_id,
             names = ?super::divergent::divergent_names(&divergent_env),
@@ -868,8 +869,7 @@ impl<'a> TurnEngine<'a> {
             });
         }
         let differing = super::divergent::divergent_names(&divergent_env);
-        let refusal =
-            super::divergent::divergence_refusal(verify, &differing, code_b, &output_b);
+        let refusal = super::divergent::divergence_refusal(verify, &differing, code_b, &output_b);
         self.push_exchange(
             llm_resp.content.clone(),
             llm_resp.reasoning_content.clone(),

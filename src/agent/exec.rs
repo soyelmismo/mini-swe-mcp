@@ -1230,7 +1230,6 @@ mod tests {
         assert!(out.contains("outside the worktree"));
     }
 
-    #[test]
     /// The per-command overlay must reach the child: the differential verify
     /// gate replays the same command in the dispatcher's ambient environment,
     /// so an overlay that is dropped would make variant B indistinguishable
@@ -1265,7 +1264,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, Some(0), "command failed: {out:?}");
-        assert_eq!(out.trim(), "present-/tmp", "the overlay must reach the child: {out:?}");
+        assert_eq!(
+            out.trim(),
+            "present-/tmp",
+            "the overlay must reach the child: {out:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

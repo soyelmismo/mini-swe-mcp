@@ -1135,13 +1135,10 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
 
 /// Whether `dir` holds a file with the given extension.
 fn has_extension(dir: &Path, extension: &str) -> bool {
-    std::fs::read_dir(dir).map_or(false, |entries| {
-        entries.flatten().any(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == extension)
-        })
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == extension))
     })
 }
 

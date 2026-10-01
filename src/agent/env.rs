@@ -261,8 +261,23 @@ pub const AMBIENT_ENV_MAX_BYTES: usize = 64 * 1024;
 /// read into a snapshot. The list is deliberately broad - a false positive
 /// costs one variable in a differential run, a false negative ships a key.
 const SECRET_NAME_MARKERS: &[&str] = &[
-    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "AUTH", "PRIVATE",
-    "SIGNATURE", "BEARER", "COOKIE", "CERT", "APIKEY", "ACCESS_KEY", "SESSION_KEY", "SALT",
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "CREDENTIAL",
+    "AUTH",
+    "PRIVATE",
+    "SIGNATURE",
+    "BEARER",
+    "COOKIE",
+    "CERT",
+    "APIKEY",
+    "ACCESS_KEY",
+    "SESSION_KEY",
+    "SALT",
 ];
 
 /// Whether `name` is credential-bearing and must never leave the client.
@@ -687,8 +702,13 @@ mod tests {
         ] {
             assert!(is_secret_name(name), "{name} must be treated as a secret");
         }
-        for name in ["PATH", "USER", "HOME", "TMPDIR", "TZ", "LANG", "MY_FOO", "BUILD_ID"] {
-            assert!(!is_secret_name(name), "{name} must not be treated as a secret");
+        for name in [
+            "PATH", "USER", "HOME", "TMPDIR", "TZ", "LANG", "MY_FOO", "BUILD_ID",
+        ] {
+            assert!(
+                !is_secret_name(name),
+                "{name} must not be treated as a secret"
+            );
         }
     }
 
@@ -713,7 +733,9 @@ mod tests {
             "plain variables must survive the snapshot"
         );
         assert!(
-            !snapshot.iter().any(|(k, _)| k == "SWE_AMBIENT_SECRET_TOKEN_TEST"),
+            !snapshot
+                .iter()
+                .any(|(k, _)| k == "SWE_AMBIENT_SECRET_TOKEN_TEST"),
             "secret names must not survive the snapshot"
         );
     }

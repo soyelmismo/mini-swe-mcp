@@ -168,24 +168,24 @@ async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> S
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
-                if let Some(content) = value["content"].as_str() {
-                    if content.contains(needle) {
-                        return content.to_string();
-                    }
+                if let Some(content) = value["content"].as_str()
+                    && content.contains(needle)
+                {
+                    return content.to_string();
                 }
             }
         }
-        if let Some(state) = pool.get_worker_state(worker_id).await {
-            if matches!(
+        if let Some(state) = pool.get_worker_state(worker_id).await
+            && matches!(
                 state,
                 WorkerState::Completed { .. } | WorkerState::Failed { .. }
-            ) {
-                let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
-                let raw = std::fs::read_to_string(&path).unwrap_or_default();
-                panic!(
-                    "worker {worker_id} finished before refusing with {needle:?}: {state:?}\n--- log ---\n{raw}"
-                );
-            }
+            )
+        {
+            let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            panic!(
+                "worker {worker_id} finished before refusing with {needle:?}: {state:?}\n--- log ---\n{raw}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -252,7 +252,8 @@ async fn a_timezone_dependent_suite_is_refused() {
     // The canonical environment keeps the host's own zone; variant B shifts it
     // to one of the two far zones, so the suite passes in A and fails in B.
     let verify = "test \"$TZ\" != \"Pacific/Kiritimati\" && test \"$TZ\" != \"Etc/GMT+12\"";
-    let (pool, worker_id) = dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
+    let (pool, worker_id) =
+        dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
     let refusal = wait_for_refusal(&pool, &worker_id, "clean environment").await;
     assert!(
         refusal.contains("HOME/TMPDIR/TZ differ"),
@@ -291,7 +292,9 @@ async fn secrets_never_reach_variant_b() {
     // before it is ever stored, so variant B cannot see it.
     let snapshot = mini_swe_mcp::agent::ambient_environment_snapshot();
     assert!(
-        !snapshot.iter().any(|(name, _)| mini_swe_mcp::agent::is_secret_name(name)),
+        !snapshot
+            .iter()
+            .any(|(name, _)| mini_swe_mcp::agent::is_secret_name(name)),
         "the ambient snapshot must never carry a secret name"
     );
     let decoded = mini_swe_mcp::hub::decode_ambient_env(&serde_json::json!([
@@ -320,7 +323,10 @@ async fn secrets_never_reach_variant_b() {
         &server.base_url,
         repo.path(),
         verify,
-        vec![("SWE_DIVERGENT_API_TOKEN_CHECK".to_string(), "must-not-travel".to_string())],
+        vec![(
+            "SWE_DIVERGENT_API_TOKEN_CHECK".to_string(),
+            "must-not-travel".to_string(),
+        )],
     )
     .await;
     let state = wait_for_terminal(&pool, &worker_id).await;
