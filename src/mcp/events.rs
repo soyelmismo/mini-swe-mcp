@@ -1834,40 +1834,51 @@ mod watch_stall_regression_tests {
     /// went quiet is dropped.
     #[test]
     fn ack_store_evicts_least_recently_acknowledged_owner() {
-        // `chatty`'s OLDEST worker (w-a) is acknowledged first,
-        // then `quiet` acknowledges its two workers, then the
-        // store is filled to the bound with filler owners, and
-        // finally `chatty` acknowledges a FRESH worker (w-b).
-        // Under the owner's *latest* acknowledgment `chatty` is
-        // the most recent (w-b) and `quiet` is the least recent,
-        // so the one eviction the final record triggers drops
-        // `quiet`. Ranking each owner by its *oldest* single
-        // entry would instead see `chatty`'s w-a and wrongly
-        // evict `chatty` -- which is exactly what this ordering
-        // distinguishes.
+        // A long-lived owner is the discriminator: it acknowledges
+        // its FIRST worker before everything else and its LAST
+        // worker after the fillers, so its oldest stamp is the
+        // lowest in the store while its newest is the highest.
+        //
+        // Ranking owners by their *latest* acknowledgment (max)
+        // keeps such an owner -- it was just active -- and evicts
+        // a filler instead. Ranking by the *oldest* single entry
+        // (min) would instead evict the long-lived owner purely
+        // because it started first, which is exactly the bug this
+        // ordering distinguishes.
         let mut store = AckStore::default();
-        store.record("chatty", "w-a", 1, "completed");
-        store.record("quiet", "w-a", 1, "completed");
-        store.record("quiet", "w-b", 1, "completed");
+        // The oldest acknowledgment in the whole store.
+        store.record("long-lived", "w-first", 1, "completed");
         for i in 0..(MAX_ACK_OWNERS - 2) {
             store.record(&format!("filler-{i:05}"), "w", 1, "completed");
         }
-        // At the bound: chatty, quiet and the fillers all present.
+        // The newest acknowledgment, so this owner is the most
+        // recent by `max` while still the least recent by `min`.
+        store.record("long-lived", "w-last", 1, "completed");
         assert_eq!(store.positions.len(), MAX_ACK_OWNERS);
-        // The fresh w-b makes chatty the most recently
-        // acknowledged owner and pushes the store one past the
-        // bound, so exactly the least recent owner is evicted.
-        store.record("chatty", "w-b", 1, "completed");
-        eprintln!("after final: len={}, quiet={}, chatty={}", store.positions.len(), store.positions.contains_key("quiet"), store.positions.contains_key("chatty"));
+        assert!(store.acknowledged("long-lived", "w-first", 1, "completed"));
+        assert!(store.acknowledged("long-lived", "w-last", 1, "completed"));
+        // One record past the bound evicts exactly one owner: the
+        // filler with the oldest stamp, never the long-lived one.
+        store.record("newcomer", "w", 1, "completed");
         assert_eq!(
             store.positions.len(),
             MAX_ACK_OWNERS,
             "the owner store must stay bounded"
         );
-        assert!(!store.positions.contains_key("quiet"));
-        assert!(store.positions.contains_key("chatty"));
-        assert!(store.acknowledged("chatty", "w-a", 1, "completed"));
-        assert!(store.acknowledged("chatty", "w-b", 1, "completed"));
+        assert!(
+            store.positions.contains_key("long-lived"),
+            "an owner that just acknowledged must not be evicted"
+        );
+        assert!(store.positions.contains_key("newcomer"));
+        // Both of the long-lived owner's workers survive together:
+        // the owner is evicted whole or kept whole, never split.
+        assert!(store.acknowledged("long-lived", "w-first", 1, "completed"));
+        assert!(store.acknowledged("long-lived", "w-last", 1, "completed"));
+        // A filler was dropped instead.
+        assert!(
+            !store.positions.contains_key("filler-00000"),
+            "the least recently acknowledged owner must be evicted"
+        );
     }
 
     #[test]
