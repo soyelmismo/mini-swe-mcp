@@ -10,11 +10,11 @@ mod common;
 
 use common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
-use mini_swe_mcp::pool::{
-    MergeRequest, WorkerHistory, WorkerRegistryEntry, append_history_message_in,
-    merge_worker_in, save_registry_entry_in,
-};
 use mini_swe_mcp::pool::RegistryStatus;
+use mini_swe_mcp::pool::{
+    MergeRequest, WorkerHistory, WorkerRegistryEntry, append_history_message_in, merge_worker_in,
+    save_registry_entry_in,
+};
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::{Path, PathBuf};
 
@@ -159,7 +159,8 @@ fn clean_merge_skips_the_gate_when_the_branch_is_already_verified() {
     f.commit_on_worker_branch("w1", "worker.txt", "from the worker\n");
     f.record_worker("w1", Some("exit 1"));
 
-    f.merge("w1", Some(true), false).expect("clean merge must succeed");
+    f.merge("w1", Some(true), false)
+        .expect("clean merge must succeed");
 
     // The merge commit is on main and carries the worker's credit.
     let subjects = git(f.repo(), &["log", "--format=%s", "-n", "1"]);
@@ -169,15 +170,17 @@ fn clean_merge_skips_the_gate_when_the_branch_is_already_verified() {
         std::fs::read_to_string(f.repo().join("worker.txt")).unwrap(),
         "from the worker\n"
     );
-    // Two commits on main: the base and the merge (--no-ff, never a fast-forward).
-    let count = git(f.repo(), &["rev-list", "--count", "main"]).trim().to_string();
-    assert_eq!(count, "2");
-    // The merge is a real merge commit, so the worker's history stays visible.
-    let parents = git(f.repo(), &["rev-list", "--parents", "-n", "1"])
+    // Three commits reachable from main: the base, the worker's own commit and
+    // the merge (--no-ff, never a fast-forward).
+    let count = git(f.repo(), &["rev-list", "--count", "main"])
         .trim()
+        .to_string();
+    assert_eq!(count, "3");
+    // The merge is a real merge commit, so the worker's history stays visible.
+    let parents = git(f.repo(), &["log", "--format=%P", "-n", "1"])
         .split_whitespace()
         .count();
-    assert_eq!(parents, 3, "merge commit must have two parents");
+    assert_eq!(parents, 2, "merge commit must have two parents");
 }
 
 /// A branch the base has moved past re-runs the gate, on the merge result.
@@ -202,6 +205,23 @@ fn stale_branch_runs_the_gate_on_the_merge_result() {
         std::fs::read_to_string(f.repo().join("worker.txt")).unwrap(),
         "from the worker\n"
     );
+    // The gate's throwaway worktree is gone, and it never lived in the
+    // operator's checkout.
+    let leftovers: Vec<String> = std::fs::read_dir(f.scratch.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("swe-merge-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the gate worktree must be reclaimed: {leftovers:?}"
+    );
+    let registered = git(f.repo(), &["worktree", "list", "--porcelain"]);
+    assert!(
+        !registered.contains("swe-merge-"),
+        "the gate worktree must be unregistered: {registered}"
+    );
 }
 
 /// A failing gate refuses the merge and leaves the repository untouched.
@@ -215,13 +235,18 @@ fn failing_gate_refuses_and_reports_the_tail() {
         Some("echo 'first line of noise'; echo 'the assertion that failed' >&2; exit 3"),
     );
 
-    let err = f.merge("w3", None, false).expect_err("a failing gate must refuse");
+    let err = f
+        .merge("w3", None, false)
+        .expect_err("a failing gate must refuse");
     let msg = err.to_string();
     assert!(
         msg.contains("the assertion that failed"),
         "the refusal must carry the failing tail: {msg}"
     );
-    assert!(msg.contains("exit 3"), "the refusal must name the exit: {msg}");
+    assert!(
+        msg.contains("exit 3"),
+        "the refusal must name the exit: {msg}"
+    );
     // Nothing was merged and the branch is still there.
     assert!(git_ref_exists(f.repo(), "worker-w3"));
     assert_eq!(
@@ -240,9 +265,14 @@ fn conflict_is_refused_with_the_steer_hint() {
     f.commit_on_base("shared.txt", "base side\n");
     f.record_worker("w4", None);
 
-    let err = f.merge("w4", None, false).expect_err("a conflict must refuse");
+    let err = f
+        .merge("w4", None, false)
+        .expect_err("a conflict must refuse");
     let msg = err.to_string();
-    assert!(msg.contains("shared.txt"), "the conflict must be named: {msg}");
+    assert!(
+        msg.contains("shared.txt"),
+        "the conflict must be named: {msg}"
+    );
     assert!(
         msg.contains("steer w4 \"merge conflicts in shared.txt\""),
         "the refusal must suggest steering the worker: {msg}"
@@ -280,7 +310,11 @@ fn dirty_touched_file_refuses_but_unrelated_files_are_ignored() {
         "the refusal must name the touched file: {}",
         err
     );
-    assert!(!msg_names(&err, "notes.txt"), "unrelated files are not a reason to refuse: {}", err);
+    assert!(
+        !msg_names(&err, "notes.txt"),
+        "unrelated files are not a reason to refuse: {}",
+        err
+    );
     // Neither the operator's edit nor their untracked file was disturbed.
     assert_eq!(
         std::fs::read_to_string(f.repo().join("shared.txt")).unwrap(),
@@ -315,7 +349,9 @@ fn wrong_checked_out_branch_refuses() {
         "the refusal must name what is checked out: {}",
         err
     );
-    let head = git(f.repo(), &["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+    let head = git(f.repo(), &["symbolic-ref", "--short", "HEAD"])
+        .trim()
+        .to_string();
     assert_eq!(head, "somewhere-else", "a refused merge must not move HEAD");
     assert!(git_ref_exists(f.repo(), "worker-w6"));
 }
@@ -342,25 +378,33 @@ fn merge_cleans_up_and_no_delete_keeps_the_branch() {
     let f = Fixture::new("merge-cleanup");
     f.commit_on_worker_branch("w8", "worker.txt", "from the worker\n");
     f.record_worker("w8", None);
+    f.record_status("w8", RegistryStatus::Completed);
     // A leftover worktree directory, as a crashed run would leave behind.
     let leftover: PathBuf = f.scratch.path().join("swe-wt-w8");
     std::fs::create_dir_all(leftover.join("nested")).unwrap();
     std::fs::write(leftover.join("nested").join("junk.txt"), "junk\n").unwrap();
     std::fs::create_dir_all(f.scratch.path().join("swe-target-swe-wt-w8")).unwrap();
     std::fs::write(
-        f.scratch.path().join("swe-target-swe-wt-w8").join("build.o"),
+        f.scratch
+            .path()
+            .join("swe-target-swe-wt-w8")
+            .join("build.o"),
         "junk\n",
     )
     .unwrap();
 
-    f.merge("w8", None, false).expect("clean merge must succeed");
+    f.merge("w8", None, false)
+        .expect("clean merge must succeed");
 
     assert!(
         !git_ref_exists(f.repo(), "worker-w8"),
         "the merged branch must be deleted"
     );
     assert!(!f.history_exists("w8"), "the history file must be removed");
-    assert!(!leftover.exists(), "the leftover worktree must be reclaimed");
+    assert!(
+        !leftover.exists(),
+        "the leftover worktree must be reclaimed"
+    );
     assert!(
         !f.scratch.path().join("swe-target-swe-wt-w8").exists(),
         "the leftover target dir must be reclaimed"
@@ -392,7 +436,8 @@ fn merge_never_pushes() {
     f.commit_on_worker_branch("w10", "worker.txt", "from the worker\n");
     f.record_worker("w10", None);
 
-    f.merge("w10", Some(true), false).expect("clean merge must succeed");
+    f.merge("w10", Some(true), false)
+        .expect("clean merge must succeed");
 
     // No remote was ever configured, so a push would have failed the merge;
     // the successful merge plus the absence of a remote proves neither was

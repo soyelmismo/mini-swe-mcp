@@ -757,6 +757,34 @@ mod tests {
     }
 
     #[test]
+    fn test_format_merge_names_the_commit_the_gate_and_the_cleanup() {
+        let out = format_merge(&v(
+            r#"{"worker_id":"w1","branch":"worker-w1","base_branch":"main","commit":"abc1234",
+                 "gate":"ran","gate_command":"cargo test","branch_deleted":true,
+                 "cleaned":["branch worker-w1 deleted","history file removed"]}"#,
+        ));
+        assert!(
+            out.starts_with("✓ Merged worker-w1 into main as abc1234"),
+            "{out}"
+        );
+        assert!(out.contains("gate passed"), "{out}");
+        assert!(out.contains("branch worker-w1 deleted"), "{out}");
+        assert!(out.contains("history file removed"), "{out}");
+    }
+
+    #[test]
+    fn test_format_merge_reports_a_skipped_gate_and_a_kept_branch() {
+        let out = format_merge(&v(
+            r#"{"worker_id":"w2","branch":"worker-w2","base_branch":"main","commit":"def5678",
+                 "gate":"skipped","branch_deleted":false,"cleaned":["history file removed"]}"#,
+        ));
+        assert!(out.contains("gate skipped"), "{out}");
+        assert!(out.contains("Branch worker-w2 kept"), "{out}");
+        // A kept branch is not reported as cleaned up.
+        assert!(!out.contains("Cleaned:"), "{out}");
+    }
+
+    #[test]
     fn test_format_kill_and_steer_reflect_the_tool_answer() {
         assert_eq!(
             format_kill(&v(r#"{"worker_id":"w","killed":true}"#)),

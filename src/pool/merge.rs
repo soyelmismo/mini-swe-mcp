@@ -181,7 +181,14 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
     git(
         repo,
         "merge --no-ff",
-        &["merge", "--no-ff", "--no-edit", "-m", &subject, &resolved.branch],
+        &[
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            &subject,
+            &resolved.branch,
+        ],
     )
     .with_context(|| {
         format!(
@@ -195,7 +202,8 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let (branch_deleted, cleaned) = cleanup(root, worker_id, repo, &resolved.branch, req.keep_branch);
+    let (branch_deleted, cleaned) =
+        cleanup(root, worker_id, repo, &resolved.branch, req.keep_branch);
 
     Ok(MergeReport {
         worker_id: worker_id.to_string(),
@@ -271,7 +279,12 @@ fn resolve(root: &ScratchRoot, worker_id: &str) -> Result<Resolved> {
 
 /// The branch `repo` currently has checked out, or `None` when detached.
 fn checked_out_branch(repo: &Path) -> Option<String> {
-    let out = git(repo, "symbolic-ref", &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
+    let out = git(
+        repo,
+        "symbolic-ref",
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -284,7 +297,12 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool> {
     Ok(git(
         repo,
         "rev-parse",
-        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )?
     .status
     .success())
@@ -359,14 +377,10 @@ fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<MergeTree> {
 /// The files a merge of `branch` into `base` would write: everything either
 /// side changed since their merge base.
 fn touched_files(repo: &Path, base: &str, branch: &str) -> Result<Vec<String>> {
-    let Some(merge_base) = git(
-        repo,
-        "merge-base",
-        &["merge-base", base, branch],
-    )
-    .ok()
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    .filter(|s| !s.is_empty())
+    let Some(merge_base) = git(repo, "merge-base", &["merge-base", base, branch])
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
     else {
         // No common history: every file either side has is in play.
         return Ok(Vec::new());
@@ -451,7 +465,9 @@ fn run_gate(
     if let Err(e) = created {
         force_remove_dir(&gate_dir);
         return Err(e).with_context(|| {
-            format!("could not create a gate worktree for worker {worker_id} under the scratch root")
+            format!(
+                "could not create a gate worktree for worker {worker_id} under the scratch root"
+            )
         });
     }
     let materialised = git(&gate_dir, "read-tree", &["read-tree", tree])
@@ -501,7 +517,10 @@ fn base_tip_ref(repo: &Path) -> Result<String> {
     let out = git(repo, "symbolic-ref", &["symbolic-ref", "--short", "HEAD"])?;
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if name.is_empty() {
-        anyhow::bail!("cannot create a gate worktree: {} has a detached HEAD", repo.display());
+        anyhow::bail!(
+            "cannot create a gate worktree: {} has a detached HEAD",
+            repo.display()
+        );
     }
     Ok(name)
 }
@@ -524,7 +543,10 @@ fn tail(text: &str, lines: usize) -> String {
         return text.trim_end().to_string();
     }
     let kept = all[all.len() - lines..].join("\n");
-    format!("... ({} earlier line(s) omitted)\n{kept}", all.len() - lines)
+    format!(
+        "... ({} earlier line(s) omitted)\n{kept}",
+        all.len() - lines
+    )
 }
 
 /// The merge subject: the task's first line, credited to the worker.
@@ -559,8 +581,8 @@ fn cleanup(
     let branch_deleted = if keep_branch {
         false
     } else {
-        let deleted = git(repo, "branch -D", &["branch", "-D", branch])
-            .is_ok_and(|o| o.status.success());
+        let deleted =
+            git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
         if deleted {
             cleaned.push(format!("branch {branch} deleted"));
         }
