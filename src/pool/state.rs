@@ -278,6 +278,10 @@ pub struct WorkerProgress {
     /// Queued heavy commands ahead of this worker while it waits for a build
     /// slot; `None` when it is not waiting. Time spent here is not a stall.
     pub waiting_for_slot: Option<usize>,
+    /// Unix time this worker's current bash command started, while one is
+    /// executing; `None` when no command is in flight. A step whose command is
+    /// still running is not worker inactivity.
+    pub command_started_at: Option<u64>,
 }
 
 /// Who a worker belongs to, as the pool and the registry record it.
