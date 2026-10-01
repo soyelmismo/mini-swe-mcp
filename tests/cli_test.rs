@@ -74,6 +74,10 @@ fn test_cli_help_flag() {
             "help missing the task guidance: {stdout}"
         );
         assert!(
+            stdout.contains("many workers at once is the intended use"),
+            "help must encourage parallel dispatch: {stdout}"
+        );
+        assert!(
             stdout.contains("mini-swe-mcp watch"),
             "help must name watch: {stdout}"
         );
