@@ -15,12 +15,6 @@
 # failing the load.
 default: ninja
 
-# Alias of the strongest tier, when the manifest marks one. A consolidator
-# integrates a whole round, so it dispatches on this model instead of the
-# dispatch default above; drop the key (or name an alias that does not exist)
-# and the dispatch default stays in place.
-strongest: nerd
-
 models:
   ninja:
     id: combo:ninja

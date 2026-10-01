@@ -156,6 +156,8 @@ impl ModelManifest {
 
     /// Alias of the manifest's strongest tier, when the manifest marks one.
     ///
+    /// The `strongest:` key of `models.yaml`; absent, or naming an alias the
+    /// catalog does not define, leaves the dispatch default in place.
     /// A consolidator integrates a whole round, so it runs on the deepest model
     /// the manifest declares rather than on the fast executor the dispatch
     /// default names. `None` when the manifest marks none (or names an alias it
