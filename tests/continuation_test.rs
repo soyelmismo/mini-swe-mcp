@@ -140,6 +140,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         base_commit: Some("base".into()),
         revision: 1,
         auto_continues: 0,
+        approved: None,
     }
 }
 

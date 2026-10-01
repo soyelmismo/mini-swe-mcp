@@ -1283,6 +1283,7 @@ fn torn_down_worker_diff_stat_comes_from_its_branch() {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        approved: None,
     };
     let now = 1_700_000_000;
     let view = watch::registry_snapshot(&entry, now);

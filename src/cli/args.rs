@@ -65,6 +65,9 @@ pub fn tool_args(
             if action == "collect" {
                 collect_diff_args(cli_args, &mut tool_args);
             }
+            if action == "review" {
+                review_diff_arg(cli_args, &mut tool_args);
+            }
             // `--no-delete` keeps the merged branch: the same tool argument
             // the MCP action reads, so the flag has one implementation.
             if flag_index(cli_args, &["--no-delete"]).is_some() {
@@ -84,6 +87,16 @@ pub fn tool_args(
                 if let Some(mut i) = flag_index(cli_args, &["--max-turns", "-t"]) {
                     take_turns(cli_args, &mut i, &mut tool_args);
                 }
+            }
+        }
+        "approve" | "unapprove" => {
+            if cli_args.len() > 2 {
+                tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
+            }
+            // `approve <id> ["note"]`: the note is the same `message` argument
+            // the MCP action reads.
+            if action == "approve" && cli_args.len() > 3 {
+                tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
             }
         }
         "list" => {
@@ -159,6 +172,16 @@ fn collect_diff_args(cli_args: &[String], tool_args: &mut Map<String, Value>) {
     }
     if !files.is_empty() {
         tool_args.insert("files".into(), Value::Array(files));
+    }
+}
+
+/// Fold `review --diff <scope>` into the tool arguments.
+///
+/// The scope is the same `diff` argument the MCP action reads, so the selector
+/// has one implementation and an unknown value is refused by the handler.
+fn review_diff_arg(cli_args: &[String], tool_args: &mut Map<String, Value>) {
+    if let Some(mut i) = flag_index(cli_args, &["--diff"]) {
+        take_value(cli_args, &mut i, tool_args, "diff");
     }
 }
 
@@ -401,7 +424,8 @@ mod tests {
         assert_eq!(r.len(), 1);
     }
 
-    /// `review <id>` is a read like `status`: one positional, no flags.
+    /// `review <id>` is a read like `status`: one positional, plus the optional
+    /// diff scope, which maps to the same `diff` argument the MCP action reads.
     #[test]
     fn test_review_maps_its_positional_worker_id() {
         let out = tool_args("review", &args(&["mini-swe-mcp", "review", "w1"]), true)
@@ -409,6 +433,51 @@ mod tests {
             .unwrap();
         assert_eq!(out["action"], "review");
         assert_eq!(out["worker_id"], "w1");
+        assert!(
+            !out.contains_key("diff"),
+            "the default scope is implicit: {out:?}"
+        );
+
+        let scoped = tool_args(
+            "review",
+            &args(&["mini-swe-mcp", "review", "w1", "--diff", "all"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(scoped["worker_id"], "w1");
+        assert_eq!(scoped["diff"], "all");
+    }
+
+    /// `approve <id> ["note"]` maps the id and the note to the same `message`
+    /// argument the MCP action reads; `unapprove <id>` needs only the id.
+    #[test]
+    fn test_approve_maps_the_id_and_optional_note() {
+        let bare = tool_args("approve", &args(&["mini-swe-mcp", "approve", "w1"]), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare["action"], "approve");
+        assert_eq!(bare["worker_id"], "w1");
+        assert!(!bare.contains_key("message"), "{bare:?}");
+
+        let noted = tool_args(
+            "approve",
+            &args(&["mini-swe-mcp", "approve", "w1", "looks right"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(noted["message"], "looks right");
+
+        let back = tool_args(
+            "unapprove",
+            &args(&["mini-swe-mcp", "unapprove", "w1"]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(back["action"], "unapprove");
+        assert_eq!(back["worker_id"], "w1");
     }
 
     /// `--full` and `--file` are the CLI spelling of the `collect` tool
