@@ -23,6 +23,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -192,6 +193,25 @@ impl Drop for CommandRun {
     }
 }
 
+/// The word that stands for the caller's most recently dispatched worker.
+pub const LAST_WORKER_ID: &str = "last";
+
+/// Shortest prefix accepted for a worker id: below it a typo would be too
+/// likely to name a different worker by accident.
+pub const MIN_WORKER_ID_PREFIX: usize = 3;
+
+/// How a caller-supplied worker reference resolved among its own workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerIdLookup {
+    /// The full id to act on; every response renders this, never the prefix.
+    Resolved(String),
+    /// Nothing of the caller's matches. The needle is left as written so the
+    /// verb keeps its own "not found" answer (and `kill` its `killed: false`).
+    NotFound,
+    /// A prefix shared by several of the caller's workers, sorted.
+    Ambiguous(Vec<String>),
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     worker_slots: fair::FairScheduler,
@@ -225,6 +245,10 @@ pub struct WorkerPool {
     /// The model manifest this pool's workers resolve against. Shared with the
     /// MCP server so a dispatch and its worker never disagree on the catalog.
     manifest: Arc<ModelManifest>,
+    /// Dispatch ordinal per worker id, so `last` names the most recently
+    /// dispatched worker even when two share a whole-second `started_at`.
+    dispatch_order: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    next_dispatch_seq: Arc<AtomicU64>,
 }
 
 impl WorkerPool {
@@ -295,6 +319,8 @@ impl WorkerPool {
             log_policy,
             terminal_ttl,
             manifest: Arc::new(ModelManifest::default()),
+            dispatch_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_dispatch_seq: Arc::new(AtomicU64::new(1)),
             scratch,
         }
     }
@@ -341,6 +367,15 @@ impl WorkerPool {
     fn notify_change(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Stamp `id` as the newest dispatch, so `last` can name it.
+    fn record_dispatch(&self, id: &str) {
+        let ordinal = self.next_dispatch_seq.fetch_add(1, Ordering::Relaxed);
+        self.dispatch_order
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id.to_string(), ordinal);
     }
 
     /// All worker progress and lifecycle mutations notify under the write lock.
@@ -469,6 +504,7 @@ impl WorkerPool {
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
         let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
+        self.record_dispatch(&worker_id);
         let now = unix_timestamp();
         let resolved_group = group
             .or_else(|| extract_group(&task))
@@ -630,6 +666,7 @@ impl WorkerPool {
     /// write-guard) without spinning up a real LLM-backed worker.
     #[doc(hidden)]
     pub async fn __test_insert_worker(&self, record: WorkerRecord) {
+        self.record_dispatch(&record.id);
         self.workers.write().await.insert(record.id.clone(), record);
         self.notify_change();
     }
@@ -832,6 +869,123 @@ impl WorkerPool {
             None => load_worker_history_in(&self.scratch, id).ok()?.owner,
         };
         Some(owner.map_or(WorkerOwner::Unattributed, WorkerOwner::Agent))
+    }
+
+    /// Resolve a caller-supplied worker reference among `owner`'s own workers.
+    ///
+    /// Accepts the full id, `last` (the caller's most recently dispatched
+    /// worker) and any unique prefix of at least [`MIN_WORKER_ID_PREFIX`]
+    /// characters. The search spans this process's records and the shared
+    /// registry but never leaves `owner`: another agent's worker is not a
+    /// candidate, so a prefix that only matches one is `NotFound` rather than
+    /// leaking its id. An exact id is taken as written whatever its owner,
+    /// because ownership is the verb's business -- its refusal names the
+    /// owning agent.
+    pub async fn lookup_worker_id(&self, needle: &str, owner: &str) -> WorkerIdLookup {
+        if needle == LAST_WORKER_ID {
+            return self
+                .last_dispatched_of(owner)
+                .await
+                .map_or(WorkerIdLookup::NotFound, WorkerIdLookup::Resolved);
+        }
+        // A prefix must never shadow a worker whose own id it exactly is.
+        if self.worker_owner(needle).await.is_some() {
+            return WorkerIdLookup::Resolved(needle.to_string());
+        }
+        if needle.chars().count() < MIN_WORKER_ID_PREFIX {
+            return WorkerIdLookup::NotFound;
+        }
+        let mut matched: Vec<String> = self
+            .owned_worker_ids(owner)
+            .await
+            .into_iter()
+            .filter(|id| id.starts_with(needle))
+            .collect();
+        matched.sort();
+        matched.dedup();
+        match matched.len() {
+            0 => WorkerIdLookup::NotFound,
+            1 => WorkerIdLookup::Resolved(matched.remove(0)),
+            _ => WorkerIdLookup::Ambiguous(matched),
+        }
+    }
+
+    /// [`Self::lookup_worker_id`], refusing an ambiguous prefix with a message
+    /// that lists only the caller's matching ids.
+    ///
+    /// One implementation for every caller that takes an id -- the MCP verbs
+    /// and the `hub/watch` route the CLI uses -- so a prefix or `last` means
+    /// the same thing everywhere.
+    pub async fn resolve_worker_id(&self, needle: &str, owner: &str) -> Result<String> {
+        match self.lookup_worker_id(needle, owner).await {
+            WorkerIdLookup::Resolved(id) => Ok(id),
+            // Nothing of the caller's matches: pass the needle through so the
+            // verb keeps its own "not found" answer.
+            WorkerIdLookup::NotFound => Ok(needle.to_string()),
+            WorkerIdLookup::Ambiguous(ids) => anyhow::bail!(
+                "worker id '{needle}' is ambiguous: matches {}",
+                ids.join(", ")
+            ),
+        }
+    }
+
+    /// Ids of every worker `owner` dispatched, in this process and the registry.
+    async fn owned_worker_ids(&self, owner: &str) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for worker in self.workers.read().await.values() {
+            if worker.owner == owner && seen.insert(worker.id.clone()) {
+                ids.push(worker.id.clone());
+            }
+        }
+        for entry in load_all_registry_entries_in(&self.scratch) {
+            if entry.owner.as_deref() == Some(owner) && seen.insert(entry.id.clone()) {
+                ids.push(entry.id);
+            }
+        }
+        ids
+    }
+
+    /// `owner`'s most recently dispatched worker.
+    ///
+    /// The in-process dispatch ordinal decides between workers that share a
+    /// whole-second `started_at`; a registry-only row (a worker this process
+    /// never dispatched, e.g. after a hub restart) falls back to its
+    /// `started_at`.
+    async fn last_dispatched_of(&self, owner: &str) -> Option<String> {
+        let own: Vec<String> = self
+            .workers
+            .read()
+            .await
+            .values()
+            .filter(|worker| worker.owner == owner)
+            .map(|worker| worker.id.clone())
+            .collect();
+        let entries = load_all_registry_entries_in(&self.scratch);
+        let started_at: HashMap<&str, u64> = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.started_at))
+            .collect();
+        let ordinals = self
+            .dispatch_order
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut best: Option<(u64, u64, String)> = None;
+        let registry_ids = entries
+            .iter()
+            .filter(|entry| entry.owner.as_deref() == Some(owner))
+            .map(|entry| &entry.id);
+        for id in own.iter().chain(registry_ids) {
+            let key = (
+                started_at.get(id.as_str()).copied().unwrap_or(0),
+                ordinals.get(id).copied().unwrap_or(0),
+                id.clone(),
+            );
+            if best.as_ref().is_none_or(|current| &key > current) {
+                best = Some(key);
+            }
+        }
+        best.map(|(_, _, id)| id)
     }
 
     /// Ids of `owner`'s still-running workers, used to report a per-agent cap.

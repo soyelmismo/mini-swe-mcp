@@ -17,7 +17,7 @@ use super::{HubPaths, hub_dir};
 /// Racing starters are serialized by the daemon's exclusive flock.
 pub async fn connect_or_spawn() -> Result<UnixStream> {
     let paths = HubPaths::new(hub_dir()?);
-    if let Ok(stream) = UnixStream::connect(paths.socket()).await {
+    if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
     let log = std::fs::OpenOptions::new()
@@ -52,7 +52,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(20);
     loop {
-        match UnixStream::connect(paths.socket()).await {
+        match super::daemon::connect_endpoint(&paths.endpoint()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
