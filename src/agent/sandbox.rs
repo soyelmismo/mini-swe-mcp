@@ -112,24 +112,423 @@ pub fn validate_bash_command(command: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// One build or test entry point of a supported ecosystem.
+///
+/// Matching is on the *program* word of a command segment, never on a
+/// substring of the whole command: `grep -rn 'cargo build' .` talks about a
+/// build without being one, and an agent grepping for build strings must not
+/// be dosed as if it were compiling.
+struct HeavyTool {
+    /// Program name, compared against a segment's first non-wrapper word.
+    program: &'static str,
+    /// Subcommand words that make an invocation heavy; empty means every
+    /// invocation is heavy, for tools with no light mode worth separating.
+    subcommands: &'static [&'static str],
+}
+
+/// Build and test entry points of the major ecosystems.
+///
+/// A tool whose every invocation compiles or tests (`cargo`, `make`, `tsc`,
+/// `gradle`) lists no subcommands. A tool with read-only subcommands lists the
+/// heavy ones, so `npm ls`, `go env` and `pip list` stay on the light budget.
+/// Multi-word entries (`"pip install"`, `"mod download"`) match a run of
+/// arguments, which is what keeps `uv pip list` light while `uv pip install`
+/// is dosed.
+const HEAVY_TOOLS: &[HeavyTool] = &[
+    HeavyTool {
+        program: "cargo",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "rustc",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "make",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "gmake",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "cmake",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "ninja",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "meson",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "bazel",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "bazelisk",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "gcc",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "g++",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "cc",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "c++",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "clang",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "clang++",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "npm",
+        subcommands: &[
+            "run",
+            "run-script",
+            "test",
+            "t",
+            "ci",
+            "install",
+            "i",
+            "add",
+            "rebuild",
+            "publish",
+            "pack",
+            "link",
+            "update",
+            "prune",
+            "dedupe",
+            "exec",
+        ],
+    },
+    HeavyTool {
+        program: "pnpm",
+        subcommands: &[
+            "run", "test", "install", "i", "add", "rebuild", "build", "update", "up", "publish",
+            "pack", "link", "prune", "dedupe", "exec", "dlx",
+        ],
+    },
+    HeavyTool {
+        program: "yarn",
+        subcommands: &[
+            "run", "test", "install", "add", "rebuild", "build", "upgrade", "up", "publish",
+            "pack", "link", "dlx", "exec", "create",
+        ],
+    },
+    HeavyTool {
+        program: "bun",
+        subcommands: &[
+            "run", "test", "install", "i", "add", "build", "rebuild", "update", "publish", "exec",
+            "x", "create",
+        ],
+    },
+    HeavyTool {
+        program: "deno",
+        subcommands: &[
+            "test", "compile", "bundle", "task", "run", "install", "cache", "check",
+        ],
+    },
+    HeavyTool {
+        program: "tsc",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "esbuild",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "webpack",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "vite",
+        subcommands: &["build", "test", "optimize", "preview"],
+    },
+    HeavyTool {
+        program: "rollup",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "jest",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "vitest",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "playwright",
+        subcommands: &["test", "install"],
+    },
+    HeavyTool {
+        program: "cypress",
+        subcommands: &["run", "install"],
+    },
+    HeavyTool {
+        program: "nx",
+        subcommands: &["build", "test", "run", "affected"],
+    },
+    HeavyTool {
+        program: "turbo",
+        subcommands: &["build", "test", "run"],
+    },
+    HeavyTool {
+        program: "pytest",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "tox",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "nox",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "pip",
+        subcommands: &["install", "wheel", "download"],
+    },
+    HeavyTool {
+        program: "pip3",
+        subcommands: &["install", "wheel", "download"],
+    },
+    HeavyTool {
+        program: "uv",
+        subcommands: &[
+            "sync",
+            "lock",
+            "build",
+            "run",
+            "pip install",
+            "pip sync",
+            "pip download",
+            "tool install",
+            "tool run",
+            "python install",
+        ],
+    },
+    HeavyTool {
+        program: "poetry",
+        subcommands: &[
+            "install", "add", "update", "lock", "build", "publish", "run",
+        ],
+    },
+    HeavyTool {
+        program: "pipenv",
+        subcommands: &["install", "add", "update", "lock", "sync", "run"],
+    },
+    HeavyTool {
+        program: "conda",
+        subcommands: &[
+            "install",
+            "create",
+            "update",
+            "build",
+            "run",
+            "env create",
+            "env update",
+        ],
+    },
+    HeavyTool {
+        program: "go",
+        subcommands: &[
+            "build",
+            "test",
+            "install",
+            "run",
+            "generate",
+            "vet",
+            "mod download",
+            "mod tidy",
+            "mod verify",
+            "work sync",
+        ],
+    },
+    HeavyTool {
+        program: "mvn",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "gradle",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "gradlew",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "mvnw",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "sbt",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "ant",
+        subcommands: &[],
+    },
+    HeavyTool {
+        program: "dotnet",
+        subcommands: &[
+            "build", "test", "publish", "pack", "restore", "run", "clean", "vstest", "msbuild",
+        ],
+    },
+    HeavyTool {
+        program: "msbuild",
+        subcommands: &[],
+    },
+];
+
+/// `python -m <module>` entry points that build, install or test.
+///
+/// Matched against the words *after* `-m`, so `python -m pip list` stays light
+/// while `python -m pip install` and `python -m build` are dosed.
+const PYTHON_MODULE_COMMANDS: &[&str] = &[
+    "build",
+    "pip install",
+    "pip wheel",
+    "pip download",
+    "pytest",
+    "tox",
+    "nox",
+    "unittest",
+    "compileall",
+    "sphinx",
+    "twine",
+    "maturin",
+    "cython",
+];
+
+/// `make` flags that only report or dry-run, never build.
+const MAKE_LIGHT_FLAGS: &[&str] = &[
+    "--version",
+    "--help",
+    "-h",
+    "--dry-run",
+    "-n",
+    "--question",
+    "-q",
+    "--print-data-base",
+    "-p",
+];
+
+/// Words that only wrap the real command, skipped when resolving its program.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "sudo", "nice", "env", "time", "command", "exec", "nohup", "stdbuf", "ionice", "watch", "npx",
+    "bunx", "pnpx",
+];
+
 /// True for CPU-heavy commands (builds, test runners) vs lightweight ones.
+///
+/// Pure and table-driven: the command is split on shell operators, each
+/// segment's program is resolved past wrappers and `VAR=value` assignments,
+/// and the answer is a lookup in [`HEAVY_TOOLS`]. No environment or
+/// filesystem access, so the classification is deterministic and testable.
 pub fn is_heavy_command(command: &str) -> bool {
-    let lower = command.to_lowercase();
-    if lower.starts_with("cargo") || lower.contains("cargo ") || lower.contains("cargo\t") {
-        return true;
+    command.split(['\n', ';', '|', '&']).any(segment_is_heavy)
+}
+
+/// Whether one operator-free command segment is heavy.
+fn segment_is_heavy(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    let Some(program) = program_word(&mut words) else {
+        return false;
+    };
+    let args: Vec<&str> = words.collect();
+
+    if let Some(tool) = HEAVY_TOOLS.iter().find(|tool| tool.program == program) {
+        // `make` builds by default, but `--version`, `-n` and friends never
+        // build: any invocation carrying one of those flags is light.
+        if tool.program == "make" || tool.program == "gmake" {
+            return args.is_empty() || !args.iter().any(|arg| MAKE_LIGHT_FLAGS.contains(arg));
+        }
+        if tool.subcommands.is_empty() || matches_subcommand(&args, tool.subcommands) {
+            return true;
+        }
     }
-    if lower == "make"
-        || lower.starts_with("make ")
-        || lower.contains(" make ")
-        || lower.contains(" make\t")
+
+    // `python -m pytest` / `python -m pip install`: the module is the entry
+    // point, so the words after `-m` carry the subcommand.
+    if matches!(program, "python" | "python2" | "python3" | "py")
+        && let Some(rest) = words_after_flag(&args, "-m")
     {
-        return true;
+        return matches_subcommand(rest, PYTHON_MODULE_COMMANDS);
     }
-    const HEAVY_PATTERNS: &[&str] = &[
-        "rustc", "pytest", "unittest", "cmake", "ninja", "gcc", "g++", "clang", "npm ", "yarn ",
-        "pnpm ", "mvn ", "gradle", "go test", "go build",
-    ];
-    HEAVY_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+
+    // `bash -c 'cargo build'`: the script is the command, so classify it. The
+    // script word keeps the caller's quoting, which the classifier ignores.
+    if matches!(program, "bash" | "sh" | "dash" | "zsh" | "ksh")
+        && let Some(script) = words_after_flag(&args, "-c").and_then(|rest| rest.first())
+    {
+        return is_heavy_command(script.trim_matches(|c| c == '\'' || c == '"'));
+    }
+
+    false
+}
+
+/// The program word of a segment: wrappers, flags and `VAR=value`
+/// assignments are skipped, and a leading directory is dropped so `./gradlew`
+/// and `/usr/bin/go` match the table.
+fn program_word<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    words.find_map(|word| {
+        // A bare number is a flag value (`nice -n 10`), never a program.
+        let is_flag_value = !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+        if COMMAND_WRAPPERS.contains(&word)
+            || word.starts_with('-')
+            || is_flag_value
+            || is_env_assignment(word)
+        {
+            None
+        } else {
+            Some(basename(word))
+        }
+    })
+}
+
+/// A `VAR=value` assignment, which only sets up the environment for a command.
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
+/// Program name without any leading directory components.
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// Whether `args` contains one of `subcommands` as a contiguous run of words.
+fn matches_subcommand(args: &[&str], subcommands: &[&str]) -> bool {
+    subcommands.iter().any(|subcommand| {
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        !words.is_empty()
+            && args
+                .windows(words.len())
+                .any(|window| window == words.as_slice())
+    })
+}
+
+/// The words following `flag` in `args`, when the flag is present.
+fn words_after_flag<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a [&'a str]> {
+    args.iter()
+        .position(|word| *word == flag)
+        .map(|at| &args[at + 1..])
 }
 
 /// Whether a binary is available on this host, probed once per name.
@@ -201,6 +600,29 @@ const READ_ONLY_SYSTEM_PATHS: &[&str] =
 /// Denied by omission (no rule ever covers them); kept explicit so the intent
 /// is testable rather than emergent.
 const DENIED_HOME_SUBDIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".gpg", ".kube", ".docker"];
+
+/// Credential files that live *next to* a shared cache and must stay
+/// unreadable even when the cache beside them is granted.
+///
+/// The shared caches point at `SWE_CACHE_DIR`, never at the operator's home,
+/// so these are unreachable by omission; the explicit list keeps that property
+/// testable and stops a future broad rule from granting them by accident.
+/// `SWE_ALLOW_TOOLCHAIN_CREDENTIALS=1` is the operator's opt-in.
+const DENIED_CREDENTIAL_FILES: &[&str] = &[
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".netrc",
+    ".pypirc",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".cargo/credentials.toml",
+    ".cargo/credentials",
+];
+
+/// Environment variable that opts an operator into exposing the credential
+/// files listed in [`DENIED_CREDENTIAL_FILES`].
+const ALLOW_CREDENTIALS_ENV: &str = "SWE_ALLOW_TOOLCHAIN_CREDENTIALS";
 
 /// Absolute system paths that must never be reachable, even read-only.
 const DENIED_ABSOLUTE_PATHS: &[&str] = &["/root", "/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
@@ -457,10 +879,16 @@ fn home_dir() -> Option<PathBuf> {
 /// handled rights deny them. An explicit, testable list stops a broad prefix
 /// rule from silently granting them by accident.
 fn denied_paths() -> Vec<PathBuf> {
-    let mut denied = Vec::with_capacity(DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len());
+    let mut denied = Vec::with_capacity(
+        DENIED_ABSOLUTE_PATHS.len() + DENIED_HOME_SUBDIRS.len() + DENIED_CREDENTIAL_FILES.len(),
+    );
     denied.extend(DENIED_ABSOLUTE_PATHS.iter().map(PathBuf::from));
     if let Some(home) = home_dir() {
         denied.extend(DENIED_HOME_SUBDIRS.iter().map(|d| home.join(d)));
+        // Credential files stay denied unless the operator opted in.
+        if std::env::var_os(ALLOW_CREDENTIALS_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            denied.extend(DENIED_CREDENTIAL_FILES.iter().map(|f| home.join(f)));
+        }
     }
     denied
 }
@@ -603,8 +1031,11 @@ fn build_path_rules(worktree: &Path, target_dir: &Path) -> Vec<PathRule> {
     }
 
     // Shared compiler/package caches, writable like the bubblewrap backend
-    // binds them: `GOCACHE`, the JS/Python caches and friends live here and
-    // must accept writes for builds to succeed.
+    // binds them: `GOCACHE`, `GOMODCACHE`, the JS/Python caches, the Maven
+    // local repository and the Gradle user home all live here and must accept
+    // writes for builds to succeed. Every one of them sits under the shared
+    // cache root, so one rule covers them all and a cache directory is never
+    // granted next to a credential file.
     for cache in writable_cache_paths() {
         push(cache, WRITE_RIGHTS);
     }
@@ -1092,22 +1523,231 @@ mod tests {
 
     #[test]
     fn test_is_heavy_command() {
-        assert!(is_heavy_command("cargo build"));
-        assert!(is_heavy_command("cargo test --all"));
-        assert!(is_heavy_command("cargo"));
-        assert!(is_heavy_command("pytest tests/"));
-        assert!(is_heavy_command("make -j4"));
-        assert!(is_heavy_command("make"));
-        assert!(is_heavy_command("gcc -O3 main.c"));
+        // Rust, C/C++ and the portable build systems: every invocation builds.
+        for command in [
+            "cargo build",
+            "cargo test --all",
+            "cargo",
+            "rustc src/main.rs",
+            "make -j4",
+            "make",
+            "gmake check",
+            "cmake --build build",
+            "ninja -C build",
+            "meson compile -C build",
+            "bazel build //...",
+            "bazelisk test //...",
+            "gcc -O3 main.c",
+            "g++ -O2 main.cpp",
+            "cc -c foo.c",
+            "clang --version",
+            "tsc",
+            "tsc --noEmit",
+            "esbuild src/index.ts --bundle",
+            "webpack",
+            "rollup -c",
+            "jest",
+            "vitest run",
+            "pytest tests/",
+            "tox",
+            "nox -s tests",
+            "mvn -q test",
+            "mvnw verify",
+            "gradle build",
+            "gradlew test",
+            "./gradlew test",
+            "sbt test",
+            "ant test",
+            "msbuild solution.sln",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
 
-        assert!(!is_heavy_command("git status"));
-        assert!(!is_heavy_command("git diff HEAD"));
-        assert!(!is_heavy_command("ls -la"));
-        assert!(!is_heavy_command("cat src/agent.rs"));
-        assert!(!is_heavy_command("find . -name '*.rs'"));
-        assert!(!is_heavy_command(
-            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-        ));
+        // Node, Python, Go and .NET: only the build/test/install verbs.
+        for command in [
+            "npm run build",
+            "npm test",
+            "npm ci",
+            "npm install",
+            "npm rebuild",
+            "pnpm run build",
+            "pnpm install",
+            "pnpm build",
+            "yarn run build",
+            "yarn install",
+            "yarn build",
+            "bun run build",
+            "bun test",
+            "bun install",
+            "bun build ./index.tsx",
+            "deno test",
+            "deno task build",
+            "deno compile main.ts",
+            "vite build",
+            "playwright test",
+            "cypress run",
+            "nx run app:build",
+            "turbo run build",
+            "pip install -r requirements.txt",
+            "pip wheel .",
+            "pip3 install requests",
+            "uv sync",
+            "uv run pytest",
+            "uv pip install -r requirements.txt",
+            "poetry install",
+            "poetry build",
+            "pipenv install",
+            "conda install numpy",
+            "conda env create -f env.yml",
+            "go build ./...",
+            "go test ./...",
+            "go run ./cmd/server",
+            "go vet ./...",
+            "go mod download",
+            "go mod tidy",
+            "/usr/bin/go build ./...",
+            "dotnet build",
+            "dotnet test",
+            "dotnet publish",
+            "dotnet run",
+            "python -m build",
+            "python -m pip install .",
+            "python -m pytest",
+            "python -m unittest",
+            "python3 -m pip install requests",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
+
+        // Composition: operators, wrappers and env assignments must not hide
+        // a build, and a quoted script is classified by its content.
+        for command in [
+            "cd src && cargo test",
+            "RUST_BACKTRACE=1 cargo test",
+            "sudo make install",
+            "nice -n 10 go test ./...",
+            "npx tsc --noEmit",
+            "bash -c 'cargo build'",
+            "echo done && npm run build",
+            "go test ./... | tail -5",
+        ] {
+            assert!(is_heavy_command(command), "{command} must be heavy");
+        }
+
+        // Read-only commands stay on the light budget, even when they name a
+        // tool that also builds or mention a build in their arguments.
+        for command in [
+            "git status",
+            "git diff HEAD",
+            "ls -la",
+            "cat src/agent.rs",
+            "cat package.json",
+            "find . -name '*.rs'",
+            "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "npm ls",
+            "npm list",
+            "npm --version",
+            "npm view react version",
+            "pnpm list",
+            "yarn --version",
+            "yarn list",
+            "yarn why react",
+            "bun --version",
+            "deno lint",
+            "deno fmt --check",
+            "vite --version",
+            "pip list",
+            "pip show requests",
+            "pip freeze",
+            "uv pip list",
+            "poetry show",
+            "conda list",
+            "conda info",
+            "go env",
+            "go list ./...",
+            "go version",
+            "go fmt ./...",
+            "dotnet --info",
+            "dotnet list package",
+            "python -m pip list",
+            "python --version",
+            "grep -rn 'cargo build' .",
+            "echo cargo build",
+            "echo 'go test'",
+            "make --version",
+            "make -n build",
+        ] {
+            assert!(!is_heavy_command(command), "{command} must be light");
+        }
+
+        assert!(!is_heavy_command(""));
+        assert!(!is_heavy_command("   "));
+    }
+
+    /// Every shared ecosystem cache the child environment points at is
+    /// writable in the Landlock plan, and no rule covers a credential file
+    /// that lives beside one of them.
+    #[test]
+    fn the_plan_grants_the_shared_caches_and_denies_their_credentials() {
+        let worktree = std::env::temp_dir().join("swe-plan-cache-test-worktree");
+        let target = std::env::temp_dir().join("swe-plan-cache-test-target");
+        let _ = std::fs::create_dir_all(&worktree);
+        let _ = std::fs::create_dir_all(&target);
+        let rules = build_path_rules(&worktree, &target);
+
+        // Each ecosystem cache is writable: some granted rule is a prefix of
+        // it, which is what a shared cache root grant provides.
+        let dirs = crate::cache::CacheDirs::new();
+        for cache in [
+            &dirs.npm,
+            &dirs.yarn,
+            &dirs.pnpm_home,
+            &dirs.pnpm_store,
+            &dirs.pip,
+            &dirs.uv,
+            &dirs.go_build,
+            &dirs.go_mod,
+            &dirs.maven,
+            &dirs.gradle,
+        ] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| rule.allowed & ACCESS_FS_WRITE_FILE != 0
+                        && cache.starts_with(&rule.path)),
+                "{} must be writable in the plan",
+                cache.display()
+            );
+        }
+
+        // The credential files that live next to those caches stay denied.
+        let denied = denied_paths();
+        let home = home_dir().expect("tests run with a discoverable $HOME");
+        for credential in [
+            ".npmrc",
+            ".yarnrc",
+            ".netrc",
+            ".pypirc",
+            ".m2/settings.xml",
+            ".gradle/gradle.properties",
+            ".cargo/credentials.toml",
+        ] {
+            let path = home.join(credential);
+            assert!(
+                denied.contains(&path),
+                "{} must be on the deny list",
+                path.display()
+            );
+            assert!(
+                !rules
+                    .iter()
+                    .any(|rule| rule.path == path || rule.path.starts_with(&path)),
+                "{} must never be granted",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&worktree);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]
@@ -1716,9 +2356,16 @@ mod tests {
             out.status.success(),
             "enforcement mode failed\nstdout: {stdout}\nstderr: {stderr}"
         );
+        // The child's own `println!` lands after libtest's unterminated
+        // "test <name> ... " prefix, so the marker is searched for inside the
+        // line rather than anchored at its start.
         for line in stdout.lines() {
-            if let Some(rest) = line.strip_prefix("RESULT ") {
-                assert_eq!(rest, "OK", "landlock enforcement check reported: {rest}");
+            if let Some(rest) = line.split("RESULT ").nth(1) {
+                assert_eq!(
+                    rest.trim_end(),
+                    "OK",
+                    "landlock enforcement check reported: {rest}"
+                );
                 return;
             }
         }
