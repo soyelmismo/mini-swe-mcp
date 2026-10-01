@@ -580,19 +580,16 @@ impl AckStore {
     fn record(&mut self, owner: &str, wid: &str, revision: u64, event: &str) {
         self.clock += 1;
         let recency = self.clock;
-        self.positions
-            .entry(owner.to_string())
-            .or_default()
-            .insert(
-                wid.to_string(),
-                AckEntry {
-                    position: AckPosition {
-                        revision,
-                        event: event.to_string(),
-                    },
-                    recency,
+        self.positions.entry(owner.to_string()).or_default().insert(
+            wid.to_string(),
+            AckEntry {
+                position: AckPosition {
+                    revision,
+                    event: event.to_string(),
                 },
-            );
+                recency,
+            },
+        );
         self.trim();
         self.persist();
     }
@@ -1275,11 +1272,7 @@ fn branch_replay_suppressed(entry: &WorkerRegistryEntry) -> bool {
     if branch_gone {
         return true;
     }
-    let Some(base) = entry
-        .base_branch
-        .as_deref()
-        .filter(|base| !base.is_empty())
-    else {
+    let Some(base) = entry.base_branch.as_deref().filter(|base| !base.is_empty()) else {
         return false;
     };
     // Only a successful ancestry check proves the branch landed in the
@@ -1737,6 +1730,100 @@ mod watch_stall_regression_tests {
         assert_eq!(router.watch_history["owner"].cursor, sequence);
         let second = router.watch_reply(&ctx, &params).unwrap();
         assert!(second["events"].as_array().unwrap().is_empty(), "{second}");
+    }
+
+    /// A terminal worker whose repository cannot be probed is never
+    /// suppressed: the suppression contract requires *proof* that the
+    /// branch is gone or merged, so a failed probe (here `128`, not a
+    /// repository) leaves the event visible. This is the regression
+    /// guard against treating any git failure as "branch gone".
+    #[test]
+    fn terminal_event_with_unprobeable_repo_is_not_suppressed() {
+        // A completed worker whose `repo_path` is a plain directory,
+        // so neither `show-ref` nor `merge-base` can run as a probe.
+        let dir =
+            std::env::temp_dir().join(format!("mcp-events-unprobeable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        let mut row = crate::pool::WorkerRegistryEntry::test_row("w-unprobe", "owner");
+        row.status = crate::pool::RegistryStatus::Completed;
+        row.repo_path = Some(dir.to_string_lossy().into_owned());
+        row.base_branch = Some("main".into());
+        assert!(
+            !branch_replay_suppressed(&row),
+            "an unprobeable repository must not suppress the event"
+        );
+        let _ = std::fs::remove_dir(&dir);
+
+        // The same row, observed, must produce a replayable event.
+        let mut view = crate::cli::watch::registry_snapshot(&row, crate::pool::unix_timestamp());
+        view["branch"] = json!("worker-w-unprobe");
+        let mut router = EventRouter::default();
+        router.observe_watch([("w-unprobe".into(), view)].into());
+        let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let reply = router
+            .watch_reply(&ctx, &json!({"worker_ids":["w-unprobe"], "initial":true}))
+            .unwrap();
+        let ids: Vec<&str> = reply["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["worker_id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"w-unprobe"),
+            "the terminal event must stay visible: {reply}"
+        );
+    }
+
+    /// Eviction keeps the store bounded by recency, not by key order:
+    /// the least recently acknowledged worker is the one dropped, and
+    /// a re-acknowledged stale key survives over a never-reacked newer one.
+    #[test]
+    fn ack_store_evicts_least_recently_acknowledged() {
+        let mut store = AckStore::default();
+        // Fill one owner past the per-owner bound with distinct keys.
+        let total = MAX_ACK_WORKERS + 10;
+        for i in 0..total {
+            store.record("owner", &format!("w-{i:05}"), 1, "completed");
+        }
+        assert_eq!(
+            store.positions["owner"].len(),
+            MAX_ACK_WORKERS,
+            "the per-owner store must stay bounded"
+        );
+        // The first ten keys were the least recently acknowledged, so
+        // they are the evicted ones; the newest keys survive.
+        for i in 0..10 {
+            assert!(
+                !store.acknowledged("owner", &format!("w-{i:05}"), 1, "completed"),
+                "the least recently acknowledged key {i} must be evicted"
+            );
+        }
+        // Re-acknowledging an evicted key makes it the most recent, so
+        // it survives while the (now) least recent are dropped.
+        store.record("owner", "w-00000", 1, "completed");
+        assert!(
+            store.acknowledged("owner", "w-00000", 1, "completed"),
+            "a re-acknowledged key is the most recent and must survive"
+        );
+        // The owner bound is exercised through the same clock.
+        let mut store = AckStore::default();
+        for i in 0..(MAX_ACK_OWNERS + 5) {
+            store.record(&format!("owner-{i:05}"), "w", 1, "completed");
+        }
+        assert_eq!(
+            store.positions.len(),
+            MAX_ACK_OWNERS,
+            "the owner store must stay bounded"
+        );
+        // The first owners were acknowledged least recently.
+        assert!(!store.positions.contains_key("owner-00000"));
+        assert!(
+            store
+                .positions
+                .contains_key(&format!("owner-{:05}", MAX_ACK_OWNERS + 4))
+        );
     }
 
     #[test]
