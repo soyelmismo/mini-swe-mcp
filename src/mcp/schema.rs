@@ -125,7 +125,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "worker_ids",
         "array",
         DescriptionSource::Static(
-            "Worker IDs to watch; each accepts the same prefixes and 'last' as 'worker_id'. Omitted watches every worker you own.",
+            "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches every worker you own.",
         ),
     ),
     (
@@ -146,7 +146,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "timeout_secs",
         "integer",
         DescriptionSource::Static(
-            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'} so you can call it again. Omit to wait indefinitely.",
+            "Deadline in seconds for the blocking 'watch' action; on expiry it returns {status:'no_event'}. Omit to wait indefinitely.",
         ),
     ),
     (
@@ -165,14 +165,14 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "review_after",
         "string",
         DescriptionSource::Static(
-            "Optional reviewer model (e.g. 'nerd') that audits and finalizes the worktree after implementation.",
+            "Optional reviewer model that audits and finalizes the worktree after implementation.",
         ),
     ),
     (
         "verify",
         "string",
         DescriptionSource::Static(
-            "Optional shell command run before a completion sentinel is honoured (e.g. 'cargo test'). Omit to auto-detect; pass an empty string to disable the gate.",
+            "Optional shell command run before a completion sentinel is honoured. Omit to auto-detect; pass an empty string to disable the gate.",
         ),
     ),
     (
@@ -202,9 +202,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "approved",
         "boolean",
-        DescriptionSource::Static(
-            "Merge every approved worker of the caller (optionally narrowed by 'group') with one              verify gate on the combined result. Optional for 'merge'.",
-        ),
+        DescriptionSource::Static("Merge every approved worker."),
     ),
     (
         "keep_branch",
