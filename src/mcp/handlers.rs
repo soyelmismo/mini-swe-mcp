@@ -204,6 +204,7 @@ impl McpServer {
             "steer" => self.handle_steer(args, token, tx, ctx).await,
             "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
+            "merge" => self.handle_merge(args, ctx).await,
             _ => anyhow::bail!("Unknown action or tool: {action}"),
         }
     }
@@ -893,6 +894,57 @@ impl McpServer {
         Ok(json!({
             "status": "pruned",
             "message": "Stale worktrees and dead worker branches cleaned up"
+        }))
+    }
+
+    /// `merge` action: land one finished worker's branch on its base branch.
+    ///
+    /// Owner-only, like every other per-worker verb. The whole sequence --
+    /// trial merge, dirty check, gate, real merge, cleanup -- is one blocking
+    /// unit in [`crate::pool::merge`], so it runs off the runtime thread and
+    /// answers with a single payload the CLI renders as one line.
+    async fn handle_merge(
+        &self,
+        args: &Value,
+        ctx: &super::server::ConnectionContext,
+    ) -> Result<Value> {
+        let wid = Self::get_worker_id(args, "merge")?;
+        self.require_owner(wid, ctx).await?;
+        // A worker this process owns carries its verify verdict in memory; a
+        // cross-process caller has only the on-disk row, which names none, and
+        // therefore re-runs the gate.
+        let verified = match self.pool.get_worker_state(wid).await {
+            Some(crate::pool::WorkerState::Completed { verified, .. }) => verified,
+            _ => None,
+        };
+        let keep_branch = args
+            .get("keep_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let root = self.pool.scratch_root().clone();
+        let worker_id = wid.to_string();
+        let report = tokio::task::spawn_blocking(move || {
+            crate::pool::merge_worker_in(
+                &root,
+                &crate::pool::MergeRequest {
+                    worker_id: &worker_id,
+                    verified,
+                    keep_branch,
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("merge task for worker {wid} failed: {e}"))??;
+        Ok(json!({
+            "worker_id": report.worker_id,
+            "branch": report.branch,
+            "base_branch": report.base_branch,
+            "repo_path": report.repo_path,
+            "commit": report.commit,
+            "gate": if report.gate_ran { "ran" } else { "skipped" },
+            "gate_command": report.gate_command,
+            "branch_deleted": report.branch_deleted,
+            "cleaned": report.cleaned,
         }))
     }
 }

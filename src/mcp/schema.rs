@@ -16,7 +16,7 @@ use crate::manifest::ModelManifest;
 /// "did you mean …?" hint reuses it. Adding a verb touches one constant.
 pub const WORKER_ACTIONS: &[&str] = &[
     "dispatch", "status", "steer", "watch", "collect", "logs", "list", "kill", "reap", "manifest",
-    "prune",
+    "prune", "merge",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -66,7 +66,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "action",
         "string",
         DescriptionSource::Static(
-            "Action to perform: 'dispatch' (spawn subagent; the reply carries 'watch_command', the exact shell command that waits on YOUR workers -- run it in the background, since a shell cannot know your session), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
+            "Action to perform: 'dispatch' (spawn subagent; the reply carries 'watch_command', the exact shell command that waits on YOUR workers -- run it in the background, since a shell cannot know your session), 'status' (check step & progress), 'steer' (correct a completed worker, or continue any stopped one -- failed, interrupted, killed -- on its own id and branch with its full context; never dispatch a replacement for a stopped worker), 'watch' (block until one of your workers produces an event -- completion, failure, a question, or a stall -- and replay the ones you missed; this action is only for agents with no shell, so prefer running `mini-swe-mcp watch` in the background, and as the fallback pass 'timeout_secs' below your host's tool deadline and call it again on 'no_event'), 'collect' (get final diff), 'logs' (inspect a live worker's bounded step history without collecting it), 'list' (list all workers), 'kill' (terminate worker), 'reap' (evict expired terminal worker records), 'manifest' (models catalog), 'prune' (clean stale worktrees), 'merge' (land a finished worker's branch on its recorded base branch: trial merge, verify gate on the merge result, merge --no-ff, then delete the branch and its leftovers; refuses while the worker runs, when the repository has another branch checked out, when a touched file is dirty, or when the merge conflicts -- in which case send the conflicts back with steer). A worker belongs to the agent that dispatched it: 'status', 'steer', 'kill', 'collect', 'logs', 'list' and 'watch' only ever see or act on your own workers; the admin override sees everything.",
         ),
     ),
     (
@@ -170,6 +170,13 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "string",
         DescriptionSource::Static(
             "Declarative network policy for the worker: 'offline' runs every bash step in an isolated network namespace with no egress (useful for pure refactor/analysis tasks), 'allow' keeps normal connectivity. Optional for 'dispatch' (default: 'allow').",
+        ),
+    ),
+    (
+        "keep_branch",
+        "boolean",
+        DescriptionSource::Static(
+            "Keep the worker branch after a successful merge instead of deleting it (the CLI's --no-delete). Optional for 'merge' (default: false).",
         ),
     ),
 ];

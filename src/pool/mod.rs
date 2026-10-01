@@ -14,6 +14,8 @@
 //! * [`clock`] — the shared wall-clock helper.
 //! * [`admission`] — resource-aware admission control for heavy commands,
 //!   replacing the fixed-width build semaphore.
+//! * [`merge`] — the one-command merge of a finished worker's branch into its
+//!   base branch, with the trial merge, the gate and the cleanup in one place.
 //!
 //! [`WorkerPool`] itself stays here: it owns the concurrency gates and the
 //! worker map, and every operation on them (dispatch, collect, steer, kill,
@@ -32,6 +34,7 @@ pub mod admission;
 mod buffer;
 mod clock;
 mod fair;
+pub mod merge;
 mod registry;
 pub mod revision;
 mod runner;
@@ -64,6 +67,7 @@ pub use self::revision::{
     load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
     remove_worker_history, remove_worker_history_in, save_worker_history, save_worker_history_in,
 };
+pub use self::merge::{MergeReport, MergeRequest, merge_worker, merge_worker_in};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{

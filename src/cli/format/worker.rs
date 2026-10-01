@@ -414,6 +414,46 @@ fn watch_command_line(val: &serde_json::Value) -> String {
     }
 }
 
+/// `merge`: one line naming the commit and what the cleanup reclaimed.
+///
+/// The gate is the part an operator wants to know about without reading a
+/// paragraph: whether it ran, or why it was skipped.
+pub fn format_merge(val: &serde_json::Value) -> String {
+    let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
+    let commit = val.get("commit").and_then(|v| v.as_str()).unwrap_or("");
+    let base = val
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("the base branch");
+    let branch = val.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+    let kept = !val
+        .get("branch_deleted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let gate = match val.get("gate").and_then(|v| v.as_str()) {
+        Some("skipped") => "gate skipped (branch already verified)",
+        _ => "gate passed",
+    };
+    let cleaned = val
+        .get("cleaned")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let mut out = format!("✓ Merged {branch} into {base} as {commit} ({gate}).");
+    if kept {
+        out.push_str(&format!(" Branch {branch} kept."));
+    } else if !cleaned.is_empty() {
+        out.push_str(&format!(" Cleaned: {cleaned}."));
+    }
+    out.push_str(&format!(" Worker {wid} merged."));
+    out
+}
+
 pub fn format_kill(val: &serde_json::Value) -> String {
     let wid = val.get("worker_id").and_then(|v| v.as_str()).unwrap_or("");
     let killed = val.get("killed").and_then(|v| v.as_bool()).unwrap_or(false);
