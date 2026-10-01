@@ -10,17 +10,24 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::net::UnixStream;
 
 use super::daemon::hub_lock_held;
+use super::exe_path;
 use super::identity;
 use super::{HubPaths, hub_dir};
 
 /// Dial the hub, starting a detached daemon if none is listening.
 /// Racing starters are serialized by the daemon's exclusive flock.
+///
+/// The daemon is this executable, through [`exe_path::executable`]: a `cargo
+/// build` under the client's feet leaves `current_exe()` marked ` (deleted)`,
+/// and starting that string is the `No such file or directory` the client
+/// would otherwise report.
 pub async fn connect_or_spawn() -> Result<UnixStream> {
     let paths = HubPaths::new(hub_dir()?);
     if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
-    spawn_daemon(&paths, &std::env::current_exe()?)?;
+    let exe = exe_path::executable()?;
+    spawn_daemon(&paths, &exe)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(20);
@@ -38,6 +45,10 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
 }
 
 /// Start a detached daemon; both auto-start and handover use this path.
+///
+/// `exe` is resolved by the caller through [`exe_path::executable`] (or the
+/// same helper on a path the daemon is already known to run), so no caller has
+/// to remember that a replaced binary is reported as ` (deleted)`.
 pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()> {
     let log = std::fs::OpenOptions::new()
         .create(true)

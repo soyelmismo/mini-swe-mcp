@@ -14,7 +14,8 @@
 //! either. [`executable`] therefore waits a bounded while for the path to come
 //! back, and only then says which executable it could not find.
 
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// The kernel's marker for a `/proc/self/exe` whose inode no longer has a name.
@@ -36,33 +37,42 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// strip. The result is not required to exist: the binary may genuinely be
 /// gone, which [`executable`] turns into a readable error.
 pub fn current_exe_path() -> Option<PathBuf> {
-    strip_deleted(std::env::current_exe().ok()?)
+    let exe = std::env::current_exe().ok()?;
+    Some(strip_deleted(exe))
 }
 
 /// The path a client or handover should run to start a hub, waiting out a
 /// build that is mid-replace.
 ///
-/// Unlike [`current_exe_path`] this requires the stripped path to be a file:
-/// that is the difference between a client that starts the hub and one whose
-/// `spawn(2)` fails with `No such file or directory (os error 2)`.
-pub fn executable() -> Result<PathBuf, String> {
-    let path =
-        current_exe_path().ok_or_else(|| "Could not read this process's own path".to_string())?;
-    await_executable(path, WAIT_FOR_REPLACEMENT)
+/// Unlike [`current_exe_path`] this requires the path to be a file: that is the
+/// difference between a client that starts the hub and one whose `spawn(2)`
+/// fails with `No such file or directory (os error 2)`.
+pub fn executable() -> Result<PathBuf> {
+    let path = current_exe_path().ok_or_else(|| {
+        anyhow::anyhow!("Could not read this process's own path to start the hub daemon")
+    })?;
+    executable_from(path)
+}
+
+/// [`executable`] for a path the caller already has, so the rule that a spawn
+/// path is never a ` (deleted)` one lives in one place and can be exercised
+/// without a rebuilt process.
+pub fn executable_from(exe: PathBuf) -> Result<PathBuf> {
+    await_executable(strip_deleted(exe), WAIT_FOR_REPLACEMENT)
 }
 
 /// `path` once it names a file, polling for up to `wait`.
 ///
 /// A path that never appears is reported by name, so the failure says which
 /// executable is missing instead of leaking the raw `spawn(2)` error.
-fn await_executable(path: PathBuf, wait: Duration) -> Result<PathBuf, String> {
+fn await_executable(path: PathBuf, wait: Duration) -> Result<PathBuf> {
     let deadline = Instant::now() + wait;
     loop {
         if path.is_file() {
             return Ok(path);
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            return Err(anyhow::anyhow!(
                 "Hub daemon executable {} does not exist: a build replaced this binary and has not written the new one yet",
                 path.display()
             ));

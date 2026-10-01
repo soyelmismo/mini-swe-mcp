@@ -1,14 +1,21 @@
 //! The ` (deleted)` strip and the wait for a replacement.
 //!
 //! A rebuilt binary is the normal case for a long-lived daemon, so both are
-//! covered without spawning anything: a client that respawned the marked path
+//! covered without spawning a daemon: a client that respawned the marked path
 //! would fail with `No such file or directory (os error 2)`.
 
 use super::*;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::fs::PermissionsExt;
+
+/// The path the kernel reports for a binary a build already replaced, at the
+/// moment it holds: unlinked, marked, and not yet written again.
+fn marked(replacement: &std::path::Path) -> PathBuf {
+    PathBuf::from(OsString::from_vec(
+        format!("{} (deleted)", replacement.display()).into_bytes(),
+    ))
+}
 
 /// A `(deleted)` path is stripped to the path the build wrote over.
 #[test]
@@ -31,68 +38,70 @@ fn a_live_path_is_untouched() {
 
 /// The marker is stripped only from the end of the path, so a directory whose
 /// own name ends in ` (deleted)` keeps it and fails loudly instead of quietly
-/// pointing somewhere else.
+/// pointing at some other directory.
 #[test]
 fn the_suffix_is_only_stripped_from_the_end() {
     let odd = PathBuf::from("/tmp/build (deleted)/mini-swe-mcp");
     assert_eq!(strip_deleted(odd.clone()), odd);
 }
 
-/// A client whose exe path carries the suffix spawns from the stripped path,
-/// once the build has written it. The path is injected, which is the only way
-/// a test can present the kernel's view of a replaced binary.
+/// A client whose exe path carries the suffix spawns from the stripped path.
+/// The path is injected, which is the only way a test can present the kernel's
+/// view of a replaced binary, and the build lands mid-wait the way `cargo`
+/// writes the replacement in place.
 #[test]
 fn a_client_exe_path_carrying_the_suffix_spawns_from_the_stripped_path() {
     let scratch = std::env::temp_dir().join(format!("exe-path-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
     let replacement = scratch.join("mini-swe-mcp");
-    // Exactly what the kernel reports while cargo holds the gap between unlink
-    // and write: the file is gone and the marker says why.
-    let deleted = PathBuf::from(OsString::from_vec(
-        format!("{} (deleted)", replacement.display()).into_bytes(),
-    ));
+    let deleted = marked(&replacement);
 
-    let spawned = Arc::new(AtomicBool::new(false));
-    let seen = spawned.clone();
     let build = {
         let replacement = replacement.clone();
         std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
             std::fs::write(&replacement, b"#!/bin/sh\nexit 0\n").expect("write the replacement");
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700))
+                .expect("make the replacement executable");
         })
     };
-    // The same wait `connect_or_spawn` performs, with the spawn stand-in so the
-    // test observes the path instead of a detached daemon.
-    let waiter = std::thread::spawn({
-        let deleted = deleted.clone();
-        move || {
-            let path = await_executable(strip_deleted(deleted), WAIT_FOR_REPLACEMENT)
-                .expect("the replacement appears");
-            seen.store(true, Ordering::SeqCst);
-            path
-        }
-    });
+    // The same resolution `connect_or_spawn` performs, on the injected path.
+    let client = std::thread::spawn(move || executable_from(deleted));
+    let resolved = client
+        .join()
+        .expect("resolver thread")
+        .expect("the replacement appears");
     build.join().expect("build thread");
-    let path = waiter.join().expect("waiter thread");
 
     assert_eq!(
-        path, replacement,
+        resolved, replacement,
         "the spawn must use the live path, not the marked one"
     );
-    assert!(path.is_file());
+    // And the resolved path is what the client's `spawn(2)` gets, end to end:
+    // running the marked string instead is the ENOENT this fixes.
+    let started = std::process::Command::new(&resolved)
+        .arg("daemon")
+        .status()
+        .expect("the resolved path is executable");
+    assert!(started.success());
     assert!(
-        spawned.load(Ordering::SeqCst),
-        "the spawn happens once the file is there"
+        std::process::Command::new(format!("{} (deleted)", resolved.display()))
+            .arg("daemon")
+            .status()
+            .is_err(),
+        "the marked path is exactly what used to fail to spawn"
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
 
-/// A path that stays gone is named in the error, so the client can say what it
-/// could not start instead of reporting a bare `ENOENT`.
+/// A path that stays gone is named in the error, so the client can say which
+/// executable it could not start instead of reporting a bare `ENOENT`.
 #[test]
 fn a_path_that_never_appears_is_reported_by_name() {
     let missing = std::env::temp_dir().join(format!("exe-path-{}", uuid::Uuid::new_v4()));
     let error = await_executable(missing.clone(), Duration::from_millis(20))
-        .expect_err("a path that never appears cannot be spawned");
+        .expect_err("a path that never appears cannot be spawned")
+        .to_string();
     assert!(error.contains(&missing.display().to_string()), "{error}");
     assert!(error.contains("does not exist"), "{error}");
 }
