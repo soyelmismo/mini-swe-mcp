@@ -19,7 +19,7 @@ mod target;
 pub use dispatch::parse_batch_tasks;
 
 /// Dispatch usage line, shared by `--help` and the missing-task error.
-pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin)";
+pub const DISPATCH_USAGE: &str = "dispatch <task> | dispatch -f <tasks.yaml> [--model <model>] [--review-after <model>] [--repo <repo>] [--max-turns <n>] [--group <group>] [--role <role>] [--offline] [--verify <cmd>] [--quiet] (task: ONE focused concern, scoped files, acceptance gate; -f runs a YAML/JSON list, '-' reads stdin; --quiet prints only the worker id(s))";
 
 /// Consolidate usage line, shared by `--help` and the missing-group error.
 pub const CONSOLIDATE_USAGE: &str =
@@ -156,6 +156,24 @@ pub fn json_requested(raw_args: &[String]) -> bool {
 /// over the flag.
 pub fn strip_json_flag(raw_args: Vec<String>) -> Vec<String> {
     raw_args.into_iter().filter(|arg| arg != "--json").collect()
+}
+
+/// True when the operator asked for the bare worker ids instead of the
+/// human-facing dispatch view.
+///
+/// A script's usual reason to dispatch is the id, and `--json` would force it
+/// to carry a parser: `--quiet`/`-q` prints just the ids, one per line.
+pub fn quiet_requested(raw_args: &[String]) -> bool {
+    raw_args.iter().any(|arg| arg == "--quiet" || arg == "-q")
+}
+
+/// argv with the `--quiet` selector removed so positional parsing never trips
+/// over the flag.
+pub fn strip_quiet_flag(raw_args: Vec<String>) -> Vec<String> {
+    raw_args
+        .into_iter()
+        .filter(|arg| arg != "--quiet" && arg != "-q")
+        .collect()
 }
 
 /// True when the operator passed `--admin`.

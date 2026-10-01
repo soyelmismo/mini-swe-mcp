@@ -171,7 +171,7 @@ fn clean_merge_skips_the_gate_when_the_branch_is_already_verified() {
 
     // The merge commit is on main and carries the worker's credit.
     let subjects = git(f.repo(), &["log", "--format=%s", "-n", "1"]);
-    assert_eq!(subjects.trim(), "do the w1 work (worker w1)");
+    assert_eq!(subjects.trim(), "Merge worker-w1: do the w1 work");
     // The worker's file landed on the base branch.
     assert_eq!(
         std::fs::read_to_string(f.repo().join("worker.txt")).unwrap(),

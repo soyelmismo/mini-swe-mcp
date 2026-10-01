@@ -41,12 +41,16 @@ use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in}
 /// what broke; the head is almost always build noise.
 const GATE_TAIL_LINES: usize = 40;
 
-/// Longest merge subject accepted from a task's first line.
+/// Longest task excerpt a merge subject keeps.
 ///
-/// A task is prose, and `git log --oneline` is read at a glance; a subject that
-/// runs to a paragraph is truncated rather than dropped, so the message still
-/// names the work.
-const MAX_SUBJECT_BYTES: usize = 200;
+/// A task is prose, and `git log --oneline` is read at a glance; the subject
+/// keeps at most this many characters of the task's first line, so a
+/// consolidator's paragraph-length task cannot become a paragraph-length
+/// subject.
+const MAX_SUBJECT_TASK_CHARS: usize = 72;
+
+/// Marks the task excerpt of a clamped merge subject as shortened.
+const SUBJECT_ELLIPSIS: &str = "...";
 
 /// One merge request, resolved against one scratch root.
 pub struct MergeRequest<'a> {
@@ -658,20 +662,24 @@ fn tail(text: &str, lines: usize) -> String {
     )
 }
 
-/// The merge subject: the task's first line, credited to the worker.
+/// The merge subject: `Merge worker-<id>: <task first line clamped>`.
+///
+/// The worker is named first so `git log --oneline` reads as a stack of merges,
+/// and the task's first line is clamped to [`MAX_SUBJECT_TASK_CHARS`] so a
+/// paragraph-length task cannot produce a paragraph-length subject.
 fn merge_subject(task: &str, worker_id: &str) -> String {
     let first = task.lines().next().unwrap_or("").trim();
-    let subject = if first.is_empty() {
-        format!("worker {worker_id}")
-    } else if first.len() > MAX_SUBJECT_BYTES {
-        format!(
-            "{}...",
-            &first[..first.floor_char_boundary(MAX_SUBJECT_BYTES)]
-        )
+    if first.is_empty() {
+        return format!("Merge worker-{worker_id}");
+    }
+    let clamped = if first.chars().count() > MAX_SUBJECT_TASK_CHARS {
+        let keep = MAX_SUBJECT_TASK_CHARS - SUBJECT_ELLIPSIS.len();
+        let kept: String = first.chars().take(keep).collect();
+        format!("{}{SUBJECT_ELLIPSIS}", kept.trim_end())
     } else {
         first.to_string()
     };
-    format!("{subject} (worker {worker_id})")
+    format!("Merge worker-{worker_id}: {clamped}")
 }
 
 /// Post-merge cleanup: the worktree leftovers, the branch and the history file.
@@ -1183,5 +1191,58 @@ fn path_of(token: &str) -> &str {
         head
     } else {
         token
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The subject names the worker first and keeps the whole first task line
+    /// when it fits, so an ordinary merge is still readable at a glance.
+    #[test]
+    fn test_merge_subject_names_the_worker_and_keeps_a_short_task() {
+        assert_eq!(
+            merge_subject("do the w1 work\nignored detail", "w1"),
+            "Merge worker-w1: do the w1 work"
+        );
+        assert_eq!(
+            merge_subject("", "w9"),
+            "Merge worker-w9",
+            "an empty task still names the worker"
+        );
+    }
+
+    /// A paragraph-length task is clamped to `MAX_SUBJECT_TASK_CHARS` so the
+    /// merge subject stays one readable line.
+    #[test]
+    fn test_merge_subject_clamps_a_long_task_to_the_limit() {
+        let at_limit = "y".repeat(MAX_SUBJECT_TASK_CHARS);
+        assert_eq!(
+            merge_subject(&at_limit, "w2"),
+            format!("Merge worker-w2: {at_limit}"),
+            "a task exactly at the limit is kept whole"
+        );
+
+        let over = "x".repeat(MAX_SUBJECT_TASK_CHARS + 20);
+        let subject = merge_subject(&over, "w3");
+        let task = subject
+            .strip_prefix("Merge worker-w3: ")
+            .expect("the subject must name the worker");
+        assert_eq!(task.chars().count(), MAX_SUBJECT_TASK_CHARS, "{subject}");
+        assert!(task.ends_with(SUBJECT_ELLIPSIS), "{subject}");
+    }
+
+    /// Clamping never splits a multi-byte character.
+    #[test]
+    fn test_merge_subject_clamps_on_a_character_boundary() {
+        let over = "\u{e9}".repeat(MAX_SUBJECT_TASK_CHARS + 5);
+        let subject = merge_subject(&over, "w4");
+        let task = subject
+            .strip_prefix("Merge worker-w4: ")
+            .expect("the subject must name the worker");
+        assert_eq!(task.chars().count(), MAX_SUBJECT_TASK_CHARS, "{subject}");
+        assert!(task.ends_with(SUBJECT_ELLIPSIS), "{subject}");
     }
 }

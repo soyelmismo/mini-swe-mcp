@@ -25,7 +25,7 @@ mod status;
 mod steer;
 
 pub use collect::format_collect;
-pub use dispatch::format_dispatch;
+pub use dispatch::{format_dispatch, format_dispatch_quiet};
 pub use kill::format_kill;
 pub use logs::format_logs;
 pub use merge::format_merge;

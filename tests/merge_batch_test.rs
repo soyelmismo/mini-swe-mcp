@@ -247,9 +247,9 @@ fn three_approved_workers_merge_with_one_gate_run() {
     assert_eq!(
         f.merge_subjects(),
         vec![
-            "do the w3 work (worker w3)",
-            "do the w2 work (worker w2)",
-            "do the w1 work (worker w1)",
+            "Merge worker-w3: do the w3 work",
+            "Merge worker-w2: do the w2 work",
+            "Merge worker-w1: do the w1 work",
         ]
     );
     for id in ["w1", "w2", "w3"] {
@@ -536,7 +536,10 @@ fn approval_order_decides_the_merge_order() {
     assert_eq!(merged, vec!["w2", "w1"], "merged: {report:?}");
     assert_eq!(
         f.merge_subjects(),
-        vec!["do the w1 work (worker w1)", "do the w2 work (worker w2)",],
+        vec![
+            "Merge worker-w1: do the w1 work",
+            "Merge worker-w2: do the w2 work",
+        ],
         "the earliest approved worker's merge commit is the older one"
     );
 }
