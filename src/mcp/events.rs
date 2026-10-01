@@ -1436,9 +1436,11 @@ impl EventRouter {
             if !ctx.is_admin() && *agent != owner {
                 continue;
             }
-            history
-                .pending
-                .retain(|v| v["worker_id"].as_str().is_none_or(|id| !selected.contains(id)));
+            history.pending.retain(|v| {
+                v["worker_id"]
+                    .as_str()
+                    .is_none_or(|id| !selected.contains(id))
+            });
         }
         for id in &selected {
             if let Some(sequence) = self

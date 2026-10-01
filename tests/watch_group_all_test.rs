@@ -263,7 +263,9 @@ async fn one_round_event_after_the_last_worker_stops() {
     // The compact content is the one line per worker an orchestrator reads.
     assert_eq!(
         event["content"],
-        json!("w-1 completed verified:yes Fixed.\nw-2 completed verified:yes Fixed.\nw-3 completed verified:yes Fixed."),
+        json!(
+            "w-1 completed verified:yes Fixed.\nw-2 completed verified:yes Fixed.\nw-3 completed verified:yes Fixed."
+        ),
         "{event}"
     );
 
@@ -345,7 +347,6 @@ async fn a_reported_round_never_replays() {
     drop(harness.hub);
 }
 
-
 /// The MCP `watch` action reaches the same consolidated round through
 /// `all: true`, with no hub in between.
 #[tokio::test]
@@ -389,10 +390,11 @@ fn the_cli_all_flag_reports_a_stopped_group() {
     let hub = common::TempDir::new_in_tmp("watch-all-cli-hub");
     let swe = common::TempDir::new_in_tmp("watch-all-cli-swe");
     std::fs::create_dir_all(swe.path().join("swe-registry")).expect("registry dir");
-    let owner = OWNER;
     for id in ["w-1", "w-2", "w-3"] {
+        // A terminal row survives only with its worktree, so the round
+        // has its preserved branch to read the diff stat from.
         let row = format!(
-            r#"{{"id":"{id}","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"{owner}","group":"{GROUP}"}}"#,
+            r#"{{"id":"{id}","pid":{},"task":"t","model":"m","status":"completed","step":2,"max_turns":10,"last_command":"done","started_at":1,"updated_at":2,"owner":"{OWNER}","group":"{GROUP}"}}"#,
             std::process::id()
         );
         std::fs::write(
@@ -400,6 +402,8 @@ fn the_cli_all_flag_reports_a_stopped_group() {
             row,
         )
         .expect("row");
+        std::fs::create_dir_all(swe.path().join(format!("swe-wt-{id}")))
+            .expect("preserved worktree");
     }
 
     let output = common::binary_command(&exe)
@@ -439,7 +443,11 @@ fn the_cli_all_flag_reports_a_stopped_group() {
 /// every worker the caller owns.
 #[test]
 fn the_cli_all_flag_needs_a_group_or_ids() {
-    let args = ["mini-swe-mcp".to_string(), "watch".to_string(), "--all".to_string()];
+    let args = [
+        "mini-swe-mcp".to_string(),
+        "watch".to_string(),
+        "--all".to_string(),
+    ];
     let error = mini_swe_mcp::cli::watch::Options::parse(&args)
         .err()
         .expect("an unselective --all must be refused");

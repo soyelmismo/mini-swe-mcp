@@ -366,18 +366,21 @@ pub fn render_with(v: &Value, verbose: bool) -> String {
 /// One event body, without the heading a whole missed batch shares.
 fn render_event(v: &Value, verbose: bool) -> String {
     if v["event"] == ROUND_EVENT {
-        return v["content"].as_str().map(str::to_string).unwrap_or_else(|| {
-            v["workers"]
-                .as_array()
-                .map(|workers| {
-                    workers
-                        .iter()
-                        .map(render_round_line)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default()
-        });
+        return v["content"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                v["workers"]
+                    .as_array()
+                    .map(|workers| {
+                        workers
+                            .iter()
+                            .map(render_round_line)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            });
     }
     if verbose {
         return render_event_verbose(v);
@@ -706,9 +709,7 @@ fn round_outcome(v: &Value, now: u64) -> &'static str {
 /// failure reason, or the escalated question.
 fn round_done(v: &Value) -> Option<String> {
     match v["status"].as_str() {
-        Some("completed") => {
-            report_done(v).or_else(|| one_line(v["summary"].as_str()))
-        }
+        Some("completed") => report_done(v).or_else(|| one_line(v["summary"].as_str())),
         Some("failed") => one_line(v["error"].as_str()),
         Some("exhausted") => one_line(v["summary"].as_str()),
         Some("paused") => one_line(v["question"].as_str()),
