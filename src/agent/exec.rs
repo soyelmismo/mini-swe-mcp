@@ -3001,7 +3001,8 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
     /// The tree fingerprint the completion gate reuses a verify run on.
     mod fingerprint {
         use crate::agent::exec::tree_fingerprint;
-        use std::path::{Path, PathBuf};
+        use crate::test_support::TestScratch;
+        use std::path::Path;
 
         fn git(dir: &Path, args: &[&str]) {
             let out = std::process::Command::new("git")
@@ -3016,31 +3017,23 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
             );
         }
 
-        fn repo(tag: &str) -> PathBuf {
-            let dir = std::env::temp_dir().join(format!(
-                "exec-fp-{tag}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            git(&dir, &["init", "-b", "master"]);
-            git(&dir, &["config", "user.name", "t"]);
-            git(&dir, &["config", "user.email", "t@localhost"]);
+        /// A fresh git repository in `scratch`, with one baseline commit.
+        fn init_repo(scratch: &TestScratch) {
+            let dir = scratch.path();
+            git(dir, &["init", "-b", "master"]);
+            git(dir, &["config", "user.name", "t"]);
+            git(dir, &["config", "user.email", "t@localhost"]);
             std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
-            git(&dir, &["add", "seed.txt"]);
-            git(&dir, &["commit", "-m", "baseline"]);
-            dir
+            git(dir, &["add", "seed.txt"]);
+            git(dir, &["commit", "-m", "baseline"]);
         }
 
         #[test]
         fn an_unchanged_tree_fingerprints_identically() {
-            let dir = repo("stable");
-            let a = tree_fingerprint(&dir).expect("fingerprint");
-            let b = tree_fingerprint(&dir).expect("fingerprint");
+            let scratch = TestScratch::new("exec-fp-stable");
+            init_repo(&scratch);
+            let a = tree_fingerprint(scratch.path()).expect("fingerprint");
+            let b = tree_fingerprint(scratch.path()).expect("fingerprint");
             assert_eq!(a, b, "an unchanged tree must fingerprint identically");
         }
 
@@ -3049,18 +3042,20 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         /// editing it must move the fingerprint.
         #[test]
         fn an_untracked_file_moves_the_fingerprint() {
-            let dir = repo("untracked");
-            let before = tree_fingerprint(&dir).expect("fingerprint before");
+            let scratch = TestScratch::new("exec-fp-untracked");
+            init_repo(&scratch);
+            let dir = scratch.path();
+            let before = tree_fingerprint(dir).expect("fingerprint before");
 
             std::fs::write(dir.join("new.rs"), "fn main() {}\n").unwrap();
-            let after_new = tree_fingerprint(&dir).expect("fingerprint after new file");
+            let after_new = tree_fingerprint(dir).expect("fingerprint after new file");
             assert_ne!(
                 before, after_new,
                 "a new untracked file must move the fingerprint"
             );
 
             std::fs::write(dir.join("new.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
-            let after_edit = tree_fingerprint(&dir).expect("fingerprint after edit");
+            let after_edit = tree_fingerprint(dir).expect("fingerprint after edit");
             assert_ne!(
                 after_new, after_edit,
                 "editing an untracked file must move the fingerprint"
@@ -3071,18 +3066,9 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         /// fingerprint, so the gate re-runs rather than reusing an unknown.
         #[test]
         fn a_directory_that_is_not_a_repository_has_no_fingerprint() {
-            let dir = std::env::temp_dir().join(format!(
-                "exec-fp-nonrepo-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let scratch = TestScratch::new("exec-fp-nonrepo");
             assert_eq!(
-                tree_fingerprint(&dir),
+                tree_fingerprint(scratch.path()),
                 None,
                 "a non-repository must yield no fingerprint, never a stable one"
             );
