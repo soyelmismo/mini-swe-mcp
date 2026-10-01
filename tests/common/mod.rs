@@ -172,6 +172,12 @@ impl TempDir {
         Self::new(&mini_swe_mcp::worktree::swe_base_dir(), tag)
     }
 
+    /// Own a scratch directory the caller has already created, removing it on
+    /// drop. The caller keeps responsibility for creating it.
+    pub fn own(path: PathBuf) -> Self {
+        Self { path }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
