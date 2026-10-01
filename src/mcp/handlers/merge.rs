@@ -47,8 +47,16 @@ impl McpServer {
         .await
         .map_err(|e| anyhow::anyhow!("merge task for worker {wid} failed: {e}"))??;
         // The backstop sweep, so a worker integrated by any other path (an older
-        // merge, another session, a consolidator) is retired too.
-        self.pool.sweep_retired_workers().await;
+        // merge, another session, a consolidator) is retired too. `--no-delete`
+        // is an explicit decision to keep this worker, so the sweep leaves it
+        // alone: undoing it here would silently discard the operator's branch
+        // (and its row) seconds after they asked for it.
+        let exempt: &[String] = if keep_branch {
+            std::slice::from_ref(&report.worker_id)
+        } else {
+            &[]
+        };
+        self.pool.sweep_retired_workers(exempt).await;
         Ok(json!({
             "worker_id": report.worker_id,
             "branch": report.branch,
@@ -99,7 +107,8 @@ impl McpServer {
         })
         .await
         .map_err(|e| anyhow::anyhow!("batch merge task failed: {e}"))??;
-        self.pool.sweep_retired_workers().await;
+        // The batch never honours `--no-delete`, so nothing is exempt here.
+        self.pool.sweep_retired_workers(&[]).await;
         Ok(json!({
             "approved": true,
             "group": group_echo,

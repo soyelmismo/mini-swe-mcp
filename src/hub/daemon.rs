@@ -457,7 +457,7 @@ impl HubServer {
         let root = self.server.pool().scratch_root().clone();
         let ack_dir = self.config.paths().dir().to_path_buf();
         match tokio::task::spawn_blocking(move || {
-            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir))
+            crate::pool::sweep_retired_workers_in(&root, Some(&ack_dir), &[])
         })
         .await
         {

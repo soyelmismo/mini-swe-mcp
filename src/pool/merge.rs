@@ -32,7 +32,8 @@ use anyhow::{Context, Result};
 use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
 use super::revision::{
-    RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_with,
+    RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
+    retire_worker_with,
 };
 use crate::agent::AgentRunner;
 use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
@@ -716,39 +717,89 @@ fn cleanup(
     let integrated = load_registry_entry_in(root, worker_id)
         .map(|row| row.integrated)
         .unwrap_or_default();
-    let branch_deleted = !keep_branch
-        && git(repo, "branch -D", &["branch", "-D", branch]).is_ok_and(|o| o.status.success());
     let ctx = RetireContext {
         repo: Some(repo),
         ack_dir: None,
         keep_branch,
     };
-    // Only when the branch really went: with `--no-delete` the worker stays a
-    // known, steerable worker, so its round stays a known round.
-    if branch_deleted && !integrated.is_empty() {
+    // The retirement performs the branch deletion, so its report is the truth:
+    // a separate `git branch -D` probe here could disagree with what actually
+    // happened (a ref another worktree still held, an already-absent branch) and
+    // would then skip the round below for a merge that did land.
+    let outcome = retire_worker_reporting(root, worker_id, &ctx);
+
+    // Only a consolidator whose own ref is gone has its round retired: with
+    // `--no-delete` the operator kept it, so the round stays a known round.
+    let mut retired_round = 0;
+    if outcome.branch_deleted && !keep_branch && !integrated.is_empty() {
         for id in &integrated {
+            // A worker may have been revised after its earlier tip was
+            // integrated: its branch then holds work the base does not have, and
+            // deleting it would destroy that work. Retire only what is provably
+            // integrated now, and leave a re-revised worker alone.
+            if !branch_is_integrated_in(root, repo, id, branch) {
+                continue;
+            }
             retire_worker_with(root, id, &ctx);
+            retired_round += 1;
         }
     }
-    retire_worker_with(root, worker_id, &ctx);
 
     let mut cleaned = Vec::new();
-    if branch_deleted {
+    if outcome.branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
     } else if keep_branch {
         cleaned.push(format!("branch {branch} kept (--no-delete)"));
     }
-    if branch_deleted && !integrated.is_empty() {
+    if retired_round > 0 {
         cleaned.push(format!(
-            "{} integrated worker(s) retired with the round",
-            integrated.len()
+            "{retired_round} integrated worker(s) retired with the round"
         ));
     }
     cleaned.push("worker retired (row, history, mailbox, scratch)".to_string());
-    if reclaimed {
+    if outcome.worktree_reclaimed || reclaimed {
         cleaned.push("worktree leftovers removed".to_string());
     }
-    (branch_deleted, cleaned)
+    (outcome.branch_deleted, cleaned)
+}
+
+/// Whether `worker-<id>`'s current branch is proven contained in `base`.
+///
+/// The round a consolidator integrated records which branches it merged *at
+/// that moment*. A worker revised afterwards commits new work on its own
+/// branch, so its recorded membership is not enough: only a fresh ancestry
+/// proof shows that whatever is on the branch right now is already in the base.
+/// Any doubt -- no row, no repository, no branch, an unprobeable repo -- answers
+/// false, so a re-revised worker survives instead of losing work.
+fn branch_is_integrated_in(
+    root: &ScratchRoot,
+    repo: &Path,
+    worker_id: &str,
+    base: &str,
+) -> bool {
+    let Some(row) = load_registry_entry_in(root, worker_id) else {
+        return false;
+    };
+    // The worker's branch must live in the repository the round landed in, or
+    // the probe below would be reading a different repository's refs.
+    if !row
+        .repo_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path) == repo)
+    {
+        return false;
+    }
+    crate::worktree::git(
+        repo,
+        "merge-base --is-ancestor",
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &format!("worker-{worker_id}"),
+            base,
+        ],
+    )
+    .is_ok_and(|out| out.status.success())
 }
 
 // ----------

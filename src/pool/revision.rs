@@ -507,9 +507,39 @@ pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
     retire_worker_with(root, worker_id, &RetireContext::default());
 }
 
+/// What a retirement actually did, as the callers must report it.
+///
+/// The retirement is the only code that deletes the branch, so its *result*
+/// is the truth a caller reports: `cleanup` used to test `git branch -D`
+/// separately and could report a deletion the retirement never performed (or
+/// miss one it did), which then silently skipped a consolidator's round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetireOutcome {
+    /// The `worker-<id>` ref is gone. False when the branch was kept, when it
+    /// was already absent, or when the repository could not be probed -- the
+    /// last case is deliberately not "deleted", because nothing proved it.
+    pub branch_deleted: bool,
+    /// A leftover worktree directory was reclaimed.
+    pub worktree_reclaimed: bool,
+    /// The registry row was deleted. A kept branch keeps its row.
+    pub row_removed: bool,
+}
+
 /// [`retire_worker_in`] with the repository and hub directory the retirement
 /// can also clean.
 pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireContext<'_>) {
+    retire_worker_reporting(root, worker_id, ctx);
+}
+
+/// [`retire_worker_with`], returning what it actually did.
+///
+/// The reporting twin of the retirement, so no caller has to re-derive the
+/// result of a deletion it did not perform itself.
+pub fn retire_worker_reporting(
+    root: &ScratchRoot,
+    worker_id: &str,
+    ctx: &RetireContext<'_>,
+) -> RetireOutcome {
     let branch = format!("worker-{worker_id}");
     // The worktree goes first: a leftover that is still registered would make
     // the branch undeletable, and `git worktree prune` clears the registration
@@ -519,6 +549,7 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     if reclaimed {
         crate::worktree::force_remove_dir(&worktree);
     }
+    let mut branch_deleted = false;
     crate::worktree::remove_target_dirs_in(root, &worktree);
     // The worker's build-directory *lease* is deliberately not touched here: the
     // directories are filed per repository, not per worker, and are shared by
@@ -530,8 +561,12 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
         let _ = crate::worktree::git(repo, "worktree prune", &["worktree", "prune"]);
         // `git branch -D` refuses a branch a worktree still has checked out;
         // the prune above just released it. An already-absent branch is not an
-        // error: the end state is the same.
-        let _ = crate::worktree::git(repo, "branch -D", &["branch", "-D", &branch]);
+        // error: the end state is the same, so report "gone" either way.
+        if crate::worktree::git(repo, "branch -D", &["branch", "-D", &branch])
+            .is_ok_and(|out| out.status.success())
+        {
+            branch_deleted = true;
+        }
     }
     for suffix in ["steer-source", "round-base"] {
         let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
@@ -542,8 +577,9 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     // `status`, `list` and a later `merge` all read its row. Its branch is what
     // keeps it meaningful, and the row is retired with the branch the moment
     // that goes -- by the sweep, or by the next merge.
+    let mut row_removed = false;
     if !ctx.keep_branch {
-        super::remove_registry_entry_in(root, worker_id);
+        row_removed = super::remove_registry_entry_in(root, worker_id);
         if let Some(dir) = ctx.ack_dir {
             crate::mcp::events::forget_watch_acks(dir, worker_id);
         }
@@ -551,11 +587,16 @@ pub fn retire_worker_with(root: &ScratchRoot, worker_id: &str, ctx: &RetireConte
     if reclaimed {
         debug!(worker = %worker_id, "Reclaimed retired worker leftovers");
     }
+    RetireOutcome {
+        branch_deleted,
+        worktree_reclaimed: reclaimed,
+        row_removed,
+    }
 }
 
 /// [`sweep_retired_workers_in`] under the default scratch root.
 pub fn sweep_retired_workers() -> RetireSweep {
-    sweep_retired_workers_in(&ScratchRoot::from_env(), None)
+    sweep_retired_workers_in(&ScratchRoot::from_env(), None, &[])
 }
 
 /// What one retirement sweep reclaimed.
@@ -592,7 +633,11 @@ pub struct RetireSweep {
 /// Every git probe is read-only and every step is best effort, so an
 /// unprobeable repository retires nothing rather than retiring the wrong
 /// worker.
-pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> RetireSweep {
+pub fn sweep_retired_workers_in(
+    root: &ScratchRoot,
+    ack_dir: Option<&Path>,
+    exempt: &[String],
+) -> RetireSweep {
     let mut sweep = RetireSweep::default();
     // Grouped by repository: the two git probes per worker run once per repo
     // instead of once per row.
@@ -614,6 +659,9 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
             keep_branch: false,
         };
         for entry in entries {
+            if exempt.iter().any(|id| id == &entry.id) {
+                continue;
+            }
             let branch = format!("worker-{}", entry.id);
             if !is_merged_branch(repo, &branch, entry.base_branch.as_deref()) {
                 continue;
@@ -622,7 +670,7 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
             sweep.workers.push(entry.id.clone());
         }
     }
-    sweep.orphans = remove_orphan_worker_files(root);
+    sweep.orphans = remove_orphan_worker_files(root, exempt);
     sweep
 }
 
@@ -645,6 +693,63 @@ fn is_merged_branch(repo: &Path, branch: &str, base_branch: Option<&str>) -> boo
     .is_ok_and(|output| output.status.success())
 }
 
+/// The fields the orphan branch probe needs, without parsing the conversation.
+#[derive(Deserialize)]
+struct OrphanOwner {
+    repo_path: String,
+    branch: String,
+}
+
+/// Whether `path` names a worker whose branch still exists, so the file must
+/// be kept even though its registry row is gone.
+///
+/// Proven or not proven, never guessed: a `.steer` or `.steer-source` file
+/// carries no repository of its own, so those keep only when a row named them --
+/// which the caller already checked. A history file's first line carries the
+/// repository and branch; if it cannot be read or parsed, or the repository
+/// cannot be probed, the answer is `true` (keep), because deleting a reachable
+/// conversation is unrecoverable while keeping an unreachable one only costs
+/// space.
+fn file_has_live_branch(path: &Path, worker_id: &str) -> bool {
+    let name = path.to_string_lossy();
+    if !(name.ends_with(".history.jsonl") || name.ends_with(".history.json")) {
+        return false;
+    }
+    let Some(raw) = std::fs::read_to_string(path).ok() else {
+        return true;
+    };
+    let Some(owner) = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|first| serde_json::from_str::<OrphanOwner>(first).ok())
+    else {
+        return true;
+    };
+    let repo = Path::new(&owner.repo_path);
+    if !repo.is_dir() {
+        // The repository itself is gone: nothing can read that branch, and the
+        // file is genuinely unreachable.
+        return false;
+    }
+    match crate::worktree::git(
+        repo,
+        "rev-parse",
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", owner.branch),
+        ],
+    ) {
+        Ok(out) if out.status.success() => true,
+        // `git` exit 1 is the "ref is not there" code and is the only outcome
+        // that proves absence; anything else (128, a failed spawn) is not proof.
+        Ok(out) if out.status.code() == Some(1) => false,
+        Ok(_) => true,
+        Err(_) => true,
+    }
+}
+
 /// Delete the per-worker files no row and no branch can ever claim again.
 ///
 /// The three companions of a retired worker: its conversation (`*.history.jsonl`
@@ -652,7 +757,7 @@ fn is_merged_branch(repo: &Path, branch: &str, base_branch: Option<&str>) -> boo
 /// steer-source marker. A file with neither a registry row nor an existing
 /// branch is unreachable: nothing can dispatch, steer, revise or collect it, so
 /// it is space nobody will ever read.
-fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
+fn remove_orphan_worker_files(root: &ScratchRoot, exempt: &[String]) -> usize {
     let live: std::collections::HashSet<String> = super::load_registry_entries_read_only_in(root)
         .into_iter()
         .map(|entry| entry.id)
@@ -676,8 +781,19 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> usize {
             }) else {
                 continue;
             };
-            // A live row keeps its files, whether or not its branch survives.
-            if live.contains(id) {
+            // A live row keeps its files, whether or not its branch survives,
+            // and so does a worker this sweep was told to leave alone.
+            if live.contains(id) || exempt.iter().any(|kept| kept == id) {
+                continue;
+            }
+            // A history file names the repository and branch its worker worked
+            // on, and that branch is what makes the file reachable: a row can be
+            // deleted (or never written) while the branch lives, and the
+            // conversation is then the only record of work that is still in
+            // git. So the branch is probed before the file goes, and the file
+            // survives whenever its absence cannot be *proven*: an unreadable
+            // file, an unprobeable repository or a git failure all keep it.
+            if file_has_live_branch(entry.path(), id) {
                 continue;
             }
             match std::fs::remove_file(entry.path()) {

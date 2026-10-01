@@ -493,11 +493,20 @@ pub fn remove_registry_entry(worker_id: &str) {
 }
 
 /// [`remove_registry_entry`] under an explicit scratch root.
-pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) {
+///
+/// Returns whether a row was actually there to remove, so a caller reporting
+/// what it reclaimed never claims a deletion that did not happen.
+pub fn remove_registry_entry_in(root: &ScratchRoot, worker_id: &str) -> bool {
+    let mut removed = false;
     for dir in root.base_dirs() {
         let path = dir.join("swe-registry").join(format!("{worker_id}.json"));
-        let _ = std::fs::remove_file(path);
+        // A base dir this process never wrote to fails with `NotFound`, which
+        // is not a removal; any other failure is likewise not a removal.
+        if std::fs::remove_file(path).is_ok() {
+            removed = true;
+        }
     }
+    removed
 }
 
 fn worktree_exists_in(root: &ScratchRoot, worker_id: &str) -> bool {

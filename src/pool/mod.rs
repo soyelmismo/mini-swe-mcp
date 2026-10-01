@@ -596,11 +596,14 @@ impl WorkerPool {
     /// session, a previous run, a consolidator this process never dispatched)
     /// still leaves nothing behind. Cheap and bounded by the number of terminal
     /// rows plus one directory read per scratch base.
-    pub async fn sweep_retired_workers(&self) -> RetireSweep {
+    pub async fn sweep_retired_workers(&self, exempt: &[String]) -> RetireSweep {
         let root = self.scratch.clone();
-        tokio::task::spawn_blocking(move || revision::sweep_retired_workers_in(&root, None))
-            .await
-            .unwrap_or_default()
+        let exempt = exempt.to_vec();
+        tokio::task::spawn_blocking(move || {
+            revision::sweep_retired_workers_in(&root, None, &exempt)
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Drop the worktree paths of workers whose records are gone.
