@@ -70,7 +70,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Correction or follow-up for 'steer', which resumes the worker on its own branch with its full context (optional 'max_turns' sets the budget). Required for 'steer'; also continues a stopped worker: never dispatch a replacement.",
+            "description": "Correction or follow-up for 'steer': continues on the worker's own branch with full context ('max_turns' sets the budget) or a stopped worker. Never dispatch a replacement.",
             "type": "string"
           },
           "model": {
@@ -160,7 +160,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.",
+            "description": "Optional shell command run before completion is honoured; auto-detect one when omitted. An empty string disables the gate; a consolidated round gives workers the cheap gate.",
             "type": "string"
           },
           "worker_id": {

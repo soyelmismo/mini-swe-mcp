@@ -247,7 +247,7 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer model (e.g. 'nerd') that audits the worktree after implementation.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Optional shell command run before completion is honoured; when omitted, auto-detect one. Pass an empty string to disable the gate. In a consolidated round, give workers the cheap gate.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Optional shell command run before completion is honoured; auto-detect one when omitted. An empty string disables the gate; a consolidated round gives workers the cheap gate.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";
