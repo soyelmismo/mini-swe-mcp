@@ -12,7 +12,7 @@ use common::{IsolatedPool, TempDir};
 use mini_swe_mcp::cli::format::format_status;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
-use mini_swe_mcp::worktree::WorktreeGuard;
+use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use serde_json::{Value, json};
 
 fn v(s: &str) -> Value {
@@ -137,6 +137,9 @@ async fn completed_status_payload_is_small_and_lists_only_changed_artifacts() {
         &["commit", "-q", "-m", "seed pre-existing artifacts"],
     );
 
+    // The worktree lives under the same temporary root as the repo, so the
+    // test never resolves or touches the ambient real scratch.
+    let root = ScratchRoot::new(scratch.subdir("scratch"));
     let id = format!(
         "status-payload-{}-{}",
         std::process::id(),
@@ -145,7 +148,7 @@ async fn completed_status_payload_is_small_and_lists_only_changed_artifacts() {
             .unwrap()
             .as_nanos()
     );
-    let guard = WorktreeGuard::new(&repo, &id).expect("worktree creation failed");
+    let guard = WorktreeGuard::new_in(&root, &repo, &id).expect("worktree creation failed");
     std::fs::create_dir_all(guard.path.join("audits")).unwrap();
     std::fs::write(guard.path.join("audits/worker_new.md"), "new\n").unwrap();
 
