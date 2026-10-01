@@ -1028,6 +1028,7 @@ impl super::WorkerPool {
             revision,
             auto_continues: history.auto_continues,
             owner: Some(owner.clone()),
+            report: None,
             // A revision changes the branch, so the previous review no longer
             // applies: drop any approval this row carried.
             approved: None,
@@ -1049,6 +1050,7 @@ impl super::WorkerPool {
             revision,
             auto_continues: history.auto_continues,
             owner,
+            report: None,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {

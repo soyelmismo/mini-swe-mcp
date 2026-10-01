@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::state::WorkerMetrics;
+use super::state::{WorkerMetrics, WorkerReport};
 use crate::worktree::ScratchRoot;
 
 /// Lifecycle status of a worker, as recorded in the on-disk registry.
@@ -141,6 +141,12 @@ pub struct WorkerRegistryEntry {
     /// worker, capped at [`super::MAX_AUTO_CONTINUES`].
     #[serde(default)]
     pub auto_continues: usize,
+    /// The structured report of the completion turn. Kept on the row, not only
+    /// in the in-memory record, because a terminal record is evicted after its
+    /// TTL while its row outlives it: `status`, `collect` and `watch` must
+    /// still be able to say what the run did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<WorkerReport>,
     /// The orchestrator's approval of the completed worker, or `None` while it
     /// is unreviewed. Persisted so it survives the in-memory eviction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +182,9 @@ pub struct WorkerMeta {
     /// disk so a cross-process reader (the monitor, a `status` answered from a
     /// registry row) sees the same numbers as the live record.
     pub metrics: WorkerMetrics,
+    /// The completion report, set by the phase loop once the worker has
+    /// finished and written with the terminal row.
+    pub report: Option<WorkerReport>,
 }
 
 impl WorkerMeta {
@@ -214,6 +223,7 @@ impl WorkerMeta {
             base_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,
+            report: self.report.clone(),
             approved: None,
         }
     }
@@ -691,6 +701,7 @@ mod recovery_cleanup_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            report: None,
             approved: None,
         }
     }

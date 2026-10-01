@@ -94,6 +94,7 @@ impl Fixture {
     /// grouped and -- when `approved` is `Some` -- carrying an approval.
     fn record_status(&self, id: &str, owner: &str, group: Option<&str>, approved: Option<u64>) {
         let entry = WorkerRegistryEntry {
+            report: None,
             approved: approved.map(|at| mini_swe_mcp::pool::WorkerApproval { at, note: None }),
             id: id.to_string(),
             pid: std::process::id(),
@@ -597,6 +598,7 @@ fn workers_of_two_repositories_are_refused() {
     .expect("history log must be writable");
     history.repo_path = other.path().to_string_lossy().into_owned();
     let entry = WorkerRegistryEntry {
+        report: None,
         approved: Some(mini_swe_mcp::pool::WorkerApproval { at: 1, note: None }),
         id: "w2".to_string(),
         pid: std::process::id(),

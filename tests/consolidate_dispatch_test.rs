@@ -87,6 +87,7 @@ impl Harness {
         group: Option<&str>,
     ) {
         let entry = WorkerRegistryEntry {
+            report: None,
             id: worker_id.to_string(),
             pid: std::process::id(),
             task: task.to_string(),
@@ -123,6 +124,7 @@ impl Harness {
                 model: "test".to_string(),
                 owner: OWNER.to_string(),
                 state: WorkerState::Completed {
+                    report: None,
                     turns: 3,
                     diff: String::new(),
                     summary: "done".to_string(),

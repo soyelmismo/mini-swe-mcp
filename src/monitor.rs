@@ -1112,6 +1112,7 @@ mod tests {
                 base_commit: None,
                 revision: 0,
                 auto_continues: 0,
+                report: None,
                 approved: None,
             }
         }
@@ -1130,6 +1131,7 @@ mod tests {
             question: None,
             started_at: 1000,
             updated_at,
+            report: None,
             group: None,
             role: crate::pool::WorkerRole::Worker,
             repo_path: None,

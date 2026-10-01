@@ -110,6 +110,7 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
@@ -152,6 +153,7 @@ fn registry_row(
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        report: None,
         approved: None,
     }
 }

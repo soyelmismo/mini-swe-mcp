@@ -116,10 +116,17 @@ impl ScriptedSseServer {
 
     /// A turn whose tool call runs `command` in the worker worktree.
     fn bash_turn(call_id: &str, command: &str) -> ScriptedTurn {
+        Self::turn(call_id, "", command)
+    }
+
+    /// A turn whose tool call runs `command`, with `content` as the prose the
+    /// model wrote alongside it.
+    fn turn(call_id: &str, content: &str, command: &str) -> ScriptedTurn {
         let arguments = json!({ "command": command }).to_string();
         vec![frame(&json!({
             "choices": [{
                 "delta": {
+                    "content": content,
                     "tool_calls": [{
                         "index": 0,
                         "id": call_id,
@@ -132,8 +139,16 @@ impl ScriptedSseServer {
 
     /// The turn a model issues when it is done: the sentinel as the final
     /// `echo` of the command, which is what `is_completion_request` accepts.
+    ///
+    /// The prose carries the REPORT block the system prompt now requires, so
+    /// the scripted worker is a compliant one and the harness never spends a
+    /// turn asking for it.
     fn completion_turn(call_id: &str) -> ScriptedTurn {
-        Self::bash_turn(call_id, &format!("echo {COMPLETION_SENTINEL}"))
+        Self::turn(
+            call_id,
+            "REPORT\ndone: scripted completion\nfiles: src/a.rs\ntests: cargo test: passed\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        )
     }
 
     /// A turn whose tool call cannot yield a command, plus reasoning content.

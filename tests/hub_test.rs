@@ -1232,8 +1232,18 @@ async fn serve_checkpoint_revision_script(listener: TcpListener) {
             21 => "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT".to_string(),
             _ => format!("echo turn {turn}"),
         };
+        // The closing turn carries the REPORT block the system prompt asks
+        // for, so the scripted worker is a compliant one and the harness
+        // never spends a follow-up turn asking for it: this script answers a
+        // fixed number of turns, and a report-less completion would need one
+        // more than it has.
+        let report = if turn == 21 {
+            "REPORT\ndone: checkpoint recovered\nfiles: kept.txt\ntests: cargo test: passed\nrisks: none\n".to_string()
+        } else {
+            String::new()
+        };
         let chunk = serde_json::json!({"choices":[{"delta":{
-            "content": format!("```bash\n{command}\n```"),
+            "content": format!("{report}```bash\n{command}\n```"),
         }}]});
         let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
         // A client killed mid-response is not an error: the next turn's

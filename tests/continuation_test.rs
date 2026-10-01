@@ -140,6 +140,7 @@ fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::Wor
         base_commit: Some("base".into()),
         revision: 1,
         auto_continues: 0,
+        report: None,
         approved: None,
     }
 }
@@ -549,6 +550,7 @@ fn three_continuations_number_one_two_three() {
                 verified: None,
                 metrics: WorkerMetrics::default(),
                 revision: 0,
+                report: None,
             },
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

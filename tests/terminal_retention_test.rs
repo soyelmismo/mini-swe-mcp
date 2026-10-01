@@ -114,6 +114,7 @@ fn history(worker_id: &str, repo: &Path) -> WorkerHistory {
 /// A registry row for `id` in `status`, as a stopped run leaves one behind.
 fn row(id: &str, repo: &Path, status: RegistryStatus) -> mini_swe_mcp::pool::WorkerRegistryEntry {
     mini_swe_mcp::pool::WorkerRegistryEntry {
+        report: None,
         id: id.to_string(),
         pid: std::process::id(),
         role: mini_swe_mcp::pool::WorkerRole::Worker,
@@ -178,6 +179,7 @@ async fn a_reaped_completed_worker_keeps_its_row_and_history_and_stays_continuab
     pool.__test_insert_worker(terminal_record(
         "rc1",
         WorkerState::Completed {
+            report: None,
             turns: 4,
             diff: String::new(),
             summary: "done".into(),
@@ -276,6 +278,7 @@ async fn collect_answers_from_the_registry_row_after_the_record_is_reaped() {
     pool.__test_insert_worker(terminal_record(
         "rco1",
         WorkerState::Completed {
+            report: None,
             turns: 4,
             diff: String::new(),
             summary: "done".into(),

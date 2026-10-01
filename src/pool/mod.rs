@@ -82,15 +82,16 @@ pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
     WorkerLaunchConfig, is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_request_turns,
-    parse_wait_job, summarize_command,
+    parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 pub use self::state::{
-    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics,
-    WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerState, retention_expired,
-    terminal_retention_secs,
+    CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat,
+    TOP_FILE_LIMIT, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord,
+    WorkerReport, WorkerState, churn_line, diff_sections_of, file_stats_of_diff,
+    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -407,6 +408,18 @@ impl WorkerPool {
         self.changes.subscribe()
     }
 
+    /// How many workers are executing a bash command right now.
+    ///
+    /// A planned handover reads it: a command in flight is work a stop must not
+    /// interrupt, while a live worker between commands is exactly what the
+    /// graceful shutdown checkpoints and the next daemon continues.
+    pub fn commands_running(&self) -> usize {
+        self.command_running
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
     /// Mark `id` as queued for a heavy build slot behind `queued` requests.
     /// The returned guard clears the state when the slot is granted or the
     /// wait is abandoned, so a killed worker leaves no stale wait behind.
@@ -668,6 +681,7 @@ impl WorkerPool {
             metrics: WorkerMetrics::default(),
             revision: 0,
             auto_continues: 0,
+            report: None,
         };
 
         let initial_record = WorkerRecord {
@@ -1990,6 +2004,7 @@ impl WorkerPool {
                 verified: None,
                 metrics: entry.metrics,
                 revision: entry.revision,
+                report: entry.report.clone(),
             },
             _ => WorkerState::Failed {
                 error: entry.last_command.clone(),
@@ -2248,6 +2263,7 @@ mod consolidate_delegation_tests {
             revision: 0,
             auto_continues: 0,
             metrics: WorkerMetrics::default(),
+            report: None,
         }
     }
 
@@ -2274,6 +2290,7 @@ mod consolidate_delegation_tests {
             base_commit: None,
             revision: 0,
             auto_continues: 0,
+            report: None,
             approved: None,
         }
     }

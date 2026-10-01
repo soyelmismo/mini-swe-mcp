@@ -73,6 +73,219 @@ impl WorkerMetrics {
     }
 }
 
+/// The structured report a worker writes in its completion turn.
+///
+/// A completion used to be read off the first line of the worker's last chat
+/// message, which is whatever the model happened to say last ("Now I'll make
+/// the edits."), so every consumer had to shell out to `git diff` to learn
+/// what the run actually did. The four lines below are the contract instead:
+/// the worker states them before the completion sentinel and the harness
+/// carries them from the completion turn to the registry row, so a `status`,
+/// `collect` or `watch` event answers without a second call.
+///
+/// Every field is optional and bounded: a worker that omits a line still
+/// completes (the harness falls back to today's summary), and a report is
+/// never allowed to grow into a second document.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerReport {
+    /// One line: what changed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done: String,
+    /// Paths changed, comma-separated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub files: String,
+    /// The commands run and their result, one line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tests: String,
+    /// Security, contract or behaviour risks, or `none`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub risks: String,
+}
+
+impl WorkerReport {
+    /// Whether the report says anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.done.is_empty()
+            && self.files.is_empty()
+            && self.tests.is_empty()
+            && self.risks.is_empty()
+    }
+}
+
+/// One file's share of a diff: the path, the lines added and the lines removed.
+///
+/// The completion diff is already in memory when a worker finishes, so the
+/// per-file split is read out of it once and carried next to the totals: a
+/// consumer that wants to know *what* changed should not have to shell out to
+/// `git diff --stat` to find out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+impl FileStat {
+    /// Lines this file accounts for, the churn the top-N ordering sorts on.
+    pub fn churn(&self) -> usize {
+        self.insertions + self.deletions
+    }
+}
+
+/// A path as git spells it in a diff header, without the `a/`/`b/` prefix or a
+/// leading `./`, so a caller's `--file src/a.rs` matches what git printed.
+pub fn normalize_diff_path(path: &str) -> String {
+    let path = path
+        .strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path)
+        .trim_matches('"');
+    path.strip_prefix("./").unwrap_or(path).to_string()
+}
+
+/// How many files a per-file diff line names before it starts counting the rest.
+pub const TOP_FILE_LIMIT: usize = 8;
+
+/// `a.rs (+3 -2), b.rs (+1 -1), +2 more`: the biggest-churn files of a diff,
+/// then how many were left out.
+///
+/// Ordered by churn and then by path so the line is deterministic, and bounded
+/// by [`TOP_FILE_LIMIT`] so it can never grow with the size of the diff.
+pub fn churn_line(stats: &[FileStat]) -> String {
+    let mut ordered: Vec<&FileStat> = stats.iter().collect();
+    ordered.sort_by(|a, b| b.churn().cmp(&a.churn()).then_with(|| a.path.cmp(&b.path)));
+    let shown = ordered.len().min(TOP_FILE_LIMIT);
+    let mut line = ordered[..shown]
+        .iter()
+        .map(|stat| format!("{} (+{} -{})", stat.path, stat.insertions, stat.deletions))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = ordered.len().saturating_sub(shown);
+    if more > 0 {
+        line.push_str(&format!(", +{more} more"));
+    }
+    line
+}
+
+/// One section of a unified diff: the path it is about plus its raw body.
+struct DiffSection {
+    /// Path from the `+++` header, or from the `diff --git` line.
+    path: String,
+    /// Path from the `---` header, which is the only one a deleted file has.
+    minus: String,
+    body: String,
+}
+
+impl DiffSection {
+    /// The path the section is about: the "after" side when the file still
+    /// exists, the "before" side when it does not.
+    fn path(&self) -> &str {
+        if self.path.is_empty() {
+            &self.minus
+        } else {
+            &self.path
+        }
+    }
+}
+
+/// Split a unified diff into one `(path, section)` pair per file.
+///
+/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
+/// removed line that happens to start with `--` can never be mistaken for one.
+/// A section with neither header — a binary file, a mode-only change — falls
+/// back to the paths its `diff --git` line names.
+pub fn diff_sections_of(diff: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current: Option<DiffSection> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            if let Some(section) = current.take() {
+                sections.push((section.path().to_string(), section.body));
+            }
+            current = Some(DiffSection {
+                path: diff_git_path(header).unwrap_or_default(),
+                minus: String::new(),
+                body: format!("{line}\n"),
+            });
+            continue;
+        }
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        section.body.push_str(line);
+        section.body.push('\n');
+        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
+            section.minus = found;
+        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
+            section.path = found;
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push((section.path().to_string(), section.body));
+    }
+    sections
+        .into_iter()
+        .filter(|(path, _)| !path.is_empty())
+        .collect()
+}
+
+/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
+fn diff_git_path(header: &str) -> Option<String> {
+    let split = header.rfind(" b/")?;
+    let path = &header[..split];
+    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
+}
+
+/// The path a `--- `/`+++ ` header names, or `None` for `/dev/null`.
+fn diff_header_path(header: &str) -> Option<String> {
+    let path = header.trim();
+    (path != "/dev/null").then(|| normalize_diff_path(path))
+}
+
+/// Per-file `(path, insertions, deletions)` of a unified diff.
+///
+/// Only hunk lines are counted, and a hunk starts at its `@@` header, so the
+/// `---`/`+++` headers and an added line that itself starts with `+` are never
+/// counted as content.
+pub fn file_stats_of_diff(diff: &str) -> Vec<FileStat> {
+    diff_sections_of(diff)
+        .into_iter()
+        .map(|(path, section)| {
+            let mut insertions = 0;
+            let mut deletions = 0;
+            let mut in_hunks = false;
+            for line in section.lines() {
+                if line.starts_with("@@") {
+                    in_hunks = true;
+                } else if in_hunks && line.starts_with('+') {
+                    insertions += 1;
+                } else if in_hunks && line.starts_with('-') {
+                    deletions += 1;
+                }
+            }
+            FileStat {
+                path,
+                insertions,
+                deletions,
+            }
+        })
+        .collect()
+}
+
+/// Whether a requested path names the file a diff section is about.
+///
+/// Exact after normalisation, or a whole-component suffix of it, so `--file
+/// a.rs` still finds `src/a.rs`.
+pub fn same_diff_path(requested: &str, actual: &str) -> bool {
+    let requested = normalize_diff_path(requested);
+    let actual = normalize_diff_path(actual);
+    actual == requested
+        || (!requested.is_empty()
+            && actual.len() > requested.len()
+            && actual.ends_with(&requested)
+            && actual[..actual.len() - requested.len()].ends_with('/'))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "state", content = "details")]
 pub enum WorkerState {
@@ -104,6 +317,10 @@ pub enum WorkerState {
         /// tell the first answer from a corrected one.
         #[serde(default)]
         revision: usize,
+        /// The structured report of the completion turn, `None` when the
+        /// worker never supplied one (the summary stays the fallback).
+        #[serde(default)]
+        report: Option<WorkerReport>,
     },
     Failed {
         error: String,
@@ -161,7 +378,8 @@ impl WorkerState {
                 verified,
                 metrics,
                 revision,
-                ..
+                report,
+                diff,
             } => serde_json::json!({
                 "status": "Completed",
                 "turns": turns,
@@ -172,6 +390,8 @@ impl WorkerState {
                 "verified": verified,
                 "metrics": metrics,
                 "revision": revision,
+                "report": report,
+                "per_file": file_stats_of_diff(diff),
             }),
             WorkerState::Failed {
                 error,
@@ -392,8 +612,9 @@ mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
     use super::{
-        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, WorkerMetrics, WorkerRecord,
-        WorkerState, expired_terminal_ids, retention_expired,
+        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics,
+        WorkerRecord, WorkerState, churn_line, expired_terminal_ids, file_stats_of_diff,
+        retention_expired,
     };
     use std::collections::HashMap;
 
@@ -432,6 +653,7 @@ mod tests {
                 verified: None,
                 metrics: WorkerMetrics::default(),
                 revision: 0,
+                report: None,
             }
             .step(),
             12
@@ -446,6 +668,64 @@ mod tests {
             }
             .step(),
             3
+        );
+    }
+
+    #[test]
+    fn churn_line_names_the_top_files_then_counts_the_rest() {
+        let mut stats = Vec::new();
+        for index in 0..11 {
+            stats.push(FileStat {
+                path: format!("src/f{index}.rs"),
+                insertions: index,
+                deletions: 0,
+            });
+        }
+        let line = churn_line(&stats);
+        assert_eq!(
+            line,
+            "src/f10.rs (+10 -0), src/f9.rs (+9 -0), src/f8.rs (+8 -0), \
+             src/f7.rs (+7 -0), src/f6.rs (+6 -0), src/f5.rs (+5 -0), \
+             src/f4.rs (+4 -0), src/f3.rs (+3 -0), +3 more"
+        );
+        assert!(churn_line(&[]).is_empty(), "no diff, no line");
+    }
+
+    #[test]
+    fn a_unified_diff_is_read_into_per_file_stats() {
+        let diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "index 111..222 100644\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,3 +1,4 @@\n",
+            " context\n",
+            "-removed\n",
+            "++added line that starts with a plus\n",
+            "--removed line that starts with two dashes\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "new file mode 100644\n",
+            "index 000..333\n",
+            "--- /dev/null\n",
+            "+++ b/two.rs\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+first\n",
+            "+second\n",
+        );
+        assert_eq!(
+            file_stats_of_diff(diff),
+            vec![
+                FileStat {
+                    path: "one.rs".to_string(),
+                    insertions: 1,
+                    deletions: 2,
+                },
+                FileStat {
+                    path: "two.rs".to_string(),
+                    insertions: 2,
+                    deletions: 0,
+                },
+            ]
         );
     }
 
@@ -467,6 +747,7 @@ mod tests {
             verified: None,
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
@@ -507,6 +788,7 @@ mod tests {
             verified: None,
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         }
     }
 

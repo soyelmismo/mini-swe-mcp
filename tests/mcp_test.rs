@@ -21,7 +21,9 @@ use mini_swe_mcp::mcp::{
     ChannelEvent, ConnectionContext, EventKind, McpServer, NETWORK_DEFAULT, NETWORK_MODES, Outcome,
     WORKER_ACTIONS, WorkerSnapshot, WorkerView, channel_frame, diff_events,
 };
-use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState};
+use mini_swe_mcp::pool::{
+    FileStat, LogBuffer, WorkerMetrics, WorkerPool, WorkerRecord, WorkerReport, WorkerState,
+};
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerRegistryEntry, remove_registry_entry_in, save_registry_entry_in,
 };
@@ -1237,6 +1239,7 @@ fn completed_worker(id: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
+            report: None,
         },
     )
 }
@@ -1459,6 +1462,24 @@ fn worker_transitions_become_one_event_each() {
         verified: Some(true),
         diff_stat: Some(String::from("2 files, +30 -4")),
         error: None,
+        report: Some(WorkerReport {
+            done: "Fixed the retry loop.".to_string(),
+            files: "src/retry.rs, src/pool/mod.rs".to_string(),
+            tests: "cargo test: passed".to_string(),
+            risks: "none".to_string(),
+        }),
+        per_file: vec![
+            FileStat {
+                path: "src/retry.rs".to_string(),
+                insertions: 28,
+                deletions: 3,
+            },
+            FileStat {
+                path: "src/pool/mod.rs".to_string(),
+                insertions: 2,
+                deletions: 1,
+            },
+        ],
     };
     let mut failed = worker_view("w-dead", Some(EventKind::Failed));
     failed.outcome = Outcome {
@@ -1655,6 +1676,7 @@ fn synthetic_registry_row(worker_id: &str, status: RegistryStatus) -> WorkerRegi
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        report: None,
         approved: None,
     }
 }
@@ -2081,6 +2103,8 @@ fn completed_channel_event_carries_the_review_guidance() {
         model: view.model.clone(),
         status: view.status.clone(),
         content: mini_swe_mcp::mcp::render_for_test(&view, EventKind::Completed),
+        report: view.outcome.report.clone(),
+        per_file: view.outcome.per_file.clone(),
     };
     assert!(
         event.content.contains("steer"),

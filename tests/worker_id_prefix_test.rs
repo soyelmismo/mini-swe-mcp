@@ -67,6 +67,7 @@ fn registry_row(id: &str, owner: &str, started_at: u64) -> WorkerRegistryEntry {
         base_commit: None,
         revision: 0,
         auto_continues: 0,
+        report: None,
         approved: None,
     }
 }

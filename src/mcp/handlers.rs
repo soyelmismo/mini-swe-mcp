@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
 use crate::pool::round::first_line;
-use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view};
+use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view, normalize_diff_path};
 
 /// Owner label used when neither the pool nor the registry has a row.
 const UNKNOWN_OWNER: &str = "unknown";
@@ -715,6 +715,7 @@ impl McpServer {
                         "step": entry.step,
                         "turns": entry.step,
                         "summary": entry.last_command.clone(),
+                        "report": entry.report,
                         "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                         "question": entry.question,
                         "pid": entry.pid,
@@ -816,7 +817,7 @@ impl McpServer {
                 logs_dropped: collected.logs_dropped,
                 logs_truncation_notice: collected.logs_truncation_notice,
             };
-            let (summary, verified, branch) = completed_fields(Some(&collected.state));
+            let (summary, verified, branch, report) = completed_fields(Some(&collected.state));
             // Collect ends the worker's reviewable life, so the guidance is
             // about the branch it leaves behind rather than a further steer.
             let next_step = crate::pool::next_step_for(branch.as_deref());
@@ -845,6 +846,7 @@ impl McpServer {
                 "summary": summary,
                 "verified": verified,
                 "branch": branch,
+                "report": report,
                 "diff_stat": diff_stat_value(&stats),
                 "next_step": next_step,
             });
@@ -879,7 +881,8 @@ impl McpServer {
         if state.is_none() && entry.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
-        let (summary, verified, state_branch) = completed_fields(state.as_ref());
+        let (summary, verified, state_branch, report) = completed_fields(state.as_ref());
+        let report = report.or_else(|| entry.as_ref().and_then(|entry| entry.report.clone()));
         let branch = state_branch.unwrap_or_else(|| format!("worker-{wid}"));
         // The registry row is the only cross-process record of where the
         // worker's repository is and which branch it integrates with.
@@ -974,6 +977,7 @@ impl McpServer {
             "test_files": test_files_value(&summaries),
             "docs": docs_value(&summaries),
             "summary": summary,
+            "report": report,
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
@@ -1559,15 +1563,26 @@ const VERIFY_TAIL_STEPS: usize = 8;
 /// gate verified it, and the branch it leaves behind.
 fn completed_fields(
     state: Option<&crate::pool::WorkerState>,
-) -> (Option<String>, Option<bool>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+    Option<crate::pool::WorkerReport>,
+) {
     match state {
         Some(crate::pool::WorkerState::Completed {
             summary,
             verified,
             branch,
+            report,
             ..
-        }) => (Some(summary.clone()), *verified, branch.clone()),
-        _ => (None, None, None),
+        }) => (
+            Some(summary.clone()),
+            *verified,
+            branch.clone(),
+            report.clone(),
+        ),
+        _ => (None, None, None, None),
     }
 }
 
@@ -1760,113 +1775,10 @@ fn numstat_count(field: &str) -> Option<usize> {
     })
 }
 
-/// One file's share of a diff, as `git diff --numstat` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DiffFileStat {
-    pub(super) path: String,
-    pub(super) insertions: usize,
-    pub(super) deletions: usize,
-}
-
-/// A path as git spells it in a diff header, without the `a/`/`b/` prefix or a
-/// leading `./`, so a caller's `--file src/a.rs` matches what git printed.
-fn normalize_diff_path(path: &str) -> String {
-    let path = path
-        .strip_prefix("b/")
-        .or_else(|| path.strip_prefix("a/"))
-        .unwrap_or(path)
-        .trim_matches('"');
-    path.strip_prefix("./").unwrap_or(path).to_string()
-}
-
-/// Whether a requested path names the file a diff section is about.
-///
-/// Exact after normalisation, or a whole-component suffix of it, so `--file
-/// a.rs` still finds `src/a.rs`.
-fn same_diff_path(requested: &str, actual: &str) -> bool {
-    let requested = normalize_diff_path(requested);
-    let actual = normalize_diff_path(actual);
-    actual == requested
-        || (!requested.is_empty()
-            && actual.len() > requested.len()
-            && actual.ends_with(&requested)
-            && actual[..actual.len() - requested.len()].ends_with('/'))
-}
-
-/// The path a `--- `/`+++ ` header names, or `None` for `/dev/null`.
-fn diff_header_path(header: &str) -> Option<String> {
-    let path = header.trim();
-    (path != "/dev/null").then(|| normalize_diff_path(path))
-}
-
-/// One file's section of a diff, while it is still being read.
-struct DiffSection {
-    /// The path as the "after" side spells it.
-    path: String,
-    /// The path as the "before" side spells it, for a file that was deleted.
-    minus: String,
-    body: String,
-}
-
-impl DiffSection {
-    /// The path the section is about: the "after" side when the file still
-    /// exists, the "before" side when it does not.
-    fn path(&self) -> &str {
-        if self.path.is_empty() {
-            &self.minus
-        } else {
-            &self.path
-        }
-    }
-}
-
-/// Split a unified diff into one `(path, section)` pair per file.
-///
-/// The path comes from the `+++`/`---` headers, which precede every hunk, so a
-/// removed line that happens to start with `--` can never be mistaken for one.
-/// A section with neither header — a binary file, a mode-only change — falls
-/// back to the paths its `diff --git` line names.
-fn diff_sections(diff: &str) -> Vec<(String, String)> {
-    let mut sections: Vec<(String, String)> = Vec::new();
-    let mut current: Option<DiffSection> = None;
-    for line in diff.lines() {
-        if let Some(header) = line.strip_prefix("diff --git ") {
-            if let Some(section) = current.take() {
-                sections.push((section.path().to_string(), section.body));
-            }
-            current = Some(DiffSection {
-                path: diff_git_path(header).unwrap_or_default(),
-                minus: String::new(),
-                body: format!("{line}\n"),
-            });
-            continue;
-        }
-        let Some(section) = current.as_mut() else {
-            continue;
-        };
-        section.body.push_str(line);
-        section.body.push('\n');
-        if let Some(found) = line.strip_prefix("--- ").and_then(diff_header_path) {
-            section.minus = found;
-        } else if let Some(found) = line.strip_prefix("+++ ").and_then(diff_header_path) {
-            section.path = found;
-        }
-    }
-    if let Some(section) = current.take() {
-        sections.push((section.path().to_string(), section.body));
-    }
-    sections
-        .into_iter()
-        .filter(|(path, _)| !path.is_empty())
-        .collect()
-}
-
-/// The path a `diff --git a/<path> b/<path>` line names on its "before" side.
-fn diff_git_path(header: &str) -> Option<String> {
-    let split = header.rfind(" b/")?;
-    let path = &header[..split];
-    Some(normalize_diff_path(path.strip_prefix("a/").unwrap_or(path)))
-}
+/// One file's share of a diff, as `git diff --numstat` reports it. The shared
+/// [`crate::pool::FileStat`] keeps the review payload and the completion event
+/// reading the same shape.
+pub(super) type DiffFileStat = crate::pool::FileStat;
 
 /// Which part of a change a path belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1968,7 +1880,7 @@ pub(super) struct DiffFileSummary {
 /// `---`/`+++` headers and an added line that itself starts with `+` are never
 /// mistaken for a change.
 fn diff_file_summaries(diff: &str) -> Vec<DiffFileSummary> {
-    diff_sections(diff)
+    crate::pool::diff_sections_of(diff)
         .into_iter()
         .map(|(path, section)| {
             let kind = classify_path(&path);
@@ -2002,19 +1914,12 @@ fn diff_file_summaries(diff: &str) -> Vec<DiffFileSummary> {
 
 /// Per-file `(path, insertions, deletions)` of a unified diff.
 fn diff_file_stats(diff: &str) -> Vec<DiffFileStat> {
-    diff_file_summaries(diff)
-        .into_iter()
-        .map(|summary| DiffFileStat {
-            path: summary.path,
-            insertions: summary.insertions,
-            deletions: summary.deletions,
-        })
-        .collect()
+    crate::pool::file_stats_of_diff(diff)
 }
 
 /// The sections of `diff` whose path classifies as `kind`, rejoined.
 fn diff_of_kind(diff: &str, kind: PathKind) -> String {
-    diff_sections(diff)
+    crate::pool::diff_sections_of(diff)
         .into_iter()
         .filter(|(path, _)| classify_path(path) == kind)
         .map(|(_, section)| section)
@@ -2058,9 +1963,13 @@ fn docs_value(summaries: &[DiffFileSummary]) -> Value {
 
 /// The sections of `diff` that touch any of `files`, rejoined.
 fn diff_of_files(diff: &str, files: &[String]) -> String {
-    diff_sections(diff)
+    crate::pool::diff_sections_of(diff)
         .into_iter()
-        .filter(|(path, _)| files.iter().any(|file| same_diff_path(file, path)))
+        .filter(|(path, _)| {
+            files
+                .iter()
+                .any(|file| crate::pool::same_diff_path(file, path))
+        })
         .map(|(_, section)| section)
         .collect()
 }
