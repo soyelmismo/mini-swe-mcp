@@ -32,7 +32,7 @@
 //! every branch; the `/proc` readers beside it return `None` when unreadable,
 //! and an unreadable criterion is skipped rather than read as a failure. The
 //! controller adds only what a pure function cannot express: the running
-//! counter, FIFO queueing and the re-evaluation wakeups.
+//! counter, priority queueing and the re-evaluation wakeups.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -304,14 +304,31 @@ fn psi_avg10_from(body: &str, kind: &str) -> Option<f64> {
     field.strip_prefix("avg10=")?.parse().ok()
 }
 
-/// The mutable half of the controller: the running count and the FIFO queue.
+/// Completion checks take precedence over exploratory builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    /// A worker still exploring or iterating.
+    Exploratory,
+    /// The canonical or divergent completion verification.
+    Completion,
+}
+
+/// Select the next request, preserving arrival order within each class.
+fn next_request(queue: &VecDeque<(u64, AdmissionClass)>) -> Option<usize> {
+    queue
+        .iter()
+        .position(|(_, class)| *class == AdmissionClass::Completion)
+        .or_else(|| (!queue.is_empty()).then_some(0))
+}
+
+/// The mutable half of the controller: the running count and priority queue.
 struct Gate {
     /// Heavy commands holding a slot right now.
     running: usize,
     /// Occupied slot indices; allocation always chooses the lowest free one.
     slots: Vec<bool>,
-    /// Ids of the queued requests, oldest first.
-    queue: VecDeque<u64>,
+    /// Requests in arrival order, selected by class and then FIFO.
+    queue: VecDeque<(u64, AdmissionClass)>,
 }
 
 /// The `/proc` readings, cached for [`SAMPLE_TTL`].
@@ -340,7 +357,7 @@ struct Inner {
     next_id: AtomicU64,
 }
 
-/// FIFO admission controller for heavy commands.
+/// Priority admission controller for heavy commands.
 ///
 /// Cloneable and cheap: every clone shares one counter, one queue and one
 /// wakeup channel, so the pool hands the same controller to every worker.
@@ -426,37 +443,39 @@ impl AdmissionController {
         self.lock_gate().running
     }
 
-    /// Requests queued for a heavy slot, oldest first.
+    /// Number of requests queued for a heavy slot.
     pub fn waiting(&self) -> usize {
         self.lock_gate().queue.len()
     }
 
-    /// Take a heavy slot, waiting FIFO while the host cannot take another
-    /// build. The returned permit holds the slot until it is dropped.
+    /// Take a heavy slot, prioritizing completion checks over exploration and
+    /// waiting FIFO within each class. The permit holds the slot until dropped.
     ///
     /// Cancellation-safe: a request dropped while queued (its worker killed,
     /// its step timed out) leaves the queue, so it can never hold the head of
     /// the line for every later request.
-    pub async fn acquire(&self) -> HeavyPermit {
+    pub async fn acquire(&self, class: AdmissionClass) -> HeavyPermit {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let ticket = QueueTicket {
             controller: self,
             id,
         };
         loop {
+            // Register before deciding so a release between the decision and
+            // the await cannot lose its wakeup.
+            let notified = self.inner.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let sample = self.sample();
             // One critical section decides *and* reserves, so two waiters
             // woken by the same notification cannot both take the last slot.
             let outcome = {
                 let mut gate = self.lock_gate();
-                // Every waiter takes a queue ticket on arrival, and only the
-                // oldest ticket is ever a candidate, so a newcomer can never
-                // jump ahead of a request that arrived first.
-                if !gate.queue.contains(&id) {
-                    gate.queue.push_back(id);
+                if !gate.queue.iter().any(|(queued, _)| *queued == id) {
+                    gate.queue.push_back((id, class));
                 }
-                let is_head = gate.queue.front().is_some_and(|head| *head == id);
-                if !is_head {
+                let next = next_request(&gate.queue).expect("queued request");
+                if gate.queue[next].0 != id {
                     None
                 } else {
                     match admit(&AdmissionInputs {
@@ -475,7 +494,7 @@ impl AdmissionController {
                         io_full_avg10: sample.io_full_avg10,
                     }) {
                         Decision::Granted { jobs } => {
-                            gate.queue.pop_front();
+                            gate.queue.remove(next);
                             let slot = gate.slots.iter().position(|used| !used).expect("free slot");
                             gate.slots[slot] = true;
                             gate.running += 1;
@@ -515,12 +534,12 @@ impl AdmissionController {
                     reason = blocked.reason(),
                     "Heavy command waiting for admission"
                 ),
-                // Somebody older is ahead of this request; it is re-evaluated
+                // A higher-priority or older peer is ahead; re-evaluate
                 // when that one is granted or gives up.
                 None => {}
             }
             tokio::select! {
-                _ = self.inner.wake.notified() => {}
+                _ = &mut notified => {}
                 _ = tokio::time::sleep(RE_EVALUATE_INTERVAL) => {}
             }
         }
@@ -578,8 +597,9 @@ struct QueueTicket<'a> {
 impl Drop for QueueTicket<'_> {
     fn drop(&mut self) {
         let mut gate = self.controller.lock_gate();
-        let was_head = gate.queue.front() == Some(&self.id);
-        gate.queue.retain(|queued| *queued != self.id);
+        let was_head =
+            next_request(&gate.queue).is_some_and(|index| gate.queue[index].0 == self.id);
+        gate.queue.retain(|(queued, _)| *queued != self.id);
         drop(gate);
         if was_head {
             // The next request in line may be admissible right now.
@@ -652,17 +672,20 @@ mod tests {
     async fn slots_are_exclusive_and_reuse_the_lowest_free_index() {
         let controller = AdmissionController::new(3, 4, 0, 0, 60.0, 10.0, 40.0);
         controller.__test_set_host_sample(Some(HostSample::default()));
-        let first = controller.acquire().await;
-        let second = controller.acquire().await;
-        let third = controller.acquire().await;
+        let first = controller.acquire(AdmissionClass::Exploratory).await;
+        let second = controller.acquire(AdmissionClass::Exploratory).await;
+        let third = controller.acquire(AdmissionClass::Exploratory).await;
         assert_eq!((first.slot(), second.slot(), third.slot()), (0, 1, 2));
         drop(second);
-        let reused = controller.acquire().await;
+        let reused = controller.acquire(AdmissionClass::Exploratory).await;
         assert_eq!(reused.slot(), 1);
         assert_eq!(controller.running_heavy(), 3);
         drop((first, third, reused));
         assert_eq!(controller.running_heavy(), 0);
-        assert_eq!(controller.acquire().await.slot(), 0);
+        assert_eq!(
+            controller.acquire(AdmissionClass::Exploratory).await.slot(),
+            0
+        );
     }
 
     #[test]
@@ -886,6 +909,119 @@ mod tests {
         let body = "some avg10=0.00 avg60=0.00 avg300=0.00 total=123456\n                    full avg10=1.50 avg60=0.00 avg300=0.00 total=789012\n";
         assert_eq!(psi_avg10_from(body, "some"), Some(0.0));
         assert_eq!(psi_avg10_from(body, "full"), Some(1.5));
+    }
+
+    /// The queue order is a pure function of the requests' classes and
+    /// arrival order: completion first, FIFO inside each class.
+    #[test]
+    fn next_request_serves_completion_before_exploration() {
+        use AdmissionClass::{Completion, Exploratory};
+        type Case = (&'static [(u64, AdmissionClass)], Option<usize>);
+        let cases: &[Case] = &[
+            (&[], None),
+            (&[(1, Exploratory)], Some(0)),
+            (&[(1, Completion)], Some(0)),
+            // A late completion jumps ahead of an older exploration.
+            (&[(1, Exploratory), (2, Completion)], Some(1)),
+            // ... but not ahead of an older completion: FIFO inside the class.
+            (
+                &[(1, Completion), (2, Exploratory), (3, Completion)],
+                Some(0),
+            ),
+            (
+                &[(1, Exploratory), (2, Exploratory), (3, Completion)],
+                Some(2),
+            ),
+            // Two completions keep their arrival order.
+            (&[(1, Completion), (2, Completion)], Some(0)),
+            (
+                &[(1, Exploratory), (2, Completion), (3, Completion)],
+                Some(1),
+            ),
+        ];
+        for (queue, expected) in cases {
+            let queue: VecDeque<(u64, AdmissionClass)> = queue.iter().copied().collect();
+            assert_eq!(
+                next_request(&queue),
+                *expected,
+                "wrong next request for {queue:?}"
+            );
+        }
+    }
+
+    /// A completion request queued behind an exploratory one is served first
+    /// when the slot frees, and the exploratory one follows.
+    #[tokio::test]
+    async fn a_completion_request_is_served_before_an_exploratory_one() {
+        let controller = AdmissionController::new(1, 4, 2048, 1536, 60.0, 10.0, 40.0);
+        controller.__test_set_host_sample(Some(HostSample {
+            mem_available_mb: Some(12_000),
+            load1: Some(0.5),
+            cpu_some_avg10: None,
+            mem_full_avg10: None,
+            io_full_avg10: None,
+        }));
+        let held = controller.acquire(AdmissionClass::Exploratory).await;
+
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawn = |class: AdmissionClass, tag: &'static str| {
+            let controller = controller.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _permit = controller.acquire(class).await;
+                order.lock().expect("order lock").push(tag);
+            })
+        };
+        let exploring = spawn(AdmissionClass::Exploratory, "exploring");
+        // The exploratory request must be queued before the completion one.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let completing = spawn(AdmissionClass::Completion, "completing");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(controller.waiting(), 2, "both requests must be queued");
+
+        drop(held);
+        let _ = tokio::join!(completing, exploring);
+        assert_eq!(
+            *order.lock().expect("order lock"),
+            vec!["completing", "exploring"],
+            "the completion gate must not wait behind an exploratory build"
+        );
+    }
+
+    /// A cancelled exploratory request cannot hold a completion one back: the
+    /// ticket leaves its queue, so the completion request is served next.
+    #[tokio::test]
+    async fn a_cancelled_exploration_does_not_block_a_completion() {
+        let controller = AdmissionController::new(1, 4, 2048, 1536, 60.0, 10.0, 40.0);
+        controller.__test_set_host_sample(Some(HostSample {
+            mem_available_mb: Some(12_000),
+            load1: Some(0.5),
+            cpu_some_avg10: None,
+            mem_full_avg10: None,
+            io_full_avg10: None,
+        }));
+        let held = controller.acquire(AdmissionClass::Exploratory).await;
+        let doomed = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.acquire(AdmissionClass::Exploratory).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let completing = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.acquire(AdmissionClass::Completion).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(controller.waiting(), 2);
+
+        doomed.abort();
+        let _ = doomed.await;
+        assert_eq!(controller.waiting(), 1, "the aborted request must leave");
+        drop(held);
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), completing)
+            .await
+            .expect("the completion request must not wait behind the ghost")
+            .expect("completion task completes");
+        drop(permit);
     }
 
     #[test]

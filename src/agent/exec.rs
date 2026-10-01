@@ -567,8 +567,12 @@ enum IoPlan {
 /// mechanism: `ioprio_set` in the child, or the `ionice -c3` wrapper on a host
 /// where the syscall does not answer.
 fn io_plan(heavy: bool, syscall_ok: bool, heavy_ionice: Option<u8>) -> IoPlan {
-    let demote = heavy && heavy_ionice != Some(0);
-    match (demote, syscall_ok) {
+    // `HUB_HEAVY_IONICE=0` disables the feature outright: the child keeps
+    // whatever class it inherited, demotion and pinning alike.
+    if heavy && heavy_ionice == Some(0) {
+        return IoPlan::Inherit;
+    }
+    match (heavy, syscall_ok) {
         (true, true) => IoPlan::Set(IoClass::Idle),
         // No `ioprio_set` on this host, so `ionice` is the only way to demote.
         (true, false) => IoPlan::Wrap(IoClass::Idle),
@@ -1464,10 +1468,7 @@ mod tests {
         // Heavy on a host with `ioprio_set`: the idle class, set by the hook.
         assert_eq!(io_plan(true, true, None), IoPlan::Set(IoClass::Idle));
         // Light: best-effort normal, so a demotion is never inherited.
-        assert_eq!(
-            io_plan(false, true, None),
-            IoPlan::Set(IoClass::BestEffort)
-        );
+        assert_eq!(io_plan(false, true, None), IoPlan::Set(IoClass::BestEffort));
         // `HUB_HEAVY_IONICE=0` opts a heavy command out entirely.
         assert_eq!(io_plan(true, true, Some(0)), IoPlan::Inherit);
         // Any other value leaves the demotion on.
@@ -2438,8 +2439,14 @@ mod tests {
     async fn run_confined_python(offline: bool, tag: &str, script: &str) -> String {
         let scratch = LandlockScratch::new(tag);
         let mut cmd = Command::new("python3");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, offline, IoPlan::Inherit)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            offline,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(script);
         let out = cmd
             .output()
@@ -2552,8 +2559,14 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
     async fn a_command_runs_while_the_landlock_hook_is_installed() {
         let scratch = LandlockScratch::new("runs");
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false, IoPlan::Inherit)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("echo confined-and-alive");
 
         let out = cmd
@@ -2625,8 +2638,14 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         );
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false, IoPlan::Inherit)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg(&probe);
         let out = cmd.output().await.expect("spawn the confined probe");
 
@@ -2680,15 +2699,27 @@ for name, fam, kind in [("tcp4", socket.AF_INET, socket.SOCK_STREAM),
         std::fs::write(&outside, b"secret").expect("seed a file outside the domain");
 
         let mut cmd = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut cmd, &scratch.worktree, &scratch.target, false, IoPlan::Inherit)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut cmd,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         cmd.arg("-c").arg("true");
         let _ = cmd.output().await.expect("spawn");
 
         // The child could not have read it...
         let mut child = Command::new("/bin/sh");
-        apply_kernel_confinement(&mut child, &scratch.worktree, &scratch.target, false, IoPlan::Inherit)
-            .expect("prepare the kernel confinement");
+        apply_kernel_confinement(
+            &mut child,
+            &scratch.worktree,
+            &scratch.target,
+            false,
+            IoPlan::Inherit,
+        )
+        .expect("prepare the kernel confinement");
         child.arg("-c").arg(format!("cat {}", outside.display()));
         let out = child.output().await.expect("spawn");
         assert!(
