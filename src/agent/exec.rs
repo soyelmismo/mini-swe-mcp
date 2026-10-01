@@ -38,19 +38,20 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::AgentRunner;
 use super::intercept::{check_command, strip_data_heredocs};
+use super::jobs::{JobHandle, JobState};
 use super::sandbox::{
     KernelConfinement, TRUNCATE_HEAD, TRUNCATE_TAIL, find_git_common_dir, find_git_dirs, has_bwrap,
     is_heavy_command, truncate_with_dropped, validate_bash_command,
 };
 
 /// Exit code reported when a command exceeded its wall-clock budget.
-const TIMEOUT_EXIT_CODE: i32 = 124;
+pub(super) const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Default wall-clock budget (seconds) for heavy commands (builds, test suites).
 const DEFAULT_HEAVY_TIMEOUT_SECS: u64 = 600;
@@ -112,7 +113,7 @@ const STEP_TERM_GRACE_MS: u64 = 500;
 const GROUP_POLL_MS: u64 = 25;
 
 /// [`TERM_GRACE_MS`] as a [`Duration`], for the callers that pass a grace.
-const TERM_GRACE: Duration = Duration::from_millis(TERM_GRACE_MS);
+pub(super) const TERM_GRACE: Duration = Duration::from_millis(TERM_GRACE_MS);
 
 /// [`STEP_TERM_GRACE_MS`] as a [`Duration`], for the callers that pass a grace.
 const STEP_TERM_GRACE: Duration = Duration::from_millis(STEP_TERM_GRACE_MS);
@@ -134,6 +135,14 @@ const NETWORK_NAMESPACE_TOOL: &str = "unshare";
 /// Wrapping in `bash -c` keeps the model's command semantics (pipes,
 /// redirections, `&&`) intact instead of re-parsing the string into argv.
 const OFFLINE_SHELL: &str = "bash";
+
+/// Cap on the log file a background job's output streams to.
+///
+/// A build log is unbounded by nature, so the file is capped: what survives is
+/// the most recent window rather than the oldest bytes. The head and tail the
+/// model sees come from the bounded in-memory buffer instead, so nothing it
+/// could read is lost here.
+const JOB_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Bound on draining the output pipes of a terminated command.
 ///
@@ -1055,7 +1064,7 @@ async fn run_with_timeout(cmd: &mut Command, timeout_secs: u64) -> Result<(Strin
 
 /// Head and tail of a command's output stream, bounded to exactly the bytes
 /// [`truncate_output`] would have kept.
-struct Captured {
+pub(super) struct Captured {
     /// First [`TRUNCATE_HEAD`] bytes seen; later input spills into `tail`.
     head: Vec<u8>,
     /// Last [`TRUNCATE_TAIL`] bytes seen, kept in a rolling window so the
@@ -1120,7 +1129,7 @@ impl Captured {
     /// single place that decides what the model sees and can account for both
     /// streams' elisions in one marker. Borrows rather than consumes so the
     /// caller can snapshot a partial drain.
-    fn captured(&self) -> Vec<u8> {
+    pub(super) fn captured(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.tail);
@@ -1128,7 +1137,7 @@ impl Captured {
     }
 
     /// Bytes this stream produced that the retained head/tail do not hold.
-    fn dropped(&self) -> usize {
+    pub(super) fn dropped(&self) -> usize {
         self.seen - self.head.len() - self.tail.len()
     }
 }
@@ -1147,7 +1156,7 @@ impl Captured {
 /// full pipe buffer from wedging the child in `write` -- while [`Captured`]
 /// discards everything the truncation budget cannot show. Together they let a
 /// multi-gigabyte build log cost 16 KiB of memory and still not deadlock.
-struct PipeBuffer {
+pub(super) struct PipeBuffer {
     bytes: Arc<Mutex<Captured>>,
     reader: tokio::task::JoinHandle<()>,
 }
@@ -1164,7 +1173,7 @@ impl Drop for PipeBuffer {
 ///
 /// `dropped` lets [`combine_streams`] tell "the child printed 20 KB" from "the
 /// child printed 4 GB" and report the right figure in the truncation marker.
-struct Stream {
+pub(super) struct Stream {
     bytes: Vec<u8>,
     dropped: usize,
 }
@@ -1203,7 +1212,7 @@ impl PipeBuffer {
     /// write end can hold the pipe open long after its parent was killed; the
     /// reader is then cancelled and the bytes captured up to that point
     /// returned.
-    async fn finish(mut self) -> Stream {
+    pub(super) async fn finish(mut self) -> Stream {
         if tokio::time::timeout(Duration::from_millis(DRAIN_GRACE_MS), &mut self.reader)
             .await
             .is_err()
