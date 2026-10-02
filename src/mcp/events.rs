@@ -961,7 +961,7 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
         }
     }
     for (id, view) in &mut current {
-        if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id) {
+        if view.event == Some(EventKind::NeedsInput) && pool.question_for_consolidator(id).await {
             view.event = None;
         } else if matches!(
             view.event,
@@ -1523,7 +1523,7 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         }
     }
     for (id, view) in &mut views {
-        if pool.question_for_consolidator(id) {
+        if pool.question_for_consolidator(id).await {
             view["question_for_consolidator"] = json!(true);
         }
         if pool.steered_by_live_consolidator(id).await {
