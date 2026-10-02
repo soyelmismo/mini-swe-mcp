@@ -9,6 +9,7 @@
 
 mod common;
 
+use mini_swe_mcp::hub::HubPaths;
 use mini_swe_mcp::pool::{RegistryStatus, WorkerMeta};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,40 @@ fn mentions(line: &str, event: &str) -> bool {
     }
 }
 
+/// Where the hub socket for `hub_dir` really is: inside it when the path fits
+/// `sun_path`, and in the short fallback directory (or the abstract namespace)
+/// when it does not. The test reads the daemon's own log rather than guessing,
+/// so a hub directory long enough to need the fallback still works.
+fn socket_path(hub_dir: &Path) -> PathBuf {
+    HubPaths::new(hub_dir.to_path_buf()).socket()
+}
+
+/// The daemon under test: the same executable the watch would start for
+/// itself, spawned here so the test can cut it.
+fn daemon_command(hub_dir: &Path, swe: &Path) -> std::process::Command {
+    let mut daemon = common::binary_command(&common::binary_path());
+    daemon
+        .arg("daemon")
+        .env("SWE_HUB_DIR", hub_dir)
+        .env("SWE_TEMP_DIR", swe)
+        .env_remove("MINI_SWE_NO_DAEMON")
+        .env("HUB_IDLE_SECS", "60")
+        // Auto-resume off, so the replacement's recovery keeps the status the
+        // row already had instead of starting a worker this test never wanted.
+        .env("HUB_AUTO_RESUME", "0")
+        .env("ENV_FILE", "/nonexistent-mini-swe-reconnect")
+        .env("OPENAI_API_KEY", "test-key-not-used-by-the-reconnect-test")
+        .stdout(Stdio::null())
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(hub_dir.join("hub.log"))
+                .expect("open the hub log"),
+        );
+    daemon
+}
+
 /// The pids the hub log announced, newest last.
 fn daemon_pids(hub_dir: &Path) -> Vec<i32> {
     let log = std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default();
@@ -77,16 +112,24 @@ fn signal(pid: i32, sig: libc::c_int) -> Option<()> {
     }
 }
 
-/// The daemon a CLI `watch` process starts for itself, so a `SIGTERM` stops
-/// that one and not any other daemon on the host.
+/// The daemons this test spawns in its own hub directory, and the stand-in
+/// worker they keep alive.
+///
+/// Every daemon that answers this directory is in `pids` — including the
+/// replacement the watch starts for itself — so a failing test signals only
+/// those, and never a daemon belonging to anything else on the host.
 struct WatchDaemon {
     hub_dir: PathBuf,
     sleeper: Child,
     pids: BTreeSet<i32>,
+    /// Whether this test still has to stop its daemons. The struct that owns
+    /// the directory arms this as soon as it starts the first one.
     armed: bool,
 }
 
 impl WatchDaemon {
+    /// A stand-in worker process: a real pid, so neither the cut nor the
+    /// replacement's recovery can decide the row it backs is dead.
     fn new(hub_dir: &Path) -> Self {
         Self {
             hub_dir: hub_dir.to_path_buf(),
@@ -100,36 +143,38 @@ impl WatchDaemon {
         }
     }
 
-    /// The pid of the daemon the watch is talking to.
+    /// The pid of the newest daemon on this directory.
     fn current(&self) -> i32 {
         *daemon_pids(&self.hub_dir)
             .last()
             .expect("a daemon announced itself")
     }
 
-    /// Stop that daemon the way a handover does: abruptly, so the connection is
-    /// cut rather than closed in an orderly way.
+    /// Stop the daemon the watch is talking to the way a busy handover does:
+    /// abruptly, with nothing flushed, so the connection is cut rather than
+    /// closed in an orderly way.
     fn cut(&mut self) {
-        assert!(
-            signal(self.current(), libc::SIGKILL).is_some(),
-            "kill the daemon the watch is talking to"
-        );
-        self.pids.insert(self.current());
+        let pid = self.current();
+        assert!(signal(pid, libc::SIGKILL).is_some(), "kill the daemon");
+        self.pids.insert(pid);
     }
 
-    /// Stop every daemon that answered this test's socket, and take the stand-in
-    /// worker with them, so a failing test leaves nothing behind.
+    /// Stop every daemon that answered this directory, and take the stand-in
+    /// worker with them, so a failing test leaves nothing running.
     fn close(&mut self) {
         for pid in std::mem::take(&mut self.pids) {
             signal(pid, libc::SIGTERM);
         }
-        self.pids.clear();
         for pid in daemon_pids(&self.hub_dir) {
             signal(pid, libc::SIGTERM);
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline
-            && self.pids.iter().any(|pid| matches!(signal(*pid, 0), Some(())))
+            && self
+                .pids
+                .iter()
+                .chain(daemon_pids(&self.hub_dir).iter())
+                .any(|pid| matches!(signal(*pid, 0), Some(())))
         {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -160,7 +205,7 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
     let pool = isolated.pool.clone();
     // Its own directory, not the pool's base: the watch spawns the replacement
     // daemon itself, so everything it starts has to stay inside this test.
-    let hub = common::TempDir::new(&swe.join("hub"), "watch-cut");
+    let hub = common::TempDir::new_in_tmp("watch-cut");
     let hub_dir = hub.path().to_path_buf();
 
     // The watch owns the hub directory from here on, so the replacement daemon
@@ -199,9 +244,10 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
         _ = tokio::time::timeout(Duration::from_secs(20), read_to_end(&mut errors)) => {
             let status = watch.wait().await.expect("the watch process joins");
             panic!(
-                "the watch never reached the daemon: {status:?}, stderr: {:?}, hub.dir={}, swe={}, hub.log:\n{}",
+                "the watch never reached the daemon: {status:?}\nstdout: {:?}\nstderr: {:?}\nhub.dir={}\nswe={}\nhub.log:\n{}",
+                read_to_end(&mut output).await,
                 read_to_end(&mut errors).await,
-                hub_dir.display(),
+                hub.path().display(),
                 swe.display(),
                 std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default(),
             );
@@ -209,15 +255,31 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
     }
     owned.cut();
 
-    // The watch follows the daemon it lost: the replacement hub starts, answers
-    // it again, and the CLI process is still the one watching.
-    wait_for_log(&hub_dir, "listening", 2).await;
-    wait_for_log(&hub_dir, "recovered", 2).await;
+    // The replacement binds the socket again: that is what the reconnecting
+    // watch dials, wherever `sun_path` allowed this hub directory to put it.
+    let rebound = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if socket_path(&hub_dir).exists() && daemon_pids(&hub_dir).len() > 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if rebound.is_err() {
+        let status = watch.wait().await.expect("the watch process joins");
+        panic!(
+            "the watch did not follow the daemon: {status:?}, stderr: {:?}, hub.log:\n{}",
+            read_to_end(&mut errors).await,
+            std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default(),
+        );
+    }
     assert!(
         matches!(watch.try_wait(), Ok(None)),
         "the watch must survive the reset, not exit with it; stderr: {:?}",
         read_to_end(&mut errors).await
     );
+    wait_for_log(&hub_dir, "recovered", 2).await;
 
     // And the delivery continues: the worker's terminal status is the next
     // event, and it reaches the same CLI process over the new connection.
@@ -282,6 +344,9 @@ fn watch_command(hub_dir: &Path, swe: &Path) -> std::process::Command {
 
 /// Drain `stream` to its end, so a child that is never waited on cannot fill a
 /// pipe and block on its next write.
+///
+/// The CLI prints its own failures to stdout (the JSON document is the
+/// interface), so `main`'s `Debug` rendering of them never reaches stderr.
 async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Vec<u8> {
     let mut seen = Vec::new();
     let _ = tokio::io::AsyncReadExt::read_to_end(stream, &mut seen).await;
