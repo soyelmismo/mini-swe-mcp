@@ -188,6 +188,11 @@ pub struct WorktreeGuard {
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
     pub preserve_branch: bool,
+    /// Set by the hub's planned shutdown: the worker ends
+    /// `Interrupted`, so its branch must survive teardown even when
+    /// the worker made no commit (the branch then points exactly at
+    /// the base commit).
+    pub interrupted: bool,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
     /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
@@ -370,6 +375,7 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
+            interrupted: false,
             seeded,
         })
     }
@@ -964,6 +970,55 @@ impl WorktreeGuard {
         .unwrap_or(false)
     }
 
+    /// Mark the guard as belonging to a worker the hub interrupted.
+    ///
+    /// Called by the hub's shutdown path before the guard is dropped:
+    /// a planned shutdown ends the worker `Interrupted`, so its branch
+    /// (and therefore its continuability) must outlive the worktree
+    /// teardown, even when the worker never committed anything.
+    ///
+    /// The pool only tracks the checkout path, so the mark is also
+    /// written to a file the guard's own [`Drop`] reads: the abort
+    /// that ends the worker's task drops the guard in another
+    /// execution context, where the in-memory flag would not be
+    /// visible. [`clear_interrupted_marker`] removes it.
+    pub fn mark_interrupted(&mut self) {
+        self.interrupted = true;
+        let _ = std::fs::write(self.interrupted_marker_path(), b"interrupted");
+    }
+
+    /// Whether this guard belongs to an interrupted worker.
+    ///
+    /// The in-memory flag covers a guard whose `mark_interrupted` ran
+    /// in this process; the marker file covers the abort-drops case,
+    /// where the shutdown path marked a guard this process later
+    /// drops without ever holding it.
+    fn interrupted(&self) -> bool {
+        self.interrupted
+            || self.interrupted_marker_path().is_file()
+    }
+
+    /// Remove the interruption marker, once it has been honoured.
+    ///
+    /// [`Drop`] calls this after the branch decision, so a *later*
+    /// run of the same worker id starts unmarked: its teardown
+    /// prunes a branch that points nowhere past the base again.
+    fn clear_interrupted_marker(&self) {
+        let _ = std::fs::remove_file(self.interrupted_marker_path());
+    }
+
+    /// The interruption marker path: beside the worktree, keyed by
+    /// worker id, so the shutdown path and the dropping task agree
+    /// on it.
+    fn interrupted_marker_path(&self) -> PathBuf {
+        let mut path = self.path.clone();
+        path.set_file_name(format!(
+            "swe-wt-{}.interrupted",
+            self.worker_id()
+        ));
+        path
+    }
+
     /// The worker id this guard belongs to, recovered from the worktree
     /// directory name (`swe-wt-<id>`): the sweep logs it, and the id is not
     /// stored on the guard.
@@ -1029,8 +1084,22 @@ impl Drop for WorktreeGuard {
         );
         // If the branch has commits beyond base_commit, ALWAYS preserve it.
         let has_commits = !self.preserve_branch && self.branch_has_commits();
+        // An interrupted worker may have made no commit at all -- its
+        // branch then points exactly at the base commit -- but the
+        // branch must survive regardless: the next daemon's recovery
+        // auto-continues an Interrupted worker by re-attaching to it,
+        // so deleting the ref would strand the worker's row and
+        // history with nothing to continue on. The marker is consumed
+        // here: a later run of the same worker id that ends some
+        // other way still prunes its branch. A worker that ended some
+        // other way keeps deleting a branch that points nowhere past
+        // the base.
+        let interrupted = !self.preserve_branch && !has_commits && self.interrupted();
+        if self.interrupted {
+            self.clear_interrupted_marker();
+        }
 
-        if self.preserve_branch || has_commits {
+        if self.preserve_branch || has_commits || interrupted {
             info!(branch = %self.branch, "Preserving worker branch with committed changes");
         } else {
             let _ = git(
