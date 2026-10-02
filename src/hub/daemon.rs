@@ -1135,6 +1135,40 @@ mod tests {
             .expect("accept the connection");
     }
 
+    /// The short fallback directory is created by the binder and taken away
+    /// with the socket, so the hub dir is never left holding an empty one.
+    ///
+    /// Everything else resolves the endpoint without touching the filesystem,
+    /// which is what makes the resolution side-effect free; this pins the other
+    /// half of that contract.
+    #[tokio::test]
+    async fn binding_a_fallback_socket_creates_a_directory_the_guard_then_removes() {
+        let scratch = crate::test_support::TestScratch::new("hub-bind-fallback");
+        let hub_dir = scratch.path().join("hub");
+        std::fs::create_dir_all(&hub_dir).expect("create the hub dir");
+        // The fallback directory stands in for `/tmp/mswe-<uid>-<hash>`, so
+        // this test never writes outside its scratch.
+        let fallback = scratch.path().join("mswe-fallback");
+        let socket = fallback.join("hub.sock");
+        let guard = FallbackSocketGuard::new(&socket, &hub_dir);
+
+        let listener =
+            bind_endpoint(&HubEndpoint::Path(socket.clone())).expect("bind the fallback socket");
+        assert!(
+            fallback.is_dir(),
+            "the binder must create the fallback directory {}",
+            fallback.display()
+        );
+        assert!(socket.exists());
+        drop(listener);
+        drop(guard);
+        assert!(
+            !fallback.exists(),
+            "the guard must remove the fallback directory with the socket"
+        );
+        assert!(!socket.exists(), "the guard must remove the socket");
+    }
+
     /// Resolving the endpoint of a hub directory too deep for `sun_path` names
     /// a short fallback directory under `/tmp` -- and must not leave one behind.
     ///
@@ -1163,6 +1197,10 @@ mod tests {
         let fallback = paths
             .fallback_dir()
             .expect("a deep hub dir needs a fallback dir");
+        // The directory the endpoint resolution names must not exist, whether or
+        // not this host can create one: a resolvable `/tmp` is what turned every
+        // such probe into an empty leftover directory.
+        let _ = paths.endpoint();
         assert!(
             !fallback.exists(),
             "fallback_dir() must only compute the path, not create {}",
@@ -1177,10 +1215,10 @@ mod tests {
         // Nor does a client checking whether a daemon is already up, nor the
         // lock waiter probing for a predecessor: both dial the fallback socket
         // through `endpoint()`, which resolves it without creating it.
-        let _ = paths.endpoint();
+        let _ = paths.socket();
         assert!(
             !fallback.exists(),
-            "resolving the endpoint left {} behind",
+            "a probe of the endpoint left {} behind",
             fallback.display()
         );
     }

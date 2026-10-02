@@ -226,7 +226,7 @@ fn reclaim_scratch_root(path: &Path) {
 }
 
 /// Own the short fallback directory a too-deep hub directory's socket moves to,
-/// when [`mini_swe_mcp::hub::HubPaths::endpoint`] chose one.
+/// when [`mini_swe_mcp::hub::HubPaths::fallback_dir`] named one.
 ///
 /// A daemon removes this directory on a graceful exit and when its `run` future
 /// is dropped, but a daemon a test SIGKILLs (or leaves running) does not, so the
