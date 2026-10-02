@@ -256,18 +256,6 @@ impl Drop for FallbackSocketGuard {
 fn bind_endpoint(endpoint: &HubEndpoint) -> Result<UnixListener> {
     match endpoint {
         HubEndpoint::Path(path) => {
-            // The short fallback directory is created here, by the one caller
-            // that actually binds, and `FallbackSocketGuard` removes it again
-            // -- so resolving the endpoint anywhere else stays side-effect
-            // free and leaves no empty `/tmp/mswe-<uid>-<hash>` behind.
-            if let Some(parent) = path.parent() {
-                harden_hub_dir(parent.to_path_buf()).with_context(|| {
-                    format!(
-                        "Could not prepare hub socket directory {}",
-                        parent.display()
-                    )
-                })?;
-            }
             let listener = UnixListener::bind(path)
                 .with_context(|| format!("Could not bind hub socket {}", path.display()))?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
