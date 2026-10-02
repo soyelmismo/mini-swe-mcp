@@ -721,3 +721,287 @@ fn meta(id: &str) -> mini_swe_mcp::pool::WorkerMeta {
         ..mini_swe_mcp::pool::WorkerMeta::test_meta(id, "handover-test")
     }
 }
+
+// ---------------------------------------------------------------------------
+// OTA-style handover: the daemon notices its own rebuilt executable.
+// ---------------------------------------------------------------------------
+
+/// Replace every occurrence of `from` with `to` in place; the two are the
+/// same length, so the file's offsets do not shift.
+fn replace_all(bytes: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i + from.len() <= bytes.len() {
+        if &bytes[i..i + from.len()] == from {
+            bytes[i..i + from.len()].copy_from_slice(to);
+            count += 1;
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// Patch the build identity embedded in a copy of the binary, so the daemon
+/// watching that path sees a *different, newer* build when it is replaced.
+///
+/// The build id and clock are string literals compiled into the binary, so
+/// overwriting them in place (same length) changes what `--build-id` prints
+/// without disturbing the file's structure.
+fn patch_build_id(exe: &std::path::Path, new_id: &str, new_ts: &str) {
+    let old_id = env!("MINI_SWE_BUILD_ID");
+    let old_ts = env!("MINI_SWE_BUILD_TS");
+    assert_eq!(
+        new_id.len(),
+        old_id.len(),
+        "build id length must be preserved"
+    );
+    assert_eq!(
+        new_ts.len(),
+        old_ts.len(),
+        "build ts length must be preserved"
+    );
+    let mut bytes = std::fs::read(exe).expect("read the binary copy");
+    let n_id = replace_all(&mut bytes, old_id.as_bytes(), new_id.as_bytes());
+    let n_ts = replace_all(&mut bytes, old_ts.as_bytes(), new_ts.as_bytes());
+    assert!(n_id > 0, "the build id literal must be in the binary");
+    assert!(n_ts > 0, "the build ts literal must be in the binary");
+    std::fs::write(exe, &bytes).expect("write the patched binary");
+}
+
+/// A build id different from this build's, same length.
+fn different_build_id() -> String {
+    let id = format!("{:016x}", 0xdead_beef_cafe_babeu64);
+    assert_ne!(id, env!("MINI_SWE_BUILD_ID"));
+    id
+}
+
+/// A build clock later than this build's, same length.
+fn newer_build_ts() -> String {
+    let old: u64 = env!("MINI_SWE_BUILD_TS").parse().unwrap();
+    let new = old + 1_000_000_000_000_000_000;
+    let s = new.to_string();
+    assert_eq!(s.len(), env!("MINI_SWE_BUILD_TS").len());
+    s
+}
+
+/// Spawn the daemon from a *copy* of the binary in a temp dir, so the test can
+/// replace that copy with a different build without touching the real one.
+fn spawn_daemon_from(exe: &std::path::Path, hub: &common::TempDir) -> tokio::process::Child {
+    let swe = hub.subdir("swe");
+    let mut command = tokio::process::Command::new(exe);
+    command
+        .arg("daemon")
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", &swe)
+        .env("ENV_FILE", hub.path().join("absent.env"))
+        .env("OPENAI_API_KEY", "unused")
+        .env("MINI_SWE_HUB_EXE_POLL_MS", "50")
+        .env("MINI_SWE_HUB_EXE_STABLE_MS", "150")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    common::scrub_identity_env(command.as_std_mut());
+    // A concurrent `exec` of the same inode can make the kernel refuse the
+    // spawn with `ETXTBSY`; retry briefly rather than blame the test for a
+    // transient of a 40 MB binary being paged in.
+    for _ in 0..40 {
+        match command.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("spawn the daemon from {}: {e}", exe.display()),
+        }
+    }
+    panic!("spawning {} kept hitting ETXTBSY", exe.display())
+}
+
+/// Replace the daemon's executable with a different, newer build, and return
+/// the new build id.
+fn replace_exe_with_newer_build(exe: &std::path::Path) -> String {
+    let new_id = different_build_id();
+    let new_ts = newer_build_ts();
+    let patched = exe.with_extension("new");
+    std::fs::copy(exe, &patched).unwrap();
+    patch_build_id(&patched, &new_id, &new_ts);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&patched, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::rename(&patched, exe).unwrap();
+    new_id
+}
+
+/// Replacing the daemon's executable with a different, complete build arms a
+/// handover without any client call: the daemon notices the new binary on its
+/// own, hands over, and the replacement comes up.
+#[tokio::test]
+async fn a_rebuilt_executable_arms_a_handover_without_a_client() {
+    let hub = common::TempDir::new_in_tmp("handover-auto");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _fallback = common::fallback_socket_dir(hub.path());
+    let _reaper = Reaper(hub.path().to_path_buf());
+
+    // The daemon runs from a copy, so the test can replace it.
+    let exe_dir = hub.subdir("exe");
+    let exe = exe_dir.join("mini-swe-mcp");
+    std::fs::copy(common::binary_path(), &exe).unwrap();
+
+    let mut daemon = spawn_daemon_from(&exe, &hub);
+    let paths = HubPaths::new(hub.path().to_path_buf());
+    wait_for_log(hub.path(), "listening", 1).await;
+
+    // Replace the copy with a different, newer build. The patched binary
+    // must report the new identity through the flag the daemon probes with.
+    let new_id = replace_exe_with_newer_build(&exe);
+    let probe = std::process::Command::new(&exe)
+        .arg("--build-id")
+        .output()
+        .expect("run the patched binary");
+    assert!(probe.status.success(), "the patched build must run");
+    let identity: Value = serde_json::from_slice(&probe.stdout).expect("--build-id prints JSON");
+    assert_eq!(identity["id"], new_id.as_str(), "{identity}");
+
+    // The daemon arms the handover by itself and stops; the replacement
+    // daemon (the patched build) comes up without any client call.
+    wait_for_log(
+        hub.path(),
+        "executable changed: arming handover to build",
+        1,
+    )
+    .await;
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
+    assert!(
+        log.contains(&format!("arming handover to build {new_id}")),
+        "the log must name the new build: {log}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), daemon.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success(),
+        "the daemon must stop for the handover"
+    );
+    wait_for_log(hub.path(), "listening", 2).await;
+    let mut replacement = Client::connect(&paths.socket()).await;
+    assert!(
+        replacement.request("tools/list", json!({})).await["result"]["tools"].is_array(),
+        "the replacement daemon must serve"
+    );
+}
+
+/// A half-written or unexecutable file at the executable path does not arm a
+/// handover: the daemon only hands over to a build that is complete and runs.
+#[tokio::test]
+async fn a_half_written_or_unexecutable_file_does_not_arm() {
+    let hub = common::TempDir::new_in_tmp("handover-auto-neg");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _fallback = common::fallback_socket_dir(hub.path());
+    let _reaper = Reaper(hub.path().to_path_buf());
+    let exe_dir = hub.subdir("exe");
+    let exe = exe_dir.join("mini-swe-mcp");
+    std::fs::copy(common::binary_path(), &exe).unwrap();
+
+    let mut daemon = spawn_daemon_from(&exe, &hub);
+    let paths = HubPaths::new(hub.path().to_path_buf());
+    wait_for_log(hub.path(), "listening", 1).await;
+
+    // A half-written file (a cargo write in progress, or a truncated copy).
+    let half = exe_dir.join("half");
+    let bytes = std::fs::read(&exe).unwrap();
+    std::fs::write(&half, &bytes[..bytes.len() / 2]).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&half, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::rename(&half, &exe).unwrap();
+
+    // An unexecutable file.
+    let not_exec = exe_dir.join("not-exec");
+    std::fs::copy(common::binary_path(), &not_exec).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&not_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    std::fs::rename(&not_exec, &exe).unwrap();
+
+    // Neither arms a handover, and the daemon keeps serving.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
+    assert!(
+        !log.contains("arming handover"),
+        "a broken build must not arm: {log}"
+    );
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "the daemon must keep running"
+    );
+    let mut client = Client::connect(&paths.socket()).await;
+    assert_eq!(
+        client.request("ping", json!({})).await["result"],
+        json!({}),
+        "the daemon must keep serving"
+    );
+
+    // A complete replacement still arms the handover: the refusals above were
+    // the completeness checks, not a watcher that is dead altogether.
+    let new_id = replace_exe_with_newer_build(&exe);
+    wait_for_log(hub.path(), &format!("arming handover to build {new_id}"), 1).await;
+}
+
+/// `HUB_AUTO_HANDOVER=0` disables the watch: a rebuilt executable does not
+/// arm a handover.
+#[tokio::test]
+async fn auto_handover_is_disabled_by_env() {
+    let hub = common::TempDir::new_in_tmp("handover-auto-off");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hub.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _fallback = common::fallback_socket_dir(hub.path());
+    let _reaper = Reaper(hub.path().to_path_buf());
+    let exe_dir = hub.subdir("exe");
+    let exe = exe_dir.join("mini-swe-mcp");
+    std::fs::copy(common::binary_path(), &exe).unwrap();
+
+    let swe = hub.subdir("swe");
+    let mut command = tokio::process::Command::new(&exe);
+    command
+        .arg("daemon")
+        .env("SWE_HUB_DIR", hub.path())
+        .env("SWE_TEMP_DIR", &swe)
+        .env("ENV_FILE", hub.path().join("absent.env"))
+        .env("OPENAI_API_KEY", "unused")
+        .env("HUB_AUTO_HANDOVER", "0")
+        .env("MINI_SWE_HUB_EXE_POLL_MS", "50")
+        .env("MINI_SWE_HUB_EXE_STABLE_MS", "150")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    common::scrub_identity_env(command.as_std_mut());
+    let mut daemon = command.spawn().unwrap();
+    wait_for_log(hub.path(), "listening", 1).await;
+
+    // Replace with a different, newer build.
+    replace_exe_with_newer_build(&exe);
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
+    assert!(
+        !log.contains("arming handover"),
+        "HUB_AUTO_HANDOVER=0 must disable the watch: {log}"
+    );
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "the daemon must keep running"
+    );
+}

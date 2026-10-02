@@ -10,7 +10,8 @@ pub const HELP_FLAGS: &str = concat!(
     "      --all      List every agent's workers (requires --admin)\n",
     "      --admin    Operator override: act on workers owned by any agent\n",
     "  -h, --help     Print help\n",
-    "  -V, --version  Print version",
+    "  -V, --version  Print version\n",
+    "      --build-id  Print this build's identity (id and build clock)",
 );
 
 mod collect;
