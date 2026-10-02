@@ -180,7 +180,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty disables. 'consolidate': cheap gate for workers, full for the consolidator.",
             "type": "string"
           },
           "worker_id": {

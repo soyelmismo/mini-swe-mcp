@@ -299,7 +299,7 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. With 'consolidate' and no explicit verify, workers get the cheap gate (fmt/lint/typecheck) while the consolidator runs the full one.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty disables. 'consolidate': cheap gate for workers, full for the consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";

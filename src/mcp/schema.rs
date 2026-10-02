@@ -182,7 +182,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "consolidate_verify",
         "string",
         DescriptionSource::Static(
-            "Automatic consolidator's full gate; default: auto-detect (workers get the cheap one).",
+            "Automatic consolidator's full gate; default: auto-detect.",
         ),
     ),
     (

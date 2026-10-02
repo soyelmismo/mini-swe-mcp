@@ -2480,7 +2480,7 @@ fn has_extension(dir: &Path, extension: &str) -> bool {
 
 #[cfg(test)]
 mod verify_detection_tests {
-    use super::detect_verify_command;
+    use super::{detect_cheap_verify_command, detect_verify_command};
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -2591,6 +2591,114 @@ mod verify_detection_tests {
             Some("pytest -q"),
             "the python manifest is probed before go, and the order is fixed"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Rust repository's cheap gate is the static subset: format plus clippy,
+    /// never the test suite the consolidator runs.
+    #[test]
+    fn a_cargo_manifest_selects_the_cheap_static_gate() {
+        let dir = scratch("cheap-cargo");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("cargo fmt --check && cargo clippy --all-targets -- -D warnings")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Node/TS: the package's own lint and typecheck scripts when it declares
+    /// them, because those are the checks the project actually runs.
+    #[test]
+    fn a_node_package_runs_its_lint_and_typecheck_scripts() {
+        let dir = scratch("cheap-node");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"lint":"eslint .","typecheck":"tsc -b"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("npm run lint && npm run typecheck")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Only the script the package declares is run; the other is not invented.
+        let dir = scratch("cheap-node-lint-only");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("npm run lint")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TypeScript project with no declared scripts still has the compiler's
+    /// own check; a plain JavaScript package has no static gate to run.
+    #[test]
+    fn a_typescript_project_falls_back_to_the_compiler() {
+        let dir = scratch("cheap-ts");
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(dir.join("index.ts"), "export const x = 1;\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("tsc --noEmit")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("cheap-js");
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(dir.join("index.js"), "module.exports = {};\n").unwrap();
+        assert_eq!(detect_cheap_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Python: ruff always, mypy only when the project configures it, so a
+    /// repository is never gated on a tool it never asked for.
+    #[test]
+    fn a_python_project_adds_mypy_only_when_it_is_configured() {
+        let dir = scratch("cheap-py");
+        std::fs::write(dir.join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(detect_cheap_verify_command(&dir).as_deref(), Some("ruff check ."));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("cheap-py-mypy");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\n\n[tool.mypy]\nstrict = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("ruff check . && mypy .")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go's cheap gate is gofmt plus vet: neither builds or runs a test.
+    #[test]
+    fn a_go_module_selects_gofmt_and_vet() {
+        let dir = scratch("cheap-go");
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("gofmt -l . && go vet ./...")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognised ecosystem has no cheap gate at all: the worker runs no
+    /// gate rather than a command that cannot pass.
+    #[test]
+    fn an_unknown_ecosystem_has_no_cheap_gate() {
+        let dir = scratch("cheap-bare");
+        assert_eq!(detect_cheap_verify_command(&dir), None);
+        std::fs::write(dir.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        assert_eq!(detect_cheap_verify_command(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
