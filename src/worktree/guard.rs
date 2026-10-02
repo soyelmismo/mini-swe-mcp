@@ -376,6 +376,10 @@ impl WorktreeGuard {
             }
         }
 
+        let scratch_base = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(crate::worktree::swe_base_dir);
         Ok(Self {
             path,
             branch: branch.to_string(),
@@ -384,10 +388,7 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
-            scratch_base: path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(ScratchRoot::from_env().base),
+            scratch_base,
             seeded,
         })
     }
