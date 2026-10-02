@@ -47,6 +47,17 @@ impl RegistryStatus {
         )
     }
 
+    /// Whether the worker has stopped without completing: it still holds a
+    /// branch nobody integrated, and only a steer (or a discard) can move it
+    /// again. A consolidator that steered such a worker and then finished
+    /// without integrating it has absorbed it.
+    pub fn stopped_not_completed(self) -> bool {
+        matches!(
+            self,
+            Self::Exhausted | Self::Failed | Self::Paused | Self::Stopped | Self::Interrupted
+        )
+    }
+
     /// Whether the worker is still live (its uptime keeps counting).
     pub fn is_live(self) -> bool {
         matches!(self, Self::Running | Self::Paused | Self::Reviewing)
@@ -178,6 +189,19 @@ pub struct WorkerRegistryEntry {
     /// proves each worker's branch is merged by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub integrated: Vec<String>,
+    /// Workers of the consolidator's round whose leftover work it took over
+    /// instead of integrating: a worker it steered that was still stopped and
+    /// not completed when the consolidator finished (exhausted, failed or
+    /// paused), or one it reported as `fixed` because it made the correction
+    /// itself. Recorded on the consolidator's row for the same reason
+    /// [`WorkerRegistryEntry::integrated`] is: when the consolidator is merged,
+    /// these workers are retired with it and their unmerged WIP branches are
+    /// discarded -- nothing outside this record is ever touched.
+    ///
+    /// `#[serde(default)]` keeps a row written before this list existed
+    /// readable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absorbed: Vec<String>,
     /// The operator asked to keep this worker's branch (`merge --no-delete`).
     ///
     /// Durable, unlike a one-off sweep exemption: the retirement sweep skips a
@@ -226,6 +250,7 @@ impl WorkerRegistryEntry {
             approved: None,
             verified: None,
             integrated: Vec::new(),
+            absorbed: Vec::new(),
             keep_branch: false,
         }
     }
@@ -341,6 +366,7 @@ impl WorkerMeta {
             approved: None,
             verified: self.verified,
             integrated: Vec::new(),
+            absorbed: Vec::new(),
             keep_branch: false,
         }
     }
@@ -435,6 +461,11 @@ impl RegistryWriter {
             for id in known.integrated {
                 if !entry.integrated.contains(&id) {
                     entry.integrated.push(id);
+                }
+            }
+            for id in known.absorbed {
+                if !entry.absorbed.contains(&id) {
+                    entry.absorbed.push(id);
                 }
             }
             entry.keep_branch |= known.keep_branch;
