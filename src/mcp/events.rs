@@ -731,6 +731,9 @@ pub(super) struct EventRouter {
     /// published and JSON event shapes are unchanged.
     seen: BTreeMap<String, u64>,
     watch_history: BTreeMap<String, WatchHistory>,
+    /// Retired worker ids, oldest first: an event of one of these is never
+    /// queued or reported again, however the snapshot describes it.
+    retired: Vec<RetiredAt>,
     /// Per-owner acknowledged positions, persisted across a daemon restart.
     acks: AckStore,
     watches: Arc<WatchRegistry>,
@@ -790,6 +793,9 @@ impl EventRouter {
                 .pending
                 .retain(|event| event["worker_id"] != worker_id);
         }
+        // The replay state is gone; the tombstone is what keeps a snapshot
+        // taken before this moment from producing the same event again.
+        self.remember_retired(worker_id);
     }
 
     pub(super) fn remove(&mut self, id: u64) {
@@ -1310,6 +1316,22 @@ struct WatchHistory {
     last_sequence: u64,
 }
 
+/// How many recently retired workers are remembered.
+///
+/// A snapshot taken just before a retirement still describes the worker whose
+/// branch was deleted, and dropping the worker's replay state alone is not
+/// enough: the next `observe_watch` reads that same completion as a transition
+/// it has never reported and queues it again, so a watch after the merge
+/// replays a worker that is already in the base branch. A retired worker id
+/// can never come back -- the branch, the row, the history and the worker
+/// itself are gone, and a new worker is dispatched under a fresh id -- so one
+/// entry is enough to keep it out, and it is dropped from here as soon as no
+/// snapshot describes it any more.
+const MAX_RETIRED_WORKERS: usize = 4096;
+
+/// The moment a retirement was observed, for the eviction order.
+type RetiredAt = (String, u64);
+
 /// Whether a terminal worker's branch is merged into its base or no longer
 /// exists, so its event must never be replayed.
 ///
@@ -1514,6 +1536,43 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
 }
 
 impl EventRouter {
+    /// Remember `worker_id` as retired: nothing it ever reported may be delivered
+    /// again, not even from a snapshot taken before the retirement.
+    ///
+    /// Called on the router's own lock, so the id and the replay state it protects
+    /// cannot be observed apart: a `watch` between the two would see an
+    /// unacknowledged completion for work that is already in the base branch.
+    fn remember_retired(&mut self, worker_id: &str) {
+        if !self.retired.iter().any(|(id, _)| id == worker_id) {
+            self.retired.push((worker_id.to_string(), 0));
+        }
+        // Bounded oldest-first: the memory the replay state already drops buys
+        // nothing when it is paid for by a fleet-sized list of dead ids.
+        while self.retired.len() > MAX_RETIRED_WORKERS {
+            let Some(oldest) = self
+                .retired
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, (_, at))| (*at, *index))
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.retired.remove(oldest);
+        }
+        if self.watch_reported.contains_key(worker_id) {
+            return;
+        }
+        let now = crate::pool::unix_timestamp();
+        if let Some((_, at)) = self
+            .retired
+            .iter_mut()
+            .find(|(id, _)| id == worker_id)
+        {
+            *at = now;
+        }
+    }
+
     fn history(&mut self, owner: &str) -> &mut WatchHistory {
         if !self.watch_history.contains_key(owner)
             && self.watch_history.len() >= 1024
@@ -1530,6 +1589,22 @@ impl EventRouter {
 
     fn observe_watch(&mut self, mut views: crate::cli::watch::Snapshot) {
         let now = crate::pool::unix_timestamp();
+        // A retired worker is gone, so the view of it is dropped on the way in
+        // rather than inspected: no event of it is queued, none is reported,
+        // and it keeps none of the state the replays are keyed by. The snapshot
+        // that raced the retirement still describes it, which is exactly the
+        // view that must not produce the event again.
+        let retired = std::mem::take(&mut self.retired);
+        if !retired.is_empty() {
+            views.retain(|id, _| !retired.iter().any(|(retired, _)| retired == id));
+        }
+        // The tombstone has done its work once no snapshot describes the worker
+        // any more: the branch, the row, the record and the event are all gone,
+        // so keeping the id would cost memory for a worker that cannot return.
+        self.retired = retired
+            .into_iter()
+            .filter(|(id, _)| views.contains_key(id))
+            .collect();
         for (id, view) in &mut views {
             crate::cli::watch::progress_clock(view, self.watch_current.get(id), now);
             // A resumed worker may ask the same question at the same turn again.

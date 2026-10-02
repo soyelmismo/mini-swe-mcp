@@ -114,17 +114,19 @@ fn an_unacknowledged_event_is_not_replayed_after_retirement() {
         after["events"].as_array().is_some_and(Vec::is_empty),
         "an unacknowledged event of a retired worker is gone: {after}"
     );
+    // A stale snapshot taken before the retirement names the worker again.
     // The explicit-id path replays the last reported terminal event, so it is
-    // the second way the same completion could come back.
+    // the second way the same completion could come back: a retired worker is
+    // unknown, never a completion to review.
     router.observe_watch(view("w-unacked", 1));
     let explicit = router
         .watch_reply(
             &ctx,
             &json!({"worker_ids":["w-unacked"], "initial":true}),
         )
-        .expect("the watch answers");
+        .expect_err("a retired worker is not found by an explicit id");
     assert!(
-        explicit["events"].as_array().is_some_and(Vec::is_empty),
-        "an explicit id must not resurrect a retired worker: {explicit}"
+        explicit.to_string().contains("Worker not found"),
+        "the explicit id must not resurrect a retired worker: {explicit}"
     );
 }
