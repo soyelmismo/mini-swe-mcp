@@ -53,7 +53,7 @@ pub use self::sentinels::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
     is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
     parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
-    parse_request_turns, parse_wait_job, summarize_command,
+    parse_request_turns, parse_wait_job, summarize_command, summary_line,
 };
 
 /// Read-only half of [`WorkerLaunchConfig`] for the phase loop: the caller owns
@@ -526,12 +526,16 @@ impl WorkerPool {
             .to_string();
         // The report's `done:` line is the summary every consumer reads; the
         // last chat message stays the fallback for a worker that never wrote
-        // one, so the commit subject is never "Now I'll make the edits.".
+        // one, so the commit subject is never "Now I'll make the edits.". The
+        // fallback skips the block marker and a consolidator's per-worker
+        // verdicts: those are protocol, so a round never headlines as the bare
+        // word "REPORT".
         let agent_summary = report
             .as_ref()
             .map(|r| r.done.trim().to_string())
             .filter(|done| !done.is_empty())
-            .unwrap_or_else(|| last_assistant_text.trim().to_string());
+            .or_else(|| summary_line(&last_assistant_text).map(str::to_string))
+            .unwrap_or_default();
         let path = worktree.path.clone();
         let repo_root = worktree.repo_root.clone();
         let base_commit = worktree.base_commit.clone();
