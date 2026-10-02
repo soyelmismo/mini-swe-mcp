@@ -165,10 +165,66 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
     prompt.push_str(
         "` and the tests of the files you touched, and see them pass.\n\
          7. Report honestly: in your REPORT block list every finding you did NOT fix in the `risks:` line, one line each. Fixing nothing real is a valid outcome; claiming a clean bill of health you did not check is not.\n\
-         8. When the gate and the tests pass and every finding is either fixed or listed, execute:\n\
+         8. Before the completion sentinel, print a line `FINDINGS: <n>` giving the total number of findings you found, fixed or listed. Print `FINDINGS: 0` when you found none; the harness shows this count in the completion event and the status.\n\
+         9. When the gate and the tests pass and every finding is either fixed or listed, execute:\n\
             echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
     );
     prompt
+}
+
+/// The repository-relative files a worker's working tree changed against its
+/// base, uncommitted changes included.
+///
+/// The automatic sensitive-path trigger runs before the review phase's
+/// checkpoint, so the tail may still be uncommitted: intent-to-add stages the
+/// new files and the diff against the base then names every path, committed or
+/// not, exactly as the worker's final diff does. A git failure yields an empty
+/// list, which reads as "nothing sensitive" and simply skips the trigger
+/// rather than failing the worker.
+pub(super) async fn touched_files(
+    path: &Path,
+    base_commit: &str,
+    base_branch: Option<&str>,
+) -> Vec<String> {
+    let path = path.to_path_buf();
+    let base_commit = base_commit.to_string();
+    let base_branch = base_branch.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let base = WorktreeGuard::diff_base_at(&path, &base_commit, base_branch.as_deref())
+            .unwrap_or_else(|_| "HEAD".to_string());
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &base]) else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Parse the security reviewer's `FINDINGS: <n>` line.
+///
+/// The adversarial prompt asks the reviewer to state the total number of
+/// findings (fixed or listed) on its own line so the completion event and the
+/// status can show a count without depending on free-form prose. A missing or
+/// unparseable line yields `None`, which a display renders as "findings not
+/// reported" rather than a reassuring zero.
+pub fn parse_findings(text: &str) -> Option<usize> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("FINDINGS:")?;
+        rest.trim().parse::<usize>().ok()
+    })
 }
 
 /// Everything the review phase needs, and the step counter it hands back.
@@ -222,6 +278,20 @@ pub struct ReviewPhaseOutcome {
     /// quietly or ran out of turns, so the whole run must be read as stopped
     /// rather than done.
     pub completed: bool,
+    /// The security review that ran, when the mode was
+    /// [`ReviewMode::Security`]. Carries the finding count the reviewer
+    /// reported, for the completion event and the status.
+    pub security: Option<SecurityReviewOutcome>,
+}
+
+/// The recorded result of one adversarial security review.
+///
+/// `findings` is what the reviewer reported on its `FINDINGS:` line; an absent
+/// line is `None`, never a silent zero, so a status never presents "not
+/// reported" as a clean audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SecurityReviewOutcome {
+    pub findings: Option<usize>,
 }
 
 impl WorkerPool {
@@ -376,9 +446,16 @@ impl WorkerPool {
                         step = review_step,
                         "Reviewer completed and approved changes"
                     );
+                    // The engine still holds the `&mut` borrow of the last
+                    // assistant text, so the text is cloned through it.
+                    let text = engine.last_assistant_text.clone();
+                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                        findings: parse_findings(&text),
+                    });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: true,
+                        security,
                     });
                 }
                 TurnOutcome::Continue | TurnOutcome::NoCommand => {}
@@ -388,6 +465,7 @@ impl WorkerPool {
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: false,
+                        security: None,
                     });
                 }
             }
@@ -397,6 +475,7 @@ impl WorkerPool {
         Ok(ReviewPhaseOutcome {
             step,
             completed: false,
+            security: None,
         })
     }
 }
