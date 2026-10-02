@@ -128,3 +128,80 @@ async fn watch_command_is_omitted_only_while_the_callers_own_watch_runs() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A second `watch` call of the same session never competes for the running
+/// one's events: an identical request is covered, a broader one widens the
+/// stored selection to the union, and the running watch keeps its slot.
+#[tokio::test]
+async fn a_second_watch_call_is_covered_or_widens_the_running_one() {
+    use crate::mcp::events::WatchSelection;
+    let base = scratch("second-watch");
+    let server = McpServer::new(
+        WorkerPool::with_scratch(
+            1,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            ScratchRoot::new(&base),
+        ),
+        "ninja".to_string(),
+    );
+    let tokens_dir = base.join("watch-tokens");
+    std::fs::create_dir_all(&tokens_dir).expect("create the token directory");
+    let mut ctx = ConnectionContext::hub_connection(1)
+        .with_watch_tokens(Arc::new(WatchTokens::new(tokens_dir)));
+    ctx.agent_id = Some("orchestrator".to_string());
+
+    let narrow = WatchSelection::new(Vec::<String>::new(), ["round-a".to_string()], true);
+    let _held = server
+        .hub_events
+        .lock()
+        .await
+        .begin_watch("orchestrator", 1, None, &narrow)
+        .started()
+        .expect("the first watch holds the slot");
+
+    // The same request on another connection is covered, not an error.
+    let covered = server.hub_events.lock().await.begin_watch(
+        "orchestrator",
+        2,
+        None,
+        &WatchSelection::new(Vec::<String>::new(), ["round-a".to_string()], true),
+    );
+    assert!(
+        matches!(covered, crate::mcp::events::WatchStart::Covered { .. }),
+        "an identical request must be covered"
+    );
+
+    // A broader request widens the stored selection to the union.
+    let widened = server.hub_events.lock().await.begin_watch(
+        "orchestrator",
+        2,
+        None,
+        &WatchSelection::new(Vec::<String>::new(), Vec::<String>::new(), true),
+    );
+    match widened {
+        crate::mcp::events::WatchStart::Widened { selection, .. } => {
+            assert!(
+                selection.contains("--all"),
+                "the union keeps round mode: {selection}"
+            );
+        }
+        _ => panic!("a broader request must widen the running watch"),
+    }
+    let stored = server
+        .hub_events
+        .lock()
+        .await
+        .selection_of("orchestrator")
+        .expect("the slot is still held");
+    assert!(
+        stored.covers(&WatchSelection::new(
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            true
+        )),
+        "the running watch now follows the union"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

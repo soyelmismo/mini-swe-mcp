@@ -118,24 +118,24 @@ impl McpServer {
         let (mut ids, mut groups, mut all) = (ids, groups, all);
         loop {
             let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
-            if let Some(widened) = reply.get("widened") {
-                if let (Some(worker_ids), Some(named), Some(round)) = (
+            if let Some(widened) = reply.get("widened")
+                && let (Some(worker_ids), Some(named), Some(round)) = (
                     widened.get("worker_ids").and_then(|v| v.as_array()),
                     widened.get("group").and_then(|v| v.as_array()),
                     widened.get("all").and_then(|v| v.as_bool()),
-                ) {
-                    ids = worker_ids
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_string)
-                        .collect();
-                    groups = named
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_string)
-                        .collect();
-                    all = round;
-                }
+                )
+            {
+                ids = worker_ids
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect();
+                groups = named
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect();
+                all = round;
             }
             let events = reply["events"].as_array().cloned().unwrap_or_default();
             if !events.is_empty() {

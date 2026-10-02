@@ -1134,6 +1134,13 @@ impl EventRouter {
         self.watches.has(identity)
     }
 
+    /// The selection `identity`'s running watch follows, or `None` while no
+    /// watch runs for it. Used by tests to assert a widening landed.
+    #[cfg(test)]
+    pub(super) fn selection_of(&self, identity: &str) -> Option<WatchSelection> {
+        self.watches.selection(identity)
+    }
+
     /// Load the persisted acknowledged positions from the hub directory. Called
     /// once at daemon start, before the watcher observes any worker.
     pub(super) fn load_ack_store(&mut self, dir: &Path) {
@@ -2075,7 +2082,7 @@ impl EventRouter {
             .values()
             .filter(|v| {
                 allowed(v)
-                    && crate::cli::watch::matches(v, ids, groups)
+                    && crate::cli::watch::matches(v, &ids, &groups)
                     && matches!(
                         v["status"].as_str(),
                         Some("running" | "paused" | "reviewing")
@@ -2159,7 +2166,7 @@ impl EventRouter {
             .values()
             .filter(|v| {
                 allowed(v)
-                    && crate::cli::watch::matches(v, &ids, &groups)
+                    && crate::cli::watch::matches(v, ids, groups)
                     && matches!(
                         v["status"].as_str(),
                         Some("running" | "paused" | "reviewing")

@@ -411,3 +411,89 @@ async fn a_widened_watch_stays_inside_its_caller_ownership() {
     harness.task.abort();
     let _ = harness.task.await;
 }
+
+/// The CLI's own rule: a running `watch --group A --all` is widened by a later
+/// `watch --all` (exit 0, one line naming the union), and a request it already
+/// covers answers "already covered" with exit 0 instead of the old exit 5.
+#[test]
+fn the_second_cli_watch_widens_or_reports_covered() {
+    let hub = common::TempDir::new_in_tmp("widen-cli-hub");
+    let swe = common::TempDir::new_in_tmp("widen-cli-swe");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let owner = common::host_of_this_process();
+    let hub_path = hub.path().to_path_buf();
+    let socket = HubPaths::new(hub_path.clone()).socket();
+    let task = rt.spawn(async move {
+        let isolated = common::IsolatedPool::new(4, "widen-cli");
+        add_running_in(&isolated.pool, "wa-1", &owner, GROUP_A).await;
+        add_running_in(&isolated.pool, "wb-1", &owner, GROUP_B).await;
+        let server = Arc::new(McpServer::new(isolated.pool.clone(), "test".to_string()));
+        let (paths, _fallback) = paths(&hub_path);
+        let daemon = HubServer::new(server, HubConfig::new(paths, 60));
+        let wait = tokio::spawn(async move {
+            let _ = daemon.run().await;
+        });
+        let _keep = isolated;
+        let _ = wait.await;
+    });
+    rt.block_on(wait_for_socket(&socket));
+
+    let spawn_watch = |args: &[&str]| {
+        common::binary_command(&common::binary_path())
+            .args(args)
+            .env("SWE_HUB_DIR", hub.path())
+            .env("SWE_TEMP_DIR", swe.path())
+            .env("TMPDIR", swe.path())
+            .env("OPENAI_API_KEY", "test-key-not-used")
+            .env("ENV_FILE", "/nonexistent-mini-swe-env")
+            .env(
+                "MODELS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/models.yaml"),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn watch")
+    };
+
+    let mut running = spawn_watch(&["watch", "--group", GROUP_A, "--all", "--timeout", "30"]);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // A broader request: widened, exit 0, one line naming the union.
+    let widened = spawn_watch(&["watch", "--all", "--timeout", "5"]);
+    let out = widened.wait_with_output().expect("the widened watch exits");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("widened the running watch (pid ") && stdout.contains(" to: "),
+        "{stdout}"
+    );
+
+    // A request the running watch now covers: exit 0, the covered line.
+    let covered = spawn_watch(&["watch", "--group", GROUP_A, "--all", "--timeout", "5"]);
+    let out = covered.wait_with_output().expect("the covered watch exits");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("already covered by the running watch (pid "),
+        "{stdout}"
+    );
+
+    let _ = running.kill();
+    let _ = running.wait();
+    task.abort();
+    let _ = rt.block_on(task);
+}
