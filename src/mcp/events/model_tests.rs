@@ -487,7 +487,7 @@ impl Harness {
     }
 
     fn violation(&self, msg: String, step: usize) -> ! {
-        let start = 0;
+        let start = self.trace.len().saturating_sub(12);
         let trace = self.trace[start..].join("\n");
         let mut world_dump = String::new();
         for w in &self.world.workers {
@@ -754,6 +754,38 @@ impl Harness {
         true
     }
 
+    /// Whether an owner has any worker in a state that legitimately keeps an
+    /// `--all` round fresh: a queued transition, a stall episode in progress,
+    /// or a reported transition not yet seen or acknowledged.
+    fn group_has_fresh_worker(&self, owner: &str) -> bool {
+        if self
+            .model
+            .episodes
+            .values()
+            .any(|ep| ep.owner == owner && ep.state == EpState::Pending)
+        {
+            return true;
+        }
+        if self.world.workers.iter().any(|w| {
+            w.owner == owner
+                && !w.retired
+                && w.status == Status::Running
+                && w.idle >= 601
+        }) {
+            return true;
+        }
+        self.router.watch_reported.iter().any(|(wid, event)| {
+            event["owner"].as_str() == Some(owner)
+                && self.router.seen.get(wid).copied() != event["sequence"].as_u64()
+                && !self.router.acks.acknowledged(
+                    owner,
+                    wid,
+                    event["revision"].as_u64().unwrap_or(0),
+                    event["event"].as_str().unwrap_or(""),
+                )
+        })
+    }
+
     fn plain_watch(
         &mut self,
         owner: &str,
@@ -827,11 +859,100 @@ impl Harness {
                 let Some(round_event) = round_events.first() else {
                     continue;
                 };
+                // Only probe when the model is certain nothing in the group is
+                // fresh: no queued terminal transition, no running worker past
+                // the stall threshold, and every reported transition either
+                // seen or acknowledged. Then the `--all` round can only be
+                // reporting an acknowledged transition again, which is exactly
+                // the regression this guards.
+                if !self.group_has_fresh_worker(owner) {
+                    eprintln!(
+                        "DEBUG fresh: {:?}",
+                        ["owner-2-w0", "owner-2-w1"]
+                            .iter()
+                            .map(|id| {
+                                let pending: bool = self
+                                    .router
+                                    .watch_history
+                                    .values()
+                                    .flat_map(|h| &h.pending)
+                                    .any(|v| v["worker_id"] == *id);
+                                let rep = self.router.watch_reported.get(*id).map(|v| {
+                                    (
+                                        v["sequence"].clone(),
+                                        v["revision"].clone(),
+                                        v["event"].clone(),
+                                    )
+                                });
+                                let seen = self.router.seen.get(*id).copied();
+                                let acked = rep.as_ref().is_some_and(|(_, rev, kind)| {
+                                    self.router.acks.acknowledged(
+                                        owner,
+                                        id,
+                                        rev.as_u64().unwrap_or(0),
+                                        kind.as_str().unwrap_or(""),
+                                    )
+                                });
+                                (id, pending, rep, seen, acked)
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                    if !round_events.is_empty() {
+                        eprintln!(
+                            "DEBUG probe group={group} current={:?} reported={:?} seen={:?} pending={:?}",
+                            self.router
+                                .watch_current
+                                .iter()
+                                .map(|(k, v)| (
+                                    k.clone(),
+                                    v["owner"].clone(),
+                                    v["status"].clone(),
+                                    v["group"].clone(),
+                                    v["steered_by_consolidator"].clone(),
+                                    v["question_for_consolidator"].clone(),
+                                    v["revision"].clone(),
+                                ))
+                                .collect::<Vec<_>>(),
+                            self.router
+                                .watch_reported
+                                .iter()
+                                .map(|(k, v)| (
+                                    k.clone(),
+                                    v["owner"].clone(),
+                                    v["event"].clone(),
+                                    v["revision"].clone(),
+                                    v["sequence"].clone()
+                                ))
+                                .collect::<Vec<_>>(),
+                            self.router.seen,
+                            self.router
+                                .watch_history
+                                .iter()
+                                .map(|(o, h)| (
+                                    o.clone(),
+                                    h.pending
+                                        .iter()
+                                        .map(|v| (
+                                            v["worker_id"].clone(),
+                                            v["event"].clone(),
+                                            v["sequence"].clone()
+                                        ))
+                                        .collect::<Vec<_>>()
+                                ))
+                                .collect::<Vec<_>>(),
+                        );
+                        self.violation(
+                            format!(
+                                "an acknowledged group returned a fresh round for {group}: {}",
+                                round["events"]
+                            ),
+                            step,
+                        );
+                    }
+                    continue;
+                }
                 // The probe round above is a real round: it acknowledges the
                 // workers it folds in, so the model follows it the same way.
-                // Only a round the router actually reports can do this; a
-                // refused probe (a sibling connection holds the slot) changes
-                // nothing, and treating it as an ack would desync the model.
                 let named: Vec<(String, usize, String)> = round_event["workers"]
                     .as_array()
                     .into_iter()
@@ -842,20 +963,6 @@ impl Harness {
                         Some((wid.to_string(), *rev, kind.clone()))
                     })
                     .collect();
-                if !named.is_empty()
-                    && named.iter().all(|(wid, rev, kind)| {
-                        self.acked
-                            .contains(&(owner.to_string(), wid.clone(), *rev, kind.clone()))
-                    })
-                {
-                    self.violation(
-                        format!(
-                            "a plain ack returned as a fresh round for {group}: {}",
-                            round["events"]
-                        ),
-                        step,
-                    );
-                }
                 for (wid, rev, kind) in named {
                     self.model.mark_seen(&wid);
                     self.acked.insert((owner.to_string(), wid.clone(), rev, kind.clone()));
@@ -1186,36 +1293,38 @@ fn plain_ack_does_not_replay_as_a_round() {
     assert_eq!(round["events"], json!([]), "an acknowledged completion is not a fresh round: {round}");
 }
 
-/// Reproduce: ack a completion, then probe the round — why is it fresh?
+/// Seed 34 step 22, reduced: an acked failure plus a running sibling must not
+/// be a fresh round for the group.
 #[test]
 fn probe_round_freshness_debug() {
     let mut router = EventRouter::default();
     let now = crate::pool::unix_timestamp();
-    let view = |id: &str, status: &str, group: &str| json!({
-        "worker_id": id, "owner": "o", "group": group, "model": "t",
-        "status": status, "step": 1, "revision": 1,
-        "branch": format!("worker-{id}"), "last_step_at": now,
+    let failed = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "failed", "step": 1, "revision": 1,
+        "branch": "worker-w0", "last_step_at": now,
         "metrics": WorkerMetrics::default(),
-        "verified": status == "completed", "summary": "Done.",
-        "error": if status == "failed" { json!("boom") } else { Value::Null },
+        "verified": false, "summary": "Done.", "error": "boom",
+    });
+    let running = json!({
+        "worker_id": "w1", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w1", "last_step_at": now,
+        "metrics": WorkerMetrics::default(),
     });
     router.observe_watch([
-        ("w0".to_string(), view("w0", "failed", "g")),
-        ("w1".to_string(), view("w1", "running", "g")),
+        ("w0".to_string(), failed.clone()),
+        ("w1".to_string(), running.clone()),
     ].into());
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
     let reply = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false})).unwrap();
-    let events = reply["events"].as_array().cloned().unwrap_or_default();
-    eprintln!("events: {events:?}");
-    for e in &events {
+    for e in reply["events"].as_array().cloned().unwrap_or_default() {
         router.acknowledge_watch(&ctx, e["sequence"].as_u64().unwrap());
     }
-    eprintln!("reported: {:?}", router.watch_reported.iter().map(|(k, v)| (k.clone(), v["event"].clone(), v["sequence"].clone())).collect::<Vec<_>>());
-    eprintln!("seen: {:?}", router.seen);
-    eprintln!("pending: {:?}", router_pending(&router));
-    eprintln!("acks: {:?}", router.acks.positions.iter().map(|(o, ws)| (o.clone(), ws.iter().map(|(w, e)| (w.clone(), e.position.revision, e.position.event.clone())).collect::<Vec<_>>())).collect::<Vec<_>>());
     let round = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true})).unwrap();
     eprintln!("round: {round}");
-    panic!("debug");
+    assert_eq!(round["events"], json!([]), "an acked group must not be a fresh round: {round}");
 }
+
+
