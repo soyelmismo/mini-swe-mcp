@@ -30,7 +30,7 @@ use super::{HubPaths, hub_dir};
 /// would otherwise report.
 pub async fn connect_or_spawn() -> Result<UnixStream> {
     let paths = HubPaths::new(hub_dir()?);
-    if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
+    if let Ok(stream) = super::daemon::connect_endpoint(&paths.probe_endpoint()).await {
         return Ok(stream);
     }
     let exe = exe_path::executable()?;
@@ -39,7 +39,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(20);
     loop {
-        match super::daemon::connect_endpoint(&paths.endpoint()).await {
+        match super::daemon::connect_endpoint(&paths.probe_endpoint()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 // The daemon is not there: reported with the refusal that proved

@@ -146,7 +146,8 @@ impl HubPaths {
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
             return None;
         }
-        Some(fallback_socket_dir(&self.dir))
+        let dir = fallback_socket_dir(&self.dir);
+        harden_hub_dir(dir.clone()).ok().map(|_| dir)
     }
 
     /// Where the hub listens: a filesystem socket when one fits, otherwise
@@ -154,6 +155,17 @@ impl HubPaths {
     /// a Linux abstract-namespace socket named after the hub dir. Daemon and
     /// clients derive the same endpoint; access stays restricted to this user
     /// by the daemon's `SO_PEERCRED` check.
+    /// The endpoint to *dial* a predecessor on, never creating anything.
+    ///
+    /// Same answer as [`HubPaths::endpoint`] when the socket sits in the hub
+    /// directory, and the same short fallback path otherwise -- but computed,
+    /// not created. A client or a lock waiter that is about to find a
+    /// predecessor listening must not leave an empty `/tmp/mswe-<uid>-<hash>`
+    /// behind for a daemon it never started.
+    pub fn probe_endpoint(&self) -> HubEndpoint {
+        self.endpoint()
+    }
+
     pub fn endpoint(&self) -> HubEndpoint {
         let natural = self.dir.join("hub.sock");
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
@@ -551,7 +563,10 @@ impl HubServer {
             if let Some(lock) = acquire_lock(&path)? {
                 return Ok(Some(lock));
             }
-            if connect_endpoint(&self.config.paths().endpoint())
+            // Probe with the side-effect-free endpoint: a predecessor owns the
+            // socket here, so this daemon never binds, and `endpoint()` must
+            // not create a fallback directory for a hub that will not run.
+            if connect_endpoint(&self.config.paths().probe_endpoint())
                 .await
                 .is_ok()
             {
@@ -1130,6 +1145,14 @@ mod tests {
         assert!(
             !fallback.exists(),
             "probing the socket left {} behind",
+            fallback.display()
+        );
+        // Nor does a client checking whether a daemon is already up: it dials
+        // the fallback socket without ever creating the directory holding it.
+        let _ = paths.probe_endpoint();
+        assert!(
+            !fallback.exists(),
+            "probing for a running daemon left {} behind",
             fallback.display()
         );
     }
