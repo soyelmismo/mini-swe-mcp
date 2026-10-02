@@ -104,10 +104,10 @@ pub fn parse_sensitive_paths(text: &str) -> Vec<String> {
             in_section = heading.eq_ignore_ascii_case("sensitive paths");
             continue;
         }
-        if in_section {
-            if let Some(path) = parse_sensitive_paths_line(line) {
-                paths.push(path);
-            }
+        if in_section
+            && let Some(path) = parse_sensitive_paths_line(line)
+        {
+            paths.push(path);
         }
     }
     paths

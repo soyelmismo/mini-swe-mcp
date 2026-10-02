@@ -99,8 +99,7 @@ fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
 #[test]
 fn the_prompt_names_no_language_specific_command() {
     for mode in [ReviewMode::Quality, ReviewMode::Security] {
-        let prompt =
-            review_prompt(mode, "task", Some("make check"), &[]);
+        let prompt = review_prompt(mode, "task", Some("make check"), &[]);
         for forbidden in ["cargo test", "cargo clippy", "cargo test --all-targets"] {
             assert!(
                 !prompt.contains(forbidden),
@@ -116,12 +115,7 @@ fn the_prompt_names_no_language_specific_command() {
 
 #[test]
 fn a_disabled_gate_is_stated_not_invented() {
-    let prompt = review_prompt(
-        ReviewMode::Quality,
-        "task",
-        Some(""),
-        &[],
-    );
+    let prompt = review_prompt(ReviewMode::Quality, "task", Some(""), &[]);
     assert!(
         prompt.contains("(none: this dispatch disabled the completion gate)"),
         "a disabled gate must be stated, not replaced by an invented suite"
@@ -167,8 +161,8 @@ src/ignored.rs
     assert_eq!(
         paths,
         vec![
-            "src/agent/sandbox*".to_string(),
             "src/hub/**".to_string(),
+            "src/agent/sandbox*".to_string(),
             "src/pool/merge.rs".to_string(),
         ]
     );
@@ -285,9 +279,7 @@ impl ScriptedSseServer {
     fn security_completion_turn(call_id: &str, findings: usize) -> Vec<String> {
         Self::completion_turn(
             call_id,
-            &format!(
-                "REPORT\ndone: adversarial pass\nFINDINGS: {findings}\nrisks: none"
-            ),
+            &format!("REPORT\ndone: adversarial pass\nFINDINGS: {findings}\nrisks: none"),
         )
     }
 }
@@ -381,13 +373,21 @@ impl TestRepo {
         }
         std::fs::write(self.dir.join("AGENTS.md"), text).expect("write AGENTS.md");
     }
+}
 
-    /// Commit a change to `file` so the worker's diff touches it.
-    fn commit_change(&self, file: &str) {
-        std::fs::write(self.dir.join(file), "changed\n").expect("write changed file");
-        common::git(self.path(), &["add", file]);
-        common::git(self.path(), &["commit", "-m", "sensitive change"]);
-    }
+/// A worker turn that writes `path` in its worktree, so the worker's diff
+/// touches it. The parent directory is created first so a nested path works.
+fn write_turn(call_id: &str, path: &str) -> Vec<String> {
+    let parent = Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let command = if parent.is_empty() {
+        format!("echo changed > {path}")
+    } else {
+        format!("mkdir -p {parent} && echo changed > {path}")
+    };
+    ScriptedSseServer::turn(call_id, "", &command)
 }
 
 impl Drop for TestRepo {
@@ -467,10 +467,13 @@ async fn review_prompt_of(server: &ScriptedSseServer) -> Option<String> {
 async fn a_sensitive_diff_triggers_the_security_review_automatically() {
     let repo = TestRepo::new("auto");
     repo.declare_sensitive(&["src/hub/**"]);
-    // The implementer's diff touches the declared path.
-    repo.commit_change("src/hub/mod.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/hub/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
         ScriptedSseServer::security_completion_turn("call_review", 2),
     ])
     .await;
@@ -483,10 +486,10 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
     let requests = server.requests.lock().await.clone();
     assert_eq!(
         requests.len(),
-        2,
-        "one implementer turn plus the automatic security review"
+        3,
+        "write turn, implementer completion, automatic security review"
     );
-    let reviewer_request = &requests[1];
+    let reviewer_request = &requests[2];
     assert_eq!(reviewer_request["model"], json!("test-model"));
     let prompt = review_prompt_of(&server).await.expect("a review prompt");
     assert!(
@@ -500,11 +503,8 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
 
     // The finding count rides the registry row, which is what the
     // completion event and the status read.
-    let registry = mini_swe_mcp::pool::load_registry_entry_in(
-        pool.scratch_root(),
-        &worker_id,
-    )
-    .expect("the worker's registry row");
+    let registry = mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &worker_id)
+        .expect("the worker's registry row");
     let security = registry
         .security_review
         .expect("the row records the security review");
@@ -522,9 +522,13 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
 async fn an_insensitive_diff_gets_no_review_phase() {
     let repo = TestRepo::new("skip");
     repo.declare_sensitive(&["src/hub/**"]);
-    repo.commit_change("src/ordinary.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/ordinary.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
     ])
     .await;
 
@@ -533,8 +537,8 @@ async fn an_insensitive_diff_gets_no_review_phase() {
 
     assert_eq!(
         server.requests.lock().await.len(),
-        1,
-        "no review phase for a diff that touches nothing sensitive"
+        2,
+        "write turn and completion, but no review phase"
     );
     assert!(
         review_prompt_of(&server).await.is_none(),
@@ -551,9 +555,13 @@ async fn an_insensitive_diff_gets_no_review_phase() {
 #[tokio::test]
 async fn no_declared_patterns_means_no_trigger() {
     let repo = TestRepo::new("undeclared");
-    repo.commit_change("src/hub/mod.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/hub/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
     ])
     .await;
 
@@ -562,8 +570,8 @@ async fn no_declared_patterns_means_no_trigger() {
 
     assert_eq!(
         server.requests.lock().await.len(),
-        1,
-        "no declared patterns, no trigger"
+        2,
+        "write turn and completion, but no trigger"
     );
     let WorkerState::Completed { .. } = &state else {
         panic!("worker must complete, got {state:?}")
@@ -576,9 +584,13 @@ async fn no_declared_patterns_means_no_trigger() {
 #[tokio::test]
 async fn the_security_suffix_selects_the_adversarial_review() {
     let repo = TestRepo::new("suffix");
-    repo.commit_change("src/ordinary.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/ordinary.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
         ScriptedSseServer::security_completion_turn("call_review", 0),
     ])
     .await;
@@ -591,9 +603,13 @@ async fn the_security_suffix_selects_the_adversarial_review() {
     .await;
 
     let requests = server.requests.lock().await.clone();
-    assert_eq!(requests.len(), 2, "the requested review ran");
     assert_eq!(
-        requests[1]["model"],
+        requests.len(),
+        3,
+        "write, implementer, and the requested review"
+    );
+    assert_eq!(
+        requests[2]["model"],
         json!("test-reviewer"),
         "the suffix selects the mode, not the model"
     );
@@ -612,9 +628,13 @@ async fn the_security_suffix_selects_the_adversarial_review() {
 #[tokio::test]
 async fn a_bare_review_after_keeps_the_generic_prompt() {
     let repo = TestRepo::new("bare");
-    repo.commit_change("src/ordinary.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/ordinary.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
         ScriptedSseServer::completion_turn("call_review", "REPORT\ndone: reviewed\nrisks: none"),
     ])
     .await;
@@ -642,9 +662,13 @@ async fn a_bare_review_after_keeps_the_generic_prompt() {
 async fn a_sensitive_diff_upgrades_a_requested_review() {
     let repo = TestRepo::new("upgrade");
     repo.declare_sensitive(&["src/hub/**"]);
-    repo.commit_change("src/hub/mod.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/hub/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
         ScriptedSseServer::security_completion_turn("call_review", 1),
     ])
     .await;
@@ -657,8 +681,8 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
     .await;
 
     let requests = server.requests.lock().await.clone();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1]["model"], json!("test-reviewer"));
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2]["model"], json!("test-reviewer"));
     let prompt = review_prompt_of(&server).await.expect("a review prompt");
     assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
     assert!(prompt.contains("src/hub/mod.rs"));
@@ -676,9 +700,13 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
 async fn the_reviewer_runs_the_dispatch_verify_command() {
     let repo = TestRepo::new("verify");
     repo.declare_sensitive(&["src/hub/**"]);
-    repo.commit_change("src/hub/mod.rs");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        write_turn("call_write", "src/hub/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
         ScriptedSseServer::security_completion_turn("call_review", 0),
     ])
     .await;
@@ -701,7 +729,7 @@ async fn the_reviewer_runs_the_dispatch_verify_command() {
             Some("review-security".to_string()),
             None,
             false,
-            Some("make check".to_string()),
+            Some("echo gate-ok".to_string()),
             Vec::new(),
         )
         .await
@@ -710,7 +738,7 @@ async fn the_reviewer_runs_the_dispatch_verify_command() {
 
     let prompt = review_prompt_of(&server).await.expect("a review prompt");
     assert!(
-        prompt.contains("make check"),
+        prompt.contains("echo gate-ok"),
         "the prompt must name the dispatch's gate"
     );
     assert!(!prompt.contains("cargo"));

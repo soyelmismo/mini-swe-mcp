@@ -299,7 +299,7 @@ fn every_row_a_meta_writes_carries_its_base_branch() {
         metrics: Default::default(),
         report: None,
         verified: None,
-    security_review: None,
+        security_review: None,
     };
     let pool = WorkerPool::with_scratch(
         1,
@@ -790,7 +790,7 @@ fn a_consolidators_round_survives_its_later_status_writes() {
         metrics: Default::default(),
         report: None,
         verified: None,
-    security_review: None,
+        security_review: None,
     };
     pool.__test_reset_registry_throttle("wcons");
     pool.__test_save_status(
@@ -950,7 +950,7 @@ fn successive_round_recordings_survive_status_writes_between_them() {
         metrics: Default::default(),
         report: None,
         verified: None,
-    security_review: None,
+        security_review: None,
     };
     let status = |pool: &mini_swe_mcp::pool::WorkerPool| {
         pool.__test_reset_registry_throttle("wunion");

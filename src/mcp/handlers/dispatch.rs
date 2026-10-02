@@ -318,7 +318,8 @@ pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; t
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model; `:security` = adversarial.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
+    "Reviewer model; `:security` = adversarial.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";

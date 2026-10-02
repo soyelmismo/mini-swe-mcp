@@ -100,7 +100,12 @@ impl ReviewMode {
 /// sensitive, which is why the security review was triggered; it is empty for
 /// a quality review or for a security review the orchestrator asked for by
 /// hand.
-pub fn review_prompt(mode: ReviewMode, task: &str, verify: Option<&str>, sensitive: &[String]) -> String {
+pub fn review_prompt(
+    mode: ReviewMode,
+    task: &str,
+    verify: Option<&str>,
+    sensitive: &[String],
+) -> String {
     let gate = verify
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -193,7 +198,8 @@ pub(super) async fn touched_files(
         let base = WorktreeGuard::diff_base_at(&path, &base_commit, base_branch.as_deref())
             .unwrap_or_else(|_| "HEAD".to_string());
         let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
-        let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &base]) else {
+        let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &base])
+        else {
             return Vec::new();
         };
         if !output.status.success() {
