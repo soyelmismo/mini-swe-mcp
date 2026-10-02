@@ -146,24 +146,39 @@ impl HubPaths {
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
             return None;
         }
-        let dir = fallback_socket_dir(&self.dir);
-        harden_hub_dir(dir.clone()).ok().map(|_| dir)
+        Some(fallback_socket_dir(&self.dir))
     }
 
-    /// Where the hub listens: a filesystem socket when one fits, otherwise
-    /// (no short writable directory, e.g. inside a sandbox that denies `/tmp`)
-    /// a Linux abstract-namespace socket named after the hub dir. Daemon and
-    /// clients derive the same endpoint; access stays restricted to this user
-    /// by the daemon's `SO_PEERCRED` check.
-    /// The endpoint to *dial* a predecessor on, never creating anything.
+    /// The endpoint to *dial* a predecessor on, without creating anything.
     ///
-    /// Same answer as [`HubPaths::endpoint`] when the socket sits in the hub
-    /// directory, and the same short fallback path otherwise -- but computed,
-    /// not created. A client or a lock waiter that is about to find a
-    /// predecessor listening must not leave an empty `/tmp/mswe-<uid>-<hash>`
-    /// behind for a daemon it never started.
+    /// The same answer as [`HubPaths::endpoint`] whenever the socket could be
+    /// bound there, but computed rather than created. Callers routinely ask
+    /// "is a hub already listening?" and find out only after connecting: a
+    /// probe that created `/tmp/mswe-<uid>-<hash>` would leave an empty
+    /// directory behind under a `TMPDIR` deep enough to force the fallback,
+    /// for a hub that is never started.
+    ///
+    /// A fallback directory that is absent *and* cannot be created means no
+    /// daemon will ever bind there, so the answer is the abstract socket the
+    /// daemon would use -- checked by attempting the same creation
+    /// [`HubPaths::endpoint`] performs, in a scratch-free way: the directory is
+    /// created and then removed again, since nothing is listening yet.
     pub fn probe_endpoint(&self) -> HubEndpoint {
-        self.endpoint()
+        let natural = self.dir.join("hub.sock");
+        if natural.as_os_str().len() < MAX_SOCKET_PATH {
+            return HubEndpoint::Path(natural);
+        }
+        let dir = fallback_socket_dir(&self.dir);
+        match harden_hub_dir(dir.clone()) {
+            // Nothing is bound to it yet -- a probe never has a predecessor's
+            // socket to preserve -- so leaving it created is not a leak as long
+            // as this call removes it again.
+            Ok(_) => {
+                let _ = std::fs::remove_dir(&dir);
+                HubEndpoint::Path(dir.join("hub.sock"))
+            }
+            Err(_) => HubEndpoint::Abstract(fallback_socket_key(&self.dir)),
+        }
     }
 
     pub fn endpoint(&self) -> HubEndpoint {
@@ -1135,7 +1150,9 @@ mod tests {
         );
 
         // Asking where the socket would go creates nothing ...
-        let fallback = paths.fallback_dir().expect("a deep hub dir needs a fallback dir");
+        let fallback = paths
+            .fallback_dir()
+            .expect("a deep hub dir needs a fallback dir");
         assert!(
             !fallback.exists(),
             "fallback_dir() must only compute the path, not create {}",

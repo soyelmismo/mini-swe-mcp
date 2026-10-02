@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 use super::daemon::hub_lock_held;
 use super::exe_path;
 use super::identity;
-use super::{HubPaths, hub_dir};
+use super::{HubEndpoint, HubPaths, hub_dir};
 
 /// Dial the hub, starting a detached daemon if none is listening.
 /// Racing starters are serialized by the daemon's exclusive flock.
@@ -553,7 +553,14 @@ async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
                         // wait for both, or the replacement would find the lock
                         // still held and exit as "hub already running".
                         loop {
-                            if !paths.socket().exists() && !hub_lock_held(&paths.lock())? {
+                            // A teardown check, not a bind: ask for the socket
+                            // path without creating the fallback directory a
+                            // deep hub dir would otherwise leave behind.
+                            if !matches!(
+                                paths.probe_endpoint(),
+                                HubEndpoint::Path(ref path) if path.exists()
+                            ) && !hub_lock_held(&paths.lock())?
+                            {
                                 break;
                             }
                             anyhow::ensure!(
