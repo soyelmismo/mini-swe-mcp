@@ -25,6 +25,7 @@ const UNKNOWN_OWNER: &str = "unknown";
 
 mod collect;
 pub(super) mod consolidate;
+mod discard;
 pub(super) mod dispatch;
 mod kill;
 mod logs;
@@ -245,6 +246,7 @@ impl McpServer {
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
             "kill" => self.handle_kill(args, ctx).await,
+            "discard" => self.handle_discard(args, ctx).await,
             "steer" => self.handle_steer(args, token, tx, ctx).await,
             "watch" => self.handle_watch(args, ctx).await,
             "prune" => self.handle_prune(args, token, tx, ctx).await,
@@ -254,8 +256,10 @@ impl McpServer {
         // Looking at or acting on a worker is the owner having seen it: drop
         // that worker's queued watch events so a later watch does not replay
         // them as "while you were not watching".
-        if matches!(action, "status" | "logs" | "collect" | "kill" | "steer")
-            && result.is_ok()
+        if matches!(
+            action,
+            "status" | "logs" | "collect" | "kill" | "discard" | "steer"
+        ) && result.is_ok()
             && let Ok(wid) = Self::get_worker_id(args, action)
         {
             self.hub_events.lock().await.mark_seen(&ctx.agent(), wid);

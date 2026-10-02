@@ -13,6 +13,10 @@ pub(super) fn build(cli_args: &[String], tool_args: &mut Map<String, Value>) -> 
 /// would have to guess. The rest are the defaults that differ from a plain
 /// dispatch -- the model, the full gate and the turn budget -- and every one of
 /// them is optional because the hub computes a sensible value.
+///
+/// `--set` picks the other meaning of the same verb: amend the pending round's
+/// auto-consolidation settings (`--model` and/or `--verify`) through the hub
+/// rather than dispatching its consolidator now.
 pub(super) fn consolidate_args(
     cli_args: &[String],
     tool_args: &mut Map<String, Value>,
@@ -24,6 +28,11 @@ pub(super) fn consolidate_args(
             "--model" | "-m" => take_value(cli_args, &mut i, tool_args, "model"),
             "--verify" => take_value(cli_args, &mut i, tool_args, "verify"),
             "--max-turns" | "-t" => take_turns(cli_args, &mut i, tool_args),
+            // `--set` amends the pending round's settings instead of
+            // dispatching its consolidator; `--model`/`--verify` say which.
+            "--set" => {
+                tool_args.insert("set".into(), Value::Bool(true));
+            }
             _ => {}
         }
         i += 1;

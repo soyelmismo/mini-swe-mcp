@@ -242,6 +242,15 @@ pub struct WorkerMeta {
     pub group: Option<String>,
     pub role: WorkerRole,
     pub repo_path: Option<String>,
+    /// Branch this worker's diff is measured against, detected at dispatch.
+    ///
+    /// Every row this meta writes carries it, because the retirement sweep proves
+    /// a worker integrated exactly from `base_branch` + the row's repository: a
+    /// row without one is a merged worker the sweep cannot retire.
+    pub base_branch: Option<String>,
+    /// Commit `worker-<id>` was created from, recorded with the row for the same
+    /// reason and for a continuation that must recreate a pruned branch.
+    pub base_commit: Option<String>,
     /// Agent identity owning this worker, copied into every row this meta
     /// writes — including the review phase's, which keeps one worker.
     pub owner: String,
@@ -279,6 +288,8 @@ impl WorkerMeta {
             group: None,
             role: WorkerRole::Worker,
             repo_path: None,
+            base_branch: None,
+            base_commit: None,
             owner: owner.into(),
             started_at: 0,
             pid: std::process::id(),
@@ -321,8 +332,8 @@ impl WorkerMeta {
             repo_path: self.repo_path.clone(),
             owner: Some(self.owner.clone()),
             metrics: self.metrics,
-            base_branch: None,
-            base_commit: None,
+            base_branch: self.base_branch.clone(),
+            base_commit: self.base_commit.clone(),
             head_commit: None,
             revision: self.revision,
             auto_continues: self.auto_continues,

@@ -219,11 +219,27 @@ impl McpServer {
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
         // Optional verify gate: an explicit string (possibly empty to disable)
-        // is passed through; an absent argument lets the pool auto-detect.
-        let verify = args
-            .get("verify")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // is passed through; an absent argument lets the pool auto-detect. A
+        // non-string is refused here rather than dropped, so a caller who
+        // meant a gate never silently gets the auto-detected one.
+        let verify = match args.get("verify") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'verify' must be a string for action 'dispatch'")
+                    })?
+                    .to_string(),
+            ),
+        };
+        // Parse-checked where it enters: a gate stored verbatim is run by a
+        // worker (or, for `consolidate_verify`, by a consolidator dispatched
+        // long after anyone was watching), and an unparsable one fails there
+        // with nobody left to fix it.
+        if let Some(gate) = &verify {
+            crate::pool::validate_verify_command(gate, "verify")?;
+        }
 
         self.validate_auto_consolidate(args)?;
         let admission = self.admit_worker().await?;
@@ -286,9 +302,9 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer model auditing the worktree after implementation.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
-    "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
+    "Auto-consolidate the group when it stops: boolean or model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";

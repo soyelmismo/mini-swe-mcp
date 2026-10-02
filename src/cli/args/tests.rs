@@ -76,3 +76,13 @@ fn test_tool_args_maps_positional_arguments_for_simple_verbs() {
         .unwrap();
     assert_eq!(r.len(), 1);
 }
+
+/// `discard` targets one worker like `kill`, so the positional maps to the same
+/// `worker_id` argument the handler reads.
+#[test]
+fn test_tool_args_maps_the_discard_target() {
+    let a = args(&["mini-swe-mcp", "discard", "w1"]);
+    let out = tool_args("discard", &a, true).unwrap().unwrap();
+    assert_eq!(out["action"], "discard");
+    assert_eq!(out["worker_id"], "w1");
+}

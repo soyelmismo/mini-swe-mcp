@@ -30,6 +30,39 @@ use crate::agent::{ChatMessage, Role};
 use super::state::{retention_expired, within_retired_grace};
 use super::steer::remove_steer_file_in;
 
+/// The branch and commit a dispatch measured its diff against, as the two
+/// probes [`detect_base_branch`] and [`detect_base_commit`] answer them.
+///
+/// Both ends of the pool need the same pair: the worktree guard detects it when
+/// it creates `worker-<id>`, and a registry row that names no base must fall
+/// back on it to prove a branch merged. Asking git twice instead would let the
+/// two drift apart, so the pair is one answer.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BaseFacts {
+    /// Branch checked out when the repository was read. `None` for a detached
+    /// `HEAD`: there is no branch to sync or to prove an ancestry against.
+    pub branch: Option<String>,
+    /// Commit the worker's branch would be created from.
+    pub commit: Option<String>,
+}
+
+/// Detect the base branch and base commit of `repo_path` in one blocking call.
+///
+/// Both probes are read-only and independent, so a failure of either leaves
+/// only that fact unknown: a caller that needs one records the other rather than
+/// losing both to a single detached or unborn `HEAD`.
+pub(crate) fn detect_base_facts(repo_path: &Path) -> BaseFacts {
+    let commit_out = crate::worktree::git(repo_path, "rev-parse HEAD", &["rev-parse", "HEAD"]);
+    let commit = commit_out
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    BaseFacts {
+        branch: detect_base_branch(repo_path),
+        commit,
+    }
+}
+
 /// Prefix of the user message a revision appends after the reloaded history.
 ///
 /// Kept in one place so the pool, the MCP schema text and the tests agree on
@@ -101,7 +134,7 @@ pub async fn ensure_base_branch(
 pub const DEFAULT_REVISION_TURNS: usize = 60;
 
 /// The metadata a finished run leaves behind so a later steer can relaunch it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkerHistory {
     /// Dispatch authority, preserved across warm and cold continuations.
     #[serde(default)]
@@ -498,10 +531,16 @@ pub struct RetireContext<'a> {
 /// here can lose work that is not already in the repository.
 ///
 /// Called for an integrated worker *immediately* -- by `merge`, by
-/// `merge --approved`, and when a consolidator lands -- and by
-/// [`sweep_retired_workers_in`] for whatever a merge could not reach. Every
-/// step is best effort: retirement is idempotent, and a file that is already
-/// gone is the desired end state, not an error.
+/// `merge --approved`, and when a consolidator lands -- by `discard` for a
+/// stopped worker that will never land, and by [`sweep_retired_workers_in`]
+/// for whatever a merge could not reach. Every step is best effort:
+/// retirement is idempotent, and a file that is already gone is the desired
+/// end state, not an error.
+///
+/// `discard` and a merge are the same operation on the files and differ only
+/// in intent: a merge retires a worker whose work is in the base branch, a
+/// discard retires one whose work is abandoned. Neither can lose work, because
+/// the branch goes with them.
 pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
     retire_worker_with(root, worker_id, &RetireContext::default());
 }
@@ -567,8 +606,15 @@ pub fn retire_worker_reporting(
             branch_deleted = true;
         }
     }
-    for suffix in ["steer-source", "round-base"] {
-        let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
+    // Every base directory the root sweeps, not just its own: a `.round-base`
+    // is written next to the root that dispatched the consolidator, and a
+    // retirement that only looked at one would leave the pinned base of a
+    // discarded round behind -- exactly the leftover a discard exists to
+    // remove.
+    for base in root.base_dirs() {
+        for suffix in ["steer-source", "round-base"] {
+            let _ = std::fs::remove_file(base.join(format!("swe-wt-{worker_id}.{suffix}")));
+        }
     }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
@@ -670,7 +716,20 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
             continue;
         };
-        let Some(base) = entry.base_branch.clone().filter(|base| !base.is_empty()) else {
+        // The path as resolved now: a row records the path as it was resolved
+        // and every probe below resolves it again.
+        let Some(canonical_repo) = repo.canonicalize().ok() else {
+            continue;
+        };
+        // A row written before base-branch tracking names no base, and without
+        // one the sweep cannot prove the worker integrated -- which is how a
+        // whole pool of merged workers stayed on the books. The base such a row
+        // was dispatched against is in the worker's own saved conversation, so
+        // the fallback reads it there. It is the same positive proof the
+        // ancestry test itself is: what the worker recorded, never a guessed
+        // branch name, and a row whose base cannot be established retires
+        // nothing.
+        let Some(base) = base_branch_proof(root, &entry, &canonical_repo) else {
             continue;
         };
         // A kept branch is a durable operator instruction, not a one-off pass:
@@ -751,6 +810,52 @@ fn refs_of(repo: &Path, args: &[&str]) -> Option<std::collections::HashSet<Strin
             .map(str::to_string)
             .collect(),
     )
+}
+
+/// The base branch an ancestry proof may compare `worker-<id>` against.
+///
+/// A row that names its base needs no help: the branch it was dispatched
+/// against is the branch its work must have landed in. A row that names none --
+/// every row written before base-branch tracking, on the host and here alike --
+/// is answered from the worker's own saved conversation, the same file a
+/// revision reloads, whose metadata records the base branch before the worker's
+/// first turn. Both sources are per-worker facts, so neither the proof nor the
+/// group key can mix two workers' bases.
+///
+/// A row with neither -- a conversation lost, or never written -- names no base
+/// at all, and the sweep must keep the worker: nothing positive can be proved.
+/// The repository's currently checked-out branch is deliberately *not* the
+/// substitute, because it moves with whoever dispatches next; proving against
+/// it would retire a merged worker and an unintegrated one alike.
+fn base_branch_proof(
+    root: &ScratchRoot,
+    entry: &super::WorkerRegistryEntry,
+    canonical_repo: &Path,
+) -> Option<String> {
+    if let Some(base) = entry
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        return Some(base.to_string());
+    }
+    let history = load_worker_history_in(root, &entry.id).ok()?;
+    if !Path::new(&history.repo_path)
+        .canonicalize()
+        .ok()
+        .is_some_and(|repo| repo == canonical_repo)
+    {
+        // The conversation names a different repository than the row, so it
+        // cannot say which branch *this* row's work was based on.
+        return None;
+    }
+    let base = history
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())?;
+    (base != format!("worker-{}", entry.id)).then(|| base.to_string())
 }
 
 /// The metadata line of a history file: the repository and branch its worker
@@ -1570,6 +1675,8 @@ impl super::WorkerPool {
             group: history.group.clone(),
             role: history.role,
             repo_path: Some(history.repo_path.clone()),
+            base_branch: history.base_branch.clone(),
+            base_commit: Some(history.base_commit.clone()),
             started_at: now,
             pid: std::process::id(),
             metrics: super::WorkerMetrics::default(),
