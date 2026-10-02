@@ -1104,6 +1104,12 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         if !watch_reply_has_fields(&response) {
             return registry_fallback(opts, json_output, admin, OLD_WATCH_REPLY_NOTICE).await;
         }
+        // The session's watch has grown behind this process: adopt the union
+        // and keep watching. The hub carries it on every poll, so a pushed
+        // widening frame is never the only way to learn it.
+        if let Some(union) = response.get("widen_to") {
+            adopt_widened_selection(&mut opts, &mut ids, union);
+        }
         // The hub answers a second watch of this session in-band: either the
         // running watch already covered it, or it was just widened to the
         // union. Both exit 0 at once; the running process - on its own

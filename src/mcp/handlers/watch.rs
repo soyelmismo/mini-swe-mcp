@@ -126,7 +126,7 @@ impl McpServer {
         let (mut ids, mut groups, mut all) = (ids, groups, all);
         loop {
             let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
-            if let Some(widened) = reply.get("widened")
+            if let Some(widened) = reply.get("widened").or_else(|| reply.get("widen_to"))
                 && let (Some(worker_ids), Some(named), Some(round)) = (
                     widened.get("worker_ids").and_then(|v| v.as_array()),
                     widened.get("group").and_then(|v| v.as_array()),

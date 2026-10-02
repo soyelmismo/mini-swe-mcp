@@ -2080,13 +2080,28 @@ impl EventRouter {
                 }}));
             }
         };
-        // The unioned selection, not the request, is what filters this reply:
-        // a connection that widened the running watch answers with the wider
-        // view from then on, and never prunes back to its own flags.
-        let ids: BTreeSet<String> = selection.ids.clone();
-        let groups: BTreeSet<String> = selection.groups.clone();
-        if selection.all {
-            return self.watch_round(ctx, &ids, &groups);
+        // This reply is filtered by *this* request, not by the session's
+        // union: a plain poll must return plain transitions even while the
+        // union also carries a round watch, and a round poll must answer a
+        // round. A caller whose session has grown behind it learns the union
+        // from the `widen_to` field below (and from the pushed frame), adopts
+        // it, and asks for the union on its next poll.
+        let widen_to = (!selection.covers(&request)).then(|| {
+            json!({
+                "worker_ids": selection.ids.iter().collect::<Vec<_>>(),
+                "group": selection.groups.iter().collect::<Vec<_>>(),
+                "all": selection.all,
+                "selection": selection.describe(),
+            })
+        });
+        let ids: BTreeSet<String> = request.ids.clone();
+        let groups: BTreeSet<String> = request.groups.clone();
+        if request.all {
+            let mut round = self.watch_round(ctx, &ids, &groups)?;
+            if let Some(union) = widen_to {
+                round["widen_to"] = union;
+            }
+            return Ok(round);
         }
         let watching: BTreeSet<String> = self
             .watch_current
@@ -2149,7 +2164,11 @@ impl EventRouter {
                 }
             }
         }
-        Ok(json!({"watching":watching,"events":events}))
+        let mut reply = json!({"watching":watching,"events":events});
+        if let Some(union) = widen_to {
+            reply["widen_to"] = union;
+        }
+        Ok(reply)
     }
 
     /// The `--all` watch: one consolidated event for the round that landed.
