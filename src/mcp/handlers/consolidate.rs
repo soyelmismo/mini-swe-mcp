@@ -13,7 +13,10 @@ impl McpServer {
     /// Defaults differ from a plain dispatch on purpose: the consolidator runs
     /// on the manifest's strongest tier when one is marked, and its gate is the
     /// project's *full* gate (the explicit `verify`, else the auto-detected
-    /// one), because it is the only worker that runs the whole suite. A
+    /// one), because it is the only worker that runs the whole suite. The
+    /// round's workers, dispatched with `consolidate` set, get the cheap
+    /// static gate (see [`crate::pool::detect_cheap_verify_command`]) unless
+    /// the dispatch names an explicit `verify` for them. A
     /// consolidated round (`consolidate` set, no explicit worker `verify`)
     /// instead hands its workers the cheap static gate, so only the
     /// consolidator pays for the full suite.
@@ -74,23 +77,15 @@ impl McpServer {
             .unwrap_or(&self.default_model);
 
         // The explicit gate wins; an absent one auto-detects, so a consolidator
-        // never runs a cheaper subset than the project's own gate.
+        // never runs a cheaper subset than the project's own gate. The
+        // round's workers get the cheap gate instead: their dispatch
+        // (with `consolidate` set) resolves it in `dispatch_one`, so
+        // only the consolidator pays for the full suite.
         let verify = match args.get("verify").and_then(|v| v.as_str()) {
             // An explicit empty string disables the gate, exactly as on dispatch.
             Some("") => None,
             Some(cmd) => Some(cmd.to_string()),
             None => crate::pool::detect_verify_command(&repo_path),
-        };
-        // A consolidated round (`consolidate` set, no explicit worker
-        // `verify`) hands its workers the cheap static gate, so only the
-        // consolidator pays for the full suite. An explicit worker verify
-        // -- including an empty one that disables it -- always wins.
-        let worker_verify = match args.get("verify").and_then(|v| v.as_str()) {
-            Some(cmd) => Some(cmd.to_string()),
-            None if args.get("consolidate").is_some() => {
-                crate::pool::detect_cheap_verify_command(&repo_path)
-            }
-            None => None,
         };
 
         let mut dispatch = Map::new();
@@ -105,12 +100,6 @@ impl McpServer {
         dispatch.insert("repo_path".into(), json!(repo_path));
         // Preserve an explicitly disabled gate rather than auto-detecting again.
         dispatch.insert("verify".into(), Value::String(verify.unwrap_or_default()));
-        // The gate the round's workers run (the cheap one for a
-        // consolidated round), so the consolidator's review judges each
-        // worker against the gate that actually ran on its branch.
-        if let Some(worker_verify) = worker_verify {
-            dispatch.insert("worker_verify".into(), Value::String(worker_verify));
-        }
         if let Some(turns) = args.get("max_turns").and_then(|v| v.as_u64()) {
             dispatch.insert("max_turns".into(), Value::Number(turns.into()));
         }

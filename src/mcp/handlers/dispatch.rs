@@ -218,12 +218,23 @@ impl McpServer {
         let network_offline =
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
-        // Optional verify gate: an explicit string (possibly empty to disable)
-        // is passed through; an absent argument lets the pool auto-detect.
+        // Optional verify gate: an explicit string (possibly empty to
+        // disable) is passed through. An absent argument lets the pool
+        // auto-detect the full gate -- unless the dispatch asks to
+        // consolidate the round, in which case the workers get the
+        // cheap static gate and the consolidator (dispatched
+        // separately) runs the full suite.
         let verify = args
             .get("verify")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .or_else(|| {
+                let consolidated_round = args.get("consolidate").is_some()
+                    && args.get("role").and_then(Value::as_str) != Some("consolidate");
+                consolidated_round
+                    .then(|| crate::pool::detect_cheap_verify_command(&repo_path))
+                    .flatten()
+            });
 
         self.validate_auto_consolidate(args)?;
         let admission = self.admit_worker().await?;
@@ -288,7 +299,7 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. With 'consolidate' and no explicit verify, workers get the cheap gate (fmt/lint/typecheck) while the consolidator runs the full one.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";
