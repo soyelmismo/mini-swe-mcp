@@ -17,7 +17,9 @@
 //! re-attaches to -- a worker that only read code has no commit to preserve,
 //! so the ref itself is the only thing left of it.
 
-use super::{ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents};
+use super::{
+    ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs,
+};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -193,15 +195,6 @@ pub struct WorktreeGuard {
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
     pub preserve_branch: bool,
-    /// The scratch *base* this checkout's directory sits directly in.
-    ///
-    /// The executor's private scratch and the legacy target directories are
-    /// named after the checkout's leaf and filed next to that directory, not
-    /// under the [`ScratchRoot`] a caller handed in -- a root can be anywhere,
-    /// while the companions are always created in the parent of the checkout
-    /// itself. Recording that parent lets teardown reclaim them from exactly
-    /// where they were created, whichever root a test injected.
-    scratch_base: PathBuf,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
     /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
@@ -376,10 +369,6 @@ impl WorktreeGuard {
             }
         }
 
-        let scratch_base = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(crate::worktree::swe_base_dir);
         Ok(Self {
             path,
             branch: branch.to_string(),
@@ -388,7 +377,6 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
-            scratch_base,
             seeded,
         })
     }
@@ -1131,10 +1119,7 @@ impl Drop for WorktreeGuard {
         // is the fallback for when it could not (audit §04).
         force_remove_dir(&self.path);
         let _ = std::fs::remove_file(&pid_file);
-        // Beside the checkout, which is where the executor created them: the
-        // scratch base follows the directory, so a checkout filed under an
-        // injected scratch root still has its companions reclaimed.
-        crate::worktree::remove_sibling_dirs(&self.scratch_base, &self.path);
+        remove_target_dirs(&self.path);
     }
 }
 
@@ -1424,7 +1409,6 @@ mod tests {
             base_commit: String::new(),
             base_branch: None,
             preserve_branch: false,
-            scratch_base: repo.to_path_buf(),
             seeded: BTreeMap::new(),
         }
     }
