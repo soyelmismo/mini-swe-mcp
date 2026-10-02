@@ -853,10 +853,39 @@ fn cleanup(
 /// proof shows that whatever is on the branch right now is already in the base.
 /// Any doubt -- no row, no repository, no branch, an unprobeable repo -- answers
 /// false, so a re-revised worker survives instead of losing work.
+///
+/// Containment alone is not enough either: a branch still sitting on the
+/// commit its worker was dispatched from is contained in the base trivially,
+/// because the base contains that commit. A worker interrupted before it
+/// committed anything -- one step into a round, or just dispatched -- looks
+/// exactly like that, and retiring it would delete the branch and the
+/// conversation its auto-continuation needs. So the branch must also carry at
+/// least one commit beyond its recorded `base_commit`; a branch whose tip
+/// equals that commit is never integrated.
 fn branch_is_integrated_in(root: &ScratchRoot, repo: &Path, worker_id: &str, base: &str) -> bool {
     let Some(row) = load_registry_entry_in(root, worker_id) else {
         return false;
     };
+    // The commit the branch was created from: on the row from the dispatch, or,
+    // for a row written before base-commit tracking, in the worker's own saved
+    // conversation. Without one nothing can be proven about the branch.
+    let base_commit = row
+        .base_commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|commit| !commit.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            load_worker_history_log_in(root, worker_id)
+                .ok()
+                .map(|history| history.base_commit)
+        });
+    if !super::revision::tip_beyond_base(
+        super::revision::branch_tip(repo, &format!("worker-{worker_id}")).as_deref(),
+        base_commit.as_deref(),
+    ) {
+        return false;
+    }
     // The worker's branch must live in the repository the round landed in, or
     // the probe below would be reading a different repository's refs. Compared
     // canonically, because a row records the path as it was resolved and the

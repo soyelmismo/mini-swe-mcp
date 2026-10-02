@@ -678,6 +678,13 @@ pub struct RetireSweep {
     pub orphan_workers: Vec<String>,
 }
 
+/// One row the sweep is still willing to consider, with the base commit that
+/// proves its branch carries work of its own.
+struct RetireCandidate {
+    id: String,
+    base_commit: String,
+}
+
 /// Retire every worker that is already integrated, and delete the leftovers of
 /// workers nobody can ever continue again.
 ///
@@ -707,10 +714,16 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
     // Grouped by (repository, base): one `for-each-ref` per group answers the
     // merged-branch question for every row of that group, instead of one git
     // process per row.
-    let mut groups: std::collections::BTreeMap<(PathBuf, String), Vec<String>> =
+    let mut groups: std::collections::BTreeMap<(PathBuf, String), Vec<RetireCandidate>> =
         std::collections::BTreeMap::new();
     for entry in super::load_registry_entries_read_only_in(root) {
-        if entry.status.is_live() {
+        // Only a worker that *completed* can have been integrated. A running,
+        // paused, interrupted, exhausted or failed worker still owns work
+        // nobody landed: a daemon handover that retired it would destroy the
+        // very run the next daemon is about to auto-continue. Such a worker is
+        // left exactly as it stands -- the sweep only ever reclaims what a
+        // merge already proved.
+        if entry.status != super::RegistryStatus::Completed {
             continue;
         }
         let Some(repo) = entry.repo_path.as_deref().map(Path::new) else {
@@ -732,6 +745,13 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let Some(base) = base_branch_proof(root, &entry, &canonical_repo) else {
             continue;
         };
+        // The commit the branch was created from, so the proof below can tell
+        // a branch that carries work from one still sitting on its base. A row
+        // with no recorded base commit and no conversation to read one from
+        // proves nothing, and nothing is retired on that evidence.
+        let Some(base_commit) = base_commit_proof(root, &entry) else {
+            continue;
+        };
         // A kept branch is a durable operator instruction, not a one-off pass:
         // leave the whole worker alone while its branch still lives.
         if entry.keep_branch
@@ -739,14 +759,16 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         {
             continue;
         }
-        groups
-            .entry((repo.to_path_buf(), base))
-            .or_default()
-            .push(entry.id);
+        groups.entry((repo.to_path_buf(), base)).or_default().push(
+            RetireCandidate {
+                id: entry.id,
+                base_commit,
+            },
+        );
     }
-    for ((repo, base), ids) in &groups {
+    for ((repo, base), candidates) in &groups {
         // The probe failed: retire nothing, and never guess a repository.
-        let Some(merged) = merged_branches(repo, base) else {
+        let Some(merged) = merged_branch_tips(repo, base) else {
             continue;
         };
         let ctx = RetireContext {
@@ -754,12 +776,22 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
             ack_dir,
             keep_branch: false,
         };
-        for id in ids {
-            if !merged.contains(&format!("worker-{id}")) {
+        for candidate in candidates {
+            let branch = format!("worker-{}", candidate.id);
+            // Two proofs, not one: the branch is contained in the base *and* it
+            // carries at least one commit of its own. A branch still sitting on
+            // the commit it was dispatched from is contained in the base
+            // trivially -- the base contains that commit -- which is how a
+            // worker interrupted one second after dispatch used to be retired
+            // as "integrated".
+            let Some(tip) = merged.get(&branch) else {
+                continue;
+            };
+            if !tip_beyond_base(Some(tip), Some(&candidate.base_commit)) {
                 continue;
             }
-            retire_worker_with(root, id, &ctx);
-            sweep.workers.push(id.clone());
+            retire_worker_with(root, &candidate.id, &ctx);
+            sweep.workers.push(candidate.id.clone());
         }
     }
     let (orphans, orphan_workers) = remove_orphan_worker_files(root);
@@ -780,16 +812,35 @@ fn local_branches(repo: &Path) -> Option<std::collections::HashSet<String>> {
     )
 }
 
-/// The local branches of `repo` already contained in `base`.
-fn merged_branches(repo: &Path, base: &str) -> Option<std::collections::HashSet<String>> {
-    refs_of(
+/// The local branches of `repo` already contained in `base`, each with the
+/// commit its tip points at.
+///
+/// The tip is part of the proof, not a detail: a branch whose tip is the commit
+/// its worker was dispatched from is "contained in `base`" while holding no
+/// work of its own, so the caller compares the two before retiring anything.
+fn merged_branch_tips(repo: &Path, base: &str) -> Option<std::collections::HashMap<String, String>> {
+    let out = crate::worktree::git(
         repo,
+        "for-each-ref",
         &[
             "for-each-ref",
-            "--format=%(refname:short)",
+            "--format=%(refname:short) %(objectname)",
             &format!("--merged={base}"),
             "refs/heads/",
         ],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (name, tip) = line.trim().split_once(' ')?;
+                (!name.is_empty() && !tip.is_empty()).then(|| (name.to_string(), tip.to_string()))
+            })
+            .collect(),
     )
 }
 
@@ -856,6 +907,69 @@ fn base_branch_proof(
         .map(str::trim)
         .filter(|base| !base.is_empty())?;
     (base != format!("worker-{}", entry.id)).then(|| base.to_string())
+}
+
+/// The commit `worker-<id>` was created from, as the integration proof needs
+/// it.
+///
+/// The row carries it from the dispatch; a row written before base-commit
+/// tracking is answered from the worker's own saved conversation, the same
+/// source [`base_branch_proof`] falls back on, which records the base before
+/// the worker's first turn. A worker with neither names no base commit, so
+/// nothing can be proven about its branch and it is never retired.
+fn base_commit_proof(root: &ScratchRoot, entry: &super::WorkerRegistryEntry) -> Option<String> {
+    let recorded = entry
+        .base_commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|commit| is_commit_sha(commit));
+    if let Some(commit) = recorded {
+        return Some(commit.to_string());
+    }
+    load_worker_history_in(root, &entry.id)
+        .ok()
+        .and_then(|history| is_commit_sha(history.base_commit.trim()).then(|| history.base_commit))
+}
+
+/// Whether `value` is a commit sha rather than a placeholder or a free-form
+/// ref, so a probe below never compares a branch tip against something that
+/// could never be a commit.
+fn is_commit_sha(value: &str) -> bool {
+    !value.is_empty() && value.len() >= 7 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The commit `branch` points at in `repo`, or `None` when it cannot be read.
+pub(crate) fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
+    let out = crate::worktree::git(
+        repo,
+        "rev-parse",
+        &["rev-parse", "--verify", "--quiet", branch],
+    )
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|tip| is_commit_sha(tip))
+}
+
+/// Whether a branch whose tip is `tip` proves integration rather than a
+/// dispatch that never committed.
+///
+/// The caller already proved the branch reachable from its base branch; this
+/// is the other half. A tip equal to the commit the worker's branch was created
+/// from holds no work of its own, so containment in the base says nothing: the
+/// base contains that commit whether or not the worker ever did anything. A
+/// worker interrupted seconds after dispatch -- with no commits yet, because it
+/// had only read code -- looks exactly like that, and retiring it would delete
+/// the branch and conversation its auto-continuation needs.
+///
+/// Either side unknown proves nothing and answers false: a missing tip or a
+/// missing base commit must never authorise a retirement.
+pub(crate) fn tip_beyond_base(tip: Option<&str>, base_commit: Option<&str>) -> bool {
+    match (tip, base_commit) {
+        (Some(tip), Some(base)) => is_commit_sha(tip) && is_commit_sha(base) && tip != base,
+        _ => false,
+    }
 }
 
 /// The metadata line of a history file: the repository and branch its worker
