@@ -1086,6 +1086,8 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
                 println!("{error}");
                 return Ok(0);
             }
+            // A hub that predates the widening still refuses a second watch
+            // instead of covering or widening it; report it as it always did.
             Err(error) if error.to_string().contains("a watch is already running") => {
                 println!("{error}");
                 return Ok(5);

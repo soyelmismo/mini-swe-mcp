@@ -831,8 +831,15 @@ impl HubClient {
     /// forgotten, exactly as before.
     pub async fn next_watch_notification(&mut self) -> Result<Option<Value>> {
         if !self.notifications.is_empty() {
+            // A widen can race an in-flight reply and be parked here; scan the
+            // parked frames before dropping them, or the running watch would
+            // only pick the union up on its next poll.
+            let widened = self
+                .notifications
+                .iter()
+                .find_map(|line| Self::widen_params(&String::from_utf8_lossy(line)));
             self.notifications.clear();
-            return Ok(None);
+            return Ok(widened);
         }
         loop {
             let bytes = self.stream.fill_buf().await?;

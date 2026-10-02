@@ -177,3 +177,33 @@ fn the_budget_is_the_default_and_its_override_is_bounded() {
     );
     assert_eq!(reconnect_secs(Some(5)), 5);
 }
+
+/// Only a watch-widen frame is handed back to the running watch; every other
+/// notification line is still consumed and forgotten.
+#[test]
+fn only_a_widen_frame_is_handed_back() {
+    let widen = format!(
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": crate::mcp::events::WATCH_WIDEN_METHOD,
+            "params": {"worker_ids": [], "group": [], "all": true, "selection": "--all every group"},
+        })
+    );
+    let params = HubClient::widen_params(&widen).expect("a widen frame is handed back");
+    assert_eq!(params["all"], serde_json::json!(true), "{params}");
+    assert_eq!(params["selection"], serde_json::json!("--all every group"));
+
+    for line in [
+        "",
+        "not json",
+        r#"{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{}}"#,
+        // A widen frame without a selection names nothing to adopt.
+        r#"{"jsonrpc":"2.0","method":"notifications/mini-swe/watch_widen","params":{}}"#,
+    ] {
+        assert!(
+            HubClient::widen_params(line).is_none(),
+            "must be ignored: {line}"
+        );
+    }
+}
