@@ -31,6 +31,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "prune",
     "merge",
     "consolidate",
+    "help",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -63,8 +64,9 @@ pub const NETWORK_DEFAULT: &str = "allow";
 /// Description of the `worker` tool itself.
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
-/// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.";
+/// guidance lives per topic, reachable as `help <topic>` (CLI) or the
+/// `help` action (MCP) (see [`crate::cli::help`]).
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks with tasks+group+consolidate, cheap per-worker gate, wait with watch --group <g> --all (MCP all:true), read the consolidator's report, then merge the consolidator. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics via `help <topic>` (CLI) or action 'help' (MCP): workflow watch steer review collect merge identity sandbox env consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -182,6 +184,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "consolidate_verify",
         "string",
         DescriptionSource::Static("Automatic consolidator's full gate; default: auto-detect."),
+    ),
+    (
+        "topic",
+        "string",
+        DescriptionSource::Static(super::handlers::help::TOPIC_DESCRIPTION),
     ),
     (
         "scope",
@@ -528,7 +535,7 @@ mod tests {
         for needle in [
             "mini-swe-mcp watch",
             "run it again after each event",
-            "mini-swe-mcp help <topic>",
+            "`help <topic>` (CLI) or action 'help' (MCP)",
             "own workers",
         ] {
             assert!(

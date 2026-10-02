@@ -26,6 +26,7 @@ const UNKNOWN_OWNER: &str = "unknown";
 mod collect;
 pub(super) mod consolidate;
 pub(super) mod dispatch;
+mod help;
 mod kill;
 mod logs;
 mod manifest;
@@ -234,6 +235,7 @@ impl McpServer {
     ) -> Result<Value> {
         let result = match action {
             "manifest" => self.handle_manifest(),
+            "help" => self.handle_help(args),
             "consolidate" => self.handle_consolidate(args, token, tx, ctx).await,
             "dispatch" => self.handle_dispatch(args, token, tx, ctx).await,
             "status" => self.handle_status(args, ctx).await,
