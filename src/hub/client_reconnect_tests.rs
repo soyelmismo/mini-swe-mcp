@@ -68,8 +68,10 @@ fn every_transport_loss_reads_as_the_daemon_going_away() {
         // Bare, the way a failed write surfaces: nothing is wrapped.
         anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
         anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-        // The dialler gave up before the replacement ever bound its socket.
-        anyhow::anyhow!("Hub did not start within 5 seconds; inspect hub.log"),
+        // The auto-start gave up before the replacement ever bound its socket:
+        // the refusal is a source of that message, not the message itself.
+        wrapped(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .context("Hub did not start; inspect hub.log"),
     ] {
         assert!(
             daemon_went_away(&error),
@@ -141,7 +143,7 @@ async fn a_chase_reports_a_refusal_without_dialling_again() {
 /// A hub that never comes back ends the watch with an explanation, not a hang.
 #[tokio::test]
 async fn a_chase_gives_up_once_its_budget_is_spent() {
-    let dial = Dial::new(std::iter::repeat_with(|| {
+    let dial = Dial::new((0..32).map(|_| {
         Err(anyhow::Error::new(std::io::Error::from(
             std::io::ErrorKind::ConnectionRefused,
         )))
@@ -152,7 +154,7 @@ async fn a_chase_gives_up_once_its_budget_is_spent() {
     let message = error.to_string();
     assert!(message.contains("did not come back"), "{message}");
     assert!(
-        message.contains("Connection refused"),
+        message.to_lowercase().contains("connection refused"),
         "the cause is reported with it: {message}"
     );
     assert!(

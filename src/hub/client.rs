@@ -42,7 +42,10 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         match super::daemon::connect_endpoint(&paths.endpoint()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
+                // The daemon is not there: reported with the refusal that proved
+                // it, so a client following it reads this as a daemon that has
+                // yet to come up rather than as its own failure.
+                return Err(error).context("Hub did not start; inspect hub.log");
             }
             Err(_) => {}
         }
@@ -102,16 +105,16 @@ pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()
 /// a context prefix could hide that kind from the chain (a failing write is
 /// reported bare, and `display` is not what `Error::source` walks).
 pub fn daemon_went_away(error: &anyhow::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
-    while let Some(cause) = source {
+    // `chain` starts at the error itself (a bare `io::Error` has no source, so
+    // walking `source` alone would never reach it) and ends at the root cause.
+    for cause in error.chain() {
         if is_gone_away_kind(cause) {
             return true;
         }
-        source = cause.source();
     }
     // `anyhow::Error` reports only the outermost context, which need not be
     // the transport error itself, so read the whole rendered chain too.
-    let chain = format!("{error:#}");
+    let chain = error_chain(error);
     chain.contains("Hub closed the connection")
         || chain.contains("Connection reset by peer")
         || chain.contains("Broken pipe")
@@ -191,13 +194,11 @@ fn give_up(waited: Duration, last: &anyhow::Error) -> anyhow::Error {
 /// Every frame of an error, so a reported cause is never the outermost context
 /// alone.
 fn error_chain(error: &anyhow::Error) -> String {
-    let mut chain = vec![error.to_string()];
-    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
-    while let Some(cause) = source {
-        chain.push(cause.to_string());
-        source = cause.source();
-    }
-    chain.join(": ")
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 /// Re-announce this identity on a new connection and return the replacement.
