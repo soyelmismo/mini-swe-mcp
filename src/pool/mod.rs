@@ -1123,6 +1123,16 @@ impl WorkerPool {
     async fn list_workers_matching(&self, owner: Option<&str>) -> Vec<serde_json::Value> {
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        // Who has absorbed whom, from the consolidators' own rows: a worker a
+        // consolidator took over is shown as absorbed until the consolidator's
+        // branch is merged and retires it, so it is never mistaken for work an
+        // orchestrator still has to resolve by hand.
+        let absorbed_by: std::collections::HashMap<String, String> =
+            load_all_registry_entries_in(&self.scratch)
+                .into_iter()
+                .filter(|e| !e.absorbed.is_empty())
+                .flat_map(|e| e.absorbed.into_iter().map(move |id| (id, e.id.clone())))
+                .collect();
         {
             let lock = self.workers.read().await;
             for w in lock
@@ -1136,7 +1146,7 @@ impl WorkerPool {
                 // after it is collected.
                 let approved =
                     load_registry_entry_in(&self.scratch, &w.id).and_then(|e| e.approved);
-                rows.push(serde_json::json!({
+                let mut row = serde_json::json!({
                     "id": w.id,
                     "task": w.task,
                     "model": w.model,
@@ -1146,7 +1156,9 @@ impl WorkerPool {
                     "logs_retained": stats.logs_retained,
                     "logs_dropped": stats.logs_dropped,
                     "approved": approved,
-                }));
+                });
+                annotate_absorbed(&mut row, &absorbed_by, &w.id);
+                rows.push(row);
             }
         }
         let registry = load_all_registry_entries_in(&self.scratch)
@@ -1155,7 +1167,7 @@ impl WorkerPool {
                 !seen.contains(&e.id) && owner.is_none_or(|owner| e.owner.as_deref() == Some(owner))
             });
         rows.extend(registry.map(|e| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "id": e.id,
                 "task": e.task,
                 "model": e.model,
@@ -1177,7 +1189,9 @@ impl WorkerPool {
                 // than being silently absent (audit 07, R7).
                 "logs_retained": 0,
                 "logs_dropped": 0,
-            })
+            });
+            annotate_absorbed(&mut row, &absorbed_by, &e.id);
+            row
         }));
         rows
     }
@@ -2382,6 +2396,31 @@ impl WorkerPool {
                 "the step log left with the evicted in-memory record".to_string(),
             ),
         })
+    }
+}
+
+/// Mark a list row whose worker a consolidator absorbed.
+///
+/// The status line becomes `absorbed by <consolidator>` and the consolidator's
+/// id is carried alongside, so an orchestrator reading `list` sees that the
+/// worker's correction is already somebody else's work and will be retired with
+/// that consolidator's merge -- not a worker it must resolve itself.
+fn annotate_absorbed(
+    row: &mut serde_json::Value,
+    absorbed_by: &std::collections::HashMap<String, String>,
+    id: &str,
+) {
+    let Some(consolidator) = absorbed_by.get(id) else {
+        return;
+    };
+    if let Some(state) = row.get_mut("state").and_then(|s| s.as_object_mut()) {
+        state.insert(
+            "status".to_string(),
+            serde_json::json!(format!("absorbed by {consolidator}")),
+        );
+    }
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("absorbed_by".to_string(), serde_json::json!(consolidator));
     }
 }
 

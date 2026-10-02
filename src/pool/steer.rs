@@ -211,7 +211,7 @@ pub(super) struct SteerSource {
 /// lands.
 pub(super) fn steered_workers_of(root: &ScratchRoot, consolidator: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(entries) = std::fs::read_dir(root.path()) else {
         return out;
     };
     for entry in entries.flatten() {
