@@ -27,6 +27,10 @@ use std::time::Duration;
 /// exact string rather than re-deriving it from the code under test.
 const RUST_CHEAP: &str = "cargo fmt --check && cargo clippy --all-targets -- -D warnings";
 
+/// The full gate the same manifest selects: the consolidator runs this once
+/// over the integrated round, so it is the half a worker must never be given.
+const RUST_FULL: &str = "cargo build --all-targets && cargo test";
+
 /// A throwaway repository with a baseline commit, optionally carrying the
 /// manifest whose presence selects the ecosystem.
 fn repo(tag: &str, manifest: Option<(&str, &str)>) -> TempDir {
@@ -117,6 +121,63 @@ impl Round {
         self.harness.root()
     }
 
+    /// Commit `files` on a `worker-<id>` branch off `master` and record the
+    /// matching completed registry row: the shape of a finished worker the
+    /// round manifest lists as ready to integrate.
+    fn finished_worker(&self, repo: &Path, worker_id: &str, files: &[(&str, &str)]) {
+        let branch = format!("worker-{worker_id}");
+        git(repo, &["checkout", "-q", "master"]);
+        git(repo, &["checkout", "-q", "-b", &branch]);
+        for (file, content) in files {
+            std::fs::write(repo.join(file), content).unwrap();
+            git(repo, &["add", file]);
+            git(
+                repo,
+                &[
+                    "-c",
+                    "user.name=w",
+                    "-c",
+                    "user.email=w@x",
+                    "commit",
+                    "-m",
+                    file,
+                ],
+            );
+        }
+        git(repo, &["checkout", "-q", "master"]);
+        mini_swe_mcp::pool::save_registry_entry_in(
+            &self.root(),
+            &mini_swe_mcp::pool::WorkerRegistryEntry {
+                task: "finished work".to_string(),
+                status: mini_swe_mcp::pool::RegistryStatus::Completed,
+                group: Some("round".to_string()),
+                role: mini_swe_mcp::pool::WorkerRole::Worker,
+                repo_path: Some(repo.to_string_lossy().to_string()),
+                base_branch: Some("master".to_string()),
+                ..mini_swe_mcp::pool::WorkerRegistryEntry::test_row(worker_id, "cheap-gate-owner")
+            },
+        );
+    }
+
+    /// Dispatch the consolidator for `group` and return its worker id.
+    async fn consolidate(&self, repo: &Path, group: &str, args: Value) -> String {
+        let mut ctx = ConnectionContext::stdio();
+        ctx.agent_id = Some("cheap-gate-owner".into());
+        let mut args = args;
+        args["action"] = json!("consolidate");
+        args["repo_path"] = json!(repo);
+        args["group"] = json!(group);
+        let result = self
+            .server
+            .execute_tool_for("worker", args, &ctx)
+            .await
+            .expect("the consolidate is accepted");
+        result["worker_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the consolidate answered without a worker id: {result}"))
+            .to_string()
+    }
+
     /// Dispatch `args` as a worker action and return the first worker id.
     async fn dispatch(&self, repo: &Path, args: Value) -> String {
         let mut ctx = ConnectionContext::stdio();
@@ -180,14 +241,10 @@ async fn a_plain_dispatch_still_gets_the_full_gate() {
         .dispatch(repo.path(), json!({"task": "add a parser", "max_turns": 2}))
         .await;
 
-    let gate = recorded_gate(&round.root(), &worker).expect("the full gate is recorded");
-    assert_ne!(
-        gate, RUST_CHEAP,
-        "without 'consolidate' the worker keeps the full auto-detected gate, got {gate:?}"
-    );
-    assert!(
-        gate.contains("test"),
-        "the full gate for a Rust repository runs its tests, got {gate:?}"
+    assert_eq!(
+        recorded_gate(&round.root(), &worker).as_deref(),
+        Some(RUST_FULL),
+        "without 'consolidate' the worker keeps the full auto-detected gate"
     );
     let _ = round.pool().kill_all().await;
 }
@@ -276,6 +333,40 @@ async fn a_node_round_gates_its_workers_on_the_package_scripts() {
         recorded_gate(&round.root(), &worker).as_deref(),
         Some("npm run lint"),
         "the package's own lint script is its cheap gate"
+    );
+    let _ = round.pool().kill_all().await;
+}
+
+/// The other half of the split: the round's one consolidator runs the full
+/// gate, even though every worker of that round ran the cheap one. This is
+/// the property that makes the cheap default pay off -- the suite runs once,
+/// over the integrated result, instead of once per worker plus once at the
+/// end.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_round_consolidator_still_gets_the_full_gate() {
+    let repo = repo("cheap-gate-consolidator", Some(("Cargo.toml", "[package]\n")));
+    let round = Round::new("cheap-gate-consolidator-pool").await;
+    round.finished_worker(repo.path(), "aaaa1111", &[("worker.rs", "fn main() {}\n")]);
+
+    let worker = round
+        .dispatch(
+            repo.path(),
+            json!({"task": "add a parser", "consolidate": true, "max_turns": 2}),
+        )
+        .await;
+    let consolidator = round
+        .consolidate(repo.path(), "round", json!({"max_turns": 2}))
+        .await;
+
+    assert_eq!(
+        recorded_gate(&round.root(), &worker).as_deref(),
+        Some(RUST_CHEAP),
+        "the worker ran the cheap gate"
+    );
+    assert_eq!(
+        recorded_gate(&round.root(), &consolidator).as_deref(),
+        Some(RUST_FULL),
+        "the consolidator alone runs the full gate over the integrated round"
     );
     let _ = round.pool().kill_all().await;
 }
