@@ -13,7 +13,10 @@ impl McpServer {
     /// Defaults differ from a plain dispatch on purpose: the consolidator runs
     /// on the manifest's strongest tier when one is marked, and its gate is the
     /// project's *full* gate (the explicit `verify`, else the auto-detected
-    /// one), because it is the only worker that runs the whole suite.
+    /// one), because it is the only worker that runs the whole suite. A
+    /// consolidated round (`consolidate` set, no explicit worker `verify`)
+    /// instead hands its workers the cheap static gate, so only the
+    /// consolidator pays for the full suite.
     ///
     /// The dispatch itself is delegated to [`Self::dispatch_one`], so the
     /// consolidator goes through exactly the validation, admission and launch
@@ -78,6 +81,17 @@ impl McpServer {
             Some(cmd) => Some(cmd.to_string()),
             None => crate::pool::detect_verify_command(&repo_path),
         };
+        // A consolidated round (`consolidate` set, no explicit worker
+        // `verify`) hands its workers the cheap static gate, so only the
+        // consolidator pays for the full suite. An explicit worker verify
+        // -- including an empty one that disables it -- always wins.
+        let worker_verify = match args.get("verify").and_then(|v| v.as_str()) {
+            Some(cmd) => Some(cmd.to_string()),
+            None if args.get("consolidate").is_some() => {
+                crate::pool::detect_cheap_verify_command(&repo_path)
+            }
+            None => None,
+        };
 
         let mut dispatch = Map::new();
         dispatch.insert("action".into(), Value::String("dispatch".into()));
@@ -91,6 +105,12 @@ impl McpServer {
         dispatch.insert("repo_path".into(), json!(repo_path));
         // Preserve an explicitly disabled gate rather than auto-detecting again.
         dispatch.insert("verify".into(), Value::String(verify.unwrap_or_default()));
+        // The gate the round's workers run (the cheap one for a
+        // consolidated round), so the consolidator's review judges each
+        // worker against the gate that actually ran on its branch.
+        if let Some(worker_verify) = worker_verify {
+            dispatch.insert("worker_verify".into(), Value::String(worker_verify));
+        }
         if let Some(turns) = args.get("max_turns").and_then(|v| v.as_u64()) {
             dispatch.insert("max_turns".into(), Value::Number(turns.into()));
         }
