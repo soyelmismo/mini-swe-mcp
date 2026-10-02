@@ -27,9 +27,9 @@ mod worker;
 
 pub use self::catalog::{format_list, format_manifest, format_prune};
 pub use self::worker::{
-    format_collect, format_consolidate, format_dispatch, format_dispatch_quiet, format_kill,
-    format_logs, format_merge, format_reap, format_review, format_status, format_steer,
-    health_line, log_counters_line,
+    format_collect, format_consolidate, format_discard, format_dispatch, format_dispatch_quiet,
+    format_kill, format_logs, format_merge, format_reap, format_review, format_status,
+    format_steer, health_line, log_counters_line,
 };
 
 /// Render `val` for `action`, falling back to pretty JSON for actions with no
@@ -48,6 +48,7 @@ pub fn format_output(action: &str, val: &serde_json::Value) -> String {
         "consolidate" => format_consolidate(val),
         "steer" => format_steer(val),
         "kill" => format_kill(val),
+        "discard" => format_discard(val),
         "merge" => format_merge(val),
         _ => serde_json::to_string_pretty(val).unwrap_or_default(),
     }
@@ -90,6 +91,11 @@ mod tests {
                 "kill",
                 "Worker w was not running.",
                 r#"{"worker_id":"w","killed":false}"#,
+            ),
+            (
+                "discard",
+                "Worker w discarded",
+                r#"{"worker_id":"w","discarded":true}"#,
             ),
             (
                 "consolidate",

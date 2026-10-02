@@ -18,10 +18,16 @@
 //! [`WatchTokens`] is what ties the two halves together: a shell cannot know
 //! its session, so the daemon mints it one token per identity and hands it out
 //! as the `watch_command` of every dispatch and steer answer.
+//!
+//! A daemon is always this executable, spawned through [`exe_path`]: a rebuilt
+//! binary makes `current_exe()` read ` (deleted)`, so the shared helper there
+//! is what lets both the client's auto-start and the daemon's handover respawn
+//! the replacement instead of failing on a path that no longer exists.
 
 pub(crate) mod auto_consolidate;
 pub mod client;
 mod daemon;
+pub mod exe_path;
 pub mod identity;
 
 pub use client::{HubClient, connect_or_spawn, decode_ambient_env, proxy_stdio};

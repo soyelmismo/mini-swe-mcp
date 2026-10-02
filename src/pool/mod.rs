@@ -70,14 +70,15 @@ pub use self::registry::{
 };
 pub use self::revision::{
     CONTINUE_PREFIX, DEFAULT_REVISION_TURNS, MAX_AUTO_CONTINUES, REVISION_PREFIX, RetireContext,
-    RetireSweep, SteerOutcome, WorkerHistory, append_history_message, append_history_message_in,
-    ensure_base_branch, history_log_path, history_log_path_in, history_path, history_path_in,
-    is_replayable, load_worker_history, load_worker_history_in, load_worker_history_log,
-    load_worker_history_log_in, prune_orphan_histories, prune_orphan_histories_in,
-    prune_orphan_histories_with_retention_and_grace_in, prune_orphan_histories_with_retention_in,
-    remove_worker_history, remove_worker_history_in, retire_expired_terminal_workers_in,
-    retire_worker, retire_worker_in, retire_worker_with, save_worker_history,
-    save_worker_history_in, sweep_retired_workers, sweep_retired_workers_in,
+    RetireOutcome, RetireSweep, SteerOutcome, WorkerHistory, append_history_message,
+    append_history_message_in, ensure_base_branch, history_log_path, history_log_path_in,
+    history_path, history_path_in, is_replayable, load_worker_history, load_worker_history_in,
+    load_worker_history_log, load_worker_history_log_in, prune_orphan_histories,
+    prune_orphan_histories_in, prune_orphan_histories_with_retention_and_grace_in,
+    prune_orphan_histories_with_retention_in, remove_worker_history, remove_worker_history_in,
+    retire_expired_terminal_workers_in, retire_worker, retire_worker_in, retire_worker_reporting,
+    retire_worker_with, save_worker_history, save_worker_history_in, sweep_retired_workers,
+    sweep_retired_workers_in,
 };
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
@@ -777,12 +778,23 @@ impl WorkerPool {
             .unwrap_or_else(|| "default".to_string());
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
+        // The base facts every row of this worker names: the branch the work
+        // starts from and the commit it forks off. Detected once here, before
+        // the first registry write, so even a dispatch that dies in its first
+        // seconds leaves a row the retirement sweep can act on -- a row without
+        // a base branch is a worker it cannot prove integrated.
+        let base_repo = repo_path.clone();
+        let base = tokio::task::spawn_blocking(move || revision::detect_base_facts(&base_repo))
+            .await
+            .unwrap_or_default();
         let meta = WorkerMeta {
             id: worker_id.clone(),
             task: task.clone(),
             group: Some(resolved_group.clone()),
             role,
             repo_path: Some(repo_path_str.clone()),
+            base_branch: base.branch,
+            base_commit: base.commit,
             owner: owner.clone(),
             started_at: now,
             pid: std::process::id(),
@@ -2392,6 +2404,53 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
         return Some("dotnet test".to_string());
     }
     None
+}
+
+/// Parse-check one verify gate without running it.
+///
+/// A gate is a shell command a worker runs at the end of its own work, and a
+/// dispatch that carries a mangled one (a quote split by the caller's shell, a
+/// truncated pipeline) is stored verbatim: the worker then fails on a command
+/// nobody can run, which is exactly what an unrunnable auto-consolidation gate
+/// looked like. The gate is therefore checked where it enters the system, so
+/// the caller is told the parse error while it can still fix the argument.
+///
+/// `sh -n -c <cmd>` parses without executing: nothing the gate names is run,
+/// and a command that only fails at *run* time (`cargo` on a repo without a
+/// manifest) still passes, because the gate is a statement about the worker's
+/// checkout, not about this process. An empty gate is legal -- it is the
+/// documented way to disable the gate -- so it is not parsed.
+pub fn validate_verify_command(command: &str, field: &str) -> Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let output = std::process::Command::new("sh")
+        .arg("-n")
+        .arg("-c")
+        .arg(trimmed)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Could not parse-check '{field}' with sh: {e}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "'{field}' is not a valid shell command: {}",
+        shell_syntax_error(&output.stderr)
+            .unwrap_or_else(|| { format!("sh exited with {}", output.status) })
+    );
+    Ok(())
+}
+
+/// The parse error out of `sh -n`'s stderr, trimmed to one line.
+///
+/// `sh` writes the diagnostic to stderr and only the first line of it names
+/// the problem; the rest is the source context of the gate, which the caller
+/// already has.
+fn shell_syntax_error(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 /// Whether `dir` holds a file with the given extension.
