@@ -254,6 +254,27 @@ async fn a_plain_dispatch_still_gets_the_full_gate() {
     let _ = round.pool().kill_all().await;
 }
 
+/// `consolidate: false` opens no round, so no consolidator will run the full
+/// suite: the worker must keep the full gate rather than the cheap one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consolidate_false_dispatch_keeps_the_full_gate() {
+    let repo = repo("cheap-gate-false", Some(("Cargo.toml", "[package]\n")));
+    let round = Round::new("cheap-gate-false-pool").await;
+    let worker = round
+        .dispatch(
+            repo.path(),
+            json!({"task": "add a parser", "consolidate": false, "max_turns": 2}),
+        )
+        .await;
+
+    assert_eq!(
+        recorded_gate(&round.root(), &worker).as_deref(),
+        Some(RUST_FULL),
+        "'consolidate: false' opens no round, so the worker keeps the full gate"
+    );
+    let _ = round.pool().kill_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_explicit_verify_wins_over_the_cheap_gate() {
     let repo = repo("cheap-gate-explicit", Some(("Cargo.toml", "[package]\n")));

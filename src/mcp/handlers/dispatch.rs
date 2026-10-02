@@ -235,8 +235,10 @@ impl McpServer {
                     })?
                     .to_string(),
             ),
-            None if args.get("consolidate").is_some()
-                && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
+            None if matches!(
+                args.get("consolidate"),
+                Some(Value::Bool(true) | Value::String(_))
+            ) && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
             {
                 crate::pool::detect_cheap_verify_command(&repo_path)
             }
