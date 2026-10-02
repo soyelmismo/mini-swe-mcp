@@ -3,7 +3,7 @@ use super::*;
 /// `topic` property of the `help` action: which topic's text to
 /// return, or none for the topic index.
 pub(crate) const TOPIC_DESCRIPTION: &str =
-    "Help topic to read; omitted returns the topic index.";
+    "Help topic to read; omitted: the index";
 
 impl McpServer {
     /// `help` action: the long-form guidance the CLI keeps per topic.

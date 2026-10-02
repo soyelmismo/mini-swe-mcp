@@ -191,9 +191,9 @@ pub(in crate::mcp) const WORKER_IDS_DESCRIPTION: &str =
     "Worker IDs to watch (prefixes like 'worker_id'). Omitted: your own workers.";
 
 pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
-    "Workers of this group. For 'watch' and 'merge --approved'.";
+    "Workers of this group (watch, merge --approved).";
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str =
-    "Watch deadline seconds; expiry: no_event.";
+    "Watch deadline secs; expiry: no_event.";
 
-pub(in crate::mcp) const ALL_DESCRIPTION: &str = "Watch the whole round as one event.";
+pub(in crate::mcp) const ALL_DESCRIPTION: &str = "The whole round as one event.";
