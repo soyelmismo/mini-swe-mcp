@@ -175,23 +175,34 @@ impl WatchDaemon {
 
     /// Stop every daemon that answered this directory, and take the stand-in
     /// worker with them, so a failing test leaves nothing running.
+    ///
+    /// Asked for politely first, because a daemon closes its connections on the
+    /// way out, and then unconditionally: a daemon still alive after the grace
+    /// period is killed, because a leaked one outlives the test run and takes
+    /// its hub directory with it.
     fn close(&mut self) {
-        for pid in std::mem::take(&mut self.pids) {
-            signal(pid, libc::SIGTERM);
+        let mut running: BTreeSet<i32> = std::mem::take(&mut self.pids);
+        running.extend(daemon_pids(&self.hub_dir));
+        /// Signal `sig` to what is still running, and drop what answered.
+        fn ask(running: &mut BTreeSet<i32>, sig: libc::c_int) {
+            for pid in running.iter() {
+                signal(*pid, sig);
+            }
+            running.retain(|pid| matches!(signal(*pid, 0), Some(())));
         }
-        for pid in daemon_pids(&self.hub_dir) {
-            signal(pid, libc::SIGTERM);
+        ask(&mut running, libc::SIGTERM);
+        for _ in 0..200 {
+            if running.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            ask(&mut running, 0);
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline
-            && self
-                .pids
-                .iter()
-                .chain(daemon_pids(&self.hub_dir).iter())
-                .any(|pid| matches!(signal(*pid, 0), Some(())))
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        ask(&mut running, libc::SIGKILL);
+        assert!(
+            running.is_empty(),
+            "these daemons survived the test: {running:?}"
+        );
         self.armed = false;
         let _ = self.sleeper.start_kill();
         drop(self.sleeper.wait());
