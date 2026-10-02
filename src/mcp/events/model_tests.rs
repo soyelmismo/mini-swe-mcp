@@ -865,82 +865,14 @@ impl Harness {
                 // seen or acknowledged. Then the `--all` round can only be
                 // reporting an acknowledged transition again, which is exactly
                 // the regression this guards.
+                // Only probe when the model is certain nothing in the group is
+                // fresh: no queued terminal transition, no running worker past
+                // the stall threshold, and every reported transition either
+                // seen or acknowledged. Then the `--all` round can only be
+                // reporting an acknowledged transition again, which is exactly
+                // the regression this guards.
                 if !self.group_has_fresh_worker(owner) {
-                    eprintln!(
-                        "DEBUG fresh: {:?}",
-                        ["owner-2-w0", "owner-2-w1"]
-                            .iter()
-                            .map(|id| {
-                                let pending: bool = self
-                                    .router
-                                    .watch_history
-                                    .values()
-                                    .flat_map(|h| &h.pending)
-                                    .any(|v| v["worker_id"] == *id);
-                                let rep = self.router.watch_reported.get(*id).map(|v| {
-                                    (
-                                        v["sequence"].clone(),
-                                        v["revision"].clone(),
-                                        v["event"].clone(),
-                                    )
-                                });
-                                let seen = self.router.seen.get(*id).copied();
-                                let acked = rep.as_ref().is_some_and(|(_, rev, kind)| {
-                                    self.router.acks.acknowledged(
-                                        owner,
-                                        id,
-                                        rev.as_u64().unwrap_or(0),
-                                        kind.as_str().unwrap_or(""),
-                                    )
-                                });
-                                (id, pending, rep, seen, acked)
-                            })
-                            .collect::<Vec<_>>()
-                    );
                     if !round_events.is_empty() {
-                        eprintln!(
-                            "DEBUG probe group={group} current={:?} reported={:?} seen={:?} pending={:?}",
-                            self.router
-                                .watch_current
-                                .iter()
-                                .map(|(k, v)| (
-                                    k.clone(),
-                                    v["owner"].clone(),
-                                    v["status"].clone(),
-                                    v["group"].clone(),
-                                    v["steered_by_consolidator"].clone(),
-                                    v["question_for_consolidator"].clone(),
-                                    v["revision"].clone(),
-                                ))
-                                .collect::<Vec<_>>(),
-                            self.router
-                                .watch_reported
-                                .iter()
-                                .map(|(k, v)| (
-                                    k.clone(),
-                                    v["owner"].clone(),
-                                    v["event"].clone(),
-                                    v["revision"].clone(),
-                                    v["sequence"].clone()
-                                ))
-                                .collect::<Vec<_>>(),
-                            self.router.seen,
-                            self.router
-                                .watch_history
-                                .iter()
-                                .map(|(o, h)| (
-                                    o.clone(),
-                                    h.pending
-                                        .iter()
-                                        .map(|v| (
-                                            v["worker_id"].clone(),
-                                            v["event"].clone(),
-                                            v["sequence"].clone()
-                                        ))
-                                        .collect::<Vec<_>>()
-                                ))
-                                .collect::<Vec<_>>(),
-                        );
                         self.violation(
                             format!(
                                 "an acknowledged group returned a fresh round for {group}: {}",
