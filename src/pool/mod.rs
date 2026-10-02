@@ -2348,14 +2348,12 @@ pub fn detect_cheap_verify_command(repo_path: &Path) -> Option<String> {
             && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&raw)
             && let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object())
         {
-            let parts = [
-                scripts.get("lint").and_then(Value::as_str),
-                scripts.get("typecheck").and_then(Value::as_str),
-            ];
-            let chain = parts
-                .into_iter()
-                .flatten()
-                .map(|script| format!("npm run {script}"))
+            // `npm run` takes the script's *name*, not the command it runs.
+            let declared = ["lint", "typecheck"].into_iter().filter(|name| {
+                scripts.get(*name).and_then(Value::as_str).is_some()
+            });
+            let chain = declared
+                .map(|name| format!("npm run {name}"))
                 .collect::<Vec<_>>()
                 .join(" && ");
             if !chain.is_empty() {
@@ -2379,24 +2377,20 @@ pub fn detect_cheap_verify_command(repo_path: &Path) -> Option<String> {
         // `ruff check` is the lint half; mypy only when the project
         // configures it, so an unconfigured repository is not gated on
         // a tool it never asked for.
-        let configured = [
-            "mypy.ini",
-            ".mypy.ini",
-            "setup.cfg",
-            "pyproject.toml",
-        ]
-        .into_iter()
-        .any(|manifest| {
-            repo_path.join(manifest).is_file()
-                && std::fs::read_to_string(repo_path.join(manifest))
-                    .is_ok_and(|text| {
+        // A mypy table in either spelling, or a mypy section in an ini/cfg:
+        // `[mypy]` and `[tool.mypy]` are the two ways a project declares it.
+        let configured = ["mypy.ini", ".mypy.ini", "setup.cfg", "pyproject.toml"]
+            .into_iter()
+            .any(|manifest| {
+                let path = repo_path.join(manifest);
+                path.is_file()
+                    && std::fs::read_to_string(path).is_ok_and(|text| {
                         text.lines().any(|line| {
-                            let trimmed = line.trim_start();
-                            trimmed.starts_with("[mypy]")
-                                || trimmed.starts_with("mypy.")
+                            let table = line.trim();
+                            table == "[mypy]" || table.starts_with("[tool.mypy]")
                         })
                     })
-        });
+            });
         return Some(if configured {
             "ruff check . && mypy .".to_string()
         } else {

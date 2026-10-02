@@ -13,13 +13,11 @@ impl McpServer {
     /// Defaults differ from a plain dispatch on purpose: the consolidator runs
     /// on the manifest's strongest tier when one is marked, and its gate is the
     /// project's *full* gate (the explicit `verify`, else the auto-detected
-    /// one), because it is the only worker that runs the whole suite. The
-    /// round's workers, dispatched with `consolidate` set, get the cheap
-    /// static gate (see [`crate::pool::detect_cheap_verify_command`]) unless
-    /// the dispatch names an explicit `verify` for them. A
+    /// one), because it is the only worker that runs the whole suite. A
     /// consolidated round (`consolidate` set, no explicit worker `verify`)
-    /// instead hands its workers the cheap static gate, so only the
-    /// consolidator pays for the full suite.
+    /// instead hands its workers the cheap static gate (see
+    /// [`crate::pool::detect_cheap_verify_command`]), so only the consolidator
+    /// pays for the full suite.
     ///
     /// The dispatch itself is delegated to [`Self::dispatch_one`], so the
     /// consolidator goes through exactly the validation, admission and launch
