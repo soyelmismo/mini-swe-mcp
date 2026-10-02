@@ -24,6 +24,7 @@
 //! its owner's own workers, in its own group, and nothing else.
 
 use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2346,6 +2347,81 @@ pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
     })
 }
 
+/// Auto-detect the cheap verify gate for the repository layout.
+///
+/// The fast static subset of the project's checks -- format, lint,
+/// type-check -- so a worker in a consolidated round does not pay for
+/// the full suite the round's consolidator runs once. Returns `None`
+/// when the ecosystem has no recognised static checks (or no manifest
+/// at all), so such a worker is not forced through a gate that cannot
+/// run; the caller falls back to whatever it would do with no gate.
+pub fn detect_cheap_verify_command(repo_path: &Path) -> Option<String> {
+    if repo_path.join("Cargo.toml").is_file() {
+        return Some("cargo fmt --check && cargo clippy --all-targets -- -D warnings".to_string());
+    }
+    if repo_path.join("package.json").is_file() {
+        // The manifest's own lint and typecheck scripts when it
+        // declares them; a repository that runs neither is not gated
+        // on a script that cannot pass.
+        if let Ok(raw) = std::fs::read_to_string(repo_path.join("package.json"))
+            && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object())
+        {
+            // `npm run` takes the script's *name*, not the command it runs.
+            let declared = ["lint", "typecheck"]
+                .into_iter()
+                .filter(|name| scripts.get(*name).and_then(Value::as_str).is_some());
+            let chain = declared
+                .map(|name| format!("npm run {name}"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            if !chain.is_empty() {
+                return Some(chain);
+            }
+        }
+        // No usable scripts, but a TypeScript project still has the
+        // compiler's own check.
+        if has_extension(repo_path, "ts") || has_extension(repo_path, "tsx") {
+            return Some("tsc --noEmit".to_string());
+        }
+        return None;
+    }
+    if repo_path.join("pyproject.toml").is_file()
+        || repo_path.join("pytest.ini").is_file()
+        || repo_path.join("setup.py").is_file()
+        || repo_path.join("setup.cfg").is_file()
+        || repo_path.join("tox.ini").is_file()
+        || repo_path.join("requirements.txt").is_file()
+    {
+        // `ruff check` is the lint half; mypy only when the project
+        // configures it, so an unconfigured repository is not gated on
+        // a tool it never asked for.
+        // A mypy table in either spelling, or a mypy section in an ini/cfg:
+        // `[mypy]` and `[tool.mypy]` are the two ways a project declares it.
+        let configured = ["mypy.ini", ".mypy.ini", "setup.cfg", "pyproject.toml"]
+            .into_iter()
+            .any(|manifest| {
+                let path = repo_path.join(manifest);
+                path.is_file()
+                    && std::fs::read_to_string(path).is_ok_and(|text| {
+                        text.lines().any(|line| {
+                            let table = line.trim();
+                            table == "[mypy]" || table.starts_with("[tool.mypy]")
+                        })
+                    })
+            });
+        return Some(if configured {
+            "ruff check . && mypy .".to_string()
+        } else {
+            "ruff check .".to_string()
+        });
+    }
+    if repo_path.join("go.mod").is_file() {
+        return Some("gofmt -l . && go vet ./...".to_string());
+    }
+    None
+}
+
 /// Auto-detect a sensible verify gate from the repository layout.
 ///
 /// Returns `None` when no recognised build/test manifest is present, so a
@@ -2464,7 +2540,7 @@ fn has_extension(dir: &Path, extension: &str) -> bool {
 
 #[cfg(test)]
 mod verify_detection_tests {
-    use super::detect_verify_command;
+    use super::{detect_cheap_verify_command, detect_verify_command};
     use std::path::PathBuf;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -2575,6 +2651,117 @@ mod verify_detection_tests {
             Some("pytest -q"),
             "the python manifest is probed before go, and the order is fixed"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Rust repository's cheap gate is the static subset: format plus clippy,
+    /// never the test suite the consolidator runs.
+    #[test]
+    fn a_cargo_manifest_selects_the_cheap_static_gate() {
+        let dir = scratch("cheap-cargo");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("cargo fmt --check && cargo clippy --all-targets -- -D warnings")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Node/TS: the package's own lint and typecheck scripts when it declares
+    /// them, because those are the checks the project actually runs.
+    #[test]
+    fn a_node_package_runs_its_lint_and_typecheck_scripts() {
+        let dir = scratch("cheap-node");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"lint":"eslint .","typecheck":"tsc -b"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("npm run lint && npm run typecheck")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Only the script the package declares is run; the other is not invented.
+        let dir = scratch("cheap-node-lint-only");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"x","scripts":{"lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("npm run lint")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TypeScript project with no declared scripts still has the compiler's
+    /// own check; a plain JavaScript package has no static gate to run.
+    #[test]
+    fn a_typescript_project_falls_back_to_the_compiler() {
+        let dir = scratch("cheap-ts");
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(dir.join("index.ts"), "export const x = 1;\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("tsc --noEmit")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("cheap-js");
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(dir.join("index.js"), "module.exports = {};\n").unwrap();
+        assert_eq!(detect_cheap_verify_command(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Python: ruff always, mypy only when the project configures it, so a
+    /// repository is never gated on a tool it never asked for.
+    #[test]
+    fn a_python_project_adds_mypy_only_when_it_is_configured() {
+        let dir = scratch("cheap-py");
+        std::fs::write(dir.join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("ruff check .")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("cheap-py-mypy");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\n\n[tool.mypy]\nstrict = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("ruff check . && mypy .")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go's cheap gate is gofmt plus vet: neither builds or runs a test.
+    #[test]
+    fn a_go_module_selects_gofmt_and_vet() {
+        let dir = scratch("cheap-go");
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        assert_eq!(
+            detect_cheap_verify_command(&dir).as_deref(),
+            Some("gofmt -l . && go vet ./...")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognised ecosystem has no cheap gate at all: the worker runs no
+    /// gate rather than a command that cannot pass.
+    #[test]
+    fn an_unknown_ecosystem_has_no_cheap_gate() {
+        let dir = scratch("cheap-bare");
+        assert_eq!(detect_cheap_verify_command(&dir), None);
+        std::fs::write(dir.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+        assert_eq!(detect_cheap_verify_command(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
