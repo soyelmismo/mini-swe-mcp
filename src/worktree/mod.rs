@@ -154,6 +154,9 @@ pub(crate) fn force_remove_dir(path: &Path) {
     }
 }
 
+/// The prefix every worker checkout directory carries, under any scratch root.
+pub const WORKTREE_PREFIX: &str = "swe-wt-";
+
 /// Private scratch root for one worker, independent of its shared build slot.
 pub(crate) fn scratch_dir(worktree: &Path) -> PathBuf {
     let name = worktree
@@ -175,6 +178,42 @@ pub(crate) fn remove_target_dirs_in(root: &ScratchRoot, wt_path: &Path) {
             force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
             force_remove_dir(&base.join(format!("swe-tmp-{wt_name}")));
         }
+    }
+}
+
+/// The checkouts and sidecars a scratch root's own pool filed inside it.
+///
+/// A pool resolves every per-worker path under its [`ScratchRoot`], so the
+/// `swe-wt-<id>` checkouts and the `swe-wt-<id>.round-base` / `.steer-source`
+/// / history files of a root live *inside* that root. Removing the root
+/// therefore takes them with it -- except for the checkout of a worker whose
+/// task was aborted: the guard that owned it died with the task, so its
+/// worktree is still on disk with the private `swe-tmp-<leaf>` and legacy
+/// `swe-target-<leaf>` companions filed next to the scratch *base*.
+///
+/// This drops every one of those leftovers, so a caller that owns a scratch
+/// root (a test harness, a temporary repository) can remove the root and leave
+/// nothing behind. Only entries whose name is a worktree checkout are touched;
+/// a pool's registry, mailbox and lease files are the caller's business.
+pub fn remove_scratch_root_worktrees(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let scratch = ScratchRoot::from_env();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only a checkout directory: `swe-wt-<id>` and nothing else, so a
+        // row, a mailbox or a lease file filed in the same root is left alone.
+        let Some(_id) = name.strip_prefix(WORKTREE_PREFIX) else {
+            continue;
+        };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        remove_target_dirs_in(&scratch, &path);
+        force_remove_dir(&path);
     }
 }
 

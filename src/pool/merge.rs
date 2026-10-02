@@ -35,7 +35,7 @@ use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
 };
 use crate::agent::AgentRunner;
-use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
+use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs};
 
 /// How many trailing lines of a failed gate a refusal carries.
 ///
@@ -570,7 +570,7 @@ fn run_gate_result(
             Err(e).with_context(|| format!("could not materialise the merge result for {label}"))
         }
     };
-    reclaim_gate_worktree(root, repo, &gate_dir);
+    reclaim_gate_worktree(repo, &gate_dir);
     gate
 }
 
@@ -652,14 +652,19 @@ fn base_tip_ref(repo: &Path) -> Result<String> {
 /// (`swe-tmp-<name>`), so the same helper the prune sweep uses reclaims both.
 /// The repository's leased build directory is named after the repository, not
 /// after this worktree, so it survives for the next build to reuse.
-fn reclaim_gate_worktree(root: &ScratchRoot, repo: &Path, gate_dir: &Path) {
+fn reclaim_gate_worktree(repo: &Path, gate_dir: &Path) {
     let _ = git(
         repo,
         "worktree remove",
         &["worktree", "remove", "--force", &gate_dir.to_string_lossy()],
     );
     force_remove_dir(gate_dir);
-    remove_target_dirs_in(root, gate_dir);
+    // From the scratch *base*, which is where the executor creates it: the gate
+    // worktree is filed under the root it was given, but its private scratch is
+    // named after the checkout and filed next to the base, so resolving the base
+    // from `root` looks in the wrong place for every injected root and leaves
+    // `swe-tmp-swe-merge-<id>` behind for the next run to trip over.
+    remove_target_dirs(gate_dir);
     let _ = git(repo, "worktree prune", &["worktree", "prune"]);
 }
 

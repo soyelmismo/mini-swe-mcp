@@ -189,6 +189,7 @@ impl AgentRunner {
         let sandbox_target = target_dir.as_deref().unwrap_or(dir);
         let tmp_dir = crate::worktree::scratch_dir(dir);
         std::fs::create_dir_all(&tmp_dir).context("Failed to create worker scratch directory")?;
+        drop_scratch_when_empty(&tmp_dir);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -988,6 +989,17 @@ fn apply_sandbox_args(cmd: &mut Command, dir: &Path, target_dir: &Path) {
 
     // Modular shared package/compiler caches.
     crate::cache::append_bwrap_cache_args(cmd, home.as_deref());
+}
+
+/// F8DBG probe: does this scratch directory still exist when the command returns?
+fn drop_scratch_when_empty(path: &Path) {
+    let probe = path.to_path_buf();
+    std::thread::spawn(move || {
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(300 * (i + 1)));
+            eprintln!("F8DBG probe {i} exists={}", probe.exists());
+        }
+    });
 }
 
 /// Replace the inherited environment with the sanitized allow-list.
