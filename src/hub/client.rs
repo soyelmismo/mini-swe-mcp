@@ -597,16 +597,18 @@ impl HubClient {
     pub async fn watch_snapshot(
         &mut self,
         ids: &std::collections::BTreeSet<String>,
-        group: Option<&str>,
+        groups: &std::collections::BTreeSet<String>,
         initial: bool,
         all: bool,
     ) -> Result<Value> {
         if !self.watch_line.is_empty() {
             self.next_watch_notification().await?;
         }
+        // One call carries the whole selection, so repeated `--group` flags
+        // stay one watch over several rounds.
         self.request(
             "hub/watch",
-            json!({"worker_ids":ids,"group":group,"initial":initial,"all":all}),
+            json!({"worker_ids":ids,"group":groups,"initial":initial,"all":all}),
         )
         .await
     }
