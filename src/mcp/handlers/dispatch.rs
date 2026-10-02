@@ -302,9 +302,9 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer model auditing the worktree after implementation.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
-    "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
+    "Auto-consolidate the group when it stops: boolean or model alias.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Cheap for workers, full for consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";

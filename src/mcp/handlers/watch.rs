@@ -188,7 +188,7 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const WORKER_IDS_DESCRIPTION: &str =
-    "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.";
+    "Worker IDs to watch, as 'worker_id' prefixes. Omitted watches your own workers.";
 
 pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
     "Only workers of this group. For 'watch' and 'merge --approved'.";
