@@ -174,6 +174,30 @@ fn parse_sensitive_paths_is_empty_without_the_section() {
     assert!(parse_sensitive_paths("").is_empty());
 }
 
+/// The repository declares its own sensitive surfaces in `AGENTS.md`, so
+/// the automatic trigger has something to match against.
+#[test]
+fn this_repository_declares_its_sensitive_paths() {
+    let paths = mini_swe_mcp::manifest::sensitive_paths(Path::new("."));
+    for expected in [
+        "src/hub/**",
+        "src/agent/sandbox*",
+        "src/agent/exec*",
+        "src/worktree/guard.rs",
+        "src/pool/merge.rs",
+        "src/pool/revision.rs",
+        "src/hub/identity.rs",
+        "src/mcp/events.rs",
+    ] {
+        assert!(
+            paths.iter().any(|p| p == expected),
+            "AGENTS.md must declare `{expected}` as sensitive: {paths:?}"
+        );
+    }
+    // A path the repository did not declare must not match.
+    assert!(!matches_sensitive("src/cli/args.rs", &paths));
+}
+
 #[test]
 fn glob_matching_crosses_segments_only_for_double_star() {
     let patterns = vec!["src/hub/**".to_string()];
@@ -747,4 +771,65 @@ async fn the_reviewer_runs_the_dispatch_verify_command() {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&worker_id).await;
+}
+
+// ----------
+// The completion event and the status
+// ----------
+
+/// The completion event says a security review ran and how many findings
+/// it reported; a review whose count was not reported is never shown as
+/// a clean zero.
+#[test]
+fn the_completion_event_shows_the_security_review_and_count() {
+    use mini_swe_mcp::mcp::{EventKind, Outcome, WorkerView, render_for_test};
+    use mini_swe_mcp::pool::SecurityReviewOutcome;
+
+    let view = WorkerView {
+        worker_id: "w1".to_string(),
+        event: Some(EventKind::Completed),
+        status: "completed".to_string(),
+        outcome: Outcome {
+            security_review: Some(SecurityReviewOutcome { findings: Some(3) }),
+            ..Outcome::default()
+        },
+        ..WorkerView::default()
+    };
+    let text = render_for_test(&view, EventKind::Completed);
+    assert!(
+        text.contains("Security review: 3 findings"),
+        "the completion event must show the security review and its count:\n{text}"
+    );
+
+    let view = WorkerView {
+        worker_id: "w2".to_string(),
+        event: Some(EventKind::Completed),
+        status: "completed".to_string(),
+        outcome: Outcome {
+            security_review: Some(SecurityReviewOutcome { findings: None }),
+            ..Outcome::default()
+        },
+        ..WorkerView::default()
+    };
+    let text = render_for_test(&view, EventKind::Completed);
+    assert!(
+        text.contains("Security review: not reported findings"),
+        "an unreported count must not read as a clean zero:\n{text}"
+    );
+}
+
+/// The plain-text status shows the same fact.
+#[test]
+fn the_status_text_shows_the_security_review_and_count() {
+    let text = mini_swe_mcp::cli::format::format_status(
+        &serde_json::from_str(
+            r#"{"worker_id":"w","state":{"state":"Completed","details":{
+             "security_review":{"findings":4}}}}"#,
+        )
+        .expect("fixture must be valid JSON"),
+    );
+    assert!(
+        text.contains("Security review: 4 findings"),
+        "the status must show the security review and its count:\n{text}"
+    );
 }

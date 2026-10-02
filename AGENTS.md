@@ -65,12 +65,12 @@ system prompt at dispatch time, so keep them short and actionable.
 - Establish the failing signal before editing, so the fix is provably a fix.
 - Do not call a failure pre-existing without showing it on the unmodified code.
 
-## Sensitive paths
+A worker whose diff touches one of the paths below gets an automatic
+adversarial security review (`--review-after <model>:security`) before it is
+reported complete. Keep the list to the surfaces where a mistake is a security
+defect, not a style one; the section is parsed as one glob per line.
 
-A worker whose diff touches any of these paths gets an automatic adversarial
-security review (`--review-after <model>:security`) before it is reported
-complete. Keep the list to the surfaces where a mistake is a security defect,
-not a style one.
+## Sensitive paths
 
 - src/hub/**
 - src/agent/sandbox*

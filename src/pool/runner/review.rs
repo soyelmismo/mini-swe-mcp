@@ -468,20 +468,30 @@ impl WorkerPool {
                 // The reviewer gave up quietly (an LLM error under
                 // `EndQuietly`): the audit is inconclusive, not approved.
                 TurnOutcome::EndReview => {
+                    // The reviewer gave up quietly: the audit is
+                    // inconclusive, but a security review that ran is still
+                    // recorded, with no count rather than a reassuring zero.
+                    let text = engine.last_assistant_text.clone();
+                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                        findings: parse_findings(&text),
+                    });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: false,
-                        security: None,
+                        security,
                     });
                 }
             }
         }
 
         // The budget ran out with no completion sentinel.
+        let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+            findings: parse_findings(&last_assistant_text),
+        });
         Ok(ReviewPhaseOutcome {
             step,
             completed: false,
-            security: None,
+            security,
         })
     }
 }
