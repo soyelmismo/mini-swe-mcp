@@ -269,11 +269,42 @@ pub fn parse_report(message: &str) -> Option<super::super::WorkerReport> {
     (!report.is_empty()).then_some(report)
 }
 
+/// The first line of a completion message worth using as a summary, or `None`.
+///
+/// This is the fallback for a worker that never wrote a `done:` line, and it is
+/// where a bare `REPORT` used to leak into every consumer: the harness derived
+/// the summary from the whole last message, so a consolidator that opened its
+/// answer with the block marker (or listed its per-worker verdicts) had the
+/// marker itself become the round's headline. The marker and a consolidator's
+/// per-worker verdict are both protocol, not prose, so they are skipped and the
+/// first line that says something is what names the round.
+///
+/// A message with nothing but protocol on it yields `None`, so the caller falls
+/// back to the task headline rather than printing a bare marker.
+pub fn summary_line(message: &str) -> Option<&str> {
+    message.lines().map(str::trim).find(|line| {
+        if line.is_empty() {
+            return false;
+        }
+        let peeled = strip_markup(line);
+        !is_per_worker_line(&peeled) && !opens_report_block(&peeled)
+    })
+}
+
 /// Whether `line` opens the block: the word `REPORT` alone, optionally wrapped
 /// in markdown emphasis or carried as the quoted argument of the bash command
 /// that echoes it, as in `printf 'REPORT\ndone: ...'`.
+///
+/// A consolidator's per-worker line (`REPORT <id> approved: <...>`) is not an
+/// opener: it is a routing note about someone else's branch, and the round's
+/// own block is what follows it. The exact-equality match below already rejects
+/// it, but it is called out here so a future loosening of that match cannot
+/// start reading one worker's verdict as the round's report.
 fn opens_report_block(line: &str) -> bool {
     let line = line.trim();
+    if is_per_worker_line(line) {
+        return false;
+    }
     if line
         .trim_matches(['*', '_', '`', '#', '>', ' '])
         .eq_ignore_ascii_case("REPORT")
@@ -283,6 +314,18 @@ fn opens_report_block(line: &str) -> bool {
     line.rsplit(['\'', '"'])
         .next()
         .is_some_and(|tail| tail.trim().eq_ignore_ascii_case("REPORT"))
+}
+
+/// Whether `line` is a consolidator's per-worker verdict, `REPORT <id> ...`.
+///
+/// The id is what separates it from the block marker: the marker stands alone,
+/// a verdict always names the branch it is about.
+fn is_per_worker_line(line: &str) -> bool {
+    let Some(rest) = line.trim().strip_prefix("REPORT") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with(char::is_whitespace) && !rest.is_empty()
 }
 
 /// Peel the markdown a model wraps a block in: code fences, list bullets and
@@ -390,7 +433,8 @@ mod tests {
     use super::{
         REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
         parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
-        parse_report, parse_request_turns, parse_wait_job, summarize_command,
+        opens_report_block, parse_report, parse_request_turns, parse_wait_job,
+        summarize_command, summary_line,
     };
     use crate::pool::WorkerReport;
 
@@ -480,6 +524,54 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    /// The block marker and a consolidator's per-worker verdict are protocol,
+    /// not prose: skipping them is what keeps a round's headline from being
+    /// the bare word `REPORT`.
+    #[test]
+    fn the_summary_skips_the_block_marker_and_the_per_worker_verdicts() {
+        // A protocol-only message has nothing to say, so there is no summary.
+        assert_eq!(
+            summary_line("REPORT\nREPORT 2a9aaca3 approved: parser"),
+            None
+        );
+        // The marker and the verdicts are skipped; the round's own words stand.
+        let with_prose = "REPORT\nREPORT 2a9aaca3 approved: parser\nRound integrated and green";
+        assert_eq!(summary_line(with_prose), Some("Round integrated and green"));
+    }
+
+    #[test]
+    fn a_bare_marker_is_never_the_summary() {
+        assert_eq!(summary_line("REPORT"), None);
+        assert_eq!(
+            summary_line("REPORT 2a9aaca3 approved: fixed the parser"),
+            None
+        );
+        assert_eq!(summary_line("   \n\n"), None);
+    }
+
+    #[test]
+    fn probe_tmp() {
+        let l = "REPORT 2a9aaca3 approved: parser";
+        let peeled = strip_markup(l);
+        println!("peeled={peeled:?} per_worker={} opens={}", is_per_worker_line(&peeled), opens_report_block(&peeled));
+        println!("marker: per_worker={} opens={}", is_per_worker_line("REPORT"), opens_report_block("REPORT"));
+        assert!(false, "probe");
+    }
+
+    #[test]
+    fn a_per_worker_verdict_does_not_open_the_block() {
+        for line in [
+            "REPORT 2a9aaca3 approved: fixed the parser",
+            "  REPORT 2a9aaca3 fixed: resolved the interaction",
+        ] {
+            assert!(!opens_report_block(line), "{line:?} is not a block opener");
+        }
+        // The marker alone still opens it, markdown and all.
+        for line in ["REPORT", "**REPORT**", "**REPORT"] {
+            assert!(opens_report_block(line), "{line:?} is a block opener");
+        }
     }
 
     #[test]
