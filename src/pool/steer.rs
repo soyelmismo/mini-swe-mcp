@@ -201,6 +201,38 @@ pub(super) struct SteerSource {
     pub round_base: Option<String>,
 }
 
+/// Every worker whose steer-source names `consolidator`, in id order.
+///
+/// The steer-source file is the durable record of "this consolidator steered
+/// this worker": it is written when the consolidator routes a correction to the
+/// worker and survives until the worker is retired. Scanning it is how a
+/// consolidator's completion finds the round members it took responsibility
+/// for, so none of them is left dangling once the consolidator's own branch
+/// lands.
+pub(super) fn steered_workers_of(root: &ScratchRoot, consolidator: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix("swe-wt-")
+            .and_then(|rest| rest.strip_suffix(".steer-source"))
+        else {
+            continue;
+        };
+        if read_source(root, id).is_some_and(|source| source.consolidator == consolidator)
+            && !out.iter().any(|known| known == id)
+        {
+            out.push(id.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
 pub(super) fn read_source(root: &ScratchRoot, id: &str) -> Option<SteerSource> {
     serde_json::from_slice(&std::fs::read(root.join(format!("swe-wt-{id}.steer-source"))).ok()?)
         .ok()

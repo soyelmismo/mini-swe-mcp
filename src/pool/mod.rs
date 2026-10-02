@@ -1443,6 +1443,69 @@ impl WorkerPool {
         .await;
     }
 
+    /// Record the round workers a consolidator absorbed on its own row.
+    ///
+    /// A worker is absorbed when the consolidator finishes while it is stopped
+    /// but not completed (exhausted, failed, paused, stopped or interrupted)
+    /// after the consolidator steered it -- its correction is now the
+    /// consolidator's own work -- or when the consolidator reports it as
+    /// `fixed`, having made the correction itself. The list lives on the
+    /// consolidator's row, next to [`WorkerRegistryEntry::integrated`], so
+    /// `merge <consolidator>` can retire the whole round: the absorbed
+    /// workers' unmerged WIP branches are discarded with it, and `list` shows
+    /// them as absorbed until then.
+    ///
+    /// The conservative rule is unchanged: only workers the consolidator's own
+    /// record names are ever absorbed, and a `fixed` id is accepted only when a
+    /// row exists for it in the consolidator's own group and owner, so free
+    /// report text can never reach into another round.
+    pub async fn record_consolidator_absorbed(&self, actor: &WorkerMeta, fixed_ids: &[String]) {
+        let root = self.scratch.clone();
+        let consolidator = actor.id.clone();
+        let owner = actor.owner.clone();
+        let group = actor.group.clone();
+        let fixed = fixed_ids.to_vec();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut row) = load_registry_entry_in(&root, &consolidator) else {
+                return;
+            };
+            let mut absorbed = Vec::new();
+            // Steered and left stopped: the steer-source file names the
+            // consolidator that took the correction over.
+            for id in steer::steered_workers_of(&root, &consolidator) {
+                if id == consolidator {
+                    continue;
+                }
+                let stopped = match load_registry_entry_in(&root, &id) {
+                    Some(entry) => entry.status.stopped_not_completed(),
+                    None => false,
+                };
+                if stopped {
+                    absorbed.push(id);
+                }
+            }
+            // Reported `fixed`: the consolidator made the correction itself, so
+            // the worker's own branch is superseded. Only a worker of the same
+            // round (owner and group) is accepted.
+            for id in fixed {
+                if let Some(entry) = load_registry_entry_in(&root, &id)
+                    && entry.owner.as_deref() == Some(owner.as_str())
+                    && entry.group == group
+                {
+                    absorbed.push(id);
+                }
+            }
+            absorbed.retain(|id| !row.absorbed.contains(id) && !row.integrated.contains(id));
+            if absorbed.is_empty() {
+                return;
+            }
+            row.absorbed.extend(absorbed);
+            row.updated_at = unix_timestamp();
+            save_registry_entry_in(&root, &row);
+        })
+        .await;
+    }
+
     /// Route a failure or a conflict back to the worker that owns it.
     ///
     /// One `CONSOLIDATE_STEER` request: the target is resolved, checked against
