@@ -22,7 +22,17 @@ fn main() -> Result<()> {
         mini_swe_mcp::monitor::print_status_line();
         return Ok(());
     }
-    bootstrap::runtime()?.block_on(async_main())
+    // The runtime is chosen before anything is awaited, because a
+    // runtime cannot be swapped once `block_on` is driving it. Only an
+    // invocation that owns a worker pool in this process needs worker
+    // threads; every other one relays frames to the hub daemon, and a
+    // relay is one thread (see `bootstrap::flavor_for`).
+    let no_daemon = env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1");
+    let runtime = match bootstrap::flavor_for(action_of(&args), no_daemon) {
+        bootstrap::Flavor::CurrentThread => bootstrap::runtime_current_thread()?,
+        bootstrap::Flavor::MultiThread => bootstrap::runtime()?,
+    };
+    runtime.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
