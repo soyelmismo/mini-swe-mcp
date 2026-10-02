@@ -1035,6 +1035,14 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
             )
             .is_ok_and(|out| out.status.success());
             let entry = super::load_registry_entry_in(root, id);
+            // An interrupted worker is not an orphan: its row says the
+            // hub stopped it mid-run, so its history is what the next
+            // daemon's recovery auto-continues from. Its retention must
+            // never expire while it is still interrupted, or the sweep
+            // would delete the very conversation the continuation needs.
+            let interrupted = entry
+                .as_ref()
+                .is_some_and(|e| e.status == super::RegistryStatus::Interrupted);
             // The branch outlived its retention, or it is gone with nothing
             // left to recreate it from, or its grace has run out: either way
             // the worker cannot be continued any more and the whole trace goes.
@@ -1044,7 +1052,7 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
             let kept_through_grace = entry
                 .as_ref()
                 .is_some_and(|e| within_retired_grace(e.updated_at, grace_secs, now));
-            if expired || (!branch_exists && !kept_through_grace) {
+            if (!interrupted && expired) || (!interrupted && !branch_exists && !kept_through_grace) {
                 retire_worker_in(root, id);
                 removed += 1;
             }
@@ -1192,9 +1200,12 @@ impl super::WorkerPool {
     ///
     /// A merged worker's branch is pruned, but its row and conversation are
     /// kept through the retired grace period. When the branch is gone, recreate
-    /// it at the head commit the row recorded at completion, so the
-    /// continuation keeps the worker's work instead of failing. The error names
-    /// the branch when there is nothing to recreate it from.
+    /// it at the head commit the row recorded at completion -- or, for a
+    /// worker that never reached a commit, at the base commit the row
+    /// branched from, which is exactly where an interrupted worker's
+    /// branch pointed -- so the continuation keeps the worker's work
+    /// instead of failing. The error names the branch when there is
+    /// nothing to recreate it from.
     async fn ensure_worker_branch(
         &self,
         id: &str,
@@ -1204,9 +1215,16 @@ impl super::WorkerPool {
         if Self::worker_branch_exists(repo_path, branch).await {
             return Ok(());
         }
-        let Some(head_commit) =
-            super::load_registry_entry_in(&self.scratch, id).and_then(|entry| entry.head_commit)
-        else {
+        let entry = super::load_registry_entry_in(&self.scratch, id);
+        // A head commit is the exact point the branch ended at; a base
+        // commit is where an interrupted worker's branch pointed when
+        // the hub stopped it, which is the best recreation point a
+        // no-commit worker has.
+        let head_commit = entry
+            .as_ref()
+            .and_then(|entry| entry.head_commit.clone())
+            .or_else(|| entry.as_ref().and_then(|entry| entry.base_commit.clone()));
+        let Some(head_commit) = head_commit else {
             anyhow::bail!(
                 "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
             );

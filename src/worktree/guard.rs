@@ -188,11 +188,6 @@ pub struct WorktreeGuard {
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
     pub preserve_branch: bool,
-    /// Set by the hub's planned shutdown: the worker ends
-    /// `Interrupted`, so its branch must survive teardown even when
-    /// the worker made no commit (the branch then points exactly at
-    /// the base commit).
-    pub interrupted: bool,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
     /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
@@ -375,7 +370,6 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
-            interrupted: false,
             seeded,
         })
     }
@@ -970,53 +964,59 @@ impl WorktreeGuard {
         .unwrap_or(false)
     }
 
-    /// Mark the guard as belonging to a worker the hub interrupted.
+    /// Mark the worktree at `path` as belonging to a worker the hub
+    /// interrupted.
     ///
-    /// Called by the hub's shutdown path before the guard is dropped:
-    /// a planned shutdown ends the worker `Interrupted`, so its branch
-    /// (and therefore its continuability) must outlive the worktree
-    /// teardown, even when the worker never committed anything.
+    /// Called by the hub's shutdown path before the worker's task is
+    /// aborted: a planned shutdown ends the worker `Interrupted`, so
+    /// its branch (and therefore its continuability) must outlive the
+    /// worktree teardown, even when the worker never committed
+    /// anything.
     ///
-    /// The pool only tracks the checkout path, so the mark is also
-    /// written to a file the guard's own [`Drop`] reads: the abort
-    /// that ends the worker's task drops the guard in another
-    /// execution context, where the in-memory flag would not be
-    /// visible. [`clear_interrupted_marker`] removes it.
-    pub fn mark_interrupted(&mut self) {
-        self.interrupted = true;
-        let _ = std::fs::write(self.interrupted_marker_path(), b"interrupted");
+    /// The pool only tracks the checkout *path* -- the guard itself
+    /// lives inside the worker's task, which the abort drops after
+    /// this method has returned -- so the mark is a file beside the
+    /// worktree, named from the worktree's own directory: the guard's
+    /// [`Drop`] reads it and [`clear_interrupted_marker`] removes it
+    /// once honoured.
+    pub fn mark_interrupted(path: &Path) {
+        let _ = std::fs::write(interrupted_marker_path(path), b"interrupted");
     }
 
     /// Whether this guard belongs to an interrupted worker.
     ///
-    /// The in-memory flag covers a guard whose `mark_interrupted` ran
-    /// in this process; the marker file covers the abort-drops case,
-    /// where the shutdown path marked a guard this process later
-    /// drops without ever holding it.
+    /// The marker file is what both the shutdown path and the
+    /// abort-drop agree on: the former writes it, the latter reads
+    /// and consumes it.
     fn interrupted(&self) -> bool {
-        self.interrupted
-            || self.interrupted_marker_path().is_file()
+        self.interrupted_marker_path().is_file()
     }
 
-    /// Remove the interruption marker, once it has been honoured.
+    /// Remove the interruption marker.
     ///
-    /// [`Drop`] calls this after the branch decision, so a *later*
-    /// run of the same worker id starts unmarked: its teardown
-    /// prunes a branch that points nowhere past the base again.
+    /// [`Drop`] calls this after the branch decision, honoured or
+    /// not, so a *later* run of the same worker id starts unmarked:
+    /// its teardown prunes a branch that points nowhere past the base
+    /// again.
     fn clear_interrupted_marker(&self) {
         let _ = std::fs::remove_file(self.interrupted_marker_path());
     }
 
-    /// The interruption marker path: beside the worktree, keyed by
-    /// worker id, so the shutdown path and the dropping task agree
-    /// on it.
+    /// The interruption marker path: beside the worktree, named from
+    /// the worktree's own directory, so the shutdown path and the
+    /// dropping task agree on it.
     fn interrupted_marker_path(&self) -> PathBuf {
-        let mut path = self.path.clone();
-        path.set_file_name(format!(
-            "swe-wt-{}.interrupted",
-            self.worker_id()
-        ));
-        path
+        interrupted_marker_path(&self.path)
+    }
+
+    /// Whether `refs/heads/{branch}` still resolves.
+    ///
+    /// A branch that never resolved was never a worker's branch at
+    /// all (a worktree whose branch someone already deleted), so
+    /// nothing needs preserving; this keeps the interrupted path
+    /// from "preserving" a branch that has nothing to preserve.
+    fn branch_ref_exists(&self) -> bool {
+        branch_ref(&self.repo_root, &self.branch).is_some()
     }
 
     /// The worker id this guard belongs to, recovered from the worktree
@@ -1090,14 +1090,15 @@ impl Drop for WorktreeGuard {
         // auto-continues an Interrupted worker by re-attaching to it,
         // so deleting the ref would strand the worker's row and
         // history with nothing to continue on. The marker is consumed
-        // here: a later run of the same worker id that ends some
-        // other way still prunes its branch. A worker that ended some
-        // other way keeps deleting a branch that points nowhere past
-        // the base.
-        let interrupted = !self.preserve_branch && !has_commits && self.interrupted();
-        if self.interrupted {
-            self.clear_interrupted_marker();
-        }
+        // here, honoured or not, so a *later* run of the same worker
+        // id that ends some other way prunes its branch again. A
+        // worker that ended some other way keeps deleting a branch
+        // that points nowhere past the base.
+        let interrupted = !self.preserve_branch
+            && !has_commits
+            && self.interrupted()
+            && self.branch_ref_exists();
+        self.clear_interrupted_marker();
 
         if self.preserve_branch || has_commits || interrupted {
             info!(branch = %self.branch, "Preserving worker branch with committed changes");
@@ -1115,6 +1116,19 @@ impl Drop for WorktreeGuard {
         let _ = std::fs::remove_file(&pid_file);
         remove_target_dirs(&self.path);
     }
+}
+
+/// The interruption marker path of the worktree at `path`: a sibling
+/// file named from the worktree's own directory.
+///
+/// [`WorktreeGuard::mark_interrupted`] writes it from the shutdown
+/// path; the guard's [`Drop`] reads and removes it. Keeping the
+/// naming in one free function lets both sides derive it from a bare
+/// path, which is all the pool tracks.
+fn interrupted_marker_path(path: &Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_os_string();
+    marker.push(".interrupted");
+    PathBuf::from(marker)
 }
 
 fn checked_git(path: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
