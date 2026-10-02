@@ -1426,11 +1426,13 @@ fn a_dead_consolidator_owns_no_question() {
             "test".into(),
             ScratchRoot::new(dir.clone()),
         );
-        // A paused worker with a question for its owner.
+        // A paused worker with a question for its owner. A running pid keeps
+        // the liveness normalisation from reporting the row as stopped.
         let mut worker = WorkerMeta::test_meta("w0", "owner");
         worker.group = Some("g".into());
+        worker.pid = 1;
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &worker.entry(
                 "test",
                 RegistryStatus::Paused,
@@ -1444,8 +1446,9 @@ fn a_dead_consolidator_owns_no_question() {
         let mut cons = WorkerMeta::test_meta("c0", "owner");
         cons.group = Some("g".into());
         cons.role = WorkerRole::Consolidate;
+        cons.pid = 1;
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
         );
         pool.test_write_steer_source("w0", "c0")
@@ -1460,7 +1463,7 @@ fn a_dead_consolidator_owns_no_question() {
         );
         // While the consolidator lives, both decisions withhold from the owner.
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
         );
         assert!(
@@ -1528,11 +1531,11 @@ fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
 
         // Phase 1: the consolidator lives, the worker asks a question.
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
         );
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &worker.entry(
                 "test",
                 RegistryStatus::Paused,
@@ -1557,7 +1560,7 @@ fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
 
         // Phase 2: the consolidator stopped; the question reaches the owner.
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
         );
         let snap = super::watch_snapshot(&pool).await;
@@ -1577,18 +1580,21 @@ fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
             router.acknowledge_watch(&ctx, event["sequence"].as_u64().unwrap());
         }
 
-        // Phase 3: the consolidator lives again, the worker fails. The
-        // failed row keeps the step, revision and question the paused row had
-        // so the snapshot is a transition of the same worker, not a stranger.
+        // Phase 3: the consolidator lives again, the worker fails.
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
         );
+        // Phase 3: the consolidator lives again, the worker fails. The
+        // scripted row keeps a live pid so the liveness normalisation does not
+        // report it as stopped, and a worktree marker so the terminal-row
+        // pruning keeps it: a failed row without either is already swept.
         let mut failed = worker.entry("test", RegistryStatus::Failed, 1, 10, "boom", None);
         failed.revision = 1;
-        save_registry_entry_in(&pool.scratch_root(), &failed);
+        failed.pid = 1;
+        save_registry_entry_in(pool.scratch_root(), &failed);
+        std::fs::create_dir_all(pool.scratch_root().join("swe-wt-w0")).expect("worktree marker");
         let snap = super::watch_snapshot(&pool).await;
-        eprintln!("PHASE3 snap w0: {}", snap["w0"]);
         assert_eq!(
             snap["w0"]["steered_by_consolidator"],
             json!(true),
@@ -1603,7 +1609,7 @@ fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
 
         // Phase 4: the consolidator stopped; the terminal event reaches the owner.
         save_registry_entry_in(
-            &pool.scratch_root(),
+            pool.scratch_root(),
             &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
         );
         let snap = super::watch_snapshot(&pool).await;
