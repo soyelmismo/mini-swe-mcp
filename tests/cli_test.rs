@@ -571,6 +571,11 @@ fn test_cli_status_line_never_autostarts_the_hub() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&hub).expect("create the scratch hub dir");
     std::fs::create_dir_all(swe.join("swe-registry")).expect("create the scratch registry");
+    // The two `socket()` probes below resolve the endpoint of a hub directory
+    // under `TMPDIR`, which is too deep for `sun_path` when the gate runs the
+    // suite with a deep one: the socket then moves to a short private
+    // fallback directory. Own it so the probe leaves no `/tmp/mswe-*` behind.
+    let _fallback = common::fallback_socket_dir(&hub);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
