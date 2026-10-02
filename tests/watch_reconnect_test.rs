@@ -155,11 +155,13 @@ impl Drop for WatchDaemon {
 /// reconnect has to re-announce the identity and replay what it missed.
 #[tokio::test]
 async fn a_watch_follows_a_daemon_cut_with_a_reset() {
-    let hub = common::TempDir::new_in_tmp("watch-cut");
-    let hub_dir = hub.path().to_path_buf();
     let isolated = common::IsolatedPool::new(2, "watch-cut");
     let swe = isolated.root().path().to_path_buf();
     let pool = isolated.pool.clone();
+    // Its own directory, not the pool's base: the watch spawns the replacement
+    // daemon itself, so everything it starts has to stay inside this test.
+    let hub = common::TempDir::new(&swe.join("hub"), "watch-cut");
+    let hub_dir = hub.path().to_path_buf();
 
     // The watch owns the hub directory from here on, so the replacement daemon
     // is the one it starts and the only one this test ever signals.
@@ -195,8 +197,14 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
     tokio::select! {
         _ = wait_for_log(&hub_dir, "Serving MCP connection", 1) => {}
         _ = tokio::time::timeout(Duration::from_secs(20), read_to_end(&mut errors)) => {
-            panic!("the watch never reached the daemon; stderr: {:?}",
-                read_to_end(&mut errors).await);
+            let status = watch.wait().await.expect("the watch process joins");
+            panic!(
+                "the watch never reached the daemon: {status:?}, stderr: {:?}, hub.dir={}, swe={}, hub.log:\n{}",
+                read_to_end(&mut errors).await,
+                hub_dir.display(),
+                swe.display(),
+                std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default(),
+            );
         }
     }
     owned.cut();
@@ -260,13 +268,14 @@ fn watch_command(hub_dir: &Path, swe: &Path) -> std::process::Command {
         .env_remove("MINI_SWE_NO_DAEMON")
         .env("SWE_HUB_DIR", hub_dir)
         .env("SWE_TEMP_DIR", swe)
-        .env("MINI_SWE_AGENT_ID", "reconnect-test")
         .env(RECONNECT_ENV, RECONNECT_SECS)
         .env("ENV_FILE", "/nonexistent-mini-swe-reconnect")
         .env("OPENAI_API_KEY", "test-key-not-used-by-the-reconnect-test")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    common::scrub_identity_env(&mut watch);
+    // Set after `binary_command`'s scrub, which clears exactly this override:
+    // the replacement's recovery has rows to hand back only to this identity.
+    watch.env("MINI_SWE_AGENT_ID", "reconnect-test");
     watch
 }
 
