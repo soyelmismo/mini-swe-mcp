@@ -376,6 +376,10 @@ mod tests {
     /// at least a 40% cut.
     const TOOLS_LIST_BASELINE_BYTES: usize = 6990;
 
+    /// Every budget test fails with this guidance: the fix is always to
+    /// shorten text, never to raise the budget.
+    const BUDGET_GUIDANCE: &str = "Shorten descriptions (details belong in `help <topic>`); never raise TOOLS_LIST_BASELINE_BYTES or the budget ratio.";
+
     fn worker_schema(tools_list: &Value) -> &Value {
         tools_list["tools"]
             .as_array()
@@ -554,8 +558,18 @@ mod tests {
             .len();
         assert!(
             bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
-            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload"
+            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload; {BUDGET_GUIDANCE}"
         );
+    }
+
+    /// Pins the baseline constant: the budget only means something while
+    /// the pre-trim payload it was measured from stays fixed, so raising
+    /// the constant to make the budget test pass must fail too.
+    #[test]
+    fn tools_list_baseline_constant_is_pinned() {
+        if TOOLS_LIST_BASELINE_BYTES != 6990 {
+            panic!("TOOLS_LIST_BASELINE_BYTES changed from 6990; {BUDGET_GUIDANCE}");
+        }
     }
 
     /// `message` stays a short call contract; the full list of stopped states
