@@ -16,6 +16,7 @@
 
 mod collect;
 mod consolidate;
+mod discard;
 mod dispatch;
 mod kill;
 mod logs;
@@ -27,6 +28,7 @@ mod steer;
 
 pub use collect::format_collect;
 pub use consolidate::format_consolidate;
+pub use discard::format_discard;
 pub use dispatch::{format_dispatch, format_dispatch_quiet};
 pub use kill::format_kill;
 pub use logs::format_logs;

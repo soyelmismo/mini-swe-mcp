@@ -198,7 +198,12 @@ impl Round {
         // whichever shape came back rather than assuming one.
         let id = result
             .get("worker_id")
-            .or_else(|| result.get("workers").and_then(|w| w.get(0)).and_then(|w| w.get("worker_id")))
+            .or_else(|| {
+                result
+                    .get("workers")
+                    .and_then(|w| w.get(0))
+                    .and_then(|w| w.get("worker_id"))
+            })
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("the dispatch answered without a worker id: {result}"));
         id.to_string()
@@ -344,7 +349,10 @@ async fn a_node_round_gates_its_workers_on_the_package_scripts() {
 /// end.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_round_consolidator_still_gets_the_full_gate() {
-    let repo = repo("cheap-gate-consolidator", Some(("Cargo.toml", "[package]\n")));
+    let repo = repo(
+        "cheap-gate-consolidator",
+        Some(("Cargo.toml", "[package]\n")),
+    );
     let round = Round::new("cheap-gate-consolidator-pool").await;
     round.finished_worker(repo.path(), "aaaa1111", &[("worker.rs", "fn main() {}\n")]);
 

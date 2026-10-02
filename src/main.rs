@@ -316,6 +316,10 @@ fn print_help() {
     println!("           Workers you own; --all (with --admin) lists every agent's.");
     println!("  kill <worker_id>");
     println!("           Terminate a worker.");
+    println!("  discard <worker_id>");
+    println!("           Drop a stopped worker for good: branch, row, history, steer files and");
+    println!("           worktree leftovers, with no merge. A running worker is refused; kill it");
+    println!("           first.");
     println!("  merge <worker_id> [--no-delete]");
     println!("           Merge a finished worker's branch into its base branch: trial merge,");
     println!("           verify gate on the merge result, then merge --no-ff and clean up.");

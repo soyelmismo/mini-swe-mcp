@@ -26,6 +26,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "logs",
     "list",
     "kill",
+    "discard",
     "reap",
     "manifest",
     "prune",
@@ -64,7 +65,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge identity sandbox env consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. Only own workers, admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge discard identity sandbox env consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -181,9 +182,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static(
-            "Automatic consolidator's full gate; default: auto-detect.",
-        ),
+        DescriptionSource::Static("Consolidator's gate; `sh -n` checked."),
+    ),
+    (
+        "set",
+        "boolean",
+        DescriptionSource::Static(super::handlers::consolidate::SET_DESCRIPTION),
     ),
     (
         "scope",
@@ -302,6 +306,11 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
+    // Several rounds running at once are named in one call: one group name, or
+    // an array of them. `watch --all` reads the omitted value as every group.
+    if name == "group" {
+        schema.insert("type".to_string(), json!(["string", "array"]));
+    }
     if name == "tasks" {
         schema.insert(
             "items".to_string(),
@@ -417,10 +426,12 @@ mod tests {
         assert_eq!(properties.len(), WORKER_PROPERTIES.len());
         for (name, json_type, _) in WORKER_PROPERTIES {
             let property = &properties[*name];
-            let expected = if *name == "consolidate" {
-                json!(["boolean", "string"])
-            } else {
-                json!(json_type)
+            // Two spellings of one call: a group name, or the list of rounds a
+            // single watch covers.
+            let expected = match *name {
+                "group" => json!(["string", "array"]),
+                "consolidate" => json!(["boolean", "string"]),
+                _ => json!(json_type),
             };
             assert_eq!(property["type"], expected, "wrong type for '{name}'");
             assert!(

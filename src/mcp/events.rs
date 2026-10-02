@@ -1647,7 +1647,7 @@ impl EventRouter {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
         let initial = params["initial"].as_bool().unwrap_or(false);
-        let group = params["group"].as_str();
+        let groups = watch_groups(params);
         let owner = ctx.agent();
         // Unattributed legacy rows are the admin's alone: an agent that happens
         // to be named "unattributed" must not inherit them by accident.
@@ -1679,7 +1679,7 @@ impl EventRouter {
             .values()
             .filter(|v| {
                 allowed(v)
-                    && crate::cli::watch::matches(v, &ids, group)
+                    && crate::cli::watch::matches(v, &ids, &groups)
                     && matches!(
                         v["status"].as_str(),
                         Some("running" | "paused" | "reviewing")
@@ -1693,7 +1693,7 @@ impl EventRouter {
                 continue;
             }
             for v in &history.pending {
-                if !crate::cli::watch::matches(v, &ids, group) {
+                if !crate::cli::watch::matches(v, &ids, &groups) {
                     continue;
                 }
                 let mut event = v.clone();
@@ -1734,7 +1734,7 @@ impl EventRouter {
                         matches!(v["event"].as_str(), Some("completed" | "failed"))
                             && self.seen.get(id).copied() != v["sequence"].as_u64()
                             && allowed(v)
-                            && crate::cli::watch::matches(v, &ids, group)
+                            && crate::cli::watch::matches(v, &ids, &groups)
                     })
                 {
                     events.push(v.clone());
@@ -1744,13 +1744,15 @@ impl EventRouter {
         Ok(json!({"watching":watching,"events":events}))
     }
 
-    /// The `--all` watch: one consolidated event per round.
+    /// The `--all` watch: one consolidated event for the round that landed.
     ///
-    /// A round needs a group or explicit ids. It answers once when every
-    /// selected worker has stopped, or earlier when one is paused (needs
-    /// input), has failed, or (past the long threshold) has gone quiet. The
-    /// individual transitions it folds in are acknowledged here, so a later
-    /// plain watch does not replay them.
+    /// `group` names one round or several, and naming none selects every live
+    /// group of the caller. The watch answers once as soon as any selected round
+    /// has stopped entirely, or earlier when one of its workers is paused
+    /// (needs input), has failed, or (past the long threshold) has gone quiet;
+    /// the event carries that round's workers alone, and the transitions it
+    /// folds in are acknowledged here, so a later plain watch of the same round
+    /// does not replay them.
     fn watch_round(
         &mut self,
         ctx: &super::server::ConnectionContext,
@@ -1763,11 +1765,7 @@ impl EventRouter {
             .flatten()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        let group = params["group"].as_str();
-        anyhow::ensure!(
-            !ids.is_empty() || group.is_some(),
-            "watch --all needs a group or explicit worker ids"
-        );
+        let groups = watch_groups(params);
         let owner = ctx.agent();
         let allowed = |v: &serde_json::Value| {
             ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed")
@@ -1777,7 +1775,7 @@ impl EventRouter {
             .values()
             .filter(|v| {
                 allowed(v)
-                    && crate::cli::watch::matches(v, &ids, group)
+                    && crate::cli::watch::matches(v, &ids, &groups)
                     && matches!(
                         v["status"].as_str(),
                         Some("running" | "paused" | "reviewing")
@@ -1805,14 +1803,16 @@ impl EventRouter {
                         .and_then(|v| v["sequence"].as_u64())
                         .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
             };
-            crate::cli::watch::round_event(&self.watch_current, &ids, group, now, fresh, allowed)
+            crate::cli::watch::round_event(&self.watch_current, &ids, &groups, now, fresh, allowed)
         };
         // Reserve the identity's one watch slot before the round is
         // acknowledged: a second watch must be refused, never let a
         // caller consume the events it was refused.
         self.watches.claim(&owner, ctx.id, ctx.pid)?;
         if let Some(event) = event {
-            self.ack_round(ctx, &ids, group);
+            // Only the round the event reports is acknowledged: a sibling round
+            // that is still running keeps its transitions for the next watch.
+            self.ack_round(ctx, &ids, &groups, event["group"].as_str());
             return Ok(json!({"watching":watching,"events":[event]}));
         }
         Ok(json!({"watching":watching,"events":[]}))
@@ -1826,14 +1826,24 @@ impl EventRouter {
         &mut self,
         ctx: &super::server::ConnectionContext,
         ids: &std::collections::BTreeSet<String>,
+        groups: &std::collections::BTreeSet<String>,
         group: Option<&str>,
     ) {
         let owner = ctx.agent();
+        let reported: Option<std::collections::BTreeSet<String>> =
+            group.map(|name| [name.to_string()].into_iter().collect());
         let selected: std::collections::BTreeSet<String> = self
             .watch_current
             .values()
             .filter(|v| ctx.is_admin() || (v["owner"] == owner && v["owner"] != "unattributed"))
-            .filter(|v| crate::cli::watch::matches(v, ids, group))
+            .filter(|v| {
+                crate::cli::watch::matches(v, ids, groups)
+                    && reported.as_ref().is_none_or(|reported| {
+                        v["group"]
+                            .as_str()
+                            .is_some_and(|name| reported.contains(name))
+                    })
+            })
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
         for id in selected {
@@ -1907,6 +1917,29 @@ impl EventRouter {
             self.acks.record(&agent, &wid, revision, &event);
         }
     }
+}
+
+/// The groups a watch or round call selected.
+///
+/// `hub/watch` takes the CLI's set; the MCP `watch` action accepts one name or
+/// an array of them, because an orchestrator with several rounds running names
+/// all of them in one call. An omitted value selects every group the caller owns.
+pub(crate) fn watch_groups(params: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    params["group"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .or_else(|| {
+            params["group"]
+                .as_str()
+                .map(|group| [group.to_string()].into_iter().collect())
+        })
+        .unwrap_or_default()
 }
 
 pub(super) async fn watch_request(
