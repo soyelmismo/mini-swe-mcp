@@ -594,11 +594,6 @@ impl HubClient {
     }
 
     /// Owner-scoped actionable replay and the current watch set.
-    /// One watch snapshot for `ids` and `groups`.
-    ///
-    /// A single `hub/watch` call carries both selections, so several `--group`
-    /// flags stay one watch: the hub answers with the first round worth
-    /// reporting out of all of them.
     pub async fn watch_snapshot(
         &mut self,
         ids: &std::collections::BTreeSet<String>,
@@ -609,6 +604,8 @@ impl HubClient {
         if !self.watch_line.is_empty() {
             self.next_watch_notification().await?;
         }
+        // One call carries the whole selection, so repeated `--group` flags
+        // stay one watch over several rounds.
         self.request(
             "hub/watch",
             json!({"worker_ids":ids,"group":groups,"initial":initial,"all":all}),

@@ -206,15 +206,12 @@ struct Harness {
 }
 
 async fn harness(ids: &[&str]) -> Harness {
-    harness_in(4, "watch-all", ids.iter().map(|id| (*id, GROUP))).await
+    let workers = ids.iter().map(|id| (*id, GROUP)).collect::<Vec<_>>();
+    harness_in(4, "watch-all", &workers).await
 }
 
 /// The same hub over workers spread across several groups.
-async fn harness_in(
-    capacity: usize,
-    label: &str,
-    workers: impl IntoIterator<Item = (&'static str, &'static str)>,
-) -> Harness {
+async fn harness_in(capacity: usize, label: &str, workers: &[(&str, &str)]) -> Harness {
     let isolated = common::IsolatedPool::new(capacity, label);
     for (id, group) in workers {
         add_running_in(&isolated.pool, id, group).await;
@@ -245,10 +242,7 @@ async fn wait_for_round(client: &mut Raw) -> Vec<serde_json::Value> {
     wait_for_round_of(client, watch_all()).await
 }
 
-async fn wait_for_round_of(
-    client: &mut Raw,
-    request: serde_json::Value,
-) -> Vec<serde_json::Value> {
+async fn wait_for_round_of(client: &mut Raw, request: serde_json::Value) -> Vec<serde_json::Value> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let reply = client.request("hub/watch", request.clone()).await;
@@ -484,23 +478,38 @@ fn the_cli_all_flag_reports_a_stopped_group() {
     );
 }
 
-/// `--all` without a group or ids is refused instead of silently watching
-/// every worker the caller owns.
+/// `--all` with no group is no longer a refusal: it is every live group of the
+/// caller, and several rounds are named by repeating `--group` in one watch.
 #[test]
-fn the_cli_all_flag_needs_a_group_or_ids() {
-    let args = [
+fn an_all_flag_without_a_group_covers_every_round() {
+    let one = mini_swe_mcp::cli::watch::Options::parse(&[
         "mini-swe-mcp".to_string(),
         "watch".to_string(),
         "--all".to_string(),
-    ];
-    let error = mini_swe_mcp::cli::watch::Options::parse(&args)
-        .err()
-        .expect("an unselective --all must be refused");
+    ])
+    .expect("--all alone must be accepted: it covers every live group");
+    assert!(one.all, "--all is still set");
     assert!(
-        error
-            .to_string()
-            .contains("--all needs --group or explicit worker ids"),
-        "{error}"
+        one.groups.is_empty(),
+        "no group named means every group: {:?}",
+        one.groups
+    );
+
+    let many = mini_swe_mcp::cli::watch::Options::parse(&[
+        "mini-swe-mcp".to_string(),
+        "watch".to_string(),
+        "--group".to_string(),
+        ROUND5.to_string(),
+        "--all".to_string(),
+        "--group".to_string(),
+        ROUND6.to_string(),
+    ])
+    .expect("repeated --group flags are one watch");
+    assert!(many.all, "--all is still set");
+    assert_eq!(
+        many.groups.iter().collect::<Vec<_>>(),
+        vec![&ROUND5.to_string(), &ROUND6.to_string()],
+        "both rounds are selected by the one watch"
     );
 }
 
@@ -571,7 +580,7 @@ async fn a_round_stays_inside_its_caller_ownership() {
 /// and lists that round's workers alone, even while the other one still runs.
 #[tokio::test]
 async fn the_first_round_to_stop_answers_the_watch_over_several() {
-    let mut harness = harness_in(4, "watch-all-rounds", ROUND_WORKERS).await;
+    let mut harness = harness_in(4, "watch-all-rounds", &ROUND_WORKERS).await;
     let watch = watch_all_of(&[ROUND5, ROUND6]);
 
     // Both rounds are running, so there is nothing to report yet.
@@ -622,7 +631,7 @@ async fn the_first_round_to_stop_answers_the_watch_over_several() {
 /// two rounds are covered without naming either.
 #[tokio::test]
 async fn an_all_watch_without_a_group_covers_every_round() {
-    let mut harness = harness_in(4, "watch-all-every", ROUND_WORKERS).await;
+    let mut harness = harness_in(4, "watch-all-every", &ROUND_WORKERS).await;
     let watch = watch_all_of(&[]);
 
     let reply = harness.client.request("hub/watch", watch.clone()).await;
@@ -640,7 +649,10 @@ async fn an_all_watch_without_a_group_covers_every_round() {
     assert_eq!(events[0]["status"], "stopped", "{events:?}");
     let workers = events[0]["workers"].as_array().expect("workers array");
     assert_eq!(
-        workers.iter().map(|worker| &worker["worker_id"]).collect::<Vec<_>>(),
+        workers
+            .iter()
+            .map(|worker| worker["worker_id"].clone())
+            .collect::<Vec<_>>(),
         vec![json!("w-3"), json!("w-4")],
         "a group-less --all answers for the first round that lands: {events:?}"
     );
@@ -682,7 +694,11 @@ async fn the_mcp_watch_action_takes_a_group_array() {
 
     assert_eq!(result["status"], "event", "{result}");
     let events = result["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 1, "one event for the finished round: {result}");
+    assert_eq!(
+        events.len(),
+        1,
+        "one event for the finished round: {result}"
+    );
     assert_eq!(events[0]["group"], ROUND5, "{result}");
     assert_eq!(
         events[0]["workers"].as_array().map(Vec::len),
@@ -690,7 +706,10 @@ async fn the_mcp_watch_action_takes_a_group_array() {
         "{result}"
     );
 
-    // The same call without a group covers both rounds: round6 has stopped too.
+    // The same call without a group covers both rounds: once round6 stops too,
+    // that is the round the group-less watch answers with.
+    set_completed(&isolated.pool, "w-3").await;
+    set_completed(&isolated.pool, "w-4").await;
     let result = server
         .execute_tool_for(
             "worker",
