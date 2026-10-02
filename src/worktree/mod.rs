@@ -181,6 +181,23 @@ pub(crate) fn remove_target_dirs_in(root: &ScratchRoot, wt_path: &Path) {
     }
 }
 
+/// The private scratch and target directories of the checkout at `wt_path`,
+/// reclaimed from `base` -- the directory the checkout itself lives in.
+///
+/// The one place that needs this is a checkout that no pool filed: a merge's
+/// gate worktree, created straight under the root it was given. Its executor
+/// scratch is named after the checkout's own leaf and filed *beside* it, so
+/// resolving the base from a [`ScratchRoot`] would look in the wrong place for
+/// every root a caller injected. Naming the directory is the same derivation
+/// the executor itself uses, in one place.
+pub(crate) fn remove_sibling_dirs(base: &Path, wt_path: &Path) {
+    let Some(wt_name) = wt_path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    force_remove_dir(&base.join(format!("swe-target-{wt_name}")));
+    force_remove_dir(&base.join(format!("swe-tmp-{wt_name}")));
+}
+
 /// The checkouts and sidecars a scratch root's own pool filed inside it.
 ///
 /// A pool resolves every per-worker path under its [`ScratchRoot`], so the

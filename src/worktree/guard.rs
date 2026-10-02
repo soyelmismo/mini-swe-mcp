@@ -193,14 +193,15 @@ pub struct WorktreeGuard {
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
     pub preserve_branch: bool,
-    /// The scratch root this checkout was filed under, kept for teardown.
+    /// The scratch *base* this checkout's directory sits directly in.
     ///
-    /// The private scratch the executor opens is derived from the checkout's
-    /// leaf name and filed next to the *scratch base*, which is
-    /// [`crate::worktree::swe_base_dir`], not necessarily the root this pool was
-    /// handed. Teardown has to remove it from the same place it was created, or
-    /// the gate worktree a merge builds leaves `swe-tmp-swe-merge-<id>` behind.
-    root: ScratchRoot,
+    /// The executor's private scratch and the legacy target directories are
+    /// named after the checkout's leaf and filed next to that directory, not
+    /// under the [`ScratchRoot`] a caller handed in -- a root can be anywhere,
+    /// while the companions are always created in the parent of the checkout
+    /// itself. Recording that parent lets teardown reclaim them from exactly
+    /// where they were created, whichever root a test injected.
+    scratch_base: PathBuf,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
     /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
@@ -383,7 +384,10 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
-            root: root.clone(),
+            scratch_base: path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(ScratchRoot::from_env().base),
             seeded,
         })
     }
@@ -1126,10 +1130,10 @@ impl Drop for WorktreeGuard {
         // is the fallback for when it could not (audit §04).
         force_remove_dir(&self.path);
         let _ = std::fs::remove_file(&pid_file);
-        // Under *this* root: `remove_target_dirs` resolves the scratch base on
-        // its own, so a checkout filed under an injected root would have its
-        // private scratch reclaimed from the wrong place and leave it behind.
-        crate::worktree::remove_target_dirs_in(&self.root, &self.path);
+        // Beside the checkout, which is where the executor created them: the
+        // scratch base follows the directory, so a checkout filed under an
+        // injected scratch root still has its companions reclaimed.
+        crate::worktree::remove_sibling_dirs(&self.scratch_base, &self.path);
     }
 }
 
@@ -1419,7 +1423,7 @@ mod tests {
             base_commit: String::new(),
             base_branch: None,
             preserve_branch: false,
-            root: ScratchRoot::from_env(),
+            scratch_base: repo.to_path_buf(),
             seeded: BTreeMap::new(),
         }
     }

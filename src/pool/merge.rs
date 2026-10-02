@@ -35,7 +35,7 @@ use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
 };
 use crate::agent::AgentRunner;
-use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_target_dirs_in};
+use crate::worktree::{ScratchRoot, force_remove_dir, git, remove_sibling_dirs};
 
 /// How many trailing lines of a failed gate a refusal carries.
 ///
@@ -659,7 +659,10 @@ fn reclaim_gate_worktree(root: &ScratchRoot, repo: &Path, gate_dir: &Path) {
         &["worktree", "remove", "--force", &gate_dir.to_string_lossy()],
     );
     force_remove_dir(gate_dir);
-    remove_target_dirs_in(root, gate_dir);
+    // Beside the gate worktree, which is where the executor opened its scratch:
+    // resolving the base from `root` would look in the wrong place for every
+    // root a caller injected.
+    remove_sibling_dirs(root.path(), gate_dir);
     let _ = git(repo, "worktree prune", &["worktree", "prune"]);
 }
 
