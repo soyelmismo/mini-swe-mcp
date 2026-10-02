@@ -33,7 +33,14 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
-    let exe = exe_path::executable()?;
+    // `executable` polls for a build that is mid-replacement, so it
+    // runs on the blocking pool: a thin transport's single runtime
+    // thread stays free to relay frames while `cargo` writes the new
+    // binary in place, instead of stalling the one thread it has.
+    let exe = tokio::task::spawn_blocking(exe_path::executable)
+        .await
+        .context("Could not run the executable resolver")?
+        .context("Could not resolve the hub daemon executable")?;
     spawn_daemon(&paths, &exe)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
