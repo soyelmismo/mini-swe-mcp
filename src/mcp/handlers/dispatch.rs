@@ -274,16 +274,14 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const TASK_DESCRIPTION: &str =
-    "ONE concern: files in scope, acceptance gate.";
+    "ONE focused concern: files in scope, acceptance gate.";
 
-pub(in crate::mcp) const TASKS_DESCRIPTION: &str =
-    "Batch {task, model?, ...}; top-level defaults.";
+pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; top-level defaults.";
 
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer model for the worktree audit.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model for the worktree audit.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate stopped group: true uses strongest/default; string pins model.";

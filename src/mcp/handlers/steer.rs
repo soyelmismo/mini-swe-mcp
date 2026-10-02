@@ -103,4 +103,5 @@ impl McpServer {
 
 pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str = "Required for steer: resumes own branch with full context, stopped included; never dispatch a replacement. max_turns sets budget.";
 
-pub(in crate::mcp) const MAX_TURNS_DESCRIPTION: &str = "Max bash turns (overrides default); on 'steer', the budget continuing a stopped worker.";
+pub(in crate::mcp) const MAX_TURNS_DESCRIPTION: &str =
+    "Max bash turns (overrides default); on 'steer', the budget continuing a stopped worker.";

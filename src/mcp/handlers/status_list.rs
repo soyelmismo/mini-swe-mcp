@@ -155,7 +155,8 @@ impl McpServer {
     }
 }
 
-pub(in crate::mcp) const WORKER_ID_DESCRIPTION: &str = "Target worker (alias 'id'): 3+ char prefix or 'last'; required by targeting verbs.";
+pub(in crate::mcp) const WORKER_ID_DESCRIPTION: &str =
+    "Target worker (alias 'id'): 3+ char prefix or 'last'; required by targeting verbs.";
 
 /// The compact `details` object behind a live worker's `status`.
 ///

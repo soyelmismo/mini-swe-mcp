@@ -86,7 +86,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Steer: resumes own branch with full context, stopped workers included; never dispatch a replacement. max_turns sets budget.",
+            "description": "Required for steer: resumes own branch with full context, stopped included; never dispatch a replacement. max_turns sets budget.",
             "type": "string"
           },
           "model": {
@@ -185,7 +185,7 @@
             "type": "integer"
           },
           "topic": {
-            "description": "Help topic to read; omitted: the index",
+            "description": "Help topic; omitted: the index",
             "type": "string"
           },
           "verify": {
