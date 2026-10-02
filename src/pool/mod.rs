@@ -778,12 +778,23 @@ impl WorkerPool {
             .unwrap_or_else(|| "default".to_string());
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
+        // The base facts every row of this worker names: the branch the work
+        // starts from and the commit it forks off. Detected once here, before
+        // the first registry write, so even a dispatch that dies in its first
+        // seconds leaves a row the retirement sweep can act on -- a row without
+        // a base branch is a worker it cannot prove integrated.
+        let base_repo = repo_path.clone();
+        let base = tokio::task::spawn_blocking(move || revision::detect_base_facts(&base_repo))
+            .await
+            .unwrap_or_default();
         let meta = WorkerMeta {
             id: worker_id.clone(),
             task: task.clone(),
             group: Some(resolved_group.clone()),
             role,
             repo_path: Some(repo_path_str.clone()),
+            base_branch: base.branch,
+            base_commit: base.commit,
             owner: owner.clone(),
             started_at: now,
             pid: std::process::id(),

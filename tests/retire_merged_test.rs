@@ -12,8 +12,9 @@ mod common;
 use common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
-    MergeRequest, WorkerHistory, WorkerRecord, WorkerRegistryEntry, append_history_message_in,
-    merge_worker_in, save_registry_entry_in, sweep_retired_workers_in,
+    MergeRequest, WorkerHistory, WorkerMeta, WorkerPool, WorkerRecord, WorkerRegistryEntry,
+    WorkerRole, WorkerState, append_history_message_in, load_registry_entry_in, merge_worker_in,
+    save_registry_entry_in, sweep_retired_workers_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::{Path, PathBuf};
@@ -104,6 +105,17 @@ impl Fixture {
         save_registry_entry_in(&self.root(), &row);
     }
 
+    /// Record a registry row that names no base branch, the way a build from
+    /// before base-branch tracking wrote one. The saved conversation is then the
+    /// row's only remaining evidence of which branch it was based on.
+    fn record_row_without_base_branch(&self, id: &str) {
+        self.record(id);
+        let mut row = load_registry_entry_in(&self.root(), id).expect("the row was just written");
+        row.base_branch = None;
+        row.base_commit = None;
+        save_registry_entry_in(&self.root(), &row);
+    }
+
     /// Write a `.steer-source` marker, as a consolidator that steered this
     /// worker leaves behind.
     fn write_steer_source(&self, id: &str) {
@@ -119,6 +131,14 @@ impl Fixture {
             .path()
             .join(format!("swe-wt-{id}.history.jsonl"))
             .exists()
+    }
+
+    /// Path of a worker's saved conversation log, the one that carries its
+    /// base branch on its metadata line.
+    fn history_path(&self, id: &str) -> PathBuf {
+        self.scratch
+            .path()
+            .join(format!("swe-wt-{id}.history.jsonl"))
     }
 
     fn steer_source_exists(&self, id: &str) -> bool {
@@ -186,6 +206,220 @@ impl Fixture {
     fn sweep(&self) -> mini_swe_mcp::pool::RetireSweep {
         sweep_retired_workers_in(&self.root(), None)
     }
+}
+
+/// A row written before base-branch tracking names no base, so the sweep has to
+/// take it from the worker's own saved conversation -- otherwise a worker whose
+/// branch *is* merged stays on the books forever, which is exactly what a
+/// daemon-start sweep once reported as `workers=0` over a pool of merged
+/// workers. The fallback is still a positive proof: nothing is retired until
+/// `worker-<id>` is an ancestor of the base the worker recorded.
+#[test]
+fn the_sweep_retires_a_merged_worker_whose_row_names_no_base_branch() {
+    let f = Fixture::new("retire-sweep-historical-base");
+
+    // 1. The row that needs the fallback: completed, no base branch recorded,
+    //    and its branch already merged into `main`.
+    f.commit_on_worker_branch("nb1", "nb1.txt", "nb1\n");
+    f.record_row_without_base_branch("nb1");
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate nb1", "worker-nb1"],
+    );
+    assert!(
+        load_registry_entry_in(&f.root(), "nb1").is_some_and(|row| row.base_branch.is_none()),
+        "the fixture must present a row without a base branch"
+    );
+
+    // 2. A second such row whose branch is NOT merged: the fallback must not
+    //    retire it.
+    f.commit_on_worker_branch("nb2", "nb2.txt", "nb2\n");
+    f.record_row_without_base_branch("nb2");
+
+    // 3. A third such row with no saved conversation left to name its base:
+    //    nothing positive can be proved, so it must survive even though the
+    //    repository's checked-out branch is exactly the branch it merged into.
+    f.commit_on_worker_branch("nb3", "nb3.txt", "nb3\n");
+    f.record_row_without_base_branch("nb3");
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate nb3", "worker-nb3"],
+    );
+    std::fs::remove_file(f.history_path("nb3")).expect("drop the conversation");
+
+    let sweep = f.sweep();
+
+    assert_eq!(
+        sweep.workers,
+        vec!["nb1".to_string()],
+        "only the branch with a recorded base and a positive ancestry proof may be retired"
+    );
+    assert!(
+        !f.row_exists("nb1"),
+        "the merged worker's row must be retired"
+    );
+    assert!(!f.history_exists("nb1"), "its conversation must be retired");
+    assert!(
+        !git_ref_exists(f.repo(), "worker-nb1"),
+        "its branch must be retired"
+    );
+    assert!(f.row_exists("nb2"), "an unmerged worker must survive");
+    assert!(
+        git_ref_exists(f.repo(), "worker-nb2"),
+        "an unmerged branch must survive"
+    );
+    assert!(
+        f.row_exists("nb3"),
+        "a worker with no provable base must survive even though its branch merged"
+    );
+}
+
+/// The base branch belongs on the row from the first write, because the sweep
+/// proves integration from the row alone: a worker whose branch is already
+/// merged must be retirable the moment its row exists, whichever path wrote it.
+/// So `WorkerMeta::entry` -- the row every registry write of a worker rebuilds
+/// from -- carries it.
+#[test]
+fn every_row_a_meta_writes_carries_its_base_branch() {
+    let f = Fixture::new("retire-meta-base");
+    let base_commit = git(f.repo(), &["rev-parse", "HEAD"]).trim().to_string();
+    let meta = WorkerMeta {
+        id: "mb1".to_string(),
+        task: "carry the base".to_string(),
+        owner: "agent-a".to_string(),
+        group: Some("round-1".to_string()),
+        role: WorkerRole::Worker,
+        repo_path: Some(f.repo().to_string_lossy().into_owned()),
+        base_branch: Some("main".to_string()),
+        base_commit: Some(base_commit.clone()),
+        started_at: 0,
+        pid: std::process::id(),
+        revision: 0,
+        auto_continues: 0,
+        metrics: Default::default(),
+        report: None,
+        verified: None,
+    };
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    // No throttling: both rows are the ones a worker really writes -- the
+    // dispatch's `running` row and its terminal `completed` row -- and the
+    // second one is the row the sweep later reads.
+    pool.__test_reset_registry_throttle("mb1");
+    pool.__test_save_status(
+        &meta,
+        "test-model",
+        mini_swe_mcp::pool::RegistryStatus::Running,
+        0,
+        10,
+        "initializing",
+        None,
+    );
+    pool.__test_reset_registry_throttle("mb1");
+    pool.__test_save_status(
+        &meta,
+        "test-model",
+        mini_swe_mcp::pool::RegistryStatus::Completed,
+        3,
+        10,
+        "completed",
+        None,
+    );
+
+    let row = load_registry_entry_in(&f.root(), "mb1").expect("the terminal row must be written");
+    assert_eq!(
+        row.base_branch.as_deref(),
+        Some("main"),
+        "a worker's row must name the base its diff is measured against"
+    );
+    assert_eq!(
+        row.base_commit.as_deref(),
+        Some(base_commit.as_str()),
+        "and the commit it branched off"
+    );
+}
+
+/// The dispatch detects the base itself, for every role: the registry row a
+/// consolidator is dispatched with is exactly as unable to prove integration as
+/// an ordinary worker's when it names no base branch.
+#[tokio::test]
+async fn a_dispatch_records_the_base_branch_on_every_role() {
+    for (label, role) in [
+        ("worker", WorkerRole::Worker),
+        ("consolidator", WorkerRole::Consolidate),
+    ] {
+        let f = Fixture::new(&format!("retire-dispatch-{label}"));
+        let llm = common::fake_llm::FakeLlm::spawn("echo staged", "echo staged").await;
+        let pool = WorkerPool::with_scratch(
+            1,
+            llm.base_url().to_string(),
+            "test-key".to_string(),
+            f.root(),
+        );
+        let group = format!("retire-{label}");
+        let id = pool
+            .dispatch_with_role(
+                "agent-a".to_string(),
+                format!("dispatch the {label}"),
+                "test-model".to_string(),
+                None,
+                f.repo().to_path_buf(),
+                6,
+                Some(group),
+                None,
+                false,
+                None,
+                Vec::new(),
+                role,
+            )
+            .await
+            .expect("the dispatch must succeed");
+
+        // The row the dispatch writes before any turn runs.
+        let row = load_registry_entry_in(&f.root(), &id).expect("the dispatch wrote its row");
+        assert_eq!(
+            row.base_branch.as_deref(),
+            Some("main"),
+            "a dispatched {label}'s row must name the base branch"
+        );
+        assert_eq!(
+            row.base_commit.as_deref(),
+            Some(git(f.repo(), &["rev-parse", "HEAD"]).trim()),
+            "a dispatched {label}'s row must name the base commit"
+        );
+
+        // The row a completion writes, which is the one the sweep reads.
+        wait_for_terminal(&pool, &id).await;
+        let done = load_registry_entry_in(&f.root(), &id).expect("the completion wrote its row");
+        assert!(
+            matches!(done.status, mini_swe_mcp::pool::RegistryStatus::Completed),
+            "the scripted worker must complete: {:?}",
+            done.status
+        );
+        assert_eq!(
+            done.base_branch.as_deref(),
+            Some("main"),
+            "the terminal row must still name the base branch"
+        );
+    }
+}
+
+/// Poll until the worker reaches a terminal state.
+async fn wait_for_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
+    for _ in 0..600 {
+        if let Some(state) = pool.get_worker_state(id).await {
+            match state {
+                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
+                other => return other,
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("worker {id} never reached a terminal state");
 }
 
 fn write(dir: &Path, name: &str, contents: &str) {
@@ -546,6 +780,8 @@ fn a_consolidators_round_survives_its_later_status_writes() {
         group: None,
         role: Default::default(),
         repo_path: Some(f.repo().to_string_lossy().into_owned()),
+        base_branch: Some("main".to_string()),
+        base_commit: None,
         started_at: 0,
         pid: std::process::id(),
         revision: 0,
@@ -703,6 +939,8 @@ fn successive_round_recordings_survive_status_writes_between_them() {
         group: None,
         role: Default::default(),
         repo_path: Some(f.repo().to_string_lossy().into_owned()),
+        base_branch: Some("main".to_string()),
+        base_commit: None,
         started_at: 0,
         pid: std::process::id(),
         revision: 0,
