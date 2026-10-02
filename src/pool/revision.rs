@@ -759,12 +759,13 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         {
             continue;
         }
-        groups.entry((repo.to_path_buf(), base)).or_default().push(
-            RetireCandidate {
+        groups
+            .entry((repo.to_path_buf(), base))
+            .or_default()
+            .push(RetireCandidate {
                 id: entry.id,
                 base_commit,
-            },
-        );
+            });
     }
     for ((repo, base), candidates) in &groups {
         // The probe failed: retire nothing, and never guess a repository.
@@ -818,7 +819,10 @@ fn local_branches(repo: &Path) -> Option<std::collections::HashSet<String>> {
 /// The tip is part of the proof, not a detail: a branch whose tip is the commit
 /// its worker was dispatched from is "contained in `base`" while holding no
 /// work of its own, so the caller compares the two before retiring anything.
-fn merged_branch_tips(repo: &Path, base: &str) -> Option<std::collections::HashMap<String, String>> {
+fn merged_branch_tips(
+    repo: &Path,
+    base: &str,
+) -> Option<std::collections::HashMap<String, String>> {
     let out = crate::worktree::git(
         repo,
         "for-each-ref",
@@ -928,7 +932,9 @@ fn base_commit_proof(root: &ScratchRoot, entry: &super::WorkerRegistryEntry) -> 
     }
     load_worker_history_in(root, &entry.id)
         .ok()
-        .and_then(|history| is_commit_sha(history.base_commit.trim()).then(|| history.base_commit))
+        .and_then(|history| {
+            is_commit_sha(history.base_commit.trim()).then_some(history.base_commit)
+        })
 }
 
 /// Whether `value` is a commit sha rather than a placeholder or a free-form
