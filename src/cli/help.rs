@@ -15,6 +15,7 @@ pub const HELP_FLAGS: &str = concat!(
 
 mod collect;
 mod consolidate;
+mod discard;
 mod env;
 mod identity;
 mod merge;
@@ -40,6 +41,7 @@ pub const TOPICS: &[&str] = &[
     "sandbox",
     "env",
     "consolidate",
+    "discard",
 ];
 
 /// Text of one help topic, or `None` for an unknown topic.
@@ -55,6 +57,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "sandbox" => sandbox::TEXT,
         "env" => env::TEXT,
         "consolidate" => consolidate::TEXT,
+        "discard" => discard::TEXT,
         _ => return None,
     })
 }
@@ -87,7 +90,7 @@ mod tests {
     /// not, so `help <topic>` can refuse it with the available list.
     #[test]
     fn every_topic_has_text_and_unknown_ones_do_not() {
-        assert_eq!(TOPICS.len(), 10);
+        assert_eq!(TOPICS.len(), 11);
         for topic in TOPICS {
             let text = topic_text(topic).unwrap_or_else(|| panic!("'{topic}' has no text"));
             assert!(!text.trim().is_empty(), "'{topic}' is empty");

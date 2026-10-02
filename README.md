@@ -112,12 +112,22 @@ mini-swe-mcp merge <id> --no-delete  # keep the branch afterwards
 
 It merges into the base branch recorded for the worker, and refuses -- changing nothing -- while the worker still runs, while the repository has another branch checked out, while a file the merge would touch has uncommitted changes (untracked and unrelated files are left alone), or while the branch conflicts, in which case it prints the conflicting files and the `steer` that sends them back. The verify gate (the worker's own command, or the auto-detected one) runs on the merge result in a throwaway worktree and is skipped when the branch already contains the base tip and the worker's last verify passed. On success it prints one line naming the merge commit and what it cleaned up. It never pushes.
 
+### 6. discard
+
+Not every stopped worker is worth landing. A failed consolidator whose gate can never run, a duplicate dispatch, a branch whose work was abandoned: `discard` removes such a worker in one command instead of by hand.
+
+```bash
+mini-swe-mcp discard <id>   # branch, row, history, steer files, round base, worktree
+```
+
+It retires the worker through the same path a merge uses, so nothing is left to clean up: the `worker-<id>` branch, the registry row, the history JSONL, the steering mailbox and steer-source, the pinned round base, the watch acknowledgements and the worktree leftovers all go. It merges nothing and runs no gate, so the base branch does not move. Like `kill` it is owner-only, and a **running or paused** worker is refused with a hint to `kill` it first — a discard deletes unmerged work with no gate, so it must never be a quiet way to stop a worker that is still producing. Nothing it removes can be recovered: read `collect <id>` first if the result is still wanted.
+
 ## The hub
 
 One daemon, many orchestrators.
 
 - **One daemon.** The CLI and `--stdio` auto-start the hub when none is running. Its socket lives in `SWE_HUB_DIR` (default `<SWE_TEMP_DIR>/mini-swe-hub-<uid>`, private to your uid). `mini-swe-mcp daemon` runs it in the foreground; it exits after `HUB_IDLE_SECS` without clients.
-- **Ownership & privacy.** A client may only read, steer, kill, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, else a `MINI_SWE_WATCH_TOKEN`, else the agent's **host process plus the session inside it**, else the MCP `initialize` client info.
+- **Ownership & privacy.** A client may only read, steer, kill, discard, collect and watch the workers it dispatched. Identity is `MINI_SWE_AGENT_ID`, else a `MINI_SWE_WATCH_TOKEN`, else the agent's **host process plus the session inside it**, else the MCP `initialize` client info.
 - **One identity per session.** The identity is the agent's host process — the first ancestor of the client that is not a shell, a wrapper or a service manager (`mini-swe-mcp <- bash <- claude` resolves to `claude`), named `host:<comm>:<pid>:<starttime>`. The MCP connection and the agent's shell commands share it, so a `mini-swe-mcp watch` in the shell sees the workers its own MCP connection dispatched, and two hosts never share workers. It survives MCP reconnects and hub restarts while the host lives; the start time keeps a recycled pid from colliding. A process daemonized with `setsid -f` is reparented to the user's `systemd`, which is never named as a host.
 - **Sessions inside one host.** One host process is not always one session: opencode v2 runs a tab per session inside one process, over one shared MCP connection. When the session is known it qualifies the host — `host:<comm>:<pid>:<starttime>/session:<id>` — so two tabs are two agents. opencode v2 sends it on every call as `CallToolRequest.params._meta.sessionID`, which is read per call and never cached on the connection; the handshakes read it from the environment instead (`CLAUDE_CODE_SESSION_ID`, then `OPENCODE_SESSION_ID`, then `MINI_SWE_SESSION_ID`). A host with no session information keeps the plain host identity. `mini-swe-mcp whoami` prints the identity and how it was derived.
 - **Watch tokens.** A shell cannot know its session — none of those variables reaches the agent's `bash` tool — so every `dispatch` and `steer` answer carries a `watch_command`: the exact command that waits on *your* workers, e.g. `MINI_SWE_WATCH_TOKEN=<32 hex> mini-swe-mcp watch`. The token is bound to the caller's identity, one per identity, created on first need and stored `0600` in the hub directory so it survives a daemon restart; a CLI presenting it acts as exactly that identity and never as `admin`. `mini-swe-mcp whoami` reports it as the derivation.

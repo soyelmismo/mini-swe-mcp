@@ -498,10 +498,16 @@ pub struct RetireContext<'a> {
 /// here can lose work that is not already in the repository.
 ///
 /// Called for an integrated worker *immediately* -- by `merge`, by
-/// `merge --approved`, and when a consolidator lands -- and by
-/// [`sweep_retired_workers_in`] for whatever a merge could not reach. Every
-/// step is best effort: retirement is idempotent, and a file that is already
-/// gone is the desired end state, not an error.
+/// `merge --approved`, and when a consolidator lands -- by `discard` for a
+/// stopped worker that will never land, and by [`sweep_retired_workers_in`]
+/// for whatever a merge could not reach. Every step is best effort:
+/// retirement is idempotent, and a file that is already gone is the desired
+/// end state, not an error.
+///
+/// `discard` and a merge are the same operation on the files and differ only
+/// in intent: a merge retires a worker whose work is in the base branch, a
+/// discard retires one whose work is abandoned. Neither can lose work, because
+/// the branch goes with them.
 pub fn retire_worker_in(root: &ScratchRoot, worker_id: &str) {
     retire_worker_with(root, worker_id, &RetireContext::default());
 }
@@ -567,8 +573,15 @@ pub fn retire_worker_reporting(
             branch_deleted = true;
         }
     }
-    for suffix in ["steer-source", "round-base"] {
-        let _ = std::fs::remove_file(root.join(format!("swe-wt-{worker_id}.{suffix}")));
+    // Every base directory the root sweeps, not just its own: a `.round-base`
+    // is written next to the root that dispatched the consolidator, and a
+    // retirement that only looked at one would leave the pinned base of a
+    // discarded round behind -- exactly the leftover a discard exists to
+    // remove.
+    for base in root.base_dirs() {
+        for suffix in ["steer-source", "round-base"] {
+            let _ = std::fs::remove_file(base.join(format!("swe-wt-{worker_id}.{suffix}")));
+        }
     }
     remove_worker_history_in(root, worker_id);
     remove_steer_file_in(root, worker_id);
