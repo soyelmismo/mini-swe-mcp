@@ -36,10 +36,19 @@ fn isolate_registry() -> PathBuf {
         .clone()
 }
 
-fn paths(dir: &Path) -> HubPaths {
+/// The hub paths a daemon under test binds, plus ownership of the short socket
+/// fallback directory that a hub directory too deep for `sun_path` moves its
+/// socket into.
+///
+/// [`common::fallback_socket_dir`] hands back `None` while the socket still fits
+/// in the hub directory (the usual case: these directories are short) and owns
+/// the directory once it does not, so a hub directory that outgrows `sun_path`
+/// leaves nothing behind whether the daemon shut down gracefully or not.
+fn paths(dir: &Path) -> (HubPaths, Option<common::TempDir>) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
-    HubPaths::new(dir.to_path_buf())
+    let fallback = common::fallback_socket_dir(dir);
+    (HubPaths::new(dir.to_path_buf()), fallback)
 }
 
 fn record(id: &str, owner: &str, state: WorkerState) -> WorkerRecord {
@@ -136,7 +145,8 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
         },
     )])
     .await;
-    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let (paths, _fallback) = paths(dir.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
 
@@ -234,7 +244,8 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
         },
     )])
     .await;
-    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let (paths, _fallback) = paths(dir.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket()).await;
 
@@ -383,7 +394,8 @@ async fn an_interaction_marks_the_workers_events_seen() {
         },
     )])
     .await;
-    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let (paths, _fallback) = paths(dir.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&dir.path().join("hub.sock")).await;
 
@@ -582,7 +594,8 @@ async fn the_binary_watches_through_the_hub() {
         ),
     ])
     .await;
-    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let (paths, _fallback) = paths(hub.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
     let run = |args: &[&str]| {
@@ -782,7 +795,8 @@ async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
     ))
     .await;
     let server = Arc::new(McpServer::new(pool.clone(), "test".to_string()));
-    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let (paths, _fallback) = paths(hub.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
 
@@ -952,7 +966,8 @@ async fn the_daemon_allows_one_watch_per_identity() {
         ),
     ])
     .await;
-    let daemon = HubServer::new(server, HubConfig::new(paths(dir.path()), 60));
+    let (paths, _fallback) = paths(dir.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     let socket = mini_swe_mcp::hub::HubPaths::new(dir.path().to_path_buf()).socket();
     wait_for_socket(&socket).await;
@@ -1106,7 +1121,8 @@ async fn a_second_cli_watch_for_one_session_exits_five() {
     ))
     .await;
     let server = Arc::new(McpServer::new(pool, "test".to_string()));
-    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let (paths, _fallback) = paths(hub.path());
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move { daemon.run().await });
     wait_for_socket(&mini_swe_mcp::hub::HubPaths::new(hub.path().to_path_buf()).socket()).await;
 
@@ -1357,7 +1373,8 @@ async fn an_old_hub_watch_reply_falls_back_to_the_registry() {
     let hub = common::TempDir::new_in_tmp("watch-old-hub");
     let swe = common::TempDir::new_in_tmp("watch-old-swe");
     let registry = swe.subdir("swe-registry");
-    let socket = paths(hub.path()).socket();
+    let (paths, _fallback) = paths(hub.path());
+    let socket = paths.socket();
     let fake = tokio::spawn(fake_old_hub(socket.clone()));
     wait_for_socket(&socket).await;
 

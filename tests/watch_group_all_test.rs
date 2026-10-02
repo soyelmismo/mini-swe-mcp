@@ -133,10 +133,19 @@ fn watch_all_of(groups: &[&str]) -> serde_json::Value {
     json!({"worker_ids": [], "group": groups, "initial": false, "all": true})
 }
 
-fn paths(dir: &Path) -> HubPaths {
+/// The hub paths a daemon under test binds, plus ownership of the short socket
+/// fallback directory that a hub directory too deep for `sun_path` moves its
+/// socket into.
+///
+/// [`common::fallback_socket_dir`] hands back `None` while the socket still fits
+/// in the hub directory (the usual case: these directories are short) and owns
+/// the directory once it does not, so a hub directory that outgrows `sun_path`
+/// leaves nothing behind whether the daemon shut down gracefully or not.
+fn paths(dir: &Path) -> (HubPaths, Option<common::TempDir>) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
-    HubPaths::new(dir.to_path_buf())
+    let fallback = common::fallback_socket_dir(dir);
+    (HubPaths::new(dir.to_path_buf()), fallback)
 }
 
 async fn wait_for_socket(path: &Path) {
@@ -218,8 +227,9 @@ async fn harness_in(capacity: usize, label: &str, workers: &[(&str, &str)]) -> H
     }
     let server = Arc::new(McpServer::new(isolated.pool.clone(), "test".to_string()));
     let hub = common::TempDir::new_in_tmp("watch-all-hub");
-    let socket = paths(hub.path()).socket();
-    let daemon = HubServer::new(server, HubConfig::new(paths(hub.path()), 60));
+    let (paths, _fallback) = paths(hub.path());
+    let socket = paths.socket();
+    let daemon = HubServer::new(server, HubConfig::new(paths, 60));
     let task = tokio::spawn(async move {
         let _ = daemon.run().await;
     });
