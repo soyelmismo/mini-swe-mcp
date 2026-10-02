@@ -803,7 +803,19 @@ fn spawn_daemon_from(exe: &std::path::Path, hub: &common::TempDir) -> tokio::pro
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     common::scrub_identity_env(command.as_std_mut());
-    command.spawn().unwrap()
+    // A concurrent `exec` of the same inode can make the kernel refuse the
+    // spawn with `ETXTBSY`; retry briefly rather than blame the test for a
+    // transient of a 40 MB binary being paged in.
+    for _ in 0..40 {
+        match command.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("spawn the daemon from {}: {e}", exe.display()),
+        }
+    }
+    panic!("spawning {} kept hitting ETXTBSY", exe.display())
 }
 
 /// Replace the daemon's executable with a different, newer build, and return

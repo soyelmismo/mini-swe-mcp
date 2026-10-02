@@ -230,7 +230,13 @@ pub async fn watch(
     deadline: Duration,
     log: PathBuf,
 ) {
-    let mut watch = ExeWatch::new(Fingerprint::of(&path));
+    // The baseline is the build this daemon actually runs, not whatever is at
+    // the path now: `/proc/self/exe` still resolves to the replaced inode, so
+    // a rebuild that landed between `exec` and this watcher is not mistaken
+    // for the running build. The path is the fallback without procfs.
+    let running_fp =
+        Fingerprint::of(Path::new("/proc/self/exe")).or_else(|| Fingerprint::of(&path));
+    let mut watch = ExeWatch::new(running_fp);
     let poll = poll_interval();
     let stable = stable_for();
     loop {
