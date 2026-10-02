@@ -2,7 +2,7 @@ use super::*;
 
 /// `topic` property of the `help` action: which topic's text to
 /// return, or none for the topic index.
-pub(super) const TOPIC_DESCRIPTION: &str =
+pub(crate) const TOPIC_DESCRIPTION: &str =
     "Help topic to read; omitted returns the topic index.";
 
 impl McpServer {

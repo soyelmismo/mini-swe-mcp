@@ -26,7 +26,7 @@ const UNKNOWN_OWNER: &str = "unknown";
 mod collect;
 pub(super) mod consolidate;
 pub(super) mod dispatch;
-mod help;
+pub(super) mod help;
 mod kill;
 mod logs;
 mod manifest;

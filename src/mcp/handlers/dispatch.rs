@@ -274,7 +274,7 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const TASK_DESCRIPTION: &str =
-    "ONE focused concern: files in scope and the acceptance gate.";
+    "ONE focused concern: files in scope, acceptance gate.";
 
 pub(in crate::mcp) const TASKS_DESCRIPTION: &str =
     "Batch {task, model?, ...} entries; top-level defaults.";
@@ -283,12 +283,12 @@ pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Absolute repository root (alias: 'path'). Required for 'dispatch'.";
 
 pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer model auditing the worktree after implementation.";
+    "Reviewer model for the worktree audit.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate stopped group: true uses strongest/default; string pins model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty disables. Cheap for workers, full for consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";

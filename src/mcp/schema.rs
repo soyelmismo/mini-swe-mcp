@@ -66,7 +66,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives per topic, reachable as `help <topic>` (CLI) or the
 /// `help` action (MCP) (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks with tasks+group+consolidate, cheap per-worker gate, wait with watch --group <g> --all (MCP all:true), read the consolidator's report, then merge the consolidator. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics via `help <topic>` (CLI) or action 'help' (MCP): workflow watch steer review collect merge identity sandbox env consolidate.";
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap per-worker gate, wait with watch --group <g> --all (MCP all:true), read the consolidator's report, merge the consolidator. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics via `help <topic>` (CLI) or action 'help' (MCP): workflow watch steer review collect merge identity sandbox env consolidate.";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
