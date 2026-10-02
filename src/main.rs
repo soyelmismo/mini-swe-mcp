@@ -22,39 +22,7 @@ fn main() -> Result<()> {
         mini_swe_mcp::monitor::print_status_line();
         return Ok(());
     }
-    // Only an invocation that owns a worker pool in this process needs
-    // worker threads; every other one relays frames, and a relay is one
-    // thread (see `bootstrap`). The choice reads argv and the escape
-    // hatch flag alone, so it costs nothing a later step did not pay.
-    let runtime = if owns_worker_pool(&args) {
-        bootstrap::runtime()?
-    } else {
-        bootstrap::runtime_current_thread()?
-    };
-    runtime.block_on(async_main())
-}
-
-/// Whether this invocation runs a worker pool in this process.
-///
-/// The hub daemon and the `MINI_SWE_NO_DAEMON=1` escape hatch do:
-/// their turns and `spawn_blocking` calls are the process's real
-/// concurrency, so they keep the multi-thread runtime. Every other
-/// invocation is a thin transport — the `--stdio` proxy, a CLI verb,
-/// `watch` — that relays JSON-RPC to the daemon and is served by a
-/// single-thread runtime. The verbs that answer from the registry or
-/// the environment alone (`monitor`, `whoami`, `help`, `watch`) never
-/// build a pool, so they stay thin even in the escape hatch.
-fn owns_worker_pool(args: &[String]) -> bool {
-    if action_of(args) == Some("daemon") {
-        return true;
-    }
-    if env::var("MINI_SWE_NO_DAEMON").ok().as_deref() != Some("1") {
-        return false;
-    }
-    !matches!(
-        action_of(args),
-        Some("monitor" | "supervisor" | "whoami" | "help" | "watch")
-    )
+    bootstrap::runtime()?.block_on(async_main())
 }
 
 async fn async_main() -> Result<()> {
