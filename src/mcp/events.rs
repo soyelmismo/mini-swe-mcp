@@ -382,12 +382,149 @@ async fn owns(pool: &WorkerPool, ctx: &super::server::ConnectionContext, id: &st
 }
 
 /// Latest events survive disconnected owners, but never retain more than 100 workers.
-/// One agent's live watch: who holds it and what to tell a second caller.
+/// One agent's live watch: who holds it, what it follows, and what a second
+/// caller of the same session is told.
 struct ActiveWatch {
     token: u64,
     connection: u64,
     pid: Option<u32>,
     since: u64,
+    /// What the running watch follows now: its own request, unioned with every
+    /// broader request a later invocation folded into it (see
+    /// [`WatchSelection::widen`]).
+    selection: WatchSelection,
+}
+
+/// What one `watch` invocation asked the hub to follow: its ids, its groups,
+/// and which mode it runs in.
+///
+/// An empty `ids` set is *every* worker of the caller and an empty `groups`
+/// set is *every* group, so two empty sets are the widest selection a plain
+/// watch can name. `all` picks the round mode: a `--all` watch reports whole
+/// rounds, a plain one reports single transitions, and the two modes are never
+/// the same selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct WatchSelection {
+    ids: std::collections::BTreeSet<String>,
+    groups: std::collections::BTreeSet<String>,
+    all: bool,
+}
+
+impl WatchSelection {
+    /// The selection a `hub/watch` (or MCP `watch`) request asked for.
+    pub(super) fn from_params(params: &serde_json::Value) -> Self {
+        Self::new(
+            params["worker_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+            watch_groups(params),
+            params["all"].as_bool().unwrap_or(false),
+        )
+    }
+
+    /// The selection named by resolved ids and groups.
+    pub(super) fn new(
+        ids: impl IntoIterator<Item = String>,
+        groups: impl IntoIterator<Item = String>,
+        all: bool,
+    ) -> Self {
+        Self {
+            ids: ids.into_iter().collect(),
+            groups: groups.into_iter().collect(),
+            all,
+        }
+    }
+
+    /// Whether every worker this request names is already named by `self`.
+    ///
+    /// Coverage is exact: the two modes must match (`--all` reports rounds and
+    /// a plain watch reports transitions, so neither covers the other), an
+    /// unfiltered set only covers a request of the same breadth, and an
+    /// explicit set only covers a subset. A request is therefore never called
+    /// covered while it asks for a group, an id or a mode the running watch
+    /// does not follow.
+    pub(super) fn covers(&self, other: &WatchSelection) -> bool {
+        if self.all != other.all {
+            return false;
+        }
+        let covers = |own: &std::collections::BTreeSet<String>,
+                      asked: &std::collections::BTreeSet<String>| {
+            own.is_empty() || (!asked.is_empty() && asked.is_subset(own))
+        };
+        covers(&self.ids, &other.ids) && covers(&self.groups, &other.groups)
+    }
+
+    /// The union of two selections: both id sets and both group sets, or the
+    /// unfiltered set when either side left one unfiltered, in the broader of
+    /// the two modes.
+    ///
+    /// An empty set means *every* worker (or group), so a request that left
+    /// ids empty cannot be unioned with an explicit id set: the union is then
+    /// every worker of the caller. `--all` wins over plain mode, so a watch
+    /// that has once been widened into round mode reports rounds from then on.
+    pub(super) fn widen(&self, other: &WatchSelection) -> WatchSelection {
+        fn union(
+            a: &std::collections::BTreeSet<String>,
+            b: &std::collections::BTreeSet<String>,
+        ) -> std::collections::BTreeSet<String> {
+            if a.is_empty() || b.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                a.union(b).cloned().collect()
+            }
+        }
+        WatchSelection {
+            ids: union(&self.ids, &other.ids),
+            groups: union(&self.groups, &other.groups),
+            all: self.all || other.all,
+        }
+    }
+
+    /// The selection as the flags that would ask for exactly it, so a widened
+    /// or covered watch can name itself in one line.
+    pub(super) fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.all {
+            parts.push("--all".to_string());
+        }
+        if self.groups.is_empty() {
+            parts.push("every group".to_string());
+        } else {
+            parts.push(
+                format!("--group {}", self.groups.iter().cloned().collect::<Vec<_>>()
+                    .join(" --group ")),
+            );
+        }
+        if self.ids.is_empty() && !self.all {
+            parts.push("every worker you own".to_string());
+        } else if !self.ids.is_empty() {
+            parts.push(format!(
+                "ids {}",
+                self.ids.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
+/// What claiming the identity's one watch slot found there.
+pub(super) enum Admission {
+    /// This connection holds (or has just taken) the slot and must follow the
+    /// returned selection: its own request, unioned with whatever an earlier
+    /// widening already added.
+    Held { token: u64, selection: WatchSelection },
+    /// Another connection of the same identity is watching, and it already
+    /// follows everything this request asked for.
+    Covered { pid: Option<u32> },
+    /// Another connection of the same identity is watching; its selection was
+    /// widened to the returned union, which this request must not consume.
+    Widened {
+        pid: Option<u32>,
+        connection: u64,
+        selection: WatchSelection,
+    },
 }
 
 /// Identity -> the single watch that may be active for it.
@@ -414,20 +551,52 @@ impl WatchRegistry {
         self.lock().contains_key(identity)
     }
 
-    fn busy(active: &ActiveWatch) -> anyhow::Error {
-        let held = match active.pid {
-            Some(pid) => format!("pid {pid}, since {}", active.since),
-            None => format!("since {}", active.since),
+    fn busy_watched(pid: Option<u32>) -> anyhow::Error {
+        let held = match pid {
+            Some(pid) => format!("pid {pid}"),
+            None => "an unknown pid".to_string(),
         };
         anyhow::anyhow!(
             "a watch is already running for your session ({held}); it will deliver the next event - do not start another"
         )
     }
 
-    fn insert(&self, identity: &str, connection: u64, pid: Option<u32>) -> anyhow::Result<u64> {
+    /// Claim `identity`'s one watch slot for a request of `selection`.
+    ///
+    /// Re-entrant: the connection that already holds the slot keeps it and
+    /// folds a broader request of its own into the stored selection, so the
+    /// selection only ever grows while a watch runs. A *different* connection
+    /// of the same identity never takes the slot over - it is told whether the
+    /// running watch already covers it, or was widened to a union that now
+    /// includes it, and the running watch keeps its connection, its place and
+    /// its unacknowledged events.
+    pub(super) fn admit(
+        &self,
+        identity: &str,
+        connection: u64,
+        pid: Option<u32>,
+        selection: &WatchSelection,
+    ) -> Admission {
         let mut slots = self.lock();
-        if let Some(active) = slots.get(identity) {
-            return Err(Self::busy(active));
+        if let Some(active) = slots.get_mut(identity) {
+            if active.connection == connection {
+                if !active.selection.covers(selection) {
+                    active.selection = active.selection.widen(selection);
+                }
+                return Admission::Held {
+                    token: active.token,
+                    selection: active.selection.clone(),
+                };
+            }
+            if active.selection.covers(selection) {
+                return Admission::Covered { pid: active.pid };
+            }
+            active.selection = active.selection.widen(selection);
+            return Admission::Widened {
+                pid: active.pid,
+                connection: active.connection,
+                selection: active.selection.clone(),
+            };
         }
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         slots.insert(
@@ -437,20 +606,19 @@ impl WatchRegistry {
                 connection,
                 pid,
                 since: crate::pool::unix_timestamp(),
+                selection: selection.clone(),
             },
         );
-        Ok(token)
+        Admission::Held {
+            token,
+            selection: selection.clone(),
+        }
     }
 
-    /// Claim `identity` for a hub connection, re-entrant so that connection's
-    /// own repeated polls keep the same slot instead of locking themselves out.
-    fn claim(&self, identity: &str, connection: u64, pid: Option<u32>) -> anyhow::Result<()> {
-        if let Some(active) = self.lock().get(identity) {
-            anyhow::ensure!(active.connection == connection, "{}", Self::busy(active));
-            return Ok(());
-        }
-        self.insert(identity, connection, pid)?;
-        Ok(())
+    /// The selection `identity`'s running watch follows, or `None` while no
+    /// watch runs for it.
+    pub(super) fn selection(&self, identity: &str) -> Option<WatchSelection> {
+        self.lock().get(identity).map(|active| active.selection.clone())
     }
 
     fn release_token(&self, identity: &str, token: u64) {
