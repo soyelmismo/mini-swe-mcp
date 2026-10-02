@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 use super::daemon::hub_lock_held;
 use super::exe_path;
 use super::identity;
-use super::{HubEndpoint, HubPaths, hub_dir};
+use super::{HubPaths, hub_dir};
 
 /// Dial the hub, starting a detached daemon if none is listening.
 /// Racing starters are serialized by the daemon's exclusive flock.
@@ -30,7 +30,7 @@ use super::{HubEndpoint, HubPaths, hub_dir};
 /// would otherwise report.
 pub async fn connect_or_spawn() -> Result<UnixStream> {
     let paths = HubPaths::new(hub_dir()?);
-    if let Ok(stream) = super::daemon::connect_endpoint(&paths.probe_endpoint()).await {
+    if let Ok(stream) = super::daemon::connect_endpoint(&paths.endpoint()).await {
         return Ok(stream);
     }
     let exe = exe_path::executable()?;
@@ -39,7 +39,7 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut delay = Duration::from_millis(20);
     loop {
-        match super::daemon::connect_endpoint(&paths.probe_endpoint()).await {
+        match super::daemon::connect_endpoint(&paths.endpoint()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 // The daemon is not there: reported with the refusal that proved
@@ -553,14 +553,7 @@ async fn negotiated_identity(cli: bool, params: Value) -> Result<HubClient> {
                         // wait for both, or the replacement would find the lock
                         // still held and exit as "hub already running".
                         loop {
-                            // A teardown check, not a bind: ask for the socket
-                            // path without creating the fallback directory a
-                            // deep hub dir would otherwise leave behind.
-                            if !matches!(
-                                paths.probe_endpoint(),
-                                HubEndpoint::Path(ref path) if path.exists()
-                            ) && !hub_lock_held(&paths.lock())?
-                            {
+                            if !paths.socket().exists() && !hub_lock_held(&paths.lock())? {
                                 break;
                             }
                             anyhow::ensure!(

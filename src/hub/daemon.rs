@@ -144,21 +144,6 @@ impl HubPaths {
         Some(fallback_socket_dir(&self.dir))
     }
 
-    /// The endpoint to *dial* a predecessor on, never creating anything.
-    ///
-    /// The same answer as [`HubPaths::endpoint`] for every socket a daemon could
-    /// have bound -- in the hub directory, or in the short fallback directory --
-    /// and no attempt to create anything. A client asks this to find out whether
-    /// a hub is *already* listening: it starts no daemon, so it must leave
-    /// nothing behind.
-    pub fn probe_endpoint(&self) -> HubEndpoint {
-        let natural = self.dir.join("hub.sock");
-        if natural.as_os_str().len() < MAX_SOCKET_PATH {
-            return HubEndpoint::Path(natural);
-        }
-        fallback_endpoint(&self.dir)
-    }
-
     /// Where the hub listens: a filesystem socket when one fits, otherwise
     /// (no short writable directory, e.g. inside a sandbox that denies `/tmp`)
     /// a Linux abstract-namespace socket named after the hub dir. Daemon and
@@ -314,37 +299,21 @@ fn fallback_socket_key(dir: &Path) -> String {
     )
 }
 
-/// Whether a fallback socket directory could be created and used at all.
+/// Whether a fallback socket directory exists, or can be created here.
 ///
-/// A sandbox that denies `/tmp` writes, or one that hands out a directory the
-/// user does not own, must not send a hub to a socket path it can never bind:
-/// those hubs listen in the abstract namespace instead.
+/// A sandbox that denies writes to `/tmp` must not send a hub to a socket path
+/// it can never bind: those hubs listen in the abstract namespace instead, and
+/// every caller derives the same answer from this one check. The test is
+/// declarative -- existence, or a parent this user can write to -- so resolving
+/// an endpoint never touches the filesystem it would create the directory in.
 fn fallback_dir_is_creatable(dir: &Path) -> bool {
-    // An existing directory is settled by its owner and mode, not by this call.
     if dir.metadata().is_ok() {
         return true;
     }
-    let parent = match dir.parent() {
-        Some(parent) => parent,
-        None => return false,
-    };
-    let meta = match parent.metadata() {
-        Ok(meta) => meta,
-        Err(_) => return false,
-    };
-    // `create_dir` needs a searchable, writable parent; an existing entry may
-    // also need replacing, which `create_dir` refuses, so report the failure
-    // the binder will hit anyway by trying the real creation.
-    if !meta.is_dir() || meta.uid() != current_uid() {
-        return false;
-    }
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir(dir);
-            true
-        }
-        Err(_) => false,
-    }
+    dir.parent()
+        .map(|parent| parent.metadata())
+        .and_then(Result::ok)
+        .is_some_and(|meta| meta.is_dir() && meta.uid() == current_uid())
 }
 
 /// Where a too-deep hub directory listens: the short fallback socket, or the
@@ -619,10 +588,10 @@ impl HubServer {
             if let Some(lock) = acquire_lock(&path)? {
                 return Ok(Some(lock));
             }
-            // Probe with the side-effect-free endpoint: a predecessor owns the
-            // socket here, so this daemon never binds, and `endpoint()` must
-            // not create a fallback directory for a hub that will not run.
-            if connect_endpoint(&self.config.paths().probe_endpoint())
+            // A predecessor owns the socket here, so this daemon never binds.
+            // `endpoint()` resolves it without creating the fallback directory
+            // a hub that will not run would otherwise leave behind.
+            if connect_endpoint(&self.config.paths().endpoint())
                 .await
                 .is_ok()
             {
@@ -1205,12 +1174,13 @@ mod tests {
             "probing the socket left {} behind",
             fallback.display()
         );
-        // Nor does a client checking whether a daemon is already up: it dials
-        // the fallback socket without ever creating the directory holding it.
-        let _ = paths.probe_endpoint();
+        // Nor does a client checking whether a daemon is already up, nor the
+        // lock waiter probing for a predecessor: both dial the fallback socket
+        // through `endpoint()`, which resolves it without creating it.
+        let _ = paths.endpoint();
         assert!(
             !fallback.exists(),
-            "probing for a running daemon left {} behind",
+            "resolving the endpoint left {} behind",
             fallback.display()
         );
     }
