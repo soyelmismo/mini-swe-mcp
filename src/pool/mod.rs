@@ -1499,12 +1499,16 @@ impl WorkerPool {
                 }
             }
             // Reported `fixed`: the consolidator made the correction itself, so
-            // the worker's own branch is superseded. Only a worker of the same
-            // round (owner and group) is accepted.
+            // the worker's own branch is superseded. The id comes from
+            // model-written report text, so an owner and group match alone is
+            // not enough: only a worker that is *stopped and not completed* is
+            // accepted, so a completed worker the report wrongly names is never
+            // absorbed and its branch is never discarded.
             for id in fixed {
                 if let Some(entry) = load_registry_entry_in(&root, &id)
                     && entry.owner.as_deref() == Some(owner.as_str())
                     && entry.group == group
+                    && entry.status.stopped_not_completed()
                 {
                     absorbed.push(id);
                 }
