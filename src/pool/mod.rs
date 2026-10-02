@@ -2386,6 +2386,53 @@ pub fn detect_verify_command(repo_path: &Path) -> Option<String> {
     None
 }
 
+/// Parse-check one verify gate without running it.
+///
+/// A gate is a shell command a worker runs at the end of its own work, and a
+/// dispatch that carries a mangled one (a quote split by the caller's shell, a
+/// truncated pipeline) is stored verbatim: the worker then fails on a command
+/// nobody can run, which is exactly what an unrunnable auto-consolidation gate
+/// looked like. The gate is therefore checked where it enters the system, so
+/// the caller is told the parse error while it can still fix the argument.
+///
+/// `sh -n -c <cmd>` parses without executing: nothing the gate names is run,
+/// and a command that only fails at *run* time (`cargo` on a repo without a
+/// manifest) still passes, because the gate is a statement about the worker's
+/// checkout, not about this process. An empty gate is legal -- it is the
+/// documented way to disable the gate -- so it is not parsed.
+pub fn validate_verify_command(command: &str, field: &str) -> Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let output = std::process::Command::new("sh")
+        .arg("-n")
+        .arg("-c")
+        .arg(trimmed)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Could not parse-check '{field}' with sh: {e}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "'{field}' is not a valid shell command: {}",
+        shell_syntax_error(&output.stderr)
+            .unwrap_or_else(|| { format!("sh exited with {}", output.status) })
+    );
+    Ok(())
+}
+
+/// The parse error out of `sh -n`'s stderr, trimmed to one line.
+///
+/// `sh` writes the diagnostic to stderr and only the first line of it names
+/// the problem; the rest is the source context of the gate, which the caller
+/// already has.
+fn shell_syntax_error(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Whether `dir` holds a file with the given extension.
 fn has_extension(dir: &Path, extension: &str) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {

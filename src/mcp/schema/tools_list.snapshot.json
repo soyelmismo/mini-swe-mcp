@@ -27,19 +27,23 @@
             ],
             "type": "string"
           },
+          "all": {
+            "description": "Watch whole rounds, one event each.",
+            "type": "boolean"
+          },
           "approved": {
             "description": "Merge every approved worker.",
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate stopped group: true uses strongest/default; string pins model.",
+            "description": "Auto-consolidate the group when it stops: boolean or model.",
             "type": [
               "boolean",
               "string"
             ]
           },
           "consolidate_verify": {
-            "description": "Automatic consolidator's full gate; default: auto-detect.",
+            "description": "Consolidator's gate; parse-checked with `sh -n`.",
             "type": "string"
           },
           "diff": {
@@ -64,7 +68,7 @@
             "type": "boolean"
           },
           "group": {
-            "description": "Group of workers, one name or several; also 'merge --approved'.",
+            "description": "Group of workers, one or several; also 'merge --approved'.",
             "type": [
               "string",
               "array"
@@ -85,7 +89,7 @@
             "type": "integer"
           },
           "message": {
-            "description": "Required for steer: resumes own branch with full context, including stopped workers; never dispatch a replacement. max_turns sets budget.",
+            "description": "Required for steer: resumes the worker's own branch with full context; never dispatch a replacement.",
             "type": "string"
           },
           "model": {
@@ -114,7 +118,7 @@
             "type": "string"
           },
           "role": {
-            "description": "'consolidate': integrate this group's completed workers (requires 'group')",
+            "description": "'consolidate': integrate this group's completed workers.",
             "type": "string"
           },
           "scope": {
@@ -125,6 +129,10 @@
               "all"
             ],
             "type": "string"
+          },
+          "set": {
+            "description": "'consolidate': amend, do not dispatch.",
+            "type": "boolean"
           },
           "task": {
             "description": "ONE focused concern: files in scope and the acceptance gate.",
@@ -184,7 +192,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables. Use cheap gate for workers, full for consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
@@ -192,15 +200,11 @@
             "type": "string"
           },
           "worker_ids": {
-            "description": "Worker IDs to watch (same prefixes as 'worker_id'). Omitted watches your own workers.",
+            "description": "Worker IDs to watch, as 'worker_id' prefixes. Omitted watches your own workers.",
             "items": {
               "type": "string"
             },
             "type": "array"
-          },
-          "all": {
-            "type": "boolean",
-            "description": "Watch whole rounds, one event each."
           }
         },
         "required": [
