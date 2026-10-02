@@ -732,8 +732,8 @@ fn cleanup(
     // A consolidator carries the round it integrated on its own row, and that
     // round is now fully in the base branch too. Read the list before the row
     // goes, so each worker it absorbed is retired with it.
-    let integrated = load_registry_entry_in(root, worker_id)
-        .map(|row| row.integrated)
+    let (integrated, absorbed) = load_registry_entry_in(root, worker_id)
+        .map(|row| (row.integrated, row.absorbed))
         .unwrap_or_default();
     let ctx = RetireContext {
         repo: Some(repo),
@@ -757,6 +757,8 @@ fn cleanup(
     // propagation exists to clean.
     let mut retired: Vec<String> = Vec::new();
     let mut round_retired = 0;
+    let mut absorbed_retired = 0;
+    let mut cleaned_kept: Vec<String> = Vec::new();
     if !keep_branch {
         for id in &integrated {
             // A member whose row a concurrent reader already pruned is still
@@ -783,12 +785,49 @@ fn cleanup(
                 round_retired += 1;
             }
         }
+        // The absorbed members are retired outright, WIP branches and all: the
+        // consolidator took their corrections over, so what is left on their
+        // branches is superseded work, not work to land. Only the ids the
+        // consolidator's own row records are touched, and each is re-checked
+        // before anything is deleted: a worker that is running again still owns
+        // its branch, and a *completed* worker's branch is only discarded when
+        // its tip is provably already in the branch the merge landed on --
+        // `base_branch`, whose tip is the merged consolidator commit, the same
+        // probe the integrated members above get. The consolidator's own ref is
+        // gone by now (the retirement above deleted it), so probing it would
+        // always answer false and strand every already-integrated worker. An
+        // absorbed id that is neither is kept and reported, never deleted --
+        // the record is the consolidator's claim, and a claim is not proof.
+        for id in &absorbed {
+            let Some(row) = load_registry_entry_in(root, id) else {
+                cleaned_kept.push(format!("kept {id}: not integrated"));
+                continue;
+            };
+            if matches!(
+                row.status,
+                RegistryStatus::Running | RegistryStatus::Reviewing
+            ) || (!row.status.stopped_not_completed()
+                && !branch_is_integrated_in(root, repo, id, base_branch))
+            {
+                cleaned_kept.push(format!("kept {id}: not integrated"));
+                continue;
+            }
+            if retire_worker_reporting(root, id, &ctx).row_removed {
+                retired.push(id.clone());
+                absorbed_retired += 1;
+            }
+        }
         if outcome.row_removed {
             retired.push(worker_id.to_string());
         }
     }
 
-    let mut cleaned = Vec::new();
+    let mut cleaned = cleaned_kept;
+    if absorbed_retired > 0 {
+        cleaned.push(format!(
+            "{absorbed_retired} absorbed worker(s) retired with the round"
+        ));
+    }
     if outcome.branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
     } else if keep_branch {

@@ -355,6 +355,48 @@ fn strip_markup(line: &str) -> String {
         .to_string()
 }
 
+/// The per-worker verdicts of a consolidator's closing report.
+///
+/// The consolidator prompt asks for one line per worker it touched,
+/// `REPORT <id> approved|returned|fixed: <one line>`. Only the verdict matters
+/// to the harness: `fixed` means the consolidator made the correction itself,
+/// so the worker it names was absorbed rather than integrated. Lines that do
+/// not match the shape -- prose, a `RISK:` line, a verdict that is none of the
+/// three -- are ignored, so a chatty report records nothing.
+pub fn parse_consolidator_verdicts(message: &str) -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for line in message.lines() {
+        let line = strip_markup(line);
+        let Some(rest) = line.strip_prefix("REPORT ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(id) = words.next() else {
+            continue;
+        };
+        if !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            continue;
+        }
+        let Some(verdict) = words.next() else {
+            continue;
+        };
+        let verdict = verdict.trim_end_matches(':');
+        let verdict = match verdict {
+            "approved" | "APPROVED" => "approved",
+            "returned" | "RETURNED" => "returned",
+            "fixed" | "FIXED" => "fixed",
+            _ => continue,
+        };
+        if !out.iter().any(|(known, _)| known == id) {
+            out.push((id.to_string(), verdict));
+        }
+    }
+    out
+}
+
 /// Deadline of a `CONSOLIDATE_WAIT` that names none, and the ceiling on one
 /// that does.
 ///
