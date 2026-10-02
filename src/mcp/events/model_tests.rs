@@ -185,8 +185,7 @@ impl World {
     }
 
     fn steered_live(&self, w: &Worker) -> bool {
-        w.steered_by
-            .is_some_and(|c| self.consolidators[c].live)
+        w.steered_by.is_some_and(|c| self.consolidators[c].live)
     }
 
     fn question_for_consolidator(&self, w: &Worker) -> bool {
@@ -296,7 +295,9 @@ impl Model {
             let Some(kind) = w.status.kind() else {
                 continue;
             };
-            if let Some(ep) = self.episodes.get(&(w.id.clone(), w.revision, kind.to_string()))
+            if let Some(ep) = self
+                .episodes
+                .get(&(w.id.clone(), w.revision, kind.to_string()))
                 && matches!(ep.state, EpState::Pending | EpState::Acked)
             {
                 self.reported
@@ -321,7 +322,10 @@ impl Model {
     }
 
     fn ack(&mut self, worker: &str, revision: usize, kind: &str) {
-        if let Some(ep) = self.episodes.get_mut(&(worker.to_string(), revision, kind.to_string())) {
+        if let Some(ep) = self
+            .episodes
+            .get_mut(&(worker.to_string(), revision, kind.to_string()))
+        {
             ep.state = EpState::Acked;
         }
     }
@@ -333,12 +337,16 @@ impl Model {
             if ep.state != EpState::Pending {
                 continue;
             }
-            let current = world.workers.iter().find(|w| &w.id == wid).is_some_and(|w| {
-                !w.retired
-                    && !w.branch_gone
-                    && w.revision == *rev
-                    && w.status.kind() == Some(kind.as_str())
-            });
+            let current = world
+                .workers
+                .iter()
+                .find(|w| &w.id == wid)
+                .is_some_and(|w| {
+                    !w.retired
+                        && !w.branch_gone
+                        && w.revision == *rev
+                        && w.status.kind() == Some(kind.as_str())
+                });
             if !current {
                 ep.state = EpState::Suppressed;
             }
@@ -451,10 +459,8 @@ impl Harness {
     fn new(seed: u64) -> Self {
         let mut rng = Rng::new(seed);
         let world = World::new(&mut rng);
-        let dir = std::env::temp_dir().join(format!(
-            "mcp-events-model-{}-{seed}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mcp-events-model-{}-{seed}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch hub dir");
         let mut router = EventRouter::default();
@@ -481,7 +487,7 @@ impl Harness {
 
     fn trace_detail(&mut self, line: String) {
         if let Some(last) = self.trace.last_mut() {
-            last.push_str("\n");
+            last.push('\n');
             last.push_str(&line);
         }
     }
@@ -509,14 +515,36 @@ impl Harness {
         }
         let mut eps = String::new();
         for ((wid, rev, kind), ep) in &self.model.episodes {
-            eps.push_str(&format!("\n  {wid} rev {rev} {kind}: {:?} delivered={}", ep.state, ep.delivered));
+            eps.push_str(&format!(
+                "\n  {wid} rev {rev} {kind}: {:?} delivered={}",
+                ep.state, ep.delivered
+            ));
         }
         panic!(
             "model violation at seed {} step {step}: {msg}\nrecent trace:\n{trace}\nworld:{world_dump}\nmodel:{eps}\nrouter reported: {:?}\nrouter seen: {:?}\nrouter acks: {:?}",
             self.seed,
-            self.router.watch_reported.iter().map(|(k, v)| (k.clone(), v["event"].clone(), v["revision"].clone(), v["sequence"].clone())).collect::<Vec<_>>(),
+            self.router
+                .watch_reported
+                .iter()
+                .map(|(k, v)| (
+                    k.clone(),
+                    v["event"].clone(),
+                    v["revision"].clone(),
+                    v["sequence"].clone()
+                ))
+                .collect::<Vec<_>>(),
             self.router.seen,
-            self.router.acks.positions.iter().map(|(o, ws)| (o.clone(), ws.iter().map(|(w, e)| (w.clone(), e.position.revision, e.position.event.clone())).collect::<Vec<_>>())).collect::<Vec<_>>(),
+            self.router
+                .acks
+                .positions
+                .iter()
+                .map(|(o, ws)| (
+                    o.clone(),
+                    ws.iter()
+                        .map(|(w, e)| (w.clone(), e.position.revision, e.position.event.clone()))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -634,7 +662,8 @@ impl Harness {
         let reported = self.model.reported.get(&id).cloned();
         self.model.mark_seen(&id);
         if let Some((revision, kind)) = reported {
-            self.acked.insert((owner.clone(), id.clone(), revision, kind));
+            self.acked
+                .insert((owner.clone(), id.clone(), revision, kind));
         }
         self.router.mark_seen(&owner, &id);
         let w = &mut self.world.workers[idx];
@@ -766,12 +795,12 @@ impl Harness {
         {
             return true;
         }
-        if self.world.workers.iter().any(|w| {
-            w.owner == owner
-                && !w.retired
-                && w.status == Status::Running
-                && w.idle >= 601
-        }) {
+        if self
+            .world
+            .workers
+            .iter()
+            .any(|w| w.owner == owner && !w.retired && w.status == Status::Running && w.idle >= 601)
+        {
             return true;
         }
         self.router.watch_reported.iter().any(|(wid, event)| {
@@ -917,12 +946,9 @@ impl Harness {
                     .collect();
                 for (wid, rev, kind) in named {
                     self.model.mark_seen(&wid);
-                    self.acked.insert((owner.to_string(), wid.clone(), rev, kind.clone()));
-                    if let Some(ep) = self
-                        .model
-                        .episodes
-                        .get_mut(&(wid, rev, kind))
-                    {
+                    self.acked
+                        .insert((owner.to_string(), wid.clone(), rev, kind.clone()));
+                    if let Some(ep) = self.model.episodes.get_mut(&(wid, rev, kind)) {
                         ep.delivered = true;
                     }
                 }
@@ -985,16 +1011,27 @@ impl Harness {
                 self.violation(format!("a round event named unknown worker {wid}"), step);
             };
             if worker.owner != owner {
-                self.violation(format!("a round event leaked worker {wid} of {}", worker.owner), step);
+                self.violation(
+                    format!("a round event leaked worker {wid} of {}", worker.owner),
+                    step,
+                );
             }
-            if worker.group != group {
-                self.violation(format!("a round event leaked group {} into {group}", worker.group), step);
+            // An empty group selects every group at once; otherwise every
+            // named worker must belong to the selected one.
+            if !group.is_empty() && worker.group != group {
+                self.violation(
+                    format!("a round event leaked group {} into {group}", worker.group),
+                    step,
+                );
             }
             if self.world.steered_live(worker) {
                 self.violation(format!("a round event named steered worker {wid}"), step);
             }
             if self.world.question_for_consolidator(worker) {
-                self.violation(format!("a round event named a consolidator-owned worker {wid}"), step);
+                self.violation(
+                    format!("a round event named a consolidator-owned worker {wid}"),
+                    step,
+                );
             }
             let outcome = view["outcome"].as_str().unwrap_or("");
             if status == "stopped" && matches!(outcome, "running" | "needs_input" | "stalled") {
@@ -1042,11 +1079,7 @@ impl Harness {
                 );
             }
         }
-        if let Some(ep) = self
-            .model
-            .episodes
-            .get_mut(&(worker, revision, kind))
-        {
+        if let Some(ep) = self.model.episodes.get_mut(&(worker, revision, kind)) {
             ep.delivered = true;
         }
     }
@@ -1177,7 +1210,9 @@ fn run_seed(seed: u64) {
                     if owned.is_empty() {
                         BTreeSet::new()
                     } else {
-                        [owned[rng.below(owned.len())].clone()].into_iter().collect()
+                        [owned[rng.below(owned.len())].clone()]
+                            .into_iter()
+                            .collect()
                     }
                 } else {
                     BTreeSet::new()
@@ -1210,11 +1245,12 @@ fn run_seed(seed: u64) {
                     let owner = harness.world.workers[idx].owner.clone();
                     let reported = harness.model.reported.get(&wid).cloned();
                     harness.model.mark_seen(&wid);
-                    harness.trace_detail(format!(
-                        "  mark_seen {owner} {wid} reported={reported:?}"
-                    ));
+                    harness
+                        .trace_detail(format!("  mark_seen {owner} {wid} reported={reported:?}"));
                     if let Some((revision, kind)) = reported {
-                        harness.acked.insert((owner.clone(), wid.clone(), revision, kind));
+                        harness
+                            .acked
+                            .insert((owner.clone(), wid.clone(), revision, kind));
                     }
                     harness.router.mark_seen(&owner, &wid);
                 }
@@ -1247,10 +1283,22 @@ fn plain_ack_does_not_replay_as_a_round() {
     harness.model.reconcile(&harness.world);
     harness.observe(0, false);
     let ctx = harness.ctxs[&owner].clone();
-    let reply = harness.router.watch_reply(&ctx, &json!({"worker_ids":[id]})).unwrap();
-    harness.router.acknowledge_watch(&ctx, reply["events"][0]["sequence"].as_u64().unwrap());
-    let round = harness.router.watch_reply(&ctx, &json!({"all":true,"worker_ids":[id],"group":group})).unwrap();
-    assert_eq!(round["events"], json!([]), "an acknowledged completion is not a fresh round: {round}");
+    let reply = harness
+        .router
+        .watch_reply(&ctx, &json!({"worker_ids":[id]}))
+        .unwrap();
+    harness
+        .router
+        .acknowledge_watch(&ctx, reply["events"][0]["sequence"].as_u64().unwrap());
+    let round = harness
+        .router
+        .watch_reply(&ctx, &json!({"all":true,"worker_ids":[id],"group":group}))
+        .unwrap();
+    assert_eq!(
+        round["events"],
+        json!([]),
+        "an acknowledged completion is not a fresh round: {round}"
+    );
 }
 
 /// A stale stall must not keep the round fresh after the terminal event.
@@ -1283,31 +1331,43 @@ fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
     idle["worker_id"] = json!("w0");
     idle["revision"] = json!(1);
     idle["last_step_at"] = json!(now.saturating_sub(601));
-    router.observe_watch([
-        ("w0".to_string(), idle),
-        ("w1".to_string(), running.clone()),
-    ].into());
+    router.observe_watch(
+        [
+            ("w0".to_string(), idle),
+            ("w1".to_string(), running.clone()),
+        ]
+        .into(),
+    );
     // The worker fails; the owner reads and acknowledges the failure.
-    router.observe_watch([
-        ("w0".to_string(), failed.clone()),
-        ("w1".to_string(), running.clone()),
-    ].into());
+    router.observe_watch(
+        [
+            ("w0".to_string(), failed.clone()),
+            ("w1".to_string(), running.clone()),
+        ]
+        .into(),
+    );
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
     let reply = router
-        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false}),
+        )
         .unwrap();
     assert!(
-        reply["events"].as_array().is_some_and(|events| events
-            .iter()
-            .any(|e| e["event"] == "failed")),
+        reply["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["event"] == "failed")),
         "the failure must be delivered: {reply}"
     );
     for e in reply["events"].as_array().cloned().unwrap_or_default() {
         router.acknowledge_watch(&ctx, e["sequence"].as_u64().unwrap());
     }
     let round = router
-        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}))
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}),
+        )
         .unwrap();
     assert_eq!(
         round["events"],
