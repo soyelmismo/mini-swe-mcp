@@ -24,6 +24,7 @@
 //! its owner's own workers, in its own group, and nothing else.
 
 use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2323,6 +2324,89 @@ pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// Auto-detect the cheap verify gate for the repository layout.
+///
+/// The fast static subset of the project's checks -- format, lint,
+/// type-check -- so a worker in a consolidated round does not pay for
+/// the full suite the round's consolidator runs once. Returns `None`
+/// when the ecosystem has no recognised static checks (or no manifest
+/// at all), so such a worker is not forced through a gate that cannot
+/// run; the caller falls back to whatever it would do with no gate.
+pub fn detect_cheap_verify_command(repo_path: &Path) -> Option<String> {
+    if repo_path.join("Cargo.toml").is_file() {
+        return Some(
+            "cargo fmt --check && cargo clippy --all-targets -- -D warnings".to_string(),
+        );
+    }
+    if repo_path.join("package.json").is_file() {
+        // The manifest's own lint and typecheck scripts when it
+        // declares them; a repository that runs neither is not gated
+        // on a script that cannot pass.
+        if let Ok(raw) = std::fs::read_to_string(repo_path.join("package.json"))
+            && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object())
+        {
+            let parts = [
+                scripts.get("lint").and_then(Value::as_str),
+                scripts.get("typecheck").and_then(Value::as_str),
+            ];
+            let chain = parts
+                .into_iter()
+                .flatten()
+                .map(|script| format!("npm run {script}"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            if !chain.is_empty() {
+                return Some(chain);
+            }
+        }
+        // No usable scripts, but a TypeScript project still has the
+        // compiler's own check.
+        if has_extension(repo_path, "ts") || has_extension(repo_path, "tsx") {
+            return Some("tsc --noEmit".to_string());
+        }
+        return None;
+    }
+    if repo_path.join("pyproject.toml").is_file()
+        || repo_path.join("pytest.ini").is_file()
+        || repo_path.join("setup.py").is_file()
+        || repo_path.join("setup.cfg").is_file()
+        || repo_path.join("tox.ini").is_file()
+        || repo_path.join("requirements.txt").is_file()
+    {
+        // `ruff check` is the lint half; mypy only when the project
+        // configures it, so an unconfigured repository is not gated on
+        // a tool it never asked for.
+        let configured = [
+            "mypy.ini",
+            ".mypy.ini",
+            "setup.cfg",
+            "pyproject.toml",
+        ]
+        .into_iter()
+        .any(|manifest| {
+            repo_path.join(manifest).is_file()
+                && std::fs::read_to_string(repo_path.join(manifest))
+                    .is_ok_and(|text| {
+                        text.lines().any(|line| {
+                            let trimmed = line.trim_start();
+                            trimmed.starts_with("[mypy]")
+                                || trimmed.starts_with("mypy.")
+                        })
+                    })
+        });
+        return Some(if configured {
+            "ruff check . && mypy .".to_string()
+        } else {
+            "ruff check .".to_string()
+        });
+    }
+    if repo_path.join("go.mod").is_file() {
+        return Some("gofmt -l . && go vet ./...".to_string());
+    }
+    None
 }
 
 /// Auto-detect a sensible verify gate from the repository layout.
