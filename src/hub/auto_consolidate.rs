@@ -154,6 +154,63 @@ impl AutoConsolidate {
         state.launching.insert(key.clone());
         Some(LaunchGuard(self.clone(), key))
     }
+    /// Amend the settings of a pending round, keyed by its owner and group.
+    ///
+    /// The durable file is written through the daemon, because the daemon holds
+    /// the rows in memory: editing `auto-consolidate.json` behind its back only
+    /// looks like it worked until the next write rewrites it. `amend` is the
+    /// supported way to change what the next auto-dispatched consolidator will
+    /// run.
+    ///
+    /// Only a *pending* round can be amended. Once consumed -- a consolidator
+    /// is on it, or a registry consolidator closed the round -- its gate is
+    /// already fixed, so the refusal names that rather than silently editing a
+    /// row nothing will read again. An absent `model` or `verify` leaves that
+    /// half of the settings as it was, so a caller can amend the gate without
+    /// restating the model; an explicit `Some("")` clears the gate, the same
+    /// spelling an empty `verify` has everywhere else.
+    ///
+    /// Ownership is not a hint: the round is looked up by `(owner, group)`, so
+    /// another agent's round is not amendable at all.
+    pub fn amend(
+        &self,
+        owner: &str,
+        group: &str,
+        model: Option<Option<&str>>,
+        verify: Option<Option<&str>>,
+    ) -> Result<Round> {
+        let mut state = self.state.lock().unwrap();
+        let row = state
+            .rows
+            .iter()
+            .find(|r| r.owner == owner && r.group == group)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No automatic consolidation round for group '{group}' of {owner}: \
+                     dispatch with --consolidate to open one"
+                )
+            })?;
+        anyhow::ensure!(
+            !row.consumed,
+            "The automatic consolidation round for group '{group}' was already consumed: \
+             its consolidator is running or finished, so amend a later round instead"
+        );
+        let row = state
+            .rows
+            .iter_mut()
+            .find(|r| r.owner == owner && r.group == group)
+            .expect("the row was found above");
+        if let Some(model) = model {
+            row.model = model.map(str::to_string);
+        }
+        if let Some(verify) = verify {
+            row.verify = verify.map(str::to_string);
+        }
+        let amended = row.clone();
+        self.save(&state.rows)?;
+        Ok(amended)
+    }
+
     pub fn consume(&self, round: &Round) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if let Some(row) = state.rows.iter_mut().find(|r| {

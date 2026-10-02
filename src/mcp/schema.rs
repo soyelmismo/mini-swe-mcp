@@ -26,6 +26,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "logs",
     "list",
     "kill",
+    "discard",
     "reap",
     "manifest",
     "prune",
@@ -66,7 +67,7 @@ pub const NETWORK_DEFAULT: &str = "allow";
 /// Kept to the rules an agent needs to call the tool correctly; the longer
 /// guidance lives per topic, reachable as `help <topic>` (CLI) or the
 /// `help` action (MCP) (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap per-worker gate, wait with watch --group <g> --all (MCP all:true), read the consolidator's report, merge it. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).";
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap worker gate, wait with watch --group <g> --all (MCP all:true), read its report, merge it. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -183,7 +184,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static("Consolidator's full gate; default: auto-detect."),
+        DescriptionSource::Static("Consolidator's gate; parse-checked with `sh -n`."),
+    ),
+    (
+        "set",
+        "boolean",
+        DescriptionSource::Static(super::handlers::consolidate::SET_DESCRIPTION),
     ),
     (
         "topic",
@@ -307,6 +313,11 @@ fn property_schema(name: &str, json_type: &str, description: &str) -> Value {
     if name == "worker_ids" || name == "files" {
         schema.insert("items".to_string(), json!({ "type": "string" }));
     }
+    // Several rounds running at once are named in one call: one group name, or
+    // an array of them. `watch --all` reads the omitted value as every group.
+    if name == "group" {
+        schema.insert("type".to_string(), json!(["string", "array"]));
+    }
     if name == "tasks" {
         schema.insert(
             "items".to_string(),
@@ -422,10 +433,12 @@ mod tests {
         assert_eq!(properties.len(), WORKER_PROPERTIES.len());
         for (name, json_type, _) in WORKER_PROPERTIES {
             let property = &properties[*name];
-            let expected = if *name == "consolidate" {
-                json!(["boolean", "string"])
-            } else {
-                json!(json_type)
+            // Two spellings of one call: a group name, or the list of rounds a
+            // single watch covers.
+            let expected = match *name {
+                "group" => json!(["string", "array"]),
+                "consolidate" => json!(["boolean", "string"]),
+                _ => json!(json_type),
             };
             assert_eq!(property["type"], expected, "wrong type for '{name}'");
             assert!(

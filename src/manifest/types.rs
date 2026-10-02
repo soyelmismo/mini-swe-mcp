@@ -196,10 +196,7 @@ impl Default for ModelManifest {
             "ninja".to_string(),
             ModelDefinition {
                 id: "combo:ninja".to_string(),
-                role: Some(
-                    "Fast executor: exploration, test runs, syntax fixes, focused edits."
-                        .to_string(),
-                ),
+                role: Some("Fast executor: exploration, tests, syntax fixes, edits.".to_string()),
                 temperature: Some(0.2),
                 max_turns: Some(100),
                 policy: Some(ExecutionPolicy {
@@ -214,8 +211,7 @@ impl Default for ModelManifest {
             ModelDefinition {
                 id: "combo:nerd".to_string(),
                 role: Some(
-                    "Deep reasoner: hard debugging, complex architecture, multi-file refactors."
-                        .to_string(),
+                    "Deep reasoner: debugging, architecture, multi-file refactors.".to_string(),
                 ),
                 temperature: Some(0.6),
                 max_turns: Some(100),

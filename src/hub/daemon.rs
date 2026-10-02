@@ -717,32 +717,23 @@ impl HubServer {
 /// Start a replacement daemon from this executable, detached exactly the way a
 /// client auto-starts one (see [`crate::hub::client::connect_or_spawn`]).
 ///
-/// `cargo` replaces the binary in place, so the running daemon's
+/// The path comes from [`crate::hub::exe_path`], the same helper the client
+/// spawns through: `cargo` replaces the binary in place, so this daemon's
 /// `/proc/self/exe` reads `<path> (deleted)` while `path` itself already holds
-/// the newer build: respawning the path is what makes the replacement the new
-/// binary instead of another copy of this one.
+/// the newer build, and a build caught mid-write leaves no file at all for a
+/// moment. Respawning the path is what makes the replacement the new binary
+/// instead of another copy of this one.
 fn respawn_daemon(paths: &HubPaths) {
-    let Some(exe) = current_exe_path() else {
-        warn!("No executable to hand over to; the next client will start the hub");
-        return;
+    let exe = match super::exe_path::executable() {
+        Ok(exe) => exe,
+        Err(error) => {
+            warn!(%error, "No executable to hand over to; the next client will start the hub");
+            return;
+        }
     };
     if let Err(e) = super::client::spawn_daemon(paths, &exe) {
         warn!(error = %e, "Could not start replacement daemon");
     }
-}
-
-/// This executable's path with the kernel's ` (deleted)` suffix removed.
-///
-/// `None` when the path no longer exists, which means there is nothing to
-/// respawn and the next client starts the hub instead.
-fn current_exe_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let bytes = exe.as_os_str().as_bytes();
-    let path = PathBuf::from(std::ffi::OsString::from_vec(
-        bytes.strip_suffix(b" (deleted)").unwrap_or(bytes).to_vec(),
-    ));
-    path.is_file().then_some(path)
 }
 
 /// Append one timestamped line to the hub log; failures are traced, never fatal.

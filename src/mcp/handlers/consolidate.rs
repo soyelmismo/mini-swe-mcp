@@ -31,6 +31,11 @@ impl McpServer {
         if group.is_empty() {
             anyhow::bail!("'group' must not be empty for action 'consolidate'");
         }
+        match args.get("set") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => return self.amend_round(args, &group, ctx).await,
+            Some(_) => anyhow::bail!("'set' must be a boolean for action 'consolidate'"),
+        }
         let agent = ctx.agent();
         let repo_path = Self::get_repo_path(args, ctx);
         let manifest = self.pool.round_manifest(&agent, &group, &repo_path).await;
@@ -103,7 +108,82 @@ impl McpServer {
         }
         Ok(payload)
     }
+
+    /// `consolidate` with `set: true`: amend the *pending* round's
+    /// auto-consolidation settings instead of dispatching a consolidator.
+    ///
+    /// A round's gate is fixed at dispatch and spent much later by a
+    /// consolidator nobody is watching, which is why a wrong one had to be
+    /// discovered by hand: the daemon keeps the rounds in memory, so editing
+    /// `<hub_dir>/auto-consolidate.json` was overwritten by the next write.
+    /// This is the path that goes through the daemon and lands on disk.
+    ///
+    /// The scope is deliberately narrow: one pending round of the *caller*, by
+    /// `(owner, group)`. Another agent's round is not addressable at all, and a
+    /// consumed round is refused rather than edited, because its consolidator
+    /// is already running with the settings it was given.
+    ///
+    /// An absent `model` or `verify` leaves that half alone; an empty
+    /// `verify` clears the gate, which is the same spelling an empty gate has
+    /// on a dispatch. A new gate is parse-checked here exactly as at dispatch,
+    /// so the amend cannot install the unrunnable gate this verb exists to fix.
+    async fn amend_round(
+        &self,
+        args: &Value,
+        group: &str,
+        ctx: &crate::mcp::server::ConnectionContext,
+    ) -> Result<Value> {
+        let store = self.auto_store().ok_or_else(|| {
+            anyhow::anyhow!("Amending an automatic round requires the hub daemon")
+        })?;
+        // `None` leaves a half alone; `Some(None)` clears it. A non-string is
+        // refused instead of dropped, so an amend cannot silently keep the
+        // setting the caller meant to replace.
+        let model: Option<Option<&str>> = args
+            .get("model")
+            .map(|value| {
+                value.as_str().map(Some).ok_or_else(|| {
+                    anyhow::anyhow!("'model' must be a string for action 'consolidate'")
+                })
+            })
+            .transpose()?;
+        let verify: Option<Option<&str>> = args
+            .get("verify")
+            .map(|value| {
+                value.as_str().map(Some).ok_or_else(|| {
+                    anyhow::anyhow!("'verify' must be a string for action 'consolidate'")
+                })
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            model.is_some() || verify.is_some(),
+            "'set' amends a round's settings: pass 'model' and/or 'verify' to change, \
+             or dispatch the consolidator without it"
+        );
+        if let Some(Some(gate)) = verify {
+            crate::pool::validate_verify_command(gate, "verify")?;
+        }
+        let round = store.amend(&ctx.agent(), group, model, verify)?;
+        Ok(json!({
+            // `amended` distinguishes this answer from a dispatch, which shares
+            // the action; the formatter keys its view on it.
+            "amended": true,
+            "group": round.group,
+            "owner": round.owner,
+            "model": round.model,
+            "verify": round.verify,
+            "generation": round.generation,
+            "consumed": round.consumed,
+            "message": format!(
+                "Automatic consolidation round for group {} updated; the hub will run its \
+                 consolidator with these settings.",
+                round.group
+            ),
+        }))
+    }
 }
 
 pub(in crate::mcp) const ROLE_DESCRIPTION: &str =
-    "'consolidate': integrate this group's completed workers (requires 'group')";
+    "'consolidate': integrate this group's completed workers.";
+
+pub(in crate::mcp) const SET_DESCRIPTION: &str = "'consolidate': amend, do not dispatch.";
