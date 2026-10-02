@@ -224,6 +224,35 @@ fn moved_counters_since(now: &WorkerMetrics, before: &WorkerMetrics) -> Vec<Stri
         .collect()
 }
 
+/// Whether `view` is doing work the watch must not read as inactivity: a bash
+/// command in flight, or a command that outlived its budget and keeps running
+/// on as a background job the worker waits on.
+///
+/// The conversion itself lands exactly on the idle threshold: the executor's
+/// mark clears the moment the job handle is returned, so reading that instant
+/// as idle reports a stall for a step the worker is still making progress on.
+/// A worker that goes idle for the whole threshold *after* the conversion has
+/// no job left in flight and stalls as it should.
+fn in_flight(view: &Value, status: &str) -> bool {
+    matches!(status, "running" | "reviewing")
+        && (view["command_started_at"].is_number() || has_live_job(view))
+}
+
+/// Whether the view lists a background job that has not been reaped yet.
+///
+/// A reaped job stays listed until the worker collects it, so a job line only
+/// counts as activity while it says it is still running.
+fn has_live_job(view: &Value) -> bool {
+    view["jobs"]
+        .as_array()
+        .is_some_and(|jobs| jobs.iter().any(|job| job.as_str().is_some_and(running_job)))
+}
+
+/// Whether a `job <n>: <command> (running, 12s)` status line is a live job.
+fn running_job(label: &str) -> bool {
+    label.contains("(running,")
+}
+
 /// Decide from state and the last reported health baseline, without I/O.
 pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<Value> {
     let status = view["status"].as_str()?;
@@ -233,8 +262,11 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
         return None;
     }
     // A command that is still executing is work in flight, not inactivity: a
-    // long `cargo test` or verify gate must never read as a stall.
-    if view["command_started_at"].is_number() && matches!(status, "running" | "reviewing") {
+    // long `cargo test` or verify gate must never read as a stall. A command
+    // that reached its budget and became a background job is the same command
+    // from here: it keeps running in its own process group and the worker is
+    // only waiting on it, so it is activity too.
+    if in_flight(view, status) {
         return None;
     }
     let metrics: WorkerMetrics =
@@ -699,7 +731,8 @@ pub const ROUND_STALL_SECS: u64 = 1200;
 /// A worker waiting for a build slot, or running a command, is not inactive:
 /// same rules as [`select_event`], so a long gate never reads as a stall.
 fn round_idle(v: &Value, now: u64) -> u64 {
-    if v["waiting_for_slot"].is_number() || v["command_started_at"].is_number() {
+    if v["waiting_for_slot"].is_number() || in_flight(v, v["status"].as_str().unwrap_or("running"))
+    {
         return 0;
     }
     now.saturating_sub(v["last_step_at"].as_u64().unwrap_or(now))
@@ -1408,6 +1441,37 @@ mod tests {
                 1200
             )
             .unwrap()["event"],
+            "stalled"
+        );
+    }
+
+    /// A command that outlived its budget becomes a background job and keeps
+    /// running: the worker is waiting on it, not idle. The conversion lands on
+    /// the idle threshold, so reading it as inactivity would fire a stall at
+    /// the exact moment the worker did the right thing. Idle after the job is
+    /// gone still stalls.
+    #[test]
+    fn a_job_conversion_is_activity_not_a_stall() {
+        let mut converted = state("running", 2, WorkerMetrics::default(), 100, 10);
+        // The 600 s step timeout put the command into job 1 at t=700; the
+        // executor's mark cleared with it, but the job is still running.
+        converted["jobs"] = json!(["job 1: cargo test (running, 3s)"]);
+        let now = 701; // 601 s since the last step, past the stall threshold.
+        assert!(
+            select_event(&converted, None, now).is_none(),
+            "a step that ended in a job conversion must not be reported as stalled"
+        );
+        // The job is reaped and the worker never steps again: the same view
+        // without a live job is a genuine stall.
+        converted["jobs"] = json!(["job 1: cargo test (finished, 480s)"]);
+        assert_eq!(
+            select_event(&converted, None, now).unwrap()["event"],
+            "stalled",
+            "an idle worker whose job has ended is stalled"
+        );
+        // A worker idle for the whole threshold after the conversion stalls too.
+        assert_eq!(
+            select_event(&converted, None, now + 600).unwrap()["event"],
             "stalled"
         );
     }
