@@ -32,6 +32,7 @@
 //! the replacement instead of failing on a path that no longer exists.
 
 pub(crate) mod auto_consolidate;
+pub(crate) mod auto_handover;
 pub mod client;
 mod daemon;
 pub mod exe_path;

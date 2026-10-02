@@ -289,12 +289,15 @@ fn client_build() -> Value {
     {
         return json!({"id": format!("test-{ts:016x}"), "ts": ts});
     }
-    build()
+    build_identity()
 }
 
 /// The build identity of this binary, in the shape the handshake carries it and
 /// the daemon answers in its own `hub/hello` reply.
-fn build() -> Value {
+///
+/// Public so `--build-id` can print it and the executable watcher can compare
+/// a replacement against it: both need the identity of the *running* build.
+pub fn build_identity() -> Value {
     json!({"id": env!("MINI_SWE_BUILD_ID"), "ts": build_ts()})
 }
 

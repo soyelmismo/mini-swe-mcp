@@ -116,6 +116,55 @@ impl Fixture {
         save_registry_entry_in(&self.root(), &row);
     }
 
+    /// Record the worker's conversation and registry row with an
+    /// explicit status, the way a hub crash leaves it: `interrupted`
+    /// for a worker the hub stopped mid-run, `completed` for one that
+    /// finished.
+    ///
+    /// The row carries the base commit the dispatch detected, so the
+    /// sweep reads it from the row alone -- the shape every row this
+    /// build writes has.
+    fn record_with_status(&self, id: &str, status: mini_swe_mcp::pool::RegistryStatus) {
+        let base_commit = git(self.repo(), &["rev-parse", "HEAD"]).trim().to_string();
+        let history = WorkerHistory {
+            task: format!("do the {id} work"),
+            role: Default::default(),
+            group: None,
+            model: "test".to_string(),
+            temperature: None,
+            repo_path: self.repo().to_string_lossy().into_owned(),
+            base_commit: base_commit.clone(),
+            base_branch: Some("main".to_string()),
+            branch: format!("worker-{id}"),
+            network_offline: false,
+            verify: None,
+            client_env: Vec::new(),
+            max_turns: 10,
+            review_after: None,
+            revision: 0,
+            auto_continues: 0,
+            owner: None,
+            messages: vec![ChatMessage::text(Role::System, "you are a worker")],
+        };
+        append_history_message_in(
+            &self.root(),
+            id,
+            &history,
+            &ChatMessage::text(Role::System, "you are a worker"),
+        )
+        .expect("history log must be writable");
+        let row = WorkerRegistryEntry {
+            task: format!("do the {id} work"),
+            status,
+            step: 1,
+            repo_path: Some(self.repo().to_string_lossy().into_owned()),
+            base_branch: Some("main".to_string()),
+            base_commit: Some(base_commit),
+            ..WorkerRegistryEntry::test_row(id, "")
+        };
+        save_registry_entry_in(&self.root(), &row);
+    }
+
     /// Write a `.steer-source` marker, as a consolidator that steered this
     /// worker leaves behind.
     fn write_steer_source(&self, id: &str) {
@@ -1418,4 +1467,140 @@ async fn the_post_merge_sweep_clears_a_reclaimed_orphans_acknowledgement() {
         "a reclaimed orphan must lose its acknowledgement too: {acked}"
     );
     events.abort();
+}
+
+/// A worker dispatched seconds before a daemon handover has no commits
+/// yet: its branch still points at the commit it was dispatched from.
+///
+/// The ancestry proof answers "merged" for such a branch -- the base
+/// branch contains its own base commit -- so a sweep that trusts it
+/// alone retires a worker that was interrupted, not integrated, and
+/// the next daemon then has no branch and no conversation to
+/// auto-continue. This is the bug that ate three rounds of workers on
+/// the host, so it is pinned from both sides: the sweep must leave the
+/// row, the branch and the conversation alone, and the worker must stay
+/// a candidate for the automatic continuation that follows the sweep.
+#[tokio::test]
+async fn a_just_dispatched_worker_with_no_commits_survives_the_start_sweep() {
+    let f = Fixture::new("retire-just-dispatched");
+    // The branch a dispatch creates: forked off `main`, nothing on it.
+    git(f.repo(), &["checkout", "-q", "-b", "worker-jd"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+    assert!(
+        git_ref_exists(f.repo(), "worker-jd"),
+        "the fixture must hold the branch the dispatch created"
+    );
+    f.record_with_status("jd", mini_swe_mcp::pool::RegistryStatus::Interrupted);
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a branch whose tip is its base commit is never integrated: {sweep:?}"
+    );
+    assert!(f.row_exists("jd"), "the interrupted row must survive");
+    assert!(
+        git_ref_exists(f.repo(), "worker-jd"),
+        "the branch the continuation needs must survive"
+    );
+    assert!(
+        f.history_exists("jd"),
+        "the conversation the continuation replays must survive"
+    );
+
+    // The continuation the daemon runs right after the sweep asks the
+    // pool which rows a hub crash left `interrupted`.
+    let pool = WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "test-key".to_string(),
+        f.root(),
+    );
+    let interrupted = pool.interrupted_workers().await;
+    assert!(
+        interrupted.iter().any(|id| id == "jd"),
+        "the survivor must still be an auto-continuation candidate: {interrupted:?}"
+    );
+}
+
+/// A worker interrupted *after* committing, whose branch nobody merged,
+/// is not integrated either: unmerged commits are work the next daemon
+/// must continue on the worker's own branch, not reclaim.
+#[test]
+fn an_interrupted_worker_with_unmerged_commits_survives_the_sweep() {
+    let f = Fixture::new("retire-interrupted-commits");
+    f.commit_on_worker_branch("ic1", "ic1.txt", "in flight\n");
+    f.record_with_status("ic1", mini_swe_mcp::pool::RegistryStatus::Interrupted);
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "an interrupted worker is never retired by the sweep: {sweep:?}"
+    );
+    assert!(f.row_exists("ic1"), "the interrupted row must survive");
+    assert!(
+        git_ref_exists(f.repo(), "worker-ic1"),
+        "the unmerged branch must survive"
+    );
+    assert!(f.history_exists("ic1"), "the conversation must survive");
+}
+
+/// The safety rule is not a blanket amnesty: a worker that *completed*
+/// and whose commits are in the base branch is still integrated, so the
+/// sweep still retires it.
+///
+/// This is the case the sweep exists for, and it is what keeps the rule
+/// above from stranding merged workers on the books forever.
+#[test]
+fn a_completed_worker_whose_commits_are_merged_is_still_retired() {
+    let f = Fixture::new("retire-completed-merged");
+    f.commit_on_worker_branch("cm1", "cm1.txt", "done\n");
+    f.record_with_status("cm1", mini_swe_mcp::pool::RegistryStatus::Completed);
+    git(
+        f.repo(),
+        &["merge", "--no-ff", "-m", "integrate cm1", "worker-cm1"],
+    );
+
+    let sweep = f.sweep();
+
+    assert_eq!(
+        sweep.workers,
+        vec!["cm1".to_string()],
+        "a completed worker whose commits are merged is still integrated"
+    );
+    assert!(!f.row_exists("cm1"), "the row must be retired");
+    assert!(!f.history_exists("cm1"), "the conversation must be retired");
+    assert!(
+        !git_ref_exists(f.repo(), "worker-cm1"),
+        "the merged branch must be deleted"
+    );
+}
+
+/// The completed status alone is not a licence to retire: a worker that
+/// finished without committing -- its branch tip is the commit it was
+/// dispatched from -- holds nothing the base branch does not already
+/// hold, and it is not integrated.
+///
+/// `Completed` is the status a *finished* worker has, so this is the
+/// sharpest form of the bug: the sweep used to retire exactly this
+/// worker, and only the commit-beyond-base proof keeps it.
+#[test]
+fn a_completed_worker_with_no_commits_beyond_its_base_is_not_integrated() {
+    let f = Fixture::new("retire-completed-no-commits");
+    git(f.repo(), &["checkout", "-q", "-b", "worker-cn"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+    f.record_with_status("cn", mini_swe_mcp::pool::RegistryStatus::Completed);
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a branch whose tip equals its base commit is never integrated: {sweep:?}"
+    );
+    assert!(f.row_exists("cn"), "the row must survive");
+    assert!(
+        git_ref_exists(f.repo(), "worker-cn"),
+        "the branch must survive"
+    );
 }

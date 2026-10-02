@@ -814,6 +814,20 @@ impl McpServer {
         .await
     }
 
+    /// The build identity this daemon runs, which the executable watcher
+    /// compares a replacement against.
+    pub fn build_identity(&self) -> Value {
+        self.daemon_build.as_ref().clone()
+    }
+
+    /// Arm the planned handover from outside a client connection.
+    ///
+    /// The executable watcher (H17) arms the same handover a newer client
+    /// would, with the same deadline and the same idempotence.
+    pub fn request_handover(&self, deadline: Duration) -> bool {
+        self.begin_handover(deadline)
+    }
+
     /// Whether a newer client has asked this daemon to hand over.
     ///
     /// The daemon reads it after teardown: a handover leaves the hub unserved
