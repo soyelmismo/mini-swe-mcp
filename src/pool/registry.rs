@@ -710,11 +710,7 @@ pub(crate) fn interrupted_registry_entries_in(root: &ScratchRoot) -> Vec<WorkerR
         .collect()
 }
 
-pub(crate) fn recover_orphaned_workers() -> usize {
-    recover_orphaned_workers_in(&ScratchRoot::from_env())
-}
-
-/// [`recover_orphaned_workers`] under an explicit scratch root.
+/// Recover orphaned workers under an explicit scratch root.
 pub(crate) fn recover_orphaned_workers_in(root: &ScratchRoot) -> usize {
     recover_entries_in(root, raw_registry_entries_in(root))
 }

@@ -1185,10 +1185,50 @@ impl WorktreeGuard {
         }
         dirs
     }
+
+    /// Test hook: slow this worker's teardown by `delay`, once.
+    ///
+    /// A handover test needs the old daemon's worktree cleanup to take long
+    /// enough to observe the ordering guarantee; the delay is keyed by worker
+    /// id so parallel tests are unaffected, and is consumed on use.
+    pub fn __test_set_teardown_delay(worker_id: &str, delay: std::time::Duration) {
+        teardown_delays()
+            .lock()
+            .expect("teardown delay lock poisoned")
+            .insert(worker_id.to_string(), delay);
+    }
+
+    /// Clear a teardown delay set by [`Self::__test_set_teardown_delay`].
+    pub fn __test_clear_teardown_delay(worker_id: &str) {
+        teardown_delays()
+            .lock()
+            .expect("teardown delay lock poisoned")
+            .remove(worker_id);
+    }
+}
+
+/// Per-worker teardown delays for tests; empty in production.
+fn teardown_delays() -> &'static std::sync::Mutex<BTreeMap<String, std::time::Duration>> {
+    static DELAYS: std::sync::Mutex<BTreeMap<String, std::time::Duration>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    &DELAYS
+}
+
+/// Take the teardown delay for `worker_id`, if a test set one.
+fn take_teardown_delay(worker_id: &str) -> Option<std::time::Duration> {
+    teardown_delays()
+        .lock()
+        .expect("teardown delay lock poisoned")
+        .remove(worker_id)
 }
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        // A test can hold teardown open to prove the replacement daemon waits
+        // for it; production never sets a delay, so this is a no-op there.
+        if let Some(delay) = take_teardown_delay(&self.worker_id()) {
+            std::thread::sleep(delay);
+        }
         // A job the worker detached from every process group (`setsid cmd &`, a
         // double fork) is reparented to init and outlives its step, so the only
         // thing that still ties it to this worker is its working directory.
