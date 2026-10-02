@@ -833,6 +833,26 @@ impl Harness {
                 let key = event_key(view);
                 self.model.ack(&key.1, key.2, &key.3);
                 self.acked.insert(key);
+                let still: Vec<_> = self
+                    .router
+                    .watch_history
+                    .get(owner)
+                    .map(|h| {
+                        h.pending
+                            .iter()
+                            .map(|v| {
+                                (
+                                    v["worker_id"].clone(),
+                                    v["event"].clone(),
+                                    v["sequence"].clone(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !still.is_empty() {
+                    self.trace_detail(format!("  post-ack pending for {owner}: {still:?}"));
+                }
             }
         }
         // A plain acknowledgement must not return as a fresh round either:
@@ -1081,8 +1101,10 @@ fn event_key(view: &Value) -> (String, String, usize, String) {
 ///
 /// A stall is an episode rather than a transition: the router never keys it by
 /// `(worker, revision, kind)` and replays it while it lasts, so the reference
-/// model of terminal transitions does not carry it either. Stalls get their own
-/// direct assertions in [`stall_delivery_tests`].
+/// model of terminal transitions does not carry it either. The
+/// `a_stale_stall_does_not_reopen_an_acknowledged_round` regression test pins
+/// the one stall interaction the walk exercises: a terminal event ends the
+/// stall episode it supersedes.
 fn router_pending(router: &EventRouter) -> BTreeSet<(String, String, usize, String)> {
     let mut set = BTreeSet::new();
     for history in router.watch_history.values() {
@@ -1171,7 +1193,13 @@ fn run_seed(seed: u64) {
             }
             45..=59 => {
                 let owner = harness.world.owners[rng.below(harness.world.owners.len())].clone();
-                let group = harness.world.groups[rng.below(harness.world.groups.len())].clone();
+                // Sometimes one group, sometimes every group at once: the
+                // multi-group `--all` must still answer with a single round.
+                let group = if rng.chance(30) {
+                    String::new()
+                } else {
+                    harness.world.groups[rng.below(harness.world.groups.len())].clone()
+                };
                 harness.round_watch(&owner, &group, step);
             }
             60..=69 => {
@@ -1225,10 +1253,16 @@ fn plain_ack_does_not_replay_as_a_round() {
     assert_eq!(round["events"], json!([]), "an acknowledged completion is not a fresh round: {round}");
 }
 
-/// Seed 34 step 22, reduced: an acked failure plus a running sibling must not
-/// be a fresh round for the group.
+/// A stale stall must not keep the round fresh after the terminal event.
+///
+/// The worker stalled while running, then failed; the owner acknowledged the
+/// failure. The queued stall episode is over -- the worker is terminal -- but
+/// it stays in the backlog, where the round oracle counts it as an
+/// unacknowledged transition and reports the group again. The round must stay
+/// silent: the only terminal transition is acked and the sibling is running
+/// without attention.
 #[test]
-fn probe_round_freshness_debug() {
+fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
     let mut router = EventRouter::default();
     let now = crate::pool::unix_timestamp();
     let failed = json!({
@@ -1244,19 +1278,40 @@ fn probe_round_freshness_debug() {
         "branch": "worker-w1", "last_step_at": now,
         "metrics": WorkerMetrics::default(),
     });
+    // The stall episode queues while the worker is idle and running.
+    let mut idle = running.clone();
+    idle["worker_id"] = json!("w0");
+    idle["revision"] = json!(1);
+    idle["last_step_at"] = json!(now.saturating_sub(601));
+    router.observe_watch([
+        ("w0".to_string(), idle),
+        ("w1".to_string(), running.clone()),
+    ].into());
+    // The worker fails; the owner reads and acknowledges the failure.
     router.observe_watch([
         ("w0".to_string(), failed.clone()),
         ("w1".to_string(), running.clone()),
     ].into());
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
-    let reply = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false})).unwrap();
+    let reply = router
+        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .unwrap();
+    assert!(
+        reply["events"].as_array().is_some_and(|events| events
+            .iter()
+            .any(|e| e["event"] == "failed")),
+        "the failure must be delivered: {reply}"
+    );
     for e in reply["events"].as_array().cloned().unwrap_or_default() {
         router.acknowledge_watch(&ctx, e["sequence"].as_u64().unwrap());
     }
-    let round = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true})).unwrap();
-    eprintln!("round: {round}");
-    assert_eq!(round["events"], json!([]), "an acked group must not be a fresh round: {round}");
+    let round = router
+        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}))
+        .unwrap();
+    assert_eq!(
+        round["events"],
+        json!([]),
+        "a stale stall must not reopen an acknowledged round: {round}"
+    );
 }
-
-

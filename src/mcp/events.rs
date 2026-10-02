@@ -1659,6 +1659,17 @@ impl EventRouter {
                     .as_str()
                     .unwrap_or("unattributed")
                     .to_string();
+                // A stall is an episode of a live worker; a terminal event
+                // ends it. Drop the worker's queued stalls so the stale
+                // episode neither replays at delivery nor keeps the round
+                // oracle fresh after the transition it preceded was read.
+                if event["event"] != "stalled"
+                    && let Some(history) = self.watch_history.get_mut(&owner)
+                {
+                    history.pending.retain(|queued| {
+                        !(queued["worker_id"] == *id && queued["event"] == "stalled")
+                    });
+                }
                 let sequence = self.sequence;
                 let history = self.history(&owner);
                 if history.pending.len() == 100 {
