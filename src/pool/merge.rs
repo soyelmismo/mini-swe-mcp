@@ -791,7 +791,11 @@ fn cleanup(
         // consolidator's own row records are touched, and each is re-checked
         // before anything is deleted: a worker that is running again still owns
         // its branch, and a *completed* worker's branch is only discarded when
-        // its tip is provably already in the merged consolidator commit. An
+        // its tip is provably already in the branch the merge landed on --
+        // `base_branch`, whose tip is the merged consolidator commit, the same
+        // probe the integrated members above get. The consolidator's own ref is
+        // gone by now (the retirement above deleted it), so probing it would
+        // always answer false and strand every already-integrated worker. An
         // absorbed id that is neither is kept and reported, never deleted --
         // the record is the consolidator's claim, and a claim is not proof.
         for id in &absorbed {
@@ -803,7 +807,7 @@ fn cleanup(
                 row.status,
                 RegistryStatus::Running | RegistryStatus::Reviewing
             ) || (!row.status.stopped_not_completed()
-                && !branch_is_integrated_in(root, repo, id, branch))
+                && !branch_is_integrated_in(root, repo, id, base_branch))
             {
                 cleaned_kept.push(format!("kept {id}: not integrated"));
                 continue;

@@ -371,3 +371,78 @@ fn a_completed_worker_reported_fixed_is_never_discarded() {
         "its work is not in master"
     );
 }
+
+#[test]
+fn a_completed_absorbed_worker_whose_branch_is_integrated_is_retired() {
+    let h = Harness::new("absorbint");
+    let consolidator = format!("consol-{}", unique_suffix("c"));
+    let landed = format!("w5-{}", unique_suffix("w"));
+    let unmerged = format!("w6-{}", unique_suffix("w"));
+
+    // A completed worker whose branch is already an ancestor of master.
+    h.worker_branch(&landed, "landed.txt", "already integrated\n");
+    git(h.path(), &["checkout", "-q", "master"]);
+    git(
+        h.path(),
+        &["merge", "-q", "--no-edit", &format!("worker-{landed}")],
+    );
+    let entry = WorkerRegistryEntry {
+        status: RegistryStatus::Completed,
+        group: Some(GROUP.to_string()),
+        role: WorkerRole::Worker,
+        repo_path: Some(h.path().to_string_lossy().to_string()),
+        base_branch: Some("master".to_string()),
+        ..WorkerRegistryEntry::test_row(&landed, OWNER)
+    };
+    save_registry_entry_in(&h.root(), &entry);
+
+    // A second completed worker whose branch is not integrated anywhere.
+    h.worker_branch(&unmerged, "unmerged.txt", "still waiting\n");
+    let entry = WorkerRegistryEntry {
+        status: RegistryStatus::Completed,
+        group: Some(GROUP.to_string()),
+        role: WorkerRole::Worker,
+        repo_path: Some(h.path().to_string_lossy().to_string()),
+        base_branch: Some("master".to_string()),
+        ..WorkerRegistryEntry::test_row(&unmerged, OWNER)
+    };
+    save_registry_entry_in(&h.root(), &entry);
+
+    h.worker_branch(&consolidator, "round.txt", "the consolidator's fix\n");
+    h.consolidator_row(&consolidator);
+
+    // A stale record lists both as absorbed; the merge must tell them apart.
+    let mut stale = load_registry_entry_in(&h.root(), &consolidator).expect("row");
+    stale.absorbed = vec![landed.clone(), unmerged.clone()];
+    save_registry_entry_in(&h.root(), &stale);
+
+    let report = h.merge(&consolidator);
+    assert!(
+        report.retired.contains(&landed),
+        "an already-integrated worker retires with the round: {:?}",
+        report.retired
+    );
+    assert!(
+        !report.retired.contains(&unmerged),
+        "an unintegrated worker is never retired: {:?}",
+        report.retired
+    );
+    assert!(
+        report
+            .cleaned
+            .iter()
+            .any(|line| *line == format!("kept {unmerged}: not integrated")),
+        "{:?}",
+        report.cleaned
+    );
+    assert!(
+        !git_ref_exists(h.path(), &format!("worker-{landed}")),
+        "the integrated worker's branch is gone with the round"
+    );
+    assert!(!h.row_exists(&landed));
+    assert!(
+        git_ref_exists(h.path(), &format!("worker-{unmerged}")),
+        "the unintegrated worker's branch survives"
+    );
+    assert!(h.row_exists(&unmerged));
+}
