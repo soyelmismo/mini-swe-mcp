@@ -798,10 +798,9 @@ impl HubServer {
         reaper.abort();
         events.abort();
         auto_consolidate.abort();
-        let killed = self.server.pool().kill_all().await;
-        if killed > 0 {
-            info!(workers = killed, "Terminated workers on hub shutdown");
-        }
+        // Stop accepting before teardown: a starter that arrives while the
+        // old daemon is still cleaning up must wait on `hub.lock`, not
+        // mistake the still-bound socket for a live hub and give up.
         let _ = std::fs::remove_file(&socket);
         // A socket moved to a short fallback directory takes it along.
         if let Some(parent) = socket.parent()
@@ -809,9 +808,13 @@ impl HubServer {
         {
             let _ = std::fs::remove_dir(parent);
         }
-        append_log(&paths.log(), "stopped");
         drop(listener);
         drop(_socket_cleanup);
+        let killed = self.server.pool().kill_all().await;
+        if killed > 0 {
+            info!(workers = killed, "Terminated workers on hub shutdown");
+        }
+        append_log(&paths.log(), "stopped");
         drop(lock);
         // A handover leaves the hub unserved until a client dials it again, and
         // the workers it just interrupted are auto-continued by whichever
