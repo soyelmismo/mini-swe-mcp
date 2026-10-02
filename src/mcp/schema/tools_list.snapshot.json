@@ -115,7 +115,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model for the worktree audit.",
+            "description": "Reviewer model; `:security` = adversarial.",
             "type": "string"
           },
           "role": {

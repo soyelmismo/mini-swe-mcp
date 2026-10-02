@@ -1838,6 +1838,7 @@ impl super::WorkerPool {
             // applies: drop any approval this row carried.
             approved: None,
             verified: None,
+            security_review: None,
             integrated: Vec::new(),
             absorbed: Vec::new(),
             keep_branch: false,
@@ -1863,6 +1864,7 @@ impl super::WorkerPool {
             owner,
             report: None,
             verified: None,
+            security_review: None,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {

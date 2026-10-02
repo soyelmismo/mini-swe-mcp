@@ -31,6 +31,7 @@ use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
 use self::review::ReviewPhase;
+pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
@@ -491,7 +492,46 @@ impl WorkerPool {
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
-        if let Some(reviewer_model) = review_after {
+        //
+        // The mode is decided here: a requested review runs as asked, but a
+        // diff that touches a declared sensitive path is always upgraded to
+        // the adversarial security review, and a sensitive diff with no
+        // requested review triggers it on its own. This is the harness's
+        // focused adversarial pass for the paths the repository declared.
+        let touched = self::review::touched_files(
+            &worktree.path,
+            &worktree.base_commit,
+            worktree.base_branch.as_deref(),
+        )
+        .await;
+        let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
+        patterns.extend(self.manifest().sensitive_paths.iter().cloned());
+        patterns.sort();
+        patterns.dedup();
+        let sensitive: Vec<String> = touched
+            .into_iter()
+            .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
+            .collect();
+        let requested = review_after.as_deref().map(ReviewMode::parse_model);
+        let review_plan = match (requested, sensitive.is_empty()) {
+            // A requested review on a sensitive diff is upgraded to the
+            // adversarial mode; the requested model still runs it.
+            (Some((model, _)), false) => Some((model, ReviewMode::Security)),
+            (Some((model, wanted)), true) => Some((model, wanted)),
+            // No requested review, but the diff is sensitive: trigger the
+            // security review on the manifest's strongest tier, falling back
+            // to the implementer's own model when the manifest marks none.
+            (None, false) => {
+                let model = self
+                    .manifest()
+                    .strongest_alias()
+                    .map(|alias| self.manifest().resolve_model(alias).0)
+                    .unwrap_or_else(|| model.clone());
+                Some((model, ReviewMode::Security))
+            }
+            (None, true) => None,
+        };
+        if let Some((reviewer_model, mode)) = review_plan {
             let outcome = self
                 .run_review_phase(
                     worktree,
@@ -506,6 +546,9 @@ impl WorkerPool {
                         step,
                         network_offline,
                         meta,
+                        mode,
+                        verify: verify.clone(),
+                        sensitive,
                     },
                 )
                 .await?;
@@ -513,6 +556,9 @@ impl WorkerPool {
             // The reviewer's own completion stands in for the implementer's:
             // a run is finished only when some phase emitted the sentinel.
             completed |= outcome.completed;
+            if let Some(security) = outcome.security {
+                meta.security_review = Some(security);
+            }
         }
 
         // The artifact sync, the final diff and the final commit all shell

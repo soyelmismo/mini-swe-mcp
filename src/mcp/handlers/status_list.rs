@@ -95,6 +95,7 @@ impl McpServer {
                         "summary": entry.last_command.clone(),
                         "report": entry.report,
                         "verified": entry.verified,
+                        "security_review": entry.security_review,
                         "error": if entry.status == crate::pool::RegistryStatus::Failed { Some(entry.last_command) } else { None },
                         "question": entry.question,
                         "pid": entry.pid,
@@ -195,6 +196,12 @@ fn compact_status_details(
     }
     if let Some(metrics) = state_metrics(state).or_else(|| entry.map(|entry| entry.metrics)) {
         details.insert("metrics".into(), json!(metrics));
+    }
+    // The security review lives on the registry row, so a live status and a
+    // row-only status answer the same question: did one run, and how many
+    // findings did it report.
+    if let Some(security) = entry.and_then(|entry| entry.security_review) {
+        details.insert("security_review".into(), json!(security));
     }
     if let Some(progress) = progress {
         if let Some(command) = progress.last_command.as_deref() {
