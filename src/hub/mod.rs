@@ -19,6 +19,13 @@
 //! its session, so the daemon mints it one token per identity and hands it out
 //! as the `watch_command` of every dispatch and steer answer.
 //!
+//! A daemon that goes away under a long-lived client is not that client's end:
+//! [`client::reconnect_following`] re-dials within one budget
+//! ([`client::reconnect_deadline`]) while [`client::daemon_went_away`] decides
+//! what counts as gone, so the CLI watch, the stdio proxy and every other thin
+//! transport resume on the replacement daemon — with the same identity and, for
+//! a watch, the events it missed replayed.
+//!
 //! A daemon is always this executable, spawned through [`exe_path`]: a rebuilt
 //! binary makes `current_exe()` read ` (deleted)`, so the shared helper there
 //! is what lets both the client's auto-start and the daemon's handover respawn
@@ -30,7 +37,10 @@ mod daemon;
 pub mod exe_path;
 pub mod identity;
 
-pub use client::{HubClient, connect_or_spawn, decode_ambient_env, proxy_stdio};
+pub use client::{
+    DEFAULT_RECONNECT_SECS, HubClient, RECONNECT_DEADLINE_ENV, connect_or_spawn, daemon_went_away,
+    decode_ambient_env, proxy_stdio, reconnect_deadline, reconnect_following,
+};
 pub use daemon::{
     HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens, connect_endpoint, hub_dir,
     run_daemon, watch_token_identity,
