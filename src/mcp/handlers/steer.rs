@@ -101,7 +101,6 @@ impl McpServer {
     }
 }
 
-pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str =
-    "Required for steer: resumes the worker's own branch with full context; never dispatch a replacement.";
+pub(in crate::mcp) const MESSAGE_DESCRIPTION: &str = "Required for steer: resumes the worker's own branch with full context; never dispatch a replacement.";
 
 pub(in crate::mcp) const MAX_TURNS_DESCRIPTION: &str = "Max bash turns (overrides the default); on 'steer', the budget when continuing a stopped worker.";
