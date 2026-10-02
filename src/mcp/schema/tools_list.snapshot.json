@@ -197,7 +197,7 @@
             "type": "string"
           },
           "verify": {
-Completion gate: auto-detect if omitted; empty string disables; `sh -n` checked. Cheap for workers on a consolidate dispatch, full for the consolidator.
+            "description": "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.",
             "type": "string"
           },
           "worker_id": {

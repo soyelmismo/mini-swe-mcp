@@ -311,7 +311,7 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model for th
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
 
-Completion gate: auto-detect if omitted; empty string disables; `sh -n` checked. Cheap for workers on a consolidate dispatch, full for the consolidator.
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
     "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.";
