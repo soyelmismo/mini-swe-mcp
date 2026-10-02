@@ -56,7 +56,9 @@ fn an_acknowledged_completion_is_not_replayed_after_retirement() {
     let mut router = EventRouter::default();
     router.observe_watch(view("w-ack", 1));
     let ctx = agent(1);
-    let first = router.watch_reply(&ctx, &params()).expect("the watch answers");
+    let first = router
+        .watch_reply(&ctx, &params())
+        .expect("the watch answers");
     let events = first["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1, "the completion is delivered once: {first}");
     assert_eq!(events[0]["event"], "completed", "{first}");
@@ -67,7 +69,10 @@ fn an_acknowledged_completion_is_not_replayed_after_retirement() {
     // The worker is still there and still completed: without an event of its
     // own it delivers nothing, which is the state the retirement starts from.
     router.observe_watch(view("w-ack", 1));
-    assert!(queued(&router).is_empty(), "acknowledged, so nothing replays");
+    assert!(
+        queued(&router).is_empty(),
+        "acknowledged, so nothing replays"
+    );
     assert!(
         router.acks.acknowledged(OWNER, "w-ack", 1, "completed"),
         "the watch recorded the position"
@@ -87,7 +92,9 @@ fn an_acknowledged_completion_is_not_replayed_after_retirement() {
         "a retired worker has no new event: {:?}",
         queued(&router)
     );
-    let after = router.watch_reply(&ctx, &params()).expect("the watch answers");
+    let after = router
+        .watch_reply(&ctx, &params())
+        .expect("the watch answers");
     assert!(
         after["events"].as_array().is_some_and(Vec::is_empty),
         "a retired worker is never replayed: {after}"
@@ -109,7 +116,9 @@ fn an_unacknowledged_event_is_not_replayed_after_retirement() {
         "retirement drops the queued event"
     );
     let ctx = agent(1);
-    let after = router.watch_reply(&ctx, &params()).expect("the watch answers");
+    let after = router
+        .watch_reply(&ctx, &params())
+        .expect("the watch answers");
     assert!(
         after["events"].as_array().is_some_and(Vec::is_empty),
         "an unacknowledged event of a retired worker is gone: {after}"
@@ -120,13 +129,40 @@ fn an_unacknowledged_event_is_not_replayed_after_retirement() {
     // unknown, never a completion to review.
     router.observe_watch(view("w-unacked", 1));
     let explicit = router
-        .watch_reply(
-            &ctx,
-            &json!({"worker_ids":["w-unacked"], "initial":true}),
-        )
+        .watch_reply(&ctx, &json!({"worker_ids":["w-unacked"], "initial":true}))
         .expect_err("a retired worker is not found by an explicit id");
     assert!(
         explicit.to_string().contains("Worker not found"),
         "the explicit id must not resurrect a retired worker: {explicit}"
+    );
+}
+
+/// The tombstone only has to outlive the snapshots that still describe the
+/// worker. Once no view names it, the branch, the row and the record are gone
+/// and the id can never come back, so holding it would cost memory for a worker
+/// that cannot fire an event again.
+#[test]
+fn a_tombstone_is_released_once_no_view_describes_the_worker() {
+    let mut router = EventRouter::default();
+    router.observe_watch(view("w-gone", 1));
+    router.forget_worker("w-gone");
+    assert_eq!(router.retired.len(), 1, "the retirement left a tombstone");
+
+    // The snapshot that raced the retirement still names the worker: the
+    // tombstone has to survive this, and the event still must not come back.
+    router.observe_watch(view("w-gone", 1));
+    assert_eq!(
+        router.retired.len(),
+        1,
+        "a view that still names the worker keeps the tombstone"
+    );
+    assert!(queued(&router).is_empty(), "and still no event");
+
+    // The next snapshot is the truth: the worker is gone, so the tombstone goes
+    // with it and leaves the router holding nothing for a dead id.
+    router.observe_watch(crate::cli::watch::Snapshot::new());
+    assert!(
+        router.retired.is_empty(),
+        "a retired worker no view describes releases its tombstone"
     );
 }
