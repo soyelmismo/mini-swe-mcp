@@ -1707,6 +1707,7 @@ impl super::WorkerPool {
             approved: None,
             verified: None,
             integrated: Vec::new(),
+            absorbed: Vec::new(),
             keep_branch: false,
         };
 

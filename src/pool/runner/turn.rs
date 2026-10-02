@@ -50,8 +50,8 @@ use super::pause::PauseRequest;
 use super::sentinels::{
     COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
     parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
-    parse_consolidate_wait, parse_kill_job, parse_report, parse_request_turns, parse_wait_job,
-    summarize_command,
+    parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
@@ -1501,6 +1501,22 @@ impl<'a> TurnEngine<'a> {
             // report: accept it and fall back to the summary the harness has
             // always derived from the last message.
             _ => {}
+        }
+
+        // A consolidator's closing report is also the round's bookkeeping: the
+        // workers it reports as `fixed`, plus the ones it steered and left
+        // stopped, are absorbed by it and retire with its branch. Recorded
+        // here, at the completion turn, so the record exists before anything
+        // merges the consolidator.
+        if self.meta.role == WorkerRole::Consolidate {
+            let fixed: Vec<String> = parse_consolidator_verdicts(&llm_resp.content)
+                .into_iter()
+                .filter(|(_, verdict)| *verdict == "fixed")
+                .map(|(id, _)| id)
+                .collect();
+            self.pool
+                .record_consolidator_absorbed(self.meta, &fixed)
+                .await;
         }
 
         let round_base = super::super::steer::read_source(&self.pool.scratch, self.worker_id)

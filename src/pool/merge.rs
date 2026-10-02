@@ -732,8 +732,8 @@ fn cleanup(
     // A consolidator carries the round it integrated on its own row, and that
     // round is now fully in the base branch too. Read the list before the row
     // goes, so each worker it absorbed is retired with it.
-    let integrated = load_registry_entry_in(root, worker_id)
-        .map(|row| row.integrated)
+    let (integrated, absorbed) = load_registry_entry_in(root, worker_id)
+        .map(|row| (row.integrated, row.absorbed))
         .unwrap_or_default();
     let ctx = RetireContext {
         repo: Some(repo),
@@ -757,6 +757,7 @@ fn cleanup(
     // propagation exists to clean.
     let mut retired: Vec<String> = Vec::new();
     let mut round_retired = 0;
+    let mut absorbed_retired = 0;
     if !keep_branch {
         for id in &integrated {
             // A member whose row a concurrent reader already pruned is still
@@ -783,12 +784,38 @@ fn cleanup(
                 round_retired += 1;
             }
         }
+        // The absorbed members are retired outright, WIP branches and all: the
+        // consolidator took their corrections over, so what is left on their
+        // branches is superseded work, not work to land. Only the ids the
+        // consolidator's own row records are touched, and one that is running
+        // again is left alone -- a worker the orchestrator resumed after the
+        // round still owns its branch.
+        for id in &absorbed {
+            let Some(row) = load_registry_entry_in(root, id) else {
+                continue;
+            };
+            if matches!(
+                row.status,
+                RegistryStatus::Running | RegistryStatus::Reviewing
+            ) {
+                continue;
+            }
+            if retire_worker_reporting(root, id, &ctx).row_removed {
+                retired.push(id.clone());
+                absorbed_retired += 1;
+            }
+        }
         if outcome.row_removed {
             retired.push(worker_id.to_string());
         }
     }
 
     let mut cleaned = Vec::new();
+    if absorbed_retired > 0 {
+        cleaned.push(format!(
+            "{absorbed_retired} absorbed worker(s) retired with the round"
+        ));
+    }
     if outcome.branch_deleted {
         cleaned.push(format!("branch {branch} deleted"));
     } else if keep_branch {
