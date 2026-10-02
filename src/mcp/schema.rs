@@ -32,6 +32,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "prune",
     "merge",
     "consolidate",
+    "help",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -64,8 +65,9 @@ pub const NETWORK_DEFAULT: &str = "allow";
 /// Description of the `worker` tool itself.
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
-/// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. Only own workers, admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge discard identity sandbox env consolidate.";
+/// guidance lives per topic, reachable as `help <topic>` (CLI) or the
+/// `help` action (MCP) (see [`crate::cli::help`]).
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap worker gate, wait with watch --group <g> --all (MCP all:true), read its report, merge it. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -86,7 +88,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static("Action to perform; the enum lists every verb."),
+        DescriptionSource::Static("The verb; the enum lists every one."),
     ),
     (
         "task",
@@ -106,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "path",
         "string",
-        DescriptionSource::Static("Alias for repo_path."),
+        DescriptionSource::Static("Alias for repo_path"),
     ),
     (
         "model",
@@ -122,7 +124,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "id",
         "string",
-        DescriptionSource::Static("Alias for worker_id."),
+        DescriptionSource::Static("Alias for worker_id"),
     ),
     (
         "message",
@@ -162,7 +164,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model temperature (overrides the default)."),
+        DescriptionSource::Static("Model temperature (overrides default)."),
     ),
     (
         "review_after",
@@ -188,6 +190,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "set",
         "boolean",
         DescriptionSource::Static(super::handlers::consolidate::SET_DESCRIPTION),
+    ),
+    (
+        "topic",
+        "string",
+        DescriptionSource::Static(super::handlers::help::TOPIC_DESCRIPTION),
     ),
     (
         "scope",
@@ -545,18 +552,18 @@ mod tests {
         for needle in [
             "mini-swe-mcp watch",
             "run it again after each event",
-            "mini-swe-mcp help <topic>",
+            "`help <topic>` (CLI) or action 'help' (MCP)",
             "own workers",
+            // The default shape of parallel work: one group, one
+            // consolidator, one branch to merge.
+            "Parallel work is a ROUND",
+            "tasks+group+consolidate",
+            "--group <g> --all",
+            "merge",
         ] {
             assert!(
                 description.contains(needle),
                 "the tool description must mention {needle}: {description}"
-            );
-        }
-        for topic in crate::cli::help::TOPICS {
-            assert!(
-                description.contains(topic),
-                "the tool description must point at the '{topic}' topic: {description}"
             );
         }
     }

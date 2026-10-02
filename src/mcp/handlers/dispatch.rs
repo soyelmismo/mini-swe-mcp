@@ -299,21 +299,19 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const TASK_DESCRIPTION: &str =
-    "ONE focused concern: files in scope and the acceptance gate.";
+    "ONE focused concern: files in scope, acceptance gate.";
 
-pub(in crate::mcp) const TASKS_DESCRIPTION: &str =
-    "Batch {task, model?, ...} entries; top-level defaults.";
+pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; top-level defaults.";
 
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
-    "Absolute repository root (alias: 'path'). Required for 'dispatch'.";
+    "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer model auditing the worktree after implementation.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model for the worktree audit.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. 'consolidate': cheap gate for workers, full for the consolidator.";
+Completion gate: auto-detect if omitted; empty string disables; `sh -n` checked. Cheap for workers on a consolidate dispatch, full for the consolidator.
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
-    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";
+    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.";
