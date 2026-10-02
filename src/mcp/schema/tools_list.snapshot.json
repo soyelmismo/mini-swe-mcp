@@ -115,7 +115,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model; `:security` = adversarial pass.",
+            "description": "Reviewer model; `:security` = adversarial.",
             "type": "string"
           },
           "role": {

@@ -31,7 +31,7 @@ use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
 use self::review::ReviewPhase;
-pub use self::review::{ReviewMode, SecurityReviewOutcome};
+pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
