@@ -90,9 +90,7 @@ pub fn flavor_for(action: Option<&str>, no_daemon: bool) -> Flavor {
         return Flavor::CurrentThread;
     }
     match action {
-        Some("monitor" | "supervisor" | "whoami" | "help" | "watch") => {
-            Flavor::CurrentThread
-        }
+        Some("monitor" | "supervisor" | "whoami" | "help" | "watch") => Flavor::CurrentThread,
         _ => Flavor::MultiThread,
     }
 }
@@ -166,7 +164,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod flavor_tests {
     use super::*;
@@ -174,9 +171,22 @@ mod flavor_tests {
     /// The verbs that go through the `worker` tool, plus the verbs that
     /// answer from the registry, so both sides of the table are covered.
     const VERBS: &[&str] = &[
-        "dispatch", "collect", "review", "merge", "kill", "discard",
-        "logs", "status", "consolidate", "steer", "approve", "unapprove",
-        "list", "manifest", "reap", "prune",
+        "dispatch",
+        "collect",
+        "review",
+        "merge",
+        "kill",
+        "discard",
+        "logs",
+        "status",
+        "consolidate",
+        "steer",
+        "approve",
+        "unapprove",
+        "list",
+        "manifest",
+        "reap",
+        "prune",
     ];
 
     /// The hub daemon owns the only pool, so it is the one process that
