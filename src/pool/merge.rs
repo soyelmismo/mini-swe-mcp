@@ -758,6 +758,7 @@ fn cleanup(
     let mut retired: Vec<String> = Vec::new();
     let mut round_retired = 0;
     let mut absorbed_retired = 0;
+    let mut cleaned_kept: Vec<String> = Vec::new();
     if !keep_branch {
         for id in &integrated {
             // A member whose row a concurrent reader already pruned is still
@@ -787,17 +788,24 @@ fn cleanup(
         // The absorbed members are retired outright, WIP branches and all: the
         // consolidator took their corrections over, so what is left on their
         // branches is superseded work, not work to land. Only the ids the
-        // consolidator's own row records are touched, and one that is running
-        // again is left alone -- a worker the orchestrator resumed after the
-        // round still owns its branch.
+        // consolidator's own row records are touched, and each is re-checked
+        // before anything is deleted: a worker that is running again still owns
+        // its branch, and a *completed* worker's branch is only discarded when
+        // its tip is provably already in the merged consolidator commit. An
+        // absorbed id that is neither is kept and reported, never deleted --
+        // the record is the consolidator's claim, and a claim is not proof.
         for id in &absorbed {
             let Some(row) = load_registry_entry_in(root, id) else {
+                cleaned_kept.push(format!("kept {id}: not integrated"));
                 continue;
             };
             if matches!(
                 row.status,
                 RegistryStatus::Running | RegistryStatus::Reviewing
-            ) {
+            ) || (!row.status.stopped_not_completed()
+                && !branch_is_integrated_in(root, repo, id, branch))
+            {
+                cleaned_kept.push(format!("kept {id}: not integrated"));
                 continue;
             }
             if retire_worker_reporting(root, id, &ctx).row_removed {
@@ -810,7 +818,7 @@ fn cleanup(
         }
     }
 
-    let mut cleaned = Vec::new();
+    let mut cleaned = cleaned_kept;
     if absorbed_retired > 0 {
         cleaned.push(format!(
             "{absorbed_retired} absorbed worker(s) retired with the round"

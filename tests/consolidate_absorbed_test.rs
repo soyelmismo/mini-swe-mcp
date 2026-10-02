@@ -308,3 +308,66 @@ fn a_steered_worker_that_is_running_again_is_not_discarded() {
     assert!(git_ref_exists(h.path(), &format!("worker-{resumed}")));
     assert!(h.row_exists(&resumed));
 }
+
+#[test]
+fn a_completed_worker_reported_fixed_is_never_discarded() {
+    let h = Harness::new("absorbdone");
+    let consolidator = format!("consol-{}", unique_suffix("c"));
+    let finished = format!("w4-{}", unique_suffix("w"));
+
+    // A completed worker whose branch was never integrated: its commits are
+    // real work awaiting an approval, not superseded WIP.
+    h.worker_branch(&finished, "done.txt", "finished, unmerged work\n");
+    let entry = WorkerRegistryEntry {
+        status: RegistryStatus::Completed,
+        group: Some(GROUP.to_string()),
+        role: WorkerRole::Worker,
+        repo_path: Some(h.path().to_string_lossy().to_string()),
+        base_branch: Some("master".to_string()),
+        ..WorkerRegistryEntry::test_row(&finished, OWNER)
+    };
+    save_registry_entry_in(&h.root(), &entry);
+    h.worker_branch(&consolidator, "round.txt", "the consolidator's fix\n");
+    h.consolidator_row(&consolidator);
+
+    let meta = h.consolidator_meta(&consolidator);
+    // The report names it `fixed`, but a completed worker is not stopped: the
+    // owner and group match alone must not absorb it.
+    block_on(
+        h.pool
+            .pool
+            .record_consolidator_absorbed(&meta, std::slice::from_ref(&finished)),
+    );
+    let row = load_registry_entry_in(&h.root(), &consolidator).expect("consolidator row");
+    assert!(row.absorbed.is_empty(), "{row:?}");
+
+    // A stale record (a row written before the guard, or another process's
+    // write) must still not cost the worker its branch: the merge re-checks.
+    let mut stale = load_registry_entry_in(&h.root(), &consolidator).expect("row");
+    stale.absorbed.push(finished.clone());
+    save_registry_entry_in(&h.root(), &stale);
+
+    let report = h.merge(&consolidator);
+    assert!(
+        !report.retired.contains(&finished),
+        "a completed, unintegrated worker is never retired: {:?}",
+        report.retired
+    );
+    assert!(
+        report
+            .cleaned
+            .iter()
+            .any(|line| *line == format!("kept {finished}: not integrated")),
+        "the kept worker is reported: {:?}",
+        report.cleaned
+    );
+    assert!(
+        git_ref_exists(h.path(), &format!("worker-{finished}")),
+        "its branch survives"
+    );
+    assert!(h.row_exists(&finished), "its row survives");
+    assert!(
+        std::fs::read_to_string(h.path().join("done.txt")).is_err(),
+        "its work is not in master"
+    );
+}
