@@ -56,12 +56,26 @@ fn mentions(line: &str, event: &str) -> bool {
     }
 }
 
-/// Where the hub socket for `hub_dir` really is: inside it when the path fits
-/// `sun_path`, and in the short fallback directory (or the abstract namespace)
-/// when it does not. The test reads the daemon's own log rather than guessing,
-/// so a hub directory long enough to need the fallback still works.
-fn socket_path(hub_dir: &Path) -> PathBuf {
-    HubPaths::new(hub_dir.to_path_buf()).socket()
+/// Wait until the hub directory's socket accepts a connection.
+///
+/// The socket is not necessarily inside the hub directory: a path too long for
+/// `sun_path` moves it to a short fallback directory, so the test asks
+/// [`HubPaths`] where this one is instead of guessing.
+async fn wait_for_socket(hub_dir: &Path) {
+    let socket = HubPaths::new(hub_dir.to_path_buf()).socket();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing is listening on {}:\n{}",
+            socket.display(),
+            std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// The daemon under test: the same executable the watch would start for
@@ -196,40 +210,47 @@ impl Drop for WatchDaemon {
 /// reconnects to the replacement and still delivers the next event.
 ///
 /// The cut is abrupt on purpose — the process is killed, nothing is flushed —
-/// so the watch sees a transport failure rather than a clean EOF, and the
-/// reconnect has to re-announce the identity and replay what it missed.
+/// so the reconnect has to re-announce the identity and replay what it missed
+/// rather than inherit a live connection. Which errno a given cut arrives as is
+/// the kernel's business; `client_reconnect_tests` covers the transport errors
+/// themselves, up to the reset an unread connection buffer produces.
 #[tokio::test]
-async fn a_watch_follows_a_daemon_cut_with_a_reset() {
+async fn a_watch_follows_a_daemon_that_is_cut_under_it() {
     let isolated = common::IsolatedPool::new(2, "watch-cut");
     let swe = isolated.root().path().to_path_buf();
     let pool = isolated.pool.clone();
-    // Its own directory, not the pool's base: the watch spawns the replacement
-    // daemon itself, so everything it starts has to stay inside this test.
     let hub = common::TempDir::new_in_tmp("watch-cut");
     let hub_dir = hub.path().to_path_buf();
+    // The daemon refuses a hub directory anyone but its owner can read, and a
+    // short fallback socket directory derived from it is owned the same way.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict the hub directory");
+    let _fallback = common::fallback_socket_dir(&hub_dir);
 
-    // The watch owns the hub directory from here on, so the replacement daemon
-    // is the one it starts and the only one this test ever signals.
+    // From here on this test owns every daemon on this directory, including the
+    // replacement the watch starts for itself.
     let mut owned = WatchDaemon::new(&hub_dir);
     owned.armed = true;
 
     // A live worker owned by the watching agent, standing in for one the
     // orchestrator dispatched. Its pid is a real process, so neither the cut
-    // nor the replacement's recovery treats it as dead.
+    // nor the replacement's recovery can decide the row it backs is dead.
     let mut meta = WorkerMeta {
         task: "reconnect probe".to_string(),
         ..WorkerMeta::test_meta("watch-cut", "reconnect-test")
     };
     meta.pid = owned.sleeper.id().expect("the sleeper has a pid");
-    pool.__test_save_status(
-        &meta,
-        "test",
-        RegistryStatus::Running,
-        1,
-        10,
-        "probe",
-        None,
-    );
+    pool.__test_save_status(&meta, "test", RegistryStatus::Running, 1, 10, "probe", None);
+
+    let mut daemon = Command::from(daemon_command(&hub_dir, &swe))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start the daemon the watch follows");
+    owned
+        .pids
+        .insert(daemon.id().expect("the daemon has a pid") as i32);
+    wait_for_socket(&hub_dir).await;
 
     let mut watch = Command::from(watch_command(&hub_dir, &swe))
         .kill_on_drop(true)
@@ -237,54 +258,35 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
         .expect("start the watch");
     let mut output = BufReader::new(watch.stdout.take().expect("watch stdout"));
     let mut errors = BufReader::new(watch.stderr.take().expect("watch stderr"));
-    // The watch starts the hub itself, so its own output is the only place a
-    // refusal would show: wait for it, and say what it said instead.
-    tokio::select! {
-        _ = wait_for_log(&hub_dir, "Serving MCP connection", 1) => {}
-        _ = tokio::time::timeout(Duration::from_secs(20), read_to_end(&mut errors)) => {
-            let status = watch.wait().await.expect("the watch process joins");
-            panic!(
-                "the watch never reached the daemon: {status:?}\nstdout: {:?}\nstderr: {:?}\nhub.dir={}\nswe={}\nhub.log:\n{}",
-                read_to_end(&mut output).await,
-                read_to_end(&mut errors).await,
-                hub.path().display(),
-                swe.display(),
-                std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default(),
-            );
-        }
-    }
-    owned.cut();
+    wait_for_log(&hub_dir, "Serving MCP connection", 1).await;
 
-    // The replacement binds the socket again: that is what the reconnecting
-    // watch dials, wherever `sun_path` allowed this hub directory to put it.
-    let rebound = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if socket_path(&hub_dir).exists() && daemon_pids(&hub_dir).len() > 1 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
-    if rebound.is_err() {
-        let status = watch.wait().await.expect("the watch process joins");
-        panic!(
-            "the watch did not follow the daemon: {status:?}, stderr: {:?}, hub.log:\n{}",
-            read_to_end(&mut errors).await,
-            std::fs::read_to_string(hub_dir.join("hub.log")).unwrap_or_default(),
-        );
-    }
+    owned.cut();
+    assert!(
+        !daemon
+            .wait()
+            .await
+            .expect("the daemon was killed")
+            .success(),
+        "the daemon exits on the kill, not on its own"
+    );
+
+    // The watch follows the daemon it lost: the replacement hub starts, answers
+    // it again, and the CLI process is still the one watching.
+    wait_for_socket(&hub_dir).await;
+    wait_for_log(&hub_dir, "Serving MCP connection", 2).await;
     assert!(
         matches!(watch.try_wait(), Ok(None)),
-        "the watch must survive the reset, not exit with it; stderr: {:?}",
+        "the watch must survive the cut, not exit with it; stderr: {:?}",
         read_to_end(&mut errors).await
     );
+    // The replacement's recovery handed the row back, so the watch has a
+    // worker to follow on the new connection rather than nothing to watch.
     wait_for_log(&hub_dir, "recovered", 2).await;
 
     // And the delivery continues: the worker's terminal status is the next
     // event, and it reaches the same CLI process over the new connection.
     std::fs::create_dir_all(format!("{}/swe-wt-watch-cut", swe.display()))
-        .expect("the worker's worktree");
+        .expect("the worker\'s worktree");
     pool.__test_reset_registry_throttle("watch-cut");
     pool.__test_save_status(
         &meta,
@@ -297,12 +299,10 @@ async fn a_watch_follows_a_daemon_cut_with_a_reset() {
     );
 
     match read_until(&mut output, "watch-cut", Duration::from_secs(30)).await {
-        Some(printed) => {
-            assert!(
-                printed.contains("watch-cut"),
-                "the event belongs to the watched worker: {printed}"
-            );
-        }
+        Some(printed) => assert!(
+            printed.contains("watch-cut"),
+            "the event belongs to the watched worker: {printed}"
+        ),
         None => panic!(
             "the reconnected watch must deliver the next event; saw {:?}",
             read_to_end(&mut output).await
@@ -341,7 +341,6 @@ fn watch_command(hub_dir: &Path, swe: &Path) -> std::process::Command {
     watch
 }
 
-
 /// Drain `stream` to its end, so a child that is never waited on cannot fill a
 /// pipe and block on its next write.
 ///
@@ -355,11 +354,7 @@ async fn read_to_end<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Vec<u8>
 
 /// Read from `stream` until `needle` appears, so the test polls for the event
 /// instead of sleeping for it.
-async fn read_until<R>(
-    stream: &mut R,
-    needle: &str,
-    within: Duration,
-) -> Option<String>
+async fn read_until<R>(stream: &mut R, needle: &str, within: Duration) -> Option<String>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -368,12 +363,20 @@ where
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            return if seen.contains(needle) { Some(seen) } else { None };
+            return if seen.contains(needle) {
+                Some(seen)
+            } else {
+                None
+            };
         }
         let mut line = String::new();
         match tokio::time::timeout(left, stream.read_line(&mut line)).await {
             Ok(Ok(0)) | Err(_) => {
-                return if seen.contains(needle) { Some(seen) } else { None };
+                return if seen.contains(needle) {
+                    Some(seen)
+                } else {
+                    None
+                };
             }
             Ok(Ok(_)) => seen.push_str(&line),
             Ok(Err(_)) => return None,

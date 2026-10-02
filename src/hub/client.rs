@@ -7,8 +7,8 @@
 //! gone" that every transport error is read through.
 
 use anyhow::{Context, Result};
-use std::future::Future;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
@@ -101,9 +101,9 @@ pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()
 /// the abrupt version of that cut surfaces as a reset or a broken pipe instead
 /// of an orderly EOF; while the replacement is still starting, the dial fails
 /// with a refused connection or a socket that is not there yet. Matching the
-/// `ErrorKind`s covers all of them, and the messages below name the cases where
-/// a context prefix could hide that kind from the chain (a failing write is
-/// reported bare, and `display` is not what `Error::source` walks).
+/// `ErrorKind`s covers all of them; the messages below cover the two the kinds
+/// cannot — the clean EOF the client reports as its own line, and the auto-start
+/// that never came up.
 pub fn daemon_went_away(error: &anyhow::Error) -> bool {
     // `chain` starts at the error itself (a bare `io::Error` has no source, so
     // walking `source` alone would never reach it) and ends at the root cause.
@@ -137,9 +137,7 @@ fn is_gone_away_kind(cause: &(dyn std::error::Error + 'static)) -> bool {
                 | std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::NotFound
         )
-    ) || cause
-        .to_string()
-        .contains("Hub closed the connection")
+    ) || cause.to_string().contains("Hub closed the connection")
 }
 
 /// Env var overriding how long a client follows a daemon that keeps going away.
@@ -228,10 +226,7 @@ pub trait Reconnect {
 /// The chase itself: dial, and if the daemon is simply gone, dial again after a
 /// backoff until `deadline`.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn follow_until<R: Reconnect>(
-    deadline: Duration,
-    mut with: R,
-) -> Result<R::Output> {
+async fn follow_until<R: Reconnect>(deadline: Duration, mut with: R) -> Result<R::Output> {
     let started = tokio::time::Instant::now();
     let mut delay = RECONNECT_BACKOFF_START;
     loop {

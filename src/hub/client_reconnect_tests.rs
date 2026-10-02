@@ -129,10 +129,7 @@ async fn a_chase_reports_a_refusal_without_dialling_again() {
     let error = follow_until::<Dial>(Duration::from_secs(5), dial.clone())
         .await
         .expect_err("a refusal is the caller's answer");
-    assert!(
-        error.to_string().contains("already running"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("already running"), "{error:#}");
     assert_eq!(
         dial.attempts(),
         1,
@@ -169,7 +166,10 @@ async fn a_chase_gives_up_once_its_budget_is_spent() {
 /// forever.
 #[test]
 fn the_budget_is_the_default_and_its_override_is_bounded() {
-    assert_eq!(reconnect_deadline(), Duration::from_secs(DEFAULT_RECONNECT_SECS));
+    assert_eq!(
+        reconnect_deadline(),
+        Duration::from_secs(DEFAULT_RECONNECT_SECS)
+    );
     assert_eq!(reconnect_secs(Some(0)), MIN_RECONNECT_SECS);
     assert_eq!(
         reconnect_secs(Some(MAX_RECONNECT_SECS + 1)),
