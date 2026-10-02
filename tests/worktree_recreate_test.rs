@@ -120,6 +120,36 @@ fn cleanup_leaves_no_worktree_registration_behind() {
     assert!(!path.exists(), "cleanup must delete the directory too");
 }
 
+/// The harder half of the same property: cleanup must unregister even when
+/// `worktree remove --force` cannot, which is exactly what a checkout whose
+/// `.git` pointer is already gone looks like. `remove` validates that pointer
+/// and fails there, so on the old code the row survived every teardown and
+/// only a manual `git worktree prune` cleared it.
+#[test]
+fn cleanup_unregisters_even_when_the_git_pointer_is_already_gone() {
+    let scratch = common::TempDir::new_in_tmp("wt-broken-gitdir");
+    let (repo, _head) = seed_repo(&scratch);
+    let root = ScratchRoot::new(scratch.subdir("workers"));
+
+    let guard = WorktreeGuard::new_in(&root, &repo, "brokendir").expect("dispatch");
+    let path = guard.path.clone();
+    // Break the pointer `worktree remove --force` validates, leaving the
+    // directory and the registration in place.
+    std::fs::remove_file(path.join(".git")).expect("remove the worktree gitdir pointer");
+    assert!(
+        common::worktree_is_registered(&repo, &path),
+        "fixture must still hold the registration"
+    );
+
+    drop(guard);
+
+    assert!(
+        !common::worktree_is_registered(&repo, &path),
+        "cleanup left a registration behind after a failed 'worktree remove'"
+    );
+    assert!(!path.exists(), "cleanup must delete the directory too");
+}
+
 /// The recovery is scoped to the worker's own path: another worker's live
 /// registration in the same repository must survive it untouched.
 #[test]

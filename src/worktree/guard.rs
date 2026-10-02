@@ -161,84 +161,6 @@ fn harden_worktree_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether git still holds a registration row for the worktree at `path`.
-///
-/// Read from `worktree list --porcelain` rather than inferred from the
-/// directory: a row outliving its directory is exactly the stale state this
-/// module now has to recognise, and the two are independent.
-fn is_registered_worktree(repo_root: &Path, path: &Path) -> bool {
-    let Ok(output) = git(
-        repo_root,
-        "worktree list",
-        &["worktree", "list", "--porcelain"],
-    ) else {
-        // Unprovable registration: assume the worst, so a caller that only
-        // recovers from a stale row can never mistake a live one for it.
-        return true;
-    };
-    if !output.status.success() {
-        return true;
-    }
-    let wanted = path.to_string_lossy();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .any(|registered| Path::new(registered.trim()) == path || registered.trim() == wanted)
-}
-
-/// Drop git's registration row for the worktree at `path`, and only that one.
-///
-/// A registration whose directory is already gone is what makes the *next*
-/// `worktree add` for the same worker fail with "is a missing but already
-/// registered worktree" (audit §13), so every exit path that deletes a checkout
-/// directory has to unregister it. Two steps, in order, because neither alone
-/// covers every state this can be called in:
-///
-/// * `worktree remove --force` is the precise unregister, but it refuses when
-///   the directory survives without a valid `.git` pointer (an empty
-///   placeholder left by a crashed creation), so it is only asked to work when
-///   the directory is actually gone.
-/// * `worktree prune` is the fallback that drops a row git itself considers
-///   stale. It is the *global* sweep, which is why it runs only after the
-///   narrow step failed and why the caller must have already decided this path
-///   is abandoned.
-///
-/// Scoped to `path` by construction: the first step names one worktree, and the
-/// second runs only on rows git already reports as prunable, which cannot
-/// include a live checkout. Returns whether the path is unregistered.
-fn unregister_worktree(repo_root: &Path, path: &Path) -> bool {
-    if !is_registered_worktree(repo_root, path) {
-        return true;
-    }
-    let path_str = path.to_string_lossy().to_string();
-    if !path.exists() {
-        let removed = git(
-            repo_root,
-            "worktree remove",
-            &["worktree", "remove", "--force", &path_str],
-        )
-        .is_ok_and(|out| out.status.success());
-        if removed {
-            debug!(path = %path.display(), "Unregistered stale git worktree");
-            return true;
-        }
-    }
-    // Either the directory is still there (a half-created checkout git will not
-    // remove) or the narrow step failed: let git drop every row it considers
-    // stale, which this one is by the caller's contract.
-    let pruned = git(repo_root, "worktree prune", &["worktree", "prune"])
-        .is_ok_and(|out| out.status.success());
-    if pruned && !is_registered_worktree(repo_root, path) {
-        debug!(path = %path.display(), "Pruned stale git worktree registration");
-        return true;
-    }
-    warn!(
-        path = %path.display(),
-        "Could not unregister git worktree; a later add of this path will fail"
-    );
-    false
-}
-
 /// Result of the harness's pre-completion integration step.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BaseSync {
@@ -392,60 +314,32 @@ impl WorktreeGuard {
         let path = root.join(format!("swe-wt-{worker_id}"));
 
         // A revision never leaves a stale checkout behind: the finished run's
-        // `Drop` removed it, but a crashed run may not have (audit §06).
+        // `Drop` removed it, but a crashed run may not have, and `worktree add`
+        // fails loudly on a registered path (audit §06).
         force_remove_dir(&path);
-
-        // Deleting the checkout is not enough to make the path reusable: git
-        // keeps its registration row until it is told to drop it, and
-        // `worktree add` then refuses the path outright ("is a missing but
-        // already registered worktree"). A crashed run leaves exactly that
-        // state, and it used to fail the whole revision until an operator ran
-        // `git worktree prune` by hand (audit §13).
-        //
-        // Scoped to this worker's own path, so recovering one worker never
-        // unregisters a live sibling's worktree.
-        unregister_worktree(repo_root, &path);
 
         info!(repo = %repo_root.display(), branch = %branch, path = %path.display(), "Creating git worktree");
 
         let path_str = path
             .to_str()
             .context("Worktree path contains invalid UTF-8")?;
-        let add = |repo_root: &Path| -> Result<std::process::Output> {
-            if fresh_branch {
-                git(
-                    repo_root,
-                    "worktree add",
-                    &["worktree", "add", "-b", branch, path_str, start_point],
-                )
-            } else {
-                git(repo_root, "worktree add", &["worktree", "add", path_str, start_point])
-            }
-        };
-
         // Create it private before checkout so no reader observes files under
         // a permissive umask.
         create_private_worktree_dir(&path)?;
-        let mut output = add(repo_root)?;
 
-        // A row can appear between the unregister above and this `add` (a
-        // concurrent sweep, a second daemon on the same repository). One retry,
-        // and only when the failure is this path's own stale registration --
-        // every other failure is reported unchanged, so a real error is never
-        // masked by a speculative prune.
-        if !output.status.success()
-            && is_registered_worktree(repo_root, &path)
-            && unregister_worktree(repo_root, &path)
-        {
-            warn!(
-                path = %path.display(),
-                "Retrying worktree creation after clearing a stale registration"
-            );
-            // The failed `add` left its own placeholder behind.
-            force_remove_dir(&path);
-            create_private_worktree_dir(&path)?;
-            output = add(repo_root)?;
-        }
+        let output = if fresh_branch {
+            git(
+                repo_root,
+                "worktree add",
+                &["worktree", "add", "-b", branch, path_str, start_point],
+            )?
+        } else {
+            git(
+                repo_root,
+                "worktree add",
+                &["worktree", "add", path_str, start_point],
+            )?
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1185,12 +1079,6 @@ impl Drop for WorktreeGuard {
         self.sync_artifacts();
         info!(path = %self.path.display(), branch = %self.branch, "Cleaning up git worktree");
 
-        // `worktree remove --force` is the precise unregister, but it fails
-        // when the directory has already gone or holds no `.git` pointer, and
-        // a surviving row is what makes the *next* revision of this worker
-        // fail (audit §13). Its result is deliberately not checked here: the
-        // authoritative cleanup is the unregister below, which also covers the
-        // states `remove` refuses.
         let _ = git(
             &self.repo_root,
             "worktree remove",
@@ -1230,12 +1118,6 @@ impl Drop for WorktreeGuard {
         // `worktree remove --force` normally deleted the directory already; this
         // is the fallback for when it could not (audit §04).
         force_remove_dir(&self.path);
-        // Then drop the registration itself. Ordering matters: git refuses to
-        // unregister a path whose directory still exists without a valid
-        // `.git` pointer, so the directory has to be gone first, and the
-        // registration has to be gone before this worker can ever be recreated
-        // (audit §13).
-        unregister_worktree(&self.repo_root, &self.path);
         let _ = std::fs::remove_file(&pid_file);
         remove_target_dirs(&self.path);
     }

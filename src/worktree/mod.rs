@@ -126,17 +126,10 @@ pub(crate) fn swe_base_dirs() -> Vec<PathBuf> {
 }
 
 /// Run `git` in `dir`, attaching the operation to the error when spawning fails.
-///
-/// Git localizes its messages, so on a host with `LANG=es_ES` a failure reaches
-/// the logs as "es un arbol de trabajo faltante pero ya registrado": stable
-/// enough to read, useless to match, count or assert on. `LC_ALL=C` pins git's
-/// *own* output to English and leaves the rest of the caller's environment
-/// alone, so the worker commands built elsewhere still inherit their `LANG`.
 pub(crate) fn git(dir: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
     Command::new("git")
         .current_dir(dir)
         .args(args)
-        .env("LC_ALL", "C")
         .output()
         .with_context(|| format!("Failed to execute git {operation}"))
 }
