@@ -227,11 +227,9 @@ fn unregister_worktree(repo_root: &Path, path: &Path) -> bool {
         )
         .is_ok_and(|out| out.status.success())
     };
-    if !path.exists() {
-        if remove(repo_root) {
-            debug!(path = %path.display(), "Unregistered stale git worktree");
-            return true;
-        }
+    if !path.exists() && remove(repo_root) {
+        debug!(path = %path.display(), "Unregistered stale git worktree");
+        return true;
     }
     // Either the directory is still there or the narrow step failed. Both git
     // escape hatches refuse a path whose directory exists, so the row can only
@@ -445,7 +443,11 @@ impl WorktreeGuard {
                     &["worktree", "add", "-b", branch, path_str, start_point],
                 )
             } else {
-                git(repo_root, "worktree add", &["worktree", "add", path_str, start_point])
+                git(
+                    repo_root,
+                    "worktree add",
+                    &["worktree", "add", path_str, start_point],
+                )
             }
         };
 
