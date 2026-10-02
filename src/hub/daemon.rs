@@ -713,6 +713,16 @@ impl HubServer {
         let idle_watcher = self.clone();
         let mut idle_task = tokio::spawn(async move { idle_watcher.watch_idle().await });
 
+        // OTA-style handover (H17): the daemon notices its own rebuilt
+        // executable and arms the planned handover itself, instead of waiting
+        // for a newer client to ask. Only a daemon that can respawn itself
+        // watches: a handover leaves the hub unserved until the replacement
+        // binds, so a daemon with no way to start one would strand its workers.
+        let auto_handover = self.clone();
+        let auto_handover_task = tokio::spawn(async move {
+            auto_handover.watch_executable().await;
+        });
+
         let mut term =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(sig) => Some(sig),
@@ -755,6 +765,7 @@ impl HubServer {
         }
 
         idle_task.abort();
+        auto_handover_task.abort();
         recovery_task.abort();
         reaper.abort();
         events.abort();
@@ -783,6 +794,32 @@ impl HubServer {
         }
         debug!("Hub daemon stopped");
         Ok(true)
+    }
+
+    /// Arm the planned handover when this daemon's own executable is
+    /// replaced by a newer build.
+    ///
+    /// `HUB_AUTO_HANDOVER=0` opts out, and a daemon with no way to respawn
+    /// itself never watches: a handover leaves the hub unserved until the
+    /// replacement binds, so stepping aside without one would strand the
+    /// workers.
+    async fn watch_executable(&self) {
+        if !self.config.respawn || !super::auto_handover::enabled() {
+            return;
+        }
+        let Some(path) = super::exe_path::current_exe_path() else {
+            return;
+        };
+        let running = self.server.build_identity();
+        let deadline = super::client::handover_deadline(None);
+        super::auto_handover::watch(
+            path,
+            running,
+            self.server.clone(),
+            deadline,
+            self.config.paths().log().to_path_buf(),
+        )
+        .await;
     }
 
     /// Resolve when the daemon has had no open connection and no live
