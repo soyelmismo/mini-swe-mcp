@@ -141,6 +141,10 @@ impl HubPaths {
     /// binder creates the directory, and it removes it with the socket (see
     /// [`FallbackSocketGuard`]).
     pub fn fallback_dir(&self) -> Option<PathBuf> {
+        let natural = self.dir.join("hub.sock");
+        if natural.as_os_str().len() < MAX_SOCKET_PATH {
+            return None;
+        }
         Some(fallback_socket_dir(&self.dir))
     }
 
@@ -615,6 +619,17 @@ impl HubServer {
         // graceful shutdown path below.
         let _socket_cleanup = FallbackSocketGuard::new(&socket, paths.dir());
         let _ = std::fs::remove_file(&socket);
+        // A socket the hub directory is too deep to hold is filed in a short
+        // private directory of its own. The daemon creates it here -- the one
+        // place that is about to bind that socket -- and the guard above removes
+        // it again with the socket, so resolving the endpoint anywhere else (a
+        // client probing for a running hub, a lock waiter) leaves no empty
+        // `/tmp/mswe-<uid>-<hash>` behind. A directory this user cannot get is
+        // not an error: `endpoint` then answers with the abstract socket, which
+        // is what a hub without `/tmp` has always listened on.
+        if let Some(fallback) = paths.fallback_dir() {
+            let _ = harden_hub_dir(fallback);
+        }
         let endpoint = paths.endpoint();
         let listener = bind_endpoint(&endpoint)?;
 
@@ -1123,8 +1138,8 @@ mod tests {
             .expect("accept the connection");
     }
 
-    /// The short fallback directory is created by the binder and taken away
-    /// with the socket, so the hub dir is never left holding an empty one.
+    /// The short fallback directory is created by the daemon that binds it and
+    /// taken away with the socket, so nothing is ever left holding an empty one.
     ///
     /// Everything else resolves the endpoint without touching the filesystem,
     /// which is what makes the resolution side-effect free; this pins the other
@@ -1140,13 +1155,11 @@ mod tests {
         let socket = fallback.join("hub.sock");
         let guard = FallbackSocketGuard::new(&socket, &hub_dir);
 
+        // The daemon's sequence: create the directory, then bind into it.
+        harden_hub_dir(fallback.clone()).expect("create the fallback socket directory");
         let listener =
             bind_endpoint(&HubEndpoint::Path(socket.clone())).expect("bind the fallback socket");
-        assert!(
-            fallback.is_dir(),
-            "the binder must create the fallback directory {}",
-            fallback.display()
-        );
+        assert!(fallback.is_dir());
         assert!(socket.exists());
         drop(listener);
         drop(guard);
