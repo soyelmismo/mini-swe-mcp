@@ -690,11 +690,23 @@ struct RetireCandidate {
 ///
 /// Two independent jobs, both cheap and bounded:
 ///
-/// * a **merged** worker -- its `worker-<id>` branch is an ancestor of the base
-///   branch its row records -- is retired outright: its commits are in the base
-///   branch, so branch, row, history, mailbox and scratch all go now. This is
-///   what keeps `list` showing only live and awaiting-integration workers, with
-///   no hiding logic anywhere.
+/// * an **integrated** worker -- its row is `Completed`, and its `worker-<id>`
+///   branch is an ancestor of the base branch its row records *and* carries at
+///   least one commit beyond the commit it was dispatched from -- is retired
+///   outright: its commits are in the base branch, so branch, row, history,
+///   mailbox and scratch all go now. This is what keeps `list` showing only
+///   live and awaiting-integration workers, with no hiding logic anywhere.
+///
+///   Both halves of that proof are load-bearing. A worker that is running,
+///   paused, interrupted, exhausted or failed is never retired here, whatever
+///   its branch looks like: a daemon handover that retired such a worker
+///   would destroy the run the next daemon is about to auto-continue. And
+///   containment alone is no proof either, because a branch still sitting on
+///   the commit it was created from is contained in the base trivially -- the
+///   base contains that commit -- which is how a worker interrupted seconds
+///   after dispatch, with no commits yet because it had only read code, came
+///   to look "integrated". A branch whose tip equals its base commit is never
+///   integrated.
 /// * an **orphan** file -- a history, steer or steer-source file with neither a
 ///   registry row nor a branch -- is deleted, because nothing can consume it
 ///   again. This is what reclaims the hundreds of history files old workers

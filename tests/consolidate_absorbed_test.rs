@@ -380,6 +380,10 @@ fn a_completed_absorbed_worker_whose_branch_is_integrated_is_retired() {
     let unmerged = format!("w6-{}", unique_suffix("w"));
 
     // A completed worker whose branch is already an ancestor of master.
+    // Its row records the base commit it forked from: the integration proof
+    // needs it to tell a branch carrying work from one still sitting on its
+    // base.
+    let landed_base = git(h.path(), &["rev-parse", "HEAD"]).trim().to_string();
     h.worker_branch(&landed, "landed.txt", "already integrated\n");
     git(h.path(), &["checkout", "-q", "master"]);
     git(
@@ -392,6 +396,7 @@ fn a_completed_absorbed_worker_whose_branch_is_integrated_is_retired() {
         role: WorkerRole::Worker,
         repo_path: Some(h.path().to_string_lossy().to_string()),
         base_branch: Some("master".to_string()),
+        base_commit: Some(landed_base),
         ..WorkerRegistryEntry::test_row(&landed, OWNER)
     };
     save_registry_entry_in(&h.root(), &entry);
