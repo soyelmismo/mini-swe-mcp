@@ -168,7 +168,7 @@ async fn steered_question_goes_to_consolidator_not_orchestrator_watch() {
     pool.steer(&worker, "orchestrator answer".into())
         .await
         .unwrap();
-    assert!(!pool.question_for_consolidator(&worker));
+    assert!(!pool.question_for_consolidator(&worker).await);
     pool.kill(&worker).await;
     pool.kill(&consolidator).await;
 }

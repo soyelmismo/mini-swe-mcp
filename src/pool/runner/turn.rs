@@ -64,6 +64,54 @@ pub(super) const VERIFICATION_OUTPUT_PREFIX: &str = "VERIFICATION FAILED (exit "
 pub(super) const NO_COMMAND_NUDGE: &str =
     "ERROR: No bash command found. You MUST call the `bash` tool with your command.";
 
+/// Prefix of a tool output an isolation guard produced instead of running the
+/// command, paired with the short rule identifier the audit log carries.
+const ISOLATION_BLOCK_PREFIXES: &[(&str, &str)] = &[
+    (
+        "COMMAND BLOCKED BY INTERCEPTOR:",
+        "destructive_command_interceptor",
+    ),
+    (
+        "COMMAND BLOCKED BY WORKTREE GUARDRAIL:",
+        "worktree_guardrail",
+    ),
+    (
+        "BLOCKED: the sandbox could not be prepared",
+        "sandbox_unavailable",
+    ),
+];
+
+/// Bound on the `reason` field of an audit line: the guard's own message is
+/// short, but a bound keeps a future message from carrying a command's text.
+const AUDIT_REASON_BYTES: usize = 200;
+
+/// Classify a command output an isolation guard produced instead of running
+/// the command.
+///
+/// The guards answer in-band -- the model has to be able to recover -- so the
+/// turn engine recognises the refusal by its fixed prefix and reports the
+/// guard's own reason, bounded, never the command or its environment.
+fn isolation_block(output: &str) -> Option<(&'static str, String)> {
+    let (prefix, rule) = ISOLATION_BLOCK_PREFIXES
+        .iter()
+        .find(|(prefix, _)| output.starts_with(prefix))?;
+    let reason = output[prefix.len()..]
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut reason = reason.to_string();
+    if reason.len() > AUDIT_REASON_BYTES {
+        reason.truncate(
+            reason
+                .char_indices()
+                .nth(AUDIT_REASON_BYTES)
+                .map_or(reason.len(), |(i, _)| i),
+        );
+    }
+    Some((rule, reason))
+}
+
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
 const AUTO_CHECKPOINT_TURNS: usize = 20;
@@ -1615,6 +1663,11 @@ impl<'a> TurnEngine<'a> {
                 "{reuse_note}{}",
                 super::divergent::side_effect_refusal(&effects)
             );
+            self.note_isolation_block(
+                "side_effect_audit",
+                &super::divergent::side_effect_summary(&effects),
+                verify,
+            );
             self.push_exchange(
                 llm_resp.content.clone(),
                 llm_resp.reasoning_content.clone(),
@@ -1659,6 +1712,11 @@ impl<'a> TurnEngine<'a> {
             let refusal = format!(
                 "{reuse_note}{}",
                 super::divergent::side_effect_refusal(&effects_b)
+            );
+            self.note_isolation_block(
+                "side_effect_audit",
+                &super::divergent::side_effect_summary(&effects_b),
+                verify,
             );
             self.push_exchange(
                 llm_resp.content.clone(),
@@ -1945,6 +2003,25 @@ impl<'a> TurnEngine<'a> {
         Ok(())
     }
 
+    /// Record one isolation denial in the hub log and the worker's counters.
+    ///
+    /// The refusal otherwise lives only in the worker's conversation, which is
+    /// deleted when the worker is retired; the audit line is what survives.
+    /// The command is summarised, never quoted in full, and no environment
+    /// value is logged.
+    fn note_isolation_block(&mut self, rule: &str, reason: &str, command: &str) {
+        self.meta.metrics.isolation_blocks += 1;
+        warn!(
+            target: "audit",
+            worker = %self.worker_id,
+            owner = %self.meta.owner,
+            rule = %rule,
+            reason = %reason,
+            command = %summarize_command(command),
+            "isolation block: command refused by a guard"
+        );
+    }
+
     /// Run through resource admission and the bash semaphore, retaining both
     /// permits until execution finishes or is cancelled.
     async fn run_gated(
@@ -2020,6 +2097,12 @@ impl<'a> TurnEngine<'a> {
         };
         let _running = self.pool.command_running(self.worker_id);
         let (output, code) = runner.execute_bash(&self.worktree.path, command).await?;
+        // An isolation guard answered instead of running the command: record
+        // it in the hub log and the worker's counters, so the refusal outlives
+        // the worker's history.
+        if let Some((rule, reason)) = isolation_block(&output) {
+            self.note_isolation_block(rule, &reason, command);
+        }
         // A command that outlived its budget is now a background job, and the
         // build slot it was admitted under moves into the job: a job never
         // outlives the admission it was granted.
@@ -2226,9 +2309,10 @@ mod tests {
         EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch,
         READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        append_report_text, edit_plan, edit_plan_text, extension_budget, named_file_defaults,
-        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
-        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, isolation_block,
+        named_file_defaults, parse_shortstat, parse_threshold, read_only_nudge_text,
+        read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
+        task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2243,6 +2327,30 @@ mod tests {
         }
     }
 
+    /// A guard's in-band refusal is classified by its prefix, with the guard's
+    /// own reason bounded; anything else is not a block.
+    #[test]
+    fn a_guard_refusal_is_classified_by_its_prefix() {
+        let (rule, reason) = isolation_block(
+            "COMMAND BLOCKED BY WORKTREE GUARDRAIL:\noutside the worktree\nPlease run ...",
+        )
+        .expect("a guardrail refusal is a block");
+        assert_eq!(rule, "worktree_guardrail");
+        assert_eq!(reason, "outside the worktree");
+
+        let (rule, reason) = isolation_block(
+            "BLOCKED: the sandbox could not be prepared (no landlock); the command was not run.",
+        )
+        .expect("a sandbox refusal is a block");
+        assert_eq!(rule, "sandbox_unavailable");
+        assert_eq!(reason, "(no landlock); the command was not run.");
+
+        assert!(
+            isolation_block("COMMAND OUTPUT (exit code: 0)\nhello").is_none(),
+            "a normal command output is not a block"
+        );
+        assert!(isolation_block("").is_none());
+    }
     #[test]
     fn the_report_scan_buffer_is_bounded_to_its_newest_bytes() {
         let long = "界".repeat(4096);
