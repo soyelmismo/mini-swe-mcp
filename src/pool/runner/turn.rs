@@ -2309,9 +2309,10 @@ mod tests {
         EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch,
         READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        append_report_text, edit_plan, edit_plan_text, extension_budget, named_file_defaults,
-        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
-        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, isolation_block,
+        named_file_defaults, parse_shortstat, parse_threshold, read_only_nudge_text,
+        read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
+        task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2326,6 +2327,30 @@ mod tests {
         }
     }
 
+    /// A guard's in-band refusal is classified by its prefix, with the guard's
+    /// own reason bounded; anything else is not a block.
+    #[test]
+    fn a_guard_refusal_is_classified_by_its_prefix() {
+        let (rule, reason) = isolation_block(
+            "COMMAND BLOCKED BY WORKTREE GUARDRAIL:\noutside the worktree\nPlease run ...",
+        )
+        .expect("a guardrail refusal is a block");
+        assert_eq!(rule, "worktree_guardrail");
+        assert_eq!(reason, "outside the worktree");
+
+        let (rule, reason) = isolation_block(
+            "BLOCKED: the sandbox could not be prepared (no landlock); the command was not run.",
+        )
+        .expect("a sandbox refusal is a block");
+        assert_eq!(rule, "sandbox_unavailable");
+        assert_eq!(reason, "(no landlock); the command was not run.");
+
+        assert!(
+            isolation_block("COMMAND OUTPUT (exit code: 0)\nhello").is_none(),
+            "a normal command output is not a block"
+        );
+        assert!(isolation_block("").is_none());
+    }
     #[test]
     fn the_report_scan_buffer_is_bounded_to_its_newest_bytes() {
         let long = "界".repeat(4096);

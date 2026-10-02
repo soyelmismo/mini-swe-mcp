@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -55,18 +55,18 @@ impl std::io::Write for SharedWriter {
 /// buffer it writes to.
 fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
     static ONCE: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
-    ONCE
-        .get_or_init(|| {
-            let buffer = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(SharedWriter(buffer.clone()))
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("install the capturing subscriber");
-            buffer
-        })
-        .clone()
+    ONCE.get_or_init(|| {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(SharedWriter(buffer.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install the capturing subscriber");
+        buffer
+    })
+    .clone()
 }
 
 fn logs(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -315,7 +315,10 @@ async fn a_guardrail_block_is_logged_and_counted() {
     let line = wait_for_audit_line(&buffer, &blocked_id)
         .await
         .expect("the refusal must reach the hub log");
-    assert!(line.contains("rule=destructive_command_interceptor"), "{line}");
+    assert!(
+        line.contains("rule=destructive_command_interceptor"),
+        "{line}"
+    );
     assert!(line.contains(&format!("worker={blocked_id}")), "{line}");
     assert!(line.contains(&format!("owner={TEST_OWNER}")), "{line}");
     assert!(line.contains("reason="), "{line}");
