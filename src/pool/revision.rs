@@ -1152,6 +1152,34 @@ impl super::WorkerPool {
         }
     }
 
+    /// Store the commit a worker branched from on its registry row.
+    ///
+    /// A continuation that finds the branch missing recreates it from
+    /// this commit: it is the only point an interrupted worker that
+    /// never committed still names, so without it a hub restart would
+    /// strand the worker. Written once, when the worktree opens, and
+    /// never rewritten -- the base of a run is what the branch was cut
+    /// from, whatever the run went on to commit.
+    pub(crate) async fn record_base_commit(&self, id: &str, base_commit: &str) {
+        if base_commit.is_empty() {
+            return;
+        }
+        let base_commit = base_commit.to_string();
+        let id = id.to_string();
+        let root = self.scratch.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut entry) = super::load_registry_entry_in(&root, &id) else {
+                return;
+            };
+            if entry.base_commit.as_deref() == Some(base_commit.as_str()) {
+                return;
+            }
+            entry.base_commit = Some(base_commit);
+            super::save_registry_entry_in(&root, &entry);
+        })
+        .await;
+    }
+
     /// Store the base branch detected during a continuation on the registry
     /// row, so the pre-completion base sync keeps running for that worker.
     async fn record_base_branch(&self, id: &str, base_branch: &str) {
@@ -1215,23 +1243,21 @@ impl super::WorkerPool {
         if Self::worker_branch_exists(repo_path, branch).await {
             return Ok(());
         }
-        let entry = super::load_registry_entry_in(&self.scratch, id);
-        // A head commit is the exact point the branch ended at; a base
-        // commit is where an interrupted worker's branch pointed when
-        // the hub stopped it, which is the best recreation point a
-        // no-commit worker has.
-        let head_commit = entry
-            .as_ref()
-            .and_then(|entry| entry.head_commit.clone())
-            .or_else(|| entry.as_ref().and_then(|entry| entry.base_commit.clone()));
-        let Some(head_commit) = head_commit else {
-            anyhow::bail!(
-                "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
-            );
-        };
+        // Recreation point, most precise first: the recorded head is the
+        // exact point the branch ended at, while the base commit is the
+        // only point an interrupted worker that never committed still
+        // names -- recreating from it is what keeps such a worker
+        // continuable when its branch was pruned.
+        let recreate_at = super::load_registry_entry_in(&self.scratch, id)
+            .and_then(|entry| entry.head_commit.clone().or(entry.base_commit.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
+                )
+            })?;
         let repo = repo_path.to_path_buf();
         let branch_for_git = branch.to_string();
-        let head = head_commit.clone();
+        let head = recreate_at.clone();
         let recreated = tokio::task::spawn_blocking(move || {
             crate::worktree::git(&repo, "branch", &["branch", &branch_for_git, &head])
                 .map(|out| out.status.success())
@@ -1241,14 +1267,14 @@ impl super::WorkerPool {
         .unwrap_or(false);
         if !recreated {
             anyhow::bail!(
-                "Worker branch {branch} no longer exists and could not be recreated from commit {head_commit}; the finished worker {id} cannot be revised"
+                "Worker branch {branch} no longer exists and could not be recreated from commit {recreate_at}; the finished worker {id} cannot be revised"
             );
         }
         tracing::info!(
             worker = %id,
             branch = %branch,
-            commit = %head_commit,
-            "Recreated a pruned worker branch from its recorded head"
+            commit = %recreate_at,
+            "Recreated a pruned worker branch from the commit its row recorded"
         );
         Ok(())
     }
