@@ -35,7 +35,9 @@ impl McpServer {
         // must not be spliced into a scratch path or a git argument. Refusing
         // it here is both the honest answer and the safe one.
         let state = self.pool.get_worker_state(wid).await;
-        // guard removed for the failing signal
+        if state.is_none() && repo.is_none() {
+            anyhow::bail!("Worker not found: {wid}");
+        }
         // This process's own record is the only state that distinguishes a live
         // worker from a row a dead process left behind, and a live one must be
         // killed first: a discard deletes unmerged work with no gate at all.
