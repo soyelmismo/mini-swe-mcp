@@ -1076,7 +1076,11 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
                 println!("{error}");
                 return Ok(0);
             }
-            Err(error) if error.to_string().contains("already covered by the running watch") => {
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("already covered by the running watch") =>
+            {
                 // The running watch already follows everything this one asked
                 // for: nothing to widen, nothing to wait for here.
                 println!("{error}");
@@ -1098,10 +1102,6 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         if !watch_reply_has_fields(&response) {
             return registry_fallback(opts, json_output, admin, OLD_WATCH_REPLY_NOTICE).await;
         }
-        // Another invocation of this session widened the running watch: follow
-        // the union from the next poll on. The widened selection only ever
-        // grows, so this process keeps its place and its pending events while
-        // its filter becomes the union of both requests.
         // The hub answers a second watch of this session in-band: either the
         // running watch already covered it, or it was just widened to the
         // union. Both exit 0 at once; the running process - on its own
@@ -1111,8 +1111,14 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             println!(
                 "{}",
                 crate::mcp::events::widened_watch_message(
-                    widened.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32),
-                    widened.get("selection").and_then(|v| v.as_str()).unwrap_or(""),
+                    widened
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    widened
+                        .get("selection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
                 )
             );
             return Ok(0);
@@ -1121,8 +1127,14 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             println!(
                 "{}",
                 crate::mcp::events::covered_watch_message(
-                    covered.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32),
-                    covered.get("selection").and_then(|v| v.as_str()).unwrap_or(""),
+                    covered
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    covered
+                        .get("selection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
                 )
             );
             return Ok(0);

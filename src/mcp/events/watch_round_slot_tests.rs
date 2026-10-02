@@ -90,7 +90,9 @@ fn a_refused_round_watch_does_not_consume_the_round() {
         "the covered watch must name the running selection: {covered}"
     );
     assert!(
-        covered["events"].as_array().is_some_and(|events| events.is_empty()),
+        covered["events"]
+            .as_array()
+            .is_some_and(|events| events.is_empty()),
         "a covered watch carries no events: {covered}"
     );
 

@@ -83,12 +83,12 @@ impl McpServer {
         // refused, and answers immediately with the confirmation; a call it
         // already covers answers "already covered" the same way.
         let selection = WatchSelection::new(ids.iter().cloned(), groups.iter().cloned(), all);
-        let _slot = match self
-            .hub_events
-            .lock()
-            .await
-            .begin_watch(&watch_key(ctx), ctx.id, ctx.pid, &selection)
-        {
+        let _slot = match self.hub_events.lock().await.begin_watch(
+            &watch_key(ctx),
+            ctx.id,
+            ctx.pid,
+            &selection,
+        ) {
             WatchStart::Started(slot) => slot,
             WatchStart::Covered { pid } => {
                 return Ok(json!({
@@ -115,9 +115,7 @@ impl McpServer {
         // the union of every request of this session, so follow it from the
         // next poll on. The union only ever grows, and the caller's ownership
         // check is unchanged, so another owner's workers never appear.
-        let mut ids = ids;
-        let mut groups = groups;
-        let mut all = all;
+        let (mut ids, mut groups, mut all) = (ids, groups, all);
         loop {
             let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
             if let Some(widened) = reply.get("widened") {

@@ -1171,7 +1171,10 @@ async fn a_second_cli_watch_for_one_session_exits_zero_when_covered() {
         "{stdout}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("already covered by the running watch"), "{stdout}");
+    assert!(
+        stdout.contains("already covered by the running watch"),
+        "{stdout}"
+    );
 
     // Once the holder exits, the session may watch again.
     let _ = first.kill();

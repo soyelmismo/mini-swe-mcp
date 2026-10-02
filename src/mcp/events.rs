@@ -496,10 +496,14 @@ impl WatchSelection {
         if self.groups.is_empty() {
             parts.push("every group".to_string());
         } else {
-            parts.push(
-                format!("--group {}", self.groups.iter().cloned().collect::<Vec<_>>()
-                    .join(" --group ")),
-            );
+            parts.push(format!(
+                "--group {}",
+                self.groups
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" --group ")
+            ));
         }
         if self.ids.is_empty() && !self.all {
             parts.push("every worker you own".to_string());
@@ -540,13 +544,19 @@ impl WatchStart {
 
 /// The one line a covered `watch` prints: it exits 0, carrying nothing.
 pub fn covered_watch_message(pid: Option<u32>, selection: &str) -> String {
-    format!("already covered by the running watch ({}): {selection}", pid_label(pid))
+    format!(
+        "already covered by the running watch ({}): {selection}",
+        pid_label(pid)
+    )
 }
 
 /// The one line a widened `watch` prints: it exits 0 immediately, while the
 /// running watch - on its existing connection - delivers the union.
 pub fn widened_watch_message(pid: Option<u32>, selection: &str) -> String {
-    format!("widened the running watch ({}) to: {selection}", pid_label(pid))
+    format!(
+        "widened the running watch ({}) to: {selection}",
+        pid_label(pid)
+    )
 }
 
 fn pid_label(pid: Option<u32>) -> String {
@@ -573,7 +583,10 @@ pub(super) enum Admission {
     /// This connection holds (or has just taken) the slot and must follow the
     /// returned selection: its own request, unioned with whatever an earlier
     /// widening already added.
-    Held { token: u64, selection: WatchSelection },
+    Held {
+        token: u64,
+        selection: WatchSelection,
+    },
     /// Another connection of the same identity is watching, and it already
     /// follows everything this request asked for.
     Covered { pid: Option<u32> },
@@ -609,7 +622,6 @@ impl WatchRegistry {
     fn has(&self, identity: &str) -> bool {
         self.lock().contains_key(identity)
     }
-
 
     /// Claim `identity`'s one watch slot for a *poll* of `selection` on
     /// `connection`: re-entrant, so the connection that holds the slot keeps it
@@ -696,7 +708,9 @@ impl WatchRegistry {
     /// The selection `identity`'s running watch follows, or `None` while no
     /// watch runs for it.
     pub(super) fn selection(&self, identity: &str) -> Option<WatchSelection> {
-        self.lock().get(identity).map(|active| active.selection.clone())
+        self.lock()
+            .get(identity)
+            .map(|active| active.selection.clone())
     }
 
     fn release_token(&self, identity: &str, token: u64) {
@@ -1069,13 +1083,11 @@ impl EventRouter {
         selection: &WatchSelection,
     ) -> WatchStart {
         match self.watches.start(identity, connection, pid, selection) {
-            Admission::Held { token, .. } => {
-                WatchStart::Started(WatchGuard {
-                    registry: Arc::clone(&self.watches),
-                    identity: identity.to_string(),
-                    token,
-                })
-            }
+            Admission::Held { token, .. } => WatchStart::Started(WatchGuard {
+                registry: Arc::clone(&self.watches),
+                identity: identity.to_string(),
+                token,
+            }),
             Admission::Covered { pid } => WatchStart::Covered { pid },
             Admission::Widened {
                 pid,
@@ -2041,13 +2053,13 @@ impl EventRouter {
                 // that never reads notifications still asks for it next poll.
                 self.push_widen(connection, &selection);
                 return Ok(json!({"watching":[], "events":[],
-                    "widened":{
-                        "pid":pid,
-                        "selection":selection.describe(),
-                        "worker_ids":selection.ids.iter().collect::<Vec<_>>(),
-                        "group":selection.groups.iter().collect::<Vec<_>>(),
-                        "all":selection.all,
-                    }}));
+                "widened":{
+                    "pid":pid,
+                    "selection":selection.describe(),
+                    "worker_ids":selection.ids.iter().collect::<Vec<_>>(),
+                    "group":selection.groups.iter().collect::<Vec<_>>(),
+                    "all":selection.all,
+                }}));
             }
         };
         // The unioned selection, not the request, is what filters this reply:
@@ -2063,7 +2075,7 @@ impl EventRouter {
             .values()
             .filter(|v| {
                 allowed(v)
-                    && crate::cli::watch::matches(v, &ids, &groups)
+                    && crate::cli::watch::matches(v, ids, groups)
                     && matches!(
                         v["status"].as_str(),
                         Some("running" | "paused" | "reviewing")
@@ -2175,7 +2187,7 @@ impl EventRouter {
                         .and_then(|v| v["sequence"].as_u64())
                         .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
             };
-            crate::cli::watch::round_event(&self.watch_current, &ids, &groups, now, fresh, allowed)
+            crate::cli::watch::round_event(&self.watch_current, ids, groups, now, fresh, allowed)
         };
         // The slot was claimed by the caller before the mode branch, so
         // this only acknowledges the reported round: a sibling round that is
@@ -2183,7 +2195,7 @@ impl EventRouter {
         if let Some(event) = event {
             // Only the round the event reports is acknowledged: a sibling round
             // that is still running keeps its transitions for the next watch.
-            self.ack_round(ctx, &ids, &groups, event["group"].as_str());
+            self.ack_round(ctx, ids, groups, event["group"].as_str());
             return Ok(json!({"watching":watching,"events":[event]}));
         }
         Ok(json!({"watching":watching,"events":[]}))

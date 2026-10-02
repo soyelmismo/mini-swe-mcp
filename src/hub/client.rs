@@ -869,7 +869,7 @@ impl HubClient {
         (!params["selection"].as_str().unwrap_or("").is_empty()).then(|| params.clone())
     }
 
-pub async fn worker(&mut self, arguments: Value) -> Result<Value> {
+    pub async fn worker(&mut self, arguments: Value) -> Result<Value> {
         let result = self
             .request(
                 "tools/call",
