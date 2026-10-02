@@ -167,10 +167,15 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 /// starts on the first failure and is never extended, so a watch cannot hold a
 /// decision open forever.
 pub fn reconnect_deadline() -> Duration {
-    let secs = crate::config::env_parse(RECONNECT_DEADLINE_ENV)
+    Duration::from_secs(reconnect_secs(None))
+}
+
+/// The budget in seconds: the environment override, else the default, clamped.
+fn reconnect_secs(requested: Option<u64>) -> u64 {
+    requested
+        .or_else(|| crate::config::env_parse(RECONNECT_DEADLINE_ENV))
         .unwrap_or(DEFAULT_RECONNECT_SECS)
-        .clamp(MIN_RECONNECT_SECS, MAX_RECONNECT_SECS);
-    Duration::from_secs(secs)
+        .clamp(MIN_RECONNECT_SECS, MAX_RECONNECT_SECS)
 }
 
 /// The failure that ends the chase for good, once the budget is spent.
@@ -201,15 +206,35 @@ fn error_chain(error: &anyhow::Error) -> String {
 /// never delivered is asked for again. `with` re-sends the hello through the
 /// caller's own connection path, so the stdio proxy keeps the identity its MCP
 /// client established while the CLI hands back a fresh [`HubClient`].
-pub async fn reconnect_following<F, Fut>(deadline: Duration, mut with: F) -> Result<HubClient>
+pub async fn reconnect_following<R>(deadline: Duration, with: R) -> Result<HubClient>
 where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<HubClient>>,
+    R: Reconnect<Output = HubClient>,
 {
+    follow_until(deadline, with).await
+}
+
+/// One dial-and-greet attempt, in the shape every hub transport reconnects with:
+/// a closure returning a future, so the chase never knows what it is dialling.
+///
+/// Implemented by [`reconnect_following`]'s callers and, in tests, by any
+/// stand-in for a dial.
+pub trait Reconnect {
+    type Output;
+    /// One attempt: the connection it made, or why there is none.
+    fn attempt(&mut self) -> impl Future<Output = Result<Self::Output>>;
+}
+
+/// The chase itself: dial, and if the daemon is simply gone, dial again after a
+/// backoff until `deadline`.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn follow_until<R: Reconnect>(
+    deadline: Duration,
+    mut with: R,
+) -> Result<R::Output> {
     let started = tokio::time::Instant::now();
     let mut delay = RECONNECT_BACKOFF_START;
     loop {
-        match with().await {
+        match with.attempt().await {
             Ok(client) => return Ok(client),
             // A fault that is not "the daemon is gone" is the caller's own
             // error (a refused identity, a malformed reply): report it now
@@ -222,6 +247,19 @@ where
         }
         tokio::time::sleep(delay.min(deadline.saturating_sub(started.elapsed()))).await;
         delay = (delay * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Any closure that produces one connection attempt is a [`Reconnect`].
+impl<F, Fut, T> Reconnect for F
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    type Output = T;
+
+    fn attempt(&mut self) -> impl Future<Output = Result<Self::Output>> {
+        self()
     }
 }
 
@@ -827,3 +865,7 @@ impl HubClient {
         Ok(serde_json::from_str(text)?)
     }
 }
+
+#[cfg(test)]
+#[path = "client_reconnect_tests.rs"]
+mod reconnect_tests;
