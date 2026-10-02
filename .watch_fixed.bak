@@ -266,7 +266,7 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     // that reached its budget and became a background job is the same command
     // from here: it keeps running in its own process group and the worker is
     // only waiting on it, so it is activity too.
-    if view["command_started_at"].is_number() && matches!(status, "running" | "reviewing") {
+    if in_flight(view, status) {
         return None;
     }
     let metrics: WorkerMetrics =
