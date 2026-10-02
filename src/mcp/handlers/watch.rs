@@ -195,4 +195,4 @@ pub(in crate::mcp) const GROUP_DESCRIPTION: &str =
 
 pub(in crate::mcp) const TIMEOUT_SECS_DESCRIPTION: &str = "Watch deadline secs; expiry: no_event.";
 
-pub(in crate::mcp) const ALL_DESCRIPTION: &str = "The whole round as one event.";
+pub(in crate::mcp) const ALL_DESCRIPTION: &str = "The round as one event.";

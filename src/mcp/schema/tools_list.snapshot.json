@@ -28,7 +28,7 @@
             "type": "string"
           },
           "all": {
-            "description": "The whole round as one event.",
+            "description": "The round as one event.",
             "type": "boolean"
           },
           "approved": {
@@ -189,7 +189,7 @@
             "type": "string"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty disables. Cheap for workers, full for consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables. Cheap for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
