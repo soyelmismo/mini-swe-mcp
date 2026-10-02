@@ -183,3 +183,28 @@ fn test_format_kill_and_steer_reflect_the_tool_answer() {
         "✓ Worker w: Steering instruction queued"
     );
 }
+
+#[test]
+fn test_health_line_reports_isolation_blocks_only_when_they_happened() {
+    let blocked = health_line(&v(
+        r#"{"state":{"details":{"metrics":{"turns_used":4,"isolation_blocks":2}}}}"#,
+    ))
+    .expect("a measured run renders a health line");
+    assert_eq!(
+        blocked,
+        "Health: 4 turns, +0/-0 ext, 0 repeats, 0 nudges, 2 isolation blocks"
+    );
+
+    // Zero blocks add nothing, and an all-zero set still renders nothing.
+    let clean = health_line(&v(
+        r#"{"state":{"details":{"metrics":{"turns_used":4,"isolation_blocks":0}}}}"#,
+    ))
+    .expect("a measured run renders a health line");
+    assert!(!clean.contains("isolation"), "{clean}");
+    assert_eq!(
+        health_line(&v(
+            r#"{"state":{"details":{"metrics":{"isolation_blocks":0}}}}"#
+        )),
+        None
+    );
+}

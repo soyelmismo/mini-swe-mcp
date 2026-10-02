@@ -49,6 +49,10 @@ pub struct WorkerMetrics {
     pub diff_insertions: usize,
     /// Lines removed by the final diff.
     pub diff_deletions: usize,
+    /// Commands an isolation guard refused to run: a worktree-guardrail or
+    /// interceptor block, a sandbox that could not be prepared, or a
+    /// completion side-effect audit that found leftovers.
+    pub isolation_blocks: usize,
 }
 
 impl WorkerMetrics {
