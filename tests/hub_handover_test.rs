@@ -17,6 +17,7 @@ mod common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1004,4 +1005,163 @@ async fn auto_handover_is_disabled_by_env() {
         daemon.try_wait().unwrap().is_none(),
         "the daemon must keep running"
     );
+}
+
+// ----------
+// Strict teardown ordering across a handover.
+// ----------
+
+/// A git repository a dispatch can cut a worker worktree from.
+fn dispatch_repo(tag: &str) -> common::TempDir {
+    let repo = common::TempDir::new_in_tmp(tag);
+    common::git(repo.path(), &["init", "-b", "master"]);
+    common::git(repo.path(), &["config", "user.name", "handover"]);
+    common::git(repo.path(), &["config", "user.email", "handover@test"]);
+    std::fs::write(repo.path().join("lib.rs"), "// base\n").unwrap();
+    common::git(repo.path(), &["add", "."]);
+    common::git(repo.path(), &["commit", "-m", "base"]);
+    repo
+}
+
+/// Wait until `id` reaches a terminal state in `pool`, or panic.
+async fn wait_for_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(state) = pool.get_worker_state(id).await
+            && !matches!(
+                state,
+                WorkerState::Running { .. } | WorkerState::Paused { .. }
+            )
+        {
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker {id} never reached a terminal state"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// A handover with an interrupted worker whose teardown is artificially slowed
+/// must not let the replacement daemon touch that worker's worktree before the
+/// old daemon has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handover_waits_for_the_predecessors_worker_teardown() {
+    let hub = common::TempDir::new_in_tmp("handover-order");
+    let repo = dispatch_repo("handover-order-repo");
+    let scratch = common::TempDir::new_in_tmp("handover-order-root");
+    let root = ScratchRoot::new(scratch.path());
+
+    // The old daemon: a real pool over the shared scratch root.
+    let llm = common::fake_llm::FakeLlm::spawn("true", "sleep 2").await;
+    let old_pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone());
+    let (paths, old_daemon) = daemon_on(&hub, old_pool.clone());
+    let old_task = tokio::spawn(async move { old_daemon.run().await });
+
+    // One worker, interrupted mid-turn with a live worktree: turn one runs
+    // `true`, turn two the slow `sleep 2` the handover cuts short.
+    let id = old_pool
+        .dispatch(
+            "handover-test".to_string(),
+            "slow worker".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            10,
+            None,
+            None,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let worktree = root.join(format!("swe-wt-{id}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if worktree.is_dir()
+            && let Some(WorkerState::Running { last_command, .. }) =
+                old_pool.get_worker_state(&id).await
+            && last_command.contains("sleep")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never reached its slow command"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Slow the old daemon's worktree teardown: its guard drop now sleeps two
+    // seconds after the abort, so a replacement that does not wait recreates
+    // the worktree while the old one is still being removed.
+    WorktreeGuard::__test_set_teardown_delay(&id, Duration::from_secs(2));
+
+    let mut client = Client::connect(&paths.socket()).await;
+
+    // Deadline one: a command is in flight, so the handover happens at the
+    // deadline instead of waiting for it.
+    let started = std::time::Instant::now();
+    let reply = client.handover(1).await;
+    assert_eq!(reply["result"]["deadline_secs"], 1, "{reply}");
+
+    // The old daemon stops accepting before it tears the workers down, so a
+    // client that finds the hub gone starts the replacement while the old one
+    // still holds the lock. Wait for that moment, then start the replacement.
+    let socket_gone = std::time::Instant::now() + Duration::from_secs(10);
+    while paths.socket().exists() {
+        assert!(
+            std::time::Instant::now() < socket_gone,
+            "the old daemon never stopped accepting connections"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let new_pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone());
+    let (new_paths, new_daemon) = daemon_on(&hub, new_pool.clone());
+    let new_task = tokio::spawn(async move { new_daemon.run().await });
+
+    // The old daemon finishes only after its delayed teardown completes.
+    let old_done = tokio::time::timeout(Duration::from_secs(20), old_task)
+        .await
+        .expect("the old daemon stops")
+        .expect("the old daemon task joins")
+        .expect("the old daemon shuts down cleanly");
+    assert!(old_done);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the old daemon must hold the lock until its delayed teardown finishes, took {:?}",
+        started.elapsed()
+    );
+
+    // The replacement must not have touched the interrupted worker's worktree
+    // before the old daemon finished: the old teardown removed it, and the new
+    // daemon has not recreated it yet.
+    assert!(
+        !worktree.exists(),
+        "the replacement daemon touched the interrupted worker's worktree before \
+         the old daemon finished teardown"
+    );
+    let log = std::fs::read_to_string(paths.log()).unwrap_or_default();
+    let stopped = log.find("stopped").expect("the old daemon logs 'stopped'");
+    let resumed = log.find("auto-continued");
+    assert!(
+        resumed.is_none_or(|at| at > stopped),
+        "recovery must run after the old daemon's teardown:\n{log}"
+    );
+
+    // The replacement waited for the lock, then recovered and continued the
+    // interrupted worker to completion.
+    let state = wait_for_terminal(&new_pool, &id).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "the replacement must continue the interrupted worker, got {state:?}"
+    );
+    WorktreeGuard::__test_clear_teardown_delay(&id);
+    new_task.abort();
+    let _ = new_task.await;
+    assert!(!new_paths.socket().exists(), "teardown removes the socket");
 }
