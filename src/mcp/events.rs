@@ -2314,3 +2314,5 @@ mod registry_verified_tests {
 mod event_dedup_tests;
 #[cfg(test)]
 mod watch_round_slot_tests;
+#[cfg(test)]
+mod retired_replay_tests;
