@@ -963,6 +963,35 @@ const OLD_WATCH_REPLY_NOTICE: &str = "[mini-swe] The running hub's 'hub/watch' r
 
 /// A `hub/watch` reply carries the fields this client reads: a missing
 /// `watching` is an older hub, not a genuine empty watch set.
+/// Adopt the union a second watch of this session pushed onto the running
+/// watch: the payload is the widened selection itself, so the ids and groups
+/// become exactly the union the hub stored, and `--all` sticks once either
+/// side asked for it.
+///
+/// An empty set is *every* worker (or group), so a widened selection with no
+/// ids or no groups drops any narrowing filter the running watch started with
+/// rather than keeping it. The union only ever grows, and it is applied to the
+/// live poll state, not only to the parsed flags: the running process keeps its
+/// place and its pending events, and its next snapshot already uses the wider
+/// filter.
+fn adopt_widened_selection(opts: &mut Options, ids: &mut BTreeSet<String>, widened: &Value) {
+    let list = |key: &str| -> BTreeSet<String> {
+        widened[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    opts.groups = list("group");
+    opts.ids = list("worker_ids");
+    *ids = opts.ids.clone();
+    if widened.get("all").and_then(Value::as_bool).unwrap_or(false) {
+        opts.all = true;
+    }
+}
+
 fn watch_reply_has_fields(response: &Value) -> bool {
     response.get("watching").is_some_and(Value::is_array)
         && response.get("events").is_some_and(Value::is_array)
@@ -1002,7 +1031,7 @@ fn end_watch(printed_event: bool, watched_any: bool) -> i32 {
 }
 
 pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32> {
-    let opts = Options::parse(args)?;
+    let mut opts = Options::parse(args)?;
     if std::env::var("MINI_SWE_NO_DAEMON").ok().as_deref() == Some("1") {
         return polling(opts, json_output, admin).await;
     }
@@ -1040,6 +1069,25 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
                 ids = opts.ids.clone();
                 continue;
             }
+            Err(error) if error.to_string().contains("widened the running watch") => {
+                // The running watch of this session was widened to the union
+                // of both selections: this invocation exits at once, and the
+                // running process - on its own connection - delivers the union.
+                println!("{error}");
+                return Ok(0);
+            }
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("already covered by the running watch") =>
+            {
+                // The running watch already follows everything this one asked
+                // for: nothing to widen, nothing to wait for here.
+                println!("{error}");
+                return Ok(0);
+            }
+            // A hub that predates the widening still refuses a second watch
+            // instead of covering or widening it; report it as it always did.
             Err(error) if error.to_string().contains("a watch is already running") => {
                 println!("{error}");
                 return Ok(5);
@@ -1055,6 +1103,49 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         };
         if !watch_reply_has_fields(&response) {
             return registry_fallback(opts, json_output, admin, OLD_WATCH_REPLY_NOTICE).await;
+        }
+        // The session's watch has grown behind this process: adopt the union
+        // and keep watching. The hub carries it on every poll, so a pushed
+        // widening frame is never the only way to learn it.
+        if let Some(union) = response.get("widen_to") {
+            adopt_widened_selection(&mut opts, &mut ids, union);
+        }
+        // The hub answers a second watch of this session in-band: either the
+        // running watch already covered it, or it was just widened to the
+        // union. Both exit 0 at once; the running process - on its own
+        // connection - delivers the union, so this invocation prints its one
+        // line and leaves.
+        if let Some(widened) = response.get("widened") {
+            println!(
+                "{}",
+                crate::mcp::events::widened_watch_message(
+                    widened
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    widened
+                        .get("selection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                )
+            );
+            return Ok(0);
+        }
+        if let Some(covered) = response.get("covered") {
+            println!(
+                "{}",
+                crate::mcp::events::covered_watch_message(
+                    covered
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32),
+                    covered
+                        .get("selection")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                )
+            );
+            return Ok(0);
         }
         let watching: BTreeSet<String> = response["watching"]
             .as_array()
@@ -1112,7 +1203,14 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // repairs channel overflow from the owner's bounded, unacknowledged backlog.
         if let Ok(result) = tokio::time::timeout(wait, client.next_watch_notification()).await {
             match result {
-                Ok(()) => {}
+                Ok(None) => {}
+                Ok(Some(widened)) => {
+                    // The hub pushed the union a second watch of this session
+                    // asked for: follow it from the next snapshot on. The
+                    // union only grows, so this process keeps its place and
+                    // its pending events while its filter becomes wider.
+                    adopt_widened_selection(&mut opts, &mut ids, &widened);
+                }
                 Err(error) if daemon_went_away(&error) => {
                     client = follow(reconnects, admin).await?;
                     initial = true;
