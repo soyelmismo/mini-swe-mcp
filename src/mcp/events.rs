@@ -1659,6 +1659,17 @@ impl EventRouter {
                     .as_str()
                     .unwrap_or("unattributed")
                     .to_string();
+                // A stall is an episode of a live worker; a terminal event
+                // ends it. Drop the worker's queued stalls so the stale
+                // episode neither replays at delivery nor keeps the round
+                // oracle fresh after the transition it preceded was read.
+                if event["event"] != "stalled"
+                    && let Some(history) = self.watch_history.get_mut(&owner)
+                {
+                    history.pending.retain(|queued| {
+                        !(queued["worker_id"] == *id && queued["event"] == "stalled")
+                    });
+                }
                 let sequence = self.sequence;
                 let history = self.history(&owner);
                 if history.pending.len() == 100 {
@@ -1849,12 +1860,30 @@ impl EventRouter {
         let event = {
             let reported = &self.watch_reported;
             let seen = &self.seen;
+            let acks = &self.acks;
             let fresh = |id: &str| {
-                pending.contains(id)
-                    || reported
-                        .get(id)
-                        .and_then(|v| v["sequence"].as_u64())
-                        .is_some_and(|sequence| seen.get(id).copied() != Some(sequence))
+                // A transition still queued for this owner is fresh outright.
+                if pending.contains(id) {
+                    return true;
+                }
+                let Some(event) = reported.get(id) else {
+                    return false;
+                };
+                if seen.get(id).copied() == event["sequence"].as_u64() {
+                    return false;
+                }
+                // A plain watch acknowledgement removes the queued event
+                // without marking its sequence seen, so the round has to
+                // consult the same ack store the replay guard does: an
+                // acknowledged transition must not return as a fresh round.
+                // The position is keyed by the event's owner, which is what
+                // an admin watch must look up too.
+                !acks.acknowledged(
+                    event["owner"].as_str().unwrap_or("unattributed"),
+                    id,
+                    event["revision"].as_u64().unwrap_or(0),
+                    event["event"].as_str().unwrap_or(""),
+                )
             };
             crate::cli::watch::round_event(&self.watch_current, &ids, &groups, now, fresh, allowed)
         };
@@ -2369,3 +2398,5 @@ mod event_dedup_tests;
 mod retired_replay_tests;
 #[cfg(test)]
 mod watch_round_slot_tests;
+#[cfg(test)]
+mod model_tests;
