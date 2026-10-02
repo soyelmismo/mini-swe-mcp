@@ -231,7 +231,7 @@ fn a_worker_the_consolidator_reported_fixed_is_absorbed_too() {
     block_on(
         h.pool
             .pool
-            .record_consolidator_absorbed(&meta, &[fixed.clone()]),
+            .record_consolidator_absorbed(&meta, std::slice::from_ref(&fixed)),
     );
 
     let row = load_registry_entry_in(&h.root(), &consolidator).expect("consolidator row");
@@ -260,7 +260,7 @@ fn an_unrelated_exhausted_worker_in_another_group_is_not_touched() {
     block_on(
         h.pool
             .pool
-            .record_consolidator_absorbed(&meta, &[unrelated.clone()]),
+            .record_consolidator_absorbed(&meta, std::slice::from_ref(&unrelated)),
     );
 
     let row = load_registry_entry_in(&h.root(), &consolidator).expect("consolidator row");
