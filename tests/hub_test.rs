@@ -6,7 +6,7 @@
 
 mod common;
 
-use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, hub_dir};
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
@@ -2084,11 +2084,5 @@ fn a_deep_hub_dir_still_gets_a_working_socket() {
     // The daemon files its socket in a short fallback directory when the hub
     // dir is too deep for `sun_path`. Own that directory so it is gone at test
     // end even if the detached daemon was killed rather than shut down.
-    let _fallback = match mini_swe_mcp::hub::HubPaths::new(deep.clone()).endpoint() {
-        HubEndpoint::Path(path) => path
-            .parent()
-            .filter(|parent| *parent != deep.as_path())
-            .map(|parent| common::TempDir::own(parent.to_path_buf())),
-        HubEndpoint::Abstract(_) => None,
-    };
+    let _fallback = common::fallback_socket_dir(&deep);
 }

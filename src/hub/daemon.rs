@@ -131,6 +131,23 @@ impl HubPaths {
         }
     }
 
+    /// The fallback directory [`HubPaths::socket`] would file its socket in,
+    /// or `None` when the socket fits in the hub directory.
+    ///
+    /// Answering "where would the socket go" must not *make* anything: the
+    /// endpoint a caller inspects is usually one it never binds, and a
+    /// fallback directory created for such a probe outlives the process that
+    /// made it -- an empty `/tmp/mswe-<uid>-<hash>` nobody ever owned. Only the
+    /// binder creates the directory, and it removes it with the socket (see
+    /// [`FallbackSocketGuard`]).
+    pub fn fallback_dir(&self) -> Option<PathBuf> {
+        let natural = self.dir.join("hub.sock");
+        if natural.as_os_str().len() < MAX_SOCKET_PATH {
+            return None;
+        }
+        Some(fallback_socket_dir(&self.dir))
+    }
+
     /// Where the hub listens: a filesystem socket when one fits, otherwise
     /// (no short writable directory, e.g. inside a sandbox that denies `/tmp`)
     /// a Linux abstract-namespace socket named after the hub dir. Daemon and
@@ -141,15 +158,7 @@ impl HubPaths {
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
             return HubEndpoint::Path(natural);
         }
-        let key = format!(
-            "mswe-{}-{:016x}",
-            current_uid(),
-            fnv1a(self.dir.as_os_str().as_encoded_bytes())
-        );
-        match harden_hub_dir(PathBuf::from("/tmp").join(&key)) {
-            Ok(dir) => HubEndpoint::Path(dir.join("hub.sock")),
-            Err(_) => HubEndpoint::Abstract(key),
-        }
+        fallback_endpoint(&self.dir)
     }
 
     /// The lock file serialising daemons on this directory.
@@ -270,6 +279,60 @@ fn bind_endpoint(endpoint: &HubEndpoint) -> Result<UnixListener> {
 
 /// Longest socket path used as-is, below Linux's 108-byte `sun_path`.
 const MAX_SOCKET_PATH: usize = 100;
+
+/// The name of the short fallback directory a too-deep hub directory's socket
+/// moves into: `mswe-<uid>-<hash>`, private to this user and derived from the
+/// hub directory so daemon and clients pick the same one.
+fn fallback_socket_key(dir: &Path) -> String {
+    format!(
+        "mswe-{}-{:016x}",
+        current_uid(),
+        fnv1a(dir.as_os_str().as_encoded_bytes())
+    )
+}
+
+/// Whether a fallback socket directory exists, or can be created here.
+///
+/// A sandbox that denies writes to `/tmp` must not send a hub to a socket path
+/// it can never bind: those hubs listen in the abstract namespace instead, and
+/// every caller derives the same answer from this one check. The test is
+/// declarative -- existence, or a parent this user can write to -- so resolving
+/// an endpoint never touches the filesystem it would create the directory in.
+fn fallback_dir_is_creatable(dir: &Path) -> bool {
+    if dir.metadata().is_ok() {
+        return true;
+    }
+    dir.parent()
+        .map(|parent| parent.metadata())
+        .and_then(Result::ok)
+        .is_some_and(|meta| meta.is_dir() && meta.uid() == current_uid())
+}
+
+/// Where a too-deep hub directory listens: the short fallback socket, or the
+/// abstract socket a sandbox that denies `/tmp` forces.
+///
+/// This is the single decision point, so the daemon that binds and the clients
+/// that dial always agree -- and it never creates anything: the fallback
+/// directory is created by `bind_endpoint` and removed again by
+/// [`FallbackSocketGuard`], so resolving an endpoint leaves no empty
+/// `/tmp/mswe-<uid>-<hash>` behind.
+fn fallback_endpoint(dir: &Path) -> HubEndpoint {
+    let fallback = fallback_socket_dir(dir);
+    if fallback_dir_is_creatable(&fallback) {
+        HubEndpoint::Path(fallback.join("hub.sock"))
+    } else {
+        HubEndpoint::Abstract(fallback_socket_key(dir))
+    }
+}
+
+/// The short fallback directory for `dir`, whether or not it exists yet.
+///
+/// Purely a path computation: callers that only inspect an endpoint must not
+/// create anything (see [`HubPaths::fallback_dir`]), while the daemon and the
+/// clients that bind there create it through [`harden_hub_dir`].
+fn fallback_socket_dir(dir: &Path) -> PathBuf {
+    PathBuf::from("/tmp").join(fallback_socket_key(dir))
+}
 
 /// FNV-1a: a stable short name for a hub dir's fallback socket directory.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -517,6 +580,9 @@ impl HubServer {
             if let Some(lock) = acquire_lock(&path)? {
                 return Ok(Some(lock));
             }
+            // A predecessor owns the socket here, so this daemon never binds.
+            // `endpoint()` resolves it without creating the fallback directory
+            // a hub that will not run would otherwise leave behind.
             if connect_endpoint(&self.config.paths().endpoint())
                 .await
                 .is_ok()
@@ -553,6 +619,17 @@ impl HubServer {
         // graceful shutdown path below.
         let _socket_cleanup = FallbackSocketGuard::new(&socket, paths.dir());
         let _ = std::fs::remove_file(&socket);
+        // A socket the hub directory is too deep to hold is filed in a short
+        // private directory of its own. The daemon creates it here -- the one
+        // place that is about to bind that socket -- and the guard above removes
+        // it again with the socket, so resolving the endpoint anywhere else (a
+        // client probing for a running hub, a lock waiter) leaves no empty
+        // `/tmp/mswe-<uid>-<hash>` behind. A directory this user cannot get is
+        // not an error: `endpoint` then answers with the abstract socket, which
+        // is what a hub without `/tmp` has always listened on.
+        if let Some(fallback) = paths.fallback_dir() {
+            let _ = harden_hub_dir(fallback);
+        }
         let endpoint = paths.endpoint();
         let listener = bind_endpoint(&endpoint)?;
 
@@ -1059,5 +1136,91 @@ mod tests {
             .await
             .expect("accept task")
             .expect("accept the connection");
+    }
+
+    /// The short fallback directory is created by the daemon that binds it and
+    /// taken away with the socket, so nothing is ever left holding an empty one.
+    ///
+    /// Everything else resolves the endpoint without touching the filesystem,
+    /// which is what makes the resolution side-effect free; this pins the other
+    /// half of that contract.
+    #[tokio::test]
+    async fn binding_a_fallback_socket_creates_a_directory_the_guard_then_removes() {
+        let scratch = crate::test_support::TestScratch::new("hub-bind-fallback");
+        let hub_dir = scratch.path().join("hub");
+        std::fs::create_dir_all(&hub_dir).expect("create the hub dir");
+        // The fallback directory stands in for `/tmp/mswe-<uid>-<hash>`, so
+        // this test never writes outside its scratch.
+        let fallback = scratch.path().join("mswe-fallback");
+        let socket = fallback.join("hub.sock");
+        let guard = FallbackSocketGuard::new(&socket, &hub_dir);
+
+        // The daemon's sequence: create the directory, then bind into it.
+        harden_hub_dir(fallback.clone()).expect("create the fallback socket directory");
+        let listener =
+            bind_endpoint(&HubEndpoint::Path(socket.clone())).expect("bind the fallback socket");
+        assert!(fallback.is_dir());
+        assert!(socket.exists());
+        drop(listener);
+        drop(guard);
+        assert!(
+            !fallback.exists(),
+            "the guard must remove the fallback directory with the socket"
+        );
+        assert!(!socket.exists(), "the guard must remove the socket");
+    }
+
+    /// Resolving the endpoint of a hub directory too deep for `sun_path` names
+    /// a short fallback directory under `/tmp` -- and must not leave one behind.
+    ///
+    /// Callers routinely ask where the socket would go and never bind it (the
+    /// tests' `socket()` probes, a client deciding whether a daemon is
+    /// listening). A `socket()` call that created `/tmp/mswe-<uid>-<hash>` would
+    /// leave an empty directory behind for every such probe, under a `TMPDIR`
+    /// deep enough to force the fallback.
+    #[test]
+    fn resolving_a_deep_hub_endpoint_creates_no_fallback_directory() {
+        let scratch = crate::test_support::TestScratch::new("hub-deep-endpoint");
+        let deep = scratch
+            .path()
+            .join("a-rather-long-directory-name-to-push-the-socket-path")
+            .join("past-the-unix-socket-path-limit-of-one-hundred-and-eight-bytes");
+        std::fs::create_dir_all(&deep).expect("create the deep hub dir");
+        let paths = HubPaths::new(deep.clone());
+
+        // The premise: this hub directory is too deep to hold its own socket.
+        assert!(
+            deep.join("hub.sock").as_os_str().len() >= MAX_SOCKET_PATH,
+            "the hub dir must exceed the socket path limit for this test to mean anything"
+        );
+
+        // Asking where the socket would go creates nothing ...
+        let fallback = paths
+            .fallback_dir()
+            .expect("a deep hub dir needs a fallback dir");
+        // The directory the endpoint resolution names must not exist, whether or
+        // not this host can create one: a resolvable `/tmp` is what turned every
+        // such probe into an empty leftover directory.
+        let _ = paths.endpoint();
+        assert!(
+            !fallback.exists(),
+            "fallback_dir() must only compute the path, not create {}",
+            fallback.display()
+        );
+        let _ = paths.socket();
+        assert!(
+            !fallback.exists(),
+            "probing the socket left {} behind",
+            fallback.display()
+        );
+        // Nor does a client checking whether a daemon is already up, nor the
+        // lock waiter probing for a predecessor: both dial the fallback socket
+        // through `endpoint()`, which resolves it without creating it.
+        let _ = paths.socket();
+        assert!(
+            !fallback.exists(),
+            "a probe of the endpoint left {} behind",
+            fallback.display()
+        );
     }
 }
