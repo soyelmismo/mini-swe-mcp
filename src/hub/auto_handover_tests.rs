@@ -38,7 +38,10 @@ fn a_change_must_be_stable_before_it_is_probed() {
         Verdict::Wait
     );
     // The file is gone: a cargo replace unlinks before it writes.
-    assert_eq!(watch.observe(None, t0 + Duration::from_secs(2), stable), Verdict::Wait);
+    assert_eq!(
+        watch.observe(None, t0 + Duration::from_secs(2), stable),
+        Verdict::Wait
+    );
     // The new file has been there, unchanged, for the whole window.
     assert_eq!(
         watch.observe(Some(fp(3, 120)), t0 + Duration::from_secs(3), stable),
@@ -96,13 +99,11 @@ async fn the_probe_only_accepts_a_runnable_build_identity() {
 
     // A binary that prints the identity: accepted.
     let good = scratch.path().join("good");
-    std::fs::write(
-        &good,
-        "#!/bin/sh\necho '{\"id\":\"abc123\",\"ts\":42}'\n",
-    )
-    .unwrap();
+    std::fs::write(&good, "#!/bin/sh\necho '{\"id\":\"abc123\",\"ts\":42}'\n").unwrap();
     std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let build = probe_build(&good).await.expect("a runnable build prints its id");
+    let build = probe_build(&good)
+        .await
+        .expect("a runnable build prints its id");
     assert_eq!(build["id"], "abc123");
     assert_eq!(build["ts"], 42);
 

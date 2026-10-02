@@ -25,7 +25,10 @@
 //!
 //! Only a build the existing identity check
 //! ([`crate::hub::client::supersedes`]) calls newer arms the handover.
-//! `HUB_AUTO_HANDOVER=0` disables the watch.
+//! `HUB_AUTO_HANDOVER=0` disables the watch, and only a daemon that can
+//! respawn itself ([`crate::hub::HubConfig`] built by `run_daemon`) watches at
+//! all. `MINI_SWE_HUB_EXE_POLL_MS` and `MINI_SWE_HUB_EXE_STABLE_MS` shorten
+//! the two windows for tests; production never sets them.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -64,14 +67,14 @@ pub fn enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// The poll interval, overridable for tests.
+/// How often the daemon re-stats its own executable, overridable for tests.
 fn poll_interval() -> Duration {
     crate::config::env_parse::<u64>(POLL_ENV)
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_POLL)
 }
 
-/// The stability window, overridable for tests.
+/// How long a changed executable must look identical, overridable for tests.
 fn stable_for() -> Duration {
     crate::config::env_parse::<u64>(STABLE_ENV)
         .map(Duration::from_millis)
@@ -202,8 +205,12 @@ async fn probe_build(exe: &Path) -> Option<Value> {
     let probe = tokio::process::Command::new(exe)
         .arg("--build-id")
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output();
-    let output = tokio::time::timeout(PROBE_TIMEOUT, probe).await.ok()?.ok()?;
+    let output = tokio::time::timeout(PROBE_TIMEOUT, probe)
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -254,7 +261,10 @@ pub async fn watch(
         }
         let id = build["id"].as_str().unwrap_or_default();
         info!("executable changed: arming handover to build {id}");
-        super::daemon::append_log(&log, &format!("executable changed: arming handover to build {id}"));
+        super::daemon::append_log(
+            &log,
+            &format!("executable changed: arming handover to build {id}"),
+        );
         server.request_handover(deadline);
         return;
     }

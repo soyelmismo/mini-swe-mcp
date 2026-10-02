@@ -752,8 +752,16 @@ fn replace_all(bytes: &mut [u8], from: &[u8], to: &[u8]) -> usize {
 fn patch_build_id(exe: &std::path::Path, new_id: &str, new_ts: &str) {
     let old_id = env!("MINI_SWE_BUILD_ID");
     let old_ts = env!("MINI_SWE_BUILD_TS");
-    assert_eq!(new_id.len(), old_id.len(), "build id length must be preserved");
-    assert_eq!(new_ts.len(), old_ts.len(), "build ts length must be preserved");
+    assert_eq!(
+        new_id.len(),
+        old_id.len(),
+        "build id length must be preserved"
+    );
+    assert_eq!(
+        new_ts.len(),
+        old_ts.len(),
+        "build ts length must be preserved"
+    );
     let mut bytes = std::fs::read(exe).expect("read the binary copy");
     let n_id = replace_all(&mut bytes, old_id.as_bytes(), new_id.as_bytes());
     let n_ts = replace_all(&mut bytes, old_ts.as_bytes(), new_ts.as_bytes());
@@ -836,12 +844,25 @@ async fn a_rebuilt_executable_arms_a_handover_without_a_client() {
     let paths = HubPaths::new(hub.path().to_path_buf());
     wait_for_log(hub.path(), "listening", 1).await;
 
-    // Replace the copy with a different, newer build.
+    // Replace the copy with a different, newer build. The patched binary
+    // must report the new identity through the flag the daemon probes with.
     let new_id = replace_exe_with_newer_build(&exe);
+    let probe = std::process::Command::new(&exe)
+        .arg("--build-id")
+        .output()
+        .expect("run the patched binary");
+    assert!(probe.status.success(), "the patched build must run");
+    let identity: Value = serde_json::from_slice(&probe.stdout).expect("--build-id prints JSON");
+    assert_eq!(identity["id"], new_id.as_str(), "{identity}");
 
     // The daemon arms the handover by itself and stops; the replacement
     // daemon (the patched build) comes up without any client call.
-    wait_for_log(hub.path(), "executable changed: arming handover to build", 1).await;
+    wait_for_log(
+        hub.path(),
+        "executable changed: arming handover to build",
+        1,
+    )
+    .await;
     let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
     assert!(
         log.contains(&format!("arming handover to build {new_id}")),
@@ -902,7 +923,7 @@ async fn a_half_written_or_unexecutable_file_does_not_arm() {
     std::fs::rename(&not_exec, &exe).unwrap();
 
     // Neither arms a handover, and the daemon keeps serving.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     let log = std::fs::read_to_string(hub.path().join("hub.log")).unwrap_or_default();
     assert!(
         !log.contains("arming handover"),
@@ -918,6 +939,11 @@ async fn a_half_written_or_unexecutable_file_does_not_arm() {
         json!({}),
         "the daemon must keep serving"
     );
+
+    // A complete replacement still arms the handover: the refusals above were
+    // the completeness checks, not a watcher that is dead altogether.
+    let new_id = replace_exe_with_newer_build(&exe);
+    wait_for_log(hub.path(), &format!("arming handover to build {new_id}"), 1).await;
 }
 
 /// `HUB_AUTO_HANDOVER=0` disables the watch: a rebuilt executable does not
