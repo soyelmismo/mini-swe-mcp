@@ -486,6 +486,41 @@ impl WorkerPool {
         }
     }
 
+    /// Publish `command` as a live worker's command in flight, returning the
+    /// label it replaced (`None` when the worker is not live or ran nothing).
+    ///
+    /// A harness-side wait spends no bash command, so without this the status
+    /// view would keep showing the previous command for the whole wait.
+    async fn set_running_command(&self, id: &str, command: &str) -> Option<String> {
+        let mut previous = None;
+        self.update_worker(id, |worker| {
+            if let WorkerState::Running { last_command, .. } = &mut worker.state {
+                previous = Some(last_command.clone());
+                *last_command = command.to_string();
+            }
+        })
+        .await;
+        previous
+    }
+
+    /// Put back the command label a [`WorkerPool::set_running_command`] replaced.
+    ///
+    /// The restore only fires while the label is still the wait's own: a wait
+    /// that ended because the worker itself stopped (killed, paused, finished)
+    /// must not overwrite the state that stop wrote.
+    async fn restore_running_command(&self, id: &str, wait_label: &str, previous: Option<String>) {
+        if let Some(previous) = previous {
+            self.update_worker(id, |worker| {
+                if let WorkerState::Running { last_command, .. } = &mut worker.state
+                    && last_command == wait_label
+                {
+                    *last_command = previous;
+                }
+            })
+            .await;
+        }
+    }
+
     fn notify_change(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1611,6 +1646,11 @@ impl WorkerPool {
         // Held for the whole wait: the consolidator is running a command as far
         // as the stall detector is concerned.
         let _running = self.command_running(&actor.id);
+        // Name the wait as the command in flight, so `status` shows what the
+        // consolidator is actually doing instead of its previous command, and
+        // restore the previous label once the wait returns.
+        let wait_label = format!("CONSOLIDATE_WAIT {}", ids.join(" "));
+        let previous_command = self.set_running_command(&actor.id, &wait_label).await;
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.subscribe_changes();
         let mut timed_out = false;
@@ -1640,6 +1680,8 @@ impl WorkerPool {
         for (slot, id) in &waited {
             lines[*slot] = Some(self.stopped_line(id, timed_out, timeout.as_secs()).await);
         }
+        self.restore_running_command(&actor.id, &wait_label, previous_command)
+            .await;
         lines.into_iter().flatten().collect::<Vec<_>>().join("\n")
     }
 
@@ -1905,9 +1947,36 @@ impl WorkerPool {
         result
     }
 
-    /// Whether a paused worker's answer belongs to its last steering consolidator.
-    pub fn question_for_consolidator(&self, id: &str) -> bool {
-        steer::read_source(&self.scratch, id).is_some()
+    /// Whether a paused worker's answer belongs to a steering consolidator that
+    /// has not stopped.
+    ///
+    /// The question is routed to the consolidator only while it is live: a
+    /// consolidator that finished, failed or died is gone from
+    /// `CONSOLIDATE_WAIT`, so the owner's watch is the only reader left and the
+    /// question must reach it rather than be withheld forever. This is the same
+    /// liveness [`steered_by_live_consolidator`](Self::steered_by_live_consolidator)
+    /// applies to the worker's lifecycle events, since one `SteerSource` names
+    /// the consolidator both decisions belong to.
+    pub async fn question_for_consolidator(&self, id: &str) -> bool {
+        self.steered_by_live_consolidator(id).await
+    }
+
+    /// Test-only: record `id` as steered by `consolidator`, the cross-process
+    /// routing decision a watch reads, without dispatching a live worker.
+    #[cfg(test)]
+    pub(crate) fn test_write_steer_source(
+        &self,
+        id: &str,
+        consolidator: &str,
+    ) -> anyhow::Result<()> {
+        steer::write_source(
+            &self.scratch,
+            id,
+            Some(&steer::SteerSource {
+                consolidator: consolidator.to_string(),
+                round_base: None,
+            }),
+        )
     }
 
     /// Whether `id`'s lifecycle events belong to a consolidator that steered it

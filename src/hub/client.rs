@@ -804,7 +804,7 @@ impl HubClient {
         all: bool,
     ) -> Result<Value> {
         if !self.watch_line.is_empty() {
-            self.next_watch_notification().await?;
+            let _ = self.next_watch_notification().await?;
         }
         // One call carries the whole selection, so repeated `--group` flags
         // stay one watch over several rounds.
@@ -823,10 +823,23 @@ impl HubClient {
     }
 
     /// Consume the existing channel stream; snapshot replay repairs dropped frames.
-    pub async fn next_watch_notification(&mut self) -> Result<()> {
+    ///
+    /// A watch-widen frame is returned instead of dropped: it carries the union
+    /// a second watch of this session pushed onto the running one, so the
+    /// process follows the wider filter from here without reconnecting or
+    /// losing its pending events. Every other frame is still consumed and
+    /// forgotten, exactly as before.
+    pub async fn next_watch_notification(&mut self) -> Result<Option<Value>> {
         if !self.notifications.is_empty() {
+            // A widen can race an in-flight reply and be parked here; scan the
+            // parked frames before dropping them, or the running watch would
+            // only pick the union up on its next poll.
+            let widened = self
+                .notifications
+                .iter()
+                .find_map(|line| Self::widen_params(&String::from_utf8_lossy(line)));
             self.notifications.clear();
-            return Ok(());
+            return Ok(widened);
         }
         loop {
             let bytes = self.stream.fill_buf().await?;
@@ -842,10 +855,25 @@ impl HubClient {
             self.watch_line.extend_from_slice(&bytes[..count]);
             self.stream.consume(count);
             if self.watch_line.last() == Some(&b'\n') {
+                let line = String::from_utf8_lossy(&self.watch_line).into_owned();
                 self.watch_line.clear();
-                return Ok(());
+                return Ok(Self::widen_params(&line));
             }
         }
+    }
+
+    /// The params of a watch-widen frame, or `None` for any other line.
+    ///
+    /// A frame that is not ours, not JSON, or not carrying a selection is
+    /// simply ignored: a widen that is missed is repaired by the next
+    /// snapshot, which the hub already filters with the stored union.
+    fn widen_params(line: &str) -> Option<Value> {
+        let frame: Value = serde_json::from_str(line).ok()?;
+        if frame["method"] != crate::mcp::events::WATCH_WIDEN_METHOD {
+            return None;
+        }
+        let params = &frame["params"];
+        (!params["selection"].as_str().unwrap_or("").is_empty()).then(|| params.clone())
     }
 
     pub async fn worker(&mut self, arguments: Value) -> Result<Value> {
