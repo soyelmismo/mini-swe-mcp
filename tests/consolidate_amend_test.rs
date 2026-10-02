@@ -41,12 +41,8 @@ impl Harness {
         common::git(&repo, &["commit", "-m", "base"]);
         let root = ScratchRoot::new(scratch.subdir("workers"));
         let hub = scratch.subdir("hub");
-        let pool = WorkerPool::with_scratch(
-            4,
-            "http://localhost:1".into(),
-            "test-key".into(),
-            root,
-        );
+        let pool =
+            WorkerPool::with_scratch(4, "http://localhost:1".into(), "test-key".into(), root);
         let server = McpServer::new(pool, "nerd".into());
         Self {
             _scratch: scratch,
@@ -70,7 +66,10 @@ impl Harness {
     }
 
     async fn start(&self) -> tokio::task::JoinHandle<()> {
-        self.server.start_auto_consolidate(self.hub.clone()).await.unwrap()
+        self.server
+            .start_auto_consolidate(self.hub.clone())
+            .await
+            .unwrap()
     }
 }
 
@@ -87,8 +86,10 @@ const MANGLED: &str = "'cargo";
 async fn an_unparsable_gate_is_refused_at_dispatch() {
     let harness = Harness::new("amend-refuse");
     let scheduler = harness.start().await;
-    for (field, extra) in [("consolidate_verify", json!({"consolidate": true})), ("verify", json!({}))]
-    {
+    for (field, extra) in [
+        ("consolidate_verify", json!({"consolidate": true})),
+        ("verify", json!({})),
+    ] {
         let error = harness
             .server
             .execute_tool_for(
@@ -110,7 +111,10 @@ async fn an_unparsable_gate_is_refused_at_dispatch() {
             .await
             .expect_err("a gate `sh` cannot parse must not reach a worker");
         let text = error.to_string();
-        assert!(text.contains(field), "the refusal must name {field}: {text}");
+        assert!(
+            text.contains(field),
+            "the refusal must name {field}: {text}"
+        );
         assert!(
             text.contains("valid shell command") && text.contains("sh:"),
             "the refusal must carry sh's own parse error: {text}"
@@ -162,7 +166,10 @@ async fn set_amends_a_pending_round_and_persists_it() {
         )
         .await
         .unwrap();
-    assert_eq!(opened["worker_id"].is_string(), true, "{opened}");
+    assert!(
+        opened["worker_id"].is_string(),
+        "the round must have opened a worker to consolidate: {opened}"
+    );
 
     let amended = harness
         .server

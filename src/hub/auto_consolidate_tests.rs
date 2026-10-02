@@ -110,16 +110,16 @@ async fn amend_is_owner_scoped_pending_only_and_persisted() {
     assert_eq!(reread.len(), 1, "the amend must not open or drop a round");
     assert_eq!(reread[0].verify.as_deref(), Some("cargo test --all"));
     assert_eq!(reread[0].model.as_deref(), Some("ninja"));
-    store
-        .amend("owner", "group", None, Some(Some("")))
-        .unwrap();
+    store.amend("owner", "group", None, Some(Some(""))).unwrap();
     assert_eq!(store.candidates()[0].verify.as_deref(), Some(""));
 
     // Once consumed the settings are spent: the round leaves the candidate set
     // and an amend is refused by name rather than silently changing a row no
     // consolidator will read.
-    let _launch = store.claim(&store.candidates()[0]).expect("claim the round");
-    store.consume(&store.candidates()[0]).unwrap();
+    let round = store.candidates()[0].clone();
+    let launch = store.claim(&round).expect("claim the round");
+    store.consume(&round).unwrap();
+    drop(launch);
     let Err(consumed) = store.amend("owner", "group", None, Some(Some("cargo test"))) else {
         panic!("a consumed round must not be amendable");
     };

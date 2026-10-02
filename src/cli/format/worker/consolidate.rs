@@ -22,10 +22,8 @@ pub fn format_consolidate(val: &serde_json::Value) -> String {
         .filter(|g| !g.is_empty())
         .or_else(|| round_group(round))
         .unwrap_or("");
-    if let Some(amended) = val.get("amended").and_then(|v| v.as_bool()) {
-        if amended {
-            return format_amend(val);
-        }
+    if val.get("amended").and_then(|v| v.as_bool()) == Some(true) {
+        return format_amend(val);
     }
     let manifest = RoundText::parse(round);
     let mut out = format!(
@@ -55,7 +53,7 @@ pub fn format_consolidate(val: &serde_json::Value) -> String {
 fn format_amend(val: &serde_json::Value) -> String {
     let group = val.get("group").and_then(|v| v.as_str()).unwrap_or("");
     let gate = match val.get("verify").and_then(|v| v.as_str()) {
-        Some(cmd) if cmd.is_empty() => "none (auto-detect)".to_string(),
+        Some("") => "none (auto-detect)".to_string(),
         Some(cmd) => cmd.to_string(),
         None => "unchanged".to_string(),
     };

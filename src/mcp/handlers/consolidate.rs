@@ -133,32 +133,26 @@ impl McpServer {
         group: &str,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
-        let store = self
-            .auto_store()
-            .ok_or_else(|| anyhow::anyhow!("Amending an automatic round requires the hub daemon"))?;
+        let store = self.auto_store().ok_or_else(|| {
+            anyhow::anyhow!("Amending an automatic round requires the hub daemon")
+        })?;
         // `None` leaves a half alone; `Some(None)` clears it. A non-string is
         // refused instead of dropped, so an amend cannot silently keep the
         // setting the caller meant to replace.
         let model: Option<Option<&str>> = args
             .get("model")
             .map(|value| {
-                value
-                    .as_str()
-                    .map(Some)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("'model' must be a string for action 'consolidate'")
-                    })
+                value.as_str().map(Some).ok_or_else(|| {
+                    anyhow::anyhow!("'model' must be a string for action 'consolidate'")
+                })
             })
             .transpose()?;
         let verify: Option<Option<&str>> = args
             .get("verify")
             .map(|value| {
-                value
-                    .as_str()
-                    .map(Some)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("'verify' must be a string for action 'consolidate'")
-                    })
+                value.as_str().map(Some).ok_or_else(|| {
+                    anyhow::anyhow!("'verify' must be a string for action 'consolidate'")
+                })
             })
             .transpose()?;
         anyhow::ensure!(

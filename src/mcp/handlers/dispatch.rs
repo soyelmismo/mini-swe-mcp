@@ -227,10 +227,16 @@ impl McpServer {
             Some(value) => Some(
                 value
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'verify' must be a string for action 'dispatch'"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'verify' must be a string for action 'dispatch'")
+                    })?
                     .to_string(),
             ),
         };
+        // Parse-checked where it enters: a gate stored verbatim is run by a
+        // worker (or, for `consolidate_verify`, by a consolidator dispatched
+        // long after anyone was watching), and an unparsable one fails there
+        // with nobody left to fix it.
         if let Some(gate) = &verify {
             crate::pool::validate_verify_command(gate, "verify")?;
         }

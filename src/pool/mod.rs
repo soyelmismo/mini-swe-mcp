@@ -2413,9 +2413,8 @@ pub fn validate_verify_command(command: &str, field: &str) -> Result<()> {
     anyhow::ensure!(
         output.status.success(),
         "'{field}' is not a valid shell command: {}",
-        shell_syntax_error(&output.stderr).unwrap_or_else(|| {
-            format!("sh exited with {}", output.status)
-        })
+        shell_syntax_error(&output.stderr)
+            .unwrap_or_else(|| { format!("sh exited with {}", output.status) })
     );
     Ok(())
 }
