@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::events::{WatchSelection, WatchStart, covered_watch_message, widened_watch_message};
 
 impl McpServer {
     /// The shell command that waits on *this* caller's workers.
@@ -74,13 +75,36 @@ impl McpServer {
             self.require_owner(id, ctx).await?;
         }
         // One watch per identity: reserve this call's slot up front and hold it
-        // until the call returns (or is cancelled), so a second watch is
-        // refused instead of silently competing for the same events.
-        let _slot = self
+        // until the call returns (or is cancelled), so a second watch of the
+        // session never competes for the same events. A second call that asks
+        // for more than the running watch follows widens it instead of being
+        // refused, and answers immediately with the confirmation; a call it
+        // already covers answers "already covered" the same way.
+        let selection = WatchSelection::new(ids.iter().cloned(), groups.iter().cloned(), all);
+        let _slot = match self
             .hub_events
             .lock()
             .await
-            .begin_watch(&ctx.agent(), ctx.id, ctx.pid)?;
+            .begin_watch(&ctx.agent(), ctx.id, ctx.pid, &selection)
+        {
+            WatchStart::Started(slot) => slot,
+            WatchStart::Covered { pid } => {
+                return Ok(json!({
+                    "status": "already_covered",
+                    "events": [],
+                    "watching": [],
+                    "message": covered_watch_message(pid, &selection.describe()),
+                }));
+            }
+            WatchStart::Widened { pid, selection } => {
+                return Ok(json!({
+                    "status": "widened",
+                    "events": [],
+                    "watching": [],
+                    "message": widened_watch_message(pid, &selection),
+                }));
+            }
+        };
         let started = tokio::time::Instant::now();
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;

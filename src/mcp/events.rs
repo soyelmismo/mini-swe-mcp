@@ -49,6 +49,11 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(30);
 /// JSON-RPC method of a channel notification (research preview).
 const CHANNEL_METHOD: &str = "notifications/claude/channel";
 
+/// The hub tells the connection that is already watching when a second watch
+/// of the same session widened its filter, so the running process follows the
+/// union without reconnecting, re-arming or losing its pending events.
+const WIDEN_METHOD: &str = "notifications/mini-swe/watch_widen";
+
 /// Byte budget for text copied out of a worker into a notification.
 ///
 /// The notification is read by a model in a session that also holds the
@@ -388,7 +393,6 @@ struct ActiveWatch {
     token: u64,
     connection: u64,
     pid: Option<u32>,
-    since: u64,
     /// What the running watch follows now: its own request, unioned with every
     /// broader request a later invocation folded into it (see
     /// [`WatchSelection::widen`]).
@@ -521,6 +525,19 @@ pub(super) enum WatchStart {
     Widened { pid: Option<u32>, selection: String },
 }
 
+impl WatchStart {
+    /// The guard when this call took the slot, or `None` when it was covered
+    /// or widened. Tests hold the slot through the guard, so they need the
+    /// same shape the handler keeps.
+    #[cfg(test)]
+    pub(super) fn started(self) -> Option<WatchGuard> {
+        match self {
+            WatchStart::Started(guard) => Some(guard),
+            _ => None,
+        }
+    }
+}
+
 /// The one line a covered `watch` prints: it exits 0, carrying nothing.
 pub fn covered_watch_message(pid: Option<u32>, selection: &str) -> String {
     format!("already covered by the running watch ({}): {selection}", pid_label(pid))
@@ -578,15 +595,6 @@ impl WatchRegistry {
         self.lock().contains_key(identity)
     }
 
-    fn busy_watched(pid: Option<u32>) -> anyhow::Error {
-        let held = match pid {
-            Some(pid) => format!("pid {pid}"),
-            None => "an unknown pid".to_string(),
-        };
-        anyhow::anyhow!(
-            "a watch is already running for your session ({held}); it will deliver the next event - do not start another"
-        )
-    }
 
     /// Claim `identity`'s one watch slot for a *poll* of `selection` on
     /// `connection`: re-entrant, so the connection that holds the slot keeps it
@@ -661,7 +669,6 @@ impl WatchRegistry {
                 token,
                 connection,
                 pid,
-                since: crate::pool::unix_timestamp(),
                 selection: selection.clone(),
             },
         );
@@ -1055,13 +1062,43 @@ impl EventRouter {
                 })
             }
             Admission::Covered { pid } => WatchStart::Covered { pid },
-            Admission::Widened { pid, selection, .. } => {
+            Admission::Widened {
+                pid,
+                connection,
+                selection,
+            } => {
+                self.push_widen(connection, &selection);
                 WatchStart::Widened {
                     pid,
                     selection: selection.describe(),
                 }
             }
         }
+    }
+
+    /// Hand the widened filter to the connection that is already watching.
+    ///
+    /// The widening is a push, not a new watch: the running process keeps its
+    /// connection, its place in the stream and its unacknowledged events, and
+    /// only its filter changes. A connection that is not registered (an
+    /// in-process MCP `watch` call, or a channel-less client) learns the same
+    /// union on its next poll, because the stored selection is what that poll
+    /// is filtered with.
+    fn push_widen(&self, connection: u64, selection: &WatchSelection) {
+        let Some((_, _, tx)) = self.connections.get(&connection) else {
+            return;
+        };
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": WIDEN_METHOD,
+            "params": {
+                "worker_ids": selection.ids.iter().collect::<Vec<_>>(),
+                "group": selection.groups.iter().collect::<Vec<_>>(),
+                "all": selection.all,
+                "selection": selection.describe(),
+            }
+        });
+        try_deliver(tx, frame.to_string() + "\n");
     }
 
     /// Whether `identity` already has a watch running, so a dispatch or steer
@@ -1977,9 +2014,24 @@ impl EventRouter {
                 return Ok(json!({"watching":[], "events":[],
                     "covered":{"pid":pid, "selection":running.describe()}}));
             }
-            Admission::Widened { pid, selection, .. } => {
+            Admission::Widened {
+                pid,
+                connection,
+                selection,
+            } => {
+                // Push the union onto the running watch's own connection: it
+                // keeps its place and its pending events, and only its filter
+                // changes. The reply itself carries the union too, so a client
+                // that never reads notifications still asks for it next poll.
+                self.push_widen(connection, &selection);
                 return Ok(json!({"watching":[], "events":[],
-                    "widened":{"pid":pid, "selection":selection.describe()}}));
+                    "widened":{
+                        "pid":pid,
+                        "selection":selection.describe(),
+                        "worker_ids":selection.ids.iter().collect::<Vec<_>>(),
+                        "group":selection.groups.iter().collect::<Vec<_>>(),
+                        "all":selection.all,
+                    }}));
             }
         };
         // The unioned selection, not the request, is what filters this reply:

@@ -90,7 +90,8 @@ async fn watch_command_is_omitted_only_while_the_callers_own_watch_runs() {
         .hub_events
         .lock()
         .await
-        .begin_watch("someone-else", 2, None)
+        .begin_watch("someone-else", 2, None, &crate::mcp::events::WatchSelection::default())
+        .started()
         .expect("another identity claims its own slot");
     let foreign = steer(&server, &ctx).await;
     assert!(
@@ -105,7 +106,8 @@ async fn watch_command_is_omitted_only_while_the_callers_own_watch_runs() {
         .hub_events
         .lock()
         .await
-        .begin_watch("orchestrator", 1, None)
+        .begin_watch("orchestrator", 1, None, &crate::mcp::events::WatchSelection::default())
+        .started()
         .expect("this identity claims the slot");
     let watching = steer(&server, &ctx).await;
     assert!(
