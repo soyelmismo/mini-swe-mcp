@@ -194,24 +194,35 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        // A worktree's private scratch and its leased build directories are
-        // filed next to the scratch base, keyed by the worktree leaf and by the
-        // repository hash, so removing the tree alone leaves them behind.
-        mini_swe_mcp::worktree::remove_target_dirs(&self.path);
-        mini_swe_mcp::cache::remove_build_dir_leases(&self.path);
-        // A pool is handed this directory as its scratch root, so the checkouts
-        // and sidecars *it* created live inside it and go with it -- except for
-        // the worktrees a killed worker leaves behind, which its aborted task
-        // no longer owns. Those are filed under the pool's own root by leaf name,
-        // so drop one `swe-wt-<id>` per id this directory has seen and the tree
-        // is then empty and removable.
-        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&self.path);
-        // A second pass, in case the first one raced a worktree registration
-        // that was being written as the guard dropped.
-        mini_swe_mcp::worktree::remove_target_dirs(&self.path);
-        // Best effort: a leftover directory must never fail an otherwise good test.
-        let _ = std::fs::remove_dir_all(&self.path);
+        reclaim_scratch_root(&self.path);
+        // A pool a test killed leaves its worker's checkout behind, and the
+        // runner rebuilds that checkout in a `spawn_blocking` task the abort
+        // cannot cancel -- so it reappears *after* the drop above, once the
+        // pool's own clone is gone. Registering the root for the exit sweep
+        // reclaims it then, which is the only moment nothing is running again.
+        remember_for_exit_sweep(&self.path);
     }
+}
+
+/// Reclaim a scratch root and everything the code under test derived from it.
+///
+/// Shared by [`TempDir::drop`] and the process-exit sweep, so a root is
+/// reclaimed the same way whenever the last chance to do it arrives.
+fn reclaim_scratch_root(path: &Path) {
+    // A worktree's private scratch and its leased build directories are filed
+    // next to the scratch base, keyed by the worktree leaf and by the repository
+    // hash, so removing the tree alone leaves them behind.
+    mini_swe_mcp::worktree::remove_target_dirs(path);
+    mini_swe_mcp::cache::remove_build_dir_leases(path);
+    // A pool is handed this directory as its scratch root, so the checkouts and
+    // sidecars *it* created live inside it and go with it -- except for the
+    // worktrees a killed worker leaves behind, which its aborted task no longer
+    // owns. Those are filed under the pool's own root by leaf name.
+    mini_swe_mcp::worktree::remove_scratch_root_worktrees(path);
+    // The companions of the checkouts just dropped, then the root itself.
+    mini_swe_mcp::worktree::remove_target_dirs(path);
+    // Best effort: a leftover directory must never fail an otherwise good test.
+    let _ = std::fs::remove_dir_all(path);
 }
 
 /// Own the short fallback directory a too-deep hub directory's socket moves to,
@@ -258,6 +269,13 @@ impl AsRef<std::ffi::OsStr> for TempDir {
 /// Scratch directories removed when the test binary exits.
 static PROCESS_SCRATCH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// Scratch roots re-swept when the test binary exits, because the code under
+/// test can still write into one after its owner dropped it.
+static EXIT_SWEPT_SCRATCH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Registers the exit sweep with libc the first time a root asks for one.
+static EXIT_SWEEP_ARMED: std::sync::Once = std::sync::Once::new();
+
 unsafe extern "C" {
     /// Registered with libc so a directory that must outlive every test in the
     /// binary still leaves nothing behind when the binary exits.
@@ -271,6 +289,36 @@ extern "C" fn remove_process_scratch() {
     for path in paths.iter() {
         let _ = std::fs::remove_dir_all(path);
     }
+    let roots = EXIT_SWEPT_SCRATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in roots.iter() {
+        reclaim_scratch_root(path);
+    }
+}
+
+/// Reclaim `path` once more when the test binary exits.
+///
+/// A pool that outlives its [`TempDir`] -- because the test kept a clone, or
+/// because a killed worker's runner task is still winding down -- writes its
+/// checkouts into a root that has already been dropped, and a `spawn_blocking`
+/// task cannot be cancelled by aborting the worker that awaited it. The exit
+/// sweep is the only point at which no test is running, so it is the only place
+/// those late writes can be undone.
+fn remember_for_exit_sweep(path: &Path) {
+    {
+        let mut roots = EXIT_SWEPT_SCRATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !roots.iter().any(|root| root == path) {
+            roots.push(path.to_path_buf());
+        }
+    }
+    EXIT_SWEEP_ARMED.call_once(|| {
+        // SAFETY: the handler only locks statics and removes directories, so it
+        // is safe to run from `atexit`.
+        unsafe { atexit(remove_process_scratch) };
+    });
 }
 
 /// A scratch directory that lives for the whole test binary.

@@ -17,9 +17,7 @@
 //! re-attaches to -- a worker that only read code has no commit to preserve,
 //! so the ref itself is the only thing left of it.
 
-use super::{
-    ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs,
-};
+use super::{ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -195,6 +193,14 @@ pub struct WorktreeGuard {
     /// Branch checked out at dispatch; detached checkouts have no sync target.
     pub base_branch: Option<String>,
     pub preserve_branch: bool,
+    /// The scratch root this checkout was filed under, kept for teardown.
+    ///
+    /// The private scratch the executor opens is derived from the checkout's
+    /// leaf name and filed next to the *scratch base*, which is
+    /// [`crate::worktree::swe_base_dir`], not necessarily the root this pool was
+    /// handed. Teardown has to remove it from the same place it was created, or
+    /// the gate worktree a merge builds leaves `swe-tmp-swe-merge-<id>` behind.
+    root: ScratchRoot,
     /// Fingerprint of every artifact file seeded into the worktree, keyed by
     /// repository-relative path. A file still matching its entry was never
     /// touched by the worker, so [`WorktreeGuard::sync_artifacts`] leaves the
@@ -377,6 +383,7 @@ impl WorktreeGuard {
             base_commit: base_commit.to_string(),
             base_branch: None,
             preserve_branch: false,
+            root: root.clone(),
             seeded,
         })
     }
@@ -1119,7 +1126,10 @@ impl Drop for WorktreeGuard {
         // is the fallback for when it could not (audit §04).
         force_remove_dir(&self.path);
         let _ = std::fs::remove_file(&pid_file);
-        remove_target_dirs(&self.path);
+        // Under *this* root: `remove_target_dirs` resolves the scratch base on
+        // its own, so a checkout filed under an injected root would have its
+        // private scratch reclaimed from the wrong place and leave it behind.
+        crate::worktree::remove_target_dirs_in(&self.root, &self.path);
     }
 }
 
@@ -1409,6 +1419,7 @@ mod tests {
             base_commit: String::new(),
             base_branch: None,
             preserve_branch: false,
+            root: ScratchRoot::from_env(),
             seeded: BTreeMap::new(),
         }
     }
