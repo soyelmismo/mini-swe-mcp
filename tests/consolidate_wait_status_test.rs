@@ -6,8 +6,10 @@
 
 mod common;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use common::{IsolatedPool, unique_suffix};
-use mini_swe_mcp::cli::watch::select_event;
+use mini_swe_mcp::cli::watch::{ROUND_STALL_SECS, Snapshot, round_event, select_event};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord,
     WorkerRegistryEntry, WorkerRole, WorkerState, save_registry_entry_in,
@@ -87,6 +89,19 @@ fn watch_view(progress: &mini_swe_mcp::pool::WorkerProgress, now: u64) -> serde_
     })
 }
 
+/// A one-worker `--all` round snapshot for the consolidator, as the round
+/// watch builds it from the live progress.
+fn round_snapshot(
+    consolidator: &str,
+    progress: &mini_swe_mcp::pool::WorkerProgress,
+    now: u64,
+) -> Snapshot {
+    let mut view = watch_view(progress, now);
+    view["worker_id"] = json!(consolidator);
+    view["group"] = json!(GROUP);
+    BTreeMap::from([(consolidator.to_string(), view)])
+}
+
 /// While the wait blocks, the consolidator's progress names the wait as the
 /// command in flight and carries a start time, so the stall detector reads the
 /// step as work even past the idle threshold.
@@ -134,6 +149,20 @@ fn a_waiting_consolidator_is_running_a_command() {
             select_event(&watch_view(&progress, now), None, now + 1800).is_none(),
             "a waiting consolidator must not stall"
         );
+        // The 20-minute `--all` round threshold is the same rule: a command in
+        // flight keeps the round from reading the wait as a stalled step.
+        assert!(
+            round_event(
+                &round_snapshot(&consolidator, &progress, now),
+                &BTreeSet::from([consolidator.clone()]),
+                &BTreeSet::from([GROUP.to_string()]),
+                now + ROUND_STALL_SECS + 600,
+                |_| true,
+                |_| true,
+            )
+            .is_none(),
+            "a waiting consolidator must not stall its --all round"
+        );
         wait.await.expect("wait task");
         // After the wait returns, ordinary stall detection applies again: the
         // mark is gone, so an idle step past the threshold stalls.
@@ -143,5 +172,17 @@ fn a_waiting_consolidator_is_running_a_command() {
             select_event(&watch_view(&progress, now), None, now + 1800).is_some(),
             "an idle step after the wait must stall again"
         );
+        // Past the `--all` threshold and with the mark gone, the round reports
+        // the same worker as stalled again.
+        let event = round_event(
+            &round_snapshot(&consolidator, &progress, now),
+            &BTreeSet::from([consolidator.clone()]),
+            &BTreeSet::from([GROUP.to_string()]),
+            now + ROUND_STALL_SECS + 600,
+            |_| true,
+            |_| true,
+        )
+        .expect("an idle consolidator stalls its --all round");
+        assert_eq!(event["workers"][0]["outcome"], "stalled");
     });
 }
