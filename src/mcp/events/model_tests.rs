@@ -686,8 +686,25 @@ impl Harness {
     fn observe(&mut self, step: usize, use_row: bool) {
         let now = crate::pool::unix_timestamp();
         let snap = self.build_snapshot(now, use_row);
+        let before: BTreeSet<(String, String, usize, String)> = router_pending(&self.router);
         self.router.observe_watch(snap);
         self.stale.clear();
+        let dropped: Vec<_> = before
+            .difference(&router_pending(&self.router))
+            .filter(|(_, wid, rev, kind)| {
+                self.model
+                    .episodes
+                    .get(&(wid.clone(), *rev, kind.clone()))
+                    .is_some_and(|ep| ep.state == EpState::Pending)
+            })
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.violation(
+                format!("observe_watch dropped still-pending events: {dropped:?}"),
+                step,
+            );
+        }
         let got = router_pending(&self.router);
         let want = self.model.pending();
         if got != want {
@@ -767,6 +784,56 @@ impl Harness {
                 let key = event_key(view);
                 self.model.ack(&key.1, key.2, &key.3);
                 self.acked.insert(key);
+            }
+        }
+        // A plain acknowledgement must not return as a fresh round either:
+        // the round oracle consults the same ack store the replay guard does.
+        // The check only applies when every worker the round would fold in is
+        // already acknowledged: an unacked sibling legitimately keeps the round
+        // fresh and carries the acked ones along in its worker list.
+        if ack {
+            let groups_seen: BTreeSet<String> = events
+                .iter()
+                .filter_map(|view| view["group"].as_str().map(str::to_string))
+                .collect();
+            for group in groups_seen {
+                let round = self.router.watch_reply(
+                    &ctx,
+                    &json!({"worker_ids":[], "group":group, "initial":false, "all":true}),
+                );
+                let Ok(round) = round else {
+                    continue;
+                };
+                let Some(round_events) = round["events"].as_array() else {
+                    continue;
+                };
+                let Some(round_event) = round_events.first() else {
+                    continue;
+                };
+                let named: Vec<(String, usize, String)> = round_event["workers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|w| {
+                        let wid = w["worker_id"].as_str()?;
+                        let (rev, kind) = self.model.reported.get(wid)?;
+                        Some((wid.to_string(), *rev, kind.clone()))
+                    })
+                    .collect();
+                if !named.is_empty()
+                    && named.iter().all(|(wid, rev, kind)| {
+                        self.acked
+                            .contains(&(owner.to_string(), wid.clone(), *rev, kind.clone()))
+                    })
+                {
+                    self.violation(
+                        format!(
+                            "a plain ack returned as a fresh round for {group}: {}",
+                            round["events"]
+                        ),
+                        step,
+                    );
+                }
             }
         }
     }
