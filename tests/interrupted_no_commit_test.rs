@@ -20,13 +20,12 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use mini_swe_mcp::pool::{
-    DEFAULT_TERMINAL_RETENTION_SECS, LogBuffer, RegistryStatus, WorkerHistory, WorkerMeta,
-    WorkerMetrics, WorkerPool, WorkerRecord, WorkerRole, WorkerState, append_history_message_in,
-    history_log_path_in, load_registry_entry_in, load_worker_history_in,
-    prune_orphan_histories_with_retention_and_grace_in, save_registry_entry_in,
+    LogBuffer, RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord,
+    WorkerRole, WorkerState, append_history_message_in, history_log_path_in,
+    load_registry_entry_in, prune_orphan_histories_with_retention_and_grace_in,
+    save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
-use mini_swe_mcp::pool::DEFAULT_WORKER_RETIRED_GRACE_SECS;
 
 const OWNER: &str = "interrupted-no-commit-test";
 
@@ -39,7 +38,9 @@ fn seed_repo(scratch: &common::TempDir) -> (PathBuf, String) {
     std::fs::write(repo.join("base.txt"), "base\n").expect("seed the repo");
     common::git(&repo, &["add", "base.txt"]);
     common::git(&repo, &["commit", "-m", "seed"]);
-    let head = common::git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let head = common::git(&repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     (repo, head)
 }
 
@@ -121,7 +122,7 @@ fn an_interrupted_worker_with_no_commit_keeps_its_branch() {
 
     // A worker that read code and changed nothing: its branch is cut at the
     // base commit and never moved.
-    let mut guard = WorktreeGuard::new_in(&root, &repo, id).expect("worktree");
+    let guard = WorktreeGuard::new_in(&root, &repo, id).expect("worktree");
     assert_eq!(guard.base_commit, head, "the branch is cut at HEAD");
     let branch = guard.branch.clone();
     let checkout = guard.path.clone();
@@ -135,10 +136,7 @@ fn an_interrupted_worker_with_no_commit_keeps_its_branch() {
     WorktreeGuard::mark_interrupted(&checkout);
     drop(guard);
 
-    assert!(
-        !checkout.exists(),
-        "the worktree itself is still reclaimed"
-    );
+    assert!(!checkout.exists(), "the worktree itself is still reclaimed");
     assert!(
         common::git_ref_exists(&repo, &branch),
         "an interrupted worker's branch survives teardown even with no commits"
@@ -187,7 +185,7 @@ fn the_interruption_marker_does_not_outlive_the_teardown() {
     let (repo, _head) = seed_repo(&scratch);
     let id = "reader3";
 
-    let mut guard = WorktreeGuard::new_in(&root, &repo, id).expect("worktree");
+    let guard = WorktreeGuard::new_in(&root, &repo, id).expect("worktree");
     let checkout = guard.path.clone();
     WorktreeGuard::mark_interrupted(&checkout);
     drop(guard);
@@ -264,9 +262,13 @@ async fn a_worker_interrupted_before_any_commit_is_auto_continued_by_the_next_da
     // The continuation the next daemon performs: it re-attaches to the branch
     // the shutdown preserved, which is what used to fail with
     // "Worker branch worker-reader4 no longer exists".
-    let reattached =
-        WorktreeGuard::reopen_in(&root, &repo, id, &row.base_commit.clone().unwrap_or(head.clone()))
-            .expect("the interrupted worker must be continuable");
+    let reattached = WorktreeGuard::reopen_in(
+        &root,
+        &repo,
+        id,
+        &row.base_commit.clone().unwrap_or(head.clone()),
+    )
+    .expect("the interrupted worker must be continuable");
     assert_eq!(reattached.branch, branch);
     drop(reattached);
     let _ = std::fs::remove_dir_all(&repo);
@@ -365,12 +367,7 @@ fn the_orphan_sweep_keeps_an_interrupted_workers_history() {
 
     // Retention is zero and the grace is zero: every age-based rule says this
     // worker's history is spent.
-    let pruned = prune_orphan_histories_with_retention_and_grace_in(
-        &root,
-        &repo,
-        0,
-        0,
-    );
+    let pruned = prune_orphan_histories_with_retention_and_grace_in(&root, &repo, 0, 0);
     assert_eq!(
         pruned, 0,
         "an interrupted worker's history is not an orphan"
@@ -409,4 +406,3 @@ fn the_orphan_sweep_keeps_an_interrupted_workers_history() {
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
-

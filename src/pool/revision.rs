@@ -1052,7 +1052,8 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
             let kept_through_grace = entry
                 .as_ref()
                 .is_some_and(|e| within_retired_grace(e.updated_at, grace_secs, now));
-            if (!interrupted && expired) || (!interrupted && !branch_exists && !kept_through_grace) {
+            if (!interrupted && expired) || (!interrupted && !branch_exists && !kept_through_grace)
+            {
                 retire_worker_in(root, id);
                 removed += 1;
             }

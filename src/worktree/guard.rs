@@ -9,6 +9,13 @@
 //! Lease bookkeeping (writing the `.pid` marker) and the sweep that consumes
 //! those markers live in the sibling [`prune`](super::prune) module; this file
 //! only owns one worktree at a time.
+//!
+//! Load-bearing: teardown deletes a `worker-<id>` branch that carries no
+//! commit beyond the base, *unless* the worker was interrupted (see
+//! [`WorktreeGuard::mark_interrupted`]). An interrupted worker must stay
+//! continuable across a hub restart, and the branch is what its continuation
+//! re-attaches to -- a worker that only read code has no commit to preserve,
+//! so the ref itself is the only thing left of it.
 
 use super::{
     ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs,
@@ -1094,10 +1101,8 @@ impl Drop for WorktreeGuard {
         // id that ends some other way prunes its branch again. A
         // worker that ended some other way keeps deleting a branch
         // that points nowhere past the base.
-        let interrupted = !self.preserve_branch
-            && !has_commits
-            && self.interrupted()
-            && self.branch_ref_exists();
+        let interrupted =
+            !self.preserve_branch && !has_commits && self.interrupted() && self.branch_ref_exists();
         self.clear_interrupted_marker();
 
         if self.preserve_branch || has_commits || interrupted {
