@@ -1824,9 +1824,36 @@ impl WorkerPool {
         result
     }
 
-    /// Whether a paused worker's answer belongs to its last steering consolidator.
-    pub fn question_for_consolidator(&self, id: &str) -> bool {
-        steer::read_source(&self.scratch, id).is_some()
+    /// Whether a paused worker's answer belongs to a steering consolidator that
+    /// has not stopped.
+    ///
+    /// The question is routed to the consolidator only while it is live: a
+    /// consolidator that finished, failed or died is gone from
+    /// `CONSOLIDATE_WAIT`, so the owner's watch is the only reader left and the
+    /// question must reach it rather than be withheld forever. This is the same
+    /// liveness [`steered_by_live_consolidator`](Self::steered_by_live_consolidator)
+    /// applies to the worker's lifecycle events, since one `SteerSource` names
+    /// the consolidator both decisions belong to.
+    pub async fn question_for_consolidator(&self, id: &str) -> bool {
+        self.steered_by_live_consolidator(id).await
+    }
+
+    /// Test-only: record `id` as steered by `consolidator`, the cross-process
+    /// routing decision a watch reads, without dispatching a live worker.
+    #[cfg(test)]
+    pub(crate) fn test_write_steer_source(
+        &self,
+        id: &str,
+        consolidator: &str,
+    ) -> anyhow::Result<()> {
+        steer::write_source(
+            &self.scratch,
+            id,
+            Some(&steer::SteerSource {
+                consolidator: consolidator.to_string(),
+                round_base: None,
+            }),
+        )
     }
 
     /// Whether `id`'s lifecycle events belong to a consolidator that steered it
