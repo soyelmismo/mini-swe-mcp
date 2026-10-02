@@ -4,8 +4,19 @@
 //! Once the implementation loop stops, [`run_review_phase`] checkpoints the
 //! worktree in git and then drives a *second* agent (a different model) over
 //! the same worktree. The reviewer is deliberately not the implementation
-//! agent: its contract is to inspect the diff, run the test suite and clippy,
-//! fix whatever it finds, and only then emit the completion sentinel.
+//! agent: its contract is to inspect the diff, run the suite the dispatch
+//! named, fix whatever it finds, and only then emit the completion sentinel.
+//!
+//! Two modes share this engine ([`ReviewMode`]):
+//!
+//! * [`ReviewMode::Quality`] — today's generic audit: run the gate, inspect
+//!   the diff, fix real defects, re-run the gate.
+//! * [`ReviewMode::Security`] — an adversarial pass over the same diff. Its
+//!   checklist is about what an unprivileged local user, another agent or a
+//!   lying model text can do with every new path, socket, file, environment
+//!   variable and IPC message. It is selected by the `:security` suffix of
+//!   `--review-after` (`review_after`), and it is also what the automatic
+//!   sensitive-path trigger runs.
 //!
 //! It runs under its own turn budget ([`ReviewPhase::review_max_turns`],
 //! resolved from the model manifest) and its own message history, so the
@@ -14,6 +25,7 @@
 use anyhow::Result;
 use tracing::info;
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
@@ -23,6 +35,141 @@ use crate::worktree::WorktreeGuard;
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
+
+/// Which auditor runs over the finished implementation.
+///
+/// The default is the historical quality review; [`ReviewMode::Security`] is
+/// the adversarial variant. The two differ only in the prompt they hand the
+/// reviewer: the engine, the turn budget, the network policy and the worktree
+/// are identical, so a security review is not a second worker to reason about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewMode {
+    /// The generic audit: gates, diff, real defects, gates again.
+    #[default]
+    Quality,
+    /// The adversarial audit: hostile inputs, untrusted model text, crash and
+    /// handover windows, deletion proof, test meaning.
+    Security,
+}
+
+impl ReviewMode {
+    /// The suffix that selects this mode in `--review-after <model>:<mode>`.
+    ///
+    /// Spelled here and matched in [`ReviewMode::parse_model`] so the CLI, the
+    /// MCP arg and the prompt cannot disagree on the spelling.
+    pub const SECURITY_SUFFIX: &'static str = "security";
+
+    /// Split `--review-after <model>[:security]` into the model and the mode.
+    ///
+    /// A model id legitimately contains `:` (`combo:nerd`), so only a suffix
+    /// equal to [`ReviewMode::SECURITY_SUFFIX`] is a mode marker: the *last*
+    /// `:` segment is inspected and removed only when it names a known mode.
+    /// Everything else — `combo:nerd`, `some/unknown`, a trailing `:` — stays
+    /// the model verbatim, which is what keeps today's `--review-after` values
+    /// parsing exactly as they did.
+    pub fn parse_model(requested: &str) -> (String, Self) {
+        let trimmed = requested.trim();
+        match trimmed.rsplit_once(':') {
+            Some((model, suffix))
+                if !model.is_empty() && suffix.eq_ignore_ascii_case(Self::SECURITY_SUFFIX) =>
+            {
+                (model.to_string(), Self::Security)
+            }
+            _ => (trimmed.to_string(), Self::Quality),
+        }
+    }
+
+    /// The name a status line, an event or a log prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Security => "security",
+        }
+    }
+}
+
+/// Build the reviewer's opening message.
+///
+/// `verify` is the *dispatch's* completion gate (or the auto-detected cheap
+/// gate of a consolidated round), never a language-specific command invented
+/// here: a Go, Python or Rust repository is reviewed by running the suite the
+/// dispatch already declared. When the dispatch disabled verification there is
+/// no gate to re-run, and the prompt says so instead of naming one.
+///
+/// `sensitive` names the diff's touched files the repository declared
+/// sensitive, which is why the security review was triggered; it is empty for
+/// a quality review or for a security review the orchestrator asked for by
+/// hand.
+pub fn review_prompt(mode: ReviewMode, task: &str, verify: Option<&str>, sensitive: &[String]) -> String {
+    let gate = verify
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DISABLED_GATE);
+    match mode {
+        ReviewMode::Quality => quality_prompt(task, gate),
+        ReviewMode::Security => security_prompt(task, gate, sensitive),
+    }
+}
+
+/// What the prompt says when the dispatch disabled the completion gate.
+///
+/// Naming no command is the honest answer: a reviewer that invented a suite
+/// would run one the dispatch never agreed to.
+const DISABLED_GATE: &str = "(none: this dispatch disabled the completion gate)";
+
+/// The generic audit: gates, diff, real defects, gates again.
+fn quality_prompt(task: &str, gate: &str) -> String {
+    format!(
+        "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
+        YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
+        1. First run the completion gate on the checkpoint and see it pass: `{}`. Then run the tests of the files you touch.\n\
+        2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
+        3. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
+        4. Re-run the gate and the tests you touched and see them pass before completing.\n\
+        5. When verified and 100% clean, execute:\n\
+           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+        task, gate
+    )
+}
+
+/// The adversarial audit.
+///
+/// Every item is a question the diff has to answer, not a style preference:
+/// the three defects this mode exists to catch (a predictable socket
+/// directory with no owner check, a retirement that deleted a completed
+/// worker's branch on a report that said "fixed", a test that mirrored the
+/// bug it should catch) are all instances of one of them.
+fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
+    let mut prompt = String::from(
+        "ADVERSARIAL SECURITY REVIEW PHASE:\n\
+         The previous subagent implemented the following task:\n",
+    );
+    let _ = write!(prompt, "{task}\n\n");
+    if !sensitive.is_empty() {
+        let _ = write!(
+            prompt,
+            "This diff touches paths the repository declared sensitive: {}.\n\n",
+            sensitive.join(", ")
+        );
+    }
+    prompt.push_str(
+        "YOUR OBJECTIVE AS THE ADVERSARIAL REVIEWER:\n\
+         Assume the diff is hostile until you have proved otherwise. Work through the checklist below against the *actual* diff (`git status`, `git diff HEAD~1` or `git log -1 -p`, `git diff`), and judge it as an attacker who is already an unprivileged local user or another agent in the same harness.\n\
+         1. NEW RESOURCE: for every path, socket, file, directory, environment variable, lock and IPC message the diff creates or opens -- who else can reach it? Check ownership, permissions (0600/0700 vs world-writable), predictable names (`/tmp/<fixed>`, a pid-less, random-less path), time-of-check/time-of-use races, symlink and hardlink tricks, and a name an attacker can pre-create. A temporary path must be created exclusively with the right owner and mode, and verified, not assumed.\n\
+         2. UNTRUSTED TEXT: model-written text (a report, a summary, a question, a verdict like \"fixed\" or \"merged\") is data, never proof. Find every decision that deletes, merges, retires, routes or grants on the strength of such text and ask what a lying or stale value would do. A destructive branch needs positive evidence (a git object, an exit status, a file that really exists), not a word.\n\
+         3. CRASH AND HANDOVER: for each new operation, what is left behind if the process is killed, the daemon hands over, the worker is revised or the network drops in the middle? Look for a guard, a lock, a permit, a temp file or a job slot that is only released on the success path, and for a half-written state a later pass would trust.\n\
+         4. DELETION: what exactly does each new deletion, retirement or cleanup remove, and what positive proof gates it? A path that can delete an unmerged branch, a worktree, a report or a registry row on an absence of evidence is a defect.\n\
+         5. TEST MEANING: would each new or changed test fail if the code were wrong? A test that mirrors the implementation (asserts the same literal, the same branch, the same constant), that cannot fail, or that only asserts a happy path, is not a regression test.\n\
+         6. FIX, DO NOT LIST AWAY: fix every real defect you find, with a regression test that fails without the fix. Run the completion gate `");
+    prompt.push_str(gate);
+    prompt.push_str(
+        "` and the tests of the files you touched, and see them pass.\n\
+         7. Report honestly: in your REPORT block list every finding you did NOT fix in the `risks:` line, one line each. Fixing nothing real is a valid outcome; claiming a clean bill of health you did not check is not.\n\
+         8. When the gate and the tests pass and every finding is either fixed or listed, execute:\n\
+            echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+    );
+    prompt
+}
 
 /// Everything the review phase needs, and the step counter it hands back.
 ///
@@ -51,6 +198,17 @@ pub struct ReviewPhase<'a> {
     /// land in one continuous set of health counters instead of a second run's
     /// worth.
     pub meta: &'a mut WorkerMeta,
+    /// Which auditor runs: the generic quality review, or the adversarial
+    /// security review. Defaults to [`ReviewMode::Quality`].
+    pub mode: ReviewMode,
+    /// The dispatch's completion gate, re-run by the reviewer instead of a
+    /// language-specific suite invented in the prompt. `None` when the
+    /// dispatch disabled the gate.
+    pub verify: Option<String>,
+    /// Touched files the repository declared sensitive, when the security
+    /// review was triggered by one of them. Empty for a hand-requested
+    /// review.
+    pub sensitive: Vec<String>,
 }
 
 /// What the review phase hands back: the combined step counter and whether the
@@ -88,11 +246,15 @@ impl WorkerPool {
             mut step,
             network_offline,
             meta,
+            mode,
+            verify,
+            sensitive,
         } = review;
 
         info!(
             worker = %worker_id,
             reviewer = %reviewer_model,
+            mode = mode.as_str(),
             "Implementation finished; starting multi-phase review pipeline"
         );
 
@@ -114,17 +276,7 @@ impl WorkerPool {
             }
         }
 
-        let review_prompt = format!(
-            "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
-            YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
-            1. First run the full test and lint suite on the checkpoint (e.g. `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`) and see it pass.\n\
-            2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
-            3. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
-            4. Re-run the full test and lint suite and see it pass before completing.\n\
-            5. When verified and 100% clean, execute:\n\
-               echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
-            task
-        );
+        let review_prompt = review_prompt(mode, &task, verify.as_deref(), &sensitive);
 
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),
