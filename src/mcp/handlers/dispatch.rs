@@ -219,11 +219,14 @@ impl McpServer {
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
 
         // Optional verify gate: an explicit string (possibly empty to disable)
-        // is passed through; an absent argument lets the pool auto-detect. A
-        // non-string is refused here rather than dropped, so a caller who
-        // meant a gate never silently gets the auto-detected one.
+        // is passed through verbatim and wins over every default. An absent
+        // argument is auto-detected: the project's full gate, except on a
+        // dispatch that asks to consolidate the round, whose workers get the
+        // cheap static gate -- the consolidator (dispatched separately, with
+        // `role: "consolidate"`) still runs the full one. A non-string is
+        // refused here rather than dropped, so a caller who meant a gate never
+        // silently gets a default one.
         let verify = match args.get("verify") {
-            None => None,
             Some(value) => Some(
                 value
                     .as_str()
@@ -232,6 +235,14 @@ impl McpServer {
                     })?
                     .to_string(),
             ),
+            None if matches!(
+                args.get("consolidate"),
+                Some(Value::Bool(true) | Value::String(_))
+            ) && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
+            {
+                crate::pool::detect_cheap_verify_command(&repo_path)
+            }
+            None => None,
         };
         // Parse-checked where it enters: a gate stored verbatim is run by a
         // worker (or, for `consolidate_verify`, by a consolidator dispatched
@@ -290,21 +301,19 @@ impl McpServer {
 }
 
 pub(in crate::mcp) const TASK_DESCRIPTION: &str =
-    "ONE focused concern: files in scope and the acceptance gate.";
+    "ONE focused concern: files in scope, acceptance gate.";
 
-pub(in crate::mcp) const TASKS_DESCRIPTION: &str =
-    "Batch {task, model?, ...} entries; top-level defaults.";
+pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; top-level defaults.";
 
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
-    "Absolute repository root (alias: 'path'). Required for 'dispatch'.";
+    "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer model auditing the worktree after implementation.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model for the worktree audit.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
 
-pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.";
+pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
-    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps connectivity.";
+    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.";

@@ -28,6 +28,8 @@ system prompt at dispatch time, so keep them short and actionable.
 
 - While working, build and run only what you touch: `cargo test --test <file>`
   or `cargo test <name>`, and `cargo check` instead of a full build.
+- A round's consolidator runs the full suite once, on the integrated result, so
+  you do not have to run it per worker while you implement.
 - Run the full gates (fmt --check, clippy, full test) once, right before
   requesting completion: the harness reuses an identical passing run and runs
   the divergent variant itself.
@@ -45,6 +47,9 @@ system prompt at dispatch time, so keep them short and actionable.
 
 ## Working style
 
+- Locate code by name, not by the line numbers in the task: they may be stale.
+- List in your REPORT any file outside the task's scope you had to touch.
+- Never modify `models.yaml`: it is the operator's model catalog, not the task's.
 - Reuse existing helpers (`tests/common/`, module-level functions) instead of
   copying a block of logic into a second place.
 - Keep the diff to the task's scope; put new tests in a file dedicated to the

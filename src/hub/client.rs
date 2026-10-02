@@ -1,7 +1,14 @@
 //! Thin transports to the shared hub, with bounded startup retries.
+//!
+//! Reconnects live here, not in the callers: a daemon that goes away under a
+//! long-lived client is one event, and [`reconnect_following`] is the single
+//! place that turns it into "dial again, say `hub/hello` with the same identity,
+//! resume" while [`daemon_went_away`] is the single test for "the daemon is
+//! gone" that every transport error is read through.
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
@@ -35,7 +42,10 @@ pub async fn connect_or_spawn() -> Result<UnixStream> {
         match super::daemon::connect_endpoint(&paths.endpoint()).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(error).context("Hub did not start within 5 seconds; inspect hub.log");
+                // The daemon is not there: reported with the refusal that proved
+                // it, so a client following it reads this as a daemon that has
+                // yet to come up rather than as its own failure.
+                return Err(error).context("Hub did not start; inspect hub.log");
             }
             Err(_) => {}
         }
@@ -81,6 +91,172 @@ pub(crate) fn spawn_daemon(paths: &HubPaths, exe: &std::path::Path) -> Result<()
     });
 
     Ok(())
+}
+
+/// Whether `error` means the daemon went away rather than refused the request.
+///
+/// Every way a hub socket can die reads as one answer, because the client's
+/// answer is the same for all of them: follow the daemon. A handover — or any
+/// daemon restart — closes the connection underneath a long-lived watch, and
+/// the abrupt version of that cut surfaces as a reset or a broken pipe instead
+/// of an orderly EOF; while the replacement is still starting, the dial fails
+/// with a refused connection or a socket that is not there yet. Matching the
+/// `ErrorKind`s covers all of them; the messages below cover the two the kinds
+/// cannot — the clean EOF the client reports as its own line, and the auto-start
+/// that never came up.
+pub fn daemon_went_away(error: &anyhow::Error) -> bool {
+    // `chain` starts at the error itself (a bare `io::Error` has no source, so
+    // walking `source` alone would never reach it) and ends at the root cause.
+    for cause in error.chain() {
+        if is_gone_away_kind(cause) {
+            return true;
+        }
+    }
+    // `anyhow::Error` reports only the outermost context, which need not be
+    // the transport error itself, so read the whole rendered chain too.
+    let chain = error_chain(error);
+    chain.contains("Hub closed the connection")
+        || chain.contains("Connection reset by peer")
+        || chain.contains("Broken pipe")
+        || chain.contains("BrokenPipe")
+        || chain.contains("Connection refused")
+        || chain.contains("ConnectionRefused")
+        || chain.contains("No such file or directory")
+        || chain.contains("NotFound")
+        || chain.contains("Did not start")
+}
+
+/// The I/O failure kinds that mean "the daemon is no longer on this socket".
+fn is_gone_away_kind(cause: &(dyn std::error::Error + 'static)) -> bool {
+    let io = cause.downcast_ref::<std::io::Error>();
+    matches!(
+        io.map(std::io::Error::kind),
+        Some(
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::NotFound
+        )
+    ) || cause.to_string().contains("Hub closed the connection")
+}
+
+/// Env var overriding how long a client follows a daemon that keeps going away.
+pub const RECONNECT_DEADLINE_ENV: &str = "MINI_SWE_RECONNECT_SECS";
+
+/// Default reconnect budget: long enough to outlast a handover and the
+/// recovery the replacement runs, short enough that a hub that never comes back
+/// ends the watch with an explanation instead of hanging on it.
+pub const DEFAULT_RECONNECT_SECS: u64 = 60;
+
+/// Bounds on the reconnect budget, so the environment cannot make a client
+/// give up instantly or wait forever.
+const MIN_RECONNECT_SECS: u64 = 1;
+const MAX_RECONNECT_SECS: u64 = 24 * 60 * 60;
+
+/// First pause between dials while the replacement starts.
+const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(50);
+
+/// Ceiling for the exponential backoff between dials.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+
+/// How long a client follows a daemon that goes away, from the environment or
+/// [`DEFAULT_RECONNECT_SECS`].
+///
+/// It bounds the whole chase, not the number of attempts: a handover costs a
+/// handful of fast failures (no socket yet, lock still held, recovery running),
+/// and a busy daemon whose replacement keeps failing costs seconds. The budget
+/// starts on the first failure and is never extended, so a watch cannot hold a
+/// decision open forever.
+pub fn reconnect_deadline() -> Duration {
+    Duration::from_secs(reconnect_secs(None))
+}
+
+/// The budget in seconds: the environment override, else the default, clamped.
+fn reconnect_secs(requested: Option<u64>) -> u64 {
+    requested
+        .or_else(|| crate::config::env_parse(RECONNECT_DEADLINE_ENV))
+        .unwrap_or(DEFAULT_RECONNECT_SECS)
+        .clamp(MIN_RECONNECT_SECS, MAX_RECONNECT_SECS)
+}
+
+/// The failure that ends the chase for good, once the budget is spent.
+fn give_up(waited: Duration, last: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "The hub went away and did not come back within {}s ({}); \
+         start the hub again and re-run the command",
+        waited.as_secs(),
+        error_chain(last)
+    )
+}
+
+/// Every frame of an error, so a reported cause is never the outermost context
+/// alone.
+fn error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+/// Re-announce this identity on a new connection and return the replacement.
+///
+/// The caller marks its next snapshot `initial`, so whatever the old daemon
+/// never delivered is asked for again. `with` re-sends the hello through the
+/// caller's own connection path, so the stdio proxy keeps the identity its MCP
+/// client established while the CLI hands back a fresh [`HubClient`].
+pub async fn reconnect_following<R>(deadline: Duration, with: R) -> Result<HubClient>
+where
+    R: Reconnect<Output = HubClient>,
+{
+    follow_until(deadline, with).await
+}
+
+/// One dial-and-greet attempt, in the shape every hub transport reconnects with:
+/// a closure returning a future, so the chase never knows what it is dialling.
+///
+/// Implemented by [`reconnect_following`]'s callers and, in tests, by any
+/// stand-in for a dial.
+pub trait Reconnect {
+    type Output;
+    /// One attempt: the connection it made, or why there is none.
+    fn attempt(&mut self) -> impl Future<Output = Result<Self::Output>>;
+}
+
+/// The chase itself: dial, and if the daemon is simply gone, dial again after a
+/// backoff until `deadline`.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn follow_until<R: Reconnect>(deadline: Duration, mut with: R) -> Result<R::Output> {
+    let started = tokio::time::Instant::now();
+    let mut delay = RECONNECT_BACKOFF_START;
+    loop {
+        match with.attempt().await {
+            Ok(client) => return Ok(client),
+            // A fault that is not "the daemon is gone" is the caller's own
+            // error (a refused identity, a malformed reply): report it now
+            // rather than dialling again until the deadline.
+            Err(error) if !daemon_went_away(&error) => return Err(error),
+            Err(error) => {
+                let waited = started.elapsed();
+                anyhow::ensure!(waited < deadline, "{}", give_up(waited, &error));
+            }
+        }
+        tokio::time::sleep(delay.min(deadline.saturating_sub(started.elapsed()))).await;
+        delay = (delay * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Any closure that produces one connection attempt is a [`Reconnect`].
+impl<F, Fut, T> Reconnect for F
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    type Output = T;
+
+    fn attempt(&mut self) -> impl Future<Output = Result<Self::Output>> {
+        self()
+    }
 }
 
 /// Announce this process to the daemon.
@@ -476,7 +652,22 @@ pub async fn proxy_stdio() -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let result = async {
         loop {
-            let mut client = negotiated_identity(false, identity.clone()).await?;
+            // A daemon that goes away is not the end of the session: follow it,
+            // so the MCP client sees one connection to the hub for its whole
+            // life. The budget is spent across the whole session rather than per
+            // reconnect, because a hub that never comes back must not leave a
+            // proxy that can still serve one tool call running forever.
+            let mut client = match reconnect_following(reconnect_deadline(), || {
+                negotiated_identity(false, identity.clone())
+            })
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    answer_cut_requests(&mut stdout, &mut pending).await?;
+                    return Err(error);
+                }
+            };
             if let Some(params) = &initialize {
                 client.request("initialize", params.clone()).await?;
             }
@@ -670,3 +861,7 @@ impl HubClient {
         Ok(serde_json::from_str(text)?)
     }
 }
+
+#[cfg(test)]
+#[path = "client_reconnect_tests.rs"]
+mod reconnect_tests;

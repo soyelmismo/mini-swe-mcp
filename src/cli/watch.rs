@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::time::Duration;
 
+use crate::hub::client::{daemon_went_away, reconnect_deadline};
 use crate::pool::{WorkerMetrics, WorkerRegistryEntry, WorkerState, clamp_string};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -978,28 +979,11 @@ async fn registry_fallback(
     polling(opts, json_output, admin).await
 }
 
-/// Whether `error` means the daemon went away rather than refused the request.
-///
-/// A handover — or any daemon restart — closes the connection underneath a
-/// long-lived watch. The watch follows the daemon instead of ending, so a
-/// planned stop is invisible to whoever is watching.
-fn daemon_went_away(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("Hub closed the connection")
-        || message.contains("Connection reset by peer")
-        || message.contains("Broken pipe")
-}
-
-/// How many times a watch follows a daemon that keeps going away before it
-/// reports the failure instead of reconnecting forever.
-const MAX_WATCH_RECONNECTS: usize = 16;
-
-/// Re-dial the hub after it went away, announcing the same identity again.
-///
-/// The caller marks the next snapshot `initial`, so the events the watch missed
-/// while the daemon was down are replayed rather than lost.
-async fn reconnect(admin: bool) -> Result<crate::hub::HubClient> {
-    crate::hub::HubClient::connect_as_admin(admin).await
+/// The reconnect budget this watch spends, read before the first dial so the
+/// [`crate::hub::client::RECONNECT_DEADLINE_ENV`] override applies to the whole
+/// watch and not to one attempt.
+fn reconnect_budget() -> Duration {
+    reconnect_deadline()
 }
 
 /// End a watch with no further event to show. Exit 0 is reserved for a watch
@@ -1040,7 +1024,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     let mut initial = true;
     let mut watched_any = false;
     let mut printed_event = false;
-    let mut reconnects = 0usize;
+    let reconnects = reconnect_budget();
     'watch: loop {
         let response = match client
             .watch_snapshot(&ids, &opts.groups, initial, opts.all)
@@ -1050,7 +1034,8 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             Err(error) if daemon_went_away(&error) => {
                 // The daemon restarted under this watch: follow it, and ask for
                 // the missed events again on the new connection.
-                client = follow(&mut reconnects, admin).await?;
+                client = follow(reconnects, admin).await?;
+                // Ask the replacement for the events the daemon took with it.
                 initial = true;
                 ids = opts.ids.clone();
                 continue;
@@ -1097,7 +1082,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
                 .await
             {
                 if daemon_went_away(&error) {
-                    client = follow(&mut reconnects, admin).await?;
+                    client = follow(reconnects, admin).await?;
                     initial = true;
                     ids = opts.ids.clone();
                     continue 'watch;
@@ -1129,7 +1114,7 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
             match result {
                 Ok(()) => {}
                 Err(error) if daemon_went_away(&error) => {
-                    client = follow(&mut reconnects, admin).await?;
+                    client = follow(reconnects, admin).await?;
                     initial = true;
                     ids = opts.ids.clone();
                     continue;
@@ -1140,14 +1125,19 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
     }
 }
 
-/// Follow a daemon that went away, or give up once it has happened too often.
-async fn follow(reconnects: &mut usize, admin: bool) -> Result<crate::hub::HubClient> {
-    *reconnects += 1;
-    anyhow::ensure!(
-        *reconnects <= MAX_WATCH_RECONNECTS,
-        "The hub went away {reconnects} times; restart the watch"
-    );
-    reconnect(admin).await
+/// Follow a daemon that went away, or give up once the budget is spent.
+///
+/// The budget belongs to the whole watch, not to one reconnect: a handover
+/// spends a few fast failures on the replacement coming up, and a hub that never
+/// comes back ends the watch with an explanation instead of an indefinitely
+/// retried dial. Every dial re-announces the same identity, and the caller marks
+/// its next snapshot `initial`, so the events the watch missed while the daemon
+/// was down are replayed rather than lost.
+async fn follow(budget: Duration, admin: bool) -> Result<crate::hub::HubClient> {
+    crate::hub::client::reconnect_following(budget, || {
+        crate::hub::HubClient::connect_as_admin(admin)
+    })
+    .await
 }
 
 async fn polling(opts: Options, json_output: bool, admin: bool) -> Result<i32> {
