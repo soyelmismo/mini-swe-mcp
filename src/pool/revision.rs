@@ -1140,6 +1140,14 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
             )
             .is_ok_and(|out| out.status.success());
             let entry = super::load_registry_entry_in(root, id);
+            // An interrupted worker is not an orphan: its row says the
+            // hub stopped it mid-run, so its history is what the next
+            // daemon's recovery auto-continues from. Its retention must
+            // never expire while it is still interrupted, or the sweep
+            // would delete the very conversation the continuation needs.
+            let interrupted = entry
+                .as_ref()
+                .is_some_and(|e| e.status == super::RegistryStatus::Interrupted);
             // The branch outlived its retention, or it is gone with nothing
             // left to recreate it from, or its grace has run out: either way
             // the worker cannot be continued any more and the whole trace goes.
@@ -1149,7 +1157,8 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
             let kept_through_grace = entry
                 .as_ref()
                 .is_some_and(|e| within_retired_grace(e.updated_at, grace_secs, now));
-            if expired || (!branch_exists && !kept_through_grace) {
+            if (!interrupted && expired) || (!interrupted && !branch_exists && !kept_through_grace)
+            {
                 retire_worker_in(root, id);
                 removed += 1;
             }
@@ -1249,6 +1258,34 @@ impl super::WorkerPool {
         }
     }
 
+    /// Store the commit a worker branched from on its registry row.
+    ///
+    /// A continuation that finds the branch missing recreates it from
+    /// this commit: it is the only point an interrupted worker that
+    /// never committed still names, so without it a hub restart would
+    /// strand the worker. Written once, when the worktree opens, and
+    /// never rewritten -- the base of a run is what the branch was cut
+    /// from, whatever the run went on to commit.
+    pub(crate) async fn record_base_commit(&self, id: &str, base_commit: &str) {
+        if base_commit.is_empty() {
+            return;
+        }
+        let base_commit = base_commit.to_string();
+        let id = id.to_string();
+        let root = self.scratch.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Some(mut entry) = super::load_registry_entry_in(&root, &id) else {
+                return;
+            };
+            if entry.base_commit.as_deref() == Some(base_commit.as_str()) {
+                return;
+            }
+            entry.base_commit = Some(base_commit);
+            super::save_registry_entry_in(&root, &entry);
+        })
+        .await;
+    }
+
     /// Store the base branch detected during a continuation on the registry
     /// row, so the pre-completion base sync keeps running for that worker.
     async fn record_base_branch(&self, id: &str, base_branch: &str) {
@@ -1297,9 +1334,12 @@ impl super::WorkerPool {
     ///
     /// A merged worker's branch is pruned, but its row and conversation are
     /// kept through the retired grace period. When the branch is gone, recreate
-    /// it at the head commit the row recorded at completion, so the
-    /// continuation keeps the worker's work instead of failing. The error names
-    /// the branch when there is nothing to recreate it from.
+    /// it at the head commit the row recorded at completion -- or, for a
+    /// worker that never reached a commit, at the base commit the row
+    /// branched from, which is exactly where an interrupted worker's
+    /// branch pointed -- so the continuation keeps the worker's work
+    /// instead of failing. The error names the branch when there is
+    /// nothing to recreate it from.
     async fn ensure_worker_branch(
         &self,
         id: &str,
@@ -1309,16 +1349,21 @@ impl super::WorkerPool {
         if Self::worker_branch_exists(repo_path, branch).await {
             return Ok(());
         }
-        let Some(head_commit) =
-            super::load_registry_entry_in(&self.scratch, id).and_then(|entry| entry.head_commit)
-        else {
-            anyhow::bail!(
-                "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
-            );
-        };
+        // Recreation point, most precise first: the recorded head is the
+        // exact point the branch ended at, while the base commit is the
+        // only point an interrupted worker that never committed still
+        // names -- recreating from it is what keeps such a worker
+        // continuable when its branch was pruned.
+        let recreate_at = super::load_registry_entry_in(&self.scratch, id)
+            .and_then(|entry| entry.head_commit.clone().or(entry.base_commit.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Worker branch {branch} no longer exists; the finished worker {id} cannot be revised"
+                )
+            })?;
         let repo = repo_path.to_path_buf();
         let branch_for_git = branch.to_string();
-        let head = head_commit.clone();
+        let head = recreate_at.clone();
         let recreated = tokio::task::spawn_blocking(move || {
             crate::worktree::git(&repo, "branch", &["branch", &branch_for_git, &head])
                 .map(|out| out.status.success())
@@ -1328,14 +1373,14 @@ impl super::WorkerPool {
         .unwrap_or(false);
         if !recreated {
             anyhow::bail!(
-                "Worker branch {branch} no longer exists and could not be recreated from commit {head_commit}; the finished worker {id} cannot be revised"
+                "Worker branch {branch} no longer exists and could not be recreated from commit {recreate_at}; the finished worker {id} cannot be revised"
             );
         }
         tracing::info!(
             worker = %id,
             branch = %branch,
-            commit = %head_commit,
-            "Recreated a pruned worker branch from its recorded head"
+            commit = %recreate_at,
+            "Recreated a pruned worker branch from the commit its row recorded"
         );
         Ok(())
     }

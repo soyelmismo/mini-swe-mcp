@@ -683,7 +683,7 @@ fn the_consolidate_help_topic_describes_the_round_workflow() {
         .as_str()
         .expect("the verify description");
     assert!(
-        verify.contains("cheap gate"),
+        verify.contains("Cheap for workers"),
         "the verify description must point at the cheap worker gate: {verify}"
     );
 }

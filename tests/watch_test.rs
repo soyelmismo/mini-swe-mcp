@@ -525,7 +525,8 @@ fn tool_description_stays_short_and_points_at_the_help_topics() {
     let text = serde_json::to_string(&server.tools_list()).expect("list");
     for needle in [
         "mini-swe-mcp watch",
-        "mini-swe-mcp help <topic>",
+        // Topics are reachable from MCP too, so the schema names both paths.
+        "`help <topic>` (CLI) or action 'help' (MCP)",
         "own workers",
         "no_event",
         "steer",

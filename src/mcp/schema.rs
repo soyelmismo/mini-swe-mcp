@@ -32,6 +32,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "prune",
     "merge",
     "consolidate",
+    "help",
 ];
 
 /// Declared network policy for a dispatched worker.
@@ -64,8 +65,9 @@ pub const NETWORK_DEFAULT: &str = "allow";
 /// Description of the `worker` tool itself.
 ///
 /// Kept to the rules an agent needs to call the tool correctly; the longer
-/// guidance lives in `mini-swe-mcp help <topic>` (see [`crate::cli::help`]).
-const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. mini-swe-mcp watch: run it again after each event. Only own workers, admin excepted. mini-swe-mcp help <topic>: workflow watch steer review collect merge discard identity sandbox env consolidate.";
+/// guidance lives per topic, reachable as `help <topic>` (CLI) or the
+/// `help` action (MCP) (see [`crate::cli::help`]).
+const WORKER_TOOL_DESCRIPTION: &str = "Git-worktree workers. Parallel work is a ROUND: dispatch tasks+group+consolidate, cheap worker gate, wait with watch --group <g> --all (MCP all:true), read its report, merge it. mini-swe-mcp watch: run it again after each event. MCP watch: timeout_secs. Only own workers; admin excepted. Topics: `help <topic>` (CLI) or action 'help' (MCP).";
 
 /// Where the `description` of an `inputSchema` property comes from.
 enum DescriptionSource {
@@ -86,7 +88,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "action",
         "string",
-        DescriptionSource::Static("Action to perform; the enum lists every verb."),
+        DescriptionSource::Static("The verb; the enum lists every one."),
     ),
     (
         "task",
@@ -106,7 +108,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "path",
         "string",
-        DescriptionSource::Static("Alias for repo_path."),
+        DescriptionSource::Static("Alias for repo_path"),
     ),
     (
         "model",
@@ -122,7 +124,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "id",
         "string",
-        DescriptionSource::Static("Alias for worker_id."),
+        DescriptionSource::Static("Alias for worker_id"),
     ),
     (
         "message",
@@ -162,7 +164,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model temperature (overrides the default)."),
+        DescriptionSource::Static("Model temperature (overrides default)."),
     ),
     (
         "review_after",
@@ -182,12 +184,17 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static("Consolidator's gate; parse-checked with `sh -n`."),
+        DescriptionSource::Static("Consolidator's gate; `sh -n` checked."),
     ),
     (
         "set",
         "boolean",
         DescriptionSource::Static(super::handlers::consolidate::SET_DESCRIPTION),
+    ),
+    (
+        "topic",
+        "string",
+        DescriptionSource::Static(super::handlers::help::TOPIC_DESCRIPTION),
     ),
     (
         "scope",
@@ -387,6 +394,10 @@ mod tests {
     /// at least a 40% cut.
     const TOOLS_LIST_BASELINE_BYTES: usize = 6990;
 
+    /// Every budget test fails with this guidance: the fix is always to
+    /// shorten text, never to raise the budget.
+    const BUDGET_GUIDANCE: &str = "Shorten descriptions (details belong in `help <topic>`); never raise TOOLS_LIST_BASELINE_BYTES or the budget ratio.";
+
     fn worker_schema(tools_list: &Value) -> &Value {
         tools_list["tools"]
             .as_array()
@@ -541,18 +552,18 @@ mod tests {
         for needle in [
             "mini-swe-mcp watch",
             "run it again after each event",
-            "mini-swe-mcp help <topic>",
+            "`help <topic>` (CLI) or action 'help' (MCP)",
             "own workers",
+            // The default shape of parallel work: one group, one
+            // consolidator, one branch to merge.
+            "Parallel work is a ROUND",
+            "tasks+group+consolidate",
+            "--group <g> --all",
+            "merge",
         ] {
             assert!(
                 description.contains(needle),
                 "the tool description must mention {needle}: {description}"
-            );
-        }
-        for topic in crate::cli::help::TOPICS {
-            assert!(
-                description.contains(topic),
-                "the tool description must point at the '{topic}' topic: {description}"
             );
         }
     }
@@ -567,8 +578,18 @@ mod tests {
             .len();
         assert!(
             bytes * 10 <= TOOLS_LIST_BASELINE_BYTES * 6,
-            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload"
+            "tools/list grew to {bytes} bytes; budget is 60% of the {TOOLS_LIST_BASELINE_BYTES}-byte pre-trim payload; {BUDGET_GUIDANCE}"
         );
+    }
+
+    /// Pins the baseline constant: the budget only means something while
+    /// the pre-trim payload it was measured from stays fixed, so raising
+    /// the constant to make the budget test pass must fail too.
+    #[test]
+    fn tools_list_baseline_constant_is_pinned() {
+        if TOOLS_LIST_BASELINE_BYTES != 6990 {
+            panic!("TOOLS_LIST_BASELINE_BYTES changed from 6990; {BUDGET_GUIDANCE}");
+        }
     }
 
     /// `message` stays a short call contract; the full list of stopped states

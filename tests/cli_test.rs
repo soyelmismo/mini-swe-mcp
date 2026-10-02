@@ -2,6 +2,7 @@
 
 mod common;
 
+use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -89,7 +90,9 @@ fn test_cli_help_flag() {
 fn test_cli_help_topics() {
     let exe = binary_path();
     for (topic, needle) in [
-        ("workflow", "ONE focused concern"),
+        ("workflow", "the default is a ROUND"),
+        ("workflow", "watch --group <g> --all"),
+        ("workflow", "--consolidate"),
         ("watch", "mini-swe-mcp watch"),
         ("steer", "worker-<id>"),
         ("identity", "own workers"),
@@ -120,6 +123,84 @@ fn test_cli_help_topics() {
         stderr.contains("workflow"),
         "an unknown topic must list the topics: {stderr}"
     );
+}
+
+/// The `workflow` topic is the round workflow: the group dispatch, the cheap
+/// worker gate, the `--all` wait for the round, the consolidator's report, and
+/// the single branch that is merged. The rules an orchestrator is most likely
+/// to break are the ones it must never break by hand.
+#[test]
+fn test_cli_help_workflow_topic_is_the_round_workflow() {
+    let exe = binary_path();
+    let output = common::binary_command(&exe)
+        .env("MINI_SWE_NO_DAEMON", "1")
+        .args(["help", "workflow"])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for needle in [
+        "ONE focused concern",
+        "dispatch -f tasks.yaml --group <g> --consolidate",
+        "CHEAP gate",
+        "watch --group <g> --all",
+        "one-line-per-worker report",
+        "security-relevant parts",
+        "merge <consolidator>",
+        // The single-worker path stays, for the one-off task.
+        "For a one-off task",
+        "merge only when it is right",
+        // Corrections go through steer, and the base branch stays put.
+        "never edit its branch yourself",
+        "Do not move the base branch while a round is consolidating",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "help workflow must mention {needle}: {stdout}"
+        );
+    }
+}
+
+/// The MCP-only agent cannot run the binary, so the `help` action must return
+/// the same topic index and topic text the CLI prints, over the tool call.
+#[test]
+fn test_mcp_help_action_returns_the_index_and_a_topic() {
+    let server = mini_swe_mcp::mcp::McpServer::new(
+        mini_swe_mcp::pool::WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()),
+        "ninja".to_string(),
+    );
+    let index = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(server.execute_tool("worker", json!({ "action": "help" })))
+        .expect("the help index");
+    let topics: Vec<&str> = index["topics"]
+        .as_array()
+        .expect("a topics array")
+        .iter()
+        .map(|topic| topic.as_str().expect("topic names are strings"))
+        .collect();
+    assert_eq!(topics, mini_swe_mcp::cli::help::TOPICS.to_vec());
+
+    let topic = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(server.execute_tool("worker", json!({ "action": "help", "topic": "workflow" })))
+        .expect("the workflow topic");
+    assert_eq!(topic["topic"], json!("workflow"));
+    assert_eq!(
+        topic["text"],
+        json!(mini_swe_mcp::cli::help::topic_text("workflow").expect("workflow topic"))
+    );
+
+    // A typo is refused with the alternatives, never an empty answer.
+    let error = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(server.execute_tool("worker", json!({ "action": "help", "topic": "nope" })))
+        .expect_err("an unknown topic must be refused");
+    assert!(error.to_string().contains("Unknown help topic"), "{error}");
 }
 
 /// `--version`/`-V` and `--help`/`-h` must be handled *before* any API-key
