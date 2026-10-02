@@ -1133,6 +1133,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             loop_pauses: 1,
             verify_runs: 2,
             verify_failures: 1,
+            isolation_blocks: 0,
             diff_files: 5,
             diff_insertions: 120,
             diff_deletions: 340,
