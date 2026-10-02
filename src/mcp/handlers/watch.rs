@@ -46,6 +46,14 @@ impl McpServer {
     /// worker to its owner -- and it answers `status: "no_event"` when
     /// `timeout_secs` expires first, so a caller under a host deadline can
     /// simply call `watch` again.
+    ///
+    /// One watch runs per session, so a second call never blocks on the same
+    /// events: a selection the running watch already follows answers at once
+    /// with `status: "already_covered"`, and a broader one widens the running
+    /// watch to the union and answers `status: "widened"`, both carrying the
+    /// one-line `message` the CLI prints. Ownership scoping is unchanged --
+    /// a widened selection names only what the running watch and this call
+    /// already named.
     pub(super) async fn handle_watch(
         &self,
         args: &Value,
