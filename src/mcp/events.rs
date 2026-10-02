@@ -32,8 +32,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::pool::{
-    FileStat, LogBuffer, RegistryStatus, WorkerMetrics, WorkerPhase, WorkerPool,
-    WorkerRegistryEntry, WorkerReport, WorkerState, clamp_string, file_stats_of_diff,
+    FileStat, LogBuffer, RegistryStatus, SecurityReviewOutcome, WorkerMetrics, WorkerPhase,
+    WorkerPool, WorkerRegistryEntry, WorkerReport, WorkerState, clamp_string, file_stats_of_diff,
 };
 
 /// How often the event task re-reads the registry for workers it does not own.
@@ -108,6 +108,10 @@ pub struct Outcome {
     pub report: Option<WorkerReport>,
     /// The completion diff split per file, biggest churn first.
     pub per_file: Vec<FileStat>,
+    /// The adversarial security review that ran over the diff, when one did.
+    /// Carried so the completion event can say a security review ran and how
+    /// many findings it reported.
+    pub security_review: Option<SecurityReviewOutcome>,
 }
 
 /// One worker's state as the event task sees it, reduced to what a notification
@@ -291,6 +295,13 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
             let files = crate::pool::churn_line(&view.outcome.per_file);
             if !files.is_empty() {
                 body.push_str(&format!("files: {files}\n"));
+            }
+            if let Some(security) = view.outcome.security_review {
+                let count = security
+                    .findings
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "not reported".to_string());
+                body.push_str(&format!("Security review: {count} findings\n"));
             }
             if let Some(risks) = view
                 .outcome
@@ -1264,7 +1275,11 @@ async fn snapshot(pool: &WorkerPool, reported: &WorkerSnapshot) -> WorkerSnapsho
             && reported.get(&id).and_then(|was| was.event) != view.event
             && let Some(state) = pool.get_worker_state(&id).await
         {
+            // The security review lives on the registry row, not the state,
+            // so it is preserved across the state-derived outcome.
+            let security_review = view.outcome.security_review;
             view.outcome = outcome_of(&state);
+            view.outcome.security_review = security_review;
             // The in-memory state names the branch the registry row cannot, so
             // the completion guidance points at the branch a revision resumes.
             view.branch = crate::pool::terminal_branch(&state);
@@ -1401,6 +1416,7 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             // what it did and whether it verified.
             verified: entry.verified,
             report: entry.report.clone(),
+            security_review: entry.security_review,
             summary: entry
                 .report
                 .as_ref()
@@ -1447,6 +1463,9 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             error: None,
             report: report.clone(),
             per_file: file_stats_of_diff(diff),
+            // The state does not carry the security review; the registry row
+            // does, and `snapshot` copies it back after this call.
+            security_review: None,
         },
         WorkerState::Failed { error, metrics, .. } => Outcome {
             error: (!error.trim().is_empty()).then(|| quote(error)),
@@ -1466,6 +1485,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             error: None,
             report: report.clone(),
             per_file: file_stats_of_diff(diff),
+            security_review: None,
         },
         WorkerState::Running { .. } | WorkerState::Paused { .. } => Outcome::default(),
     }

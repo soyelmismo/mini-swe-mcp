@@ -185,6 +185,14 @@ pub struct ModelManifest {
     /// marks none, which keeps the dispatch default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strongest: Option<String>,
+    /// Repository-relative globs whose diffs trigger an automatic adversarial
+    /// security review, the manifest-side counterpart of the `## Sensitive
+    /// paths` section of `AGENTS.md`.
+    ///
+    /// Absent means "none declared here"; the instruction-file section is
+    /// still consulted, so marking paths in either place is enough.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_paths: Vec<String>,
     #[serde(default)]
     pub models: HashMap<String, ModelDefinition>,
 }
@@ -226,6 +234,7 @@ impl Default for ModelManifest {
         Self {
             default: Some(BUILTIN_DEFAULT_MODEL.to_string()),
             strongest: None,
+            sensitive_paths: Vec::new(),
             models,
         }
     }

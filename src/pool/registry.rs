@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::SecurityReviewOutcome;
 use super::state::{WorkerMetrics, WorkerReport};
 use crate::worktree::ScratchRoot;
 
@@ -178,6 +179,11 @@ pub struct WorkerRegistryEntry {
     /// written before the flag was recorded readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// The adversarial security review that ran over this worker's diff, and
+    /// the finding count it reported. `None` when no security review ran, and
+    /// `#[serde(default)]` keeps a row written before this field readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_review: Option<SecurityReviewOutcome>,
     /// Workers whose branches a consolidator merged into its own branch, in
     /// merge order. Recorded on the consolidator's row because that row is the
     /// only durable record of the round it integrated: when the consolidator
@@ -249,6 +255,7 @@ impl WorkerRegistryEntry {
             report: None,
             approved: None,
             verified: None,
+            security_review: None,
             integrated: Vec::new(),
             absorbed: Vec::new(),
             keep_branch: false,
@@ -300,6 +307,9 @@ pub struct WorkerMeta {
     /// Whether the completion passed its verify gate, written with the
     /// terminal row so the row carries the same verdict as the report.
     pub verified: Option<bool>,
+    /// The security review the phase loop ran, written with the terminal row
+    /// so a view built from the row alone still shows it ran and its count.
+    pub security_review: Option<SecurityReviewOutcome>,
 }
 
 impl WorkerMeta {
@@ -323,6 +333,7 @@ impl WorkerMeta {
             metrics: WorkerMetrics::default(),
             report: None,
             verified: None,
+            security_review: None,
         }
     }
 
@@ -365,6 +376,7 @@ impl WorkerMeta {
             report: self.report.clone(),
             approved: None,
             verified: self.verified,
+            security_review: self.security_review,
             integrated: Vec::new(),
             absorbed: Vec::new(),
             keep_branch: false,

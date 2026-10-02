@@ -67,6 +67,14 @@ pub fn format_status(val: &serde_json::Value) -> String {
         out.push_str(&line);
     }
     push_verified_line(&mut out, field("verified"));
+    if let Some(security) = field("security_review") {
+        let count = security
+            .get("findings")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "not reported".to_string());
+        out.push_str(&format!("Security review: {count} findings\n"));
+    }
     if let Some(revision) = field("revision").and_then(|v| v.as_u64()) {
         out.push_str(&format!("Revision: {revision}\n"));
     }
