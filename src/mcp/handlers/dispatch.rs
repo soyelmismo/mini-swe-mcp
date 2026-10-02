@@ -210,9 +210,19 @@ impl McpServer {
         {
             anyhow::bail!("role 'consolidate' requires 'group'");
         }
+        // `--review-after <model>[:security]`: the mode suffix is split off
+        // *before* the model is resolved, so an alias (`nerd:security`) still
+        // resolves to its id and the suffix survives to the phase loop, which
+        // re-parses it.
         let review_after = args.get("review_after").and_then(|v| v.as_str()).map(|s| {
-            let (resolved, _, _) = self.manifest.resolve_model(s);
-            resolved
+            let (model, mode) = crate::pool::ReviewMode::parse_model(s);
+            let (resolved, _, _) = self.manifest.resolve_model(&model);
+            match mode {
+                crate::pool::ReviewMode::Security => {
+                    format!("{resolved}:{}", crate::pool::ReviewMode::SECURITY_SUFFIX)
+                }
+                crate::pool::ReviewMode::Quality => resolved,
+            }
         });
 
         let network_offline =
@@ -308,7 +318,7 @@ pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; t
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model for the worktree audit.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "Reviewer model; `:security` = adversarial pass.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";

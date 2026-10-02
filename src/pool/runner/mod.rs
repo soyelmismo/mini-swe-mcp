@@ -30,8 +30,8 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
-use self::review::{ReviewMode, ReviewPhase};
-pub use self::review::SecurityReviewOutcome;
+use self::review::ReviewPhase;
+pub use self::review::{ReviewMode, SecurityReviewOutcome};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };

@@ -64,3 +64,19 @@ system prompt at dispatch time, so keep them short and actionable.
 
 - Establish the failing signal before editing, so the fix is provably a fix.
 - Do not call a failure pre-existing without showing it on the unmodified code.
+
+## Sensitive paths
+
+A worker whose diff touches any of these paths gets an automatic adversarial
+security review (`--review-after <model>:security`) before it is reported
+complete. Keep the list to the surfaces where a mistake is a security defect,
+not a style one.
+
+- src/hub/**
+- src/agent/sandbox*
+- src/agent/exec*
+- src/worktree/guard.rs
+- src/pool/merge.rs
+- src/pool/revision.rs
+- src/hub/identity.rs
+- src/mcp/events.rs

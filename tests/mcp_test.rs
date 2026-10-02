@@ -1480,6 +1480,7 @@ fn worker_transitions_become_one_event_each() {
                 deletions: 1,
             },
         ],
+            security_review: None,
     };
     let mut failed = worker_view("w-dead", Some(EventKind::Failed));
     failed.outcome = Outcome {
