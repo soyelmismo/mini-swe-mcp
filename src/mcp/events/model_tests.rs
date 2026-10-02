@@ -188,8 +188,13 @@ impl World {
         w.steered_by.is_some_and(|c| self.consolidators[c].live)
     }
 
+    /// Whether the worker's question is withheld for its steering consolidator.
+    ///
+    /// Like [`WorkerPool::question_for_consolidator`], only a *live*
+    /// consolidator owns the question: once the consolidator stopped, the
+    /// owner's watch is the only reader left and the question must reach it.
     fn question_for_consolidator(&self, w: &Worker) -> bool {
-        w.question_to_consolidator && w.status == Status::Paused
+        w.question_to_consolidator && w.status == Status::Paused && self.steered_live(w)
     }
 
     fn live_workers(&self) -> Vec<usize> {
@@ -701,7 +706,13 @@ impl Harness {
         }
     }
 
+    /// Hand a paused worker's question to a live consolidator, the way
+    /// `consolidate_steer` routes it: the question is withheld from the owner
+    /// only while that consolidator lives, and reaches the owner once it stops.
     fn mutate_question(&mut self, rng: &mut Rng) {
+        let live_cons: Vec<usize> = (0..self.world.consolidators.len())
+            .filter(|&c| self.world.consolidators[c].live)
+            .collect();
         let paused: Vec<usize> = self
             .world
             .live_workers()
@@ -712,11 +723,19 @@ impl Harness {
             return;
         }
         let idx = paused[rng.below(paused.len())];
-        let w = &mut self.world.workers[idx];
-        w.question_to_consolidator = !w.question_to_consolidator;
-        let id = w.id.clone();
-        let q = w.question_to_consolidator;
-        self.trace_detail(format!("  question_to_consolidator {id}={q}"));
+        if !live_cons.is_empty() && rng.chance(70) {
+            let cons = live_cons[rng.below(live_cons.len())];
+            let w = &mut self.world.workers[idx];
+            w.question_to_consolidator = true;
+            w.steered_by = Some(cons);
+            let id = w.id.clone();
+            self.trace_detail(format!("  question {id} -> consolidator {cons}"));
+        } else {
+            let w = &mut self.world.workers[idx];
+            w.question_to_consolidator = false;
+            let id = w.id.clone();
+            self.trace_detail(format!("  question {id} -> owner"));
+        }
     }
 
     // -- observation --------------------------------------------------------
@@ -1374,4 +1393,232 @@ fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
         json!([]),
         "a stale stall must not reopen an acknowledged round: {round}"
     );
+}
+
+/// A dead consolidator owns no question: it must reach the owner's watch.
+///
+/// A consolidator steered the worker, so a `SteerSource` names it; then the
+/// consolidator stopped (completed). The old `question_for_consolidator` only
+/// checked that a source exists, so the paused question was withheld from the
+/// owner's watch forever even though no live consolidator waits on it. The
+/// question must be delivered once the steering consolidator is gone, the same
+/// way a terminal event is.
+#[test]
+fn a_dead_consolidator_owns_no_question() {
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerPool, WorkerRole, save_registry_entry_in};
+    use crate::worktree::ScratchRoot;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-events-dead-cons-{}-{}",
+            std::process::id(),
+            crate::pool::unix_timestamp()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let pool = WorkerPool::with_scratch(
+            1,
+            "http://127.0.0.1:1".into(),
+            "test".into(),
+            ScratchRoot::new(dir.clone()),
+        );
+        // A paused worker with a question for its owner.
+        let mut worker = WorkerMeta::test_meta("w0", "owner");
+        worker.group = Some("g".into());
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &worker.entry(
+                "test",
+                RegistryStatus::Paused,
+                1,
+                10,
+                "done",
+                Some("why?".into()),
+            ),
+        );
+        // A consolidator that steered it, then stopped.
+        let mut cons = WorkerMeta::test_meta("c0", "owner");
+        cons.group = Some("g".into());
+        cons.role = WorkerRole::Consolidate;
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
+        );
+        pool.test_write_steer_source("w0", "c0")
+            .expect("a steer source is writable");
+        assert!(
+            !pool.question_for_consolidator("w0").await,
+            "a stopped consolidator must not own the question"
+        );
+        assert!(
+            !pool.steered_by_live_consolidator("w0").await,
+            "a stopped consolidator must not own the lifecycle either"
+        );
+        // While the consolidator lives, both decisions withhold from the owner.
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
+        );
+        assert!(
+            pool.question_for_consolidator("w0").await,
+            "a live consolidator owns the question"
+        );
+        assert!(
+            pool.steered_by_live_consolidator("w0").await,
+            "a live consolidator owns the lifecycle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// The real snapshot routes a steered worker to its live consolidator.
+///
+/// This drives the decision the harness otherwise injects: `watch_snapshot`
+/// reads a scripted pool's `SteerSource` file and consolidator registry row
+/// through `WorkerPool::question_for_consolidator` and
+/// `WorkerPool::steered_by_live_consolidator`, and the router's own suppression
+/// code turns those flags into what the owner's watch receives. Each phase
+/// asserts the delivery: a question and a terminal event are withheld while the
+/// consolidator lives and reach the owner once it has stopped.
+#[test]
+fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerPool, WorkerRole, save_registry_entry_in};
+    use crate::worktree::ScratchRoot;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime");
+    rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!(
+            "mcp-events-real-route-{}-{}",
+            std::process::id(),
+            crate::pool::unix_timestamp()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let pool = WorkerPool::with_scratch(
+            1,
+            "http://127.0.0.1:1".into(),
+            "test".into(),
+            ScratchRoot::new(dir.clone()),
+        );
+        let mut worker = WorkerMeta::test_meta("w0", "owner");
+        worker.group = Some("g".into());
+        worker.pid = 1;
+        // The consolidator is owned by someone else, so its own completion is
+        // not part of the owner's watch and cannot mask the worker's. A
+        // running pid keeps the liveness normalisation from reporting it as
+        // stopped: pid 1 is the container init and always alive.
+        let mut cons = WorkerMeta::test_meta("c0", "other");
+        cons.group = Some("g".into());
+        cons.role = WorkerRole::Consolidate;
+        cons.pid = 1;
+        pool.test_write_steer_source("w0", "c0")
+            .expect("a steer source is writable");
+
+        let mut router = EventRouter::default();
+        let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+        ctx.agent_id = Some("owner".into());
+        let watch = json!({"worker_ids":["w0"], "initial":false});
+
+        // Phase 1: the consolidator lives, the worker asks a question.
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
+        );
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &worker.entry(
+                "test",
+                RegistryStatus::Paused,
+                1,
+                10,
+                "done",
+                Some("why?".into()),
+            ),
+        );
+        let snap = super::watch_snapshot(&pool).await;
+        assert_eq!(
+            snap["w0"]["question_for_consolidator"],
+            json!(true),
+            "the real snapshot must flag the live consolidator"
+        );
+        router.observe_watch(snap);
+        let reply = router.watch_reply(&ctx, &watch).unwrap();
+        assert!(
+            reply["events"].as_array().is_some_and(Vec::is_empty),
+            "the question is withheld while the consolidator lives: {reply}"
+        );
+
+        // Phase 2: the consolidator stopped; the question reaches the owner.
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
+        );
+        let snap = super::watch_snapshot(&pool).await;
+        assert!(
+            snap["w0"]["question_for_consolidator"] != true,
+            "a stopped consolidator owns no question"
+        );
+        router.observe_watch(snap);
+        let reply = router.watch_reply(&ctx, &watch).unwrap();
+        assert!(
+            reply["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|e| e["event"] == "needs_input")),
+            "the question reaches the owner once the consolidator is gone: {reply}"
+        );
+        for event in reply["events"].as_array().into_iter().flatten() {
+            router.acknowledge_watch(&ctx, event["sequence"].as_u64().unwrap());
+        }
+
+        // Phase 3: the consolidator lives again, the worker fails. The
+        // failed row keeps the step, revision and question the paused row had
+        // so the snapshot is a transition of the same worker, not a stranger.
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Running, 0, 10, "run", None),
+        );
+        let mut failed = worker.entry("test", RegistryStatus::Failed, 1, 10, "boom", None);
+        failed.revision = 1;
+        save_registry_entry_in(&pool.scratch_root(), &failed);
+        let snap = super::watch_snapshot(&pool).await;
+        eprintln!("PHASE3 snap w0: {}", snap["w0"]);
+        assert_eq!(
+            snap["w0"]["steered_by_consolidator"],
+            json!(true),
+            "the real snapshot must flag the live consolidator"
+        );
+        router.observe_watch(snap);
+        let reply = router.watch_reply(&ctx, &watch).unwrap();
+        assert!(
+            reply["events"].as_array().is_some_and(Vec::is_empty),
+            "the terminal event is withheld while the consolidator lives: {reply}"
+        );
+
+        // Phase 4: the consolidator stopped; the terminal event reaches the owner.
+        save_registry_entry_in(
+            &pool.scratch_root(),
+            &cons.entry("test", RegistryStatus::Completed, 2, 10, "done", None),
+        );
+        let snap = super::watch_snapshot(&pool).await;
+        assert!(
+            snap["w0"]["steered_by_consolidator"] != true,
+            "a stopped consolidator owns no lifecycle event"
+        );
+        router.observe_watch(snap);
+        let reply = router.watch_reply(&ctx, &watch).unwrap();
+        assert!(
+            reply["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|e| e["event"] == "failed")),
+            "the terminal event reaches the owner once the consolidator is gone: {reply}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
