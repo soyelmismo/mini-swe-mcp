@@ -61,7 +61,10 @@ fn the_per_worker_lines_stay_in_the_message_for_the_orchestrator_to_read() {
 #[test]
 fn a_bare_report_marker_is_never_a_summary() {
     assert_eq!(parse_report("REPORT"), None);
-    assert_eq!(parse_report("REPORT\nREPORT 2a9aaca3 approved: fixed the parser"), None);
+    assert_eq!(
+        parse_report("REPORT\nREPORT 2a9aaca3 approved: fixed the parser"),
+        None
+    );
 }
 
 /// A per-worker line is not a block opener, so it cannot swallow the keys that
@@ -100,7 +103,7 @@ fn the_procedure_asks_for_the_standard_block_before_the_per_worker_lines() {
         block < per_worker,
         "the standard block must be asked for first: {CONSOLIDATOR_INSTRUCTIONS}"
     );
-    assert!(CONSOLIDATOR_INSTRUCTIONS.contains("tests: <the full gate result>"));
+    assert!(CONSOLIDATOR_INSTRUCTIONS.contains("tests: <the full gate result"));
     assert!(CONSOLIDATOR_INSTRUCTIONS.contains("files: <paths changed"));
     assert!(CONSOLIDATOR_INSTRUCTIONS.contains("risks: <"));
 }

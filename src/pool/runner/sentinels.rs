@@ -474,10 +474,9 @@ pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
-        parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
-        is_per_worker_line, opens_report_block, parse_report, parse_request_turns,
-        parse_wait_job,
+        REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, opens_report_block,
+        parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+        parse_consolidate_wait, parse_kill_job, parse_report, parse_request_turns, parse_wait_job,
         summarize_command, summary_line,
     };
     use crate::pool::WorkerReport;
