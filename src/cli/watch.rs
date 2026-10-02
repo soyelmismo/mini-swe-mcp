@@ -266,7 +266,7 @@ pub fn select_event(view: &Value, previous: Option<&Value>, now: u64) -> Option<
     // that reached its budget and became a background job is the same command
     // from here: it keeps running in its own process group and the worker is
     // only waiting on it, so it is activity too.
-    if view["command_started_at"].is_number() && matches!(status, "running" | "reviewing") {
+    if in_flight(view, status) {
         return None;
     }
     let metrics: WorkerMetrics =
@@ -731,8 +731,7 @@ pub const ROUND_STALL_SECS: u64 = 1200;
 /// A worker waiting for a build slot, or running a command, is not inactive:
 /// same rules as [`select_event`], so a long gate never reads as a stall.
 fn round_idle(v: &Value, now: u64) -> u64 {
-    if v["waiting_for_slot"].is_number()
-        || in_flight(v, v["status"].as_str().unwrap_or("running"))
+    if v["waiting_for_slot"].is_number() || in_flight(v, v["status"].as_str().unwrap_or("running"))
     {
         return 0;
     }
