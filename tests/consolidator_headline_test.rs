@@ -91,8 +91,8 @@ fn a_worker_block_still_parses_as_before() {
 #[test]
 fn the_procedure_asks_for_the_standard_block_before_the_per_worker_lines() {
     let block = CONSOLIDATOR_INSTRUCTIONS
-        .find("REPORT\ndone:")
-        .expect("the procedure must spell out the standard block");
+        .find("done: <one line")
+        .expect("the procedure must spell out the standard block's `done:` line");
     let per_worker = CONSOLIDATOR_INSTRUCTIONS
         .find("REPORT <id>")
         .expect("the procedure must keep the per-worker line");
@@ -100,7 +100,6 @@ fn the_procedure_asks_for_the_standard_block_before_the_per_worker_lines() {
         block < per_worker,
         "the standard block must be asked for first: {CONSOLIDATOR_INSTRUCTIONS}"
     );
-    assert!(CONSOLIDATOR_INSTRUCTIONS.contains("done: <one line"));
     assert!(CONSOLIDATOR_INSTRUCTIONS.contains("tests: <the full gate result>"));
     assert!(CONSOLIDATOR_INSTRUCTIONS.contains("files: <paths changed"));
     assert!(CONSOLIDATOR_INSTRUCTIONS.contains("risks: <"));

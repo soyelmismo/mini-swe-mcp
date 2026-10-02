@@ -324,8 +324,9 @@ fn is_per_worker_line(line: &str) -> bool {
     let Some(rest) = line.trim().strip_prefix("REPORT") else {
         return false;
     };
-    let rest = rest.trim_start();
-    rest.starts_with(char::is_whitespace) && !rest.is_empty()
+    // A verdict separates the marker from the id with whitespace; the marker on
+    // its own, or glued to its id, is not one.
+    rest.starts_with(char::is_whitespace) && !rest.trim().is_empty()
 }
 
 /// Peel the markdown a model wraps a block in: code fences, list bullets and
@@ -433,7 +434,8 @@ mod tests {
     use super::{
         REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, parse_ask_orchestrator,
         parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_kill_job,
-        opens_report_block, parse_report, parse_request_turns, parse_wait_job,
+        is_per_worker_line, opens_report_block, parse_report, parse_request_turns,
+        parse_wait_job,
         summarize_command, summary_line,
     };
     use crate::pool::WorkerReport;
@@ -549,15 +551,6 @@ mod tests {
             None
         );
         assert_eq!(summary_line("   \n\n"), None);
-    }
-
-    #[test]
-    fn probe_tmp() {
-        let l = "REPORT 2a9aaca3 approved: parser";
-        let peeled = strip_markup(l);
-        println!("peeled={peeled:?} per_worker={} opens={}", is_per_worker_line(&peeled), opens_report_block(&peeled));
-        println!("marker: per_worker={} opens={}", is_per_worker_line("REPORT"), opens_report_block("REPORT"));
-        assert!(false, "probe");
     }
 
     #[test]
