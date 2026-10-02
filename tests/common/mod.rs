@@ -194,17 +194,23 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        eprintln!("F8DBG drop {}", self.path.display());
         // A worktree's private scratch and its leased build directories are
         // filed next to the scratch base, keyed by the worktree leaf and by the
         // repository hash, so removing the tree alone leaves them behind.
         mini_swe_mcp::worktree::remove_target_dirs(&self.path);
         mini_swe_mcp::cache::remove_build_dir_leases(&self.path);
+        // A pool is handed this directory as its scratch root, so the checkouts
+        // and sidecars *it* created live inside it and go with it -- except for
+        // the worktrees a killed worker leaves behind, which its aborted task
+        // no longer owns. Those are filed under the pool's own root by leaf name,
+        // so drop one `swe-wt-<id>` per id this directory has seen and the tree
+        // is then empty and removable.
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&self.path);
+        // A second pass, in case the first one raced a worktree registration
+        // that was being written as the guard dropped.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.path);
         // Best effort: a leftover directory must never fail an otherwise good test.
-        match std::fs::remove_dir_all(&self.path) {
-            Ok(()) => eprintln!("F8DBG removed {}", self.path.display()),
-            Err(e) => eprintln!("F8DBG FAILED {} {e}", self.path.display()),
-        }
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
