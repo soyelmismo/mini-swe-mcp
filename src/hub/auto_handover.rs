@@ -17,11 +17,13 @@
 //! is never handed over to:
 //!
 //! 1. The path is a regular, executable file.
-//! 2. Its fingerprint (inode, size, mtime) has been unchanged for
-//!    [`stable_for`], so a `cargo` write in progress is not picked up.
+//! 2. Its fingerprint (inode, size, mtime) has been unchanged for the
+//!    stability window, so a `cargo` write in progress is not picked up.
 //! 3. The binary actually runs: `<exe> --build-id` exits 0 and reports a
-//!    build identity, because a daemon must never hand over to a build that
-//!    fails to start.
+//!    build identity. That probe is at least as strong as `<exe> --version`:
+//!    the binary must start, initialise and exit cleanly for the identity to
+//!    come back at all, so a daemon never hands over to a build that fails to
+//!    start.
 //!
 //! Only a build the existing identity check
 //! ([`crate::hub::client::supersedes`]) calls newer arms the handover.
@@ -221,8 +223,12 @@ async fn probe_build(exe: &Path) -> Option<Value> {
 /// Watch `path` until a newer build has replaced it, then arm the planned
 /// handover on `server`.
 ///
-/// Returns when the handover is armed (the daemon's shutdown watcher then
-/// stops it) or immediately when the watch is disabled.
+/// Returns only once the handover is armed: the daemon's shutdown watcher
+/// then stops it, and [`crate::hub::HubServer`] respawns the build that was
+/// just verified.
+///
+/// The caller is responsible for `HUB_AUTO_HANDOVER` and for watching only
+/// when it can respawn itself.
 pub async fn watch(
     path: PathBuf,
     running: Value,
