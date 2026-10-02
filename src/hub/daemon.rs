@@ -9,7 +9,7 @@
 //! live worker for [`HubConfig::idle_secs`], or on `SIGTERM`/`SIGINT`.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -210,17 +210,43 @@ impl std::fmt::Display for HubEndpoint {
 }
 
 /// Connect to a hub endpoint.
+///
+/// The dial is followed by a credential check, because the fallback socket name
+/// is predictable and `/tmp` is shared: a local attacker can squat either a
+/// filesystem socket or an abstract name. Refusing the peer before the client
+/// sends an identity or a task means a squat can only deny service, never
+/// impersonate the hub. [`HubServer::serve`] performs the mirror check on the
+/// accepted side, so both directions of the connection are verified.
 pub async fn connect_endpoint(endpoint: &HubEndpoint) -> std::io::Result<UnixStream> {
-    match endpoint {
-        HubEndpoint::Path(path) => UnixStream::connect(path).await,
+    let stream = match endpoint {
+        HubEndpoint::Path(path) => UnixStream::connect(path).await?,
         HubEndpoint::Abstract(name) => {
             use std::os::linux::net::SocketAddrExt;
             let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
             let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
             stream.set_nonblocking(true)?;
-            UnixStream::from_std(stream)
+            UnixStream::from_std(stream)?
         }
+    };
+    ensure_peer_is_self(stream.peer_cred()?.uid())?;
+    Ok(stream)
+}
+
+/// Refuse a hub connection whose peer is not this user.
+///
+/// `SO_PEERCRED` is what makes a shared fallback name safe: the daemon already
+/// drops foreign peers, and this keeps the client from ever speaking to a
+/// daemon another user planted on `/tmp/mswe-<uid>-<hash>` or on an abstract
+/// name.
+fn ensure_peer_is_self(uid: u32) -> std::io::Result<()> {
+    if uid == current_uid() {
+        return Ok(());
     }
+    let me = current_uid();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("hub peer is uid {uid}, but this process is uid {me}"),
+    ))
 }
 
 /// Removes a hub socket that lives outside its hub directory, taking the short
@@ -294,33 +320,40 @@ fn fallback_socket_key(dir: &Path) -> String {
     )
 }
 
-/// Whether a fallback socket directory exists, or this user can create it here.
+/// Whether a fallback socket directory may be used, or can be created here.
 ///
-/// A sandbox that denies writes to `/tmp` must not send a hub to a socket path
-/// it can never bind: those hubs listen in the abstract namespace instead, and
-/// every caller derives the same answer from this one check. Ownership of the
-/// parent says nothing -- `/tmp` is root-owned and world-writable -- so this
-/// asks the only question that counts, whether the creation the daemon would
-/// perform succeeds, and undoes it again. Nothing is listening yet, so the undo
-/// leaves nothing behind and a probe still cannot leak a directory.
+/// The fallback name is predictable (`mswe-<uid>-<hash>`) and `/tmp` is shared,
+/// so an existing directory is trusted only when it is a real directory --
+/// never a symlink -- owned by this user and private to it. Anything else (a
+/// foreign or group/world-accessible directory, a symlink) is refused, and the
+/// hub listens in the abstract namespace instead: a directory another user
+/// planted must never be the socket a client dials into. A directory that is
+/// absent is probed: the creation the daemon would perform is attempted and
+/// undone, so a sandbox that denies `/tmp` falls back to the abstract socket
+/// while an ordinary probe still leaves nothing behind. The daemon re-runs
+/// [`harden_hub_dir`] before it binds, so a directory planted between this
+/// check and the bind is refused rather than used.
 fn fallback_dir_is_creatable(dir: &Path) -> bool {
-    if dir.metadata().is_ok() {
-        return true;
-    }
-    // `/tmp` is root-owned but world-writable, so ownership of the parent says
-    // nothing about whether this user may create in it. Try the creation this
-    // hub would perform and undo it again: the answer has to be the real one,
-    // because it decides whether the daemon binds a socket in this directory
-    // and binds it in the abstract namespace instead. Nothing is listening yet,
-    // so removing it leaves nothing behind.  Use mode 0o700 so a racing
-    // `harden_hub_dir` sees a private directory and does not bail on group/
-    // world-accessible mode.
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir(dir);
-            true
+    match std::fs::symlink_metadata(dir) {
+        // Present: accept only a real directory, ours, and private to us.
+        Ok(meta) => {
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == current_uid()
+                && (meta.permissions().mode() & 0o077) == 0
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+        // Absent: try the creation this hub would perform and undo it, so the
+        // answer is the real one for a shared `/tmp` without leaking a
+        // directory. Mode 0o700 keeps a racing `harden_hub_dir` happy.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {
+                    let _ = std::fs::remove_dir(dir);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
         Err(_) => false,
     }
 }
@@ -329,11 +362,11 @@ fn fallback_dir_is_creatable(dir: &Path) -> bool {
 /// abstract socket a sandbox that denies `/tmp` forces.
 ///
 /// This is the single decision point, so the daemon that binds and the clients
-/// that dial always agree -- and it leaves nothing behind: the fallback
-/// directory is created by `bind_endpoint` and removed again by
-/// [`FallbackSocketGuard`], and the self-cleaning probe in
-/// [`fallback_dir_is_creatable`] creates and removes the directory in the
-/// same call, so resolving an endpoint leaves no empty
+/// that dial always agree -- and it leaves nothing behind: an existing
+/// fallback directory is only trusted when it is this user's and private, an
+/// absent one is probed and undone by [`fallback_dir_is_creatable`], and the
+/// directory that is finally used is created by `harden_hub_dir` and removed
+/// again by [`FallbackSocketGuard`], so resolving an endpoint leaves no empty
 /// `/tmp/mswe-<uid>-<hash>` behind.
 fn fallback_endpoint(dir: &Path) -> HubEndpoint {
     let fallback = fallback_socket_dir(dir);
@@ -1243,6 +1276,58 @@ mod tests {
             !fallback.exists(),
             "a probe of the endpoint left {} behind",
             fallback.display()
+        );
+    }
+
+    /// A fallback directory this user owns and kept private is trusted; a
+    /// squatted, group/world-accessible or symlinked one is not, so a client
+    /// never dials a socket another user planted under the shared name.
+    #[test]
+    fn a_foreign_open_or_symlinked_fallback_directory_is_refused() {
+        let scratch = crate::test_support::TestScratch::new("hub-fallback-trust");
+
+        let owned = scratch.path().join("owned");
+        std::fs::create_dir(&owned).expect("create the owned dir");
+        std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o700))
+            .expect("private mode");
+        assert!(fallback_dir_is_creatable(&owned));
+
+        let open = scratch.path().join("open");
+        std::fs::create_dir(&open).expect("create the open dir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("open mode");
+        assert!(
+            !fallback_dir_is_creatable(&open),
+            "a group/world-accessible fallback directory must be refused"
+        );
+
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&owned, &link).expect("create the symlink");
+        assert!(
+            !fallback_dir_is_creatable(&link),
+            "a symlinked fallback directory must be refused"
+        );
+
+        // Absent: probed by creating and undoing, so nothing is left behind.
+        let absent = scratch.path().join("absent");
+        assert!(fallback_dir_is_creatable(&absent));
+        assert!(
+            !absent.exists(),
+            "the creatability probe must not leave {} behind",
+            absent.display()
+        );
+    }
+
+    /// The peer-uid seam accepts this process's own uid and refuses any other,
+    /// so a squatted socket can deny service but never impersonate the hub.
+    #[test]
+    fn a_foreign_peer_uid_is_refused() {
+        assert!(ensure_peer_is_self(current_uid()).is_ok());
+        let foreign = current_uid().wrapping_add(1);
+        let error = ensure_peer_is_self(foreign).expect_err("a foreign uid is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("hub peer is uid"),
+            "the refusal must say who the peer is: {error}"
         );
     }
 }
