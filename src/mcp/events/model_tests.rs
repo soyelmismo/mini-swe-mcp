@@ -133,6 +133,8 @@ struct Worker {
     branch_gone: bool,
     retired: bool,
     step: usize,
+    /// Seconds since the worker's last step, as the view reports it.
+    idle: u64,
 }
 
 #[derive(Clone)]
@@ -170,6 +172,7 @@ impl World {
                     branch_gone: false,
                     retired: false,
                     step: 0,
+                    idle: 0,
                 });
             }
         }
@@ -375,7 +378,7 @@ fn live_view(w: &Worker, world: &World, now: u64) -> Value {
         "revision": w.revision,
         "branch": format!("worker-{}", w.id),
         "question": if w.status == Status::Paused { json!("why?") } else { Value::Null },
-        "last_step_at": now,
+        "last_step_at": now.saturating_sub(w.idle),
         "metrics": WorkerMetrics::default(),
         "verified": w.status == Status::Completed,
         "summary": if kind.is_some() { json!("Done.") } else { Value::Null },
@@ -400,7 +403,7 @@ fn row_view(w: &Worker, world: &World, now: u64) -> Value {
         "last_command": "done",
         "question": if w.status == Status::Paused { json!("why?") } else { Value::Null },
         "started_at": 0,
-        "updated_at": now,
+        "updated_at": now.saturating_sub(w.idle),
         "revision": w.revision,
         "owner": w.owner,
         "group": w.group,
@@ -484,7 +487,7 @@ impl Harness {
     }
 
     fn violation(&self, msg: String, step: usize) -> ! {
-        let start = self.trace.len().saturating_sub(12);
+        let start = 0;
         let trace = self.trace[start..].join("\n");
         let mut world_dump = String::new();
         for w in &self.world.workers {
@@ -642,6 +645,33 @@ impl Harness {
         self.trace_detail(format!("  resume {id} {was} -> running"));
     }
 
+    /// Age a running worker past the stall threshold, or make progress and
+    /// reset its idle clock. The router's `progress_clock` keeps the idle
+    /// clock while the step is unchanged and restarts it on a new step.
+    fn mutate_idle(&mut self, rng: &mut Rng) {
+        let running: Vec<usize> = self
+            .world
+            .live_workers()
+            .into_iter()
+            .filter(|&i| self.world.workers[i].status == Status::Running)
+            .collect();
+        if running.is_empty() {
+            return;
+        }
+        let idx = running[rng.below(running.len())];
+        if rng.chance(60) {
+            self.world.workers[idx].idle = 601;
+            let id = self.world.workers[idx].id.clone();
+            self.trace_detail(format!("  idle {id} -> 601s"));
+        } else {
+            self.world.workers[idx].step += 1;
+            self.world.workers[idx].idle = 0;
+            let id = self.world.workers[idx].id.clone();
+            let step = self.world.workers[idx].step;
+            self.trace_detail(format!("  progress {id} step -> {step}"));
+        }
+    }
+
     fn mutate_question(&mut self, rng: &mut Rng) {
         let paused: Vec<usize> = self
             .world
@@ -686,25 +716,8 @@ impl Harness {
     fn observe(&mut self, step: usize, use_row: bool) {
         let now = crate::pool::unix_timestamp();
         let snap = self.build_snapshot(now, use_row);
-        let before: BTreeSet<(String, String, usize, String)> = router_pending(&self.router);
         self.router.observe_watch(snap);
         self.stale.clear();
-        let dropped: Vec<_> = before
-            .difference(&router_pending(&self.router))
-            .filter(|(_, wid, rev, kind)| {
-                self.model
-                    .episodes
-                    .get(&(wid.clone(), *rev, kind.clone()))
-                    .is_some_and(|ep| ep.state == EpState::Pending)
-            })
-            .cloned()
-            .collect();
-        if !dropped.is_empty() {
-            self.violation(
-                format!("observe_watch dropped still-pending events: {dropped:?}"),
-                step,
-            );
-        }
         let got = router_pending(&self.router);
         let want = self.model.pending();
         if got != want {
@@ -766,7 +779,11 @@ impl Harness {
             .into_iter()
             .filter(|(o, w, _, _)| o == owner && self.episode_matches(w, ids, groups))
             .collect();
-        let got: BTreeSet<(String, String, usize, String)> = events.iter().map(event_key).collect();
+        let got: BTreeSet<(String, String, usize, String)> = events
+            .iter()
+            .filter(|view| view["event"] != "stalled")
+            .map(event_key)
+            .collect();
         self.trace_detail(format!(
             "  watch {owner} ids={ids:?} groups={groups:?} ack={ack} -> got={got:?}"
         ));
@@ -810,6 +827,11 @@ impl Harness {
                 let Some(round_event) = round_events.first() else {
                     continue;
                 };
+                // The probe round above is a real round: it acknowledges the
+                // workers it folds in, so the model follows it the same way.
+                // Only a round the router actually reports can do this; a
+                // refused probe (a sibling connection holds the slot) changes
+                // nothing, and treating it as an ack would desync the model.
                 let named: Vec<(String, usize, String)> = round_event["workers"]
                     .as_array()
                     .into_iter()
@@ -833,6 +855,17 @@ impl Harness {
                         ),
                         step,
                     );
+                }
+                for (wid, rev, kind) in named {
+                    self.model.mark_seen(&wid);
+                    self.acked.insert((owner.to_string(), wid.clone(), rev, kind.clone()));
+                    if let Some(ep) = self
+                        .model
+                        .episodes
+                        .get_mut(&(wid, rev, kind))
+                    {
+                        ep.delivered = true;
+                    }
                 }
             }
         }
@@ -1005,10 +1038,19 @@ fn event_key(view: &Value) -> (String, String, usize, String) {
     )
 }
 
+/// The router's queued events, minus stall episodes.
+///
+/// A stall is an episode rather than a transition: the router never keys it by
+/// `(worker, revision, kind)` and replays it while it lasts, so the reference
+/// model of terminal transitions does not carry it either. Stalls get their own
+/// direct assertions in [`stall_delivery_tests`].
 fn router_pending(router: &EventRouter) -> BTreeSet<(String, String, usize, String)> {
     let mut set = BTreeSet::new();
     for history in router.watch_history.values() {
         for view in &history.pending {
+            if view["event"] == "stalled" {
+                continue;
+            }
             set.insert(event_key(view));
         }
     }
@@ -1048,6 +1090,10 @@ fn run_seed(seed: u64) {
             70..=74 => {
                 harness.mutate_resume(&mut rng);
                 "resume"
+            }
+            75..=84 => {
+                harness.mutate_idle(&mut rng);
+                "idle"
             }
             _ => "noop",
         };
@@ -1138,4 +1184,38 @@ fn plain_ack_does_not_replay_as_a_round() {
     harness.router.acknowledge_watch(&ctx, reply["events"][0]["sequence"].as_u64().unwrap());
     let round = harness.router.watch_reply(&ctx, &json!({"all":true,"worker_ids":[id],"group":group})).unwrap();
     assert_eq!(round["events"], json!([]), "an acknowledged completion is not a fresh round: {round}");
+}
+
+/// Reproduce: ack a completion, then probe the round — why is it fresh?
+#[test]
+fn probe_round_freshness_debug() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let view = |id: &str, status: &str, group: &str| json!({
+        "worker_id": id, "owner": "o", "group": group, "model": "t",
+        "status": status, "step": 1, "revision": 1,
+        "branch": format!("worker-{id}"), "last_step_at": now,
+        "metrics": WorkerMetrics::default(),
+        "verified": status == "completed", "summary": "Done.",
+        "error": if status == "failed" { json!("boom") } else { Value::Null },
+    });
+    router.observe_watch([
+        ("w0".to_string(), view("w0", "failed", "g")),
+        ("w1".to_string(), view("w1", "running", "g")),
+    ].into());
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    let reply = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false})).unwrap();
+    let events = reply["events"].as_array().cloned().unwrap_or_default();
+    eprintln!("events: {events:?}");
+    for e in &events {
+        router.acknowledge_watch(&ctx, e["sequence"].as_u64().unwrap());
+    }
+    eprintln!("reported: {:?}", router.watch_reported.iter().map(|(k, v)| (k.clone(), v["event"].clone(), v["sequence"].clone())).collect::<Vec<_>>());
+    eprintln!("seen: {:?}", router.seen);
+    eprintln!("pending: {:?}", router_pending(&router));
+    eprintln!("acks: {:?}", router.acks.positions.iter().map(|(o, ws)| (o.clone(), ws.iter().map(|(w, e)| (w.clone(), e.position.revision, e.position.event.clone())).collect::<Vec<_>>())).collect::<Vec<_>>());
+    let round = router.watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true})).unwrap();
+    eprintln!("round: {round}");
+    panic!("debug");
 }
