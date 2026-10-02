@@ -388,6 +388,17 @@ Make the tests independent of the environment.\n\
 
 /// The refusal pushed back to the model when the gate left side effects.
 pub fn side_effect_refusal(effects: &SideEffects) -> String {
+    format!(
+        "COMPLETION REFUSED: your tests must clean up after themselves: {}{}. \
+The harness removed what it could; make the suite leave the repository, its refs and its processes exactly as it found them.",
+        side_effect_summary(effects),
+        if effects.truncated { " (list truncated; there is more)" } else { "" }
+    )
+}
+
+/// The leftovers an audit found, as one bounded clause: what the audit log
+/// records and the refusal quotes, so both name the same facts.
+pub fn side_effect_summary(effects: &SideEffects) -> String {
     let mut items = Vec::new();
     for reference in &effects.new_refs {
         items.push(format!("created ref {reference}"));
@@ -403,16 +414,7 @@ pub fn side_effect_refusal(effects: &SideEffects) -> String {
             "created file {file} in the repository's main checkout"
         ));
     }
-    let truncation = if effects.truncated {
-        " (list truncated; there is more)"
-    } else {
-        ""
-    };
-    format!(
-        "COMPLETION REFUSED: your tests must clean up after themselves: {}{truncation}. \
-The harness removed what it could; make the suite leave the repository, its refs and its processes exactly as it found them.",
-        items.join(", ")
-    )
+    items.join(", ")
 }
 
 #[cfg(test)]
