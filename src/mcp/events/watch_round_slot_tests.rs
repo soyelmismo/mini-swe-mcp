@@ -79,18 +79,22 @@ fn a_refused_round_watch_does_not_consume_the_round() {
     // acknowledge.
     router.observe_watch(views(completed, 2));
 
-    // A second connection running the same round watch is refused.
+    // A second connection running the same round watch is covered: it
+    // answers in-band, without consuming anything.
     let second = agent(2);
-    let error = router
+    let covered = router
         .watch_reply(&second, &all())
-        .expect_err("the second watch must be refused");
-    let message = error.to_string();
+        .expect("a covered watch answers in-band");
     assert!(
-        message.contains("a watch is already running"),
-        "the refusal must name the running watch: {message}"
+        covered["covered"]["selection"].as_str().is_some(),
+        "the covered watch must name the running selection: {covered}"
+    );
+    assert!(
+        covered["events"].as_array().is_some_and(|events| events.is_empty()),
+        "a covered watch carries no events: {covered}"
     );
 
-    // The refused watch did not acknowledge anything, so the connection
+    // The covered watch did not acknowledge anything, so the connection
     // that holds the slot still receives the whole round.
     let round = router
         .watch_reply(&first, &all())

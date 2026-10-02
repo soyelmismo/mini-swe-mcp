@@ -1,5 +1,7 @@
 use super::*;
-use crate::mcp::events::{WatchSelection, WatchStart, covered_watch_message, widened_watch_message};
+use crate::mcp::events::{
+    WatchSelection, WatchStart, covered_watch_message, watch_key, widened_watch_message,
+};
 
 impl McpServer {
     /// The shell command that waits on *this* caller's workers.
@@ -27,7 +29,7 @@ impl McpServer {
         payload: &mut Value,
         ctx: &crate::mcp::server::ConnectionContext,
     ) {
-        if self.hub_events.lock().await.has_watch(&ctx.agent()) {
+        if self.hub_events.lock().await.has_watch(&watch_key(ctx)) {
             return;
         }
         if let Some(command) = Self::watch_command(ctx) {
@@ -85,7 +87,7 @@ impl McpServer {
             .hub_events
             .lock()
             .await
-            .begin_watch(&ctx.agent(), ctx.id, ctx.pid, &selection)
+            .begin_watch(&watch_key(ctx), ctx.id, ctx.pid, &selection)
         {
             WatchStart::Started(slot) => slot,
             WatchStart::Covered { pid } => {

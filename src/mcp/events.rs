@@ -553,6 +553,21 @@ fn pid_label(pid: Option<u32>) -> String {
     pid.map_or_else(|| "unknown pid".to_string(), |pid| format!("pid {pid}"))
 }
 
+/// The slot key of a `watch` for `ctx`: one watch per session *and scope*.
+///
+/// An `admin` connection watches every owner's workers, a plain one watches
+/// its own only, and neither can deliver for the other - a widened or covered
+/// selection must never reach another owner's workers. Keying the slot by
+/// scope keeps those two watches apart instead of letting one be reported as
+/// covered by a watcher that could never have shown it its events.
+pub fn watch_key(ctx: &super::server::ConnectionContext) -> String {
+    if ctx.is_admin() {
+        format!("{}#admin", ctx.agent())
+    } else {
+        ctx.agent()
+    }
+}
+
 /// What claiming the identity's one watch slot found there.
 pub(super) enum Admission {
     /// This connection holds (or has just taken) the slot and must follow the
@@ -1978,6 +1993,7 @@ impl EventRouter {
         let request = WatchSelection::from_params(params);
         let initial = params["initial"].as_bool().unwrap_or(false);
         let owner = ctx.agent();
+        let key = watch_key(ctx);
         // Unattributed legacy rows are the admin's alone: an agent that happens
         // to be named "unattributed" must not inherit them by accident.
         let allowed = |v: &serde_json::Value| {
@@ -2007,10 +2023,10 @@ impl EventRouter {
         // union of both selections (the widened filter rides on the running
         // connection's own polls, so that process keeps its place and its
         // pending events).
-        let selection = match self.watches.admit(&owner, ctx.id, ctx.pid, &request) {
+        let selection = match self.watches.admit(&key, ctx.id, ctx.pid, &request) {
             Admission::Held { selection, .. } => selection,
             Admission::Covered { pid } => {
-                let running = self.watches.selection(&owner).unwrap_or_default();
+                let running = self.watches.selection(&key).unwrap_or_default();
                 return Ok(json!({"watching":[], "events":[],
                     "covered":{"pid":pid, "selection":running.describe()}}));
             }
