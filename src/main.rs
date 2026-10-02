@@ -36,6 +36,13 @@ async fn async_main() -> Result<()> {
                 println!("mini-swe-mcp {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            // The daemon's executable watcher reads the identity of the build
+            // sitting at its own path by running it with this flag, so it
+            // answers without an API key, a manifest, or a hub.
+            "--build-id" => {
+                println!("{}", mini_swe_mcp::hub::client::build_identity());
+                return Ok(());
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());

@@ -869,7 +869,7 @@ fn respawn_daemon(paths: &HubPaths) {
 }
 
 /// Append one timestamped line to the hub log; failures are traced, never fatal.
-fn append_log(path: &Path, event: &str) {
+pub(crate) fn append_log(path: &Path, event: &str) {
     use std::fmt::Write as _;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
