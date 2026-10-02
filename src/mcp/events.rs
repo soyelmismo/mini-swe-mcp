@@ -52,7 +52,7 @@ const CHANNEL_METHOD: &str = "notifications/claude/channel";
 /// The hub tells the connection that is already watching when a second watch
 /// of the same session widened its filter, so the running process follows the
 /// union without reconnecting, re-arming or losing its pending events.
-const WIDEN_METHOD: &str = "notifications/mini-swe/watch_widen";
+pub(crate) const WATCH_WIDEN_METHOD: &str = "notifications/mini-swe/watch_widen";
 
 /// Byte budget for text copied out of a worker into a notification.
 ///
@@ -1090,7 +1090,7 @@ impl EventRouter {
         };
         let frame = json!({
             "jsonrpc": "2.0",
-            "method": WIDEN_METHOD,
+            "method": WATCH_WIDEN_METHOD,
             "params": {
                 "worker_ids": selection.ids.iter().collect::<Vec<_>>(),
                 "group": selection.groups.iter().collect::<Vec<_>>(),

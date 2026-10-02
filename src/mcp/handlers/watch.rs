@@ -109,8 +109,34 @@ impl McpServer {
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;
         let mut watched_any = false;
+        // The hub may widen this call while it waits: the stored selection is
+        // the union of every request of this session, so follow it from the
+        // next poll on. The union only ever grows, and the caller's ownership
+        // check is unchanged, so another owner's workers never appear.
+        let mut ids = ids;
+        let mut groups = groups;
+        let mut all = all;
         loop {
             let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
+            if let Some(widened) = reply.get("widened") {
+                if let (Some(worker_ids), Some(named), Some(round)) = (
+                    widened.get("worker_ids").and_then(|v| v.as_array()),
+                    widened.get("group").and_then(|v| v.as_array()),
+                    widened.get("all").and_then(|v| v.as_bool()),
+                ) {
+                    ids = worker_ids
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect();
+                    groups = named
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect();
+                    all = round;
+                }
+            }
             let events = reply["events"].as_array().cloned().unwrap_or_default();
             if !events.is_empty() {
                 // Acknowledge what was delivered: the router's per-agent

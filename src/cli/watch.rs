@@ -964,46 +964,31 @@ const OLD_WATCH_REPLY_NOTICE: &str = "[mini-swe] The running hub's 'hub/watch' r
 /// A `hub/watch` reply carries the fields this client reads: a missing
 /// `watching` is an older hub, not a genuine empty watch set.
 /// Adopt the union a second watch of this session pushed onto the running
-/// watch: the stored ids and groups become the union's, and `--all` sticks
-/// once either side asked for it.
+/// watch: the payload is the widened selection itself, so the ids and groups
+/// become exactly the union the hub stored, and `--all` sticks once either
+/// side asked for it.
 ///
-/// The union only ever grows (an empty set is *every* worker or group, so a
-/// widened selection never narrows), and it is applied to the live poll state,
-/// not only to the parsed flags: the running process keeps its place and its
-/// pending events, and its next snapshot already uses the wider filter.
-fn adopt_widened_selection(opts: &mut Options, ids: &mut BTreeSet<String>, selection: &str) {
-    if selection.contains("--all") {
+/// An empty set is *every* worker (or group), so a widened selection with no
+/// ids or no groups drops any narrowing filter the running watch started with
+/// rather than keeping it. The union only ever grows, and it is applied to the
+/// live poll state, not only to the parsed flags: the running process keeps its
+/// place and its pending events, and its next snapshot already uses the wider
+/// filter.
+fn adopt_widened_selection(opts: &mut Options, ids: &mut BTreeSet<String>, widened: &Value) {
+    let list = |key: &str| -> BTreeSet<String> {
+        widened[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    opts.groups = list("group");
+    opts.ids = list("worker_ids");
+    *ids = opts.ids.clone();
+    if widened.get("all").and_then(Value::as_bool).unwrap_or(false) {
         opts.all = true;
-    }
-    for token in selection.split_whitespace() {
-        let group = token.strip_prefix("--group").and_then(|rest| {
-            let rest = rest.strip_prefix('=').unwrap_or(rest);
-            (!rest.is_empty()).then(|| rest.to_string())
-        });
-        if let Some(group) = group {
-            opts.groups.insert(group);
-        }
-    }
-    for chunk in selection.split("ids ").skip(1) {
-        let list = chunk.split_whitespace().next().unwrap_or("");
-        for id in list.split(',').filter(|id| !id.is_empty()) {
-            if id != "every" {
-                ids.insert(id.to_string());
-                opts.ids.insert(id.to_string());
-            }
-        }
-    }
-    // "every group" is the unfiltered set: a widened selection that says it
-    // clears any group filter the running watch started with.
-    if selection.contains("every group") {
-        opts.groups.clear();
-    }
-    // A widened selection that names no explicit ids follows every worker of
-    // the caller, so an explicit id set the running watch started with is
-    // dropped rather than kept as a narrowing filter.
-    if !selection.contains("ids ") {
-        ids.clear();
-        opts.ids.clear();
     }
 }
 
@@ -1117,10 +1102,8 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // the union from the next poll on. The widened selection only ever
         // grows, so this process keeps its place and its pending events while
         // its filter becomes the union of both requests.
-        if let Some(widened) = response.get("widened").and_then(|v| v.as_object()) {
-            if let Some(selection) = widened.get("selection").and_then(|v| v.as_str()) {
-                adopt_widened_selection(&mut opts, &mut ids, selection);
-            }
+        if let Some(widened) = response.get("widened") {
+            adopt_widened_selection(&mut opts, &mut ids, widened);
         }
         let watching: BTreeSet<String> = response["watching"]
             .as_array()
@@ -1178,7 +1161,14 @@ pub async fn run(args: &[String], json_output: bool, admin: bool) -> Result<i32>
         // repairs channel overflow from the owner's bounded, unacknowledged backlog.
         if let Ok(result) = tokio::time::timeout(wait, client.next_watch_notification()).await {
             match result {
-                Ok(()) => {}
+                Ok(None) => {}
+                Ok(Some(widened)) => {
+                    // The hub pushed the union a second watch of this session
+                    // asked for: follow it from the next snapshot on. The
+                    // union only grows, so this process keeps its place and
+                    // its pending events while its filter becomes wider.
+                    adopt_widened_selection(&mut opts, &mut ids, &widened);
+                }
                 Err(error) if daemon_went_away(&error) => {
                     client = follow(reconnects, admin).await?;
                     initial = true;
