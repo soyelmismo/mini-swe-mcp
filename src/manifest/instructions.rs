@@ -61,6 +61,130 @@ const TRUNCATION_NOTE: &str =
 /// instructions and the role memory.
 pub const MAX_INSTRUCTIONS_PROMPT_BYTES: usize = 16 * 1024;
 
+/// One line of the `## Sensitive paths` section of an instruction file.
+///
+/// The section is the repository's declaration of which paths a worker's diff
+/// must never touch without an adversarial review. One glob per line; blank
+/// lines and `#` comments are ignored, and a bullet marker (`- `, `* `, `+ `)
+/// or surrounding backticks is stripped so a markdown list reads the same as
+/// a bare list.
+fn parse_sensitive_paths_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed)
+        .trim();
+    let stripped = stripped.trim_matches('`').trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+/// Extract the globs of the `## Sensitive paths` section from one instruction
+/// file's text.
+///
+/// The section runs from its heading (any `#`-depth, case-insensitive
+/// `sensitive paths`) to the next heading or the end of the file. Everything
+/// before the heading, and every other section, is ignored: the parser is
+/// deliberately narrow so a repository that documents sensitive paths in
+/// prose is never misread as declaring them.
+pub fn parse_sensitive_paths(text: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim();
+            in_section = heading.eq_ignore_ascii_case("sensitive paths");
+            continue;
+        }
+        if in_section {
+            if let Some(path) = parse_sensitive_paths_line(line) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// The sensitive-path globs declared by the repository's instruction files.
+///
+/// Every candidate file is scanned and the globs are unioned, so a repository
+/// that splits the declaration across `AGENTS.md` and `CLAUDE.md` gets both.
+/// An empty list means "no sensitive paths declared", which is the signal to
+/// skip the automatic security review.
+pub fn sensitive_paths(repo_root: &Path) -> Vec<String> {
+    let Ok(canonical_root) = repo_root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for candidate in INSTRUCTION_FILES {
+        let Some(content) = read_instruction_file(&canonical_root, candidate) else {
+            continue;
+        };
+        paths.extend(parse_sensitive_paths(&content));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Whether `path` matches any of the declared globs.
+///
+/// The matcher understands the two glob forms the section documents: `**`
+/// crosses directory boundaries (`src/hub/**` matches `src/hub/mod.rs` and
+/// `src/hub/sub/file.rs`), and `*` stays inside one segment (`sandbox*`
+/// matches `sandbox.rs` but not `sandbox/mod.rs`). A literal pattern (no
+/// glob) matches only that exact path.
+pub fn matches_sensitive(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| glob_matches(pattern, path))
+}
+
+/// Match one glob against one repository-relative path.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    // A trailing `/**` matches everything under the directory, including the
+    // directory itself being absent from the diff (a diff never names a bare
+    // directory, so `src/hub/**` must match `src/hub/mod.rs`).
+    let mut regex = String::from('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    // `**` crosses segments; `**/` also matches the empty
+                    // segment so `src/**` matches `src/mod.rs`.
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                        regex.push_str("(?:.*/)?");
+                    } else {
+                        regex.push_str(".*");
+                    }
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '?' => regex.push_str("[^/]"),
+            '.' => regex.push_str("\\."),
+            c => regex.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    regex.push('$');
+    regex::Regex::new(&regex)
+        .map(|re| re.is_match(path))
+        .unwrap_or(false)
+}
+
 /// Read and label the repository's instruction files.
 ///
 /// Returns `(relative path, trimmed contents)` for every candidate that is a
