@@ -2148,6 +2148,15 @@ impl WorkerPool {
         };
         for id in &live {
             self.checkpoint_before_kill(id).await;
+            // The checkpoint may find nothing to commit (a worker that
+            // only read code), so the branch can point exactly at the
+            // base commit. Mark the worktree interrupted *before* the
+            // abort drops its guard: the guard's teardown then keeps
+            // the branch, and the next daemon's recovery can
+            // auto-continue the worker on it.
+            if let Some(path) = self.worktrees.read().await.get(id).cloned() {
+                WorktreeGuard::mark_interrupted(&path);
+            }
         }
         let (count, entries) = {
             let mut lock = self.workers.write().await;

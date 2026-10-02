@@ -272,6 +272,12 @@ impl WorkerPool {
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
         self.register_worktree(&worker_id, worktree.path.clone())
             .await;
+        // The branch this worker cut is now real, so the row names the
+        // commit it points at. A worker that never commits still has a
+        // branch, and a continuation that finds it pruned recreates it
+        // from exactly this commit.
+        self.record_base_commit(&worker_id, &worktree.base_commit)
+            .await;
 
         // The system prompt carries this role's persistent memory
         // (`.agents/memory/<alias>.md`) when the repository provides any, so a
