@@ -504,15 +504,13 @@ impl WorkerPool {
             worktree.base_branch.as_deref(),
         )
         .await;
-        let mut patterns = crate::manifest::instructions::sensitive_paths(std::path::Path::new(
-            &repo_path_str,
-        ));
+        let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
         patterns.sort();
         patterns.dedup();
         let sensitive: Vec<String> = touched
             .into_iter()
-            .filter(|path| crate::manifest::instructions::matches_sensitive(path, &patterns))
+            .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
             .collect();
         let requested = review_after.as_deref().map(ReviewMode::parse_model);
         let review_plan = match (requested, sensitive.is_empty()) {

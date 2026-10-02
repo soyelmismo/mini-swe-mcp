@@ -841,6 +841,7 @@ impl WorkerPool {
             auto_continues: 0,
             report: None,
             verified: None,
+            security_review: None,
         };
 
         let initial_record = WorkerRecord {
