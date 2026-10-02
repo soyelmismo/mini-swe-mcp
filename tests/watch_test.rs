@@ -982,14 +982,22 @@ async fn the_daemon_allows_one_watch_per_identity() {
     let reply = a1.request("hub/watch", watch.clone()).await;
     assert!(reply.get("error").is_none(), "{reply:?}");
 
-    // A second connection of the same identity is refused, naming the first.
+    // A second connection asking for the same selection is covered: it
+    // answers in-band, naming the running watch, and consumes nothing.
     let mut a2 = Raw::connect(&socket).await;
     a2.request("hub/hello", serde_json::json!({"agent_id": "agent-a"}))
         .await;
     let reply = a2.request("hub/watch", watch.clone()).await;
-    let message = reply["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("a watch is already running"), "{reply:?}");
-    assert!(message.contains("pid 1111"), "{reply:?}");
+    assert!(reply.get("error").is_none(), "{reply:?}");
+    let covered = &reply["result"]["covered"];
+    assert!(
+        covered["selection"].as_str().is_some(),
+        "a covered watch names the running selection: {reply:?}"
+    );
+    assert!(
+        covered["pid"] == serde_json::json!(1111),
+        "a covered watch names the running watch: {reply:?}"
+    );
 
     // A different identity watches at the same time.
     let mut b = Raw::connect(&socket).await;
@@ -1060,16 +1068,20 @@ async fn the_mcp_watch_action_allows_one_watch_per_identity() {
     // Let the first watch reserve the identity's slot.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let error = server
+    let covered = server
         .execute_tool(
             "worker",
             serde_json::json!({"action": "watch", "timeout_secs": 10}),
         )
         .await
-        .expect_err("a second watch for the same identity must be refused");
+        .expect("a second watch of the same selection is covered");
+    assert_eq!(covered["status"], "already_covered", "{covered}");
     assert!(
-        error.to_string().contains("a watch is already running"),
-        "{error}"
+        covered["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already covered by the running watch"),
+        "{covered}"
     );
 
     // A different identity may watch at the same time.
@@ -1100,10 +1112,10 @@ async fn the_mcp_watch_action_allows_one_watch_per_identity() {
     assert_eq!(reply["status"], "no_event", "{reply}");
 }
 
-/// The CLI maps a refused second watch of one session to exit code 5 and
+/// The CLI maps a covered second watch of one session to exit code 0 and
 /// accepts a fresh watch once the holder has exited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_cli_watch_for_one_session_exits_five() {
+async fn a_second_cli_watch_for_one_session_exits_zero_when_covered() {
     isolate_registry();
     let hub = common::TempDir::new_in_tmp("wg-cli-hub");
     let swe = common::TempDir::new_in_tmp("wg-cli-swe");
@@ -1155,11 +1167,14 @@ async fn a_second_cli_watch_for_one_session_exits_five() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(
         out.status.code(),
-        Some(5),
+        Some(0),
         "{stdout}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("a watch is already running"), "{stdout}");
+    assert!(
+        stdout.contains("already covered by the running watch"),
+        "{stdout}"
+    );
 
     // Once the holder exits, the session may watch again.
     let _ = first.kill();

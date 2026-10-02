@@ -1,4 +1,7 @@
 use super::*;
+use crate::mcp::events::{
+    WatchSelection, WatchStart, covered_watch_message, watch_key, widened_watch_message,
+};
 
 impl McpServer {
     /// The shell command that waits on *this* caller's workers.
@@ -26,7 +29,7 @@ impl McpServer {
         payload: &mut Value,
         ctx: &crate::mcp::server::ConnectionContext,
     ) {
-        if self.hub_events.lock().await.has_watch(&ctx.agent()) {
+        if self.hub_events.lock().await.has_watch(&watch_key(ctx)) {
             return;
         }
         if let Some(command) = Self::watch_command(ctx) {
@@ -43,6 +46,14 @@ impl McpServer {
     /// worker to its owner -- and it answers `status: "no_event"` when
     /// `timeout_secs` expires first, so a caller under a host deadline can
     /// simply call `watch` again.
+    ///
+    /// One watch runs per session, so a second call never blocks on the same
+    /// events: a selection the running watch already follows answers at once
+    /// with `status: "already_covered"`, and a broader one widens the running
+    /// watch to the union and answers `status: "widened"`, both carrying the
+    /// one-line `message` the CLI prints. Ownership scoping is unchanged --
+    /// a widened selection names only what the running watch and this call
+    /// already named.
     pub(super) async fn handle_watch(
         &self,
         args: &Value,
@@ -74,19 +85,66 @@ impl McpServer {
             self.require_owner(id, ctx).await?;
         }
         // One watch per identity: reserve this call's slot up front and hold it
-        // until the call returns (or is cancelled), so a second watch is
-        // refused instead of silently competing for the same events.
-        let _slot = self
-            .hub_events
-            .lock()
-            .await
-            .begin_watch(&ctx.agent(), ctx.id, ctx.pid)?;
+        // until the call returns (or is cancelled), so a second watch of the
+        // session never competes for the same events. A second call that asks
+        // for more than the running watch follows widens it instead of being
+        // refused, and answers immediately with the confirmation; a call it
+        // already covers answers "already covered" the same way.
+        let selection = WatchSelection::new(ids.iter().cloned(), groups.iter().cloned(), all);
+        let _slot = match self.hub_events.lock().await.begin_watch(
+            &watch_key(ctx),
+            ctx.id,
+            ctx.pid,
+            &selection,
+        ) {
+            WatchStart::Started(slot) => slot,
+            WatchStart::Covered { pid } => {
+                return Ok(json!({
+                    "status": "already_covered",
+                    "events": [],
+                    "watching": [],
+                    "message": covered_watch_message(pid, &selection.describe()),
+                }));
+            }
+            WatchStart::Widened { pid, selection } => {
+                return Ok(json!({
+                    "status": "widened",
+                    "events": [],
+                    "watching": [],
+                    "message": widened_watch_message(pid, &selection),
+                }));
+            }
+        };
         let started = tokio::time::Instant::now();
         let mut changes = self.pool.subscribe_changes();
         let mut initial = true;
         let mut watched_any = false;
+        // The hub may widen this call while it waits: the stored selection is
+        // the union of every request of this session, so follow it from the
+        // next poll on. The union only ever grows, and the caller's ownership
+        // check is unchanged, so another owner's workers never appear.
+        let (mut ids, mut groups, mut all) = (ids, groups, all);
         loop {
             let reply = self.watch_poll(ctx, &ids, &groups, initial, all).await?;
+            if let Some(widened) = reply.get("widened").or_else(|| reply.get("widen_to"))
+                && let (Some(worker_ids), Some(named), Some(round)) = (
+                    widened.get("worker_ids").and_then(|v| v.as_array()),
+                    widened.get("group").and_then(|v| v.as_array()),
+                    widened.get("all").and_then(|v| v.as_bool()),
+                )
+            {
+                ids = worker_ids
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect();
+                groups = named
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect();
+                all = round;
+            }
             let events = reply["events"].as_array().cloned().unwrap_or_default();
             if !events.is_empty() {
                 // Acknowledge what was delivered: the router's per-agent
