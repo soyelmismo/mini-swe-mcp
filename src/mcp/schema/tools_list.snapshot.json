@@ -35,7 +35,7 @@
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate the group when it stops: boolean or model alias.",
+            "description": "Auto-consolidate the group when it stops: boolean or model.",
             "type": [
               "boolean",
               "string"
@@ -188,7 +188,7 @@
             "type": "integer"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Cheap for workers, full for consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables; parsed with `sh -n`. Use cheap gate for workers, full for consolidator.",
             "type": "string"
           },
           "worker_id": {
