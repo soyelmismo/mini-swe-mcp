@@ -955,16 +955,26 @@ fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) -> Option<Wor
     parsed
 }
 
-/// Whether `last_command` is a harness-side wait that names itself as the
-/// command in flight.
+/// Whether `last_command` is the label the pool's own wait published, so the
+/// label in flight belongs to the wait and not to some step.
 ///
-/// A wait (`CONSOLIDATE_WAIT`, `WAIT_JOB`) holds the pool's command-in-flight
-/// mark for its whole duration, so a step that starts while one is in flight
-/// must not overwrite the label with its own command: the wait is what `status`
-/// shows and what the stall detector reads as work, and replacing it made a wait
-/// report `running for 0s` and then stall as a step that had gone idle.
+/// `CONSOLIDATE_WAIT` holds the pool's command-in-flight mark for its whole
+/// duration, so a step that starts while one is in flight must not overwrite the
+/// label with its own command: the wait is what `status` shows and what the stall
+/// detector reads as work, and replacing it made a wait report `running for 0s`
+/// and then stall as a step that had gone idle.
+///
+/// The match is on the whole first word, not a prefix of the label. A step's
+/// own label is model-written text, and a command like `CONSOLIDATE_WAITING_FOR`
+/// must not be mistaken for the harness's wait: a prefix match froze that
+/// worker's reported command for good, because every later step reads the same
+/// unchanged label and skips again.
 fn wait_label_in_flight(last_command: &str) -> bool {
-    last_command.starts_with(HARNESS_WAIT_PREFIX)
+    let label = last_command.trim_start();
+    label == HARNESS_WAIT_PREFIX
+        || label
+            .strip_prefix(HARNESS_WAIT_PREFIX)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
 impl<'a> TurnEngine<'a> {
@@ -2413,6 +2423,28 @@ mod tests {
             !wait_label_in_flight("cargo test --all-targets"),
             "an ordinary step is not a wait"
         );
+    }
+
+    /// A step's own label is model-written text, and the wait's name is a prefix
+    /// of perfectly ordinary commands. Reading it as a prefix would leave the
+    /// worker's reported command frozen at the impostor for good: every later
+    /// step reads the same unchanged label and skips its own write again.
+    #[test]
+    fn a_command_that_only_looks_like_a_wait_never_owns_the_label() {
+        for impostor in [
+            "CONSOLIDATE_WAITING_FOR_THING",
+            "CONSOLIDATE_WAITED",
+            "CONSOLIDATE_WAIT=x",
+            "CONSOLIDATE_WAITER",
+        ] {
+            assert!(
+                !wait_label_in_flight(impostor),
+                "a model-authored command must not pass as the harness wait: {impostor}"
+            );
+        }
+        // The real label, however it is spaced, still owns the label.
+        assert!(wait_label_in_flight("CONSOLIDATE_WAIT w-abc"));
+        assert!(wait_label_in_flight("CONSOLIDATE_WAIT"));
     }
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
