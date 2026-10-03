@@ -264,11 +264,9 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
-                WorkerState::Completed { ..
-                verdicts: None, }
+                WorkerState::Completed { .. }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { ..
-                verdicts: None, } => return state,
+                | WorkerState::Exhausted { .. } => return state,
                 other => last = Some(format!("{other:?}")),
             }
         }
@@ -279,8 +277,7 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
 
 fn metrics_of(state: &WorkerState) -> WorkerMetrics {
     match state {
-        WorkerState::Completed { metrics, ..
-        verdicts: None, } => *metrics,
+        WorkerState::Completed { metrics, .. } => *metrics,
         other => panic!("expected a completed worker, got {other:?}"),
     }
 }

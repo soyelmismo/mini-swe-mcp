@@ -255,8 +255,7 @@ async fn wait_for_paused(pool: &WorkerPool, worker_id: &str) -> Option<String> {
     for _ in 0..600 {
         match pool.get_worker_state(worker_id).await {
             Some(WorkerState::Paused { question, .. }) => return Some(question),
-            Some(WorkerState::Completed { ..
-            verdicts: None, } | WorkerState::Failed { .. }) => return None,
+            Some(WorkerState::Completed { .. } | WorkerState::Failed { .. }) => return None,
             _ => {}
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -271,11 +270,9 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
-                WorkerState::Completed { ..
-                verdicts: None, }
+                WorkerState::Completed { .. }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { ..
-                verdicts: None, } => return state,
+                | WorkerState::Exhausted { .. } => return state,
                 other => last = Some(format!("{other:?}")),
             }
         }
@@ -286,8 +283,7 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
 
 fn metrics_of(state: &WorkerState) -> WorkerMetrics {
     match state {
-        WorkerState::Completed { metrics, ..
-        verdicts: None, } => *metrics,
+        WorkerState::Completed { metrics, .. } => *metrics,
         other => panic!("expected a completed worker, got {other:?}"),
     }
 }
@@ -385,8 +381,7 @@ async fn an_ignored_nudge_carries_the_plan_and_then_pauses_the_worker() {
         .expect("steer the paused worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
     assert!(
-        matches!(state, WorkerState::Completed { ..
-        verdicts: None, }),
+        matches!(state, WorkerState::Completed { .. }),
         "the worker must finish once the orchestrator guides it, got {state:?}"
     );
     let metrics = metrics_of(&state);
@@ -426,8 +421,7 @@ async fn a_worker_that_edits_after_the_nudge_never_reaches_the_pause() {
 
     let state = wait_for_terminal(&pool, &worker_id).await;
     let metrics = match &state {
-        WorkerState::Completed { metrics, ..
-        verdicts: None, } => *metrics,
+        WorkerState::Completed { metrics, .. } => *metrics,
         other => panic!("a worker that edits must finish, got {other:?}"),
     };
     assert_eq!(

@@ -150,11 +150,9 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
-                WorkerState::Completed { ..
-                verdicts: None, }
+                WorkerState::Completed { .. }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { ..
-                verdicts: None, } => return state,
+                | WorkerState::Exhausted { .. } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
@@ -185,8 +183,7 @@ async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> S
         if let Some(state) = pool.get_worker_state(worker_id).await
             && matches!(
                 state,
-                WorkerState::Completed { ..
-                verdicts: None, } | WorkerState::Failed { .. }
+                WorkerState::Completed { .. } | WorkerState::Failed { .. }
             )
         {
             let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
@@ -284,8 +281,7 @@ async fn a_hermetic_suite_completes_verified() {
     .await;
     let state = wait_for_terminal(&pool, &worker_id).await;
     match state {
-        WorkerState::Completed { ..
-        verdicts: None, } => {}
+        WorkerState::Completed { .. } => {}
         other => panic!("a hermetic suite must complete, got {other:?}"),
     }
 }
@@ -367,8 +363,7 @@ async fn secrets_never_reach_variant_b() {
     .await;
     let state = wait_for_terminal(&pool, &worker_id).await;
     match state {
-        WorkerState::Completed { ..
-        verdicts: None, } => {}
+        WorkerState::Completed { .. } => {}
         other => panic!("a secret must never reach variant B, got {other:?}"),
     }
 }

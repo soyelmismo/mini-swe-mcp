@@ -1239,8 +1239,8 @@ fn completed_worker(id: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
-            report: None
-        verdicts: None,,
+            report: None,
+            verdicts: None,
         },
     )
 }
@@ -1469,6 +1469,7 @@ fn worker_transitions_become_one_event_each() {
             tests: "cargo test: passed".to_string(),
             risks: "none".to_string(),
         }),
+        verdicts: None,
         per_file: vec![
             FileStat {
                 path: "src/retry.rs".to_string(),

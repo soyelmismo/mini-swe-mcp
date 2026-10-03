@@ -172,8 +172,8 @@ async fn completed_status_payload_is_small_and_lists_only_changed_artifacts() {
         verified: Some(true),
         metrics: WorkerMetrics::default(),
         revision: 2,
-        report: None
-    verdicts: None,,
+        report: None,
+        verdicts: None,
     };
 
     let owned = IsolatedPool::new(4, "status-payload");

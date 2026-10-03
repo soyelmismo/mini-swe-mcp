@@ -384,11 +384,9 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
         if let Some(state) = pool.get_worker_state(id).await
             && matches!(
                 state,
-                WorkerState::Completed { ..
-                verdicts: None, }
+                WorkerState::Completed { .. }
                     | WorkerState::Failed { .. }
-                    | WorkerState::Exhausted { ..
-                    verdicts: None, }
+                    | WorkerState::Exhausted { .. }
             )
             && !pool.scratch_root().join(format!("swe-wt-{id}")).exists()
         {

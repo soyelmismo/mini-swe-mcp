@@ -110,8 +110,8 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
-            report: None
-        verdicts: None,,
+            report: None,
+            verdicts: None,
         },
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),

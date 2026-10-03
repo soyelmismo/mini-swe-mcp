@@ -195,8 +195,7 @@ async fn completion_integrates_round_base_not_new_master_tip() {
         .unwrap();
     let initial = wait_state(&pool, &worker, false).await;
     assert!(
-        matches!(initial, WorkerState::Completed { ..
-        verdicts: None, }),
+        matches!(initial, WorkerState::Completed { .. }),
         "{initial:?}"
     );
     std::fs::write(repo.path().join("round-file"), "round base\n").unwrap();
@@ -216,8 +215,7 @@ async fn completion_integrates_round_base_not_new_master_tip() {
     assert!(result.contains("revising"), "{result}");
     let completed = wait_state(&pool, &worker, false).await;
     assert!(
-        matches!(completed, WorkerState::Completed { ..
-        verdicts: None, }),
+        matches!(completed, WorkerState::Completed { .. }),
         "{completed:?}"
     );
     let branch = format!("worker-{worker}");
@@ -232,8 +230,7 @@ async fn completion_integrates_round_base_not_new_master_tip() {
     pool.steer(&consolidator, "complete".into()).await.unwrap();
     let completed = wait_state(&pool, &consolidator, false).await;
     assert!(
-        matches!(completed, WorkerState::Completed { ..
-        verdicts: None, }),
+        matches!(completed, WorkerState::Completed { .. }),
         "{completed:?}"
     );
     let files = common::git(
