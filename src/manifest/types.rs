@@ -282,9 +282,6 @@ impl ModelInstructions {
         // Reserve the wrapping the prompt adds around the bullets (its own
         // leading newlines, the header line and the truncation note) so the
         // *emitted* section, not just the bullets, stays inside the budget.
-        // Reserve the wrapping the prompt adds around the bullets (its own
-        // leading newlines, the header line and the truncation note) so the
-        // *emitted* section, not just the bullets, stays inside the budget.
         let budget = max_bytes.saturating_sub(SECTION_OVERHEAD);
         let mut used = 0;
         let mut kept = 0;
