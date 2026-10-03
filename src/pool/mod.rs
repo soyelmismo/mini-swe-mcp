@@ -103,8 +103,8 @@ pub use self::state::{
     same_diff_path, terminal_retention_secs, within_retired_grace, worker_retired_grace_secs,
 };
 pub use self::steer::{
-    drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
-    steer_path, steer_path_in, write_steer_message, write_steer_message_in,
+    __test_log_nonce_in, drain_steer_messages, drain_steer_messages_in, remove_steer_file,
+    remove_steer_file_in, steer_path, steer_path_in, write_steer_message, write_steer_message_in,
 };
 
 use self::revision::outcome_revision;

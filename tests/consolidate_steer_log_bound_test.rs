@@ -9,7 +9,9 @@
 mod common;
 
 use common::{IsolatedPool, TempDir, git, unique_suffix};
-use mini_swe_mcp::pool::{RegistryStatus, WorkerRegistryEntry, WorkerRole, save_registry_entry_in};
+use mini_swe_mcp::pool::{
+    __test_log_nonce_in, RegistryStatus, WorkerRegistryEntry, WorkerRole, save_registry_entry_in,
+};
 
 const OWNER: &str = "agent-a";
 const GROUP: &str = "round-logbound";
@@ -172,13 +174,18 @@ async fn a_record_torn_by_the_read_cap_is_dropped_not_half_shown() {
         .scratch
         .path()
         .join(format!("swe-wt-{worker}.steer-log.jsonl"));
+    // The records carry this scratch root's own nonce: this test is about where
+    // the read cap cuts, not about who may write a record, and a record the
+    // reader refuses as unauthenticated would pass the test for the wrong reason.
+    let nonce = __test_log_nonce_in(&pool.root()).expect("a nonce for this scratch root");
     let mut payload = String::new();
     payload.push_str(
-        &serde_json::json!({"message": "INTACT-STEER", "sent_at": 1_u64, "pid": 1_u32}).to_string(),
+        &serde_json::json!({"message": "INTACT-STEER", "sent_at": 1_u64, "pid": 1_u32, "nonce": nonce})
+            .to_string(),
     );
     payload.push('\n');
     payload.push_str(
-        &serde_json::json!({"message": "SECOND-INTACT-STEER", "sent_at": 2_u64, "pid": 1_u32})
+        &serde_json::json!({"message": "SECOND-INTACT-STEER", "sent_at": 2_u64, "pid": 1_u32, "nonce": nonce})
             .to_string(),
     );
     payload.push('\n');
