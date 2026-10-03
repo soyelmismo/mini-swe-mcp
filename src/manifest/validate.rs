@@ -119,11 +119,20 @@ impl ModelManifest {
         // Review modes are iterated in sorted name order so the output is
         // stable across runs. A mode with an empty checklist is an auditor
         // with nothing to say, so it is reported and dropped by `normalize`.
+        // Each trigger glob is validated: an invalid glob would silently match
+        // nothing, so it is reported and dropped too.
         for (name, def) in self.sorted_review_modes() {
             if def.checklist.trim().is_empty() {
                 warnings.push(format!(
                     "review mode \"{name}\" has an empty checklist; it will be ignored"
                 ));
+            }
+            for trigger in &def.triggers {
+                if !super::validate_glob(trigger) {
+                    warnings.push(format!(
+                        "review mode \"{name}\" has an invalid trigger glob \"{trigger}\"; it will be ignored"
+                    ));
+                }
             }
         }
 
