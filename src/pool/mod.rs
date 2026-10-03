@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 pub mod admission;
+pub mod archive;
 mod buffer;
 mod clock;
 mod fair;
@@ -50,6 +51,7 @@ pub use self::admission::{
     AdmissionController, AdmissionInputs, Blocked, Decision, HeavyPermit, HostSample, admit,
     jobs_for,
 };
+pub use self::archive::{ArchiveRecord, RetireReason};
 pub use self::buffer::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, EmittedLogs, LogBuffer,
     LogRetentionPolicy, LogStats, MAX_EMITTED_LOGS_CEILING, MAX_LOG_COMMAND_BYTES,

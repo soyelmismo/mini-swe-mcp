@@ -510,8 +510,19 @@ pub struct RetireContext<'a> {
     /// branch alone rather than guessing a repository that may hold other
     /// work.
     pub repo: Option<&'a Path>,
-    /// Hub directory holding `watch_acks.json`. `None` skips the ack store.
+    /// Hub directory holding `watch_acks.json` and `archive.jsonl`. `None`
+    /// skips the ack store *and* the archive: both live in the one directory
+    /// only the hub daemon knows, and a retirement that guessed one would
+    /// write owner names into a place nobody asked for.
     pub ack_dir: Option<&'a Path>,
+    /// Why this worker is being retired, which is what the archive line says.
+    /// `None` is read as [`RetireReason::Merged`]: every retirement of a
+    /// finished worker outside the deliberate ones is a merge or the sweep that
+    /// proves it.
+    pub reason: Option<super::archive::RetireReason>,
+    /// The commit that landed this worker, when the retirement knows one.
+    /// `None` when nothing in the caller could name it.
+    pub merge_commit: Option<&'a str>,
     /// Whether the `worker-<id>` branch itself survives.
     ///
     /// `merge --no-delete` sets this: the operator asked to keep the branch, so
@@ -579,6 +590,14 @@ pub fn retire_worker_reporting(
     ctx: &RetireContext<'_>,
 ) -> RetireOutcome {
     let branch = format!("worker-{worker_id}");
+    // The archive line goes first, while the row that answers for the run
+    // still exists: everything this retirement is about to delete -- the row,
+    // the conversation, the branch -- is what the line is built from. A
+    // retirement without a hub directory (a pool driven straight from a test,
+    // an ownerless sweep) archives nothing rather than guessing a directory.
+    if let Some(dir) = ctx.ack_dir {
+        archive_retirement(root, worker_id, ctx, dir);
+    }
     // The worktree goes first: a leftover that is still registered would make
     // the branch undeletable, and `git worktree prune` clears the registration
     // once its directory is gone.
@@ -653,6 +672,38 @@ pub fn retire_worker_reporting(
         branch_deleted,
         worktree_reclaimed: reclaimed,
         row_removed,
+    }
+}
+
+/// Append the archive line for one retirement, before its row is deleted.
+///
+/// The row is the only record that names the owner, the group, the final status
+/// and the gate verdict, and it is deleted a few lines later, so this reads it
+/// first and appends immediately. A row that is already gone writes nothing:
+/// retirement is idempotent, and a second pass over the same worker must not
+/// add a second line for a run that left exactly once.
+fn archive_retirement(root: &ScratchRoot, worker_id: &str, ctx: &RetireContext<'_>, dir: &Path) {
+    let Some(entry) = super::load_registry_entry_in(root, worker_id) else {
+        return;
+    };
+    let reason = ctx
+        .reason
+        .unwrap_or(super::archive::RetireReason::Merged);
+    let record = super::archive::ArchiveRecord::from_entry(
+        &entry,
+        reason,
+        ctx.merge_commit,
+        super::unix_timestamp(),
+    );
+    // Best effort, like every other step of a retirement: an unwritable hub
+    // directory must not turn a merge into a failure, and the work is already
+    // in the base branch either way.
+    if let Err(error) = super::archive::append_record(dir, &record) {
+        tracing::warn!(
+            worker = %worker_id,
+            error = %error,
+            "Could not append the retired worker's report to the archive"
+        );
     }
 }
 
