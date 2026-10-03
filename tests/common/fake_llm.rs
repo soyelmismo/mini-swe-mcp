@@ -33,6 +33,9 @@ pub struct FakeLlm {
     requests: Arc<AtomicUsize>,
     /// Of those, the ones that scripted the heavy command.
     heavy: Arc<AtomicUsize>,
+    /// Every request body received, so a test can inspect what the worker was
+    /// told rather than only what it answered.
+    bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 /// What commands a [`FakeLlm`] answers with, turn by turn.
@@ -46,6 +49,10 @@ enum Script {
     /// A heavy command on turn 1, a distinct benign command on turns 2 and 3,
     /// then the completion sentinel from turn 4 on.
     GateThenComplete { heavy: String },
+    /// One scripted command per turn, by turn number (the number of `tool`
+    /// results the request already carries). A turn past the end of the script
+    /// is left unanswered, so a worker can only end by exhausting its budget.
+    Turns(Vec<String>),
 }
 
 impl FakeLlm {
@@ -82,8 +89,10 @@ impl FakeLlm {
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
         let requests = Arc::new(AtomicUsize::new(0));
         let heavy_served = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let counted = requests.clone();
         let heavy_counted = heavy_served.clone();
+        let captured = bodies.clone();
 
         tokio::spawn(async move {
             loop {
@@ -93,10 +102,11 @@ impl FakeLlm {
                 let script = script.clone();
                 let requests = counted.clone();
                 let heavy_served = heavy_counted.clone();
+                let bodies = captured.clone();
                 // One task per connection: a slow or stalled client must never
                 // hold up the conversations behind it.
                 tokio::spawn(async move {
-                    serve_turn(socket, &script, requests, heavy_served).await;
+                    serve_turn(socket, &script, requests, heavy_served, bodies).await;
                 });
             }
         });
@@ -105,12 +115,33 @@ impl FakeLlm {
             base_url,
             requests,
             heavy: heavy_served,
+            bodies,
         }
     }
 
     /// The base URL to hand the pool as `OPENAI_API_BASE`.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Serve `commands` in order, one per turn, and answer nothing past the
+    /// end of the script.
+    ///
+    /// The turn number is read off the request body rather than a connection
+    /// counter, so a retried request re-asks the same turn and a test that
+    /// scripts a long run stays aligned with the conversation it inspects.
+    pub async fn spawn_scripted(commands: &[&str]) -> Self {
+        Self::spawn_script(Script::Turns(
+            commands.iter().map(|c| c.to_string()).collect(),
+        ))
+        .await
+    }
+
+    /// Every chat-completion request body received, in order. The body carries
+    /// the whole conversation, so a test can read the messages the pool
+    /// injected into a worker's turn.
+    pub async fn request_bodies(&self) -> Vec<Value> {
+        self.bodies.lock().await.clone()
     }
 
     /// Chat-completion requests answered so far.
@@ -130,11 +161,15 @@ async fn serve_turn(
     script: &Script,
     requests: Arc<AtomicUsize>,
     heavy_served: Arc<AtomicUsize>,
+    bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
 ) {
     let Some(body) = read_request(&mut socket).await else {
         return;
     };
     requests.fetch_add(1, Ordering::Relaxed);
+    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        bodies.lock().await.push(value);
+    }
     let turn = turn_of(&body);
     let command = match script {
         Script::LightThenHeavy { light, heavy } => match turn {
@@ -158,6 +193,16 @@ async fn serve_turn(
             1 => "echo gate-turn-2 > gate-turn-2.txt".to_string(),
             2 => "echo gate-turn-3 > gate-turn-3.txt".to_string(),
             _ => format!("echo {}", mini_swe_mcp::pool::COMPLETION_SENTINEL),
+        },
+        // Past the end of a scripted run there is nothing left to answer: the
+        // socket closes empty, so the caller sees the turn it scripted end and
+        // never a turn of someone else's script.
+        Script::Turns(commands) => match commands.get(turn) {
+            Some(command) => command.clone(),
+            None => {
+                let _ = socket.shutdown().await;
+                return;
+            }
         },
     };
     let response = sse_response(&command, turn);
