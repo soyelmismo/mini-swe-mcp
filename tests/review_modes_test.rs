@@ -483,3 +483,186 @@ async fn an_unknown_mode_is_a_dispatch_error() {
         "{message} must list the declared mode"
     );
 }
+
+// ----------
+// Triggers
+// ----------
+
+#[test]
+fn a_declared_mode_parses_its_triggers() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check.\n    triggers:\n      - src/hot/**\n      - src/perf.rs\n",
+    );
+    let def = manifest.review_mode("perf").expect("perf mode");
+    assert_eq!(def.triggers, vec!["src/hot/**".to_string(), "src/perf.rs".to_string()]);
+    assert!(manifest.validate().is_empty());
+}
+
+#[test]
+fn an_invalid_trigger_glob_warns_and_is_dropped_by_normalize() {
+    let manifest = modes_manifest(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check.\n    triggers:\n      - src/good/**\n      - \"   \"\n",
+    );
+    let warnings = manifest.validate();
+    assert!(
+        warnings.iter().any(|w| w.contains("invalid trigger glob")),
+        "an invalid glob must warn: {warnings:?}"
+    );
+    let normalized = manifest.normalize();
+    let def = normalized.review_mode("perf").expect("perf mode");
+    assert_eq!(def.triggers, vec!["src/good/**".to_string()], "the invalid glob is dropped");
+}
+
+/// A manifest-declared mode whose `triggers` match the diff runs automatically.
+#[tokio::test]
+async fn a_custom_trigger_fires_its_mode() {
+    let repo = TestRepo::new("trigger");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::turn("call_write", "", "mkdir -p src/hot && echo changed > src/hot/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
+        ScriptedSseServer::completion_turn("call_review", "REPORT\ndone: reviewed\nrisks: none"),
+    ])
+    .await;
+
+    let scratch = common::TempDir::new_in_tmp("review-modes-trigger");
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    triggers:\n      - src/hot/**\n",
+    )
+    .expect("modes manifest must parse");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url.clone(),
+        "test-key".to_string(),
+        ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(manifest));
+    let worker_id = pool
+        .dispatch(
+            TEST_OWNER.to_string(),
+            "exercise the custom trigger".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            5,
+            Some("review-modes".to_string()),
+            None,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let state = wait_for_terminal(&pool, &worker_id).await;
+
+    let requests = server.requests.lock().await.clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "write, implementer, and the triggered review"
+    );
+    // The custom mode has no default model, so the implementer's model runs it.
+    assert_eq!(requests[2]["model"], json!("test-model"));
+    let prompt = review_prompt_of(&server).await.expect("a review prompt");
+    assert!(
+        prompt.contains("REVIEW PHASE (perf)"),
+        "the trigger runs the perf mode: {prompt}"
+    );
+    assert!(
+        prompt.contains("Check for N+1 queries."),
+        "the checklist is used: {prompt}"
+    );
+
+    let WorkerState::Completed { .. } = &state else {
+        panic!("worker must complete, got {state:?}")
+    };
+    let _ = pool.kill(&worker_id).await;
+}
+
+/// Several modes whose triggers match run as successive review phases in
+/// sorted name order.
+#[tokio::test]
+async fn several_triggered_modes_run_successively_in_sorted_order() {
+    let repo = TestRepo::new("several");
+    let server = ScriptedSseServer::spawn(vec![
+        ScriptedSseServer::turn("call_write", "", "mkdir -p src/hot && echo changed > src/hot/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_impl",
+            "REPORT\ndone: impl\nrisks: none",
+            &format!("echo {COMPLETION_SENTINEL}"),
+        ),
+        ScriptedSseServer::completion_turn("call_review_a", "REPORT\ndone: a\nrisks: none"),
+        ScriptedSseServer::completion_turn("call_review_b", "REPORT\ndone: b\nrisks: none"),
+    ])
+    .await;
+
+    let scratch = common::TempDir::new_in_tmp("review-modes-several");
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  zebra:\n    checklist: Zebra check.\n    triggers:\n      - src/hot/**\n  alpha:\n    checklist: Alpha check.\n    triggers:\n      - src/hot/**\n",
+    )
+    .expect("modes manifest must parse");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url.clone(),
+        "test-key".to_string(),
+        ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(manifest));
+    let worker_id = pool
+        .dispatch(
+            TEST_OWNER.to_string(),
+            "exercise several triggers".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            5,
+            Some("review-modes".to_string()),
+            None,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let state = wait_for_terminal(&pool, &worker_id).await;
+
+    let requests = server.requests.lock().await.clone();
+    assert_eq!(requests.len(), 4, "write, implementer, and two reviews");
+    // The two reviews run in sorted name order: alpha before zebra.
+    let prompts: Vec<String> = requests
+        .iter()
+        .skip(2)
+        .map(|req| {
+            req["messages"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|m| {
+                    if m["role"] == json!("user") {
+                        m["content"].as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .find(|c| c.contains("REVIEW PHASE"))
+                .unwrap_or_default()
+        })
+        .collect();
+    let alpha = prompts
+        .iter()
+        .position(|p| p.contains("REVIEW PHASE (alpha)"))
+        .expect("alpha phase ran");
+    let zebra = prompts
+        .iter()
+        .position(|p| p.contains("REVIEW PHASE (zebra)"))
+        .expect("zebra phase ran");
+    assert!(alpha < zebra, "phases run in sorted order: {prompts:?}");
+
+    let WorkerState::Completed { .. } = &state else {
+        panic!("worker must complete, got {state:?}")
+    };
+    let _ = pool.kill(&worker_id).await;
+}

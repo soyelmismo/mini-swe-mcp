@@ -208,6 +208,9 @@ impl ModelManifest {
 
         self.review_modes
             .retain(|_, def| !def.checklist.trim().is_empty());
+        for def in self.review_modes.values_mut() {
+            def.triggers.retain(|trigger| super::validate_glob(trigger));
+        }
 
         self
     }
