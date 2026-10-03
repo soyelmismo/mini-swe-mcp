@@ -5,7 +5,7 @@
 //! goes through the same Unix socket a thin client would dial.
 
 use crate::common;
-use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir};
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir_in};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
@@ -295,18 +295,10 @@ async fn world_writable_hub_dir_is_refused() {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
             .expect("chmod scratch dir");
     }
-    // `hub_dir()` reads `SWE_HUB_DIR` from the process environment, so this
-    // test must hold the shared env lock while it mutates the variable.
-    let _env = crate::common::ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let before = std::env::var_os("SWE_HUB_DIR");
-    unsafe { std::env::set_var("SWE_HUB_DIR", &dir) };
-    let refused = hub_dir().is_err();
-    match before {
-        Some(v) => unsafe { std::env::set_var("SWE_HUB_DIR", v) },
-        None => unsafe { std::env::remove_var("SWE_HUB_DIR") },
-    }
+    // The directory is named directly: `hub_dir_in` is the same hardening
+    // path `hub_dir` takes for `$SWE_HUB_DIR`, without this process having to
+    // mutate an environment variable every other test would inherit.
+    let refused = hub_dir_in(dir.path().to_path_buf()).is_err();
     assert!(refused, "a world-writable hub dir must be refused");
     let _ = std::fs::remove_dir_all(&dir);
 }
