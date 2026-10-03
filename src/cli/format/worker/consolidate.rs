@@ -254,6 +254,7 @@ interaction points (touched by more than one worker):
             task: title.to_string(),
             // A body the compact render must keep out of the summary.
             full_task: format!("{title}\nfull body"),
+            steers: Vec::new(),
             files: vec!["src/a.rs".to_string()],
         };
         let manifest = RoundManifest {

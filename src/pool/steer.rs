@@ -194,6 +194,62 @@ pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
     }
 }
 
+/// Path of the durable orchestrator-steer log for `worker_id`.
+///
+/// Unlike the mailbox this file is never drained: it is the round's record of
+/// what the orchestrator told each worker *after* dispatch, so a consolidator
+/// dispatched later can be shown the scope amendments that superseded the
+/// original task. Written by [`record_orchestrator_steer_in`] alone, which
+/// only the orchestrator's own steer path calls.
+pub(super) fn steer_log_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    root.join(format!("swe-wt-{worker_id}.steer-log.jsonl"))
+}
+
+/// Append one orchestrator-authored steer to `worker_id`'s durable log.
+///
+/// Only messages that reached the worker are recorded, so the log never names
+/// an amendment the worker was never told. The consolidator routes its own
+/// corrections through the same delivery path but under a recorded
+/// [`SteerSource`], and it never calls this: the log is the *orchestrator's*
+/// voice, and a consolidator must not be shown its own past steers as scope
+/// amendments to a task it is judging.
+///
+/// A log that cannot be written is a warning, never a failed steer: the
+/// message has already been delivered and the round loses an amendment, which
+/// is strictly less bad than refusing guidance the worker needs.
+pub(super) fn record_orchestrator_steer_in(
+    root: &ScratchRoot,
+    worker_id: &str,
+    message: &str,
+) {
+    let path = steer_log_path_in(root, worker_id);
+    let record = SteerRecord {
+        message: message.to_string(),
+        sent_at: super::unix_timestamp(),
+        pid: std::process::id(),
+    };
+    // `to_string` on a `Value` cannot fail.
+    let mut payload = serde_json::to_string(&record).unwrap_or_default();
+    payload.push('\n');
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(payload.as_bytes()));
+    if let Err(e) = result {
+        warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+    }
+}
+
+/// Every orchestrator steer `worker_id` received after dispatch, in order.
+///
+/// A missing log is the common case (nobody steered this worker) and yields an
+/// empty vector. Lines that fail to parse are skipped with a warning, so one
+/// torn or corrupt append cannot hide the amendments around it.
+pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
+    read_records(&steer_log_path_in(root, worker_id))
+}
+
 /// The last consolidator to steer a worker, and its immutable round base.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SteerSource {

@@ -535,6 +535,7 @@ fn the_full_task_section_is_bounded_overall() {
         verified: Some(true),
         task: "heading".to_string(),
         full_task: format!("heading {id}\n{}", "z".repeat(8 * 1024)),
+        steers: Vec::new(),
         files: Vec::new(),
     };
     let manifest = RoundManifest {

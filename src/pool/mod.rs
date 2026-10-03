@@ -1487,11 +1487,13 @@ impl WorkerPool {
                 Some(WorkerState::Completed { verified, .. }) => verified.or(entry.verified),
                 _ => entry.verified,
             };
+            let steers = steer::orchestrator_steers_in(&self.scratch, &entry.id);
             rows.push(RoundRow {
                 id: entry.id,
                 task: entry.task,
                 status: entry.status,
                 verified,
+                steers,
             });
         }
         round::build(
@@ -2069,9 +2071,18 @@ impl WorkerPool {
         // Record before delivery: the resumed worker can immediately pause again.
         let previous = steer::read_source(&self.scratch, id);
         steer::write_source(&self.scratch, id, source.as_ref())?;
-        let result = self.deliver_steer(id, message, revision_turns).await;
+        // The round's own record of what the orchestrator told this worker
+        // after dispatch. Only the orchestrator's path carries no
+        // `SteerSource` -- a consolidator's own routing does -- so a
+        // consolidator reviewing the round is never shown its own steers as
+        // amendments to the task it is judging. Recorded after delivery, so
+        // the log only ever names guidance the worker actually received.
+        let from_orchestrator = source.is_none();
+        let result = self.deliver_steer(id, message.clone(), revision_turns).await;
         if result.is_err() {
             steer::write_source(&self.scratch, id, previous.as_ref())?;
+        } else if from_orchestrator {
+            steer::record_orchestrator_steer_in(&self.scratch, id, &message);
         }
         self.notify_change();
         result
