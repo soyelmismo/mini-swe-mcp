@@ -26,7 +26,26 @@ pub(crate) const DEGENERATE_MIN_BYTES: usize = 16;
 
 /// Consecutive turns whose reasoning may be identical before it counts as
 /// degenerate.
+///
+/// Two turns of the same sentence is a model repeating itself; the third is a
+/// model that has stopped thinking and is echoing the value it was fed.
 pub(crate) const DEGENERATE_REPEAT_TURNS: usize = 3;
+
+/// Degenerate turns tolerated before the worker is parked on the orchestrator.
+///
+/// The first one earns a nudge and a history without the replayed reasoning;
+/// two more that ignore it mean the run is not going to recover on its own.
+pub(crate) const DEGENERATE_PAUSE_STREAK: usize = 3;
+
+/// Turns after a degeneracy guard fire during which the replayed reasoning
+/// stays dropped.
+///
+/// The guard cannot know from the next request alone whether the model has
+/// recovered -- a turn is only judged by what it produced -- so the drop stays
+/// in force for one turn past the fire and lapses if the reasoning comes back
+/// sound. A drop that never lapsed would strip reasoning from a healthy
+/// conversation for the rest of the run.
+pub(crate) const DEGENERATE_REPLAY_WINDOW: usize = 1;
 
 /// How much of a text must be made of the repeated pattern for it to be
 /// filler. A 90% share leaves room for the punctuation, line breaks and the
@@ -127,17 +146,54 @@ fn coverage_needed(len: usize) -> usize {
     len * DEGENERATE_COVERAGE_PCT
 }
 
-/// The question the orchestrator is asked when the degeneracy persisted.
+/// The question asked when the degeneracy itself persisted.
 ///
-/// It names the value the model keeps sending (trimmed and bounded, so a
-/// 64 KiB run of one character cannot take the pause record with it) and the
-/// number of turns it has been going on for, because the decision -- replace
-/// the model, steer the worker, or retire it -- is the orchestrator's.
-pub(crate) fn degenerate_pause_question(turns: usize, sample: &str) -> String {
-    const SAMPLE_BYTES: usize = 64;
-    let sample: String = sample.trim().chars().take(SAMPLE_BYTES).collect();
+/// Distinct from [`no_command_pause_question`]: here the model is still
+/// calling tools, so the decision is about the model and the replayed
+/// reasoning rather than about the tool contract.
+pub(crate) fn degenerate_pause_question(turns: usize, reasoning: Option<&str>) -> String {
+    const SAMPLE_BYTES: usize = 120;
+    let sample: String = reasoning
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(SAMPLE_BYTES)
+        .collect();
     format!(
-        "Degenerate reasoning: {turns} consecutive assistant turns produced no usable reasoning (last value: {sample:?}). The worker is echoing filler back to the provider and is not making progress; replace the model, steer it, or retire it."
+        "Degenerate reasoning: {turns} consecutive turns produced empty or degenerate reasoning (last value: {sample:?}). The replayed reasoning has been dropped, so the worker is being sent its history without it; replace the model, steer it, or retire it."
+    )
+}
+
+/// The question the orchestrator is asked when a worker stops calling tools.
+///
+/// It names the mechanism rather than the symptom, because the fixes differ:
+/// a model whose reasoning came back as filler needs the replay dropped (done
+/// before the pause) or a different model, while a reply the provider itself
+/// cut short needs a shorter history. `content` and `reasoning` are bounded,
+/// so a 64 KiB run of one character cannot take the pause record with it.
+pub(crate) fn no_command_pause_question(
+    content: &str,
+    reasoning: Option<&str>,
+    turns: usize,
+    degenerate: bool,
+    truncated: bool,
+) -> String {
+    const SAMPLE_BYTES: usize = 120;
+    let sample: String = reasoning
+        .unwrap_or(content)
+        .trim()
+        .chars()
+        .take(SAMPLE_BYTES)
+        .collect();
+    let cause = if truncated {
+        "the provider reported finish_reason=length/content_filter, so the reply was cut short"
+    } else if degenerate {
+        "the reasoning is degenerate (one short pattern repeated)"
+    } else {
+        "the model is answering prose with no tool call"
+    };
+    format!(
+        "The model stopped calling tools: {turns} consecutive turns answered with no bash tool call ({cause}). Last reply: {sample:?}. Replay this worker with a shorter history, restate the tool contract, or retire it."
     )
 }
 
@@ -222,10 +278,24 @@ mod tests {
 
     #[test]
     fn the_pause_question_names_the_problem_and_bounds_the_sample() {
-        let question = degenerate_pause_question(5, &"!".repeat(8 * 1024));
-        assert!(question.contains("Degenerate reasoning"), "{question}");
+        let question = no_command_pause_question("", Some(&"!".repeat(8 * 1024)), 5, true, false);
+        assert!(question.contains("stopped calling tools"), "{question}");
         assert!(question.contains("5 consecutive"), "{question}");
+        assert!(question.contains("degenerate"), "{question}");
         assert!(question.len() < 1024, "the sample must be bounded: {question}");
+    }
+
+    #[test]
+    fn a_truncated_reply_is_named_as_such_in_the_question() {
+        let question = no_command_pause_question("partial", None, 5, false, true);
+        assert!(question.contains("finish_reason=length/content_filter"), "{question}");
+    }
+
+    #[test]
+    fn the_degenerate_question_names_the_turns_and_the_value() {
+        let question = degenerate_pause_question(3, Some(OBSERVED));
+        assert!(question.contains("3 consecutive"), "{question}");
+        assert!(question.contains("!!"), "{question}");
     }
 
     #[test]

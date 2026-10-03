@@ -46,6 +46,7 @@ use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
 
 pub(crate) mod context_pack;
+pub(crate) mod degenerate;
 pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
