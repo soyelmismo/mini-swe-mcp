@@ -44,7 +44,10 @@ fn plant_target(tag: &str) -> (TempDir, std::path::PathBuf) {
     let victim = dir.path().join("planted.jsonl");
     std::fs::write(
         &victim,
-        format!("{}\n", serde_json::to_string(&planted_record("victim-owner")).unwrap()),
+        format!(
+            "{}\n",
+            serde_json::to_string(&planted_record("victim-owner")).unwrap()
+        ),
     )
     .expect("the plant target must be writable");
     (dir, victim)
@@ -112,7 +115,8 @@ fn a_fifo_archive_is_refused_instead_of_blocking() {
         std::io::Error::last_os_error()
     );
 
-    let records = archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
+    let records =
+        archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
     assert!(
         records.is_empty(),
         "a FIFO is not the archive and must yield no lines: {records:?}"

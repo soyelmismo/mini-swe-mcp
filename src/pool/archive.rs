@@ -174,14 +174,31 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
         && meta.file_type().is_file()
         && meta.len().saturating_add(line.len() as u64) > ARCHIVE_MAX_BYTES
     {
+        // `rename(2)` replaces the destination atomically, so the previous
+        // generation is displaced without being unlinked first. Unlinking it
+        // would only open a window in which the generation is gone and the
+        // rename can still fail -- losing the old one *and* the new one. A
+        // destination that is a link is replaced as the link itself, never
+        // followed to its target.
+        //
+        // A rotation that cannot be performed is not fatal. The rotated name is
+        // fixed and predictable, so it can be occupied by something a rename
+        // cannot displace (a directory, for one), and the previous writer may
+        // have rotated the very file this call measured -- concurrent
+        // retirements are expected here, not an exotic case. Neither is a
+        // reason to drop the report: the row, the conversation and the branch
+        // are deleted a moment later, so the line written here is the only copy
+        // of this worker's before/after measurements. The file may therefore
+        // grow past the cap while the rotated name is unusable, and that is the
+        // intended trade.
         let rotated = rotated_path(dir);
-        // Replace the previous generation outright rather than appending to it:
-        // the cap is a bound, not a queue. The previous generation is unlinked
-        // before the rename, so the rename cannot clobber a file this process
-        // did not write.
-        let _ = std::fs::remove_file(&rotated);
-        std::fs::rename(&path, &rotated)
-            .with_context(|| format!("could not rotate {}", path.display()))?;
+        if let Err(error) = std::fs::rename(&path, &rotated) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "Could not rotate the retired-worker archive; appending without rotating"
+            );
+        }
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
