@@ -710,6 +710,76 @@ struct VerifySuccess {
 /// Keep at most one record per permitted turn.
 const VERIFY_SUCCESS_LIMIT: usize = MAX_TURNS_LIMIT;
 
+/// Turns of recent history the budget-extension decision looks over.
+const BUDGET_EXTENSION_WINDOW: usize = 10;
+
+/// Recent-history summary the budget-extension decision is pure over.
+///
+/// Built by [`ProgressWatch::progress_summary`] from the cross-turn state the
+/// phase loop already keeps; the decision itself is a pure function of this
+/// summary, so it is testable without an LLM round-trip.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ProgressSummary {
+    /// Turns since the repository sample last changed.
+    pub unchanged_turns: usize,
+    /// Step of the last test/gate command that ran, if any.
+    pub last_gate_step: Option<usize>,
+    /// Step of the last repetition/stagnation/read-only guard fire, if any.
+    pub last_guard_step: Option<usize>,
+    /// The step the budget was reached at.
+    pub step: usize,
+}
+
+/// Decide whether a worker that just reached its turn budget gets one
+/// automatic extension.
+///
+/// Pure over the recent-history summary: progress (a changed diff or a
+/// test/gate command in the window) and no recent guard fire means the
+/// worker is close, so grant one bounded extension; anything else stops
+/// as today. `budget` is the extension size in turns, and `0` disables the
+/// extension entirely (env `POOL_BUDGET_EXTENSION_PCT=0`). Never grants twice
+/// in one revision (`already_extended`).
+fn grant_extension(
+    recent: &ProgressSummary,
+    already_extended: bool,
+    budget: usize,
+) -> Option<usize> {
+    if already_extended || budget == 0 {
+        return None;
+    }
+    let window = BUDGET_EXTENSION_WINDOW;
+    if recent
+        .last_guard_step
+        .is_some_and(|s| recent.step.saturating_sub(s) <= window)
+    {
+        return None;
+    }
+    let diff_changed = recent.unchanged_turns < window;
+    let gate_recent = recent
+        .last_gate_step
+        .is_some_and(|s| recent.step.saturating_sub(s) <= window);
+    if !diff_changed && !gate_recent {
+        return None;
+    }
+    Some(budget)
+}
+
+/// The automatic extension size for a dispatch budget, in turns.
+///
+/// `+25%` of the budget, capped at `30`, both env-configurable; `0` disables
+/// the extension entirely.
+fn extension_budget(dispatch_max_turns: usize) -> usize {
+    let pct = crate::config::env_parse::<usize>("POOL_BUDGET_EXTENSION_PCT").unwrap_or(25);
+    if pct == 0 {
+        return 0;
+    }
+    let max = crate::config::env_parse::<usize>("POOL_BUDGET_EXTENSION_MAX").unwrap_or(30);
+    if max == 0 {
+        return 0;
+    }
+    (dispatch_max_turns * pct / 100).clamp(1, max)
+}
+
 /// Cross-turn state of the two loop detectors, plus the last successful run
 /// of each heavy command the completion gate can reuse.
 ///
@@ -731,6 +801,12 @@ pub(super) struct ProgressWatch {
     /// command string. The completion gate reuses an entry when the same
     /// command is issued as the verify gate on an unchanged tree.
     verify_success: BTreeMap<String, VerifySuccess>,
+    /// Step of the last test/gate command that ran, for the budget-extension
+    /// decision.
+    last_gate_step: Option<usize>,
+    /// Step of the last repetition/stagnation/read-only guard fire, for the
+    /// budget-extension decision.
+    last_guard_step: Option<usize>,
 }
 
 impl ProgressWatch {
@@ -799,6 +875,26 @@ impl ProgressWatch {
     /// earlier pass no longer describes the tree, so the gate re-runs it.
     fn invalidate_verify_success(&mut self, command: &str) {
         self.verify_success.remove(command);
+    }
+
+    /// Note that a test/gate command ran at `step`.
+    fn note_gate(&mut self, step: usize) {
+        self.last_gate_step = Some(step);
+    }
+
+    /// Note that a repetition/stagnation/read-only guard fired at `step`.
+    fn note_guard(&mut self, step: usize) {
+        self.last_guard_step = Some(step);
+    }
+
+    /// The recent-history summary the budget-extension decision is pure over.
+    fn progress_summary(&self, step: usize) -> ProgressSummary {
+        ProgressSummary {
+            unchanged_turns: self.unchanged_turns,
+            last_gate_step: self.last_gate_step,
+            last_guard_step: self.last_guard_step,
+            step,
+        }
     }
 }
 
@@ -1211,6 +1307,7 @@ impl<'a> TurnEngine<'a> {
         // the command is answered without being executed.
         if let Some(blocks) = self.watch.register_command(&cmd_str) {
             self.meta.metrics.repeat_blocks += 1;
+            self.watch.note_guard(*self.step);
             warn!(
                 worker = %self.worker_id,
                 step = *self.step,
@@ -1791,6 +1888,7 @@ impl<'a> TurnEngine<'a> {
         }
 
         self.meta.metrics.loop_pauses += 1;
+        self.watch.note_guard(*self.step);
         let question = format!(
             "Repetition loop: `{cmd_summary}` was blocked {blocks} turns in a row (byte-identical to the previous turn's command, output unchanged). The worker is not making progress; guide it to a different action."
         );
@@ -1920,6 +2018,7 @@ impl<'a> TurnEngine<'a> {
             return;
         }
         self.meta.metrics.stagnation_nudges += 1;
+        self.watch.note_guard(*self.step);
         warn!(
             worker = %self.worker_id,
             step = *self.step,
@@ -1952,6 +2051,7 @@ impl<'a> TurnEngine<'a> {
             return Ok(());
         };
         self.meta.metrics.stagnation_nudges += 1;
+        self.watch.note_guard(*self.step);
         let read_only_turns = self.watch.read_only.read_only_turns;
         warn!(
             worker = %self.worker_id,
@@ -1989,6 +2089,7 @@ impl<'a> TurnEngine<'a> {
     /// guidance for the turn after it.
     async fn pause_on_read_only(&mut self, config: &TurnConfig<'_>, question: &str) -> Result<()> {
         self.meta.metrics.loop_pauses += 1;
+        self.watch.note_guard(*self.step);
         let answer = self
             .pool
             .pause_for_orchestrator(PauseRequest {
@@ -2059,6 +2160,7 @@ impl<'a> TurnEngine<'a> {
         self.watch.invalidate_verify_success(command);
         let result = self.run_gated_with_env(command, class, Vec::new()).await;
         if heavy {
+            self.watch.note_gate(*self.step);
             self.update_verify_success(command, &result, before).await;
         }
         result

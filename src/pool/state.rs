@@ -33,6 +33,8 @@ pub struct WorkerMetrics {
     pub extensions_granted: usize,
     /// `REQUEST_TURNS` asks past the self-grant budget that were refused.
     pub extensions_refused: usize,
+    /// Automatic budget extensions granted once at the turn limit.
+    pub auto_extensions_granted: usize,
     /// Commands answered by the repetition detector instead of being run.
     pub repeat_blocks: usize,
     /// "Stop exploring" nudges the stagnation detector injected.
