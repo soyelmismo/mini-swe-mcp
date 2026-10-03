@@ -18,6 +18,14 @@
 //!   `--review-after` (`review_after`), and it is also what the automatic
 //!   sensitive-path trigger runs.
 //!
+//! The security review audits only what has not been audited yet. Every commit
+//! an earlier security review approved is recorded on the worker's registry row
+//! ([`SecurityScope`]), so a revision — and a consolidator, whose diff is the
+//! union of branches each already reviewed — is handed the diff since that
+//! commit, not the whole branch again: 22 full reviews of 9 workers become one
+//! review per real change. With nothing new since the approval, the review is
+//! skipped and the skip is logged rather than paid for.
+//!
 //! It runs under its own turn budget ([`ReviewPhase::review_max_turns`],
 //! resolved from the model manifest) and its own message history, so the
 //! reviewer's context never mixes with the implementer's.
@@ -33,7 +41,7 @@ use crate::manifest::build_system_prompt;
 use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
-use super::super::registry::{RegistryStatus, WorkerMeta};
+use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
 
 /// Which auditor runs over the finished implementation.
@@ -177,6 +185,138 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
     prompt
 }
 
+impl SecurityScope {
+    /// The skip line for this scope, when the review must not run because
+    /// nothing unaudited changed; `None` when there is something to review.
+    pub(super) fn skip_log(&self) -> Option<String> {
+        match self {
+            Self::Since { base, commits, .. } if commits.is_empty() => Some(format!(
+                "security review skipped: no sensitive change since {base}"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Decide what one run's security review has to cover.
+///
+/// * A first run, with no earlier approval, reviews the whole diff since the
+///   base commit (`SecurityScope::Full`).
+/// * A revision with a recorded approval reviews only the commits after that
+///   approved commit (`SecurityScope::Since`). When nothing came after it, the
+///   scope is empty and the caller skips the review and logs why.
+/// * A consolidator reviews only its *own* commits — its interaction fixes and
+///   conflict resolutions — excluding the worker branches it merged, each
+///   already security-reviewed at its own approved commit. It does so whenever
+///   the security review is otherwise wanted; the worker list comes from the
+///   consolidated branches, so the set difference is over real reviewed
+///   histories rather than a marker on the row.
+///
+/// `security_wanted` says a security review is otherwise due for this run
+/// (a requested `--review-after <m>:security`, or a consolidator, whose own
+/// commits always need the adversarial pass). When it is `false` and there is no
+/// approval to scope from, the whole diff is returned but the caller's ordinary
+/// trigger still decides whether to review at all.
+pub(super) async fn security_scope(
+    worktree: &WorktreeGuard,
+    role: WorkerRole,
+    approved_commit: Option<String>,
+    merged_branches: &[String],
+    security_wanted: bool,
+) -> SecurityScope {
+    let branch = worktree.branch.clone();
+    // A consolidator integrates worker branches that were already reviewed at
+    // their own approved commits, so only its own commits are unaudited.
+    if role == WorkerRole::Consolidate && security_wanted {
+        let commits = own_commits(&worktree.path, &branch, merged_branches).await;
+        return SecurityScope::Since {
+            base: worktree.base_commit.clone(),
+            approved: Vec::new(),
+            commits,
+        };
+    }
+    match approved_commit {
+        Some(base) => {
+            let commits = commits_since(&worktree.path, &base, &branch).await;
+            let approved = vec![base.clone()];
+            SecurityScope::Since {
+                base,
+                approved,
+                commits,
+            }
+        }
+        None => SecurityScope::Full,
+    }
+}
+
+/// The reviewer's opening message for a review that covers only what came after
+/// an earlier approval.
+///
+/// The reviewer is auditing a revision, not the whole branch: the diff since
+/// `base` is what it has never seen, while the commits earlier security reviews
+/// already approved are named so it neither re-reviews them nor mistakes them
+/// for new code. It keeps the adversarial checklist -- only the scope shrinks.
+fn incremental_prompt(task: &str, base: &str, approved: &[String], diff: &str) -> String {
+    let mut prompt = String::from(
+        "ADVERSARIAL SECURITY REVIEW PHASE (incremental):\n\
+         The previous subagent implemented the following task:\n",
+    );
+    let _ = write!(prompt, "{task}\n\n");
+    let _ = write!(
+        prompt,
+        "An earlier security review already approved the branch at commit {base}, \
+         so this pass covers only what came after it.\n\
+         Commits already security-reviewed and approved: {}.\n\n",
+        if approved.is_empty() {
+            base.to_string()
+        } else {
+            approved.join(", ")
+        }
+    );
+    prompt.push_str(
+        "YOUR OBJECTIVE AS THE ADVERSARIAL REVIEWER:\n\
+         Review ONLY the incremental diff below (`git diff {base}..HEAD`, \
+         plus the working tree with `git diff`). The earlier commits were \
+         already adversarially reviewed; re-litigating them wastes the budget. \
+         Ask the same questions of the new lines as of any other diff: who else \
+         can reach every path, socket, file, environment variable and IPC message \
+         they create; what model-written text is trusted as proof; what is left \
+         behind on a crash, handover or revision; what each deletion removes and \
+         what gates it; whether each changed test would fail if the code were wrong.\n\
+         Fix every real defect you find, with a regression test that fails without the fix.\n\
+         1. Report honestly: list every finding you did NOT fix in the `risks:` line.\n\
+         2. Print a line `FINDINGS: <n>` with the total number of findings you found.\n\
+         When done, execute:\n\
+         \x20  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n\n\
+         INCREMENTAL DIFF SINCE {base}:\n",
+    );
+    if diff.trim().is_empty() {
+        prompt.push_str("(no committed change since the approved commit; the working tree diff is the change)\n");
+    } else {
+        prompt.push_str(diff);
+        if !diff.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    prompt
+}
+
+/// The commit the worktree's checked-out branch points at, or `None` when git
+/// cannot resolve it. Recorded as the commit a security review approved.
+pub(super) async fn head_commit_of(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = crate::worktree::git(&path, "rev-parse", &["rev-parse", "HEAD"]).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|head| !head.is_empty())
+    })
+    .await
+    .unwrap_or(None)
+}
+
 /// The repository-relative files a worker's working tree changed against its
 /// base, uncommitted changes included.
 ///
@@ -245,6 +385,89 @@ pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Vec<
     .unwrap_or_default()
 }
 
+/// The files a consolidator's own commits changed: the same exclusion of the
+/// worker branches it merged, but yielding the paths those own commits touched
+/// instead of the commits themselves. This is the consolidator's sensitive-path
+/// probe -- the merged worker branches are not its to re-audit.
+pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+    let path = path.to_path_buf();
+    let branch = branch.to_string();
+    let merged = merged.to_vec();
+    tokio::task::spawn_blocking(move || {
+        // Every commit of every merged branch, so `git log ... --not` leaves
+        // exactly the consolidator's own non-merge commits.
+        let mut exclusions: Vec<String> = merged
+            .iter()
+            .filter(|merged| *merged != &branch)
+            .flat_map(|merged| rev_list(&path, merged))
+            .collect();
+        exclusions.sort();
+        exclusions.dedup();
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
+            "--no-merges".to_string(),
+            "--name-only".to_string(),
+            "--format=".to_string(),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                files.sort();
+                files.dedup();
+                files
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The files the commits `base..branch` changed, sorted and deduplicated.
+///
+/// This is the sensitive-path probe for an incremental review: it answers "what
+/// did this run change that nobody has reviewed yet" without ever widening back
+/// to the whole branch diff. A range git cannot resolve yields an empty list,
+/// which the caller treats as "nothing new" rather than "everything".
+pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<String> {
+    let path = path.to_path_buf();
+    let base = base.to_string();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        let range = format!("{base}..{branch}");
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        let Ok(output) =
+            crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Commits on `branch` that none of `merged` contains: a consolidator's own
 /// work -- its interaction fixes and conflict resolutions -- with the worker
 /// branches it integrated, each already reviewed at its own approved commit,
@@ -305,7 +528,7 @@ fn rev_list(path: &Path, r#ref: &str) -> Vec<String> {
 
 /// Commit ids out of a `git rev-list`/`git log --format=%H` body.
 fn commits_in(stdout: Vec<u8>) -> Vec<String> {
-    String::from_utf8_lossy(stdout)
+    String::from_utf8_lossy(&stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -409,18 +632,9 @@ pub struct ReviewPhaseOutcome {
 /// `findings` is what the reviewer reported on its `FINDINGS:` line; an absent
 /// line is `None`, never a silent zero, so a status never presents "not
 /// reported" as a clean audit.
-///
-/// `approved_commit` is the commit the review covered: the branch tip the
-/// approval stands for, recorded so a later revision reviews only what came
-/// after it (see [`SecurityScope::since`]). `None` on an outcome written by an
-/// older build, which is why it deserializes with a default.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecurityReviewOutcome {
     pub findings: Option<usize>,
-    /// Branch commit this review approved. The next revision measures its own
-    /// review scope from this commit instead of from the base commit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved_commit: Option<String>,
 }
 
 /// Which commits one security review has to look at.
@@ -455,14 +669,6 @@ impl SecurityScope {
                 "reviewing {} commits since {base}",
                 commits.len()
             ),
-        }
-    }
-
-    /// Whether this scope reviews nothing at all.
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Self::Full => false,
-            Self::Since { commits, .. } => commits.is_empty(),
         }
     }
 }
@@ -538,9 +744,6 @@ impl WorkerPool {
         };
         let review_prompt = security_prompt.unwrap_or(review_prompt);
 
-        // The commit this review approves, recorded on the registry row so a
-        // later revision starts from it.
-        let approved_commit = head_commit_of(&worktree.path).await;
 
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),
@@ -651,10 +854,8 @@ impl WorkerPool {
                     // The engine still holds the `&mut` borrow of the last
                     // assistant text, so the text is cloned through it.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
-                        findings: parse_findings(&text),
-                        approved_commit: approved_commit.clone(),
-                    });
+                    let security = (mode == ReviewMode::Security)
+                        .then(|| SecurityReviewOutcome { findings: parse_findings(&text) });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: true,
@@ -669,10 +870,8 @@ impl WorkerPool {
                     // inconclusive, but a security review that ran is still
                     // recorded, with no count rather than a reassuring zero.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
-                        findings: parse_findings(&text),
-                        approved_commit: approved_commit.clone(),
-                    });
+                    let security = (mode == ReviewMode::Security)
+                        .then(|| SecurityReviewOutcome { findings: parse_findings(&text) });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: false,
@@ -683,10 +882,8 @@ impl WorkerPool {
         }
 
         // The budget ran out with no completion sentinel.
-        let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
-            findings: parse_findings(&last_assistant_text),
-            approved_commit: approved_commit.clone(),
-        });
+        let security = (mode == ReviewMode::Security)
+            .then(|| SecurityReviewOutcome { findings: parse_findings(&last_assistant_text) });
         Ok(ReviewPhaseOutcome {
             step,
             completed: false,

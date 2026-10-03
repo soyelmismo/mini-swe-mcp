@@ -559,21 +559,68 @@ impl WorkerPool {
         // the adversarial security review, and a sensitive diff with no
         // requested review triggers it on its own. This is the harness's
         // focused adversarial pass for the paths the repository declared.
-        let touched = self::review::touched_files(
-            &worktree.path,
-            &worktree.base_commit,
-            worktree.base_branch.as_deref(),
-        )
-        .await;
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
         patterns.sort();
         patterns.dedup();
+        let requested = review_after.as_deref().map(ReviewMode::parse_model);
+        let security_wanted = matches!(
+            requested,
+            Some((_, ReviewMode::Security))
+        ) || matches!(meta.role, super::registry::WorkerRole::Consolidate);
+        // What this run has to be audited over: everything since the base, or
+        // only what came after the commit an earlier security review approved.
+        // A consolidator's own commits are what its security review covers: the
+        // worker branches it merged were reviewed at their own approved commits.
+        let merged_branches: Vec<String> = match meta.role {
+            super::registry::WorkerRole::Consolidate => {
+                super::load_registry_entry_in(&self.scratch, worker_id)
+                    .map(|entry| entry.integrated.iter().map(|w| format!("worker-{w}")).collect())
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let scope = self::review::security_scope(
+            worktree,
+            meta.role,
+            meta.security_approved_commit.clone(),
+            &merged_branches,
+            security_wanted,
+        )
+        .await;
+        // Nothing changed since the last approval: the audit that already
+        // stands covers this run, so the security review is skipped rather than
+        // repeated. The generic quality review is untouched by this: it is not a
+        // security gate, and a revision asks for it the same way it asked before.
+        let security_skip = scope.skip_log();
+        let touched = match (&scope, meta.role) {
+            (self::review::SecurityScope::Full, _) => {
+                self::review::touched_files(
+                    &worktree.path,
+                    &worktree.base_commit,
+                    worktree.base_branch.as_deref(),
+                )
+                .await
+            }
+            (
+                self::review::SecurityScope::Since { .. },
+                super::registry::WorkerRole::Consolidate,
+            ) => self::review::own_files(&worktree.path, &worktree.branch, &merged_branches).await,
+            (self::review::SecurityScope::Since { base, .. }, _) => {
+                self::review::files_since(&worktree.path, base, &worktree.branch).await
+            }
+        };
         let sensitive: Vec<String> = touched
             .into_iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
             .collect();
-        let requested = review_after.as_deref().map(ReviewMode::parse_model);
+        let requested = match security_skip {
+            // A revision whose security review was skipped must not run the
+            // security review the dispatch asked for: that is the duplicate this
+            // scope exists to avoid.
+            Some(_) => requested.map(|(model, _)| (model, ReviewMode::Quality)),
+            None => requested,
+        };
         let review_plan = match (requested, sensitive.is_empty()) {
             // A requested review on a sensitive diff is upgraded to the
             // adversarial mode; the requested model still runs it.
@@ -592,6 +639,9 @@ impl WorkerPool {
             }
             (None, true) => None,
         };
+        if let Some(reason) = security_skip {
+            info!(worker = %worker_id, "{reason}");
+        }
         if let Some((reviewer_model, mode)) = review_plan {
             let outcome = self
                 .run_review_phase(
@@ -610,6 +660,7 @@ impl WorkerPool {
                         mode,
                         verify: verify.clone(),
                         sensitive,
+                        scope: scope.clone(),
                     },
                 )
                 .await?;
@@ -619,6 +670,11 @@ impl WorkerPool {
             completed |= outcome.completed;
             if let Some(security) = outcome.security {
                 meta.security_review = Some(security);
+                // The commit this review approved rides the registry row, so a
+                // later revision reviews from here instead of re-auditing the
+                // whole diff since the base commit.
+                meta.security_approved_commit =
+                    self::review::head_commit_of(&worktree.path).await;
             }
         }
 

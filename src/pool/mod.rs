@@ -962,6 +962,7 @@ impl WorkerPool {
             report: None,
             verified: None,
             security_review: None,
+            security_approved_commit: None,
             verdicts: None,
         };
 

@@ -184,6 +184,12 @@ pub struct WorkerRegistryEntry {
     /// `#[serde(default)]` keeps a row written before this field readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_review: Option<SecurityReviewOutcome>,
+    /// The commit a security review last approved on this worker, kept when a
+    /// revision restarts it: the next revision reviews only the diff since this
+    /// commit, so an approved change is never audited twice (see
+    /// `SecurityScope`). `None` until a security review approves a commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_approved_commit: Option<String>,
     /// Workers whose branches a consolidator merged into its own branch, in
     /// merge order. Recorded on the consolidator's row because that row is the
     /// only durable record of the round it integrated: when the consolidator
@@ -264,6 +270,7 @@ impl WorkerRegistryEntry {
             approved: None,
             verified: None,
             security_review: None,
+            security_approved_commit: None,
             integrated: Vec::new(),
             absorbed: Vec::new(),
             verdicts: None,
@@ -319,6 +326,9 @@ pub struct WorkerMeta {
     /// The security review the phase loop ran, written with the terminal row
     /// so a view built from the row alone still shows it ran and its count.
     pub security_review: Option<SecurityReviewOutcome>,
+    /// The commit a security review last approved, carried from the previous
+    /// revision's row so this one can scope its review to what came after it.
+    pub security_approved_commit: Option<String>,
     /// A consolidator's per-worker verdicts, set by the phase loop once the
     /// round has finished and written with the terminal row, like the report.
     pub verdicts: Option<WorkerVerdicts>,
@@ -346,6 +356,7 @@ impl WorkerMeta {
             report: None,
             verified: None,
             security_review: None,
+            security_approved_commit: None,
             verdicts: None,
         }
     }
@@ -390,6 +401,7 @@ impl WorkerMeta {
             approved: None,
             verified: self.verified,
             security_review: self.security_review,
+            security_approved_commit: self.security_approved_commit.clone(),
             integrated: Vec::new(),
             absorbed: Vec::new(),
             verdicts: self.verdicts.clone(),
