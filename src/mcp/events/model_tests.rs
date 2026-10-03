@@ -1395,17 +1395,18 @@ fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
     );
 }
 
-/// A replayed stall reports its idle time through the stall rule's own clock,
-/// not through a raw subtraction of `last_step_at`.
+/// A stall queued while a step was idle is not delivered once that step starts
+/// a command.
 ///
-/// A worker queued a stall while it was idle, then started a harness-side wait
+/// A worker queued a stall, then started a harness-side wait
 /// (`CONSOLIDATE_WAIT`, `WAIT_JOB`), which the detector holds in flight as work.
 /// The replay copies the current view over the queued event, so that view
-/// carries the command-in-flight mark -- but the idle time was recomputed from
-/// the raw step time, so the delivered event claimed 1800 s of inactivity for a
-/// step that is provably doing something.
+/// carries the command-in-flight mark -- but the idle time used to be recomputed
+/// from the raw step time, and the delivered event claimed 1800 s of inactivity
+/// for a step that was provably doing something. Such an episode is stale and is
+/// dropped instead.
 #[test]
-fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
+fn a_stall_is_not_delivered_for_a_step_that_started_a_command() {
     let mut router = EventRouter::default();
     let now = crate::pool::unix_timestamp();
     let idle = json!({
@@ -1428,17 +1429,10 @@ fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
             &json!({"worker_ids":[], "group":"g", "initial":false}),
         )
         .unwrap();
-    let stall = reply["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|e| e["event"] == "stalled")
-        .unwrap_or_else(|| panic!("the queued stall is replayed: {reply}"));
     assert_eq!(
-        stall["time_since_last_step"],
-        json!(0),
-        "a command in flight is not idle time: {stall}"
+        reply["events"],
+        json!([]),
+        "a stall for a step that is now running a command must not be delivered: {reply}"
     );
 }
 
