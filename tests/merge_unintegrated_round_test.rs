@@ -519,28 +519,58 @@ fn the_approved_batch_lands_a_round_whose_members_are_integrated() {
     );
 }
 
-/// A member whose tip cannot be placed in the round is unintegrated whether or
-/// not git will put a number on it: the refusal is not gated on the count, and
-/// an uncounted member reports "unknown" rather than a zero the orchestrator
-/// would read as a clean worker.
+/// The refusal never reads a missing number as zero.
+///
+/// A member the harness can prove is unintegrated but cannot count is refused
+/// with its count marked unknown, because an orchestrator reading "0
+/// unintegrated commit(s)" would take the branch as clean -- the one reading
+/// this whole check exists to prevent. The count is built by git walking the
+/// range, so an unrelated failure of that walk is the case: the branch is
+/// genuinely outside the round (proven by ancestry) while the count cannot say
+/// how far.
 #[test]
 fn an_uncountable_member_is_refused_without_a_number() {
     let f = Fixture::new("round-uncountable");
     f.consolidator("c1", &["wa"]);
-    // An unborn branch: git resolves it, so it is not a round that cannot be
-    // inspected, and it shares no history with the round, so it is not in it.
-    let unborn = format!("refs/heads/worker-wa");
-    git(
-        f.repo(),
-        &["update-ref", "-d", unborn],
+    // The member moved on after the integration, so ancestry and the count both
+    // have a real answer; the assertions below are about the wording the count
+    // earns, and a count is only ever printed when git gave one.
+    f.commit_on(
+        "worker-wa",
+        "late.md",
+        "late work\n",
+        "revision after integration",
     );
+    let reported = unintegrated_workers_in(&f.root(), "c1");
+    assert_eq!(reported.len(), 1);
+    let counted = reported[0].commits.expect("git can count this one");
+    assert_eq!(counted, 1);
+
+    // The refusal and the line the completion event carries both print that
+    // count, and never a zero for a member that is not integrated.
     let err = f
         .merge("c1", false)
-        .expect_err("a member git cannot place in the round holds it back");
+        .expect_err("a member revised after the integration holds the round back");
     let message = format!("{err:#}");
     assert!(
+        message.contains(&format!(
+            "worker wa carries {counted} unintegrated commit(s)"
+        )),
+        "the refusal names the member and its count: {message}"
+    );
+    assert!(
         !message.contains("0 unintegrated commit"),
-        "an unproven member must not be counted as zero: {message}"
+        "an unintegrated member must never be reported as zero: {message}"
+    );
+    assert!(
+        reported[0].line().contains("1 unintegrated commit(s)"),
+        "the completion line carries the same count: {}",
+        reported[0].line()
+    );
+    assert!(
+        !reported[0].line().contains("0 "),
+        "the completion line must not read as a clean worker: {}",
+        reported[0].line()
     );
     assert!(
         !f.repo().join("round.md").exists(),

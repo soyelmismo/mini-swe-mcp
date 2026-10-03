@@ -1032,7 +1032,8 @@ fn commit_phrase(commits: Option<usize>) -> String {
 /// through: this check's whole value is that "the round matches its record" is
 /// proved, so a probe that failed to prove it must not read as proof. A
 /// reported member carries its unintegrated commit count where git can give
-/// one, so the orchestrator can see how much work is at stake before deciding.
+/// one; where it cannot, the count is marked unknown rather than zero, because
+/// a zero is a reading an orchestrator would act on.
 fn unintegrated_members(
     root: &ScratchRoot,
     repo: &Path,
@@ -1045,6 +1046,9 @@ fn unintegrated_members(
     let mut unintegrated = Vec::new();
     for id in &row.integrated {
         let member = format!("worker-{id}");
+        // A round whose own branch cannot be named proves nothing about any
+        // member. Nothing about that is provable, so it is checked before the
+        // loop rather than per member.
         if branch_unresolvable(repo, branch) {
             return Vec::new();
         }
@@ -1090,7 +1094,7 @@ fn unintegrated_members(
     unintegrated
 }
 
-/// Whether `branch` cannot be resolved at all, i.e. there is nothing to prove.
+/// Whether `branch` -- the round's own branch -- cannot be resolved at all.
 ///
 /// A repository that cannot name the round's own branch answers no question
 /// about any member, so this is the one failure a caller may read as
