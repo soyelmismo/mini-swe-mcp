@@ -35,13 +35,16 @@
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
 //! here assumes a language or a test runner.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::admission::{AdmissionClass, AdmissionController};
 use super::archive::RetireReason;
-use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
+use super::registry::{
+    RegistryStatus, WorkerRegistryEntry, WorkerRole, load_all_registry_entries_in, load_registry_entry_in,
+};
 use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
 };
@@ -994,6 +997,11 @@ struct Unintegrated {
     /// "none": a member the harness cannot put a number on still holds the
     /// round back.
     commits: Option<usize>,
+    /// Whether the member was left out of the round entirely rather than
+    /// merged and then revised on. The two are different failures for the
+    /// orchestrator: one is a merge to redo, the other is work that was never
+    /// in the round at all.
+    left_out: bool,
 }
 
 /// How many commits a member is holding back, worded for a refusal.
@@ -1044,7 +1052,7 @@ fn unintegrated_members(
         return Vec::new();
     };
     let mut unintegrated = Vec::new();
-    for id in &row.integrated {
+    for id in round_members(root, &row) {
         let member = format!("worker-{id}");
         // A round whose own branch cannot be named proves nothing about any
         // member. Nothing about that is provable, so it is checked before the
@@ -1052,10 +1060,12 @@ fn unintegrated_members(
         if branch_unresolvable(repo, branch) {
             return Vec::new();
         }
+        let left_out = !row.integrated.contains(&id);
         let mut report = |commits: Option<usize>| {
             unintegrated.push(Unintegrated {
                 worker_id: id.clone(),
                 commits,
+                left_out,
             });
         };
         // No branch means nothing left to integrate: the worker was already
@@ -1118,6 +1128,44 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
         return true;
     };
     !out.status.success()
+}
+
+/// Every worker of the round `consolidator` was dispatched for, ready or not.
+///
+/// The `integrated` set alone is not the round: it is only the members the
+/// consolidator chose to merge. A member it reported as "not ready" and left
+/// out is just as absent from its branch as one it merged and then missed, and
+/// merging the round lands master without either one. So the round is
+/// reconstructed from the registry the same way the consolidator saw it -- its
+/// owner's workers in its group, still carrying a branch -- and the recorded
+/// `integrated` ids are unioned in, because a member that has since been
+/// merged may already be retired and no longer listed.
+///
+/// A member the consolidator absorbed is excluded: that is the record of work
+/// it took over and finished itself, so its branch is not expected in the
+/// round. A member with no branch (discarded, pruned, never dispatched) has
+/// nothing left to land and is filtered by the probe in the caller.
+fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
+    let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
+    let (Some(owner), Some(group)) = (row.owner.as_deref(), row.group.as_deref()) else {
+        // Without an owner and a group the round cannot be enumerated; the
+        // recorded integrations are all that is known, and the sweep still
+        // protects every branch it can prove.
+        return members.into_iter().collect();
+    };
+    for entry in load_all_registry_entries_in(root) {
+        if entry.role != WorkerRole::Worker
+            || entry.owner.as_deref() != Some(owner)
+            || entry.group.as_deref() != Some(group)
+        {
+            continue;
+        }
+        if row.absorbed.contains(&entry.id) {
+            continue;
+        }
+        members.insert(entry.id);
+    }
+    members.into_iter().collect()
 }
 
 /// Whether merging `member` into `branch` would change nothing, i.e. whether
