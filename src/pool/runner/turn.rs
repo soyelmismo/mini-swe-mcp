@@ -582,7 +582,7 @@ fn summarized_task(task: &str) -> String {
 /// Turns a worker may self-grant through `REQUEST_TURNS`: half of the budget
 /// its dispatch was given, never past the manifest ceiling. Without the bound
 /// a confused model walks itself from 150 to 500 turns with nobody watching.
-fn extension_budget(dispatch_max_turns: usize) -> usize {
+pub(super) fn extension_budget(dispatch_max_turns: usize) -> usize {
     (dispatch_max_turns / 2).min(MAX_TURNS_LIMIT)
 }
 
@@ -728,6 +728,8 @@ pub(super) struct ProgressSummary {
     pub last_guard_step: Option<usize>,
     /// The step the budget was reached at.
     pub step: usize,
+    /// Step of the last repository sample taken, if any.
+    pub last_sample_step: Option<usize>,
 }
 
 /// Decide whether a worker that just reached its turn budget gets one
@@ -739,7 +741,7 @@ pub(super) struct ProgressSummary {
 /// as today. `budget` is the extension size in turns, and `0` disables the
 /// extension entirely (env `POOL_BUDGET_EXTENSION_PCT=0`). Never grants twice
 /// in one revision (`already_extended`).
-fn grant_extension(
+pub(super) fn grant_extension(
     recent: &ProgressSummary,
     already_extended: bool,
     budget: usize,
@@ -754,7 +756,7 @@ fn grant_extension(
     {
         return None;
     }
-    let diff_changed = recent.unchanged_turns < window;
+    let diff_changed = recent.last_sample_step.is_some() && recent.unchanged_turns < window;
     let gate_recent = recent
         .last_gate_step
         .is_some_and(|s| recent.step.saturating_sub(s) <= window);
@@ -768,7 +770,7 @@ fn grant_extension(
 ///
 /// `+25%` of the budget, capped at `30`, both env-configurable; `0` disables
 /// the extension entirely.
-fn extension_budget(dispatch_max_turns: usize) -> usize {
+pub(super) fn auto_extension_budget(dispatch_max_turns: usize) -> usize {
     let pct = crate::config::env_parse::<usize>("POOL_BUDGET_EXTENSION_PCT").unwrap_or(25);
     if pct == 0 {
         return 0;
@@ -807,6 +809,8 @@ pub(super) struct ProgressWatch {
     /// Step of the last repetition/stagnation/read-only guard fire, for the
     /// budget-extension decision.
     last_guard_step: Option<usize>,
+    /// Step of the last repository sample taken by the stagnation detector.
+    last_sample_step: Option<usize>,
 }
 
 impl ProgressWatch {
@@ -888,11 +892,12 @@ impl ProgressWatch {
     }
 
     /// The recent-history summary the budget-extension decision is pure over.
-    fn progress_summary(&self, step: usize) -> ProgressSummary {
+    pub(super) fn progress_summary(&self, step: usize) -> ProgressSummary {
         ProgressSummary {
             unchanged_turns: self.unchanged_turns,
             last_gate_step: self.last_gate_step,
             last_guard_step: self.last_guard_step,
+            last_sample_step: self.last_sample_step,
             step,
         }
     }
@@ -2014,6 +2019,7 @@ impl<'a> TurnEngine<'a> {
         if *self.step == 0 || !(*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS) {
             return;
         }
+        self.watch.last_sample_step = Some(*self.step);
         if self.watch.record_sample(sample) < STAGNATION_TURNS_LIMIT {
             return;
         }
@@ -2424,13 +2430,13 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressWatch,
-        READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressSummary,
+        ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        append_report_text, edit_plan, edit_plan_text, extension_budget, isolation_block,
-        named_file_defaults, parse_shortstat, parse_threshold, read_only_nudge_text,
-        read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
-        task_names_files,
+        append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
+        isolation_block, named_file_defaults, parse_shortstat, parse_threshold,
+        read_only_nudge_text, read_only_pause_question, read_only_plan_text, read_only_thresholds,
+        summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2443,6 +2449,78 @@ mod tests {
             tool_call_id: None,
             invalid_utf8_lines: 0,
         }
+    }
+
+    /// Progress (a changed diff) with no recent guard fire grants one extension.
+    #[test]
+    fn progress_diff_changed_grants_one_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 0,
+            last_gate_step: None,
+            last_guard_step: None,
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, false, 10), Some(10));
+    }
+
+    /// Progress (a test/gate command in the window) grants one extension.
+    #[test]
+    fn progress_gate_command_grants_one_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 30,
+            last_gate_step: Some(25),
+            last_guard_step: None,
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, false, 10), Some(10));
+    }
+
+    /// No progress (stagnation) stops as today.
+    #[test]
+    fn stagnation_grants_no_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 30,
+            last_gate_step: None,
+            last_guard_step: None,
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, false, 10), None);
+    }
+
+    /// A repetition/stagnation guard fired recently: no extension.
+    #[test]
+    fn recent_guard_fire_grants_no_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 0,
+            last_gate_step: None,
+            last_guard_step: Some(28),
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, false, 10), None);
+    }
+
+    /// Never extend twice in one revision.
+    #[test]
+    fn already_extended_grants_no_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 0,
+            last_gate_step: None,
+            last_guard_step: None,
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, true, 10), None);
+    }
+
+    /// A zero budget disables the extension entirely.
+    #[test]
+    fn zero_budget_disables_the_extension() {
+        let recent = ProgressSummary {
+            unchanged_turns: 0,
+            last_gate_step: None,
+            last_guard_step: None,
+            step: 30,
+        };
+        assert_eq!(grant_extension(&recent, false, 0), None);
     }
 
     /// A guard's in-band refusal is classified by its prefix, with the guard's
