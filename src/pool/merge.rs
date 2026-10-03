@@ -31,6 +31,9 @@
 //!   own branch before the merge, by `merge <consolidator>` and by the
 //!   `--approved` batch alike, and a member that is neither missing nor
 //!   integrated refuses the merge by name and by unintegrated commit count.
+//!   Integration is proved per commit -- the tip is reachable from the round, or
+//!   every commit it adds was taken by content -- so a member whose commits
+//!   merely cancel out cannot pass for an integrated one.
 //!   `merge --force` is the only way past it. A probe that fails to prove
 //!   integration reports the member too: "cannot be proved" is never read as
 //!   "integrated".
@@ -1112,9 +1115,10 @@ fn unintegrated_members(
                 continue;
             }
         }
-        // The content proof. A tree that merges to no change is a round that
-        // already carries this worker, however it got there.
-        if tree_already_in(repo, branch, &member) {
+        // The content proof: a member whose commits are not reachable may still
+        // have been taken by content (squash, cherry-pick). Proved per commit,
+        // not by comparing trees -- see `every_commit_taken_by_content`.
+        if every_commit_taken_by_content(repo, branch, &member) {
             continue;
         }
         report(unintegrated_commit_count(repo, &member, branch));
@@ -1186,54 +1190,63 @@ fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     members.into_iter().collect()
 }
 
-/// Whether merging `member` into `branch` would change nothing, i.e. whether
-/// the round already carries this worker's content.
+/// Whether every commit `branch` does not carry was nonetheless taken onto
+/// `branch` by content -- the squash / cherry-pick case, where the worker's
+/// commits are not ancestors of the round although every line of the work is on
+/// it. Refusing such a round would punish the cleanest integration there is.
 ///
-/// This is the squash/cherry-pick case: the worker's commits are not ancestors
-/// of the consolidator branch, but its *tree* is, because the consolidator took
-/// the change and committed it its own way. Refusing that round would punish the
-/// cleanest integration there is.
+/// The proof is per commit, and it has to be: a *net* comparison cannot answer
+/// it. Asking only whether merging the member into the branch would change
+/// nothing cannot tell a member whose commits cancel out -- one that added a
+/// file, and a second that deleted it -- from an integrated one, and so waves a
+/// genuinely unintegrated branch through: the round lands while commits only
+/// that branch has stay unlanded, which is the failure this check exists to
+/// prevent. A patch-equivalence walk has no such blind spot.
 ///
-/// `git merge-tree --write-tree <branch> <member>` writes the merged tree
-/// without touching a single file or index entry. A clean merge answers with
-/// the tree it computed on stdout and exit code 0; comparing it with the
-/// branch's own tree is what makes "changes nothing" decidable. A conflict
-/// answers exit code 1 (or 128 for an unrelated failure) and is emphatically
-/// *not* integration -- the work is not on the branch, which is exactly what
-/// this check exists to catch.
-fn tree_already_in(repo: &Path, branch: &str, member: &str) -> bool {
-    let merged = git(
+/// `git cherry <branch> <member>` is that walk: it lists each commit of
+/// `member` absent from `branch`, marked `-` when a patch-equivalent commit is
+/// already upstream and `+` when it is not. Only an all-`-` listing proves the
+/// round took the work; a single `+` means the member holds the round back.
+///
+/// A listing git could not produce is not proof: nothing is taken by content
+/// until git says so. An empty listing is not proof either -- a member that
+/// carries commits always has some to list, so emptiness means the walk
+/// answered nothing, which is "unproven" and must refuse like any other
+/// unproven probe.
+fn every_commit_taken_by_content(repo: &Path, branch: &str, member: &str) -> bool {
+    let out = git(
         repo,
-        "merge-tree --write-tree",
-        &["merge-tree", "--write-tree", branch, member],
+        "cherry <branch> <member>",
+        &["cherry", branch, member],
     );
-    let Ok(merged) = merged else {
+    let Ok(out) = out else {
         return false;
     };
-    // Exit 1 is a conflict and anything above it is a git failure; only a
-    // clean merge (0) carries a tree to compare.
-    if !merged.status.success() {
+    if !out.status.success() {
         return false;
     }
-    let merged_tree = String::from_utf8_lossy(&merged.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let Ok(branch_tree) = git(
-        repo,
-        "rev-parse <branch>^{tree}",
-        &["rev-parse", &format!("{branch}^{{tree}}")],
-    ) else {
-        return false;
-    };
-    if !branch_tree.status.success() {
-        return false;
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let mut commits = 0usize;
+    for line in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some(mark) = line.split_whitespace().next() else {
+            return false;
+        };
+        match mark {
+            // `-`: this commit's patch is already upstream on `branch`, which is
+            // what a squash or a cherry-pick of the member's work leaves behind.
+            "-" => commits += 1,
+            // `+`: a patch `branch` does not carry. The member is holding the
+            // round back -- even if another of its commits nets the tree out to
+            // the branch's own, the round does not contain this work.
+            "+" => return false,
+            // Anything else is not a verdict this check knows how to read.
+            _ => return false,
+        }
     }
-    let branch_tree = String::from_utf8_lossy(&branch_tree.stdout);
-    let branch_tree = branch_tree.trim();
-    !merged_tree.is_empty() && merged_tree == branch_tree
+    // Nothing to prove is nothing held back, but only when git actually
+    // answered: an empty listing from a member that *does* carry commits is
+    // exactly the shape a failed walk produces, so it must not read as proof.
+    commits > 0
 }
 
 /// Commits on `branch` that `ancestor` does not contain.
