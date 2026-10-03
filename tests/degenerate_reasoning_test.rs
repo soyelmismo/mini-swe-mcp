@@ -323,9 +323,7 @@ fn messages_of(request: &Value) -> Vec<Value> {
     request["messages"]
         .as_array()
         .expect("messages array")
-        .iter()
-        .cloned()
-        .collect()
+        .to_vec()
 }
 
 /// Every non-empty `reasoning_content` an assistant turn of `request` carries.
