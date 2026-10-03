@@ -172,6 +172,29 @@ pub struct ModelDefinition {
     pub policy: Option<ExecutionPolicy>,
 }
 
+/// One review role declared by `models.yaml`'s optional `review_modes:` map.
+///
+/// A review mode is the user's own auditor: its `checklist` is the focus
+/// instructions appended to the common review frame (inspect the diff, run
+/// the dispatch's verify gate, fix real defects with a regression test, list
+/// unfixed findings in REPORT risks), and the optional `model` names the
+/// default reviewer for that mode. Built-in modes `quality` and `security`
+/// keep their current prompts and can be overridden by declaring the same
+/// name here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewModeDefinition {
+    /// The focus instructions appended to the common review frame.
+    ///
+    /// Non-empty is validated in `validate.rs`; an empty checklist would be an
+    /// auditor with nothing to say.
+    pub checklist: String,
+    /// The default reviewer model for this mode, when one is declared.
+    ///
+    /// `None` falls back to the dispatch's own model for the review phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelManifest {
     #[serde(default)]
@@ -195,6 +218,14 @@ pub struct ModelManifest {
     pub sensitive_paths: Vec<String>,
     #[serde(default)]
     pub models: HashMap<String, ModelDefinition>,
+    /// Optional review roles, keyed by mode name.
+    ///
+    /// Each entry is a [`ReviewModeDefinition`]. Declaring a mode named
+    /// `quality` or `security` overrides the built-in prompt; any other name
+    /// adds a new mode selectable via `--review-after <model>:<mode>`. Absent
+    /// means only the built-in `quality` and `security` modes exist.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub review_modes: HashMap<String, ReviewModeDefinition>,
 }
 
 impl Default for ModelManifest {
@@ -236,6 +267,7 @@ impl Default for ModelManifest {
             strongest: None,
             sensitive_paths: Vec::new(),
             models,
+            review_modes: HashMap::new(),
         }
     }
 }
