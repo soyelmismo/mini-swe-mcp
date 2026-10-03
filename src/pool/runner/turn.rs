@@ -1225,11 +1225,15 @@ impl<'a> TurnEngine<'a> {
         if config.apply_sentinels {
             if let Some(job) = parse_kill_job(&cmd_str) {
                 let (output, code) = self.stop_job(job);
-                return self.record_harness_result(&llm_resp, &label, output, code).await;
+                return self
+                    .record_harness_result(&llm_resp, &label, output, code)
+                    .await;
             }
             if let Some(job) = parse_wait_job(&cmd_str) {
                 let (output, code) = self.wait_on_job(job).await;
-                return self.record_harness_result(&llm_resp, &label, output, code).await;
+                return self
+                    .record_harness_result(&llm_resp, &label, output, code)
+                    .await;
             }
         }
 

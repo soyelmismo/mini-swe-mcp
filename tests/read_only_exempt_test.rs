@@ -68,7 +68,10 @@ async fn wait_for_paused(pool: &WorkerPool, id: &str) -> Option<String> {
 }
 
 /// The metrics of a finished worker, whatever terminal state it reached.
-async fn wait_for_terminal_metrics(pool: &WorkerPool, id: &str) -> mini_swe_mcp::pool::WorkerMetrics {
+async fn wait_for_terminal_metrics(
+    pool: &WorkerPool,
+    id: &str,
+) -> mini_swe_mcp::pool::WorkerMetrics {
     let state = tokio::time::timeout(Duration::from_secs(90), async {
         let mut changes = pool.subscribe_changes();
         loop {
@@ -146,9 +149,7 @@ async fn pool_for(tag: &str, base_url: &str) -> (WorkerPool, common::TempDir) {
 #[tokio::test]
 async fn a_consolidator_that_only_reviews_and_waits_is_never_paused() {
     let repo = repo("read-only-exempt-consolidator");
-    let mut commands: Vec<&str> = (0..PAUSE_TURN + 10)
-        .map(|n| review_turn(n))
-        .collect();
+    let mut commands: Vec<&str> = (0..PAUSE_TURN + 10).map(review_turn).collect();
     // The closing wait: a `CONSOLIDATE_WAIT` names workers that never existed
     // in this test, so it is refused immediately and answers the turn without
     // blocking on anything. The budget ends on that same turn, so the run
@@ -159,7 +160,6 @@ async fn a_consolidator_that_only_reviews_and_waits_is_never_paused() {
     let worker_id = dispatch(&pool, repo.path(), WorkerRole::Consolidate, commands.len()).await;
 
     let metrics = wait_for_terminal_metrics(&pool, &worker_id).await;
-    eprintln!("DEBUG consolidator metrics: {metrics:?}");
     assert_eq!(
         metrics.loop_pauses, 0,
         "a consolidator must never be parked for reviewing or waiting, got {metrics:?}"
