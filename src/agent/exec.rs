@@ -1259,6 +1259,49 @@ fn job_label(command: &str) -> String {
     label
 }
 
+/// Drop an incomplete trailing code point from `bytes`.
+///
+/// Every cut the buffer makes -- the head budget, the tail window, the seam
+/// where the two halves join -- can fall inside a multi-byte character. The
+/// orphaned bytes have no complete sequence to decode to, so `combine_streams`
+/// would turn each of them into U+FFFD: the mangled text the model and the
+/// watch renderer would show. Snapping here is what keeps `captured()` decodable
+/// whatever the cut did.
+fn trim_partial_tail(bytes: &mut Vec<u8>) {
+    // `from_utf8` reports the first invalid byte; a valid prefix ends just
+    // before it, which is exactly the longest whole-code-point prefix.
+    match std::str::from_utf8(bytes) {
+        Ok(_) => {}
+        Err(err) => bytes.truncate(err.valid_up_to()),
+    }
+}
+
+/// Whether `byte` is a UTF-8 continuation byte (`0b10xxxxxx`).
+fn is_continuation(byte: u8) -> bool {
+    (byte & 0xC0) == 0x80
+}
+
+/// Drop an incomplete leading code point from `tail`.
+///
+/// The rolling window is filled from the front and drained from the front, so
+/// either can start part-way through a multi-byte character. Those leading
+/// continuation bytes have no start byte to attach to, and decoding the buffer
+/// would replace each with U+FFFD.
+fn trim_partial_lead(tail: &mut Vec<u8>) {
+    // Drop the whole incomplete leading sequence, lead byte included: those
+    // bytes have no start byte ahead of them, so decoding the buffer would
+    // replace each with U+FFFD. At most 4 bytes can belong to one code point.
+    let mut lead = 0usize;
+    while lead < tail.len() && lead < 4 && is_continuation(tail[lead]) {
+        lead += 1;
+    }
+    if lead == 0 {
+        return;
+    }
+    // The byte after the run is the start of the next code point, so it stays.
+    tail.drain(..lead);
+}
+
 /// Head and tail of a command's output stream, bounded to exactly the bytes
 /// [`truncate_output`] would have kept.
 pub(super) struct Captured {
@@ -1295,19 +1338,31 @@ impl Captured {
         // Fill the head first; only what spills past it is eligible for the
         // rolling tail.
         if self.head.len() < TRUNCATE_HEAD {
-            let take = (TRUNCATE_HEAD - self.head.len()).min(rest.len());
+            let room = TRUNCATE_HEAD - self.head.len();
+            let take = room.min(rest.len());
             self.head.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
+            // Snap the head's tail down to a code point boundary. The cut lands
+            // mid-character whenever the budget is not a multiple of the stream
+            //'s code point width, and those trailing bytes have no complete
+            // sequence to decode to: `combine_streams` would turn each of them
+            // into U+FFFD, which is the mangled text the model and the watch
+            // renderer would show. Dropping them keeps `head` decodable and
+            // costs at most 3 bytes of the budget. Re-run on every later chunk
+            // too, because the next append would otherwise re-split a character.
+            trim_partial_tail(&mut self.head);
         }
         if rest.is_empty() {
             return;
         }
 
         if rest.len() >= TRUNCATE_TAIL {
-            // The chunk alone fills the window: keep only its last bytes.
+            // The chunk alone fills the window: keep only its last bytes, then
+            // drop any code point the front cut split.
             self.tail.clear();
             self.tail
                 .extend_from_slice(&rest[rest.len() - TRUNCATE_TAIL..]);
+            trim_partial_lead(&mut self.tail);
             return;
         }
         // Append, then drop the oldest bytes that fell off the front. The
@@ -1315,8 +1370,12 @@ impl Captured {
         // and O(1) amortised per byte.
         self.tail.extend_from_slice(rest);
         if self.tail.len() > TRUNCATE_TAIL {
-            self.tail.drain(..self.tail.len() - TRUNCATE_TAIL);
+            let drop = self.tail.len() - TRUNCATE_TAIL;
+            self.tail.drain(..drop);
         }
+        // The drain above can leave the window starting inside a multi-byte code
+        // point whose start byte was just discarded.
+        trim_partial_lead(&mut self.tail);
     }
 
     /// The retained bytes -- head then tail -- with no marker of its own.
@@ -1330,6 +1389,12 @@ impl Captured {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.tail);
+        // Snap the seam: head and tail are bounded independently, so a code
+        // point can straddle the join and leave `out` undecodable. Trimming here
+        // keeps the contract -- valid UTF-8 out of `captured()` -- in one place
+        // instead of trusting every cut path to have got it right, and costs at
+        // most 3 bytes of the 16 KiB budget.
+        trim_partial_tail(&mut out);
         out
     }
 
@@ -2102,6 +2167,45 @@ mod tests {
             "the overlay must reach the child: {out:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The retained head/tail must be valid UTF-8: `Captured::push` cuts on the
+    /// raw byte budget, so a stream whose boundary falls inside a multi-byte
+    /// code point hands `combine_streams` bytes that decode to U+FFFD -- the
+    /// mangled text the model and every downstream renderer see.
+    ///
+    /// The leading `x` shifts the 3-byte `\u{65e5}` run off the budget's
+    /// alignment, which is what puts the cut inside a code point.
+    #[test]
+    fn captured_keeps_head_and_tail_on_char_boundaries() {
+        let mut captured = Captured::new();
+        let mut stream = String::from("x");
+        stream.push_str(&"\u{65e5}".repeat(20_000));
+        for chunk in stream.as_bytes().chunks(4_096) {
+            captured.push(chunk);
+        }
+
+        let retained = captured.captured();
+        std::str::from_utf8(&retained)
+            .unwrap_or_else(|err| panic!("retained bytes are not valid UTF-8: {err}"));
+    }
+
+    /// What the model actually reads: no replacement character standing in for
+    /// a code point the buffer cut in half.
+    #[test]
+    fn truncated_output_never_invents_a_replacement_character() {
+        let mut captured = Captured::new();
+        let mut stream = String::from("x");
+        stream.push_str(&"\u{65e5}".repeat(20_000));
+        for chunk in stream.as_bytes().chunks(4_096) {
+            captured.push(chunk);
+        }
+        let out = combine_streams(&captured.captured(), b"", captured.dropped());
+        assert!(
+            !out.contains('\u{fffd}'),
+            "a split code point must not become U+FFFD, got {:?}",
+            &out[..out.floor_char_boundary(60)]
+        );
     }
 
     #[test]
