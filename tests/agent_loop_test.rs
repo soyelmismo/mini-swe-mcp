@@ -854,8 +854,9 @@ async fn verify_gate_exhausts_after_three_failures() {
 /// The command a looping worker used to re-issue dozens of times.
 const REPEATED_COMMAND: &str = "sed -n '1,5p' README.md";
 
-/// The exact answer a blocked repetition gets instead of a second run.
-const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
+/// A stable key token of the answer a blocked repetition gets instead of a
+/// second run (the full wording is not a contract, only the refusal is).
+const REPEAT_REFUSAL_TOKEN: &str = "You already ran this exact command";
 
 /// A command byte-identical to the one before it is answered, not run: its
 /// output is already in the history, so running it again only burns a turn.
@@ -903,8 +904,8 @@ async fn a_repeated_command_is_answered_without_being_executed() {
     // is not a command output, which is what "was not executed" looks like.
     let second = tool_results(&requests[2]);
     let refusal = second.get("call_2").expect("a tool result for call_2");
-    assert_eq!(
-        refusal, REPEAT_REFUSAL,
+    assert!(
+        refusal.contains(REPEAT_REFUSAL_TOKEN),
         "a repeated command must be refused with the loop answer, got {refusal:?}"
     );
 
