@@ -1,12 +1,6 @@
 use super::*;
 
 impl McpServer {
-    /// Per-agent worker cap, `MAX_WORKERS_PER_AGENT`; `0` (the default) is
-    /// unlimited.
-    pub(in crate::mcp) fn max_workers_per_agent() -> usize {
-        crate::config::env_parse("MAX_WORKERS_PER_AGENT").unwrap_or(0)
-    }
-
     /// Refuse a dispatch that would push `agent` past its cap, naming the
     /// workers already running so the caller can pick one to collect.
     pub(super) async fn check_agent_cap(&self, agent: &str, cap: usize) -> Result<()> {
@@ -168,7 +162,7 @@ impl McpServer {
         let agent = ctx.agent();
         // Fairness gate: one agent may not fill the pool, so its dispatches
         // stop at `MAX_WORKERS_PER_AGENT` running workers (0 = unlimited).
-        self.check_agent_cap(&agent, Self::max_workers_per_agent())
+        self.check_agent_cap(&agent, self.max_workers_per_agent)
             .await?;
         let repo_path = Self::get_repo_path(args, ctx);
         let requested_model = args

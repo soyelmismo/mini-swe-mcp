@@ -34,6 +34,10 @@ pub struct McpServer {
         Arc<std::sync::Mutex<Option<Arc<crate::hub::auto_consolidate::AutoConsolidate>>>>,
     pub(super) default_model: String,
     pub(super) manifest: Arc<ModelManifest>,
+    /// Per-agent worker cap, `MAX_WORKERS_PER_AGENT`; `0` (the default) is
+    /// unlimited. Resolved once, at construction, like every other
+    /// environment-derived setting.
+    pub(super) max_workers_per_agent: usize,
     /// Precomputed, immutable `tools/list` result. The manifest is never
     /// mutated after construction, so the payload is byte-identical for the
     /// process lifetime and is cloned (an `Arc` memcpy) instead of rebuilt.
@@ -278,6 +282,7 @@ impl McpServer {
             pool: Arc::new(pool),
             auto_consolidate: Arc::new(std::sync::Mutex::new(None)),
             default_model,
+            max_workers_per_agent: Self::max_workers_per_agent_from_env(),
             manifest,
             tools_list,
             hub_events: Arc::new(Mutex::new(super::events::EventRouter::default())),
@@ -289,6 +294,27 @@ impl McpServer {
             recovery: Arc::new(RecoveryGate::open()),
             handover: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The per-agent worker cap this process resolves at construction.
+    ///
+    /// Read once, from the environment, the way the binary sets it up; a
+    /// caller that needs a different cap names it with
+    /// [`McpServer::with_max_workers_per_agent`] instead of setting the
+    /// variable for the whole process.
+    pub(in crate::mcp) fn max_workers_per_agent_from_env() -> usize {
+        crate::config::env_parse("MAX_WORKERS_PER_AGENT").unwrap_or(0)
+    }
+
+    /// Name the per-agent worker cap this server enforces.
+    ///
+    /// `0` (the default) is unlimited. The binary keeps
+    /// `MAX_WORKERS_PER_AGENT`; this setter is the seam an in-process caller
+    /// uses to exercise the cap without mutating the environment every other
+    /// test in the same process would inherit.
+    pub fn with_max_workers_per_agent(mut self, cap: usize) -> Self {
+        self.max_workers_per_agent = cap;
+        self
     }
 
     /// Serve MCP over stdin/stdout until the client closes the input.
