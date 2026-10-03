@@ -31,6 +31,7 @@ use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
 use self::review::ReviewPhase;
+pub use self::context_pack::{context_pack, extract_identifiers, extract_paths, outline_file};
 pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
@@ -42,6 +43,7 @@ use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
 
+pub(crate) mod context_pack;
 pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
@@ -153,18 +155,27 @@ impl Drop for JobGuard<'_> {
 }
 
 /// The worker's opening user message: the task, then -- when a completion
-/// verify is configured -- the exact command the gate will run.
+/// verify is configured -- the exact command the gate will run, then the
+/// bounded context pack ([`context_pack`]) built from the task text against
+/// `root` (the worker's checkout).
 ///
 /// The gate reuses an identical passing run on an unchanged tree (see
 /// `TurnEngine::reusable_verify_step`), but only when the worker ran exactly
 /// the verify string. Naming it here is what lets the worker's own last check
 /// be the run the gate reuses instead of paying for a second full run.
-pub fn opening_task_message(task: &str, verify: Option<&str>) -> String {
+pub fn opening_task_message(task: &str, verify: Option<&str>, root: &std::path::Path) -> String {
     let mut message = format!("TASK:\n{task}\n\nBegin by exploring the repository.");
     if let Some(verify) = verify.filter(|v| !v.is_empty()) {
         message.push_str(&format!(
             "\n\nCompletion gate: `{verify}`. Run exactly this command as your last check; an identical passing run on the same tree is reused."
         ));
+    }
+    // The bounded context pack: the paths the task names and the symbols it
+    // quotes, so the worker starts editing instead of re-discovering them
+    // over its first dozen read-only turns. Empty when the task names
+    // nothing, so the message is unchanged for free-form tasks.
+    if let Some(pack) = context_pack(task, root) {
+        message.push_str(&format!("\n\n{pack}"));
     }
     message
 }
@@ -296,7 +307,10 @@ impl WorkerPool {
             Some(replayed) => replayed,
             None => vec![
                 ChatMessage::text(Role::System, system_prompt),
-                ChatMessage::text(Role::User, opening_task_message(&task, verify.as_deref())),
+                ChatMessage::text(
+                    Role::User,
+                    opening_task_message(&task, verify.as_deref(), &worktree.path),
+                ),
             ],
         };
 
