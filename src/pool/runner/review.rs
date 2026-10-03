@@ -639,7 +639,7 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
     let merged = merged.to_vec();
     tokio::task::spawn_blocking(move || {
         // Every commit of every merged branch, so `git log ... --not` leaves
-        // exactly the consolidator's own non-merge commits.
+        // exactly the consolidator's own commits.
         let mut exclusions: Vec<String> = merged
             .iter()
             .filter(|merged| *merged != &branch)
@@ -647,9 +647,41 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
             .collect();
         exclusions.sort();
         exclusions.dedup();
+        // `--remerge-diff` reports a merge commit's *resolution* -- what the
+        // consolidator decided on top of the automatic merge -- so a resolved
+        // sensitive file is named while a clean merge contributes none of the
+        // merged worker's files. It needs git 2.36; the fallback below keeps
+        // the resolutions in scope on an older git.
         let mut args: Vec<String> = vec![
             "log".to_string(),
-            "--no-merges".to_string(),
+            "--remerge-diff".to_string(),
+            "--name-only".to_string(),
+            "--format=".to_string(),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions.clone());
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let names = |out: Vec<u8>| -> Vec<String> {
+            let mut files: Vec<String> = String::from_utf8_lossy(&out)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            files.sort();
+            files.dedup();
+            files
+        };
+        if let Some(files) = crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| names(out.stdout))
+        {
+            return files;
+        }
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
             "--name-only".to_string(),
             "--format=".to_string(),
             branch.clone(),
@@ -660,17 +692,7 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
         crate::worktree::git(&path, "log", &borrowed)
             .ok()
             .filter(|out| out.status.success())
-            .map(|out| {
-                let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                files.sort();
-                files.dedup();
-                files
-            })
+            .map(|out| names(out.stdout))
             .unwrap_or_default()
     })
     .await
@@ -727,41 +749,122 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
 /// commit parents, so a worker branch that is itself an ancestor of another
 /// merged one cannot smuggle that ancestor's commits back into the review.
 pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+    own_history(path, branch, merged).await.0
+}
+
+/// A consolidator's own commits and the files they touched, one query.
+///
+/// The consolidator's work is its own commits *and* the conflict resolutions it
+/// recorded inside its merges. A merge commit is therefore in scope when it
+/// carries a resolution -- the part of it nobody else wrote -- and out of scope
+/// when it is a clean carrier of an already-reviewed worker branch. That is
+/// exactly what `--remerge-diff` reports: the difference between the merge
+/// result and the merge git would have made on its own, and nothing at all for
+/// a clean merge.
+async fn own_history(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+) -> (Vec<String>, Vec<String>) {
     let path = path.to_path_buf();
     let branch = branch.to_string();
     let merged = merged.to_vec();
     tokio::task::spawn_blocking(move || {
-        let all = rev_list(&path, &branch);
-        if all.is_empty() {
-            return Vec::new();
-        }
         let exclusions: Vec<String> = merged
             .iter()
             .filter(|merged_branch| *merged_branch != &branch)
             .flat_map(|merged_branch| rev_list(&path, merged_branch))
             .collect();
-        if exclusions.is_empty() {
-            return all;
-        }
-        // `--not` flips every revision after it, so the merged branches' own
-        // commits are listed as `^sha` and subtracted from the branch.
+        // The history query: one marker line per commit the consolidator wrote
+        // or resolved, followed by the files of that commit's own change.
         let mut args: Vec<String> = vec![
-            "rev-list".to_string(),
+            "log".to_string(),
             "--reverse".to_string(),
-            "--no-merges".to_string(),
+            "--remerge-diff".to_string(),
+            "--name-only".to_string(),
+            format!("--format={OWN_COMMIT_MARKER}%H"),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions.clone());
+        let parsed = run_own_history(&path, &args);
+        if let Some(parsed) = parsed {
+            return parsed;
+        }
+        // `--remerge-diff` needs git 2.36. On an older git the same query
+        // without it is a superset -- every merge comes back, resolutions
+        // included -- so the audit is wider, never narrower. Returning `None`
+        // rather than an empty scope is the point: an empty scope would skip
+        // the review of a resolution nobody else wrote.
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
+            "--reverse".to_string(),
+            "--name-only".to_string(),
+            format!("--format={OWN_COMMIT_MARKER}%H"),
             branch.clone(),
             "--not".to_string(),
         ];
         args.extend(exclusions);
-        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::worktree::git(&path, "rev-list", &borrowed)
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| commits_in(out.stdout))
-            .unwrap_or(all)
+        run_own_history(&path, &args).unwrap_or_else(|| (rev_list(&path, &branch), Vec::new()))
     })
     .await
     .unwrap_or_default()
+}
+
+/// The commit-list prefix every line of the own-history query starts with, so
+/// the parser can tell a commit id from a file name without guessing.
+const OWN_COMMIT_MARKER: &str = "\u{1}own-commit\u{1}";
+
+/// Run the own-history query and split its output into commits and files.
+///
+/// A commit is the consolidator's own only when it carries a change of its own,
+/// which `--remerge-diff` reports as at least one file line under the commit's
+/// marker. A clean merge is listed with no file under it: it contributed nothing
+/// but the merged worker branch, which was reviewed at its own approved commit.
+fn run_own_history(path: &Path, args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = crate::worktree::git(path, "log", &borrowed)
+        .ok()
+        .filter(|out| out.status.success())?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut commits: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut listed: Option<String> = None;
+    let mut changed = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(commit) = line.strip_prefix(OWN_COMMIT_MARKER) {
+            // The previous commit ends here: keep it only if it changed
+            // something of its own.
+            if let Some(commit) = listed.take() {
+                if changed {
+                    commits.push(commit);
+                }
+            }
+            let commit = commit.trim().to_string();
+            if commit.is_empty() {
+                continue;
+            }
+            listed = Some(commit);
+            changed = false;
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if listed.is_some() {
+            changed = true;
+            files.push(line.to_string());
+        }
+    }
+    if let Some(commit) = listed {
+        if changed {
+            commits.push(commit);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Some((commits, files))
 }
 
 /// Commits reachable from `r#ref`, or empty when git cannot resolve it.

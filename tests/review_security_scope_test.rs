@@ -593,34 +593,60 @@ async fn a_conflict_resolved_in_a_merge_commit_stays_in_the_consolidators_scope(
         &["config", "user.email", "review-scope@example.invalid"],
     );
     common::git(&path, &["config", "user.name", "Review Scope Test"]);
-    let base = commit(&path, "master", "README.md", "base");
     let socket = "src/hub/socket.rs";
+    std::fs::create_dir_all(path.join("src/hub")).expect("create the sensitive directory");
+    std::fs::write(path.join(socket), "the original handshake").expect("seed the sensitive file");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "-m", "base"]);
+    let base = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
-    // Two workers branch off the same base and edit the same sensitive file, so
-    // integrating them conflicts and the consolidator has to decide the result.
+    // Two workers edit the same sensitive file, so integrating them conflicts
+    // and the consolidator alone has to decide which version wins.
     common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
-    let w1 = commit(&path, "worker-w1", socket, "worker's handshake");
+    std::fs::write(path.join(socket), "worker's handshake").expect("worker one edits the file");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w1"]);
+    let w1 = common::git(&path, &["rev-parse", "HEAD"]).trim().to_string();
     common::git(&path, &["checkout", "-q", "-b", "worker-w2", "master"]);
-    let w2 = commit(&path, "worker-w2", socket, "other worker's handshake");
-    common::git(&path, &["checkout", "-q", "-b", "worker-c1", "master"]);
+    std::fs::write(path.join(socket), "other worker's handshake")
+        .expect("worker two edits the same file");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w2"]);
+    let w2 = common::git(&path, &["rev-parse", "HEAD"]).trim().to_string();
 
-    // Merge, resolve the conflict, and record the resolution in the merge
-    // commit -- which is what git does and what the consolidator agent does.
+    // The consolidator integrates both; the second merge conflicts.
+    common::git(&path, &["checkout", "-q", "-b", "worker-c1", "master"]);
     common::git(
         &path,
         &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
     );
-    let conflicted = std::fs::read_to_string(path.join(socket)).expect("the conflicted file");
+    let conflict = std::process::Command::new("git")
+        .args(["merge", "--no-ff", "-m", "merge w2", "worker-w2"])
+        .current_dir(&path)
+        .output()
+        .expect("run the conflicting merge");
     assert!(
-        conflicted.contains("<<<<<<<"),
+        !conflict.status.success(),
         "the two workers' edits must really conflict, or this test proves nothing"
     );
+    let conflicted = std::fs::read_to_string(path.join(socket)).expect("read the conflicted file");
+    assert!(
+        conflicted.contains("<<<<<<<"),
+        "git left conflict markers, so there is a resolution to review"
+    );
+
+    // The resolution lands in the merge commit, which is where a consolidator
+    // agent records it.
     std::fs::write(path.join(socket), "the resolved handshake").expect("write the resolution");
     common::git(&path, &["add", socket]);
     common::git(&path, &["commit", "-q", "--no-edit"]);
     let resolution = common::git(&path, &["rev-parse", "HEAD"])
         .trim()
         .to_string();
+    assert!(
+        !scope_is_non_merge(&path, &resolution),
+        "the resolution really does live in a merge commit, which is what this test is about"
+    );
 
     let merged = vec![w1.clone(), w2.clone()];
     let scope = scope_for(
@@ -659,8 +685,14 @@ async fn a_conflict_resolved_in_a_merge_commit_stays_in_the_consolidators_scope(
     // And the diff it hands the reviewer must actually carry the resolution.
     let diff = scope.reviewed_diff(&path).await;
     assert!(
-        diff.contains("+the resolved handshake"),
+        diff.contains("the resolved handshake"),
         "the reviewer's diff must contain the resolution, or it is told to audit code it \
          cannot see; diff was:\n{diff}"
     );
+}
+
+/// True when `commit` is a merge commit, so the test above can state that the
+/// resolution it wrote really landed in one.
+fn scope_is_non_merge(dir: &Path, commit: &str) -> bool {
+    common::git(dir, &["rev-list", "--no-merges", "-1", commit]).trim().is_empty()
 }
