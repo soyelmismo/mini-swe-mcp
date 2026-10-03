@@ -1423,7 +1423,10 @@ fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
     let reply = router
-        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false}),
+        )
         .unwrap();
     let stall = reply["events"]
         .as_array()
@@ -1703,7 +1706,10 @@ fn a_queued_stall_does_not_report_a_worker_with_a_command_in_flight() {
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
     let round = router
-        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}))
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}),
+        )
         .unwrap();
     assert_eq!(
         round["events"],

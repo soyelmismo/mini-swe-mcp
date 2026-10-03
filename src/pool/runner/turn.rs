@@ -955,6 +955,18 @@ fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) -> Option<Wor
     parsed
 }
 
+/// Whether `last_command` is a harness-side wait that names itself as the
+/// command in flight.
+///
+/// A wait (`CONSOLIDATE_WAIT`, `WAIT_JOB`) holds the pool's command-in-flight
+/// mark for its whole duration, so a step that starts while one is in flight
+/// must not overwrite the label with its own command: the wait is what `status`
+/// shows and what the stall detector reads as work, and replacing it made a wait
+/// report `running for 0s` and then stall as a step that had gone idle.
+fn wait_label_in_flight(last_command: &str) -> bool {
+    last_command.starts_with(HARNESS_WAIT_PREFIX)
+}
+
 impl<'a> TurnEngine<'a> {
     /// Run one turn of the agent loop.
     pub(super) async fn run_turn(&mut self, config: &TurnConfig<'_>) -> Result<TurnOutcome> {
@@ -1194,13 +1206,7 @@ impl<'a> TurnEngine<'a> {
                 } = w.state
                 {
                     *s = *self.step;
-                    // A harness-side wait (CONSOLIDATE_WAIT, WAIT_JOB) names
-                    // itself as the command in flight for the whole wait, so
-                    // `status` shows what the worker is doing and the stall
-                    // detector reads the wait as work. This step's own label
-                    // must not overwrite it: the wait is still the command in
-                    // flight until it returns.
-                    if !last_command.starts_with(HARNESS_WAIT_PREFIX) {
+                    if !wait_label_in_flight(last_command) {
                         *last_command = label.clone();
                     }
                 }
@@ -2391,8 +2397,23 @@ mod tests {
         append_report_text, edit_plan, edit_plan_text, extension_budget, isolation_block,
         named_file_defaults, parse_shortstat, parse_threshold, read_only_nudge_text,
         read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
-        task_names_files,
+        task_names_files, wait_label_in_flight,
     };
+
+    /// A harness-side wait names itself as the command in flight and keeps the
+    /// label for its whole duration; an ordinary step's own command is not one
+    /// and always takes the label.
+    #[test]
+    fn a_wait_label_outranks_a_step_that_starts_during_the_wait() {
+        assert!(
+            wait_label_in_flight("CONSOLIDATE_WAIT w-abc w-def"),
+            "the wait names itself as the command in flight"
+        );
+        assert!(
+            !wait_label_in_flight("cargo test --all-targets"),
+            "an ordinary step is not a wait"
+        );
+    }
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
     fn scanned(content: &str, command: Option<&str>) -> LlmResponse {

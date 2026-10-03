@@ -2164,10 +2164,8 @@ impl EventRouter {
                     // or a live background job) is doing work, so replaying its
                     // queued stall must not claim seconds of inactivity the
                     // detector itself would never count.
-                    event["time_since_last_step"] = json!(crate::cli::watch::round_idle_secs(
-                        current,
-                        now
-                    ));
+                    event["time_since_last_step"] =
+                        json!(crate::cli::watch::round_idle_secs(current, now));
                     event["commands"] = json!(crate::cli::watch::commands(&event));
                 }
                 event["missed"] = json!(initial);
