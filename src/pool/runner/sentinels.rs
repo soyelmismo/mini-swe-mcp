@@ -113,19 +113,126 @@ pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
         && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")
     {
         let rest = &trimmed[pos + "ASK_ORCHESTRATOR:".len()..];
-        let line = rest
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim();
-        if !line.is_empty() && line != "<your specific question>" && line != "<question>" {
-            return Some(line.to_string());
+        let question = ask_question_argument(rest);
+        if !question.is_empty() && !is_question_placeholder(question) {
+            return Some(bound_question(question));
         }
     }
     None
+}
+
+/// The question of an `ASK_ORCHESTRATOR` request: everything the quoted
+/// argument carries, or — when nothing is quoted — the rest of the command up
+/// to the first shell separator.
+///
+/// A question is a decision request, and a decision request is often more than
+/// one line: the worker describes the two options it is stuck between, what each
+/// costs, and what it would do. Read as one line, the first half of that
+/// reached the orchestrator and the rest was lost, so the reply answered a
+/// question the worker never asked. The quote is the authority on where the
+/// argument ends, so it is taken whole — across line breaks — up to the quote
+/// that closes it, backslash escapes included so `"` does not end a
+/// double-quoted string. Unquoted, the shell is the authority: the first `;`,
+/// `&&`, `||`, `|` or line break ends the question, exactly as it ends the
+/// command.
+fn ask_question_argument(rest: &str) -> &str {
+    let text = rest.trim_start();
+    let opener = text.chars().next().filter(|c| *c == '"' || *c == '\'');
+    let Some(opener) = opener else {
+        return unquoted_question(text);
+    };
+    match closing_quote(&text[opener.len_utf8()..], opener) {
+        // The opening quote ended on its own line, so the rest of the line
+        // after the keyword is the whole question; the unquoted rule then
+        // applies unchanged.
+        Some(0) => unquoted_question(&text[opener.len_utf8()..]),
+        Some(end) => &text[opener.len_utf8()..opener.len_utf8() + end],
+        None => text,
+    }
+}
+
+/// The text an unquoted `ASK_ORCHESTRATOR:` argument carries: the rest of the
+/// command up to the first separator, with its own quotes peeled because
+/// `echo ASK_ORCHESTRATOR: "Proceed?"` is still a question.
+fn unquoted_question(text: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' | '\'' => quoted = !quoted,
+            _ if !quoted && c.is_shell_separator() => return &text[..i],
+            _ => {}
+        }
+    }
+    text
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+}
+
+/// Whether `c` ends an unquoted shell command: a separator, a line break, or
+/// the ampersand of a `&&` pair.
+fn is_shell_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '|' | '&')
+}
+
+/// The byte offset of the quote that closes the one already opened, or `None`
+/// when it is never closed.
+///
+/// Counts the first `quote` that is not escaped, so an escaped double quote
+/// inside a double-quoted argument is content rather than the end of the
+/// string. An unterminated string takes everything that is left of the command:
+/// the worker wrote one long question, and cutting it at a quote that may not
+/// exist would drop the answer the question is waiting for.
+fn closing_quote(text: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The angle-bracket templates of the system prompt, echoed back verbatim.
+fn is_question_placeholder(question: &str) -> bool {
+    matches!(question, "<your specific question>" | "<question>")
+}
+
+/// Byte budget of one orchestrator question, the trailing [`QUESTION_TRUNCATED`]
+/// marker included.
+///
+/// The question is carried by the pause, the event and the registry row until
+/// someone answers it, so a worker that pastes a whole file into its question
+/// must not be able to flood those. 4 KiB is far longer than a decision request
+/// needs, and the cut is on a char boundary so multi-byte text is never sliced
+/// mid-code-point.
+const QUESTION_BYTES: usize = 4000;
+
+/// Marker appended to a question cut to [`QUESTION_BYTES`], so a short
+/// question reaches the orchestrator as asked and a long one is visibly short.
+const QUESTION_TRUNCATED: &str = " [truncated]";
+
+/// `question` bounded to [`QUESTION_BYTES`].
+fn bound_question(question: &str) -> String {
+    if question.len() <= QUESTION_BYTES {
+        return question.to_string();
+    }
+    if QUESTION_BYTES <= QUESTION_TRUNCATED.len() {
+        return QUESTION_TRUNCATED.to_string();
+    }
+    let cut = question.floor_char_boundary(QUESTION_BYTES - QUESTION_TRUNCATED.len());
+    format!("{}{QUESTION_TRUNCATED}", &question[..cut])
 }
 
 /// `echo "WAIT_JOB: <n>"` → the background job to block on.
