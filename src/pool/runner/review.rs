@@ -368,16 +368,17 @@ impl WorkerPool {
         let manifest = self.manifest();
         let (_, _, reviewer_manifest_turns) = manifest.resolve_model(&reviewer_model);
 
-        // The reviewer gets *its own* role memory, keyed by the reviewer alias, so
-        // review lessons never bleed into the implementer's prompt (and vice versa).
+        // The reviewer gets *its own* role memory and *its own* manifest
+        // `instructions:` block, both keyed by the reviewer alias, so review
+        // habits never bleed into the implementer's prompt (and vice versa).
         // `reviewer_model` may already be a resolved id (`combo:nerd`), so it is
         // mapped back to its alias first; an unknown id passes through unchanged and
-        // simply finds no memory file.
+        // simply finds no memory file and no instructions.
         let reviewer_alias = manifest.alias_for_model(&reviewer_model);
         let mut review_messages = vec![
             ChatMessage::text(
                 Role::System,
-                build_system_prompt(Path::new(&repo_path_str), &reviewer_alias),
+                build_system_prompt(manifest, Path::new(&repo_path_str), &reviewer_alias),
             ),
             ChatMessage::text(Role::User, review_prompt),
         ];

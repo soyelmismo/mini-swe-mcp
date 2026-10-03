@@ -16,7 +16,7 @@
 
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{
-    INSTRUCTION_FILES, MAX_INSTRUCTIONS_PROMPT_BYTES, build_system_prompt,
+    INSTRUCTION_FILES, MAX_INSTRUCTIONS_PROMPT_BYTES, ModelManifest, build_system_prompt,
 };
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,7 @@ fn test_agents_and_claude_are_both_injected_with_headers() {
     repo.write("AGENTS.md", "- Run the gates before reporting.\n");
     repo.write("CLAUDE.md", "- Prefer the smallest edit that works.\n");
 
-    let prompt = build_system_prompt(repo.path(), "ninja");
+    let prompt = build_system_prompt(&ModelManifest::default(), repo.path(), "ninja");
 
     assert!(
         prompt.starts_with(SYSTEM_PROMPT),
@@ -88,7 +88,7 @@ fn test_byte_identical_instruction_files_are_injected_once() {
     repo.write("AGENTS.md", shared);
     repo.write("CLAUDE.md", shared);
 
-    let prompt = build_system_prompt(repo.path(), "ninja");
+    let prompt = build_system_prompt(&ModelManifest::default(), repo.path(), "ninja");
 
     assert_eq!(
         prompt.matches("### AGENTS.md").count(),
@@ -110,7 +110,7 @@ fn test_injected_instructions_are_bounded() {
     let note = filler.repeat(MAX_INSTRUCTIONS_PROMPT_BYTES / filler.len() + 8);
     repo.write("AGENTS.md", &note);
 
-    let prompt = build_system_prompt(repo.path(), "ninja");
+    let prompt = build_system_prompt(&ModelManifest::default(), repo.path(), "ninja");
     let injected = &prompt[SYSTEM_PROMPT.len()..];
 
     assert!(
@@ -130,7 +130,7 @@ fn test_no_instruction_files_leaves_the_prompt_unchanged() {
     let repo = Scratch::new("none");
 
     assert_eq!(
-        build_system_prompt(repo.path(), "ninja"),
+        build_system_prompt(&ModelManifest::default(), repo.path(), "ninja"),
         SYSTEM_PROMPT,
         "a repository without instruction files must keep the static prompt byte-identical"
     );
@@ -155,7 +155,7 @@ fn test_symlink_out_of_the_repository_is_ignored() {
     // symlink is being refused.
     repo.write("CLAUDE.md", "- In-repo rule.\n");
 
-    let prompt = build_system_prompt(repo.path(), "ninja");
+    let prompt = build_system_prompt(&ModelManifest::default(), repo.path(), "ninja");
 
     assert!(
         prompt.contains("- In-repo rule."),

@@ -13,6 +13,27 @@ Requirements: `git`, an OpenAI-compatible endpoint, and `OPENAI_API_KEY`. A `.en
 
 Model aliases resolve from the first `models.yaml` found: `MODELS_FILE`, then `./models.yaml`, then `$XDG_CONFIG_HOME/mini-swe/models.yaml`, then next to the executable, then the built-in catalog. `mini-swe-mcp manifest` prints the resolved catalog; `DEFAULT_MODEL` names the alias used when a dispatch omits `--model`.
 
+### Per-model instructions
+
+Any model entry may carry an optional `instructions:` block: extra rules appended to the system prompt of every worker that runs on that model, after the repository's own instruction files and the role memory. It is how you correct a model's habits from the catalog -- a small model that reads files in many small ranges is told to read whole files. Both spellings mean one instruction per line:
+
+```yaml
+models:
+  small:
+    id: combo:small
+    instructions: |
+      Read whole files instead of many small ranges.
+      Run the cheap gate before the full suite.
+  # equivalently:
+  small:
+    id: combo:small
+    instructions:
+      - Read whole files instead of many small ranges.
+      - Run the cheap gate before the full suite.
+```
+
+The block is optional: an entry without one behaves exactly as before. The review phase uses the block of the *reviewer's* model (`--review-after <alias>`), so review habits never leak into the implementer's prompt. It is bounded at 4 KB per model: beyond that the tail is dropped, the cut is marked in the prompt and the manifest load warns. `mini-swe-mcp manifest` prints the instruction count per model.
+
 ## Connect an agent
 
 The server speaks MCP over stdio. `mini-swe-mcp --stdio` starts (or joins) the shared hub and proxies the connection to it, so many orchestrators share one pool.
