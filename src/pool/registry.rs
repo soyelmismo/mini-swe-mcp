@@ -994,9 +994,9 @@ mod recovery_cleanup_tests {
 /// (the hub's tick read a partially written row, saw no worker, and closed the
 /// round without it). The write path is atomic (temp sibling + rename), so a
 /// reader always sees the old row or the complete new one. This test hammers a
-/// row with repeated writes from one thread while another reads it back, and
-/// asserts the row is present on every read: a torn write would make a read
-/// miss it.
+/// row with repeated writes from one thread while another reads the file back
+/// directly, and asserts the row parses on every read: a torn write would make
+/// one of them miss it.
 #[cfg(test)]
 mod registry_atomic_write_tests {
     use super::*;
@@ -1018,6 +1018,7 @@ mod registry_atomic_write_tests {
         row.task = "t".repeat(64 * 1024);
         row.status = RegistryStatus::Running;
         save_registry_entry_in(&root, &row);
+        let path = registry_dir_in(&root).join(format!("{id}.json"));
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_writer = stop.clone();
@@ -1037,15 +1038,21 @@ mod registry_atomic_write_tests {
             }
         });
 
-        // Read the row back many times while the writer churns it. Every read
-        // must see the row: a torn write would make one of them miss it.
+        // Read the row file back directly many times while the writer churns
+        // it. Every read must parse the row: a torn write would make one of
+        // them see an empty or half-written file.
         let mut reads = 0usize;
         for _ in 0..2000 {
-            let entries = raw_registry_entries_in(&root);
-            assert!(
-                entries.iter().any(|(_, e)| e.id == id),
-                "a read missed the row after {reads} successful reads: a torn                  registry write is visible to a concurrent reader"
-            );
+            let raw = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("a read of the row failed after {reads} successful reads: {e}")
+            });
+            let entry: WorkerRegistryEntry = serde_json::from_slice(&raw).unwrap_or_else(|e| {
+                panic!(
+                    "a read saw a torn row after {reads} successful reads ({} bytes): {e}",
+                    raw.len()
+                )
+            });
+            assert_eq!(entry.id, id, "the row must keep its identity");
             reads += 1;
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
