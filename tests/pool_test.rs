@@ -737,6 +737,7 @@ async fn steer_on_a_finished_worker_without_history_names_the_missing_file() {
         verified: None,
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     };
     pool.__test_insert_worker(done).await;
     let err = pool.steer("w4", "x".into()).await.unwrap_err();
@@ -782,6 +783,7 @@ async fn worker_progress_never_clones_the_terminal_payload() {
         verified: None,
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     };
     pool.__test_insert_worker(w).await;
 
@@ -1128,6 +1130,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             turns_used: 142,
             extensions_granted: 4,
             extensions_refused: 2,
+            auto_extensions_granted: 0,
             repeat_blocks: 3,
             stagnation_nudges: 1,
             loop_pauses: 1,
@@ -1199,6 +1202,7 @@ fn test_a_completed_state_serializes_its_health_counters() {
         verified: Some(true),
         metrics: measured_entry().metrics,
         revision: 0,
+        verdicts: None,
     };
     let json = serde_json::to_value(&state).expect("state serializes");
     assert_eq!(json["state"], "Completed");
@@ -1472,6 +1476,7 @@ async fn steer_on_a_completed_worker_revises_on_the_same_branch() {
         verified: None,
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     };
     pool.__test_insert_worker(done).await;
     // The finished run's history file is what the revision reloads.
@@ -1561,6 +1566,7 @@ async fn collect_keeps_the_history_so_a_collected_worker_stays_revisable() {
         verified: None,
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     };
     pool.__test_insert_worker(done).await;
     let history = sample_history(&repo, "abc123", "worker-keep1");
@@ -1595,6 +1601,7 @@ async fn steer_on_a_finished_worker_without_a_branch_is_a_clear_error() {
         verified: None,
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     };
     pool.__test_insert_worker(done).await;
     // No `worker-gonework` branch was ever created in the scratch repo.
@@ -2063,6 +2070,7 @@ async fn the_per_agent_cap_counts_only_that_agents_running_workers() {
             verified: None,
             revision: 0,
             metrics: WorkerMetrics::default(),
+            verdicts: None,
         },
         ..owned_worker("h3-a3", "agent-a")
     })

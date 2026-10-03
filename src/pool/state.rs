@@ -33,6 +33,8 @@ pub struct WorkerMetrics {
     pub extensions_granted: usize,
     /// `REQUEST_TURNS` asks past the self-grant budget that were refused.
     pub extensions_refused: usize,
+    /// Automatic budget extensions granted once at the turn limit.
+    pub auto_extensions_granted: usize,
     /// Commands answered by the repetition detector instead of being run.
     pub repeat_blocks: usize,
     /// "Stop exploring" nudges the stagnation detector injected.
@@ -114,6 +116,220 @@ impl WorkerReport {
             && self.tests.is_empty()
             && self.risks.is_empty()
     }
+}
+
+/// A consolidator's per-worker verdicts, kept beside the round's headline.
+///
+/// The consolidator procedure asks for one line per worker it integrated
+/// (`REPORT <id> approved|returned|fixed: <one line>`) plus a `RISK:` line for
+/// anything that touches the sandbox, governance or identity. Without them the
+/// orchestrator only sees the round's one-line `done:`, and the per-worker
+/// detail is in the consolidator's history JSONL -- which is why it is recorded
+/// here, on the completed state and on the registry row, instead.
+///
+/// Bounded by construction: at most [`VERDICT_BYTES`] bytes survive, and the
+/// lines are kept in the order the consolidator wrote them, so a reader sees
+/// the same verdicts in the same order they were made.
+///
+/// It serializes as the flat array of lines a consumer renders (the per-worker
+/// verdicts, then the risks), which is what the notification text shows and
+/// what the compact views carry; the two groups stay available on the value
+/// for code that wants them separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "WorkerVerdictsWire")]
+pub struct WorkerVerdicts {
+    /// One `REPORT <id> <verdict>: <line>` per worker, in the written order.
+    pub workers: Vec<String>,
+    /// The consolidator's `RISK:` lines, verbatim, in the written order.
+    pub risks: Vec<String>,
+}
+
+/// The on-the-wire shape of a [`WorkerVerdicts`]: one flat array of the lines
+/// a notification shows, which is also the wire shape this type parses back.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum WorkerVerdictsWire {
+    /// The compact views carry the lines as an array.
+    Lines(Vec<String>),
+    /// The two-group form, for a payload that keeps them apart.
+    Grouped {
+        #[serde(default)]
+        workers: Vec<String>,
+        #[serde(default)]
+        risks: Vec<String>,
+    },
+}
+
+impl From<WorkerVerdictsWire> for WorkerVerdicts {
+    fn from(wire: WorkerVerdictsWire) -> Self {
+        // The budget is enforced on the way *in* as well as on the way out: a
+        // registry row is plain JSON in a directory another local user can
+        // write, and the type promises at most `VERDICT_BYTES` survive. Without
+        // this an oversized array off disk is read whole and rendered whole
+        // into the completion event, the review payload and every watch view.
+        match wire {
+            WorkerVerdictsWire::Lines(lines) => {
+                let (workers, risks) = lines
+                    .into_iter()
+                    .partition(|line| !line.starts_with("RISK:"));
+                bounded(workers, risks)
+            }
+            WorkerVerdictsWire::Grouped { workers, risks } => bounded(workers, risks),
+        }
+    }
+}
+
+/// Charge `workers` then `risks` against [`VERDICT_BYTES`], dropping whatever
+/// does not fit and naming the count, exactly as [`parse_verdict_lines`] does
+/// when the value is built. One rule, so a stored payload and a read-back one
+/// are bounded the same way.
+fn bounded(workers: Vec<String>, risks: Vec<String>) -> WorkerVerdicts {
+    let mut out = WorkerVerdicts::default();
+    // Charged from the first line, so a truncated payload can still afford the
+    // notice that says it is truncated.
+    let mut spent = 0usize;
+    let mut dropped = 0usize;
+    let mut push = |line: String, into: fn(&mut WorkerVerdicts) -> &mut Vec<String>| {
+        if spent + line.len() + 1 > VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
+            dropped += 1;
+            return;
+        }
+        spent += line.len() + 1;
+        into(&mut out).push(line);
+    };
+    for line in workers {
+        push(line, |v| &mut v.workers);
+    }
+    for line in risks {
+        push(line, |v| &mut v.risks);
+    }
+    if dropped > 0 {
+        out.risks
+            .push(format!("... [{dropped} more verdict lines dropped]"));
+    }
+    out
+}
+
+impl serde::Serialize for WorkerVerdicts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.lines().serialize(serializer)
+    }
+}
+
+/// Byte budget for the whole of a [`WorkerVerdicts`] payload.
+///
+/// A round reports one line per worker it integrated, so a big round is the
+/// case that matters: the lines are kept until the budget is spent and the
+/// overflow is dropped with a marker line, never an unbounded registry row.
+pub const VERDICT_BYTES: usize = 4096;
+
+/// Budget held back from [`VERDICT_BYTES`] for the truncation notice, so a
+/// round that hit the ceiling can always say so.
+const TRUNCATION_NOTICE_BYTES: usize = 64;
+
+impl WorkerVerdicts {
+    /// Whether the consolidator recorded anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty() && self.risks.is_empty()
+    }
+
+    /// The lines a notification shows, one per line: the per-worker verdicts
+    /// then the risks.
+    pub fn lines(&self) -> Vec<&str> {
+        self.workers
+            .iter()
+            .chain(self.risks.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Collect a consolidator's per-worker `REPORT` lines and `RISK:` lines from
+/// its closing message, bounded to [`VERDICT_BYTES`].
+///
+/// Lines are kept verbatim (markup stripped by the caller) in the order they
+/// were written, because the order is the round's history. Once the budget is
+/// spent the remaining lines are dropped and a trailing marker names how many,
+/// so a truncated round reads as truncated instead of quietly short.
+pub fn parse_verdict_lines(message: &str) -> WorkerVerdicts {
+    let mut verdicts = WorkerVerdicts::default();
+    // The notice is charged against the budget from the first line, so a
+    // truncated round can always afford to say that it is truncated.
+    let notice_room = TRUNCATION_NOTICE_BYTES;
+    let mut spent = 0usize;
+    let mut dropped = 0usize;
+    let mut push = |line: String, into: fn(&mut WorkerVerdicts) -> &mut Vec<String>| {
+        if spent + line.len() + 1 > VERDICT_BYTES - notice_room {
+            dropped += 1;
+            return;
+        }
+        spent += line.len() + 1;
+        into(&mut verdicts).push(line);
+    };
+    for line in message.lines() {
+        // The same peel the authoritative verdict parser applies, so a line the
+        // harness absorbed a worker on is the line the round displays. A
+        // consolidator that wraps its verdicts in a markdown bullet is read
+        // identically by both, and a round never renders as having no verdicts
+        // for the workers it did act on.
+        let line = crate::pool::runner::strip_markup(line);
+        if line.is_empty() {
+            continue;
+        }
+        if is_risk_line(&line) {
+            push(risk_line(&line), |v| &mut v.risks);
+        } else if is_per_worker_verdict(&line) {
+            push(line, |v| &mut v.workers);
+        }
+    }
+    if dropped > 0 {
+        // The count is fixed-width so the notice can never itself be the thing
+        // that does not fit.
+        verdicts
+            .risks
+            .push(format!("... [{dropped} more verdict lines dropped]"));
+    }
+    verdicts
+}
+
+/// Whether `line` is a consolidator's `RISK:` line.
+fn is_risk_line(line: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(head, _)| head.trim().eq_ignore_ascii_case("RISK"))
+}
+
+/// The `RISK:` line without its marker, so every stored risk reads the same way.
+fn risk_line(line: &str) -> String {
+    match line.split_once(':') {
+        Some((_, rest)) => format!("RISK: {}", rest.trim()),
+        None => line.to_string(),
+    }
+}
+
+/// Whether `line` is a consolidator's per-worker verdict, `REPORT <id> <v>:`.
+///
+/// The id is what separates a verdict from the round's own block marker, and
+/// the verdict must be one of the three the procedure names, so the block's
+/// `REPORT` / `done:` / `risks:` lines are never mistaken for one.
+fn is_per_worker_verdict(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("REPORT ") else {
+        return false;
+    };
+    let mut words = rest.split_whitespace();
+    let Some(id) = words.next() else {
+        return false;
+    };
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    matches!(
+        words.next().map(|verdict| verdict.trim_end_matches(':')),
+        Some("approved" | "APPROVED" | "returned" | "RETURNED" | "fixed" | "FIXED")
+    )
 }
 
 /// One file's share of a diff: the path, the lines added and the lines removed.
@@ -345,6 +561,11 @@ pub enum WorkerState {
         /// worker never supplied one (the summary stays the fallback).
         #[serde(default)]
         report: Option<WorkerReport>,
+        /// The per-worker `REPORT` lines and `RISK:` lines of a consolidator's
+        /// closing message. `None` for an ordinary worker, which has one
+        /// verdict to give -- its own -- already in `report`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdicts: Option<WorkerVerdicts>,
     },
     Failed {
         error: String,
@@ -382,6 +603,11 @@ pub enum WorkerState {
         /// one; the summary stays the fallback.
         #[serde(default)]
         report: Option<WorkerReport>,
+        /// Same counter as on [`WorkerState::Completed`]: a consolidator that
+        /// ran out of turns mid-round still reported the workers it had
+        /// already reached a verdict on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdicts: Option<WorkerVerdicts>,
     },
 }
 
@@ -440,6 +666,7 @@ impl WorkerState {
                 metrics,
                 revision,
                 report,
+                verdicts,
                 diff,
             } => {
                 let (artifacts, artifacts_total) = compact_artifacts(artifacts);
@@ -455,6 +682,10 @@ impl WorkerState {
                     "metrics": metrics,
                     "revision": revision,
                     "report": report,
+                    // The round's per-worker verdicts ride in the compact view
+                    // too: this projection is what `list` and a cold `status`
+                    // read, and they are the round's detail.
+                    "verdicts": verdicts,
                     "per_file": file_stats_of_diff(diff),
                 })
             }
@@ -481,6 +712,7 @@ impl WorkerState {
                 metrics,
                 revision,
                 report,
+                verdicts,
                 diff,
             } => {
                 let (artifacts, artifacts_total) = compact_artifacts(artifacts);
@@ -495,6 +727,7 @@ impl WorkerState {
                     "metrics": metrics,
                     "revision": revision,
                     "report": report,
+                    "verdicts": verdicts,
                     "reason": TURN_BUDGET_EXHAUSTED,
                     "per_file": file_stats_of_diff(diff),
                 })
@@ -781,6 +1014,7 @@ mod tests {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             }
             .step(),
             12
@@ -807,6 +1041,7 @@ mod tests {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             }
             .step(),
             7
@@ -890,6 +1125,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
@@ -934,6 +1170,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         }
     }
 
@@ -958,6 +1195,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         }
     }
 

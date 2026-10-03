@@ -23,8 +23,12 @@ impl McpServer {
         if state.is_none() && entry.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
-        let (summary, verified, state_branch, report) = completed_fields(state.as_ref());
+        let (summary, verified, state_branch, report, verdicts) = completed_fields(state.as_ref());
         let report = report.or_else(|| entry.as_ref().and_then(|entry| entry.report.clone()));
+        // The row carries the round's verdicts like the report, so a
+        // consolidator whose in-memory record was already evicted still says
+        // what it decided about each worker.
+        let verdicts = verdicts.or_else(|| entry.as_ref().and_then(|entry| entry.verdicts.clone()));
         let branch = state_branch.unwrap_or_else(|| format!("worker-{wid}"));
         // The registry row is the only cross-process record of where the
         // worker's repository is and which branch it integrates with.
@@ -121,6 +125,7 @@ impl McpServer {
             "docs": docs_value(&summaries),
             "summary": summary,
             "report": report,
+            "verdicts": verdicts,
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
@@ -215,37 +220,50 @@ impl ReviewDiffScope {
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
 
-/// The fields a finished worker carries: its summary, whether the gate
-/// verified it (always `None` for an exhausted worker, which never verified),
-/// and the branch it leaves behind.
-pub(super) fn completed_fields(
-    state: Option<&crate::pool::WorkerState>,
-) -> (
+/// What a terminal state carries that `collect` and `review` both show: the
+/// summary, whether the gate verified it (always `None` for an exhausted
+/// worker, which never verified), the branch, the structured report and a
+/// consolidator's per-worker verdicts. `None` throughout for a live worker,
+/// which has produced none of them yet.
+pub(super) type CompletedFields = (
     Option<String>,
     Option<bool>,
     Option<String>,
     Option<crate::pool::WorkerReport>,
-) {
+    Option<crate::pool::WorkerVerdicts>,
+);
+
+/// The fields of a finished worker, read off its state.
+pub(super) fn completed_fields(state: Option<&crate::pool::WorkerState>) -> CompletedFields {
     match state {
         Some(crate::pool::WorkerState::Completed {
             summary,
             verified,
             branch,
             report,
+            verdicts,
             ..
         }) => (
             Some(summary.clone()),
             *verified,
             branch.clone(),
             report.clone(),
+            verdicts.clone(),
         ),
         Some(crate::pool::WorkerState::Exhausted {
             summary,
             branch,
             report,
+            verdicts,
             ..
-        }) => (Some(summary.clone()), None, branch.clone(), report.clone()),
-        _ => (None, None, None, None),
+        }) => (
+            Some(summary.clone()),
+            None,
+            branch.clone(),
+            report.clone(),
+            verdicts.clone(),
+        ),
+        _ => (None, None, None, None, None),
     }
 }
 
@@ -684,8 +702,7 @@ pub(super) fn diff_stat_value(stats: &[DiffFileStat]) -> Value {
     })
 }
 
-pub(in crate::mcp) const DIFF_DESCRIPTION: &str =
-    "Diff scope for 'review': 'code' (default) hides tests, 'all' all, 'none' none.";
+pub(in crate::mcp) const DIFF_DESCRIPTION: &str = "Diff scope for 'review'; 'code' hides tests.";
 
 #[cfg(test)]
 mod tests {

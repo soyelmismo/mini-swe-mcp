@@ -130,6 +130,7 @@ pub fn health_line(val: &serde_json::Value) -> Option<String> {
     );
     let (verify_runs, verify_failures) = (count("verify_runs"), count("verify_failures"));
     let isolation_blocks = count("isolation_blocks");
+    let auto_extensions = count("auto_extensions_granted");
     let (files, insertions, deletions) = (
         count("diff_files"),
         count("diff_insertions"),
@@ -143,6 +144,7 @@ pub fn health_line(val: &serde_json::Value) -> Option<String> {
         && pauses == 0
         && verify_runs == 0
         && isolation_blocks == 0
+        && auto_extensions == 0
         && files == 0
         && insertions == 0
         && deletions == 0
@@ -159,6 +161,9 @@ pub fn health_line(val: &serde_json::Value) -> Option<String> {
     ];
     if pauses > 0 {
         parts.push(plural(pauses, "loop pause"));
+    }
+    if auto_extensions > 0 {
+        parts.push(plural(auto_extensions, "auto ext"));
     }
     if isolation_blocks > 0 {
         parts.push(plural(isolation_blocks, "isolation block"));

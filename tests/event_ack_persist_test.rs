@@ -52,6 +52,7 @@ fn completed(id: &str, summary: &str) -> WorkerState {
         metrics: WorkerMetrics::default(),
         revision: 0,
         report: None,
+        verdicts: None,
     }
 }
 

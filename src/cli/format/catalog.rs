@@ -39,6 +39,66 @@ pub fn format_manifest(val: &serde_json::Value) -> String {
     out.trim_end().to_string()
 }
 
+/// The retired workers' final reports, oldest first.
+///
+/// One block per line: who ran, what they were asked, how they left and what
+/// they reported. An empty archive says so rather than printing an empty table,
+/// because "nothing retired yet" and "the archive is empty for another reason"
+/// are different things and the caller can only tell them apart here.
+pub fn format_archive(val: &serde_json::Value) -> String {
+    let empty = Vec::new();
+    let entries = val
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    if entries.is_empty() {
+        return "No retired worker reports yet (archive is empty).".to_string();
+    }
+    let mut out = format!("Retired worker reports ({}):\n", entries.len());
+    for entry in entries {
+        let field = |key: &str| entry.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        let id = field("worker_id");
+        out.push_str(&format!("\n{id} ({})", field("reason")));
+        let group = field("group");
+        if !group.is_empty() {
+            out.push_str(&format!(" [group {group}]"));
+        }
+        if let Some(at) = entry.get("retired_at").and_then(|v| v.as_u64()) {
+            out.push_str(&format!(" at {at}"));
+        }
+        out.push('\n');
+        let task = field("task");
+        if !task.is_empty() {
+            out.push_str(&format!("  task: {task}\n"));
+        }
+        let mut meta = vec![format!("status: {}", field("status"))];
+        match entry.get("verified") {
+            Some(serde_json::Value::Bool(true)) => meta.push("verified: yes".to_string()),
+            Some(serde_json::Value::Bool(false)) => meta.push("verified: no".to_string()),
+            _ => {}
+        }
+        if let Some(commit) = entry.get("commit").and_then(|v| v.as_str())
+            && !commit.is_empty()
+        {
+            meta.push(format!("commit: {commit}"));
+        }
+        out.push_str(&format!("  {}\n", meta.join(" | ")));
+        // The four REPORT fields, in the order the worker wrote them, with the
+        // label the worker used so a reader can match it to the prompt.
+        if let Some(report) = entry.get("report").filter(|r| r.is_object()) {
+            for key in ["done", "files", "tests", "risks"] {
+                let value = report.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                if !value.is_empty() {
+                    out.push_str(&format!("  {key}: {value}\n"));
+                }
+            }
+        } else {
+            out.push_str("  report: none recorded\n");
+        }
+    }
+    out.trim_end().to_string()
+}
+
 pub fn format_list(val: &serde_json::Value) -> String {
     let empty_vec = Vec::new();
     let workers = val

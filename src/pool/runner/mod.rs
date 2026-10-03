@@ -30,6 +30,9 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
+pub use self::context_pack::{
+    PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
+};
 use self::review::ReviewPhase;
 pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
@@ -42,6 +45,7 @@ use super::steer::remove_steer_file_in;
 use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
 
+pub(crate) mod context_pack;
 pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
@@ -49,6 +53,8 @@ mod review;
 mod sentinels;
 mod turn;
 pub(crate) use self::turn::parse_shortstat;
+
+pub(crate) use self::sentinels::strip_markup;
 
 pub use self::sentinels::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
@@ -153,18 +159,27 @@ impl Drop for JobGuard<'_> {
 }
 
 /// The worker's opening user message: the task, then -- when a completion
-/// verify is configured -- the exact command the gate will run.
+/// verify is configured -- the exact command the gate will run, then the
+/// bounded context pack ([`context_pack`]) built from the task text against
+/// `root` (the worker's checkout).
 ///
 /// The gate reuses an identical passing run on an unchanged tree (see
 /// `TurnEngine::reusable_verify_step`), but only when the worker ran exactly
 /// the verify string. Naming it here is what lets the worker's own last check
 /// be the run the gate reuses instead of paying for a second full run.
-pub fn opening_task_message(task: &str, verify: Option<&str>) -> String {
+pub fn opening_task_message(task: &str, verify: Option<&str>, root: &std::path::Path) -> String {
     let mut message = format!("TASK:\n{task}\n\nBegin by exploring the repository.");
     if let Some(verify) = verify.filter(|v| !v.is_empty()) {
         message.push_str(&format!(
             "\n\nCompletion gate: `{verify}`. Run exactly this command as your last check; an identical passing run on the same tree is reused."
         ));
+    }
+    // The bounded context pack: the paths the task names and the symbols it
+    // quotes, so the worker starts editing instead of re-discovering them
+    // over its first dozen read-only turns. Empty when the task names
+    // nothing, so the message is unchanged for free-form tasks.
+    if let Some(pack) = context_pack(task, root) {
+        message.push_str(&format!("\n\n{pack}"));
     }
     message
 }
@@ -296,7 +311,10 @@ impl WorkerPool {
             Some(replayed) => replayed,
             None => vec![
                 ChatMessage::text(Role::System, system_prompt),
-                ChatMessage::text(Role::User, opening_task_message(&task, verify.as_deref())),
+                ChatMessage::text(
+                    Role::User,
+                    opening_task_message(&task, verify.as_deref(), &worktree.path),
+                ),
             ],
         };
 
@@ -435,62 +453,101 @@ impl WorkerPool {
         let mut report: Option<crate::pool::WorkerReport> = None;
         let mut report_asked = false;
         let mut report_text = String::new();
+        // A consolidator's per-worker verdicts live across turns like the
+        // report: the completion turn is replayed on a verify failure, and the
+        // verdicts it already gave must survive that replay.
+        let mut verdicts: Option<crate::pool::WorkerVerdicts> = None;
 
-        while step < current_max_turns {
-            step += 1;
-            let max_turns_for_config = current_max_turns;
-            let turn_config = TurnConfig {
-                label_prefix: "",
-                steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
-                apply_sentinels: true,
-                // A consolidator reviews, merges, steers and waits; it is not
-                // paid to edit, so the read-only escalation would pause it for
-                // doing its job. An ordinary implementer keeps the guard.
-                read_only_exempt: meta.role == WorkerRole::Consolidate,
-                llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
-                status: RegistryStatus::Running,
-                model: &model,
-                max_turns: max_turns_for_config,
-                task: &task,
-                temperature,
-                review_after: review_after.as_deref(),
-                network_offline,
-            };
-            let mut engine = TurnEngine {
-                pool: self,
-                worktree,
-                runner: &runner,
-                worker_id,
-                meta,
-                messages,
-                unsaved_messages: Vec::new(),
-                step: &mut step,
-                current_max_turns: &mut current_max_turns,
-                last_assistant_text: &mut last_assistant_text,
-                consecutive_no_cmd: &mut consecutive_no_cmd,
-                verify: verify.as_deref(),
-                client_env: &client_env,
-                dispatch_max_turns: max_turns,
-                watch: &mut watch,
-                report: &mut report,
-                report_asked: &mut report_asked,
-                report_text: &mut report_text,
-            };
-            match engine.run_turn(&turn_config).await? {
-                TurnOutcome::Completed { verified: v } => {
-                    // Flush the completion turn too: a reused verify pushes its
-                    // disclosure note here, and a crash must not lose it.
-                    engine.flush_history_log(&turn_config).await;
-                    verified = v;
-                    completed = true;
-                    break;
+        let mut auto_extended = false;
+        loop {
+            while step < current_max_turns {
+                step += 1;
+                let max_turns_for_config = current_max_turns;
+                let turn_config = TurnConfig {
+                    label_prefix: "",
+                    steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
+                    apply_sentinels: true,
+                    // A consolidator reviews, merges, steers and waits; it is not
+                    // paid to edit, so the read-only escalation would pause it for
+                    // doing its job. An ordinary implementer keeps the guard.
+                    read_only_exempt: meta.role == WorkerRole::Consolidate,
+                    llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
+                    status: RegistryStatus::Running,
+                    model: &model,
+                    max_turns: max_turns_for_config,
+                    task: &task,
+                    temperature,
+                    review_after: review_after.as_deref(),
+                    network_offline,
+                };
+                let mut engine = TurnEngine {
+                    pool: self,
+                    worktree,
+                    runner: &runner,
+                    worker_id,
+                    meta,
+                    messages,
+                    unsaved_messages: Vec::new(),
+                    step: &mut step,
+                    current_max_turns: &mut current_max_turns,
+                    last_assistant_text: &mut last_assistant_text,
+                    consecutive_no_cmd: &mut consecutive_no_cmd,
+                    verify: verify.as_deref(),
+                    client_env: &client_env,
+                    dispatch_max_turns: max_turns,
+                    watch: &mut watch,
+                    report: &mut report,
+                    report_asked: &mut report_asked,
+                    report_text: &mut report_text,
+                    verdicts: &mut verdicts,
+                };
+                match engine.run_turn(&turn_config).await? {
+                    TurnOutcome::Completed { verified: v } => {
+                        // Flush the completion turn too: a reused verify pushes its
+                        // disclosure note here, and a crash must not lose it.
+                        engine.flush_history_log(&turn_config).await;
+                        verified = v;
+                        completed = true;
+                        break;
+                    }
+                    TurnOutcome::Continue | TurnOutcome::NoCommand => {}
+                    TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
                 }
-                TurnOutcome::Continue | TurnOutcome::NoCommand => {}
-                TurnOutcome::EndReview => unreachable!("implementer never ends review quietly"),
+                // One line per message, flushed at the turn boundary: a crash can
+                // only lose the turn that was in flight.
+                engine.flush_history_log(&turn_config).await;
             }
-            // One line per message, flushed at the turn boundary: a crash can
-            // only lose the turn that was in flight.
-            engine.flush_history_log(&turn_config).await;
+
+            if completed || auto_extended {
+                break;
+            }
+
+            // The budget ran out before the completion sentinel: decide on one
+            // automatic extension, or fall through to the exhausted branch.
+            let summary = watch.progress_summary(step);
+            match turn::grant_extension(
+                &summary,
+                auto_extended,
+                turn::auto_extension_budget(max_turns),
+            ) {
+                Some(n) => {
+                    auto_extended = true;
+                    current_max_turns += n;
+                    meta.metrics.auto_extensions_granted += 1;
+                    messages.push(ChatMessage::text(
+                        Role::User,
+                        format!(
+                            "Budget extended once by {n} turns: finish now (gate, REPORT, completion sentinel)"
+                        ),
+                    ));
+                    info!(
+                        worker = %worker_id,
+                        turns = n,
+                        "Budget extended once by the automatic extension"
+                    );
+                }
+                None => break,
+            }
         }
 
         // --- MULTI-PHASE REVIEW PIPELINE ---
@@ -666,10 +723,15 @@ impl WorkerPool {
                 metrics: meta.metrics,
                 revision,
                 report: report.clone(),
+                verdicts: verdicts.clone(),
             };
             self.update_worker(worker_id, |w| w.state = exhausted_state)
                 .await;
             meta.report = report;
+            // An exhausted consolidator reports the workers it had reached a
+            // verdict on before the budget ran out; the row carries them like
+            // the report it already writes here.
+            meta.verdicts = verdicts;
             self.save_status(
                 meta,
                 &model,
@@ -711,6 +773,7 @@ impl WorkerPool {
             metrics: meta.metrics,
             revision,
             report: report.clone(),
+            verdicts: verdicts.clone(),
         };
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
@@ -720,6 +783,7 @@ impl WorkerPool {
         // TTL, the row is not.
         meta.report = report;
         meta.verified = verified;
+        meta.verdicts = verdicts;
         self.save_status(
             meta,
             &model,

@@ -111,6 +111,7 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         },
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),

@@ -125,7 +125,7 @@ fn registry_snapshot_row(entry: &WorkerRegistryEntry, now: u64) -> Value {
         "elapsed":if entry.status.is_terminal() {entry.updated_at.saturating_sub(entry.started_at)} else {now.saturating_sub(entry.started_at)}, "last_step_at":entry.updated_at, "question":entry.question.clone(), "last_ops":[clamp_string(&entry.last_command, 256)],
         "metrics":entry.metrics, "branch":null, "revision":entry.revision, "summary":null,
         "task":clamp_string(entry.task.lines().next().unwrap_or(""), 500),
-        "verified":entry.verified, "report":entry.report,
+        "verified":entry.verified, "report":entry.report, "verdicts":entry.verdicts,
         "error":if entry.status == crate::pool::RegistryStatus::Failed {Some(clamp_string(&entry.last_command, 1500))} else {None}})
 }
 
@@ -146,6 +146,7 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             metrics,
             diff,
             report,
+            verdicts,
             ..
         } => {
             view["status"] = json!("completed");
@@ -158,6 +159,9 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             // changed, and the per-file split comes from the diff the state
             // already holds rather than a second `git diff --stat`.
             view["report"] = json!(report);
+            // A consolidator's per-worker verdicts ride along: the round's
+            // headline cannot carry them.
+            view["verdicts"] = json!(verdicts);
             view["per_file"] = json!(crate::pool::file_stats_of_diff(diff));
         }
         WorkerState::Failed {
@@ -178,6 +182,7 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             metrics,
             diff,
             report,
+            verdicts,
             ..
         } => {
             view["status"] = json!("exhausted");
@@ -189,6 +194,7 @@ pub fn enrich_state(view: &mut Value, state: &WorkerState) {
             view["revision"] = json!(revision);
             view["metrics"] = json!(metrics);
             view["report"] = json!(report);
+            view["verdicts"] = json!(verdicts);
             view["per_file"] = json!(crate::pool::file_stats_of_diff(diff));
         }
     }

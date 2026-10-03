@@ -336,7 +336,12 @@ fn is_per_worker_line(line: &str) -> bool {
 /// contain a digit (`cargo test: 4 passed`) must survive untouched, which is
 /// why a numbered bullet is recognised by its leading digits rather than by
 /// the first digit anywhere on the line.
-fn strip_markup(line: &str) -> String {
+///
+/// Shared with the recorded verdict lines (`crate::pool::parse_verdict_lines`):
+/// a verdict the harness acted on and a verdict it displays must be the same
+/// line, so a consolidator that wraps its per-worker verdicts in a markdown
+/// bullet gets the same reading in both places.
+pub(crate) fn strip_markup(line: &str) -> String {
     let mut line = line.trim().trim_matches('`').trim();
     for marker in ["- ", "* ", "+ "] {
         if let Some(rest) = line.strip_prefix(marker) {

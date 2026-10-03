@@ -32,6 +32,10 @@ impl McpServer {
             .unwrap_or(false);
         let root = self.pool.scratch_root().clone();
         let admission = self.pool.admission();
+        // The retirement the merge performs appends the worker's final REPORT
+        // to the hub's archive; the hub directory is this process's to name, and
+        // `None` simply archives nothing.
+        let archive_dir = crate::hub::hub_dir().ok();
         let worker_id = wid.to_string();
         let report = tokio::task::spawn_blocking(move || {
             crate::pool::merge_worker_in(
@@ -41,6 +45,7 @@ impl McpServer {
                     verified,
                     keep_branch,
                     admission: Some(admission),
+                    archive_dir,
                 },
             )
         })
@@ -105,6 +110,7 @@ impl McpServer {
         };
         let root = self.pool.scratch_root().clone();
         let admission = self.pool.admission();
+        let archive_dir = crate::hub::hub_dir().ok();
         let report = tokio::task::spawn_blocking(move || {
             crate::pool::merge_approved_in(
                 &root,
@@ -112,6 +118,7 @@ impl McpServer {
                     owner: owner.as_deref(),
                     group: group.as_deref(),
                     admission: Some(admission),
+                    archive_dir,
                 },
             )
         })
