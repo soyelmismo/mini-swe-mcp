@@ -198,6 +198,37 @@ impl ModelManifest {
         entries
     }
 
+    /// Whether `name` is an available review mode.
+    ///
+    /// The built-in modes `quality` and `security` are always available, even
+    /// when the manifest does not declare them; any other name is available
+    /// only when the manifest declares it under `review_modes:`.
+    pub fn is_review_mode(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("quality")
+            || name.eq_ignore_ascii_case("security")
+            || self.review_modes.contains_key(name)
+    }
+
+    /// Every available review-mode name in stable order: the built-ins first,
+    /// then the manifest-declared modes in sorted order.
+    ///
+    /// Used for the "unknown mode" dispatch error, so the caller can list what
+    /// `--review-after <model>:<mode>` actually accepts.
+    pub fn available_review_modes(&self) -> Vec<String> {
+        let mut modes = vec!["quality".to_string(), "security".to_string()];
+        let mut declared: Vec<String> = self
+            .review_modes
+            .keys()
+            .filter(|name| {
+                !name.eq_ignore_ascii_case("quality") && !name.eq_ignore_ascii_case("security")
+            })
+            .cloned()
+            .collect();
+        declared.sort();
+        modes.extend(declared);
+        modes
+    }
+
     /// Resolve the *alias* that owns `model`, whether `model` is already an alias
     /// or a full model id.
     ///

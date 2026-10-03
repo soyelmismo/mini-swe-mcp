@@ -925,6 +925,12 @@ impl WorkerPool {
         if role == WorkerRole::Consolidate && group.as_deref().is_none_or(|g| g.trim().is_empty()) {
             anyhow::bail!("role 'consolidate' requires 'group'");
         }
+        // An unknown review mode is a dispatch error, not a worker failure:
+        // validate the `--review-after <model>:<mode>` suffix against the
+        // manifest's declared modes before the worker starts.
+        if let Some(requested) = review_after.as_deref() {
+            ReviewMode::parse_with_manifest(requested, &self.manifest)?;
+        }
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
         let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);

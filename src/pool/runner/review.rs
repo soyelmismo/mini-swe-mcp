@@ -129,6 +129,95 @@ impl ReviewMode {
     pub fn as_str(&self) -> &str {
         &self.name
     }
+
+    /// Parse `--review-after <model>[:<mode>]` against the manifest's declared
+    /// modes.
+    ///
+    /// A trailing `:<mode>` names the mode when `<mode>` is available
+    /// (a built-in or a manifest-declared `review_modes:` entry); the mode's
+    /// checklist is resolved here, and an empty model part falls back to the
+    /// mode's declared default reviewer. A string with no mode suffix is the
+    /// reviewer with the default `quality` mode. A `:<suffix>` that names no
+    /// available mode is a dispatch error listing the available ones — unless
+    /// the whole string is a known model (an alias or an id), in which case it
+    /// is that model with the default mode, which is what keeps a
+    /// colon-containing model id like `combo:nerd` parsing as a model.
+    pub fn parse_with_manifest(
+        requested: &str,
+        manifest: &crate::manifest::ModelManifest,
+    ) -> anyhow::Result<(String, Self)> {
+        let trimmed = requested.trim();
+        if let Some((model, suffix)) = trimmed.rsplit_once(':')
+            && !suffix.trim().is_empty()
+        {
+            let mode_name = suffix.trim();
+            if manifest.is_review_mode(mode_name) {
+                let mode = Self::resolve_declared(mode_name, manifest);
+                // An empty model part uses the mode's default reviewer; a mode
+                // without one falls back to the empty string, which the caller
+                // resolves against the implementer's model.
+                let reviewer = if model.trim().is_empty() {
+                    mode_default_reviewer(mode_name, manifest).unwrap_or_default()
+                } else {
+                    model.trim().to_string()
+                };
+                return Ok((reviewer, mode));
+            }
+            // Not a declared mode: if the whole string is a known model, it is
+            // the reviewer with the default mode. Otherwise the suffix was
+            // meant as a mode and it does not exist.
+            if !is_known_model(trimmed, manifest) {
+                anyhow::bail!(
+                    "unknown review mode \"{mode_name}\"; available modes: {}",
+                    manifest.available_review_modes().join(", ")
+                );
+            }
+        }
+        Ok((trimmed.to_string(), Self::quality()))
+    }
+
+    /// Resolve a declared mode name to its [`ReviewMode`], filling in the
+    /// manifest's checklist when one is declared.
+    ///
+    /// A manifest entry named `quality` or `security` overrides the built-in
+    /// prompt; any other declared name builds a custom mode around its
+    /// checklist.
+    pub fn resolve_declared(name: &str, manifest: &crate::manifest::ModelManifest) -> Self {
+        if let Some(def) = manifest.review_mode(name) {
+            return Self {
+                name: name.to_string(),
+                checklist: Some(def.checklist.clone()),
+            };
+        }
+        if name.eq_ignore_ascii_case(Self::SECURITY_SUFFIX) {
+            return Self::security();
+        }
+        Self::quality()
+    }
+}
+
+/// The default reviewer a manifest-declared mode names, if any.
+pub fn mode_default_reviewer(
+    name: &str,
+    manifest: &crate::manifest::ModelManifest,
+) -> Option<String> {
+    manifest
+        .review_mode(name)
+        .and_then(|def| def.model.clone())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+}
+
+/// Whether `requested` names a model the manifest knows: an alias, or a full
+/// id owned by some alias.
+fn is_known_model(requested: &str, manifest: &crate::manifest::ModelManifest) -> bool {
+    if manifest.models.contains_key(requested) {
+        return true;
+    }
+    manifest
+        .models
+        .values()
+        .any(|def| def.id.trim() == requested)
 }
 
 /// Build the reviewer's opening message.
@@ -332,7 +421,7 @@ pub struct ReviewPhase<'a> {
     /// worth.
     pub meta: &'a mut WorkerMeta,
     /// Which auditor runs: the generic quality review, or the adversarial
-    /// security review. Defaults to [`ReviewMode::Quality`].
+    /// security review. Defaults to the `quality` mode.
     pub mode: ReviewMode,
     /// The dispatch's completion gate, re-run by the reviewer instead of a
     /// language-specific suite invented in the prompt. `None` when the
@@ -356,7 +445,7 @@ pub struct ReviewPhaseOutcome {
     /// rather than done.
     pub completed: bool,
     /// The security review that ran, when the mode was
-    /// [`ReviewMode::Security`]. Carries the finding count the reviewer
+    /// `security`. Carries the finding count the reviewer
     /// reported, for the completion event and the status.
     pub security: Option<SecurityReviewOutcome>,
 }

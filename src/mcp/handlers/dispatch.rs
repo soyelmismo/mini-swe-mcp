@@ -210,20 +210,36 @@ impl McpServer {
         {
             anyhow::bail!("role 'consolidate' requires 'group'");
         }
-        // `--review-after <model>[:security]`: the mode suffix is split off
+        // `--review-after <model>[:<mode>]`: the mode suffix is split off
         // *before* the model is resolved, so an alias (`nerd:security`) still
         // resolves to its id and the suffix survives to the phase loop, which
-        // re-parses it.
-        let review_after = args.get("review_after").and_then(|v| v.as_str()).map(|s| {
-            let (model, mode) = crate::pool::ReviewMode::parse_model(s);
-            let (resolved, _, _) = self.manifest.resolve_model(&model);
-            match mode {
-                crate::pool::ReviewMode::Security => {
-                    format!("{resolved}:{}", crate::pool::ReviewMode::SECURITY_SUFFIX)
+        // re-parses it against the manifest. An unknown mode is a dispatch
+        // error listing the available ones.
+        let review_after = args
+            .get("review_after")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                let (model, mode) =
+                    crate::pool::ReviewMode::parse_with_manifest(s, &self.manifest)?;
+                // An empty model part uses the mode's default reviewer; the
+                // phase loop resolves it against the implementer's model.
+                let resolved = if model.trim().is_empty() {
+                    model
+                } else {
+                    self.manifest.resolve_model(&model).0
+                };
+                if mode.is_security() && mode.checklist.is_none() {
+                    Ok(format!(
+                        "{resolved}:{}",
+                        crate::pool::ReviewMode::SECURITY_SUFFIX
+                    ))
+                } else if mode.name.eq_ignore_ascii_case("quality") && mode.checklist.is_none() {
+                    Ok(resolved)
+                } else {
+                    Ok(format!("{resolved}:{}", mode.name))
                 }
-                crate::pool::ReviewMode::Quality => resolved,
-            }
-        });
+            })
+            .transpose()?;
 
         let network_offline =
             Self::resolve_network_policy(args, "dispatch", &self.manifest, &resolved_model)?;
