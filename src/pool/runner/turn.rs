@@ -184,6 +184,27 @@ const REPEAT_BLOCK_LIMIT: usize = 3;
 /// Answer handed to the model that re-issues the command of the turn before.
 const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
 
+/// Runs of one base command inside one window that make a loop. Four is one
+/// past the pair an honest cycle spends on the same command, so a worker that
+/// alternates its steps is never called a loop.
+const LOOP_RUN_COUNT: usize = 4;
+
+/// Turns of the sliding window the loop detector looks back over.
+const LOOP_WINDOW_TURNS: usize = 12;
+
+/// Runs of the same base command that earn the orchestrator pause, counting
+/// from the run the nudge was sent on: the first detection nudges, and a
+/// recurrence the worker did not answer is what pauses.
+const LOOP_PAUSE_RUN: usize = 2;
+
+/// Bytes of the last output a loop pause quotes back, so the orchestrator is
+/// told what the command said without a whole log in its terminal.
+const LOOP_OUTPUT_TAIL_BYTES: usize = 300;
+
+/// Bytes one base command may occupy in a message, so a pathological command
+/// cannot paste itself into a nudge or an orchestrator question.
+const LOOP_BASE_BYTES: usize = 160;
+
 /// Nudge injected after a worker has explored long enough without changing
 /// anything: the answer to a stuck agent is a decision, not another turn.
 fn stagnation_nudge() -> String {
