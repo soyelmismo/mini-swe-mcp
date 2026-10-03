@@ -79,6 +79,13 @@ struct SteerRecord {
     sent_at: u64,
     #[serde(default)]
     pid: u32,
+    /// Proof that this scratch root wrote the record (see [`log_nonce_in`]).
+    ///
+    /// `None` for a record written before this field existed, and `None` for
+    /// one an attacker composed: the field is exactly what separates them, so
+    /// the reader rejects it rather than guessing from the other fields.
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 /// Path of the steering mailbox for `worker_id`.
@@ -177,7 +184,32 @@ fn read_records(claim: &Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(claim) else {
         return Vec::new();
     };
-    parse_records(&content, claim)
+    parse_mailbox(&content, claim)
+}
+
+/// Every well-formed message line of a mailbox, in order.
+///
+/// No authentication here, and deliberately so: a mailbox is claimed by
+/// [`drain_steer_messages_in`] with a `rename`, so only one reader ever sees a
+/// generation, and its messages are handed to the worker as guidance to
+/// consider rather than rendered as the orchestrator's authority. The durable
+/// log ([`orchestrator_steers_in`]) is the one whose text reaches the
+/// consolidator as scope amendments, and that is where [`parse_records`] and
+/// its nonce check live.
+fn parse_mailbox(content: &str, source: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SteerRecord>(line) {
+            Ok(record) => out.push(record.message),
+            Err(e) => {
+                warn!(path = %source.display(), error = %e, "Skipping unparsable steering mailbox line")
+            }
+        }
+    }
+    out
 }
 
 /// Delete `worker_id`'s mailbox and any stale claim file.
@@ -207,6 +239,74 @@ pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
     }
 }
 
+/// Path of this scratch root's steer-log nonce.
+fn log_nonce_path_in(root: &ScratchRoot) -> PathBuf {
+    root.join(".steer-log-nonce")
+}
+
+/// The secret that marks a steer-log record as this scratch root's own.
+///
+/// The log sits in the shared scratch base, which any local user can write, so
+/// a planted file at the log path is indistinguishable from a real one by
+/// content: a `message`, a `sent_at` and a `pid` are all forgeable, and the
+/// writer cannot be "the process that wrote it" because a later consolidator
+/// legitimately reads a log an earlier process wrote. Ownership and permissions
+/// do not separate them either, because the attacker plants the file as the
+/// same user the pool runs as.
+///
+/// What does separate them is a secret the pool holds and an attacker does not
+/// have. Every record carries it, and a record without a matching one is not
+/// this pool's voice: it is dropped, whatever it claims to say. This is the
+/// difference between the two trust models -- "the file exists" (plantable) and
+/// "only this pool could have written this file" (not, without the secret).
+///
+/// The nonce is per *scratch root*, not per process, so a consolidator started
+/// later verifies the records the orchestrator wrote before it. It is created
+/// on first use, owner-only, and never leaves the root; if it cannot be created
+/// or read, the log is refused rather than trusted unauthenticated -- an
+/// unreadable secret means an unauthenticated log, which is the case the whole
+/// mechanism exists to prevent.
+fn log_nonce_in(root: &ScratchRoot) -> Option<String> {
+    let path = log_nonce_path_in(root);
+    // Read an existing nonce first: regenerating it would invalidate every
+    // record already written, i.e. silently drop real amendments.
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return Some(existing);
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().simple().to_string();
+    let created = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .and_then(|mut file| file.write_all(fresh.as_bytes()));
+    if let Err(e) = created {
+        warn!(path = %path.display(), error = %e, "Cannot establish the steer-log nonce");
+        return None;
+    }
+    // `mode` applies only to a file this call created, so tighten an existing
+    // one planted world-readable before its first byte lands in it.
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_file()
+        && let Ok(mut file) = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&path)
+        && file.metadata().is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+    {
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    // Re-read rather than trust the buffer: a pre-existing nonce written by
+    // another process between the read and the create is the one that must win.
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or(Some(fresh))
+}
+
 /// Path of the durable orchestrator-steer log for `worker_id`.
 ///
 /// Unlike the mailbox this file is never drained: it is the round's record of
@@ -232,10 +332,18 @@ pub(super) fn steer_log_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf 
 /// is strictly less bad than refusing guidance the worker needs.
 pub(super) fn record_orchestrator_steer_in(root: &ScratchRoot, worker_id: &str, message: &str) {
     let path = steer_log_path_in(root, worker_id);
+    // A record with no nonce is indistinguishable from a planted one, so it is
+    // not written at all: better a lost amendment than guidance the consolidator
+    // would have to refuse anyway.
+    let Some(nonce) = log_nonce_in(root) else {
+        warn!(worker = %worker_id, path = %path.display(), "Not recording orchestrator steer: the steer-log nonce is unavailable");
+        return;
+    };
     let record = SteerRecord {
         message: message.to_string(),
         sent_at: super::unix_timestamp(),
         pid: std::process::id(),
+        nonce: Some(nonce),
     };
     // `to_string` on a `Value` cannot fail.
     let mut payload = serde_json::to_string(&record).unwrap_or_default();
@@ -353,17 +461,33 @@ pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec
     if !content.is_empty() && !content.ends_with('\n') {
         content.truncate(content.rfind('\n').map_or(0, |i| i + 1));
     }
-    parse_records(&content, &path)
+    // Nothing is rendered unless this scratch root's own nonce authenticates
+    // it: see [`log_nonce_in`]. A log that cannot be authenticated is not this
+    // pool's voice, so it yields no amendments rather than a planted one.
+    let Some(nonce) = log_nonce_in(root) else {
+        warn!(worker = %worker_id, path = %path.display(), "Refusing to read orchestrator steer log: no nonce to authenticate it");
+        return Vec::new();
+    };
+    parse_records(&content, &path, &nonce)
 }
 
-/// The parsed records of an already-read mailbox body.
-fn parse_records(content: &str, source: &Path) -> Vec<String> {
+/// The messages of an already-read steer log that this scratch root wrote.
+///
+/// A record whose `nonce` does not match is dropped, not rendered: it is either
+/// planted in the shared base or left over from a scratch root that has since
+/// been recreated, and neither is this pool's voice. A malformed line is
+/// dropped the same way, so one corrupt append cannot hide the amendments
+/// around it.
+fn parse_records(content: &str, source: &Path, nonce: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<SteerRecord>(line) {
+            Ok(record) if record.nonce.as_deref() != Some(nonce) => {
+                warn!(path = %source.display(), "Skipping an orchestrator steer record this scratch root did not write")
+            }
             Ok(record) => out.push(record.message),
             Err(e) => {
                 warn!(path = %source.display(), error = %e, "Skipping unparsable steering mailbox line")
