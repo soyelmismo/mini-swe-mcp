@@ -90,6 +90,15 @@ impl Raw {
     }
 }
 
+/// A pool over this test's own scratch root.
+///
+/// [`common::IsolatedPool`] rather than [`WorkerPool::new`], which resolves its
+/// root from the process environment: a watch here must follow only the workers
+/// this test inserted, never a row the host's real registry happens to hold.
+fn isolated_pool(tag: &str) -> common::IsolatedPool {
+    common::IsolatedPool::new(4, tag)
+}
+
 async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
     let scratch = common::TempDir::new_in_tmp("watch-pool");
     let pool = WorkerPool::with_scratch(
@@ -686,8 +695,8 @@ fn one_watch_call_replays_every_missed_event() {
 /// is re-evaluated on every poll instead of frozen at the first one.
 #[tokio::test]
 async fn a_no_arg_watch_action_follows_late_dispatches() {
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let owned = isolated_pool("watch-mcp");
+    let pool = owned.pool.clone().with_manifest(Arc::new(ModelManifest::default()));
     pool.__test_insert_worker(record(
         "w-mcp-first",
         mini_swe_mcp::mcp::LOCAL_AGENT,
@@ -754,8 +763,8 @@ async fn a_no_arg_watch_action_follows_late_dispatches() {
 async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
     let hub = common::TempDir::new_in_tmp("watch-late-hub");
     let swe = common::TempDir::new_in_tmp("watch-late-swe");
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let owned = isolated_pool("watch-mcp");
+    let pool = owned.pool.clone().with_manifest(Arc::new(ModelManifest::default()));
     let owner = common::host_of_this_process();
     pool.__test_insert_worker(record(
         "w-late-first",
@@ -1012,8 +1021,8 @@ async fn the_daemon_allows_one_watch_per_identity() {
 /// The MCP `watch` action obeys the same one-watch-per-identity rule.
 #[tokio::test]
 async fn the_mcp_watch_action_allows_one_watch_per_identity() {
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let owned = isolated_pool("watch-mcp");
+    let pool = owned.pool.clone().with_manifest(Arc::new(ModelManifest::default()));
     pool.__test_insert_worker(record(
         "w-mcp-one",
         mini_swe_mcp::mcp::LOCAL_AGENT,
@@ -1090,8 +1099,8 @@ async fn the_mcp_watch_action_allows_one_watch_per_identity() {
 async fn a_second_cli_watch_for_one_session_exits_zero_when_covered() {
     let hub = common::TempDir::new_in_tmp("wg-cli-hub");
     let swe = common::TempDir::new_in_tmp("wg-cli-swe");
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
-        .with_manifest(Arc::new(ModelManifest::default()));
+    let owned = isolated_pool("watch-mcp");
+    let pool = owned.pool.clone().with_manifest(Arc::new(ModelManifest::default()));
     let owner = common::host_of_this_process();
     pool.__test_insert_worker(record(
         "w-cli-one",
@@ -1216,7 +1225,8 @@ fn a_build_slot_wait_keeps_the_idle_clock_at_zero() {
 /// wait ends, so the exposed state tracks admission exactly.
 #[tokio::test]
 async fn the_pool_exposes_then_clears_a_build_slot_wait() {
-    let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string());
+    let owned = isolated_pool("watch-slot-pool");
+    let pool = owned.pool.clone();
     pool.__test_insert_worker(record(
         "w-slot-pool",
         "local",
