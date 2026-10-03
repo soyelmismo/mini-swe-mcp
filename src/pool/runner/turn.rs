@@ -44,6 +44,7 @@
 //! ([`ProgressWatch::note_harness_progress`]).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::Duration;
 
@@ -195,9 +196,13 @@ const REPEAT_BLOCK_LIMIT: usize = 3;
 /// Answer handed to the model that re-issues the command of the turn before.
 const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
 
-/// Runs of one base command inside one window that make a loop. Four is one
-/// past the pair an honest cycle spends on the same command, so a worker that
-/// alternates its steps is never called a loop.
+/// Runs of one base command inside one window that make a loop.
+///
+/// Four runs of one command inside twelve turns, with nothing changed and
+/// nothing new in the answer, is repetition rather than work: a worker that is
+/// narrowing a failure re-runs the command with a different filter, a different
+/// result or an edit in between, and a worker that alternates its steps never
+/// reaches four.
 const LOOP_RUN_COUNT: usize = 4;
 
 /// Turns of the sliding window the loop detector looks back over.
@@ -254,13 +259,11 @@ enum LoopVerdict {
 struct LoopDetector {
     /// The last [`LOOP_WINDOW_TURNS`] answered turns, oldest first.
     window: VecDeque<LoopStep>,
-    /// Base commands the nudge has already been sent for, with the run count
-    /// it was sent on, newest last and bounded so the table cannot grow with
-    /// the run.
-    nudged: Vec<(String, usize)>,
-    /// Base commands the worker has already been parked for, with the run
-    /// count it was parked on.
-    paused: Vec<(String, usize)>,
+    /// Base commands the nudge has already been sent for, newest last and
+    /// bounded so the table cannot grow with the run.
+    nudged: Vec<String>,
+    /// Base commands the worker has already been parked for.
+    paused: Vec<String>,
     /// Worktree content fingerprint of the last recorded turn.
     last_state: Option<u64>,
 }
@@ -283,8 +286,17 @@ impl LoopDetector {
         digest: u64,
         state: Option<u64>,
     ) -> LoopVerdict {
+        // An empty window is a fresh episode: the worker ran nothing for a
+        // whole window, so a base it looped on before earns its nudge again.
+        if self.window.is_empty() {
+            self.nudged.clear();
+        }
         let changed = matches!((self.last_state, state), (Some(a), Some(b)) if a != b);
-        self.last_state = state;
+        // A sample git could not answer leaves the last known state in place:
+        // a failed sample is never read as "nothing changed".
+        if state.is_some() {
+            self.last_state = state;
+        }
         self.window.push_back(LoopStep {
             step,
             base: base.to_string(),
@@ -321,24 +333,21 @@ impl LoopDetector {
             return LoopVerdict::None;
         }
 
-        // A base that was already parked is never parked again.
-        if self.paused.iter().any(|(b, _)| b == base) {
+        // A base that was already parked is never parked again: the
+        // orchestrator has been told, and a second question about the same
+        // loop would only cost it another decision.
+        if self.paused.iter().any(|b| b == base) {
             return LoopVerdict::None;
         }
 
-        let nudged_on = self
-            .nudged
-            .iter()
-            .find(|(b, _)| b == base)
-            .map_or(0, |(_, n)| *n);
-        if nudged_on == 0 {
-            remember_command(&mut self.nudged, base, runs);
+        if !self.nudged.iter().any(|b| b == base) {
+            remember_base(&mut self.nudged, base);
             return LoopVerdict::Nudge { count: runs };
         }
-        if runs < nudged_on + LOOP_PAUSE_RUN {
+        if runs < LOOP_RUN_COUNT + LOOP_PAUSE_RUN {
             return LoopVerdict::None;
         }
-        remember_command(&mut self.paused, base, 1);
+        remember_base(&mut self.paused, base);
         LoopVerdict::Pause { count: runs }
     }
 
@@ -355,26 +364,41 @@ impl LoopDetector {
     }
 }
 
-/// Remember `base` in a bounded list of (base, runs), evicting the oldest
-/// entry when the list is full.
-fn remember_command(list: &mut Vec<(String, usize)>, base: &str, runs: usize) {
-    if let Some((_, recorded)) = list.iter_mut().find(|(b, _)| b == base) {
-        *recorded = runs;
+/// Remember `base` in a bounded list, evicting the oldest entry when the list
+/// is full: the detector remembers which commands it already answered so it
+/// can escalate on a recurrence, and a table that grew with the run would be
+/// the unbounded growth the crate forbids.
+fn remember_base(list: &mut Vec<String>, base: &str) {
+    if list.iter().any(|b| b == base) {
         return;
     }
     if list.len() >= LOOP_TRACKED_BASES {
         list.remove(0);
     }
-    list.push((base.to_string(), runs));
+    list.push(base.to_string());
 }
 
-/// The digest of one run's output: a hash of the output text. Two runs "say
-/// the same thing" when the digests match, so the detector can hold the digest
-/// instead of the output itself.
+/// The digest of one run's output: a hash of the output with every run of
+/// digits folded to a single `#`.
+///
+/// Counts, timings, line numbers and addresses move between two runs of one
+/// command without changing what the output *says*, so they must not read as
+/// new information. The words around them still do, which is what tells a
+/// worker that its last edit moved the failure somewhere else.
 fn output_digest(output: &str) -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    output.hash(&mut hasher);
+    let mut in_digits = false;
+    for byte in output.bytes() {
+        if byte.is_ascii_digit() {
+            if !in_digits {
+                hasher.write_u8(b'#');
+                in_digits = true;
+            }
+            continue;
+        }
+        in_digits = false;
+        hasher.write_u8(byte);
+    }
     hasher.finish()
 }
 
@@ -1161,9 +1185,9 @@ fn worktree_state_of(path: &Path) -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(&output.stdout, &mut hasher);
-    Some(std::hash::Hasher::finish(&hasher))
+    let mut hasher = DefaultHasher::new();
+    output.stdout.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Read a `git diff --shortstat` line as `(files, insertions, deletions)`.
@@ -3495,8 +3519,11 @@ mod tests {
     fn new_information_and_edits_break_the_loop() {
         // Same base, but the output keeps changing: never a loop.
         let mut detector = LoopDetector::default();
-        for step in 0..8 {
-            let digest = output_digest(&format!("{step} passed"));
+        for (step, word) in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+            .into_iter()
+            .enumerate()
+        {
+            let digest = output_digest(&format!("failure in {word}"));
             assert!(matches!(
                 detector.record(step, "cargo test", Some(1), digest, Some(5)),
                 LoopVerdict::None
@@ -3517,6 +3544,32 @@ mod tests {
                 LoopVerdict::None
             ));
         }
+    }
+
+    /// A count or a timing that moved is not new information: the same
+    /// failure with a different number in it is still the same answer.
+    #[test]
+    fn a_digit_only_change_is_not_new_information() {
+        let first = output_digest("837 passed; 1 failed; finished in 0.42s");
+        let second = output_digest("838 passed; 1 failed; finished in 0.51s");
+        assert_eq!(first, second);
+        // The words around the numbers still count.
+        assert_ne!(
+            output_digest("test result: FAILED. 1 failed"),
+            output_digest("test result: ok. 0 failed")
+        );
+
+        let mut detector = LoopDetector::default();
+        let mut nudges = 0;
+        for step in 0..4 {
+            let digest = output_digest(&format!("837 passed; 1 failed; finished in 0.{step}s"));
+            if let LoopVerdict::Nudge { count } = detector.record(step, "cargo test", Some(1), digest, Some(2))
+            {
+                assert_eq!(count, 4);
+                nudges += 1;
+            }
+        }
+        assert_eq!(nudges, 1);
     }
 
     /// The nudge and the pause question carry the phrases the orchestrator and
