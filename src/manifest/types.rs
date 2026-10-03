@@ -67,9 +67,7 @@ pub(crate) const BULLET_PREFIX: &str = "- ";
 /// budget with it, not against the bullets alone: a block whose bullets fit
 /// under the cap can still push the rendered section over it. Built from the
 /// renderer's own text by `catalog`, so the two cannot drift apart.
-pub(crate) const FRAMING_OVERHEAD: usize = 2
-    + super::catalog::MODEL_INSTRUCTIONS_HEADER.len()
-    + 1;
+pub(crate) const FRAMING_OVERHEAD: usize = 2 + super::catalog::MODEL_INSTRUCTIONS_HEADER.len() + 1;
 
 /// Bytes the prompt spends on everything *around* the instruction bullets when
 /// the block has been cut: [`FRAMING_OVERHEAD`] plus the truncation note and its

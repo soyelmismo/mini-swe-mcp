@@ -548,6 +548,13 @@ fn test_a_block_under_the_bullet_budget_but_over_the_section_budget_is_cut() {
         "models:\n  small:\n    id: combo:small\n    instructions:\n      - {entry}\n      - tail\n"
     );
     let raw: ModelManifest = serde_yaml::from_str(&yaml).expect("parses");
+    assert!(
+        raw.validate()
+            .iter()
+            .any(|w| w.contains("instructions") && w.contains("budget")),
+        "the block must be warned about exactly when it is cut: {:?}",
+        raw.validate()
+    );
     let manifest = raw.normalize();
 
     let repo = TempDir::new_in_tmp("model-instructions-section-budget");

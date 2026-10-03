@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 
 use super::rules::join_known;
 use super::types::{
-    DEFAULT_MAX_TURNS, MAX_MODEL_INSTRUCTIONS_BYTES, MAX_TURNS_LIMIT, ModelInstructions,
-    ModelManifest,
+    DEFAULT_MAX_TURNS, FRAMING_OVERHEAD, MAX_MODEL_INSTRUCTIONS_BYTES, MAX_TURNS_LIMIT,
+    ModelInstructions, ModelManifest,
 };
 
 impl ModelManifest {
@@ -177,7 +177,11 @@ impl ModelManifest {
         instructions: &ModelInstructions,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
-        let len = instructions.rendered_len();
+        // The budget bounds the *emitted* section, not just the bullets, so the
+        // warning fires exactly when [`ModelInstructions::truncate_to`] would
+        // cut: a block whose bullets alone sit under the cap can still overrun
+        // it once the header framing is counted.
+        let len = FRAMING_OVERHEAD + instructions.rendered_len();
         if len > MAX_MODEL_INSTRUCTIONS_BYTES {
             warnings.push(format!(
                 "model \"{alias}\": instructions are {len} bytes, above the \
