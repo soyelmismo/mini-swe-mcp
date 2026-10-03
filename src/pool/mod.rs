@@ -336,6 +336,21 @@ pub struct WorkerPool {
     /// dispatched worker even when two share a whole-second `started_at`.
     dispatch_order: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     next_dispatch_seq: Arc<AtomicU64>,
+    /// How long [`WorkerPool::kill_all`] waits for live workers' teardowns to
+    /// finish before it releases the hub lock. Resolved once at construction so
+    /// a test pool can pin it without mutating the process environment.
+    teardown_wait: Duration,
+}
+
+/// The default teardown wait: how long the hub's shutdown waits for live
+/// workers' teardowns before it leaves their `.teardown` markers behind.
+///
+/// The bound keeps a stuck `git` in one worker's cleanup from hanging the whole
+/// handover; the workers that miss it are waited on by the replacement hub
+/// through their markers. `MINI_SWE_TEARDOWN_WAIT_SECS` overrides it; the
+/// default is generous enough for a normal teardown.
+fn default_teardown_wait() -> Duration {
+    Duration::from_secs(crate::config::env_parse("MINI_SWE_TEARDOWN_WAIT_SECS").unwrap_or(60))
 }
 
 impl WorkerPool {
@@ -408,6 +423,7 @@ impl WorkerPool {
             terminal_ttl,
             manifest: Arc::new(ModelManifest::default()),
             dispatch_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            teardown_wait: default_teardown_wait(),
             next_dispatch_seq: Arc::new(AtomicU64::new(1)),
             scratch,
         }
@@ -573,6 +589,21 @@ impl WorkerPool {
     /// The model manifest this pool's workers resolve against.
     pub fn manifest(&self) -> &ModelManifest {
         &self.manifest
+    }
+
+    /// Pin how long [`Self::kill_all`] waits for live workers' teardowns.
+    ///
+    /// The replacement hub waits on the same value for a worker's `.teardown`
+    /// marker, so a test that wants the timeout path can set both at once
+    /// without touching the process environment (which parallel tests share).
+    pub fn with_teardown_wait(mut self, wait: Duration) -> Self {
+        self.teardown_wait = wait;
+        self
+    }
+
+    /// How long this pool's shutdown waits for a live worker's teardown.
+    pub fn teardown_wait(&self) -> Duration {
+        self.teardown_wait
     }
 
     /// Clone of the shared manifest `Arc`, for the MCP server to share.
@@ -2311,6 +2342,14 @@ impl WorkerPool {
                 WorktreeGuard::mark_interrupted(&path);
             }
         }
+        // The worktree each live worker owns, read once under a short guard so
+        // the abort loop below can mark a teardown without taking the lock.
+        let worktrees: std::collections::HashMap<String, PathBuf> = {
+            let map = self.worktrees.read().await;
+            live.iter()
+                .filter_map(|id| map.get(id).map(|path| (id.clone(), path.clone())))
+                .collect()
+        };
         let (count, entries, handles) = {
             let mut lock = self.workers.write().await;
             let mut count = 0usize;
@@ -2324,8 +2363,14 @@ impl WorkerPool {
                     continue;
                 }
                 if let Some(handle) = worker.handle.take() {
+                    // Mark the worktree's teardown *before* the abort drops the
+                    // guard: the marker is what makes the replacement hub wait
+                    // for a teardown that outlives the bounded wait below.
+                    if let Some(path) = worktrees.get(&worker.id) {
+                        WorktreeGuard::mark_teardown(path);
+                    }
                     handle.abort();
-                    handles.push(handle);
+                    handles.push((worker.id.clone(), handle));
                 }
                 worker.fail(Self::shutdown_message(&worker.id));
                 if let Some(entry) = self.interrupted_entry(worker) {
@@ -2336,14 +2381,35 @@ impl WorkerPool {
             }
             (count, entries, handles)
         };
-        // A planned shutdown must not release the hub lock until every
-        // worker's teardown has run to completion: the abort drops each
-        // worker's `WorktreeGuard`, whose `Drop` commits, unregisters and
-        // removes the worktree. Awaiting the aborted handles waits for that
-        // drop, so the replacement daemon never recovers a worker whose
-        // worktree is still being torn down.
-        for handle in handles {
-            let _ = handle.await;
+        // A planned shutdown must not release the hub lock until every worker's
+        // teardown has run to completion: the abort drops each worker's
+        // `WorktreeGuard`, whose `Drop` commits, unregisters and removes the
+        // worktree. Awaiting the aborted handles waits for that drop, so the
+        // replacement daemon never recovers a worker whose worktree is still
+        // being torn down.
+        //
+        // The wait is bounded: a teardown blocked on a stuck `git` (lock
+        // contention, a hung hook, NFS) must not hang the whole handover with
+        // the daemon half-stopped. A worker whose drop did not finish keeps its
+        // `.teardown` marker, and the replacement hub waits on that marker
+        // before it auto-continues the worker, so the ordering guarantee holds
+        // through the timeout path too.
+        let deadline = tokio::time::Instant::now() + self.teardown_wait;
+        let mut unfinished: Vec<String> = Vec::new();
+        for (id, handle) in handles {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, handle).await.is_err() {
+                // Dropping the handle leaves the teardown task running in this
+                // process; it removes the marker itself when it does finish.
+                unfinished.push(id);
+            }
+        }
+        if !unfinished.is_empty() {
+            warn!(
+                workers = unfinished.len(),
+                wait_secs = self.teardown_wait.as_secs(),
+                "Worker teardown exceeded the shutdown wait; the replacement hub will wait for its marker",
+            );
         }
         self.persist_kills(entries);
         count

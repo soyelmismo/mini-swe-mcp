@@ -512,6 +512,13 @@ impl HubServer {
         let candidates = pool.interrupted_workers().await;
         let mut resumed = 0;
         for id in candidates {
+            // A predecessor that outlived the bounded shutdown wait is still
+            // tearing this worker's worktree down in its own process. Wait for
+            // its `.teardown` marker to clear (bounded) before recreating the
+            // checkout, or the two remove/create calls race exactly as H18.
+            if !self.teardown_settled(&id).await {
+                continue;
+            }
             let budget = pool.auto_continue_budget(&id).await;
             if budget == 0 {
                 info!(
@@ -535,6 +542,42 @@ impl HubServer {
             }
         }
         resumed
+    }
+
+    /// Wait, bounded, for a worker's predecessor teardown to finish.
+    ///
+    /// Returns `true` when the worker's worktree is safe to recreate: no
+    /// `.teardown` marker, or one whose owning process is gone. Returns `false`
+    /// when the marker still names a live process at the deadline, so the
+    /// worker stays interrupted for the orchestrator instead of racing a
+    /// teardown that would delete the checkout out from under the recreation.
+    async fn teardown_settled(&self, id: &str) -> bool {
+        let path = self
+            .server
+            .pool()
+            .scratch_root()
+            .join(format!("swe-wt-{id}"));
+        if !crate::worktree::WorktreeGuard::teardown_pending(&path) {
+            return true;
+        }
+        // One clear line: the predecessor is provably slow, and the operator
+        // needs to know why this worker is not being continued yet.
+        info!(worker = %id, "Predecessor is still tearing this worker's worktree down; waiting for it");
+        let deadline = tokio::time::Instant::now() + self.server.pool().teardown_wait();
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if !crate::worktree::WorktreeGuard::teardown_pending(&path) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    worker = %id,
+                    wait_secs = self.server.pool().teardown_wait().as_secs(),
+                    "Predecessor teardown did not finish in time; leaving the worker interrupted",
+                );
+                return false;
+            }
+        }
     }
 
     /// Recover the previous hub's workers and auto-continue them, then open
