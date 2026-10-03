@@ -32,7 +32,7 @@ pub(super) mod help;
 mod kill;
 mod logs;
 mod manifest;
-mod merge;
+pub(super) mod merge;
 mod prune_reap;
 pub(super) mod review;
 pub(super) mod status_list;

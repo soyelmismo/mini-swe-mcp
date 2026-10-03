@@ -237,6 +237,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "boolean",
         DescriptionSource::Static("Keep the branch."),
     ),
+    (
+        "force",
+        "boolean",
+        DescriptionSource::Static(super::handlers::merge::FORCE_DESCRIPTION),
+    ),
 ];
 
 /// Render one table row as a JSON Schema property object.

@@ -2524,7 +2524,20 @@ impl<'a> TurnEngine<'a> {
             // one-line headline. They are recorded here, on the meta, so the
             // terminal state and row both carry them without a second pass
             // over the history log.
-            let verdicts = crate::pool::state::parse_verdict_lines(&llm_resp.content);
+            let mut verdicts = crate::pool::state::parse_verdict_lines(&llm_resp.content);
+            // A round that no longer matches its own record is the orchestrator's
+            // last chance to hear about it: a member revised after the
+            // integration commits again, so `merge <consolidator>` will refuse.
+            // Said here, on the completion event and in the watch line, rather
+            // than only at merge time, where the whole round has already been
+            // reviewed. One line per worker, counted, and never dropped -- the
+            // lines ride in the risk group, which is read before the payload is
+            // rendered.
+            let unintegrated =
+                crate::pool::unintegrated_workers_in(&self.pool.scratch, self.worker_id);
+            for worker in &unintegrated {
+                verdicts.push_risk_bounded(worker.line());
+            }
             if !verdicts.is_empty() {
                 *self.verdicts = Some(verdicts);
                 self.meta.verdicts = self.verdicts.clone();

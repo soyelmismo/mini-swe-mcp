@@ -240,6 +240,25 @@ impl WorkerVerdicts {
         self.workers.is_empty() && self.risks.is_empty()
     }
 
+    /// Append one harness-derived risk line, charged against the same
+    /// [`VERDICT_BYTES`] budget the parsed lines are.
+    ///
+    /// The consolidator completion path adds its own lines (a worker whose
+    /// commits never reached the round) after the model's, so the bound has to
+    /// be enforced here too: the type promises at most [`VERDICT_BYTES`] survive,
+    /// whichever path built the value.
+    pub fn push_risk_bounded(&mut self, line: String) {
+        let spent: usize = self
+            .workers
+            .iter()
+            .chain(self.risks.iter())
+            .map(|line| line.len() + 1)
+            .sum();
+        if spent + line.len() + 1 <= VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
+            self.risks.push(line);
+        }
+    }
+
     /// The lines a notification shows, one per line: the per-worker verdicts
     /// then the risks.
     pub fn lines(&self) -> Vec<&str> {
