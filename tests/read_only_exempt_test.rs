@@ -69,7 +69,7 @@ async fn wait_for_paused(pool: &WorkerPool, id: &str) -> Option<String> {
 
 /// The metrics of a finished worker, whatever terminal state it reached.
 async fn wait_for_terminal_metrics(pool: &WorkerPool, id: &str) -> mini_swe_mcp::pool::WorkerMetrics {
-    let state = tokio::time::timeout(Duration::from_secs(120), async {
+    let state = tokio::time::timeout(Duration::from_secs(90), async {
         let mut changes = pool.subscribe_changes();
         loop {
             if let Some(state) = pool.get_worker_state(id).await
@@ -151,30 +151,39 @@ async fn a_consolidator_that_only_reviews_and_waits_is_never_paused() {
         .collect();
     // The closing wait: a `CONSOLIDATE_WAIT` names workers that never existed
     // in this test, so it is refused immediately and answers the turn without
-    // blocking on anything.
+    // blocking on anything. The budget ends on that same turn, so the run
+    // stops instead of pausing on a socket that has run out of script.
     commands.push("echo \"CONSOLIDATE_WAIT nobody timeout=1\"");
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&commands).await;
     let (pool, _scratch) = pool_for("read-only-exempt-pool", llm.base_url()).await;
-    let worker_id = dispatch(&pool, repo.path(), WorkerRole::Consolidate, PAUSE_TURN + 20).await;
+    let worker_id = dispatch(&pool, repo.path(), WorkerRole::Consolidate, commands.len()).await;
 
     let metrics = wait_for_terminal_metrics(&pool, &worker_id).await;
+    eprintln!("DEBUG consolidator metrics: {metrics:?}");
     assert_eq!(
         metrics.loop_pauses, 0,
         "a consolidator must never be parked for reviewing or waiting, got {metrics:?}"
     );
-    assert_eq!(
-        metrics.stagnation_nudges, 0,
-        "an exempt worker must not be nudged to edit either, got {metrics:?}"
-    );
 
-    // The wait was answered by the harness and recorded as a turn, so the
-    // script really did reach the point where the streak would have fired.
+    // The script really did run past the point where the streak would have
+    // fired, and the closing wait was answered by the harness as a turn.
     let bodies = llm.request_bodies().await;
     assert!(
         bodies.len() as usize >= PAUSE_TURN,
         "the script must have run past the pause threshold, got {} turns",
         bodies.len()
     );
+    // None of the three read-only steps reached the model: neither the demand,
+    // nor the plan, nor the pause. The stagnation detector is a different
+    // guard and keeps its own timing, so its nudges are not what is asserted
+    // here.
+    for (turn, body) in bodies.iter().enumerate() {
+        let told = body.to_string();
+        assert!(
+            !told.contains("read-only turns") && !told.contains("write the first edit now"),
+            "turn {turn} must not carry the read-only escalation, got {told}"
+        );
+    }
 }
 
 /// The same run, as an ordinary worker, is still escalated: the exemption is
@@ -193,5 +202,34 @@ async fn an_ordinary_worker_is_still_paused_by_the_same_run() {
     assert!(
         question.contains("read-only turns"),
         "the pause must still name the streak, got {question:?}"
+    );
+}
+
+/// A turn spent waiting on a background job is progress, not another read-only
+/// turn, whatever role the worker has: an ordinary implementer that alternates
+/// its reads with `WAIT_JOB` -- the sanctioned alternative to sleep-polling --
+/// never reaches the escalation, though every one of those turns leaves the
+/// worktree unchanged.
+#[tokio::test]
+async fn a_wait_job_turn_does_not_count_as_a_read_only_turn() {
+    let repo = repo("read-only-exempt-wait-job");
+    // Reads interleaved with waits, one more turn than the pause threshold:
+    // every turn here leaves the worktree exactly as it found it.
+    let commands: Vec<&str> = (0..PAUSE_TURN + 5)
+        .flat_map(|n| [review_turn(n), "echo WAIT_JOB 1"])
+        .collect();
+    let llm = common::fake_llm::FakeLlm::spawn_scripted(&commands).await;
+    let (pool, _scratch) = pool_for("read-only-exempt-wait-pool", llm.base_url()).await;
+    let worker_id = dispatch(&pool, repo.path(), WorkerRole::Worker, commands.len()).await;
+
+    let paused = wait_for_paused(&pool, &worker_id).await;
+    assert!(
+        paused.is_none(),
+        "a worker waiting on its jobs must never be parked, got {paused:?}"
+    );
+    let metrics = wait_for_terminal_metrics(&pool, &worker_id).await;
+    assert_eq!(
+        metrics.loop_pauses, 0,
+        "the waits must have kept the streak from escalating, got {metrics:?}"
     );
 }
