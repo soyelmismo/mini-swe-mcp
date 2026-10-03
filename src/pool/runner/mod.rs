@@ -615,22 +615,20 @@ impl WorkerPool {
             .into_iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
             .collect();
-        let requested = match security_skip {
-            // A revision whose security review was skipped must not run the
-            // security review the dispatch asked for: that is the duplicate this
-            // scope exists to avoid.
-            Some(_) => requested.map(|(model, _)| (model, ReviewMode::Quality)),
-            None => requested,
-        };
-        let review_plan = match (requested, sensitive.is_empty()) {
+        // A skip is absolute for the security review: neither a requested
+        // `--review-after <m>:security` nor the automatic sensitive-path
+        // trigger may re-run the audit that already stands. A requested *quality*
+        // review still runs, because it is not the audit this scope defers.
+        let review_plan = match (&security_skip, requested, sensitive.is_empty()) {
+            (Some(_), requested, _) => requested.map(|(model, _)| (model, ReviewMode::Quality)),
             // A requested review on a sensitive diff is upgraded to the
             // adversarial mode; the requested model still runs it.
-            (Some((model, _)), false) => Some((model, ReviewMode::Security)),
-            (Some((model, wanted)), true) => Some((model, wanted)),
+            (None, Some((model, _)), false) => Some((model, ReviewMode::Security)),
+            (None, Some((model, wanted)), true) => Some((model, wanted)),
             // No requested review, but the diff is sensitive: trigger the
             // security review on the manifest's strongest tier, falling back
             // to the implementer's own model when the manifest marks none.
-            (None, false) => {
+            (None, None, false) => {
                 let model = self
                     .manifest()
                     .strongest_alias()
@@ -638,7 +636,7 @@ impl WorkerPool {
                     .unwrap_or_else(|| model.clone());
                 Some((model, ReviewMode::Security))
             }
-            (None, true) => None,
+            (None, None, true) => None,
         };
         if let Some(reason) = security_skip {
             info!(worker = %worker_id, "{reason}");

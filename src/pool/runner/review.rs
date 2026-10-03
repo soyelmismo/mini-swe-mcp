@@ -335,25 +335,13 @@ pub async fn scope_for(
     }
 }
 
-/// Decide what one run's security review has to cover.
+/// Decide what one run's security review has to cover, from the worktree's own
+/// facts.
 ///
-/// * A first run, with no earlier approval, reviews the whole diff since the
-///   base commit (`SecurityScope::Full`).
-/// * A revision with a recorded approval reviews only the commits after that
-///   approved commit (`SecurityScope::Since`). When nothing came after it, the
-///   scope is empty and the caller skips the review and logs why.
-/// * A consolidator reviews only its *own* commits — its interaction fixes and
-///   conflict resolutions — excluding the worker branches it merged, each
-///   already security-reviewed at its own approved commit. It does so whenever
-///   the security review is otherwise wanted; the worker list comes from the
-///   consolidated branches, so the set difference is over real reviewed
-///   histories rather than a marker on the row.
-///
-/// `security_wanted` says a security review is otherwise due for this run
-/// (a requested `--review-after <m>:security`, or a consolidator, whose own
-/// commits always need the adversarial pass). When it is `false` and there is no
-/// approval to scope from, the whole diff is returned but the caller's ordinary
-/// trigger still decides whether to review at all.
+/// A thin adapter over [`scope_for`], which holds the rule; this only supplies
+/// the branch, base commit and merged worker branches the guard already carries,
+/// so the phase loop and any other reader cannot drift apart on what a security
+/// review covers.
 pub(super) async fn security_scope(
     worktree: &WorktreeGuard,
     role: WorkerRole,
