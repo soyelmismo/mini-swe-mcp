@@ -2530,14 +2530,14 @@ impl<'a> TurnEngine<'a> {
             // integration commits again, so `merge <consolidator>` will refuse.
             // Said here, on the completion event and in the watch line, rather
             // than only at merge time, where the whole round has already been
-            // reviewed. One line per worker, counted, and never dropped -- the
-            // lines ride in the risk group, which is read before the payload is
-            // rendered.
-            let unintegrated =
-                crate::pool::unintegrated_workers_in(&self.pool.scratch, self.worker_id);
-            for worker in &unintegrated {
-                verdicts.push_risk_bounded(worker.line());
-            }
+            // reviewed. One line per worker, counted, charged to the verdict
+            // budget as the harness's own -- a padded report cannot decide
+            // whether the operator is told.
+            verdicts.push_risks_bounded(
+                crate::pool::unintegrated_workers_in(&self.pool.scratch, self.worker_id)
+                    .iter()
+                    .map(|worker| worker.line()),
+            );
             if !verdicts.is_empty() {
                 *self.verdicts = Some(verdicts);
                 self.meta.verdicts = self.verdicts.clone();

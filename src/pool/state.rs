@@ -240,27 +240,53 @@ impl WorkerVerdicts {
         self.workers.is_empty() && self.risks.is_empty()
     }
 
-    /// Append one harness-derived risk line, charged against the same
+    /// Append harness-derived risk lines, charged against the same
     /// [`VERDICT_BYTES`] budget the parsed lines are.
     ///
-    /// The consolidator completion path adds its own lines (a worker whose
-    /// commits never reached the round) after the model's, so the bound has to
-    /// be enforced here too: the type promises at most [`VERDICT_BYTES`] survive,
-    /// whichever path built the value.
-    pub fn push_risk_bounded(&mut self, line: String) {
-        let spent: usize = self
-            .workers
-            .iter()
-            .chain(self.risks.iter())
-            .map(|line| line.len() + 1)
-            .sum();
+    /// The consolidator completion path adds its own lines (a round member
+    /// whose commits never reached the round) *after* the model's, and the
+    /// model's lines are what spends the budget: without this, a report padded
+    /// with long `RISK:` lines would decide for itself whether the harness
+    /// warning survives, and model-written text would gate what the operator is
+    /// told. So the model's own lines give way first -- the trailing risks, then
+    /// the per-worker verdicts -- counted and named by the same marker
+    /// [`bounded`] uses, and the caller's lines land whatever the model wrote.
+    /// The budget still bounds the result: it is [`VERDICT_BYTES`] over, not
+    /// unbounded, so a caller that hands over more lines than fit keeps the
+    /// first ones that do.
+    pub fn push_risks_bounded<I: IntoIterator<Item = String>>(&mut self, lines: I) {
+        let lines: Vec<String> = lines.into_iter().collect();
+        if lines.is_empty() {
+            return;
+        }
+        let charged = |v: &Self| -> usize {
+            v.workers
+                .iter()
+                .chain(v.risks.iter())
+                .map(|line| line.len() + 1)
+                .sum()
+        };
+        let wanted: usize = lines.iter().map(|line| line.len() + 1).sum();
+        let mut dropped = 0usize;
         // Charged the way `parse_verdict_lines` charges a line: the newline
         // that joins it to the next one, and the notice held back for the
         // truncation marker.
-        if spent + line.len() + 1 > VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
-            return;
+        while charged(self) + wanted > VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
+            match self.risks.pop().or_else(|| self.workers.pop()) {
+                Some(line) => dropped += line.len() + 1,
+                None => break,
+            }
         }
-        self.risks.push(line);
+        if dropped > 0 {
+            self.risks
+                .push(format!("... [{dropped} more verdict lines dropped]"));
+        }
+        for line in lines {
+            if charged(self) + line.len() + 1 > VERDICT_BYTES {
+                break;
+            }
+            self.risks.push(line);
+        }
     }
 
     /// The lines a notification shows, one per line: the per-worker verdicts
@@ -1002,9 +1028,9 @@ mod tests {
     use super::super::buffer::LogBuffer;
     use super::super::unix_timestamp;
     use super::{
-        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat, WorkerMetrics,
-        WorkerRecord, WorkerState, churn_line, expired_terminal_ids, file_stats_of_diff,
-        retention_expired,
+        DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS, FileStat, VERDICT_BYTES,
+        WorkerMetrics, WorkerRecord, WorkerState, churn_line, expired_terminal_ids,
+        file_stats_of_diff, parse_verdict_lines, retention_expired,
     };
     use std::collections::HashMap;
 
@@ -1332,6 +1358,65 @@ mod tests {
         assert!(
             expired_terminal_ids(&workers, 1).is_empty(),
             "a record younger than the TTL must survive so collect() still works"
+        );
+    }
+
+    // ----------
+    // WorkerVerdicts::push_risks_bounded
+    // ----------
+
+    /// A report padded with long risk lines must not be able to swallow the
+    /// harness's own line: model-written text must not decide whether the
+    /// operator is told that a round member's commits never landed.
+    #[test]
+    fn harness_lines_outrank_a_padded_model_report() {
+        let padded = (0..12)
+            .map(|i| format!("RISK: {i} {}", "x".repeat(390)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut verdicts = parse_verdict_lines(&padded);
+        assert!(!verdicts.risks.is_empty(), "the padded report must be kept");
+        verdicts.push_risks_bounded(["UNINTEGRATED worker wa: 1 commit(s)".to_string()]);
+        assert!(
+            verdicts
+                .risks
+                .iter()
+                .any(|line| line.contains("UNINTEGRATED")),
+            "the harness line must survive a padded report: {:?}",
+            verdicts.risks
+        );
+        // The budget still holds: the eviction bought room, it did not raise it.
+        let spent: usize = verdicts
+            .workers
+            .iter()
+            .chain(verdicts.risks.iter())
+            .map(|line| line.len() + 1)
+            .sum();
+        assert!(
+            spent <= VERDICT_BYTES,
+            "verdicts must stay within the budget: {spent} > {VERDICT_BYTES}"
+        );
+        // The model's own lines are the ones that went, and the payload says so.
+        assert!(
+            verdicts
+                .risks
+                .iter()
+                .any(|line| line.contains("verdict lines dropped")),
+            "the eviction must be counted, not silent"
+        );
+    }
+
+    /// An empty payload is a no-op, so the completion path can call it
+    /// unconditionally, and a line that fits is appended after the model's.
+    #[test]
+    fn harness_lines_are_appended_when_they_fit() {
+        let mut verdicts = parse_verdict_lines("RISK: one\nVERDICT wa: fixed\n");
+        verdicts.push_risks_bounded(Vec::new());
+        assert_eq!(verdicts.risks, vec!["RISK: one".to_string()]);
+        verdicts.push_risks_bounded(["UNINTEGRATED worker wa: 2 commit(s)".to_string()]);
+        assert_eq!(
+            verdicts.risks.last().map(String::as_str),
+            Some("UNINTEGRATED worker wa: 2 commit(s)")
         );
     }
 }

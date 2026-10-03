@@ -1396,6 +1396,24 @@ pub fn merge_approved_in(
         );
     }
 
+    // A round lands whole or not at all, whichever entry point is used, so the
+    // batch owes the orchestrator the same provenance refusal `merge <id>`
+    // takes: an approved consolidator whose members carry commits it never
+    // integrated must not land through `--approved` either. It runs here,
+    // before the gate worktree is built and before any branch is merged, so a
+    // refused batch leaves the repository exactly as it was. The batch has no
+    // override of its own -- landing such a round is a decision about one
+    // worker, so the way past the refusal is `merge <id> --force`.
+    for (id, worker) in &included {
+        let unintegrated = unintegrated_members(root, repo, id, worker.branch.as_str());
+        if !unintegrated.is_empty() {
+            anyhow::bail!(
+                "{} Merge it on its own with `merge {id} --force` to land the round anyway.",
+                unintegrated_refusal(id, &unintegrated)
+            );
+        }
+    }
+
     // One gate for the whole batch, on the combined tree.
     let gate_command = shared_gate_command(repo, &included)?;
     let gate_req = MergeRequest {
