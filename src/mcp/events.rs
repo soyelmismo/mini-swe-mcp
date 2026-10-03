@@ -2140,7 +2140,7 @@ impl EventRouter {
         // Stale stall episodes dropped from this reply: the loop below reads the
         // backlog through a shared borrow, so they are collected here and
         // forgotten once that borrow is released.
-        let mut suppressed: Vec<String> = Vec::new();
+        let mut suppressed: Vec<(String, String)> = Vec::new();
         for (agent, history) in &self.watch_history {
             if !ctx.is_admin() && *agent != owner {
                 continue;
@@ -2174,7 +2174,10 @@ impl EventRouter {
                         // Collected, not acted on: the loop below holds the
                         // backlog borrowed, so the drop happens once it is
                         // released.
-                        suppressed.push(v["worker_id"].as_str().unwrap_or("").to_string());
+                        suppressed.push((
+                            agent.clone(),
+                            v["worker_id"].as_str().unwrap_or("").to_string(),
+                        ));
                         continue;
                     }
                     let now = crate::pool::unix_timestamp();
@@ -2190,10 +2193,16 @@ impl EventRouter {
                 events.push(event);
             }
         }
-        // The stale episodes are now dropped and marked seen, so a later watch
+        // The stale episodes are dropped from the backlog, so a later watch
         // does not replay a stall the detector itself would never have raised.
-        for wid in &suppressed {
-            self.mark_seen(&owner, wid.as_str());
+        //
+        // Only the stall episode goes: `mark_seen` would also forget every
+        // *other* queued transition of that worker and record an ack for its
+        // last reported event, so a group-scoped watch that suppressed w0's
+        // stale stall silently destroyed w0's queued `completed` in another
+        // group -- a terminal event the owner then never learns about.
+        for (agent, wid) in &suppressed {
+            self.drop_stalled_episode(agent, wid);
         }
         events.sort_by_key(|v| v["sequence"].as_u64());
         // An explicit terminal id is reported immediately even if another
@@ -2343,6 +2352,22 @@ impl EventRouter {
                 // Round delivery is an acknowledgment too, including after restart.
                 self.mark_seen(&agent, &id);
             }
+        }
+    }
+
+    /// Forget only the queued *stall* episodes of `wid` under `agent`.
+    ///
+    /// A stall is an episode, not a transition: a worker that has since started
+    /// a command made the queued stall stale, and the stall rule would never
+    /// have raised it. Dropping just the episode leaves every other queued
+    /// transition -- including a terminal `completed`/`failed` the owner has
+    /// not read yet -- in place, and records no acknowledgement, so the replay
+    /// guard cannot swallow a real event either.
+    fn drop_stalled_episode(&mut self, agent: &str, wid: &str) {
+        if let Some(history) = self.watch_history.get_mut(agent) {
+            history
+                .pending
+                .retain(|v| !(v["worker_id"] == wid && v["event"] == "stalled"));
         }
     }
 

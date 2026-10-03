@@ -1753,10 +1753,17 @@ fn a_queued_stall_does_not_report_a_worker_with_a_command_in_flight() {
     );
 }
 
-/// PROOF (adversarial): suppressing a stale stall must not destroy the
-/// worker's *other* queued transitions that this same watch does not deliver.
+/// Suppressing a stale stall episode must not destroy the worker's *other*
+/// queued transitions.
+///
+/// A stall is an episode, not a transition, so dropping one is safe. Dropping
+/// the whole backlog for that worker is not: `mark_seen` forgets every queued
+/// event the worker has, so a group-scoped watch that suppressed `w0`'s stale
+/// stall in group `g` silently destroyed `w0`'s queued `completed` in group
+/// `other` -- a terminal event the owner then never learns about, on a watch
+/// that never delivered it either.
 #[test]
-fn zz_proof_suppressing_a_stall_keeps_other_queued_events() {
+fn suppressing_a_stale_stall_keeps_the_workers_other_queued_events() {
     let mut router = EventRouter::default();
     let now = crate::pool::unix_timestamp();
     let idle = json!({
@@ -1765,16 +1772,14 @@ fn zz_proof_suppressing_a_stall_keeps_other_queued_events() {
         "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
         "metrics": WorkerMetrics::default(),
     });
+    // The stall episode queues while the worker is idle and running.
     router.observe_watch([("w0".to_string(), idle.clone())].into());
+    // The worker starts a harness-side wait: same step, now in flight.
     let mut waiting = idle;
     waiting["command_started_at"] = json!(now);
     router.observe_watch([("w0".to_string(), waiting)].into());
-    // A genuine queued transition for the SAME worker that a *paused* status
-    // will not be delivered by: the stall replay path `continue`s on a
-    // non-running status, dropping the event WITHOUT delivering it, yet
-    // mark_seen also wipes it from the backlog. Simulate: the owner asks for
-    // a DIFFERENT group, so neither event is in scope for delivery, but the
-    // suppression still fires for the stall.
+    // A real terminal transition for the same worker, in another group: this
+    // watch must not deliver it, and suppressing the stall must not eat it.
     router.watch_history.get_mut("o").expect("history").pending.push_back(json!({
         "worker_id": "w0", "owner": "o", "group": "other", "event": "completed",
         "status": "completed", "step": 5, "revision": 2, "sequence": 99,
@@ -1783,12 +1788,15 @@ fn zz_proof_suppressing_a_stall_keeps_other_queued_events() {
     }));
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
-    // This watch is scoped to group g, so the `other`-group event is not
-    // matched and never delivered, but the stall IS suppressed+mark_seen.
+    // Scoped to group g: the stale stall is suppressed, the completion is out
+    // of scope and undelivered.
     let reply = router
-        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false}),
+        )
         .unwrap();
-    assert_eq!(reply["events"], json!([]), "stall suppressed: {reply}");
+    assert_eq!(reply["events"], json!([]), "the stale stall is suppressed: {reply}");
     let left: Vec<String> = router.watch_history["o"]
         .pending
         .iter()
@@ -1797,6 +1805,20 @@ fn zz_proof_suppressing_a_stall_keeps_other_queued_events() {
     assert_eq!(
         left,
         vec!["completed".to_string()],
-        "PROBE: an out-of-scope queued completion must survive suppressing a stale stall"
+        "an undelivered terminal event must survive suppressing a stale stall"
+    );
+    // And a watch of that other group still delivers it.
+    let later = router
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"other", "initial":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        later["events"][0]["event"], "completed",
+        "the completion must still reach the owner: {later}"
     );
 }
+
+
+
