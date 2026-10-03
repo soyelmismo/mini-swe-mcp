@@ -268,6 +268,15 @@ fn log_nonce_path_in(root: &ScratchRoot) -> PathBuf {
 /// difference between the two trust models -- "the file exists" (plantable) and
 /// "only this pool could have written this file" (not, without the secret).
 ///
+/// That only holds if the pool *chooses* the value, so the nonce is created
+/// with `O_EXCL` and an existing file is never adopted: the name is fixed and
+/// predictable in the shared base, and a value found there is one the local
+/// user chose, so trusting it would hand them the very trust this exists to
+/// establish. A file already at the name is read back only when it is a regular
+/// file with owner-only permissions -- which is what this pool's own `0600`
+/// create leaves -- and refused otherwise, so a planted, linked or
+/// world-readable file authenticates nothing.
+///
 /// The nonce is per *scratch root*, not per process, so a consolidator started
 /// later verifies the records the orchestrator wrote before it. It is created
 /// on first use, owner-only, and never leaves the root; if it cannot be created
@@ -304,10 +313,12 @@ fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
     // nonce cannot authenticate anything.
     match create_nonce_exclusive(&path, &fresh) {
         // This call created the file, so the value it wrote is the secret.
-        Ok(true) => return Some(fresh),
-        // The name was already taken: the existing content is not trusted on
-        // the strength of having been found.
-        Ok(false) => {}
+        // This call created the file, so the value it wrote is the secret.
+        Ok(()) => return Some(fresh),
+        // The name was already taken (`O_EXCL` reports it as `AlreadyExists`):
+        // the existing content is not trusted for merely having been found, so
+        // it is resolved below.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
             warn!(path = %path.display(), error = %e, "Cannot establish the steer-log nonce");
             return None;
@@ -324,11 +335,7 @@ fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
 }
 
 /// Create the nonce file exclusively, refusing a link and an existing name.
-///
-/// `Ok(true)` is this call creating the file; `Ok(false)` is the name already
-/// taken, which the caller resolves through [`read_back_owned_nonce`] rather
-/// than by believing whatever was found there.
-fn create_nonce_exclusive(path: &Path, value: &str) -> std::io::Result<bool> {
+fn create_nonce_exclusive(path: &Path, value: &str) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true) // `O_EXCL|O_CREAT`: never adopt, never truncate.
@@ -336,7 +343,7 @@ fn create_nonce_exclusive(path: &Path, value: &str) -> std::io::Result<bool> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     file.write_all(value.as_bytes())?;
-    Ok(true)
+    Ok(())
 }
 
 /// Read the nonce back, but only from a file this pool can prove it wrote.

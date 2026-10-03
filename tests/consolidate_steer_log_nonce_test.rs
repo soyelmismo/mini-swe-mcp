@@ -14,8 +14,8 @@ mod common;
 
 use common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::pool::{
-    LogBuffer, RegistryStatus, WorkerRecord,
-    WorkerRegistryEntry, WorkerRole, WorkerState, save_registry_entry_in,
+    LogBuffer, RegistryStatus, WorkerRecord, WorkerRegistryEntry, WorkerRole, WorkerState,
+    save_registry_entry_in,
 };
 
 const OWNER: &str = "agent-a";
@@ -180,5 +180,87 @@ async fn a_genuine_steer_cannot_be_signed_with_a_planted_nonce() {
     assert!(
         !shown.iter().any(|s| s.contains("PLANTED-AMENDMENT-2")),
         "a planted nonce must not authenticate a forged record next to a genuine one: {shown:?}"
+    );
+}
+
+/// A nonce file that anything outside this user can read is refused even
+/// though it sits at the right name with a plausible value: the pool's own
+/// create leaves `0600`, so group- or world-accessible means somebody else
+/// wrote it and knows the value.
+#[tokio::test]
+async fn a_world_readable_nonce_file_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo("steer-log-nonce-world-repo");
+    let pool = IsolatedPool::new(4, "steer-log-nonce-world");
+    let worker = format!("w3-{}", unique_suffix("w"));
+    file_row(&repo, &pool, &worker);
+
+    std::fs::write(pool.root().join(".steer-log-nonce"), "readable-by-all").unwrap();
+    std::fs::set_permissions(
+        pool.root().join(".steer-log-nonce"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::write(
+        pool.scratch
+            .path()
+            .join(format!("swe-wt-{worker}.steer-log.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "message": "PLANTED-AMENDMENT-3: world-readable nonce accepted",
+                "sent_at": 1_u64,
+                "pid": 1_u32,
+                "nonce": "readable-by-all",
+            })
+        ),
+    )
+    .unwrap();
+
+    let manifest = pool.pool.round_manifest(OWNER, GROUP, repo.path()).await;
+    let shown = steers_of(&manifest);
+    assert!(
+        !shown.iter().any(|s| s.contains("PLANTED-AMENDMENT-3")),
+        "a nonce readable outside this user is one another local user knows: {shown:?}"
+    );
+}
+
+/// A symlink planted at the nonce name must not be followed: it aims the
+/// secret at a file the attacker controls (and can rewrite), which would let
+/// them choose the value the reader then authenticates records against.
+#[tokio::test]
+async fn a_symlinked_nonce_file_is_refused() {
+    let repo = repo("steer-log-nonce-link-repo");
+    let pool = IsolatedPool::new(4, "steer-log-nonce-link");
+    let worker = format!("w4-{}", unique_suffix("w"));
+    file_row(&repo, &pool, &worker);
+
+    // The attacker-controlled file holding the value they want adopted.
+    let elsewhere = TempDir::new_in_tmp("steer-log-nonce-link-target");
+    let attacker = elsewhere.path().join("attacker-nonce");
+    std::fs::write(&attacker, "attacker-via-link").unwrap();
+    std::os::unix::fs::symlink(&attacker, pool.root().join(".steer-log-nonce")).unwrap();
+
+    std::fs::write(
+        pool.scratch
+            .path()
+            .join(format!("swe-wt-{worker}.steer-log.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "message": "PLANTED-AMENDMENT-4: nonce adopted through a link",
+                "sent_at": 1_u64,
+                "pid": 1_u32,
+                "nonce": "attacker-via-link",
+            })
+        ),
+    )
+    .unwrap();
+
+    let manifest = pool.pool.round_manifest(OWNER, GROUP, repo.path()).await;
+    let shown = steers_of(&manifest);
+    assert!(
+        !shown.iter().any(|s| s.contains("PLANTED-AMENDMENT-4")),
+        "the nonce name must not be followed through a planted link: {shown:?}"
     );
 }
