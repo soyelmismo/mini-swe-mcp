@@ -481,8 +481,13 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
 }
 
 /// Wait until the hub log holds at least `count` lines mentioning `event`.
+///
+/// The event is produced by a real daemon process the test (or its watch)
+/// spawns; on a loaded host its exec and bind can take many seconds, so the
+/// deadline carries margin. The wait returns as soon as the count is reached,
+/// so an unloaded run is unaffected.
 async fn wait_for_log(hub_dir: &std::path::Path, event: &str, count: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let seen = std::fs::read_to_string(hub_dir.join("hub.log"))
             .map(|log| {
