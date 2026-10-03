@@ -327,4 +327,4 @@ pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
 pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.";
 
 pub(in crate::mcp) const NETWORK_DESCRIPTION: &str =
-    "Network: 'offline' isolates every step (no egress).";
+    "Network: 'offline' isolates every step (no egress); 'allow' (default) keeps it.";

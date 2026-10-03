@@ -50,7 +50,7 @@
           },
           "diff": {
             "default": "code",
-            "description": "Diff scope for 'review': 'code' (default) hides tests, 'all' all, 'none' none.",
+            "description": "Diff scope for 'review'; 'code' hides tests.",
             "enum": [
               "code",
               "all",
@@ -85,7 +85,7 @@
             "type": "boolean"
           },
           "max_turns": {
-            "description": "Max bash turns (overrides default); on 'steer', the budget for a stopped worker.",
+            "description": "Max bash turns; on 'steer', a stopped worker's budget.",
             "maximum": 500,
             "minimum": 1,
             "type": "integer"
@@ -125,7 +125,7 @@
           },
           "scope": {
             "default": "mine",
-            "description": "'list' scope: 'mine' (default) or 'all' (admin).",
+            "description": "'list'/'archive' scope: 'mine' (default) or 'all' (admin).",
             "enum": [
               "mine",
               "all"
@@ -183,7 +183,7 @@
             "type": "array"
           },
           "temperature": {
-            "description": "Model temperature (overrides default).",
+            "description": "Model temperature.",
             "maximum": 2.0,
             "minimum": 0.0,
             "type": "number"
@@ -206,7 +206,7 @@
             "type": "string"
           },
           "worker_ids": {
-            "description": "Worker IDs to watch, as 'worker_id' prefixes. Omitted: your own workers.",
+            "description": "Worker IDs to watch as 'worker_id' prefixes; omitted: your own.",
             "items": {
               "type": "string"
             },
