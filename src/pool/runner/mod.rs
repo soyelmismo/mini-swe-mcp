@@ -584,7 +584,11 @@ impl WorkerPool {
         let security_mode = ReviewMode::resolve_declared("security", self.manifest());
         // An empty reviewer (a bare `:mode`) falls back to the mode's default
         // reviewer, then to the implementer's own model.
-        let resolve_reviewer = |requested_model: String, mode_name: &str, manifest: &crate::manifest::ModelManifest, implementer: &str| -> String {
+        let resolve_reviewer = |requested_model: String,
+                                mode_name: &str,
+                                manifest: &crate::manifest::ModelManifest,
+                                implementer: &str|
+         -> String {
             if !requested_model.trim().is_empty() {
                 return requested_model;
             }

@@ -263,10 +263,22 @@ mod tests {
         let out = format_manifest(&v(r#"{"default_model":"z","models":{"a":{"id":"a-model"}},
                  "review_modes":{"perf":{"checklist":"Check.","model":"nerd"},"style":{"checklist":"Names."}}}"#));
         assert!(out.contains("Review modes:"), "modes are listed: {out}");
-        assert!(out.contains("- quality (built-in)"), "built-ins are listed: {out}");
-        assert!(out.contains("- security (built-in)"), "built-ins are listed: {out}");
-        assert!(out.contains("- perf (model: nerd)"), "default model is shown: {out}");
-        assert!(out.contains("- style"), "a mode without a model is listed: {out}");
+        assert!(
+            out.contains("- quality (built-in)"),
+            "built-ins are listed: {out}"
+        );
+        assert!(
+            out.contains("- security (built-in)"),
+            "built-ins are listed: {out}"
+        );
+        assert!(
+            out.contains("- perf (model: nerd)"),
+            "default model is shown: {out}"
+        );
+        assert!(
+            out.contains("- style"),
+            "a mode without a model is listed: {out}"
+        );
         // Sorted by name after the built-ins.
         let perf = out.find("- perf").expect("perf row");
         let style = out.find("- style").expect("style row");
@@ -276,7 +288,10 @@ mod tests {
     #[test]
     fn test_format_manifest_lists_only_builtins_without_declared_modes() {
         let out = format_manifest(&v(r#"{"models":{"a":{"id":"a-model"}}}"#));
-        assert!(out.contains("Review modes:"), "the section is always present: {out}");
+        assert!(
+            out.contains("Review modes:"),
+            "the section is always present: {out}"
+        );
         assert!(out.contains("- quality (built-in)"));
         assert!(out.contains("- security (built-in)"));
     }

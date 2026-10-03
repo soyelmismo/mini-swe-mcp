@@ -197,7 +197,8 @@ impl ModelManifest {
             Self::normalize_policy(&mut def.policy);
         }
 
-        self.review_modes.retain(|_, def| !def.checklist.trim().is_empty());
+        self.review_modes
+            .retain(|_, def| !def.checklist.trim().is_empty());
 
         self
     }

@@ -59,7 +59,9 @@ fn an_empty_checklist_warns_and_is_dropped_by_normalize() {
     );
     let warnings = manifest.validate();
     assert!(
-        warnings.iter().any(|w| w.contains("empty") && w.contains("checklist")),
+        warnings
+            .iter()
+            .any(|w| w.contains("empty") && w.contains("checklist")),
         "an empty checklist must warn: {warnings:?}"
     );
     let normalized = manifest.normalize();
@@ -90,8 +92,7 @@ fn parse_with_manifest_uses_the_mode_default_for_an_empty_model() {
     let manifest = modes_manifest(
         "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
     );
-    let (model, mode) =
-        ReviewMode::parse_with_manifest(":perf", &manifest).expect("perf mode");
+    let (model, mode) = ReviewMode::parse_with_manifest(":perf", &manifest).expect("perf mode");
     assert_eq!(model, "nerd");
     assert_eq!(mode.name, "perf");
 }
@@ -101,8 +102,7 @@ fn parse_with_manifest_keeps_colon_model_ids_as_quality() {
     let manifest = ModelManifest::default();
     // `combo:nerd` is a model id, not a mode: the suffix names no mode and
     // the whole string is a known model.
-    let (model, mode) =
-        ReviewMode::parse_with_manifest("combo:nerd", &manifest).expect("model id");
+    let (model, mode) = ReviewMode::parse_with_manifest("combo:nerd", &manifest).expect("model id");
     assert_eq!(model, "combo:nerd");
     assert_eq!(mode.name, "quality");
     assert_eq!(mode.checklist, None);
@@ -119,7 +119,10 @@ fn an_unknown_mode_is_refused_with_the_available_ones() {
     assert!(message.contains("unknown review mode"), "{message}");
     assert!(message.contains("nope"), "{message}");
     for available in ["quality", "security", "perf"] {
-        assert!(message.contains(available), "{message} must list {available}");
+        assert!(
+            message.contains(available),
+            "{message} must list {available}"
+        );
     }
 }
 
@@ -422,7 +425,11 @@ async fn a_custom_mode_uses_its_checklist_and_reviewer() {
     let state = wait_for_terminal(&pool, &worker_id).await;
 
     let requests = server.requests.lock().await.clone();
-    assert_eq!(requests.len(), 3, "write, implementer, and the custom review");
+    assert_eq!(
+        requests.len(),
+        3,
+        "write, implementer, and the custom review"
+    );
     assert_eq!(
         requests[2]["model"],
         json!("test-reviewer"),
@@ -471,5 +478,8 @@ async fn an_unknown_mode_is_a_dispatch_error() {
     let message = err.to_string();
     assert!(message.contains("unknown review mode"), "{message}");
     assert!(message.contains("nope"), "{message}");
-    assert!(message.contains("perf"), "{message} must list the declared mode");
+    assert!(
+        message.contains("perf"),
+        "{message} must list the declared mode"
+    );
 }
