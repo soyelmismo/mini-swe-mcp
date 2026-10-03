@@ -17,6 +17,7 @@
               "unapprove",
               "logs",
               "list",
+              "archive",
               "kill",
               "discard",
               "reap",
@@ -210,6 +211,10 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "last": {
+            "description": "Only the N most recent.",
+            "type": "integer"
           }
         },
         "required": [

@@ -214,6 +214,7 @@ impl Fixture {
                 verified: Some(true),
                 keep_branch: true,
                 admission: None,
+                archive_dir: None,
             },
         )?;
         // No exemption list: the retirement marked the row, and the sweep
@@ -232,6 +233,7 @@ impl Fixture {
                 verified: Some(true),
                 keep_branch: false,
                 admission: None,
+                archive_dir: None,
             },
         )
         .map(|_| ())
@@ -247,6 +249,7 @@ impl Fixture {
                 verified: Some(true),
                 keep_branch: false,
                 admission: None,
+                archive_dir: None,
             },
         )
     }

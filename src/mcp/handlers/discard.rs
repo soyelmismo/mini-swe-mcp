@@ -51,6 +51,7 @@ impl McpServer {
             _ => {}
         }
         let root = self.pool.scratch_root().clone();
+        let hub_dir = crate::hub::hub_dir().ok();
         let worker_id = wid.to_string();
         // The retirement shells out to git, so it runs off the runtime thread.
         let outcome = tokio::task::spawn_blocking(move || {
@@ -59,13 +60,18 @@ impl McpServer {
                 &worker_id,
                 &crate::pool::RetireContext {
                     repo: repo.as_deref(),
+                    // A discard is the one retirement with no commit behind it:
+                    // the work is abandoned, not landed.
+                    reason: Some(crate::pool::RetireReason::Discarded),
+                    merge_commit: None,
                     // The persisted watch acknowledgements live in the hub
                     // directory, which only the hub daemon knows, and
                     // `retire_and_forget` below drops them through the event
                     // router instead: the router owns that file whenever it
                     // exists and rewrites it on the spot, so the file and its
-                    // memory can never disagree.
-                    ack_dir: None,
+                    // memory can never disagree. The same directory receives the
+                    // discarded worker's final REPORT line.
+                    ack_dir: hub_dir.as_deref(),
                     keep_branch: false,
                 },
             )

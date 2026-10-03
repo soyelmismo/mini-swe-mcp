@@ -343,6 +343,9 @@ fn print_help() {
     println!("  merge --approved [--group <group>]");
     println!("           Land every approved worker of a group with ONE gate on the combined");
     println!("           result: a conflicting worker is skipped, the rest merge with --no-ff.");
+    println!("  archive [--group <group>] [--last <n>]");
+    println!("           Final reports of already-retired workers (merge, discard, retention):");
+    println!("           done/files/tests/risks, the task, the gate verdict and why it left.");
     println!("  reap");
     println!("           Evict expired terminal worker records.");
     println!("  prune");

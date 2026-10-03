@@ -7,6 +7,7 @@
 use anyhow::Result;
 use serde_json::{Map, Value};
 
+mod archive;
 mod collect;
 mod consolidate;
 mod dispatch;
@@ -54,6 +55,7 @@ pub fn tool_args(
         "steer" => steer::build(cli_args, &mut tool_args)?,
         "approve" | "unapprove" => review::build(action, cli_args, &mut tool_args)?,
         "list" => list::build(cli_args, &mut tool_args)?,
+        "archive" => archive::build(cli_args, &mut tool_args)?,
         "manifest" | "reap" | "prune" => {}
         _ => {
             let actions = crate::cli::available_actions();

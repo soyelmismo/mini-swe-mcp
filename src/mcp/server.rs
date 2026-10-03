@@ -296,7 +296,7 @@ impl McpServer {
         // Background reaper: bounds the memory held by terminal worker records
         // even when the orchestrator never calls `collect`. The hub daemon
         // starts its own once for every connection it serves.
-        let reaper = crate::pool::spawn_reaper((*self.pool).clone());
+        let reaper = crate::pool::spawn_reaper((*self.pool).clone(), crate::hub::hub_dir().ok());
 
         info!("Mini-SWE-MCP server listening on stdio");
         // The stdio transport has no `hub/hello` handshake, so the ambient
