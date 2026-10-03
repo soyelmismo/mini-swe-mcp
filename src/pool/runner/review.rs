@@ -512,13 +512,21 @@ impl SecurityScope {
     }
 }
 
-/// The merged worker branches a consolidator may leave out of its own audit.
+/// The approvals a consolidator may treat as already audited, one approved
+/// commit per merged worker that has one.
 ///
-/// Dropping a merged branch is a claim that the code it carries was already
-/// reviewed at its own approved commit. `integrated` proves only that the merge
-/// happened, so the approval has to be checked separately: a worker merged
-/// without one -- never reviewed, or reviewed before the field existed -- keeps
-/// its branch in scope and is audited by the consolidator rather than by nobody.
+/// Dropping a merged worker's code is a claim that it was reviewed at its own
+/// approved commit. `integrated` proves only that the merge happened, so the
+/// approval has to be checked separately: a worker merged without one -- never
+/// reviewed, or reviewed before the field existed -- keeps its branch in scope
+/// and is audited by the consolidator rather than by nobody.
+///
+/// The exclusion is the **approved commit**, never the branch name. A branch
+/// keeps growing after its review: the worker that merged it went on, and a
+/// consolidator steering that worker lands new commits on it. Excluding the
+/// branch's current tip would subtract those commits too and audit nothing --
+/// the exact hole this rule closes. Only what is reachable from the approved
+/// commit is known to be reviewed, so only that much is subtracted.
 ///
 /// `approvals` maps a worker id to the commit its security review approved, so
 /// the rule is one predicate the pipeline and the tests read alike.
@@ -526,11 +534,7 @@ pub fn approved_merged_branches(
     integrated: &[String],
     approvals: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    integrated
-        .iter()
-        .filter(|id| approvals(id).is_some())
-        .map(|id| format!("worker-{id}"))
-        .collect()
+    integrated.iter().filter_map(|id| approvals(id)).collect()
 }
 
 /// The review the pipeline will actually run, given the scope's skip decision,
@@ -592,8 +596,9 @@ fn is_object_id(value: &str) -> bool {
 ///
 /// * `approved` is the commit an earlier security review approved on this
 ///   branch, if any.
-/// * `merged` names the worker branches a consolidator integrated; a
-///   consolidator's scope excludes them.
+/// * `merged` names the commits a consolidator's merged workers were each
+///   security-approved at; a consolidator's scope excludes what those commits
+///   already cover, and nothing else.
 /// * `role` decides the exclusion; a plain worker is never treated as a
 ///   consolidator even if it names branches.
 pub async fn scope_for(
@@ -750,6 +755,45 @@ pub(super) async fn head_commit_of(path: &Path) -> Option<String> {
     .unwrap_or(None)
 }
 
+/// Whether the checkout at `path` has nothing uncommitted, so the commit the
+/// harness just made is exactly the tree `head` named.
+///
+/// This is the guard on recording a security approval as the harness's commit:
+/// the reviewer left the tree at `head`, and if nothing has touched it since,
+/// the harness's commit contains precisely the reviewed code. Anything else --
+/// the artifact sync, a steer landing mid-flight, a second checkpoint -- means
+/// that commit covers code no reviewer saw, and the approval must stay at `head`,
+/// which re-reviews the difference rather than missing it.
+///
+/// `false` whenever `head` is unknown: an unmeasurable tree is not a clean one.
+pub(super) async fn tree_matches_head(path: &Path, head: &Option<String>) -> bool {
+    let Some(head) = head.clone() else {
+        return false;
+    };
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // The branch must still point where the reviewer left it: a commit
+        // landing after the review (a second checkpoint, a steer that ran on)
+        // moved the tree even when the files are clean.
+        let still_at_head = crate::worktree::git(&path, "rev-parse", &["rev-parse", "HEAD"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head);
+        if !still_at_head {
+            return false;
+        }
+        // Intent-to-add first so a new file counts as a change, the same way the
+        // diff probe sees one.
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        crate::worktree::git(&path, "status", &["status", "--porcelain"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// The repository-relative files a worker's working tree changed against its
 /// base, uncommitted changes included.
 ///
@@ -830,7 +874,7 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
     let merged = merged.to_vec();
     tokio::task::spawn_blocking(move || {
         // Every commit of every merged branch, so `git log ... --not` leaves
-        // exactly the consolidator's own non-merge commits.
+        // exactly the consolidator's own commits.
         let mut exclusions: Vec<String> = merged
             .iter()
             .filter(|merged| *merged != &branch)
@@ -838,9 +882,41 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
             .collect();
         exclusions.sort();
         exclusions.dedup();
+        // `--remerge-diff` reports a merge commit's *resolution* -- what the
+        // consolidator decided on top of the automatic merge -- so a resolved
+        // sensitive file is named while a clean merge contributes none of the
+        // merged worker's files. It needs git 2.36; the fallback below keeps
+        // the resolutions in scope on an older git.
         let mut args: Vec<String> = vec![
             "log".to_string(),
-            "--no-merges".to_string(),
+            "--remerge-diff".to_string(),
+            "--name-only".to_string(),
+            "--format=".to_string(),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions.clone());
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let names = |out: Vec<u8>| -> Vec<String> {
+            let mut files: Vec<String> = String::from_utf8_lossy(&out)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            files.sort();
+            files.dedup();
+            files
+        };
+        if let Some(files) = crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| names(out.stdout))
+        {
+            return files;
+        }
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
             "--name-only".to_string(),
             "--format=".to_string(),
             branch.clone(),
@@ -851,17 +927,7 @@ pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> V
         crate::worktree::git(&path, "log", &borrowed)
             .ok()
             .filter(|out| out.status.success())
-            .map(|out| {
-                let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                files.sort();
-                files.dedup();
-                files
-            })
+            .map(|out| names(out.stdout))
             .unwrap_or_default()
     })
     .await
@@ -918,41 +984,118 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
 /// commit parents, so a worker branch that is itself an ancestor of another
 /// merged one cannot smuggle that ancestor's commits back into the review.
 pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+    own_history(path, branch, merged).await.0
+}
+
+/// A consolidator's own commits and the files they touched, one query.
+///
+/// The consolidator's work is its own commits *and* the conflict resolutions it
+/// recorded inside its merges. A merge commit is therefore in scope when it
+/// carries a resolution -- the part of it nobody else wrote -- and out of scope
+/// when it is a clean carrier of an already-reviewed worker branch. That is
+/// exactly what `--remerge-diff` reports: the difference between the merge
+/// result and the merge git would have made on its own, and nothing at all for
+/// a clean merge.
+async fn own_history(path: &Path, branch: &str, merged: &[String]) -> (Vec<String>, Vec<String>) {
     let path = path.to_path_buf();
     let branch = branch.to_string();
     let merged = merged.to_vec();
     tokio::task::spawn_blocking(move || {
-        let all = rev_list(&path, &branch);
-        if all.is_empty() {
-            return Vec::new();
-        }
         let exclusions: Vec<String> = merged
             .iter()
             .filter(|merged_branch| *merged_branch != &branch)
             .flat_map(|merged_branch| rev_list(&path, merged_branch))
             .collect();
-        if exclusions.is_empty() {
-            return all;
-        }
-        // `--not` flips every revision after it, so the merged branches' own
-        // commits are listed as `^sha` and subtracted from the branch.
+        // The history query: one marker line per commit the consolidator wrote
+        // or resolved, followed by the files of that commit's own change.
         let mut args: Vec<String> = vec![
-            "rev-list".to_string(),
+            "log".to_string(),
             "--reverse".to_string(),
-            "--no-merges".to_string(),
+            "--remerge-diff".to_string(),
+            "--name-only".to_string(),
+            format!("--format={OWN_COMMIT_MARKER}%H"),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions.clone());
+        let parsed = run_own_history(&path, &args);
+        if let Some(parsed) = parsed {
+            return parsed;
+        }
+        // `--remerge-diff` needs git 2.36. On an older git the same query
+        // without it is a superset -- every merge comes back, resolutions
+        // included -- so the audit is wider, never narrower. Returning `None`
+        // rather than an empty scope is the point: an empty scope would skip
+        // the review of a resolution nobody else wrote.
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
+            "--reverse".to_string(),
+            "--name-only".to_string(),
+            format!("--format={OWN_COMMIT_MARKER}%H"),
             branch.clone(),
             "--not".to_string(),
         ];
         args.extend(exclusions);
-        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-        crate::worktree::git(&path, "rev-list", &borrowed)
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| commits_in(out.stdout))
-            .unwrap_or(all)
+        run_own_history(&path, &args).unwrap_or_else(|| (rev_list(&path, &branch), Vec::new()))
     })
     .await
     .unwrap_or_default()
+}
+
+/// The commit-list prefix every line of the own-history query starts with, so
+/// the parser can tell a commit id from a file name without guessing.
+const OWN_COMMIT_MARKER: &str = "\u{1}own-commit\u{1}";
+
+/// Run the own-history query and split its output into commits and files.
+///
+/// A commit is the consolidator's own only when it carries a change of its own,
+/// which `--remerge-diff` reports as at least one file line under the commit's
+/// marker. A clean merge is listed with no file under it: it contributed nothing
+/// but the merged worker branch, which was reviewed at its own approved commit.
+fn run_own_history(path: &Path, args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = crate::worktree::git(path, "log", &borrowed)
+        .ok()
+        .filter(|out| out.status.success())?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut commits: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut listed: Option<String> = None;
+    let mut changed = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(commit) = line.strip_prefix(OWN_COMMIT_MARKER) {
+            // The previous commit ends here: keep it only if it changed
+            // something of its own.
+            if let Some(commit) = listed.take()
+                && changed
+            {
+                commits.push(commit);
+            }
+            let commit = commit.trim().to_string();
+            if commit.is_empty() {
+                continue;
+            }
+            listed = Some(commit);
+            changed = false;
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if listed.is_some() {
+            changed = true;
+            files.push(line.to_string());
+        }
+    }
+    if let Some(commit) = listed
+        && changed
+    {
+        commits.push(commit);
+    }
+    files.sort();
+    files.dedup();
+    Some((commits, files))
 }
 
 /// Commits reachable from `r#ref`, or empty when git cannot resolve it.
