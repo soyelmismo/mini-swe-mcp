@@ -478,8 +478,7 @@ fn normalize_command_base(command: &str) -> String {
     let segments = raw_segments(&one_line);
     let base = segments
         .iter()
-        .filter(|segment| !is_output_filter(segment))
-        .next_back()
+        .rfind(|segment| !is_output_filter(segment))
         .or_else(|| segments.iter().find(|segment| !segment.trim().is_empty()))
         .cloned()
         .unwrap_or_default();
@@ -625,7 +624,7 @@ fn is_output_filter(segment: &str) -> bool {
     let first = segment
         .split_whitespace()
         .next()
-        .map(|word| word.trim_start_matches(|c: char| c == '\\' || c == '$' || c == '('));
+        .map(|word| word.trim_start_matches(['\\', '$', '(']));
     match first {
         None => true,
         Some(word) => FILTERS.binary_search(&word).is_ok(),
@@ -2177,7 +2176,10 @@ impl<'a> TurnEngine<'a> {
             } else {
                 None
             };
-            match self.watch.note_loop_run(*self.step, &base, code, digest, state) {
+            match self
+                .watch
+                .note_loop_run(*self.step, &base, code, digest, state)
+            {
                 LoopVerdict::None => {}
                 LoopVerdict::Nudge { count } => {
                     self.watch.note_guard(*self.step);
@@ -3215,14 +3217,14 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressSummary,
-        ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
-        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
-        isolation_block, named_file_defaults, normalize_command_base, parse_shortstat,
-        parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
-        read_only_thresholds, summarized_task, task_names_files,
-        LoopDetector, LoopVerdict, loop_nudge_text, loop_pause_question, output_digest,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, LoopDetector, LoopVerdict,
+        MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
+        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
+        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
+        edit_plan_text, extension_budget, grant_extension, isolation_block, loop_nudge_text,
+        loop_pause_question, named_file_defaults, normalize_command_base, output_digest,
+        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
+        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -3426,7 +3428,9 @@ mod tests {
                     assert_eq!(count, 4);
                     nudges += 1;
                 }
-                LoopVerdict::Pause { .. } => panic!("the first detection nudges, it does not pause"),
+                LoopVerdict::Pause { .. } => {
+                    panic!("the first detection nudges, it does not pause")
+                }
             }
         }
         assert_eq!(nudges, 1);
@@ -3461,7 +3465,13 @@ mod tests {
         let mut nudged = false;
         let mut paused = false;
         for step in 0..10 {
-            match detector.record(step, "cargo test", Some(1), output_digest("837 passed"), Some(3)) {
+            match detector.record(
+                step,
+                "cargo test",
+                Some(1),
+                output_digest("837 passed"),
+                Some(3),
+            ) {
                 LoopVerdict::None => {}
                 LoopVerdict::Nudge { count } => {
                     assert_eq!(count, 4);
@@ -3497,7 +3507,13 @@ mod tests {
         for step in 0..8 {
             let state = 100 + (step / 2) as u64;
             assert!(matches!(
-                detector.record(step, "cargo test", Some(1), output_digest("837 passed"), Some(state)),
+                detector.record(
+                    step,
+                    "cargo test",
+                    Some(1),
+                    output_digest("837 passed"),
+                    Some(state)
+                ),
                 LoopVerdict::None
             ));
         }
@@ -3527,7 +3543,13 @@ mod tests {
         let mut watch = ProgressWatch::default();
         let fill = |watch: &mut ProgressWatch| {
             for step in 0..4 {
-                watch.note_loop_run(step, "cargo test", Some(1), output_digest("837 passed"), Some(7));
+                watch.note_loop_run(
+                    step,
+                    "cargo test",
+                    Some(1),
+                    output_digest("837 passed"),
+                    Some(7),
+                );
             }
         };
         // The first answer has nothing to be compared against, so it is
@@ -3590,7 +3612,10 @@ mod tests {
             normalize_command_base("git -C . log --oneline -n 5"),
             "git -C . log --oneline -n 5"
         );
-        assert_eq!(normalize_command_base("(cd sub && make) && echo done"), "echo done");
+        assert_eq!(
+            normalize_command_base("(cd sub && make) && echo done"),
+            "echo done"
+        );
         assert_eq!(
             normalize_command_base("awk '{print $2}' log.txt | sort | uniq -c"),
             "awk '{print $2}' log.txt"
