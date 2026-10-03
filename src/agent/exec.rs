@@ -1389,12 +1389,11 @@ impl Captured {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.tail);
-        trim_partial_tail(&mut out);
         // Snap the seam: head and tail are bounded independently, so a code
-        // point can straddle the join and leave `out` undecodable. Dropping the
-        // incomplete sequence on the head side keeps the contract -- valid
-        // UTF-8 out of `captured()` -- in one place instead of trusting every
-        // cut path to have got it right. At most 3 bytes of a 16 KiB budget.
+        // point can straddle the join and leave `out` undecodable. Trimming here
+        // keeps the contract -- valid UTF-8 out of `captured()` -- in one place
+        // instead of trusting every cut path to have got it right, and costs at
+        // most 3 bytes of the 16 KiB budget.
         trim_partial_tail(&mut out);
         out
     }
