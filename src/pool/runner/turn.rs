@@ -63,6 +63,10 @@ use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::super::revision::{WorkerHistory, append_history_message_in};
 use super::super::state::{WorkerReport, WorkerState, WorkerVerdicts};
 use super::super::steer::drain_steer_messages_in;
+use super::degenerate::{
+    DEGENERATE_PAUSE_STREAK, DEGENERATE_REPEAT_TURNS, DEGENERATE_REPLAY_WINDOW, degenerate_nudge,
+    degenerate_pause_question, is_degenerate, no_command_pause_question,
+};
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
@@ -81,6 +85,22 @@ pub(super) const VERIFICATION_OUTPUT_PREFIX: &str = "VERIFICATION FAILED (exit "
 /// Follow-up when the model produced no executable bash command.
 pub(super) const NO_COMMAND_NUDGE: &str =
     "ERROR: No bash command found. You MUST call the `bash` tool with your command.";
+
+/// Consecutive no-command turns that must happen before the engine stops
+/// trusting the replayed history and says so.
+///
+/// One turn is a hiccup a provider hands out for free; two in a row is the
+/// shape the observed failure took, so the reminder is added to the second
+/// rather than to a later one.
+const NO_COMMAND_REMIND_TURNS: usize = 2;
+
+/// Consecutive no-command turns that park the worker on the orchestrator.
+///
+/// The escalation exists because the loop is otherwise self-sustaining: the
+/// model answers with no tool call, the harness answers with the same
+/// [`NO_COMMAND_NUDGE`], and the model answers that identical prompt with the
+/// identical filler. One run did that for 55 turns before a human steered it.
+const NO_COMMAND_PAUSE_TURNS: usize = 5;
 
 /// Prefix of a tool output an isolation guard produced instead of running the
 /// command, paired with the short rule identifier the audit log carries.
@@ -1419,6 +1439,17 @@ pub(super) struct ProgressWatch {
     /// Digest of the last answer the harness gave a turn itself, so a repeated
     /// answer is not read as progress.
     last_harness_answer: Option<u64>,
+    /// The reasoning of the previous turn, for the byte-identical-across-turns
+    /// half of the degeneracy detector. Holds the value as stored, which the
+    /// accumulator already bounded to `MAX_STREAMED_CONTENT_BYTES`.
+    last_reasoning: Option<String>,
+    /// Consecutive turns whose reasoning was degenerate or byte-identical to
+    /// the previous turn's.
+    degenerate_turns: usize,
+    /// Step of the last degeneracy guard fire. The guard drops the replayed
+    /// reasoning until the model produces a sound one, so the next request
+    /// has to know whether the drop is still in force.
+    degenerate_guard_step: Option<usize>,
 }
 
 impl ProgressWatch {
@@ -1534,6 +1565,55 @@ impl ProgressWatch {
     /// Note that a repetition/stagnation/read-only guard fired at `step`.
     fn note_guard(&mut self, step: usize) {
         self.last_guard_step = Some(step);
+    }
+
+    /// Note that the degeneracy guard fired at `step`.
+    fn note_degenerate(&mut self, step: usize) {
+        self.degenerate_guard_step = Some(step);
+        self.note_guard(step);
+    }
+
+    /// Whether the degeneracy guard has fired within the last `window` steps,
+    /// i.e. whether the last turn's request still went out without the
+    /// replayed reasoning.
+    pub(super) fn replayed_reasoning_dropped(&self, step: usize) -> bool {
+        self.degenerate_guard_step
+            .is_some_and(|fired| step.saturating_sub(fired) <= DEGENERATE_REPLAY_WINDOW)
+    }
+
+    /// Record this turn's reasoning and report the degenerate streak it now
+    /// belongs to, or `None` when the reasoning is fine.
+    ///
+    /// Two shapes count, and both are the observed failure: a value that is
+    /// itself filler (one short pattern repeated), and a value byte-identical
+    /// to the previous turn's -- a model echoing back what it was fed, which
+    /// is how one degenerate value survives 55 turns once the harness replays
+    /// it. A turn the model answered with no reasoning at all is not
+    /// degenerate: that is the ordinary non-thinking shape.
+    fn register_reasoning(&mut self, reasoning: Option<&str>) -> Option<usize> {
+        let Some(reasoning) = reasoning else {
+            self.last_reasoning = None;
+            self.degenerate_turns = 0;
+            return None;
+        };
+        let repeated = self.last_reasoning.as_deref() == Some(reasoning);
+        self.last_reasoning = Some(reasoning.to_string());
+        // Filler is judged on its own text: one turn of it is already a model
+        // that has stopped thinking, and the value has to leave the replay
+        // before the model copies it a second time.
+        if is_degenerate(reasoning) {
+            self.degenerate_turns += 1;
+            return Some(self.degenerate_turns);
+        }
+        if !repeated {
+            self.degenerate_turns = 0;
+            return None;
+        }
+        // Byte-identical to the previous turn: a model quoting itself. Two
+        // turns of the same sentence can happen; the third consecutive
+        // identical value is the echo the observed run looped on.
+        self.degenerate_turns += 1;
+        (self.degenerate_turns >= DEGENERATE_REPEAT_TURNS).then_some(self.degenerate_turns)
     }
 
     /// The recent-history summary the budget-extension decision is pure over.
@@ -1736,6 +1816,24 @@ impl<'a> TurnEngine<'a> {
         // A provider outage is waited out (up to `outage_patience`) before the
         // orchestrator is asked, and a resume retries the step rather than
         // failing the worker on the next error.
+        // --- Degeneracy guard (both phases) ---
+        // The replayed reasoning of a turn that came back degenerate is what
+        // the model copies, so it is dropped from the request before the call
+        // rather than nagged about afterwards. The guard fires on the turn
+        // that produced the value and lapses one turn later, so a model that
+        // recovers gets its history back intact.
+        let drop_replayed = self.watch.replayed_reasoning_dropped(*self.step);
+        if drop_replayed {
+            let emptied = crate::agent::strip_replayed_reasoning(self.messages);
+            if emptied > 0 {
+                warn!(
+                    worker = %self.worker_id,
+                    step = *self.step,
+                    turns = emptied,
+                    "Dropping degenerate replayed reasoning from this request"
+                );
+            }
+        }
         let mut outage_waited = std::time::Duration::ZERO;
         let llm_resp = loop {
             compact_history(self.messages);
@@ -1841,6 +1939,7 @@ impl<'a> TurnEngine<'a> {
         config: &TurnConfig<'_>,
         llm_resp: LlmResponse,
     ) -> Result<TurnOutcome> {
+        let nudged = self.note_reasoning(config, &llm_resp).await?;
         // The REPORT block is not guaranteed to sit in the same assistant
         // message as the sentinel: the completion turn can carry the sentinel
         // while the block arrives in the one follow-up, or both are written
@@ -1886,16 +1985,7 @@ impl<'a> TurnEngine<'a> {
                     step = *self.step,
                     "No bash command in response; prompting subagent directly"
                 );
-                self.push_no_command_history(
-                    &llm_resp.content,
-                    llm_resp.reasoning_content,
-                    llm_resp.tool_calls,
-                );
-                if *self.consecutive_no_cmd < 2 {
-                    *self.consecutive_no_cmd += 1;
-                    *self.step = self.step.saturating_sub(1);
-                }
-                return Ok(TurnOutcome::NoCommand);
+                return self.no_command_turn(config, llm_resp, nudged).await;
             }
         };
 
@@ -3141,6 +3231,208 @@ impl<'a> TurnEngine<'a> {
             .reusable_verify_step(verify, &self.current_fingerprint().await?)
     }
 
+    /// Judge this turn's reasoning and, when it is degenerate, drop the
+    /// replayed reasoning from the next request, nudge the worker, and park it
+    /// on the orchestrator if it keeps happening.
+    ///
+    /// Runs before the rest of the turn so the drop is decided against the
+    /// turn that produced the value: a model that answers with filler gets a
+    /// history without that filler on the very next call, not three turns
+    /// later. The no-command path never reaches here, because that turn is
+    /// answered by [`Self::no_command_turn`] instead.
+    async fn note_reasoning(
+        &mut self,
+        config: &TurnConfig<'_>,
+        llm_resp: &LlmResponse,
+    ) -> Result<bool> {
+        let Some(streak) = self
+            .watch
+            .register_reasoning(llm_resp.reasoning_content.as_deref())
+        else {
+            return Ok(false);
+        };
+        let reasoning = llm_resp.reasoning_content.clone().unwrap_or_default();
+        self.watch.note_degenerate(*self.step);
+        self.push_message(ChatMessage::text(Role::User, degenerate_nudge()));
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            streak,
+            bytes = reasoning.len(),
+            "Reasoning came back degenerate; dropping the replayed reasoning"
+        );
+        if streak < DEGENERATE_PAUSE_STREAK {
+            return Ok(true);
+        }
+        self.meta.metrics.loop_pauses += 1;
+        let question = degenerate_pause_question(streak, Some(&reasoning));
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question: &question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: &format!("paused_degenerate_reasoning: {streak} turns"),
+                model: config.model,
+                meta: self.meta,
+            })
+            .await?;
+        let Some(answer) = answer else {
+            return Ok(true);
+        };
+        // A pause the orchestrator answered ends both streaks: the guidance is
+        // the model's chance to produce real reasoning again, and a counter
+        // left running would park the worker on the very next turn.
+        self.watch.degenerate_turns = 0;
+        *self.consecutive_no_cmd = 0;
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            msg = %answer,
+            "Worker resumed from the degeneracy pause by orchestrator guidance"
+        );
+        if !answer.trim().is_empty() && answer.trim() != "resume" {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Handle a turn the model answered without a bash command.
+    ///
+    /// The turn is always replayed (with its reasoning and any `tool_calls` it
+    /// did emit) and answered with [`NO_COMMAND_NUDGE`], because dropping it
+    /// would leave unanswered `tool_calls` in the history. What escalates is
+    /// what goes with it:
+    ///
+    /// * the second consecutive one replays the history with the reasoning
+    ///   stripped and adds a reminder of the tool contract, so a collapsed
+    ///   model is not fed its own filler back;
+    /// * the [`NO_COMMAND_PAUSE_TURNS`] one parks the worker on the
+    ///   orchestrator instead of looping, the step the observed run never
+    ///   reached in 55 turns;
+    /// * a reply the provider itself cut short (`length` / `content_filter`)
+    ///   is named as such in the pause question: the fix is a shorter history,
+    ///   not a nudge.
+    ///
+    /// A turn that costs no command costs no budget, which is why the step
+    /// counter is walked back: the run pays for commands, not for retries the
+    /// model did not ask for.
+    async fn no_command_turn(
+        &mut self,
+        config: &TurnConfig<'_>,
+        llm_resp: LlmResponse,
+        nudged: bool,
+    ) -> Result<TurnOutcome> {
+        self.meta.metrics.no_command_turns += 1;
+        // Either field collapsing is the same failure: a turn that is all
+        // filler carries nothing for the next one to build on, whichever
+        // channel the model put it in.
+        let degenerate = llm_resp
+            .reasoning_content
+            .as_deref()
+            .is_some_and(is_degenerate)
+            || is_degenerate(&llm_resp.content);
+        let truncated = llm_resp.is_truncated();
+        self.push_no_command_history(
+            &llm_resp.content,
+            llm_resp.reasoning_content.clone(),
+            llm_resp.tool_calls.clone(),
+        );
+        // The streak is what escalates, so it has to keep counting past the
+        // turns that are free; only the *budget* stops being refunded.
+        *self.consecutive_no_cmd += 1;
+        if *self.consecutive_no_cmd <= NO_COMMAND_REMIND_TURNS {
+            *self.step = self.step.saturating_sub(1);
+        }
+        let turns = *self.consecutive_no_cmd;
+        if degenerate {
+            // The drop stays in force however the turn is answered; only the
+            // message is skipped when the reasoning guard already sent it.
+            self.watch.note_degenerate(*self.step);
+            if !nudged {
+                self.push_message(ChatMessage::text(Role::User, degenerate_nudge()));
+            }
+        }
+        if turns >= NO_COMMAND_PAUSE_TURNS {
+            return self
+                .pause_on_no_command(config, &llm_resp, turns, degenerate, truncated)
+                .await;
+        }
+        Ok(TurnOutcome::NoCommand)
+    }
+
+    /// Park a worker that keeps answering without a tool call.
+    ///
+    /// The question names the mechanism, not just the symptom, because the two
+    /// fixes differ: a worker that stopped calling tools needs the contract
+    /// repeated, while one whose reply the provider truncated needs a shorter
+    /// history, and one whose reasoning is filler needs a different model.
+    async fn pause_on_no_command(
+        &mut self,
+        config: &TurnConfig<'_>,
+        llm_resp: &LlmResponse,
+        turns: usize,
+        degenerate: bool,
+        truncated: bool,
+    ) -> Result<TurnOutcome> {
+        self.meta.metrics.no_command_pauses += 1;
+        self.watch.note_guard(*self.step);
+        let question = no_command_pause_question(
+            &llm_resp.content,
+            llm_resp.reasoning_content.as_deref(),
+            turns,
+            degenerate,
+            truncated,
+        );
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            turns,
+            degenerate,
+            truncated,
+            "Model stopped calling tools; pausing for the orchestrator"
+        );
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question: &question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: &format!("paused_no_command: {turns} turns"),
+                model: config.model,
+                meta: self.meta,
+            })
+            .await?;
+        let Some(answer) = answer else {
+            return Ok(TurnOutcome::NoCommand);
+        };
+        // The pause was the orchestrator's decision to make, and making it
+        // spent the streak: the worker resumes with guidance the model has not
+        // seen, so a counter left running would park it again on the very next
+        // turn -- and a worker that is still broken is asked again rather than
+        // held here.
+        *self.consecutive_no_cmd = 0;
+        self.watch.degenerate_turns = 0;
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            msg = %answer,
+            "Worker resumed from the no-command pause by orchestrator guidance"
+        );
+        if !answer.trim().is_empty() && answer.trim() != "resume" {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(TurnOutcome::NoCommand)
+    }
+
     /// Record one executed exchange in the history: an assistant turn that
     /// called a tool is answered by a `tool` message with that call's id; a
     /// code-block (prose) turn is answered by a user message. The assistant
@@ -3318,6 +3610,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             invalid_utf8_lines: 0,
+            finish_reason: None,
         }
     }
 

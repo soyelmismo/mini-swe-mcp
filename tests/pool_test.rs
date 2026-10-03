@@ -1137,6 +1137,8 @@ fn measured_entry() -> WorkerRegistryEntry {
             verify_runs: 2,
             verify_failures: 1,
             isolation_blocks: 0,
+            no_command_turns: 0,
+            no_command_pauses: 0,
             diff_files: 5,
             diff_insertions: 120,
             diff_deletions: 340,
