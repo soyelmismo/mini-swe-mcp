@@ -16,8 +16,6 @@
 //! (see `audits/opt_07_step_log_memory.md`).
 
 use crate::common;
-use serde_json::json;
-use std::io::Write;
 use mini_swe_mcp::agent::AgentStepLog;
 use mini_swe_mcp::pool::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, LogBuffer, LogRetentionPolicy,
@@ -26,6 +24,8 @@ use mini_swe_mcp::pool::{
     WorkerRecord, WorkerRegistryEntry, WorkerState, build_step_log, clamp_string, emit_view,
     parse_ask_orchestrator, parse_request_turns, summarize_command,
 };
+use serde_json::json;
+use std::io::Write;
 
 /// Owner recorded for the synthetic workers these tests insert: the pool's
 /// lock discipline and registry coalescing are under test, not ownership.

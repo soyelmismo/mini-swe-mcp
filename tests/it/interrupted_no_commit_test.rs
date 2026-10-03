@@ -16,7 +16,6 @@
 //!   orphaned, because that conversation is what the continuation replays.
 
 use crate::common;
-use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord,
     WorkerRole, WorkerState, append_history_message_in, history_log_path_in,
@@ -24,6 +23,7 @@ use mini_swe_mcp::pool::{
     save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
+use std::path::{Path, PathBuf};
 
 const OWNER: &str = "interrupted-no-commit-test";
 

@@ -11,11 +11,11 @@
 //!   working tree emptied on.
 
 use crate::common;
-use std::path::Path;
-use std::time::Duration;
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState, opening_task_message};
 use mini_swe_mcp::worktree::ScratchRoot;
+use std::path::Path;
+use std::time::Duration;
 
 /// Owner recorded for the worker dispatched here: what is under test is the
 /// wording it is told, not the per-agent ownership check.

@@ -8,11 +8,11 @@
 //! completion event carries the report plus the per-file diff.
 
 use crate::common;
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;

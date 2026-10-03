@@ -15,10 +15,10 @@
 //! through the same loop and assert the orchestrator question each one gets.
 
 use crate::common;
-use std::path::Path;
-use std::time::Duration;
 use mini_swe_mcp::pool::{WorkerPool, WorkerRole, WorkerState};
 use mini_swe_mcp::worktree::ScratchRoot;
+use std::path::Path;
+use std::time::Duration;
 
 /// Owner recorded for the workers this test dispatches: the loop is what is
 /// under test, not the per-agent ownership check.

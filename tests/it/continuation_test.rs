@@ -6,8 +6,6 @@
 //! branch, and that `failed` only means "this cannot continue by itself".
 
 use crate::common;
-use std::path::Path;
-use std::time::Duration;
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
@@ -15,6 +13,8 @@ use mini_swe_mcp::pool::{
     append_history_message_in, history_log_path_in, load_registry_entry_in, load_worker_history_in,
     remove_registry_entry_in, save_registry_entry_in,
 };
+use std::path::Path;
+use std::time::Duration;
 
 /// A per-test scratch root, owning its directory.
 ///

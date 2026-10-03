@@ -18,9 +18,9 @@
 //! requested model.
 
 use crate::common;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
-use serde_json::{Value, json};
 
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};

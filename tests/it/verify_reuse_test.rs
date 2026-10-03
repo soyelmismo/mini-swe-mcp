@@ -13,8 +13,8 @@
 //! skipped a fresh variant A -- and carries nothing of the sort when it ran.
 
 use crate::common;
-use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use std::path::{Path, PathBuf};
 
 const TEST_OWNER: &str = "verify-reuse";
 

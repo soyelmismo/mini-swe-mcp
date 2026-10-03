@@ -11,8 +11,6 @@
 //! the log, and only a gone branch or an expired retention retires them.
 
 use crate::common;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_WORKER_RETIRED_GRACE_SECS, LogBuffer,
@@ -21,6 +19,8 @@ use mini_swe_mcp::pool::{
     load_worker_history_in, prune_orphan_histories_with_retention_and_grace_in,
     prune_orphan_histories_with_retention_in, save_registry_entry_in,
 };
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A per-test scratch root, owning its directory.
 struct Scratch {

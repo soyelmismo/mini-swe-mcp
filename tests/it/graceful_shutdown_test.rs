@@ -7,12 +7,12 @@
 //! `auto_continue_budget`). An explicit user `kill` still ends `Failed`.
 
 use crate::common;
-use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{
     LogBuffer, MAX_AUTO_CONTINUES, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool,
     WorkerRecord, WorkerState, load_registry_entry_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
+use std::path::{Path, PathBuf};
 
 const OWNER: &str = "graceful-shutdown-test";
 

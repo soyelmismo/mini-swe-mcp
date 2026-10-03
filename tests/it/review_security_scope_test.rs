@@ -21,10 +21,10 @@
 //! registry, hub or real repository is written.
 
 use crate::common;
-use std::path::Path;
 use mini_swe_mcp::pool::{
     ReviewMode, WorkerRole, approved_merged_branches, plan_review, scope_for,
 };
+use std::path::Path;
 
 /// Commit `body` into `branch` after writing `file`, and return the commit id.
 ///

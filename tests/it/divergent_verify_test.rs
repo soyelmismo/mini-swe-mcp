@@ -14,10 +14,10 @@
 //! verbatim.
 
 use crate::common;
+use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerPool, WorkerState};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use mini_swe_mcp::pool::{COMPLETION_SENTINEL, WorkerPool, WorkerState};
 
 /// Owner recorded for the workers these tests dispatch: the gate is what is
 /// under test here, not the per-agent ownership check.

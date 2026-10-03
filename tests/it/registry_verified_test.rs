@@ -7,8 +7,6 @@
 //! falls back to it, and a new revision starts from a row with no verdict.
 
 use crate::common;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{
@@ -18,6 +16,8 @@ use mini_swe_mcp::pool::{
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const OWNER: &str = LOCAL_AGENT;
 const GROUP: &str = "registry-verified";
