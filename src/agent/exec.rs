@@ -389,10 +389,7 @@ pub(crate) fn write_roots(worktree: &Path, target: &Path) -> WriteRoots {
         worktree: worktree.to_path_buf(),
         target: target.to_path_buf(),
         scratch: crate::worktree::scratch_dir(worktree),
-        caches: crate::agent::sandbox::writable_cache_paths()
-            .into_iter()
-            .map(|path| normalise(&path))
-            .collect(),
+        caches: crate::agent::sandbox::writable_cache_paths(),
     }
 }
 
@@ -3206,6 +3203,7 @@ mod tests {
     /// A worker that writes to `/tmp` through the worktree (`../out`) is
     /// refused exactly like one typing `/tmp`, so the `..` spelling must not
     /// read as a write inside the worktree and lose the note.
+
     #[test]
     fn a_traversal_out_of_the_worktree_is_still_a_refused_outside_write() {
         let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
