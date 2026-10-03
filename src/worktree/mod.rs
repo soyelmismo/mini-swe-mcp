@@ -28,14 +28,24 @@ use tracing::error;
 /// Root directory hosting all subagent scratch data (worktrees, target dirs, caches).
 pub fn swe_base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SWE_TEMP_DIR") {
-        PathBuf::from(dir)
+        return PathBuf::from(dir);
+    }
+    default_swe_base_dir()
+}
+
+/// [`swe_base_dir`] for the case `SWE_TEMP_DIR` is unset: `/var/tmp` when it
+/// is a directory, else the system temp dir.
+///
+/// `$SWE_TEMP_DIR` is read by [`swe_base_dir`], which is what the binary
+/// resolves; keeping the fallback separate lets an in-process caller (a test,
+/// an embedder) name the base directory it wants without the process-wide
+/// variable every other test in the same process would inherit.
+pub fn default_swe_base_dir() -> PathBuf {
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() {
+        var_tmp
     } else {
-        let var_tmp = PathBuf::from("/var/tmp");
-        if var_tmp.is_dir() {
-            var_tmp
-        } else {
-            std::env::temp_dir()
-        }
+        std::env::temp_dir()
     }
 }
 
