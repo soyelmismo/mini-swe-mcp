@@ -378,18 +378,34 @@ fn remember_base(list: &mut Vec<String>, base: &str) {
     list.push(base.to_string());
 }
 
-/// The digest of one run's output: a hash of the output with every run of
-/// digits folded to a single `#`.
+/// The digest of one run's output for the loop detector: a hash of the output
+/// with every run of digits folded to a single `#`.
 ///
 /// Counts, timings, line numbers and addresses move between two runs of one
 /// command without changing what the output *says*, so they must not read as
 /// new information. The words around them still do, which is what tells a
 /// worker that its last edit moved the failure somewhere else.
 fn output_digest(output: &str) -> u64 {
+    digest(output, true)
+}
+
+/// The digest of a harness answer for the progress check: the text exactly as
+/// it came back.
+///
+/// A different job number is a different answer even though the sentence has
+/// the same shape, so this one folds nothing. The loop detector still sees the
+/// two as one run, because it asks whether the *states* changed.
+fn answer_digest(answer: &str) -> u64 {
+    digest(answer, false)
+}
+
+/// A hash of `text`, with every run of digits folded to a single `#` when
+/// `fold_digits` is set.
+fn digest(text: &str, fold_digits: bool) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut in_digits = false;
-    for byte in output.bytes() {
-        if byte.is_ascii_digit() {
+    for byte in text.bytes() {
+        if fold_digits && byte.is_ascii_digit() {
             if !in_digits {
                 hasher.write_u8(b'#');
                 in_digits = true;
@@ -1433,7 +1449,7 @@ impl ProgressWatch {
     /// changed answer is progress the worktree sample cannot see, so it
     /// restarts the read-only streak and ends any loop window.
     fn note_harness_progress(&mut self, answer: &str) {
-        let digest = output_digest(answer);
+        let digest = answer_digest(answer);
         if self.last_harness_answer == Some(digest) {
             return;
         }
@@ -3519,9 +3535,11 @@ mod tests {
     fn new_information_and_edits_break_the_loop() {
         // Same base, but the output keeps changing: never a loop.
         let mut detector = LoopDetector::default();
-        for (step, word) in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
-            .into_iter()
-            .enumerate()
+        for (step, word) in [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let digest = output_digest(&format!("failure in {word}"));
             assert!(matches!(
@@ -3563,7 +3581,8 @@ mod tests {
         let mut nudges = 0;
         for step in 0..4 {
             let digest = output_digest(&format!("837 passed; 1 failed; finished in 0.{step}s"));
-            if let LoopVerdict::Nudge { count } = detector.record(step, "cargo test", Some(1), digest, Some(2))
+            if let LoopVerdict::Nudge { count } =
+                detector.record(step, "cargo test", Some(1), digest, Some(2))
             {
                 assert_eq!(count, 4);
                 nudges += 1;
