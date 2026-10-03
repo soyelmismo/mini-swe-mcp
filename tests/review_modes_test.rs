@@ -494,7 +494,10 @@ fn a_declared_mode_parses_its_triggers() {
         "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check.\n    triggers:\n      - src/hot/**\n      - src/perf.rs\n",
     );
     let def = manifest.review_mode("perf").expect("perf mode");
-    assert_eq!(def.triggers, vec!["src/hot/**".to_string(), "src/perf.rs".to_string()]);
+    assert_eq!(
+        def.triggers,
+        vec!["src/hot/**".to_string(), "src/perf.rs".to_string()]
+    );
     assert!(manifest.validate().is_empty());
 }
 
@@ -510,7 +513,11 @@ fn an_invalid_trigger_glob_warns_and_is_dropped_by_normalize() {
     );
     let normalized = manifest.normalize();
     let def = normalized.review_mode("perf").expect("perf mode");
-    assert_eq!(def.triggers, vec!["src/good/**".to_string()], "the invalid glob is dropped");
+    assert_eq!(
+        def.triggers,
+        vec!["src/good/**".to_string()],
+        "the invalid glob is dropped"
+    );
 }
 
 /// A manifest-declared mode whose `triggers` match the diff runs automatically.
@@ -518,7 +525,11 @@ fn an_invalid_trigger_glob_warns_and_is_dropped_by_normalize() {
 async fn a_custom_trigger_fires_its_mode() {
     let repo = TestRepo::new("trigger");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::turn("call_write", "", "mkdir -p src/hot && echo changed > src/hot/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_write",
+            "",
+            "mkdir -p src/hot && echo changed > src/hot/mod.rs",
+        ),
         ScriptedSseServer::turn(
             "call_impl",
             "REPORT\ndone: impl\nrisks: none",
@@ -588,7 +599,11 @@ async fn a_custom_trigger_fires_its_mode() {
 async fn several_triggered_modes_run_successively_in_sorted_order() {
     let repo = TestRepo::new("several");
     let server = ScriptedSseServer::spawn(vec![
-        ScriptedSseServer::turn("call_write", "", "mkdir -p src/hot && echo changed > src/hot/mod.rs"),
+        ScriptedSseServer::turn(
+            "call_write",
+            "",
+            "mkdir -p src/hot && echo changed > src/hot/mod.rs",
+        ),
         ScriptedSseServer::turn(
             "call_impl",
             "REPORT\ndone: impl\nrisks: none",
