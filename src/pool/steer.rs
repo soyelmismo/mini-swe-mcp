@@ -68,7 +68,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -290,48 +290,86 @@ pub fn __test_log_nonce_in(root: &ScratchRoot) -> Option<String> {
 
 fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
     let path = log_nonce_path_in(root);
-    // Read an existing nonce first: regenerating it would invalidate every
-    // record already written, i.e. silently drop real amendments.
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return Some(existing);
+    let fresh = uuid::Uuid::new_v4().simple().to_string();
+    // Established with `O_EXCL`, never adopted from whatever is already at the
+    // name. The nonce is only a secret if the pool chose it, and the name is
+    // fixed and predictable in the shared scratch base: an unprivileged local
+    // user who creates it first, or who writes it before this pool ever runs,
+    // would otherwise hold the secret and could sign records that the reader
+    // then renders to the consolidator as the orchestrator's own scope
+    // amendments -- the one text that SUPERSEDES a worker's task. So the first
+    // `open` either creates the file (this pool chose the value) or finds it
+    // already there, and only the *create* branch is trusted; a file that was
+    // there before us is refused outright rather than read, so a planted
+    // nonce cannot authenticate anything.
+    match create_nonce_exclusive(&path, &fresh) {
+        // This call created the file, so the value it wrote is the secret.
+        Ok(true) => return Some(fresh),
+        // The name was already taken: the existing content is not trusted on
+        // the strength of having been found.
+        Ok(false) => {}
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "Cannot establish the steer-log nonce");
+            return None;
         }
     }
-    let fresh = uuid::Uuid::new_v4().simple().to_string();
-    let created = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+    // The file exists, so this pool did not create it on this call. Reading it
+    // back is only sound when the pool can prove it wrote it: an existing file
+    // is accepted when it is owner-only *and* this process created it earlier
+    // (the common case for every process after the first, and for the same
+    // process on a later call). Anything else -- a planted file, a link, a
+    // world-readable one -- is refused, because a nonce read from it is not a
+    // secret this pool holds.
+    read_back_owned_nonce(&path)
+}
+
+/// Create the nonce file exclusively, refusing a link and an existing name.
+///
+/// `Ok(true)` is this call creating the file; `Ok(false)` is the name already
+/// taken, which the caller resolves through [`read_back_owned_nonce`] rather
+/// than by believing whatever was found there.
+fn create_nonce_exclusive(path: &Path, value: &str) -> std::io::Result<bool> {
+    let mut file = OpenOptions::new()
         .write(true)
+        .create_new(true) // `O_EXCL|O_CREAT`: never adopt, never truncate.
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .and_then(|mut file| file.write_all(fresh.as_bytes()));
-    if let Err(e) = created {
-        warn!(path = %path.display(), error = %e, "Cannot establish the steer-log nonce");
+        .open(path)?;
+    file.write_all(value.as_bytes())?;
+    Ok(true)
+}
+
+/// Read the nonce back, but only from a file this pool can prove it wrote.
+///
+/// The proof is ownership plus owner-only permissions: the file was created by
+/// this process or by a peer pool process running as the same user, it is a
+/// regular file rather than a link or a device, and nothing outside this user
+/// can read it. A planted file in a shared base is readable and writable by
+/// whoever planted it, and is refused rather than believed.
+fn read_back_owned_nonce(path: &Path) -> Option<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() {
+        warn!(path = %path.display(), "Refusing the steer-log nonce: not a regular file");
         return None;
     }
-    // `mode` applies only to a file this call created, so tighten an existing
-    // one planted world-readable before its first byte lands in it.
-    if let Ok(meta) = std::fs::symlink_metadata(&path)
-        && meta.file_type().is_file()
-        && let Ok(file) = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        && file
-            .metadata()
-            .is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
-    {
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    if meta.mode() & 0o077 != 0 {
+        warn!(path = %path.display(), mode = format!("{:o}", meta.mode() & 0o7777), "Refusing the steer-log nonce: readable or writable beyond this user");
+        return None;
     }
-    // Re-read rather than trust the buffer: a pre-existing nonce written by
-    // another process between the read and the create is the one that must win.
-    std::fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or(Some(fresh))
+    let mut content = String::new();
+    file.take(STEER_LOG_READ_CAP)
+        .read_to_string(&mut content)
+        .ok()?;
+    let nonce = content.trim().to_string();
+    if nonce.is_empty() {
+        return None;
+    }
+    Some(nonce)
 }
 
 /// Path of the durable orchestrator-steer log for `worker_id`.
