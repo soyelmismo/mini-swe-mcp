@@ -20,6 +20,13 @@
 //! * **A refusal leaves no trace.** Every check that can fail runs before the
 //!   real merge, so a refused merge changes neither the repository nor the
 //!   worker's files.
+//! * **A round never lands as more than it integrated.** A consolidator's row
+//!   records the workers it merged *at that moment*; a worker revised afterwards
+//!   commits again on its own branch, so the round the orchestrator is about to
+//!   merge is no longer the round the consolidator integrated. Every member is
+//!   re-proved against the consolidator's own branch before the merge, and a
+//!   member whose tip is not an ancestor refuses the merge by name and by
+//!   unintegrated commit count -- `merge --force` is the only way past it.
 //!
 //! The gate itself is deliberately the same command the worker ran -- the one
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
@@ -65,6 +72,14 @@ pub struct MergeRequest<'a> {
     pub verified: Option<bool>,
     /// Keep the worker branch after merging (the CLI's `--no-delete`).
     pub keep_branch: bool,
+    /// Merge a round whose members carry commits the consolidator never
+    /// integrated (the CLI's `--force`, the MCP property `force`).
+    ///
+    /// The refusal is a provenance check, not a safety interlock: the forced
+    /// merge is exactly the same sequence, and a worker whose extra commits are
+    /// still unintegrated is still left unretired by the cleanup, so the work
+    /// survives a round that lands without it.
+    pub force: bool,
     /// The pool's admission controller, so the gate's build competes for the
     /// host's heavy-command budget like any worker's. `None` for a caller with
     /// no pool (tests, one-shot tools): the gate still runs confined, only the
@@ -111,6 +126,7 @@ pub fn merge_worker(worker_id: &str) -> Result<MergeReport> {
             worker_id,
             verified: None,
             keep_branch: false,
+            force: false,
             admission: None,
             archive_dir: None,
         },
@@ -152,6 +168,16 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
             resolved.base_branch,
             resolved.base_branch
         );
+    }
+
+    // A consolidator's recorded round is a claim about the past: a member
+    // revised after the integration commits again, so the branch about to land
+    // is no longer the round the consolidator reviewed. Re-prove every member
+    // against the consolidator's own branch *before* anything is written, so the
+    // orchestrator decides with the whole round in front of it.
+    let unintegrated = unintegrated_members(root, repo, worker_id, &resolved.branch);
+    if !unintegrated.is_empty() && !req.force {
+        anyhow::bail!("{}", unintegrated_refusal(worker_id, &unintegrated));
     }
 
     // Trial merge: `merge-tree` computes the merge without touching a single
@@ -905,6 +931,150 @@ fn cleanup(
     (outcome.branch_deleted, cleaned, retired)
 }
 
+/// A round member the consolidator recorded but whose own tip never reached the
+/// consolidator's branch.
+#[derive(Debug, Clone)]
+pub struct UnintegratedWorker {
+    /// The worker id, as the orchestrator names it.
+    pub worker_id: String,
+    /// Commits on `worker-<id>` the consolidator branch does not contain.
+    pub commits: usize,
+}
+
+impl UnintegratedWorker {
+    /// The one line a completion event and the orchestrator's `watch` show.
+    pub fn line(&self) -> String {
+        format!(
+            "UNINTEGRATED worker {}: {} commit(s) on worker-{} never reached the round; the \
+             round does not carry this work",
+            self.worker_id, self.commits, self.worker_id
+        )
+    }
+}
+
+/// The round members `worker_id`'s own branch does not carry, for a
+/// consolidator about to complete.
+///
+/// The same proof [`merge_worker_in`] refuses on, run where the orchestrator
+/// still has time to act: a round that does not match its record is reported on
+/// the consolidator's completion event instead of being discovered at merge
+/// time, after the whole round has been reviewed and the revision's work is
+/// already stranded on a branch nobody owns.
+///
+/// An ordinary worker has no `integrated` set, so this is empty for it.
+pub fn unintegrated_workers_in(root: &ScratchRoot, worker_id: &str) -> Vec<UnintegratedWorker> {
+    // The same resolution the merge itself uses: the row names the repository,
+    // the saved conversation (or `worker-<id>`) names the branch, so a
+    // consolidator's own branch is probed exactly as `merge` will probe it.
+    let Ok(resolved) = resolve(root, worker_id) else {
+        return Vec::new();
+    };
+    unintegrated_members(root, &resolved.repo, worker_id, &resolved.branch)
+        .into_iter()
+        .map(|worker| UnintegratedWorker {
+            worker_id: worker.worker_id,
+            commits: worker.commits,
+        })
+        .collect()
+}
+
+/// One round member whose commits the consolidator's branch does not carry.
+struct Unintegrated {
+    /// The worker id, as the orchestrator names it.
+    worker_id: String,
+    /// Commits on `worker-<id>` that the consolidator branch does not contain.
+    commits: usize,
+}
+
+/// The round members of `branch` whose own tip did not reach it.
+///
+/// A consolidator's row records the ids it merged, but that record says nothing
+/// about where those branches are *now*: a worker revised afterwards carries
+/// commits the consolidator never saw and never integrated, and merging the
+/// round silently would ship master without them -- the stale-docs failure this
+/// check exists to stop. So every recorded member is re-proved the only way
+/// that survives a revision: `git merge-base --is-ancestor <tip> <branch>`.
+///
+/// A member that cannot be probed is *not* reported. No branch (already pruned
+/// or never created) means there is nothing left to integrate, and a repository
+/// that refuses the probe cannot be asked about any of its refs; both answer
+/// "integrated" so a broken probe never blocks an unrelated merge. A member
+/// that is reported is reported with its unintegrated commit count, so the
+/// orchestrator can see how much work is at stake before deciding.
+fn unintegrated_members(
+    root: &ScratchRoot,
+    repo: &Path,
+    consolidator: &str,
+    branch: &str,
+) -> Vec<Unintegrated> {
+    let Some(row) = load_registry_entry_in(root, consolidator) else {
+        return Vec::new();
+    };
+    let mut unintegrated = Vec::new();
+    for id in &row.integrated {
+        let member = format!("worker-{id}");
+        // No branch means nothing left to integrate: the worker was already
+        // merged or its branch pruned, so it cannot be holding back the round.
+        if !branch_exists(repo, &member).unwrap_or(false) {
+            continue;
+        }
+        match is_ancestor(repo, &member, branch) {
+            // Contained: whatever the member carries is already in the branch
+            // the merge will land, so the round is the round that was reviewed.
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(count) = unintegrated_commit_count(repo, &member, branch) {
+                    unintegrated.push(Unintegrated {
+                        worker_id: id.clone(),
+                        commits: count,
+                    });
+                }
+            }
+            // An unprobeable repository is not evidence of lost work.
+            Err(_) => continue,
+        }
+    }
+    unintegrated
+}
+
+/// Commits on `branch` that `ancestor` does not contain.
+///
+/// `git rev-list --count <ancestor>..<descendant>` is the same walk
+/// `git merge-base --is-ancestor` answers yes/no about, so the count names
+/// exactly the work a refused merge would leave behind. `None` when git cannot
+/// answer, which the caller reads as "unknown", never as "zero".
+fn unintegrated_commit_count(repo: &Path, member: &str, branch: &str) -> Option<usize> {
+    let range = format!("{branch}..{member}");
+    let out = git(repo, "rev-list --count", &["rev-list", "--count", &range]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .ok()
+}
+
+/// The refusal `merge` answers with when a round does not match its record.
+fn unintegrated_refusal(consolidator: &str, unintegrated: &[Unintegrated]) -> String {
+    let named: Vec<String> = unintegrated
+        .iter()
+        .map(|worker| {
+            format!(
+                "worker {} carries {} unintegrated commit(s)",
+                worker.worker_id, worker.commits
+            )
+        })
+        .collect();
+    format!(
+        "{consolidator} is not the round it integrated: {}. Merge it anyway with \
+         `merge {consolidator} --force` only if the extra work is not wanted. Otherwise steer \
+         {consolidator} to integrate it: steer {consolidator} \"integrate the latest commits of \
+         worker <id>\", or discard the worker whose extra commits should not land: discard <id>",
+        named.join("; ")
+    )
+}
+
 /// Whether `worker-<id>`'s current branch is proven contained in `base`.
 ///
 /// The round a consolidator integrated records which branches it merged *at
@@ -1167,6 +1337,10 @@ pub fn merge_approved_in(
         worker_id: "approved",
         verified: None,
         keep_branch: false,
+        // The batch merges approved workers one by one through the same
+        // machinery; there is no round record on this synthetic id, so nothing
+        // can be unintegrated here.
+        force: false,
         admission: req.admission.clone(),
         archive_dir: None,
     };

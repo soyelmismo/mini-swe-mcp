@@ -30,6 +30,10 @@ impl McpServer {
             .get("keep_branch")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // `force`: merge a round whose members carry commits the consolidator
+        // never integrated. The refusal names each one; the forced merge lands
+        // them unretired, so nothing is lost by overriding.
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let root = self.pool.scratch_root().clone();
         let admission = self.pool.admission();
         // The retirement the merge performs appends the worker's final REPORT
@@ -44,6 +48,7 @@ impl McpServer {
                     worker_id: &worker_id,
                     verified,
                     keep_branch,
+                    force,
                     admission: Some(admission),
                     archive_dir,
                 },
