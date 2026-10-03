@@ -170,9 +170,9 @@ impl From<WorkerVerdictsWire> for WorkerVerdicts {
                 let (workers, risks) = lines
                     .into_iter()
                     .partition(|line| !line.starts_with("RISK:"));
-                Self { workers, risks }
+                bounded(workers, risks)
             }
-            WorkerVerdictsWire::Grouped { workers, risks } => Self { workers, risks },
+            WorkerVerdictsWire::Grouped { workers, risks } => bounded(workers, risks),
         }
     }
 }
@@ -181,7 +181,6 @@ impl From<WorkerVerdictsWire> for WorkerVerdicts {
 /// does not fit and naming the count, exactly as [`parse_verdict_lines`] does
 /// when the value is built. One rule, so a stored payload and a read-back one
 /// are bounded the same way.
-#[allow(dead_code)]
 fn bounded(workers: Vec<String>, risks: Vec<String>) -> WorkerVerdicts {
     let mut out = WorkerVerdicts::default();
     // Charged from the first line, so a truncated payload can still afford the

@@ -625,7 +625,6 @@ fn a_markdown_wrapped_verdict_is_shown_as_the_harness_read_it() {
     }
 }
 
-
 /// The budget is a property of the type, not only of the parser that builds
 /// it. A registry row is plain JSON in a directory another local user can
 /// write, so an oversized array read back off disk must be bounded exactly like
