@@ -197,7 +197,9 @@ fn token_contains_escape(token: &str) -> bool {
     path.components().any(|c| {
         matches!(
             c,
-            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
         )
     })
 }
