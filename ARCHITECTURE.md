@@ -358,6 +358,30 @@ other character) before it touches the filesystem, so a hostile `model` argument
 (`../../etc/passwd`) collapses to `-etc-passwd.md` inside the memory directory and can never
 escape it.
 
+### Per-model instructions
+
+`models.yaml` may attach an `instructions:` block to any model entry: rules appended to the
+system prompt of every worker that runs on that model, under a `Model-specific
+instructions` header. It is the operator's lever for correcting one model's habits (a small
+model that reads files in many small ranges is told to read whole files) without touching
+the repository's own instruction files, which every model would share.
+
+Two properties are load-bearing:
+
+- **One spelling, normalized once.** The block accepts a multi-line string or a list of
+  strings (`serde` untagged) and deserializes into one ordered `Vec<String>`, one entry per
+  line/bullet, with blank entries dropped. Nothing downstream branches on which form a
+  catalog used.
+- **Optional and bounded.** An entry without the block deserializes to `None`, so a catalog
+  written before this field existed renders byte-identical prompts. A block above
+  `MAX_MODEL_INSTRUCTIONS_BYTES` (4 KiB) is warned about by `validate` and cut by
+  `normalize`, keeping the *head* entry by entry and marking the block truncated so the
+  prompt never presents a cut rulebook as a whole one.
+
+`build_system_prompt` appends it last — after the repository files and the role memory — and
+the review phase resolves the *reviewer's* alias first, so a reviewer's habits never bleed
+into the implementer's prompt.
+
 ---
 
 ## 8. Step-Log Retention, Residency & Health

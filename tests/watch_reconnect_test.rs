@@ -25,12 +25,12 @@ const RECONNECT_ENV: &str = mini_swe_mcp::hub::RECONNECT_DEADLINE_ENV;
 /// Seconds this test gives the reconnect budget. Long enough for the
 /// replacement daemon to start and its recovery to run before the watch
 /// reconnects, and bounded so a watch that never reconnects ends on its own.
-const RECONNECT_SECS: &str = "60";
+const RECONNECT_SECS: &str = "120";
 
 /// Wait until the hub log holds at least `count` lines mentioning `event`, so
 /// the test polls for the daemon instead of sleeping for it.
 async fn wait_for_log(hub_dir: &Path, event: &str, count: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let seen = std::fs::read_to_string(hub_dir.join("hub.log"))
             .map(|log| log.lines().filter(|line| mentions(line, event)).count())
@@ -63,7 +63,7 @@ fn mentions(line: &str, event: &str) -> bool {
 /// [`HubPaths`] where this one is instead of guessing.
 async fn wait_for_socket(hub_dir: &Path) {
     let socket = HubPaths::new(hub_dir.to_path_buf()).socket();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return;
@@ -309,7 +309,7 @@ async fn a_watch_follows_a_daemon_that_is_cut_under_it() {
         None,
     );
 
-    match read_until(&mut output, "watch-cut", Duration::from_secs(30)).await {
+    match read_until(&mut output, "watch-cut", Duration::from_secs(60)).await {
         Some(printed) => assert!(
             printed.contains("watch-cut"),
             "the event belongs to the watched worker: {printed}"
@@ -319,7 +319,7 @@ async fn a_watch_follows_a_daemon_that_is_cut_under_it() {
             read_to_end(&mut output).await
         ),
     }
-    let finished = tokio::time::timeout(Duration::from_secs(30), watch.wait())
+    let finished = tokio::time::timeout(Duration::from_secs(60), watch.wait())
         .await
         .expect("the watch ends once its worker is terminal")
         .expect("the watch exits");

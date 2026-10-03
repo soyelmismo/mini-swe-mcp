@@ -1,10 +1,13 @@
 //! Data model and tuning constants for the model manifest.
 //!
-//! Owns the two serializable structs of `models.yaml` ([`ModelDefinition`],
-//! [`ModelManifest`]) plus the four process-wide constants that bound them
-//! ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`], [`MAX_TURNS_LIMIT`],
-//! [`TEMPERATURE_RANGE`]). Contains no behaviour: every rule that reads or
-//! repairs these values lives in the `validate` submodule.
+//! Owns the serializable structs of `models.yaml` ([`ModelDefinition`],
+//! [`ModelManifest`], [`ModelInstructions`]) plus the process-wide constants that
+//! bound them ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`],
+//! [`MAX_TURNS_LIMIT`], [`MAX_MODEL_INSTRUCTIONS_BYTES`], [`TEMPERATURE_RANGE`]).
+//! Contains no behaviour: every rule that reads or repairs these values lives
+//! in the `validate` submodule. The one exception is how an `instructions:`
+//! block is *split* into entries, which is deserialization itself and therefore
+//! belongs next to the field it deserializes.
 //!
 //! The declarative execution policy ([`ExecutionPolicy`] and its
 //! [`NetworkPolicy`] field) is the exception: it is *data* here too. Parsing
@@ -38,6 +41,43 @@ pub const MAX_TURNS_LIMIT: usize = 500;
 /// warning messages print, and so a future mode can be added without changing
 /// every message.
 pub const NETWORK_POLICIES: &[&str] = &["offline", "allow"];
+
+/// Hard ceiling on the bytes of one model's `instructions:` block.
+///
+/// Instructions are appended to a worker's system prompt verbatim, so an
+/// unbounded block would let one catalog entry crowd out the repository rules
+/// and the role memory it shares a prompt with. 4 KB is enough to correct a
+/// model's habits and small enough to stay a minor part of the prompt; the
+/// head is kept when the budget is exceeded (see `validate.rs`).
+pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 4 * 1024;
+
+/// Prefix every instruction is rendered under in the system prompt.
+///
+/// Owned here rather than duplicated in the renderer because the byte budget
+/// below counts it: a bound that ignored the prefix would let the emitted
+/// section overrun the very cap it claims to enforce.
+pub(crate) const BULLET_PREFIX: &str = "- ";
+
+/// Bytes the prompt spends on the framing *around* the instruction bullets
+/// whether or not the block is cut: the two leading newlines, the
+/// `Model-specific instructions` header line and its trailing newline.
+///
+/// This is what a *complete* block adds on top of its bullets, so
+/// [`ModelInstructions::truncate_to`] compares the emitted section against the
+/// budget with it, not against the bullets alone: a block whose bullets fit
+/// under the cap can still push the rendered section over it. Built from the
+/// renderer's own text by `catalog`, so the two cannot drift apart.
+pub(crate) const FRAMING_OVERHEAD: usize = 2 + super::catalog::MODEL_INSTRUCTIONS_HEADER.len() + 1;
+
+/// Bytes the prompt spends on everything *around* the instruction bullets when
+/// the block has been cut: [`FRAMING_OVERHEAD`] plus the truncation note and its
+/// trailing newline.
+///
+/// Reserved out of [`MAX_MODEL_INSTRUCTIONS_BYTES`] by
+/// [`ModelInstructions::truncate_to`] so the rendered section — not merely the
+/// bullets behind it — fits the budget even after the note is appended.
+pub(crate) const SECTION_OVERHEAD: usize =
+    FRAMING_OVERHEAD + super::catalog::MODEL_INSTRUCTIONS_TRUNCATION_NOTE.len() + 1;
 
 /// Inclusive bounds every sampling temperature is clamped into before it can
 /// reach a provider. OpenAI-compatible endpoints reject values outside this
@@ -157,6 +197,196 @@ impl ExecutionPolicy {
     }
 }
 
+/// The optional `instructions:` block of one model entry: extra rules appended
+/// to the system prompt of every worker that runs on this model.
+///
+/// Both spellings a YAML author reaches for are accepted and mean the same
+/// thing — a multi-line string is one instruction per line, a list is one
+/// instruction per bullet:
+///
+/// ```yaml
+/// models:
+///   small:
+///     id: combo:small
+///     instructions: |
+///       Read whole files instead of many small ranges.
+///       Run the cheap gate before the full suite.
+///   # equivalently:
+///   small:
+///     instructions:
+///       - Read whole files instead of many small ranges.
+///       - Run the cheap gate before the full suite.
+/// ```
+///
+/// The two forms are normalized into one ordered list at parse time, so nothing
+/// downstream has to know which one a catalog used, and the list form is what
+/// serializes back out. Blank entries are dropped here rather than rendered as
+/// empty bullets, and [`Self::is_truncated`] records that a repair cut the
+/// block at [`MAX_MODEL_INSTRUCTIONS_BYTES`] so the prompt can say so.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelInstructions {
+    entries: Vec<String>,
+    /// Set when [`truncate_to`](ModelInstructions::truncate_to) dropped the
+    /// tail of an over-long block; never set by deserialization.
+    truncated: bool,
+}
+
+impl ModelInstructions {
+    /// The instructions in declaration order, one per line of the block.
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// How many instructions the block carries, which is what the `manifest`
+    /// action reports per model.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the block carries nothing worth injecting into a prompt.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether a repair cut this block short at [`MAX_MODEL_INSTRUCTIONS_BYTES`].
+    ///
+    /// Kept as state rather than re-derived from the byte count so the prompt
+    /// can mark a cut block exactly once, and so re-normalizing a cut block is
+    /// idempotent.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The bytes the entry list occupies once rendered into the prompt: every
+    /// instruction as its own `- <entry>\n` bullet, which is exactly what
+    /// `build_system_prompt` appends.
+    ///
+    /// The bullet prefix is counted because it is real payload the model reads,
+    /// so a bound checked against this value bounds the emitted text and not
+    /// just the strings behind it.
+    pub fn rendered_len(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| entry.len() + BULLET_PREFIX.len() + 1)
+            .sum::<usize>()
+    }
+
+    /// Cut the block to at most `max_bytes`, keeping the head, and report whether
+    /// anything was dropped.
+    ///
+    /// The budget is spent entry by entry, because an instruction is the unit the
+    /// author wrote: dropping a whole one is comprehensible where half a
+    /// sentence is not. A single entry larger than the whole budget is the one
+    /// exception — it is cut at a `char` boundary so the block still carries
+    /// *something* and never disappears without trace. Either way
+    /// [`Self::is_truncated`] is set, and running this on an already-cut block is
+    /// a no-op, which keeps normalizing idempotent.
+    pub(crate) fn truncate_to(&mut self, max_bytes: usize) -> bool {
+        // A *complete* block adds the framing on top of its bullets, so the
+        // no-cut case must fit the section, not just the bullets: a block whose
+        // bullets alone sit under the cap can still overrun the budget once the
+        // header is counted.
+        if FRAMING_OVERHEAD + self.rendered_len() <= max_bytes {
+            return false;
+        }
+
+        // Reserve the wrapping the prompt adds around the bullets (its own
+        // leading newlines, the header line and the truncation note) so the
+        // *emitted* section, not just the bullets, stays inside the budget.
+        let budget = max_bytes.saturating_sub(SECTION_OVERHEAD);
+        let mut used = 0;
+        let mut kept = 0;
+        for entry in &self.entries {
+            let cost = entry.len() + BULLET_PREFIX.len() + 1;
+            if used + cost > budget {
+                break;
+            }
+            used += cost;
+            kept += 1;
+        }
+        if kept == 0 {
+            // One entry bigger than the budget: keep its head, rounded down so
+            // the block stays inside the budget and the slice cannot split a
+            // multi-byte code point. Everything behind it is dropped — the head
+            // alone already fills the budget.
+            let head = budget
+                .saturating_sub(BULLET_PREFIX.len() + 1)
+                .min(self.entries[0].len());
+            let head = floor_char_boundary(&self.entries[0], head);
+            self.entries.truncate(1);
+            self.entries[0] = self.entries[0][..head].to_string();
+        } else {
+            self.entries.truncate(kept);
+        }
+        self.truncated = true;
+        true
+    }
+
+    /// Split raw YAML forms into one entry per line/bullet, dropping blanks.
+    fn from_parts(parts: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            entries: parts.into_iter().filter_map(normalize_entry).collect(),
+            // Deserialization never cuts: an over-long block is repaired by
+            // `validate::normalize_instructions`, which can warn about it.
+            truncated: false,
+        }
+    }
+}
+
+impl Serialize for ModelInstructions {
+    /// Always emit the list form, so a catalog round-trips through one spelling
+    /// no matter which one it was written in.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.entries.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelInstructions {
+    /// Accept a multi-line string or a list of strings, in that order.
+    ///
+    /// A YAML scalar is a string, so `instructions: read whole files` is one
+    /// instruction; anything else that is neither string nor list of strings
+    /// (a bare number, a mapping) is a schema error and fails the manifest load
+    /// with the parser's own message rather than being silently dropped.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            List(Vec<String>),
+        }
+
+        Ok(match Repr::deserialize(d)? {
+            Repr::Text(text) => Self::from_parts(text.lines().map(str::to_string)),
+            Repr::List(items) => Self::from_parts(items),
+        })
+    }
+}
+
+/// The largest index `<= index` that falls on a `char` boundary of `text`.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Trim one raw instruction and drop it when nothing is left.
+///
+/// A markdown bullet marker is stripped so the list and string spellings of the
+/// same instruction render identically (the prompt adds its own bullet).
+fn normalize_entry(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed)
+        .trim();
+    (!stripped.is_empty()).then(|| stripped.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDefinition {
     pub id: String,
@@ -170,6 +400,15 @@ pub struct ModelDefinition {
     /// written before policies existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<ExecutionPolicy>,
+    /// Extra rules appended to the system prompt of a worker of this model,
+    /// `None` for every catalog that declares none.
+    ///
+    /// This is how a model's habits are corrected from the catalog: the
+    /// operator appends them to the prompt of a worker running that model, and
+    /// the review phase uses the reviewer's own block. See
+    /// [`ModelInstructions`] for the accepted spellings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<ModelInstructions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +451,7 @@ impl Default for ModelManifest {
                     // egress.
                     network: Some(NetworkPolicy::Allow),
                 }),
+                instructions: None,
             },
         );
         models.insert(
@@ -228,6 +468,7 @@ impl Default for ModelManifest {
                     // broadly and must reach its dependencies to do so.
                     network: Some(NetworkPolicy::Allow),
                 }),
+                instructions: None,
             },
         );
 
