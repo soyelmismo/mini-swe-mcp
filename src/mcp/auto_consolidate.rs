@@ -201,7 +201,15 @@ impl McpServer {
         // not just `Running`: a worker paused on an orchestrator question is
         // just as unsettled as one running, and its row can lag the same way.
         for worker in &workers {
-            let _ = worker;
+            if matches!(
+                self.pool.get_worker_state(&worker.id).await,
+                Some(
+                    crate::pool::WorkerState::Running { .. }
+                        | crate::pool::WorkerState::Paused { .. }
+                )
+            ) {
+                return RoundDecision::Wait;
+            }
         }
         RoundDecision::Start
     }
