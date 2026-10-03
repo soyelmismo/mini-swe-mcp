@@ -38,14 +38,18 @@
 //!   the type check reachable: `O_APPEND` on a FIFO blocks inside `open(2)`
 //!   until a reader arrives, and a read-only `open` on a FIFO blocks until a
 //!   writer does. `round_manifest` is async and reads the log on the reactor, so
-//!   either would stall every request on the pool. Cleanup is therefore the worker
-//! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
-//! held for the worker's whole lifetime), not the pruner's — a mailbox only
-//! exists while some `steer` call created it, and every worker removes its own
-//! on exit.
+//!   either would stall every request on the pool.
+//!
+//!   Cleanup is therefore the worker loop's own responsibility
+//!   ([`remove_steer_file`], invoked by a `Drop` guard held for the worker's
+//!   whole lifetime), not the pruner's — a mailbox only exists while some
+//!   `steer` call created it, and every worker removes its own on exit.
 //!
 //! Messages are **JSON lines**, one object per line:
 //! `{"message": "…", "sent_at": 1700000000, "pid": 4242}`.
+//! A record in the durable orchestrator steer log also carries the scratch
+//! root's `nonce`, which is what proves the log is this pool's own voice rather
+//! than a file planted in the shared base (see [`log_nonce_in`]).
 //! JSON lines (rather than raw text) make appends self-delimiting, so a message
 //! containing newlines — a multi-line diff hunk, a pasted stack trace — can
 //! never be split into two bogus messages or glued onto its neighbour.
@@ -64,7 +68,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -128,6 +132,10 @@ pub fn write_steer_message_in(
         message: message.to_string(),
         sent_at: super::unix_timestamp(),
         pid: std::process::id(),
+        // A mailbox message is claimed by rename and handed to the worker as
+        // guidance, never rendered as the orchestrator's authority, so it needs
+        // no nonce. Only the durable log does (see [`log_nonce_in`]).
+        nonce: None,
     };
     // `to_string` on a `Value` cannot fail.
     let mut payload = serde_json::to_string(&record).unwrap_or_default();
@@ -267,6 +275,20 @@ fn log_nonce_path_in(root: &ScratchRoot) -> PathBuf {
 /// unreadable secret means an unauthenticated log, which is the case the whole
 /// mechanism exists to prevent.
 fn log_nonce_in(root: &ScratchRoot) -> Option<String> {
+    log_nonce_of(root)
+}
+
+/// This scratch root's steer-log nonce (test support).
+///
+/// Exposed so a test that exercises the read *cap* can plant records the reader
+/// will accept: authentication and truncation are independent properties, and a
+/// test of one must not have to defeat the other to see the thing it is testing.
+#[doc(hidden)]
+pub fn __test_log_nonce_in(root: &ScratchRoot) -> Option<String> {
+    log_nonce_of(root)
+}
+
+fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
     let path = log_nonce_path_in(root);
     // Read an existing nonce first: regenerating it would invalidate every
     // record already written, i.e. silently drop real amendments.
@@ -293,8 +315,13 @@ fn log_nonce_in(root: &ScratchRoot) -> Option<String> {
     // one planted world-readable before its first byte lands in it.
     if let Ok(meta) = std::fs::symlink_metadata(&path)
         && meta.file_type().is_file()
-        && let Ok(mut file) = OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&path)
-        && file.metadata().is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+        && let Ok(file) = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        && file
+            .metadata()
+            .is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
     {
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }

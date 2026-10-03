@@ -88,7 +88,15 @@ fn file_row(repo: &TempDir, pool: &IsolatedPool, worker_id: &str) {
     git(repo.path(), &["add", "."]);
     git(
         repo.path(),
-        &["-c", "user.name=w", "-c", "user.email=w@x", "commit", "-m", "work"],
+        &[
+            "-c",
+            "user.name=w",
+            "-c",
+            "user.email=w@x",
+            "commit",
+            "-m",
+            "work",
+        ],
     );
     git(repo.path(), &["checkout", "-q", "master"]);
 
@@ -170,7 +178,10 @@ async fn a_planted_steer_log_is_not_rendered_as_an_orchestrator_amendment() {
     // log is ever written by this process.
     std::fs::write(
         log_path(&pool.scratch, &worker),
-        format!("{}\n", serde_json::json!({"message": PLANTED, "sent_at": 1_u64, "pid": 1_u32})),
+        format!(
+            "{}\n",
+            serde_json::json!({"message": PLANTED, "sent_at": 1_u64, "pid": 1_u32})
+        ),
     )
     .unwrap();
     std::fs::set_permissions(
@@ -225,9 +236,7 @@ fn a_fifo_steer_log_does_not_block_the_manifest_build() {
             .enable_all()
             .build()
             .expect("a current-thread runtime");
-        rt.block_on(async {
-            pool.pool.round_manifest(OWNER, GROUP, repo.path()).await
-        });
+        rt.block_on(async { pool.pool.round_manifest(OWNER, GROUP, repo.path()).await });
         let _ = tx.send(());
     });
 
