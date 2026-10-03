@@ -186,3 +186,58 @@ fn a_waiting_consolidator_is_running_a_command() {
         assert_eq!(event["workers"][0]["outcome"], "stalled");
     });
 }
+
+/// The wait stamps its command start exactly once, so the status view's
+/// `running for` clock only ever grows. A wait that re-published the mark on
+/// every poll reset the start time each time, so a wait that had been going for
+/// half an hour still read as `running for 0s`.
+#[test]
+fn a_long_wait_reports_a_growing_elapsed_time() {
+    let h = Harness::new("wait-clock");
+    let worker = format!("w1-{}", unique_suffix("w"));
+    let consolidator = format!("consol-{}", unique_suffix("c"));
+    let root = h.root();
+    let pool = h.pool.pool.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        insert_live_worker(&pool, &root, &worker, OWNER).await;
+        insert_live_worker(&pool, &root, &consolidator, OWNER).await;
+        let wait_pool = pool.clone();
+        let wait_meta = h.consolidator(&consolidator);
+        let wait_worker = worker.clone();
+        let wait = tokio::spawn(async move {
+            wait_pool
+                .consolidate_wait(&wait_meta, &[wait_worker], Some(3))
+                .await
+        });
+        // Poll until the wait has taken its mark.
+        let first = loop {
+            let progress = pool.worker_progress(&consolidator).await.unwrap();
+            if progress.command_started_at.is_some() {
+                break progress;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let started = first.command_started_at.expect("the wait takes the mark");
+        // Let the wait run past the point where a re-publish would have reset
+        // the clock, then confirm the start time never moved.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let later = pool.worker_progress(&consolidator).await.unwrap();
+        assert_eq!(
+            later.command_started_at,
+            Some(started),
+            "a wait must stamp its command start once, not on every poll"
+        );
+        // The status view turns that one stamp into a growing elapsed clock.
+        let now = mini_swe_mcp::pool::unix_timestamp();
+        let elapsed = now.saturating_sub(started);
+        assert!(
+            elapsed >= 1,
+            "a wait in flight must report a non-zero elapsed: {elapsed}s"
+        );
+        wait.await.expect("wait task");
+    });
+}

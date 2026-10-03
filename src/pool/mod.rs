@@ -85,11 +85,11 @@ pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
-    ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig, is_completion_request,
-    opening_task_message, parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
-    parse_consolidate_wait, parse_findings, parse_kill_job, parse_report, parse_request_turns,
-    parse_wait_job, review_prompt, summarize_command, summary_line,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    HARNESS_WAIT_PREFIX, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig,
+    is_completion_request, opening_task_message, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_consolidate_steer, parse_consolidate_wait, parse_findings, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, review_prompt, summarize_command, summary_line,
 };
 pub use self::state::{
     ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
@@ -1677,12 +1677,15 @@ impl WorkerPool {
                 .min(CONSOLIDATE_WAIT_MAX_SECS),
         );
         // Held for the whole wait: the consolidator is running a command as far
-        // as the stall detector is concerned.
+        // as the stall detector is concerned. The mark is stamped once, here,
+        // and the loop below only waits on it -- re-publishing it per
+        // iteration would keep resetting the command's start time, so a wait
+        // of half an hour would still read as `running for 0s`.
         let _running = self.command_running(&actor.id);
         // Name the wait as the command in flight, so `status` shows what the
         // consolidator is actually doing instead of its previous command, and
         // restore the previous label once the wait returns.
-        let wait_label = format!("CONSOLIDATE_WAIT {}", ids.join(" "));
+        let wait_label = format!("{} {}", HARNESS_WAIT_PREFIX, ids.join(" "));
         let previous_command = self.set_running_command(&actor.id, &wait_label).await;
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.subscribe_changes();

@@ -2154,26 +2154,16 @@ impl EventRouter {
                     if !matches!(current["status"].as_str(), Some("running" | "reviewing")) {
                         continue;
                     }
-                    // A worker that is running a command now (a harness-side
-                    // wait such as CONSOLIDATE_WAIT or WAIT_JOB, a long gate,
-                    // or a live background job) is doing work, and the stall
-                    // rule would never have fired for it: the episode queued
-                    // while it was idle is stale. Delivering it anyway told the
-                    // owner a working consolidator had stalled and suggested
-                    // killing it, so the episode is dropped instead -- the same
-                    // verdict the `--all` round reaches, and the same one
-                    // `select_event` gives the live view.
-                    if crate::cli::watch::round_idle_secs(current, crate::pool::unix_timestamp())
-                        == 0
-                        && !current["waiting_for_slot"].is_number()
-                    {
-                        self.suppress_stall(v["worker_id"].as_str().unwrap_or_default(), owner);
-                        continue;
-                    }
                     let now = crate::pool::unix_timestamp();
                     for (key, value) in current.as_object().into_iter().flatten() {
                         event[key] = value.clone();
                     }
+                    // The idle clock is the stall rule's own, not a raw
+                    // subtraction: a worker with a command in flight (a
+                    // harness-side wait such as CONSOLIDATE_WAIT or WAIT_JOB,
+                    // or a live background job) is doing work, so replaying its
+                    // queued stall must not claim seconds of inactivity the
+                    // detector itself would never count.
                     event["time_since_last_step"] =
                         json!(crate::cli::watch::round_idle_secs(current, now));
                     event["commands"] = json!(crate::cli::watch::commands(&event));
