@@ -37,16 +37,17 @@ use super::types::ModelManifest;
 const CATALOG_HEADER: &str = "Available model aliases and their roles:\n";
 
 /// Header of the per-model instructions appended to a worker's system prompt.
-const MODEL_INSTRUCTIONS_HEADER: &str =
+pub(super) const MODEL_INSTRUCTIONS_HEADER: &str =
     "Model-specific instructions (declared for this model in models.yaml):";
 
 /// Note appended when a model's instructions did not fit their budget, so a
 /// cut block is never mistaken for the whole one.
-const MODEL_INSTRUCTIONS_TRUNCATION_NOTE: &str =
+pub(super) const MODEL_INSTRUCTIONS_TRUNCATION_NOTE: &str =
     "[truncated: this model's instructions exceed the catalog budget]";
 
-/// Prefix of each rendered instruction.
-const INSTRUCTION_BULLET: &str = "- ";
+/// Prefix of each rendered instruction, shared with the byte budget in
+/// [`super::types::BULLET_PREFIX`] so the two cannot drift.
+const INSTRUCTION_BULLET: &str = super::types::BULLET_PREFIX;
 
 impl ModelManifest {
     /// Render the catalog advertised through the MCP `tools/list` payload.

@@ -503,3 +503,40 @@ models:
         "the reviewer must not inherit the implementer's rules: {reviewer:?}"
     );
 }
+
+/// The cap bounds the text that actually reaches the prompt, not just the
+/// strings behind it: the `- ` bullet the renderer adds to every entry, the
+/// heading and the truncation note are all part of the section.
+///
+/// Checking `rendered_len()` alone cannot catch a budget overrun, because the
+/// framing is what makes the difference: a block of many short entries spends
+/// two bytes of bullet per entry on top of the text, so a section that fits the
+/// entry strings alone can still overrun the cap the docs promise.
+#[test]
+fn test_the_emitted_prompt_section_fits_the_documented_cap() {
+    // Many short entries: the worst case for per-entry framing overhead.
+    let mut yaml = String::from("models:\n  small:\n    id: combo:small\n    instructions:\n");
+    for i in 0..400 {
+        yaml.push_str(&format!("      - rule {i} with a little padding\n"));
+    }
+    let raw: ModelManifest = serde_yaml::from_str(&yaml).expect("parses");
+    let manifest = raw.normalize();
+
+    let repo = TempDir::new_in_tmp("model-instructions-budget");
+    let with = build_system_prompt(&manifest, repo.path(), "small");
+    // A model that declares nothing is the same prompt minus this section.
+    let without = build_system_prompt(&manifest, repo.path(), "other");
+    let section = with.trim_start_matches(&without);
+
+    assert!(
+        section.len() <= MAX_MODEL_INSTRUCTIONS_BYTES,
+        "the section appended to the system prompt must fit the {MAX_MODEL_INSTRUCTIONS_BYTES}-byte \
+         cap, but it is {} bytes: the bullet, heading and note overhead must be \
+         charged to the budget",
+        section.len()
+    );
+    assert!(
+        section.contains("[truncated"),
+        "a block cut to fit is marked as cut: {section}"
+    );
+}

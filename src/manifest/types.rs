@@ -51,6 +51,27 @@ pub const NETWORK_POLICIES: &[&str] = &["offline", "allow"];
 /// head is kept when the budget is exceeded (see `validate.rs`).
 pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 4 * 1024;
 
+/// Prefix every instruction is rendered under in the system prompt.
+///
+/// Owned here rather than duplicated in the renderer because the byte budget
+/// below counts it: a bound that ignored the prefix would let the emitted
+/// section overrun the very cap it claims to enforce.
+pub(crate) const BULLET_PREFIX: &str = "- ";
+
+/// Bytes the prompt spends on everything *around* the instruction bullets: the
+/// two leading newlines, the `Model-specific instructions` header line and, for a
+/// cut block, the truncation note.
+///
+/// Reserved out of [`MAX_MODEL_INSTRUCTIONS_BYTES`] by
+/// [`ModelInstructions::truncate_to`] so the rendered section — not merely the
+/// bullets behind it — fits the budget. The value is built from the renderer's
+/// own text by `catalog`, so the two cannot drift apart.
+pub(crate) const SECTION_OVERHEAD: usize = 2
+    + super::catalog::MODEL_INSTRUCTIONS_HEADER.len()
+    + 1
+    + super::catalog::MODEL_INSTRUCTIONS_TRUNCATION_NOTE.len()
+    + 1;
+
 /// Inclusive bounds every sampling temperature is clamped into before it can
 /// reach a provider. OpenAI-compatible endpoints reject values outside this
 /// window, some silently clamp, and some ignore the field entirely.
@@ -229,11 +250,17 @@ impl ModelInstructions {
         self.truncated
     }
 
-    /// The bytes the block occupies once rendered as a newline-joined list.
+    /// The bytes the entry list occupies once rendered into the prompt: every
+    /// instruction as its own `- <entry>\n` bullet, which is exactly what
+    /// `build_system_prompt` appends.
+    ///
+    /// The bullet prefix is counted because it is real payload the model reads,
+    /// so a bound checked against this value bounds the emitted text and not
+    /// just the strings behind it.
     pub fn rendered_len(&self) -> usize {
         self.entries
             .iter()
-            .map(|entry| entry.len() + 1)
+            .map(|entry| entry.len() + BULLET_PREFIX.len() + 1)
             .sum::<usize>()
     }
 
@@ -252,11 +279,18 @@ impl ModelInstructions {
             return false;
         }
 
+        // Reserve the wrapping the prompt adds around the bullets (its own
+        // leading newlines, the header line and the truncation note) so the
+        // *emitted* section, not just the bullets, stays inside the budget.
+        // Reserve the wrapping the prompt adds around the bullets (its own
+        // leading newlines, the header line and the truncation note) so the
+        // *emitted* section, not just the bullets, stays inside the budget.
+        let budget = max_bytes.saturating_sub(SECTION_OVERHEAD);
         let mut used = 0;
         let mut kept = 0;
         for entry in &self.entries {
-            let cost = entry.len() + 1;
-            if used + cost > max_bytes {
+            let cost = entry.len() + BULLET_PREFIX.len() + 1;
+            if used + cost > budget {
                 break;
             }
             used += cost;
@@ -267,7 +301,9 @@ impl ModelInstructions {
             // the block stays inside the budget and the slice cannot split a
             // multi-byte code point. Everything behind it is dropped — the head
             // alone already fills the budget.
-            let head = max_bytes.saturating_sub(1).min(self.entries[0].len());
+            let head = budget
+                .saturating_sub(BULLET_PREFIX.len() + 1)
+                .min(self.entries[0].len());
             let head = floor_char_boundary(&self.entries[0], head);
             self.entries.truncate(1);
             self.entries[0] = self.entries[0][..head].to_string();
