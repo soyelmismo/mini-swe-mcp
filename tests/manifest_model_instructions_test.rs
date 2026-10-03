@@ -26,14 +26,10 @@ mod common;
 use common::TempDir;
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{
-    MAX_MODEL_INSTRUCTIONS_BYTES, ModelInstructions, ModelManifest, build_system_prompt,
+    MAX_MODEL_INSTRUCTIONS_BYTES, MODEL_INSTRUCTIONS_HEADER, ModelInstructions, ModelManifest,
+    build_system_prompt,
 };
 use std::path::Path;
-
-/// Heading the renderer puts above a model's instruction bullets, pinned here
-/// rather than imported: it is the wording this file claims models are told to
-/// follow as mandatory.
-const MANDATORY_DIRECTIVES_HEADER: &str = "MANDATORY DIRECTIVES FOR YOUR MODEL (set by the operator in models.yaml). Follow every one of them on every step; they are not suggestions:";
 
 /// Parse a `models.yaml` the way the loader does.
 fn parse_manifest(yaml: &str) -> ModelManifest {
@@ -159,7 +155,7 @@ models:
     // The heading names the source, so a worker can tell these rules from the
     // repository's own, and frames them as directives rather than as optional
     // background.
-    assert!(with.contains(MANDATORY_DIRECTIVES_HEADER), "{with}");
+    assert!(with.contains(MODEL_INSTRUCTIONS_HEADER), "{with}");
     // No model-specific rules declared anywhere means byte-identical behaviour
     // to before this block existed.
     let bare = ModelManifest::default();
@@ -546,7 +542,7 @@ fn test_the_emitted_prompt_section_fits_the_documented_cap() {
 /// many-short-entries case above cannot reach (it is always far over budget).
 #[test]
 fn test_a_block_under_the_bullet_budget_but_over_the_section_budget_is_cut() {
-    let header = MANDATORY_DIRECTIVES_HEADER;
+    let header = MODEL_INSTRUCTIONS_HEADER;
     // Bullets alone fit within the cap...
     let entry_len = MAX_MODEL_INSTRUCTIONS_BYTES - 2 - header.len() - 1;
     let entry = "a".repeat(entry_len);
