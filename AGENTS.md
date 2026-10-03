@@ -22,6 +22,7 @@ system prompt at dispatch time, so keep them short and actionable.
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - `cargo test`
 
 ## Iterating
@@ -30,9 +31,9 @@ system prompt at dispatch time, so keep them short and actionable.
   or `cargo test <name>`, and `cargo check` instead of a full build.
 - A round's consolidator runs the full suite once, on the integrated result, so
   you do not have to run it per worker while you implement.
-- Run the full gates (fmt --check, clippy, full test) once, right before
-  requesting completion: the harness reuses an identical passing run and runs
-  the divergent variant itself.
+- Run the full gates (fmt --check, clippy, rustdoc, full test) once, right
+  before requesting completion: the harness reuses an identical passing run
+  and runs the divergent variant itself.
 
 ## Tests must be hermetic
 
