@@ -106,3 +106,59 @@ fn a_blocked_rotation_keeps_every_report_of_a_long_run() {
         blocker.display()
     );
 }
+
+/// The append is claimed safe for concurrent retirements, and the hub really
+/// does run several at once: the daemon's retention reaper, its integrated
+/// sweep and a `merge` from a client can all retire in the same window, all
+/// rotating against the same cap. Two writers that both measure the file over
+/// the cap and both rotate must not lose a line between them.
+///
+/// Every writer here is a thread of this one test process writing into this
+/// one test-owned hub directory; nothing outside the temporary base dir is
+/// touched.
+#[test]
+fn concurrent_writers_over_the_cap_lose_no_line() {
+    let hub = TempDir::new_in_tmp("archive-rotate-concurrent");
+    fill_past_the_cap(hub.path());
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 12;
+    let dir = hub.path().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let dir = dir.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..PER_WRITER {
+                    archive::append_record(&dir, &record(&format!("w{w}-{i}")))
+                        .expect("every append must succeed");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("no writer may panic");
+    }
+
+    // Every line written must be readable, across both generations and in the
+    // order it was written. A rotation that discarded another writer's file
+    // loses a contiguous run, so a per-writer sequence number catches it where
+    // a mere count would not: a duplicate can mask a loss.
+    let records = archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
+    for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+            let id = format!("w{w}-{i}");
+            let seen = records.iter().filter(|r| r.worker_id == id).count();
+            assert_eq!(seen, 1, "{id} must be present exactly once, seen {seen} times");
+        }
+    }
+    assert_eq!(
+        records.len(),
+        WRITERS * PER_WRITER,
+        "no line may be lost or duplicated by a concurrent rotation: {} of {}",
+        records.len(),
+        WRITERS * PER_WRITER
+    );
+}
