@@ -37,6 +37,10 @@ pub struct RoundRow {
     /// Whether the worker's own verify gate passed, when this process still
     /// holds the state that recorded it.
     pub verified: Option<bool>,
+    /// Steers the orchestrator sent this worker after dispatch, in arrival
+    /// order. Read from the worker's steer log, so a worker this process never
+    /// steered is still listed.
+    pub steers: Vec<String>,
 }
 
 /// One worker of the round, as the consolidator sees it.
@@ -54,6 +58,12 @@ pub struct RoundWorker {
     /// [`RoundManifest::render_full_tasks`]), never part of the compact
     /// [`RoundManifest::render`].
     pub full_task: String,
+    /// What the orchestrator steered the worker *after* dispatch, in arrival
+    /// order: the scope amendments that supersede `full_task` where they
+    /// conflict. Bounded when rendered (see
+    /// [`RoundManifest::render_full_tasks`]), never part of the compact
+    /// [`RoundManifest::render`].
+    pub steers: Vec<String>,
     /// Files the branch touched, relative to the base branch.
     pub files: Vec<String>,
 }
@@ -148,10 +158,12 @@ impl RoundManifest {
     /// The compact manifest keeps each task's first line so the orchestrator
     /// can diff two rounds by eye; the consolidator judges whether each diff
     /// respected its task's scope and so needs the whole text. Every worker
-    /// listed (ready first, then not ready) contributes one entry, each task
-    /// bounded by `FULL_TASK_BUDGET` with a `[truncated]` marker when it is
-    /// cut, and the whole section — the omitted-count footer included,
-    /// when one is written — bounded by `FULL_TASKS_BUDGET` bytes, so
+    /// listed (ready first, then not ready) contributes one entry: its whole
+    /// task bounded by `FULL_TASK_BUDGET`, then the orchestrator steers it
+    /// received after dispatch (see [`render_steers`]), which amend that task.
+    /// Both are cut with a `[truncated]` marker, and the whole section — the
+    /// omitted-count footer included, when one is written — bounded by
+    /// [`FULL_TASKS_BUDGET`] bytes, so
     /// a verbose round cannot flood the prompt; work the budget leaves
     /// out is counted rather than silently dropped.
     ///
@@ -163,8 +175,8 @@ impl RoundManifest {
         }
         let mut out = String::from(
             "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the \
-             worker's own text below; the manifest above keeps only each task's first \
-             line):\n",
+             worker's own text below, as amended by the orchestrator steers that follow \
+             it; the manifest above keeps only each task's first line):\n",
         );
         // The section ends with the omitted-count footer whenever any
         // worker is left out, so the footer's bytes are part of the
@@ -182,7 +194,11 @@ impl RoundManifest {
         let mut omitted = 0usize;
         for worker in self.ready.iter().chain(self.not_ready.iter()) {
             let task = bound_task(&worker.full_task, FULL_TASK_BUDGET);
-            let entry = format!("### {}:\n{task}\n", worker.id);
+            let entry = format!(
+                "### {}:\n{task}{}\n",
+                worker.id,
+                render_steers(&worker.steers)
+            );
             if entry.len() > remaining {
                 omitted += 1;
                 continue;
@@ -230,6 +246,39 @@ fn bound_task(task: &str, budget: usize) -> String {
     let cut = task.floor_char_boundary(budget - TASK_TRUNCATION_MARKER.len());
     format!("{}{TASK_TRUNCATION_MARKER}", &task[..cut])
 }
+
+/// What the orchestrator told a worker after dispatch, as the amendment block
+/// that follows that worker's task.
+///
+/// Rendered after the original task because it *is* an amendment to it: the
+/// consolidator reads the task, then the orchestrator's later steering, and
+/// judges the diff against the pair. Each steer is one numbered item so the
+/// order the worker received them in stays visible (a later steer can retract
+/// an earlier one), and the whole block is bounded by [`STEERS_BUDGET`] with
+/// the shared truncation marker, so a chatty orchestrator cannot push a real
+/// amendment out of the section.
+///
+/// Returns an empty string for a worker nobody steered, so the common case
+/// costs nothing in the section's byte budget.
+fn render_steers(steers: &[String]) -> String {
+    if steers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "ORCHESTRATOR STEERS AFTER DISPATCH (these SUPERSEDE the task above wherever they \
+         conflict):\n",
+    );
+    for (i, steer) in steers.iter().enumerate() {
+        // A steer is the orchestrator's own words: rendered verbatim, so the
+        // consolidator judges the decision the user actually approved.
+        out.push_str(&format!("{}. {}\n", i + 1, steer.trim()));
+    }
+    bound_task(&out, STEERS_BUDGET)
+}
+
+/// Byte budget for one worker's orchestrator-steer amendment block,
+/// truncation marker included.
+const STEERS_BUDGET: usize = 2 * 1024;
 
 /// One worker's lines: identity, state, verification, task heading, files.
 fn push_worker(out: &mut String, worker: &RoundWorker) {
@@ -290,6 +339,7 @@ pub async fn build(
                 verified: row.verified,
                 task: first_line(&row.task),
                 full_task: row.task,
+                steers: row.steers,
                 files: Vec::new(),
             })
             .collect();
@@ -335,6 +385,7 @@ pub async fn build(
             verified: row.verified,
             task: first_line(&row.task),
             full_task: row.task,
+            steers: row.steers,
             files: files.clone(),
         };
         if exists && row.status == RegistryStatus::Completed {
@@ -417,6 +468,7 @@ mod round_tests {
             verified: None,
             task: first_line(full_task),
             full_task: full_task.to_string(),
+            steers: Vec::new(),
             files: Vec::new(),
         }
     }
@@ -527,7 +579,7 @@ mod round_tests {
         let section = small.render_full_tasks();
         assert_eq!(
             section,
-            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the worker's own text below; the manifest above keeps only each task's first line):\n### w1:\none task\nbody\n",
+            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the worker's own text below, as amended by the orchestrator steers that follow it; the manifest above keeps only each task's first line):\n### w1:\none task\nbody\n",
             "{section}"
         );
         assert!(section.len() <= FULL_TASKS_BUDGET);

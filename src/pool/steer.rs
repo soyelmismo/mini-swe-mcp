@@ -16,7 +16,29 @@
 //!
 //! Note that `prune_stale_worktrees` does *not* reclaim these files: its sweep
 //! matches `swe-wt-*` directories and `swe-wt-*.pid` leases, and a
-//! `swe-wt-<id>.steer` file matches neither. Cleanup is therefore the worker
+//! `swe-wt-<id>.steer` file matches neither. The same is true of the
+//! orchestrator steer log ([`record_orchestrator_steer_in`]), which is swept as
+//! a worker companion by retirement instead.
+//!
+//! ## What the steer log is, and what may not reach it
+//!
+//! The orchestrator steer log (`swe-wt-<id>.steer-log.jsonl`) is never drained:
+//! it is the round's record of the orchestrator's *own* scope amendments, read
+//! back when a consolidator is dispatched much later. Two properties follow from
+//! that, and both hold at the `open(2)` itself rather than in a check before it:
+//!
+//! * **It is written and read only as a regular file, never through a link.**
+//!   The name sits in the shared scratch base, so a local user can pre-create
+//!   it. Following a planted symlink would turn an orchestrator steer into an
+//!   append into an arbitrary file, and would let a planted file be read back as
+//!   the orchestrator's voice -- text the consolidator is told *supersedes* the
+//!   worker's task. `O_NOFOLLOW` plus a check of the opened handle's own type
+//!   refuses a link, a FIFO, or a device, in both directions.
+//! * **Neither direction may block.** `O_NONBLOCK` at the open is what makes
+//!   the type check reachable: `O_APPEND` on a FIFO blocks inside `open(2)`
+//!   until a reader arrives, and a read-only `open` on a FIFO blocks until a
+//!   writer does. `round_manifest` is async and reads the log on the reactor, so
+//!   either would stall every request on the pool. Cleanup is therefore the worker
 //! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
 //! held for the worker's whole lifetime), not the pruner's — a mailbox only
 //! exists while some `steer` call created it, and every worker removes its own
@@ -41,7 +63,8 @@
 //!   same file and deliver every message twice.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -154,17 +177,7 @@ fn read_records(claim: &Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(claim) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<SteerRecord>(line) {
-            Ok(record) => out.push(record.message),
-            Err(e) => warn!(error = %e, "Skipping unparsable steering mailbox line"),
-        }
-    }
-    out
+    parse_records(&content, claim)
 }
 
 /// Delete `worker_id`'s mailbox and any stale claim file.
@@ -192,6 +205,172 @@ pub fn remove_steer_file_in(root: &ScratchRoot, worker_id: &str) {
             }
         }
     }
+}
+
+/// Path of the durable orchestrator-steer log for `worker_id`.
+///
+/// Unlike the mailbox this file is never drained: it is the round's record of
+/// what the orchestrator told each worker *after* dispatch, so a consolidator
+/// dispatched later can be shown the scope amendments that superseded the
+/// original task. Written by [`record_orchestrator_steer_in`] alone, which
+/// only the orchestrator's own steer path calls.
+pub(super) fn steer_log_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf {
+    root.join(format!("swe-wt-{worker_id}.steer-log.jsonl"))
+}
+
+/// Append one orchestrator-authored steer to `worker_id`'s durable log.
+///
+/// Only messages that reached the worker are recorded, so the log never names
+/// an amendment the worker was never told. The consolidator routes its own
+/// corrections through the same delivery path but under a recorded
+/// [`SteerSource`], and it never calls this: the log is the *orchestrator's*
+/// voice, and a consolidator must not be shown its own past steers as scope
+/// amendments to a task it is judging.
+///
+/// A log that cannot be written is a warning, never a failed steer: the
+/// message has already been delivered and the round loses an amendment, which
+/// is strictly less bad than refusing guidance the worker needs.
+pub(super) fn record_orchestrator_steer_in(root: &ScratchRoot, worker_id: &str, message: &str) {
+    let path = steer_log_path_in(root, worker_id);
+    let record = SteerRecord {
+        message: message.to_string(),
+        sent_at: super::unix_timestamp(),
+        pid: std::process::id(),
+    };
+    // `to_string` on a `Value` cannot fail.
+    let mut payload = serde_json::to_string(&record).unwrap_or_default();
+    payload.push('\n');
+    match open_steer_log_for_append(&path) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(payload.as_bytes()) {
+                warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+            }
+        }
+        Err(e) => {
+            warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+        }
+    }
+}
+
+/// Open the steer log to append one record, refusing anything but our own file.
+///
+/// The log lives in the shared scratch base, which any local user can write, so
+/// the name alone proves nothing: a symlink planted at the path would turn
+/// this append into an append into whatever the link names -- a file the
+/// attacker cannot otherwise write -- with orchestrator-authored bytes in it.
+/// `O_NOFOLLOW` refuses a link at the open itself, rather than a `symlink_metadata`
+/// check that precedes it and leaves a window to swap a regular file for one.
+///
+/// `O_NONBLOCK` is here for the type that is not a link: `O_APPEND` on a FIFO
+/// blocks inside `open(2)` until a reader shows up, which would park the whole
+/// pool on a steer. The handle's own `fstat` then proves the type on the object
+/// actually opened, so a FIFO or a device cannot be substituted for the log
+/// either. A regular file ignores `O_NONBLOCK`, so the real log pays nothing.
+fn open_steer_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "steer log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Open the steer log to read it, refusing a link and any non-regular file.
+///
+/// The companion of [`open_steer_log_for_append`] on the read side: this text is
+/// rendered to the consolidator as the orchestrator's scope amendments, so what
+/// is read here is treated as the orchestrator's own voice. A planted file must
+/// never be able to speak in that voice, and a FIFO must never be able to stall
+/// the async caller that builds the manifest.
+fn open_steer_log_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "steer log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Ceiling on the bytes [`orchestrator_steers_in`] reads from one log.
+///
+/// The caller renders each worker's block through [`STEERS_BUDGET`], so a
+/// record past that point cannot reach the prompt; reading the rest only costs
+/// memory on a path that has to answer promptly. The log is append-only and
+/// read from the start, where the amendments that matter are: the oldest
+/// steering is the one a later steer retracts. The cap is deliberately
+/// generous relative to [`STEERS_BUDGET`] so ordinary rounds are never cut.
+const STEER_LOG_READ_CAP: u64 = 256 * 1024;
+
+/// Every orchestrator steer `worker_id` received after dispatch, in order.
+///
+/// A missing log is the common case (nobody steered this worker) and yields an
+/// empty vector. Lines that fail to parse are skipped with a warning, so one
+/// torn or corrupt append cannot hide the amendments around it.
+///
+/// Bounded by [`STEER_LOG_READ_CAP`]: the log sits in the shared scratch base,
+/// which any local user can write, so its size is not this process's to
+/// assume. Only whole leading lines are parsed, so a cap never yields a
+/// half-decoded record.
+pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
+    let path = steer_log_path_in(root, worker_id);
+    // Opened the way the archive reader opens its own shared file: `O_NOFOLLOW`
+    // so a planted link is never harvested as the orchestrator's own words, and
+    // `O_NONBLOCK` so the type can be established without blocking in
+    // `open(2)` -- a FIFO read-only blocks until a writer arrives, which would
+    // stall every request on the pool. The handle's own type is then checked, so
+    // a FIFO or a device cannot stand in for the log either. A missing log is
+    // the common case and yields nothing.
+    let file = match open_steer_log_for_read(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!(worker = %worker_id, path = %path.display(), error = %e, "Refusing to read orchestrator steer log");
+            return Vec::new();
+        }
+    };
+    let mut content = String::new();
+    if let Err(e) = file.take(STEER_LOG_READ_CAP).read_to_string(&mut content)
+        && e.kind() != std::io::ErrorKind::UnexpectedEof
+    {
+        warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to read orchestrator steer log");
+        return Vec::new();
+    }
+    // A cut at the cap can leave a partial trailing record; dropping it keeps a
+    // half-written line from being read as guidance.
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.truncate(content.rfind('\n').map_or(0, |i| i + 1));
+    }
+    parse_records(&content, &path)
+}
+
+/// The parsed records of an already-read mailbox body.
+fn parse_records(content: &str, source: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SteerRecord>(line) {
+            Ok(record) => out.push(record.message),
+            Err(e) => {
+                warn!(path = %source.display(), error = %e, "Skipping unparsable steering mailbox line")
+            }
+        }
+    }
+    out
 }
 
 /// The last consolidator to steer a worker, and its immutable round base.
