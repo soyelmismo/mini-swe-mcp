@@ -416,6 +416,10 @@ impl WorkerPool {
                 label_prefix: "[review] ",
                 steer_prefix: "ORCHESTRATOR GUIDANCE:\n",
                 apply_sentinels: false,
+                // Inspecting the diff and re-running the gate is the reviewer's
+                // job in both modes, so a turn that changes nothing is the
+                // review, not a stall: the read-only escalation stays off.
+                read_only_exempt: true,
                 llm_error_policy: LlmErrorPolicy::EndQuietly,
                 status: RegistryStatus::Reviewing,
                 model: &reviewer_model,
