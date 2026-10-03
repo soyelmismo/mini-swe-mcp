@@ -1780,12 +1780,17 @@ fn suppressing_a_stale_stall_keeps_the_workers_other_queued_events() {
     router.observe_watch([("w0".to_string(), waiting)].into());
     // A real terminal transition for the same worker, in another group: this
     // watch must not deliver it, and suppressing the stall must not eat it.
-    router.watch_history.get_mut("o").expect("history").pending.push_back(json!({
-        "worker_id": "w0", "owner": "o", "group": "other", "event": "completed",
-        "status": "completed", "step": 5, "revision": 2, "sequence": 99,
-        "verified": true, "branch": "worker-w0",
-        "metrics": WorkerMetrics::default()
-    }));
+    router
+        .watch_history
+        .get_mut("o")
+        .expect("history")
+        .pending
+        .push_back(json!({
+            "worker_id": "w0", "owner": "o", "group": "other", "event": "completed",
+            "status": "completed", "step": 5, "revision": 2, "sequence": 99,
+            "verified": true, "branch": "worker-w0",
+            "metrics": WorkerMetrics::default()
+        }));
     let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
     ctx.agent_id = Some("o".into());
     // Scoped to group g: the stale stall is suppressed, the completion is out
@@ -1796,7 +1801,11 @@ fn suppressing_a_stale_stall_keeps_the_workers_other_queued_events() {
             &json!({"worker_ids":[], "group":"g", "initial":false}),
         )
         .unwrap();
-    assert_eq!(reply["events"], json!([]), "the stale stall is suppressed: {reply}");
+    assert_eq!(
+        reply["events"],
+        json!([]),
+        "the stale stall is suppressed: {reply}"
+    );
     let left: Vec<String> = router.watch_history["o"]
         .pending
         .iter()
@@ -1819,6 +1828,3 @@ fn suppressing_a_stale_stall_keeps_the_workers_other_queued_events() {
         "the completion must still reach the owner: {later}"
     );
 }
-
-
-
