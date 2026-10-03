@@ -45,5 +45,5 @@ pub use client::{
 };
 pub use daemon::{
     HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens, connect_endpoint, hub_dir,
-    run_daemon, watch_token_identity,
+    hub_dir_in, run_daemon, watch_token_identity,
 };
