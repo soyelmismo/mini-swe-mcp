@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 
 use super::admission::{AdmissionClass, AdmissionController};
 use super::registry::{RegistryStatus, load_all_registry_entries_in, load_registry_entry_in};
+use super::archive::RetireReason;
 use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
 };
@@ -69,6 +70,10 @@ pub struct MergeRequest<'a> {
     /// no pool (tests, one-shot tools): the gate still runs confined, only the
     /// host budget is not reserved.
     pub admission: Option<AdmissionController>,
+    /// Hub directory the retirement appends the worker's final REPORT to
+    /// (`archive.jsonl`). `None` archives nothing: only the hub daemon knows its
+    /// own directory, and a merge must never guess one.
+    pub archive_dir: Option<PathBuf>,
 }
 
 /// What a successful merge did, in the words the CLI prints.
@@ -107,6 +112,7 @@ pub fn merge_worker(worker_id: &str) -> Result<MergeReport> {
             verified: None,
             keep_branch: false,
             admission: None,
+            archive_dir: None,
         },
     )
 }
@@ -231,6 +237,8 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
         &resolved.branch,
         &resolved.base_branch,
         req.keep_branch,
+        &commit,
+        req.archive_dir.as_deref(),
     );
 
     Ok(MergeReport {
@@ -245,6 +253,20 @@ pub fn merge_worker_in(root: &ScratchRoot, req: &MergeRequest) -> Result<MergeRe
         cleaned,
         retired,
     })
+}
+
+/// The context a round member retires under: the merged worker's repository,
+/// hub directory and commit, but `reason` naming the round's own door.
+///
+/// The member never had its own branch merged in this command -- the
+/// consolidator carried it -- so archiving it as "merged" would blur exactly
+/// the distinction the archive exists to preserve. Everything else is the
+/// merged worker's, so a member's line carries the same landing commit.
+fn round_ctx<'a>(ctx: &RetireContext<'a>, reason: RetireReason) -> RetireContext<'a> {
+    RetireContext {
+        reason: Some(reason),
+        ..ctx.clone()
+    }
 }
 
 /// Abbreviated commit `repo` currently has checked out.
@@ -726,6 +748,8 @@ fn cleanup(
     branch: &str,
     base_branch: &str,
     keep_branch: bool,
+    merge_commit: &str,
+    archive_dir: Option<&Path>,
 ) -> (bool, Vec<String>, Vec<String>) {
     let worktree = root.join(format!("swe-wt-{worker_id}"));
     let reclaimed = worktree.exists();
@@ -737,7 +761,12 @@ fn cleanup(
         .unwrap_or_default();
     let ctx = RetireContext {
         repo: Some(repo),
-        ack_dir: None,
+        // The hub directory is the one place both the watch acknowledgements
+        // and the retired worker's report live; the MCP handler passes it, so
+        // a merge run without a hub archives nothing rather than guessing one.
+        ack_dir: archive_dir,
+        reason: Some(RetireReason::Merged),
+        merge_commit: Some(merge_commit),
         keep_branch,
     };
     // The retirement performs the branch deletion, so its report is the truth:
@@ -780,7 +809,8 @@ fn cleanup(
                     continue;
                 }
             }
-            if retire_worker_reporting(root, id, &ctx).row_removed {
+            if retire_worker_reporting(root, id, &round_ctx(&ctx, RetireReason::Integrated)).row_removed
+            {
                 retired.push(id.clone());
                 round_retired += 1;
             }
@@ -812,7 +842,7 @@ fn cleanup(
                 cleaned_kept.push(format!("kept {id}: not integrated"));
                 continue;
             }
-            if retire_worker_reporting(root, id, &ctx).row_removed {
+            if retire_worker_reporting(root, id, &round_ctx(&ctx, RetireReason::Absorbed)).row_removed {
                 retired.push(id.clone());
                 absorbed_retired += 1;
             }
@@ -928,6 +958,10 @@ pub struct MergeApprovedRequest<'a> {
     /// with no pool: the gate still runs confined, only the budget is not
     /// reserved.
     pub admission: Option<AdmissionController>,
+    /// Hub directory each worker's final REPORT is appended to
+    /// (`archive.jsonl`). `None` archives nothing: only the hub daemon knows
+    /// its own directory.
+    pub archive_dir: Option<PathBuf>,
 }
 
 /// One approved worker whose branch landed.
@@ -1104,6 +1138,7 @@ pub fn merge_approved_in(
         verified: None,
         keep_branch: false,
         admission: req.admission.clone(),
+        archive_dir: None,
     };
     // The gate replays the dispatcher's filtered environment; a round's workers
     // share it, so the first included worker's copy is the batch's.
@@ -1157,8 +1192,16 @@ pub fn merge_approved_in(
             )
         })?;
         let commit = head_commit(repo);
-        let (_, worker_cleaned, worker_retired) =
-            cleanup(root, id, repo, &worker.branch, &base_branch, false);
+        let (_, worker_cleaned, worker_retired) = cleanup(
+            root,
+            id,
+            repo,
+            &worker.branch,
+            &base_branch,
+            false,
+            &commit,
+            req.archive_dir.as_deref(),
+        );
         cleaned.extend(worker_cleaned);
         retired.extend(worker_retired);
         merged.push(MergedWorker {

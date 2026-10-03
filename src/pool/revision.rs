@@ -838,6 +838,12 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         let ctx = RetireContext {
             repo: Some(repo.as_path()),
             ack_dir,
+            // The sweep only ever retires what a merge already proved: the
+            // branch is in the base branch and carries work of its own. It
+            // cannot name the commit that landed it -- by now the merge is over
+            // -- so the line says so rather than guessing.
+            reason: Some(super::archive::RetireReason::Integrated),
+            merge_commit: None,
             keep_branch: false,
         };
         for candidate in candidates {
@@ -1205,7 +1211,11 @@ fn remove_orphan_worker_files(root: &ScratchRoot) -> (usize, Vec<String>) {
 /// its row and its conversation until this retention runs out, which is what
 /// lets an orchestrator continue a worker it finished days ago. Returns how
 /// many workers were retired.
-pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u64) -> usize {
+pub fn retire_expired_terminal_workers_in(
+    root: &ScratchRoot,
+    retention_secs: u64,
+    archive_dir: Option<&Path>,
+) -> usize {
     let now = super::unix_timestamp();
     let mut retired = 0;
     for entry in super::load_registry_entries_read_only_in(root) {
@@ -1213,7 +1223,17 @@ pub fn retire_expired_terminal_workers_in(root: &ScratchRoot, retention_secs: u6
         {
             continue;
         }
-        retire_worker_in(root, &entry.id);
+        // Same deletion, one archive line: the retention run is the only reason
+        // this worker is going, and the report it ended with goes with it.
+        retire_worker_reporting(
+            root,
+            &entry.id,
+            &RetireContext {
+                reason: Some(super::archive::RetireReason::Expired),
+                ack_dir: archive_dir,
+                ..RetireContext::default()
+            },
+        );
         retired += 1;
     }
     retired

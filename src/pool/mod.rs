@@ -610,11 +610,18 @@ impl WorkerPool {
     /// Age-based and independent of the in-memory records, so a worker whose
     /// branch remains keeps everything until this retention ends. Returns how
     /// many workers were retired.
-    pub async fn retire_expired_terminal_workers(&self) -> usize {
+    ///
+    /// `archive_dir` is the hub directory each retired worker's final REPORT is
+    /// appended to; `None` retires without archiving, which is what a caller
+    /// with no hub (an in-process pool, a test) gets.
+    pub async fn retire_expired_terminal_workers(
+        &self,
+        archive_dir: Option<std::path::PathBuf>,
+    ) -> usize {
         let root = self.scratch.clone();
         let retention = terminal_retention_secs();
         let retired = tokio::task::spawn_blocking(move || {
-            revision::retire_expired_terminal_workers_in(&root, retention)
+            revision::retire_expired_terminal_workers_in(&root, retention, archive_dir.as_deref())
         })
         .await
         .unwrap_or(0);
@@ -2507,7 +2514,7 @@ fn annotate_absorbed(
 ///
 /// Kept in the library so the server can start it from `run_stdio` without
 /// depending on `main.rs`.
-pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
+pub fn spawn_reaper(pool: WorkerPool, archive_dir: Option<std::path::PathBuf>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(30);
         // The durable retention is a week, so sweeping it needs no such
@@ -2520,7 +2527,7 @@ pub fn spawn_reaper(pool: WorkerPool) -> JoinHandle<()> {
             since_retention += 1;
             if since_retention >= retention_every {
                 since_retention = 0;
-                pool.retire_expired_terminal_workers().await;
+                pool.retire_expired_terminal_workers(archive_dir.clone()).await;
             }
         }
     })
