@@ -904,7 +904,7 @@ pub fn terminal_retention_secs() -> u64 {
 /// A row that never recorded an age (`updated_at` of zero, written before the
 /// field existed) is *not* expired: an unknown age must not be read as an
 /// ancient one. Clock skew is absorbed by `saturating_sub`, exactly as
-/// [`expired_terminal_ids`] absorbs it.
+/// `expired_terminal_ids` absorbs it.
 pub fn retention_expired(updated_at: u64, retention_secs: u64, now: u64) -> bool {
     updated_at != 0 && now.saturating_sub(updated_at) >= retention_secs
 }

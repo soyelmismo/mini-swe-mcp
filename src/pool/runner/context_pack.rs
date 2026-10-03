@@ -130,7 +130,7 @@ pub fn extract_identifiers(task: &str) -> Vec<String> {
 }
 
 /// The top-level item lines of one file, as `"<line>: <text>"`, capped at
-/// [`OUTLINE_CAP`] with a trailing count of what was omitted.
+/// `OUTLINE_CAP` with a trailing count of what was omitted.
 ///
 /// The language is chosen from the extension and falls back to a generic
 /// "non-indented declaration-looking line" rule for anything else.

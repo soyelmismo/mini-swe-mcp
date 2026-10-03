@@ -171,10 +171,10 @@ impl Drop for JobGuard<'_> {
 /// be the run the gate reuses instead of paying for a second full run.
 ///
 /// The base commit line is load-bearing: the harness commits a checkpoint of
-/// the worker's uncommitted changes every [`AUTO_CHECKPOINT_TURNS`](super::turn::AUTO_CHECKPOINT_TURNS)
-/// steps, so a bare `git diff` is empty after the first checkpoint and a model
-/// that reads it as "my edits are gone" spends its remaining turns re-checking
-/// and re-applying them. `base_commit` empty (git could not answer) leaves the
+/// the worker's uncommitted changes every `AUTO_CHECKPOINT_TURNS` steps, so a
+/// bare `git diff` is empty after the first checkpoint and a model that
+/// reads it as "my edits are gone" spends its remaining turns re-checking and
+/// re-applying them. `base_commit` empty (git could not answer) leaves the
 /// line out rather than naming a base that does not exist.
 pub fn opening_task_message(
     task: &str,
