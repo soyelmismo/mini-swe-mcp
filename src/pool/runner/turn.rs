@@ -1194,17 +1194,7 @@ impl<'a> TurnEngine<'a> {
         // beginning with the wait's name would otherwise own the label for
         // the rest of the worker's life, every later step reading the same
         // unchanged label and skipping its own write again.
-        let wait_owns_label = self
-            .pool
-            .worker_progress(self.worker_id)
-            .await
-            .and_then(|p| p.last_command)
-            .is_some_and(|lc| {
-                let t = lc.trim_start();
-                t == "CONSOLIDATE_WAIT"
-                    || t.strip_prefix("CONSOLIDATE_WAIT")
-                        .is_some_and(|r| r.starts_with(char::is_whitespace))
-            });
+        let wait_owns_label = self.pool.harness_wait_in_flight(self.worker_id);
         self.pool
             .update_worker(self.worker_id, |w| {
                 w.metrics = self.meta.metrics;
