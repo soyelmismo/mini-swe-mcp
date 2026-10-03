@@ -515,12 +515,12 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
     );
     let reviewer_request = &requests[2];
     // The default catalog marks no `strongest:` tier, so the automatic
-    // reviewer is the dispatch default -- never the implementer's own
-    // `test-model`, which the pool resolves to the built-in `ninja` default.
-    // See `review_reviewer_choice_test.rs` for the strongest-tier rule.
+    // reviewer is the dispatch default (`ninja`), never the implementer's own
+    // `test-model`. See `review_reviewer_choice_test.rs` for the rule and its
+    // strongest-tier case.
     assert_eq!(
         reviewer_request["model"],
-        json!("ninja"),
+        json!("combo:ninja"),
         "the automatic review must not run on the implementer's model"
     );
     let prompt = review_prompt_of(&server).await.expect("a review prompt");
