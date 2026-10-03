@@ -7,16 +7,19 @@
 //! agent: its contract is to inspect the diff, run the suite the dispatch
 //! named, fix whatever it finds, and only then emit the completion sentinel.
 //!
-//! Two modes share this engine ([`ReviewMode`]):
+//! Two built-in modes share this engine ([`ReviewMode`]), plus any the
+//! manifest declares (`review_modes:` in `models.yaml`):
 //!
-//! * [`ReviewMode::Quality`] — today's generic audit: run the gate, inspect
-//!   the diff, fix real defects, re-run the gate.
-//! * [`ReviewMode::Security`] — an adversarial pass over the same diff. Its
-//!   checklist is about what an unprivileged local user, another agent or a
-//!   lying model text can do with every new path, socket, file, environment
-//!   variable and IPC message. It is selected by the `:security` suffix of
-//!   `--review-after` (`review_after`), and it is also what the automatic
-//!   sensitive-path trigger runs.
+//! * `quality` — today's generic audit: run the gate, inspect the diff, fix
+//!   real defects, re-run the gate.
+//! * `security` — an adversarial pass over the same diff. Its checklist is
+//!   about what an unprivileged local user, another agent or a lying model
+//!   text can do with every new path, socket, file, environment variable and
+//!   IPC message. It is selected by the `:security` suffix of `--review-after`
+//!   (`review_after`), and it is also what the automatic sensitive-path
+//!   trigger runs.
+//! * A manifest-declared mode — its `checklist` appended to the common review
+//!   frame, selected by `--review-after <model>:<mode>`.
 //!
 //! It runs under its own turn budget ([`ReviewPhase::review_max_turns`],
 //! resolved from the model manifest) and its own message history, so the
@@ -38,53 +41,93 @@ use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOut
 
 /// Which auditor runs over the finished implementation.
 ///
-/// The default is the historical quality review; [`ReviewMode::Security`] is
-/// the adversarial variant. The two differ only in the prompt they hand the
+/// The default is the historical quality review; the `security` mode is the
+/// adversarial variant. The modes differ only in the prompt they hand the
 /// reviewer: the engine, the turn budget, the network policy and the worktree
 /// are identical, so a security review is not a second worker to reason about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReviewMode {
-    /// The generic audit: gates, diff, real defects, gates again.
-    #[default]
-    Quality,
-    /// The adversarial audit: hostile inputs, untrusted model text, crash and
-    /// handover windows, deletion proof, test meaning.
-    Security,
+///
+/// A manifest may declare its own review modes (`review_modes:` in
+/// `models.yaml`), each with a `checklist` and an optional default `model`.
+/// Declaring a mode named `quality` or `security` overrides the built-in
+/// prompt; any other name adds a new mode selectable via
+/// `--review-after <model>:<mode>`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewMode {
+    /// The mode's name: `quality`, `security`, or a manifest-declared mode.
+    pub name: String,
+    /// The checklist for a manifest-declared mode (or a built-in overridden by
+    /// the manifest). `None` for the built-in quality/security modes, which
+    /// build their own full prompt.
+    pub checklist: Option<String>,
 }
 
 impl ReviewMode {
-    /// The suffix that selects this mode in `--review-after <model>:<mode>`.
+    /// The suffix that selects the adversarial mode in
+    /// `--review-after <model>:<mode>`.
     ///
     /// Spelled here and matched in [`ReviewMode::parse_model`] so the CLI, the
     /// MCP arg and the prompt cannot disagree on the spelling.
     pub const SECURITY_SUFFIX: &'static str = "security";
 
-    /// Split `--review-after <model>[:security]` into the model and the mode.
+    /// The suffix that selects the generic audit in
+    /// `--review-after <model>:<mode>`.
+    pub const QUALITY_SUFFIX: &'static str = "quality";
+
+    /// The generic audit: gates, diff, real defects, gates again.
+    pub fn quality() -> Self {
+        Self {
+            name: Self::QUALITY_SUFFIX.to_string(),
+            checklist: None,
+        }
+    }
+
+    /// The adversarial audit: hostile inputs, untrusted model text, crash and
+    /// handover windows, deletion proof, test meaning.
+    pub fn security() -> Self {
+        Self {
+            name: Self::SECURITY_SUFFIX.to_string(),
+            checklist: None,
+        }
+    }
+
+    /// Whether this is the adversarial security review (by name).
+    ///
+    /// A manifest that overrides `security` with its own checklist is still
+    /// the security review, so the finding count is still recorded.
+    pub fn is_security(&self) -> bool {
+        self.name.eq_ignore_ascii_case(Self::SECURITY_SUFFIX)
+    }
+
+    /// Split `--review-after <model>[:mode]` into the model and the mode.
     ///
     /// A model id legitimately contains `:` (`combo:nerd`), so only a suffix
-    /// equal to [`ReviewMode::SECURITY_SUFFIX`] is a mode marker: the *last*
-    /// `:` segment is inspected and removed only when it names a known mode.
+    /// equal to a built-in mode (`security`, `quality`) is a mode marker: the
+    /// *last* `:` segment is inspected and removed only when it names one.
     /// Everything else — `combo:nerd`, `some/unknown`, a trailing `:` — stays
     /// the model verbatim, which is what keeps today's `--review-after` values
-    /// parsing exactly as they did.
+    /// parsing exactly as they did. Manifest-declared modes are resolved by
+    /// [`crate::manifest::ModelManifest::parse_review_after`], which has the
+    /// catalog to validate them against.
     pub fn parse_model(requested: &str) -> (String, Self) {
         let trimmed = requested.trim();
         match trimmed.rsplit_once(':') {
             Some((model, suffix))
                 if !model.is_empty() && suffix.eq_ignore_ascii_case(Self::SECURITY_SUFFIX) =>
             {
-                (model.to_string(), Self::Security)
+                (model.to_string(), Self::security())
             }
-            _ => (trimmed.to_string(), Self::Quality),
+            Some((model, suffix))
+                if !model.is_empty() && suffix.eq_ignore_ascii_case(Self::QUALITY_SUFFIX) =>
+            {
+                (model.to_string(), Self::quality())
+            }
+            _ => (trimmed.to_string(), Self::quality()),
         }
     }
 
     /// The name a status line, an event or a log prints.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Quality => "quality",
-            Self::Security => "security",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.name
     }
 }
 
@@ -101,7 +144,7 @@ impl ReviewMode {
 /// a quality review or for a security review the orchestrator asked for by
 /// hand.
 pub fn review_prompt(
-    mode: ReviewMode,
+    mode: &ReviewMode,
     task: &str,
     verify: Option<&str>,
     sensitive: &[String],
@@ -110,10 +153,16 @@ pub fn review_prompt(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or(DISABLED_GATE);
-    match mode {
-        ReviewMode::Quality => quality_prompt(task, gate),
-        ReviewMode::Security => security_prompt(task, gate, sensitive),
+    // A manifest-declared checklist overrides the built-in prompt of the same
+    // name; any other declared mode runs the common review frame with its own
+    // focus instructions appended.
+    if let Some(checklist) = mode.checklist.as_deref() {
+        return custom_prompt(&mode.name, task, gate, checklist);
     }
+    if mode.is_security() {
+        return security_prompt(task, gate, sensitive);
+    }
+    quality_prompt(task, gate)
 }
 
 /// What the prompt says when the dispatch disabled the completion gate.
@@ -175,6 +224,28 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
             echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
     );
     prompt
+}
+
+/// A manifest-declared review mode: the common review frame with the mode's
+/// own focus instructions appended.
+///
+/// The frame is the same contract every reviewer honours — inspect the diff,
+/// run the dispatch's verify gate, fix real defects with a regression test,
+/// list unfixed findings in REPORT risks — and the `checklist` is what the
+/// manifest author added on top of it.
+fn custom_prompt(name: &str, task: &str, gate: &str, checklist: &str) -> String {
+    format!(
+        "REVIEW PHASE ({name}):\nThe previous subagent implemented the following task:\n{task}\n\n\
+        YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
+        1. First run the completion gate on the checkpoint and see it pass: `{gate}`. Then run the tests of the files you touch.\n\
+        2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
+        3. Focus instructions for this review mode:\n{checklist}\n\
+        4. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements, with a regression test that fails without the fix.\n\
+        5. Re-run the gate and the tests you touched and see them pass before completing.\n\
+        6. In your REPORT block list every finding you did NOT fix in the `risks:` line, one line each.\n\
+        7. When verified and 100% clean, execute:\n\
+           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+    )
 }
 
 /// The repository-relative files a worker's working tree changed against its
@@ -463,7 +534,7 @@ impl WorkerPool {
                     // The engine still holds the `&mut` borrow of the last
                     // assistant text, so the text is cloned through it.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                    let security = mode.is_security().then(|| SecurityReviewOutcome {
                         findings: parse_findings(&text),
                     });
                     return Ok(ReviewPhaseOutcome {
@@ -480,7 +551,7 @@ impl WorkerPool {
                     // inconclusive, but a security review that ran is still
                     // recorded, with no count rather than a reassuring zero.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                    let security = mode.is_security().then(|| SecurityReviewOutcome {
                         findings: parse_findings(&text),
                     });
                     return Ok(ReviewPhaseOutcome {
@@ -493,7 +564,7 @@ impl WorkerPool {
         }
 
         // The budget ran out with no completion sentinel.
-        let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+        let security = mode.is_security().then(|| SecurityReviewOutcome {
             findings: parse_findings(&last_assistant_text),
         });
         Ok(ReviewPhaseOutcome {
