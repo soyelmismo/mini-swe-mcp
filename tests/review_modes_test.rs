@@ -234,7 +234,7 @@ async fn a_custom_mode_uses_its_checklist_and_reviewer() {
     .await;
 
     let scratch = common::TempDir::new_in_tmp("review-modes-custom");
-    let pool = modes_pool(&server.base_url(), &scratch);
+    let pool = modes_pool(server.base_url(), &scratch);
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -264,7 +264,9 @@ async fn a_custom_mode_uses_its_checklist_and_reviewer() {
         json!("test-reviewer"),
         "the suffix selects the mode, not the model"
     );
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(
         prompt.contains("REVIEW PHASE (perf)"),
         "the custom mode names itself: {prompt}"
@@ -287,7 +289,7 @@ async fn an_unknown_mode_is_a_dispatch_error() {
     let server = FakeLlm::spawn_sse(vec![]).await;
 
     let scratch = common::TempDir::new_in_tmp("review-modes-unknown");
-    let pool = modes_pool(&server.base_url(), &scratch);
+    let pool = modes_pool(server.base_url(), &scratch);
     let err = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -406,7 +408,9 @@ async fn a_custom_trigger_fires_its_mode() {
     );
     // The custom mode has no default model, so the implementer's model runs it.
     assert_eq!(requests[2]["model"], json!("test-model"));
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(
         prompt.contains("REVIEW PHASE (perf)"),
         "the trigger runs the perf mode: {prompt}"

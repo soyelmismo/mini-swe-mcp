@@ -315,7 +315,7 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
     .await;
 
     let (pool, worker_id, state, _scratch) =
-        dispatch_and_wait(&server.base_url(), repo.path(), None).await;
+        dispatch_and_wait(server.base_url(), repo.path(), None).await;
 
     // The security review ran: the reviewer's turn exists, and the
     // completion event carries its finding count.
@@ -335,7 +335,9 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
         json!("combo:ninja"),
         "the automatic review must not run on the implementer's model"
     );
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(
         prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"),
         "the automatic trigger must run the adversarial prompt"
@@ -377,7 +379,7 @@ async fn an_insensitive_diff_gets_no_review_phase() {
     .await;
 
     let (pool, _worker_id, state, _scratch) =
-        dispatch_and_wait(&server.base_url(), repo.path(), None).await;
+        dispatch_and_wait(server.base_url(), repo.path(), None).await;
 
     assert_eq!(
         server.requests(),
@@ -410,7 +412,7 @@ async fn no_declared_patterns_means_no_trigger() {
     .await;
 
     let (pool, _worker_id, state, _scratch) =
-        dispatch_and_wait(&server.base_url(), repo.path(), None).await;
+        dispatch_and_wait(server.base_url(), repo.path(), None).await;
 
     assert_eq!(
         server.requests(),
@@ -440,7 +442,7 @@ async fn the_security_suffix_selects_the_adversarial_review() {
     .await;
 
     let (pool, _worker_id, state, _scratch) = dispatch_and_wait(
-        &server.base_url(),
+        server.base_url(),
         repo.path(),
         Some("test-reviewer:security".to_string()),
     )
@@ -457,7 +459,9 @@ async fn the_security_suffix_selects_the_adversarial_review() {
         json!("test-reviewer"),
         "the suffix selects the mode, not the model"
     );
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
     // Nothing sensitive was touched, so the trigger adds no paths.
     assert!(!prompt.contains("declared sensitive"));
@@ -484,13 +488,15 @@ async fn a_bare_review_after_keeps_the_generic_prompt() {
     .await;
 
     let (pool, _worker_id, state, _scratch) = dispatch_and_wait(
-        &server.base_url(),
+        server.base_url(),
         repo.path(),
         Some("test-reviewer".to_string()),
     )
     .await;
 
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(prompt.contains("AUDIT & REVIEW PHASE"));
     assert!(!prompt.contains("ADVERSARIAL"));
 
@@ -518,7 +524,7 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
     .await;
 
     let (pool, _worker_id, state, _scratch) = dispatch_and_wait(
-        &server.base_url(),
+        server.base_url(),
         repo.path(),
         Some("test-reviewer".to_string()),
     )
@@ -527,7 +533,9 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
     let requests = server.request_bodies().await;
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[2]["model"], json!("test-reviewer"));
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
     assert!(prompt.contains("src/hub/mod.rs"));
 
@@ -580,7 +588,9 @@ async fn the_reviewer_runs_the_dispatch_verify_command() {
         .expect("dispatch the worker");
     let state = common::wait_for_terminal(&pool, &worker_id).await;
 
-    let prompt = common::review_prompt_of(&server).await.expect("a review prompt");
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
     assert!(
         prompt.contains("echo gate-ok"),
         "the prompt must name the dispatch's gate"

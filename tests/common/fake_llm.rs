@@ -189,12 +189,9 @@ async fn serve_turn(
     let turn = turn_of(&body);
     if let Script::Scripted(turns) = script {
         let index = requests.load(Ordering::Relaxed);
-        match turns.get(index.wrapping_sub(1)) {
-            Some(chunks) => {
-                let _ = socket.write_all(sse_frames(chunks).as_bytes()).await;
-                let _ = socket.flush().await;
-            }
-            None => {}
+        if let Some(chunks) = turns.get(index.wrapping_sub(1)) {
+            let _ = socket.write_all(sse_frames(chunks).as_bytes()).await;
+            let _ = socket.flush().await;
         }
         let _ = socket.shutdown().await;
         return;

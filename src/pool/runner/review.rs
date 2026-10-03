@@ -580,8 +580,7 @@ pub fn plan_review(
 /// git as an option rather than a revision, so anything else is not an
 /// approval: [`scope_for`] widens to the whole diff instead of trusting it.
 fn is_object_id(value: &str) -> bool {
-    (value.len() == 40 || value.len() == 64)
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Decide a worker's security review scope from a repository path and a branch.

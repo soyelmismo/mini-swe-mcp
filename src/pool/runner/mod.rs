@@ -690,10 +690,13 @@ impl WorkerPool {
         // upgrade replaces it, as it did before declared modes existed.
         if let Some((reviewer, wanted)) = requested_review
             && wanted.checklist.is_some()
-            && !review_plan.iter().any(|(_, mode, _)| mode.name == wanted.name)
+            && !review_plan
+                .iter()
+                .any(|(_, mode, _)| mode.name == wanted.name)
         {
             review_plan.push((reviewer, wanted, Vec::new()));
         }
+
         // Manifest-declared modes whose `triggers` match the diff run as
         // successive phases in sorted name order. `security` is skipped here:
         // its triggers already union into the sensitive check above, so it has

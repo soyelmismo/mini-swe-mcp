@@ -77,23 +77,31 @@ async fn dispatch_and_wait(
 async fn an_inconclusive_security_review_records_no_approval() {
     let repo = common::TestRepo::new("approval-inconclusive");
     repo.declare_sensitive(&["src/hub/**"]);
-    let llm = FakeLlm::spawn_sse(vec![
+    // The reviewer works through its whole turn budget without ever issuing
+    // the completion sentinel, so the phase ends by budget exhaustion -- an
+    // inconclusive audit -- rather than by approval.
+    let audit_turns: Vec<Vec<String>> = (1..=5)
+        .map(|n| {
+            common::tool_turn(
+                &format!("call_audit_{n}"),
+                &format!("still auditing, pass {n}"),
+                &format!("echo pass > audit-{n}.txt"),
+            )
+        })
+        .collect();
+    let mut turns = vec![
         common::write_turn("call_write", "src/hub/mod.rs"),
         common::completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
-        // The reviewer keeps working and never finishes: the script runs out
-        // after this turn, so the next request is left unanswered and the
-        // phase ends inconclusive rather than approved.
-        common::tool_turn("call_review", "still auditing", "true"),
-    ])
-    .await;
+    ];
+    turns.extend(audit_turns);
+    let llm = FakeLlm::spawn_sse(turns).await;
 
     let scratch = common::TempDir::new_in_tmp("review-approval-inconclusive");
-    let pool = default_pool(&llm.base_url(), &scratch);
+    let pool = default_pool(llm.base_url(), &scratch);
     let (worker_id, _state) = dispatch_and_wait(&pool, repo.path(), "test-model", None).await;
 
-    let entry =
-        mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &worker_id)
-            .expect("the worker's registry row");
+    let entry = mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &worker_id)
+        .expect("the worker's registry row");
     assert!(
         entry.security_review.is_some(),
         "the security review ran (it touched a sensitive path)"
@@ -118,12 +126,11 @@ async fn a_completed_security_review_records_the_approved_commit() {
     .await;
 
     let scratch = common::TempDir::new_in_tmp("review-approval-completed");
-    let pool = default_pool(&llm.base_url(), &scratch);
+    let pool = default_pool(llm.base_url(), &scratch);
     let (worker_id, _state) = dispatch_and_wait(&pool, repo.path(), "test-model", None).await;
 
-    let entry =
-        mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &worker_id)
-            .expect("the worker's registry row");
+    let entry = mini_swe_mcp::pool::load_registry_entry_in(pool.scratch_root(), &worker_id)
+        .expect("the worker's registry row");
     let approved = entry
         .security_approved_commit
         .expect("a completing review records the approval");
@@ -156,7 +163,7 @@ async fn an_empty_reviewer_runs_on_the_implementers_model() {
     .await;
 
     let scratch = common::TempDir::new_in_tmp("review-approval-empty-reviewer");
-    let pool = default_pool(&llm.base_url(), &scratch);
+    let pool = default_pool(llm.base_url(), &scratch);
     let (worker_id, _state) = dispatch_and_wait(
         &pool,
         repo.path(),
@@ -202,8 +209,7 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
     .await;
 
     let scratch = common::TempDir::new_in_tmp("review-approval-displaced");
-    let pool = default_pool(&llm.base_url(), &scratch)
-        .with_manifest(Arc::new(manifest));
+    let pool = default_pool(llm.base_url(), &scratch).with_manifest(Arc::new(manifest));
     let (worker_id, _state) = dispatch_and_wait(
         &pool,
         repo.path(),
@@ -236,7 +242,9 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
         })
         .collect();
     assert!(
-        prompts.iter().any(|p| p.contains("ADVERSARIAL SECURITY REVIEW PHASE")),
+        prompts
+            .iter()
+            .any(|p| p.contains("ADVERSARIAL SECURITY REVIEW PHASE")),
         "the sensitive diff triggers the security upgrade: {prompts:?}"
     );
     assert!(
@@ -254,23 +262,20 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
 /// `scope_for` so it is never spliced verbatim into a git revision argument.
 #[tokio::test]
 async fn a_planted_approval_is_not_an_object_id() {
-    let dir = common::TempDir::new_in_tmp("approval-planted");
-    let repo = dir.path();
-    common::git(repo, &["init", "-q", "-b", "master", "."]);
-    common::git(repo, &["config", "user.email", "planted@test"]);
-    common::git(repo, &["config", "user.name", "Planted Test"]);
-    common::git(repo, &["add", "-A"]);
-    common::git(repo, &["commit", "-q", "-m", "base"]);
-    common::git(repo, &["checkout", "-q", "-b", "worker-w1"]);
-    std::fs::write(repo.join("work.rs"), "// work\n").unwrap();
-    common::git(repo, &["add", "-A"]);
-    common::git(repo, &["commit", "-q", "-m", "work"]);
-    let base = common::git(repo, &["rev-parse", "master"]).trim().to_string();
+    let repo = common::TestRepo::new("approval-planted");
+    let dir = repo.path();
+    common::git(dir, &["checkout", "-q", "-b", "worker-w1"]);
+    std::fs::write(dir.join("work.rs"), "// work\n").unwrap();
+    common::git(dir, &["add", "-A"]);
+    common::git(dir, &["commit", "-q", "-m", "work"]);
+    let base = common::git(dir, &["rev-parse", "master"])
+        .trim()
+        .to_string();
 
     // A value that looks like a git option, not a revision.
     let planted = "--output=pwned".to_string();
     let scope = scope_for(
-        repo,
+        dir,
         "worker-w1",
         WorkerRole::Worker,
         &base,
@@ -287,7 +292,7 @@ async fn a_planted_approval_is_not_an_object_id() {
     // Without the guard, `git log --reverse --format=%H --output=pwned..worker-w1`
     // would have created this file.
     assert!(
-        !repo.join("pwned..worker-w1").exists(),
+        !dir.join("pwned..worker-w1").exists(),
         "no git option was executed"
     );
 }

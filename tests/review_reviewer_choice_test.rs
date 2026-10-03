@@ -77,7 +77,6 @@ async fn dispatch_and_wait(
     (pool, worker_id, state, scratch)
 }
 
-
 /// The model each request in the run asked for, in order.
 fn models_of(bodies: &[Value]) -> Vec<String> {
     bodies
