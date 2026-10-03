@@ -14,6 +14,7 @@ pub const HELP_FLAGS: &str = concat!(
     "      --build-id  Print this build's identity (id and build clock)",
 );
 
+mod archive;
 mod collect;
 mod consolidate;
 mod discard;
@@ -38,6 +39,7 @@ pub const TOPICS: &[&str] = &[
     "review",
     "collect",
     "merge",
+    "archive",
     "identity",
     "sandbox",
     "env",
@@ -54,6 +56,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "review" => review::TEXT,
         "collect" => collect::TEXT,
         "merge" => merge::TEXT,
+        "archive" => archive::TEXT,
         "identity" => identity::TEXT,
         "sandbox" => sandbox::TEXT,
         "env" => env::TEXT,

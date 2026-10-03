@@ -1,9 +1,5 @@
 use super::*;
 
-/// Description of the `group` property, next to the handler it belongs to.
-pub(crate) const ARCHIVE_GROUP_DESCRIPTION: &str =
-    "Only the retired workers of this round. Accepts a string or an array.";
-
 /// Description of the `last` property.
 pub(crate) const ARCHIVE_LAST_DESCRIPTION: &str =
     "Only the N most recently retired workers, newest first.";

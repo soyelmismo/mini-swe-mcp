@@ -25,7 +25,7 @@
 mod catalog;
 mod worker;
 
-pub use self::catalog::{format_list, format_manifest, format_prune};
+pub use self::catalog::{format_archive, format_list, format_manifest, format_prune};
 pub use self::worker::{
     format_collect, format_consolidate, format_discard, format_dispatch, format_dispatch_quiet,
     format_kill, format_logs, format_merge, format_reap, format_review, format_status,
@@ -38,6 +38,7 @@ pub fn format_output(action: &str, val: &serde_json::Value) -> String {
     match action {
         "manifest" => format_manifest(val),
         "list" => format_list(val),
+        "archive" => format_archive(val),
         "prune" => format_prune(val),
         "status" => format_status(val),
         "collect" => format_collect(val),
@@ -67,6 +68,11 @@ mod tests {
         let cases = [
             ("manifest", "Default model: x", r#"{"default_model":"x"}"#),
             ("list", "Workers (1):", r#"{"workers":[{"id":"w"}]}"#),
+            (
+                "archive",
+                "w (merged)",
+                r#"{"entries":[{"worker_id":"w","reason":"merged","task":"fix the bug","status":"Completed","verified":true,"report":{"done":"it is fixed"}}]}"#,
+            ),
             ("prune", "✓", r#"{"message":"done"}"#),
             ("status", "Worker: w", r#"{"worker_id":"w"}"#),
             (
