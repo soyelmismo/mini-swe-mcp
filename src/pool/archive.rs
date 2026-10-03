@@ -156,6 +156,10 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     let mut line = serde_json::to_string(record).context("archive record did not serialize")?;
     line.push('\n');
     let path = archive_path(dir);
+    // The directory first: rotation renames a file out of it, so a directory
+    // that does not exist yet would make the rename fail and lose the report on
+    // the very call meant to keep it.
+    ensure_dir(dir)?;
     // Rotation before the open: the rename and the append cannot interleave
     // into the same file, so the rotated generation is always a whole file.
     if let Ok(size) = std::fs::metadata(&path).map(|meta| meta.len())
@@ -163,12 +167,13 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     {
         let rotated = rotated_path(dir);
         // Replace the previous generation outright rather than appending to it:
-        // the cap is a bound, not a queue.
+        // the cap is a bound, not a queue. The previous generation is unlinked
+        // before the rename, so the rename cannot clobber a file this process
+        // did not write.
         let _ = std::fs::remove_file(&rotated);
         std::fs::rename(&path, &rotated)
             .with_context(|| format!("could not rotate {}", path.display()))?;
     }
-    ensure_dir(dir)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -182,13 +187,16 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
 
 /// The archive of `dir`, oldest line first, across both generations.
 ///
-/// `group` keeps one round's records; `last` keeps the newest `n` of whatever
-/// survived that filter, so `--last 5` is "the five most recent". A line that
-/// does not parse is skipped rather than failing the whole read: a retirement
-/// interrupted mid-append leaves a torn tail, and one torn line must not cost
-/// the caller every report before it.
+/// `owner` keeps one agent's records and is applied *before* `last`, so
+/// `--last 5` is "the five most recent of this agent's" and never a window over
+/// the whole archive that another agent's lines happen to fill. `group` keeps
+/// one round's records; `last` keeps the newest `n` of whatever survived both
+/// filters. A line that does not parse is skipped rather than failing the whole
+/// read: a retirement interrupted mid-append leaves a torn tail, and one torn
+/// line must not cost the caller every report before it.
 pub fn read_records(
     dir: &Path,
+    owner: Option<&str>,
     group: Option<&str>,
     last: Option<usize>,
 ) -> Result<Vec<ArchiveRecord>> {
@@ -205,6 +213,11 @@ pub fn read_records(
             let Ok(record) = serde_json::from_str::<ArchiveRecord>(line) else {
                 continue;
             };
+            if let Some(owner) = owner
+                && record.owner != owner
+            {
+                continue;
+            }
             if let Some(group) = group
                 && record.group.as_deref() != Some(group)
             {
@@ -223,12 +236,32 @@ pub fn read_records(
 
 /// Create the hub directory the archive lives in, owner-only.
 ///
-/// The hub daemon creates it long before anything retires, so this is only the
-/// path a caller that archives without a daemon takes; it is created `0700`
-/// because the archive names owners.
+/// The hub daemon creates and hardens it long before anything retires, so this
+/// is only the path a caller that archives without a daemon takes; it is
+/// created `0700` because the archive names owners.
+///
+/// The existing-directory check uses [`symlink_metadata`] and not
+/// [`Path::is_dir`], which follows a link: a `hub` entry that is a symlink to
+/// some other directory reads as "the hub dir is there", and the append below
+/// would write one agent's owners and REPORT text through it into a directory
+/// the hub never claimed. Refusing the link keeps the archive in the directory
+/// the caller named, or nowhere.
 fn ensure_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
-        return Ok(());
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!(
+                "refusing to archive through the symlink {}",
+                dir.display()
+            );
+        }
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            anyhow::bail!("archive path {} is not a directory", dir.display());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("could not inspect {}", dir.display()));
+        }
     }
     std::fs::DirBuilder::new()
         .mode(0o700)

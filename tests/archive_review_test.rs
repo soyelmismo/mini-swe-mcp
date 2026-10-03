@@ -8,8 +8,83 @@
 mod common;
 
 use common::TempDir;
+
+const OWNER: &str = "agent-one";
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_MAX_BYTES, ArchiveRecord};
-use std::path::Path;
+use mini_swe_mcp::pool::{
+    MergeRequest, RegistryStatus, RetireContext, WorkerRegistryEntry, WorkerReport,
+    load_registry_entry_in, merge_worker_in, retire_worker_reporting, save_registry_entry_in,
+};
+use mini_swe_mcp::worktree::ScratchRoot;
+use std::path::{Path, PathBuf};
+
+/// A repo, scratch root and hub directory the tests own, plus a terminal row.
+struct Fixture {
+    repo: TempDir,
+    scratch: TempDir,
+    hub: TempDir,
+}
+
+impl Fixture {
+    fn new(tag: &str) -> Self {
+        let repo = TempDir::new_in_tmp(tag);
+        common::git(repo.path(), &["init", "--initial-branch=main"]);
+        common::git(repo.path(), &["config", "user.email", "review@test"]);
+        common::git(repo.path(), &["config", "user.name", "review test"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        common::git(repo.path(), &["add", "."]);
+        common::git(repo.path(), &["commit", "-m", "base"]);
+        Self {
+            repo,
+            scratch: TempDir::new_in_tmp(&format!("{tag}-scratch")),
+            hub: TempDir::new_in_tmp(&format!("{tag}-hub")),
+        }
+    }
+
+    fn root(&self) -> ScratchRoot {
+        ScratchRoot::new(self.scratch.path())
+    }
+
+    fn hub_dir(&self) -> PathBuf {
+        self.hub.path().to_path_buf()
+    }
+
+    /// A terminal worker with a REPORT, the gate verdict and a group.
+    fn record(&self, id: &str, owner: &str, group: Option<&str>) {
+        let entry = WorkerRegistryEntry {
+            task: format!("fix the {id} regression\nand its follow-up"),
+            status: RegistryStatus::Completed,
+            step: 4,
+            repo_path: Some(self.repo.path().to_string_lossy().into_owned()),
+            owner: Some(owner.to_string()),
+            group: group.map(str::to_string),
+            base_branch: Some("main".to_string()),
+            verified: Some(true),
+            report: Some(WorkerReport {
+                done: "fixed the parser".to_string(),
+                files: "src/a.rs".to_string(),
+                tests: "cargo test: 12 before, 12 after".to_string(),
+                risks: "none".to_string(),
+            }),
+            ..WorkerRegistryEntry::test_row(id, owner)
+        };
+        save_registry_entry_in(&self.root(), &entry);
+    }
+
+    /// Give `id` a branch off `main`, so a merge has something to land.
+    fn commit_on_worker_branch(&self, id: &str) {
+        let branch = format!("worker-{id}");
+        common::git(self.repo.path(), &["checkout", "-q", "-b", &branch]);
+        std::fs::write(self.repo.path().join(format!("{id}.txt")), "from the worker\n").unwrap();
+        common::git(self.repo.path(), &["add", "."]);
+        common::git(self.repo.path(), &["commit", "-m", &format!("worker {id}")]);
+        common::git(self.repo.path(), &["checkout", "-q", "main"]);
+    }
+
+    fn records(&self) -> Vec<ArchiveRecord> {
+        archive::read_records(self.hub.path(), None, None).expect("the archive must be readable")
+    }
+}
 
 fn record(id: &str, owner: &str, group: Option<&str>) -> ArchiveRecord {
     ArchiveRecord {
@@ -129,4 +204,29 @@ fn probe_ensure_dir_follows_a_symlinked_hub_dir() {
     println!("mode={:o}", std::fs::metadata(outside.path().join(archive::ARCHIVE_FILE)).map(|m| {
         use std::os::unix::fs::PermissionsExt; m.permissions().mode() & 0o777
     }).unwrap_or(0));
+}
+
+/// PROBE 5: `merge --no-delete` keeps the branch, the row and the history, but
+/// the retirement still archives the worker as retired.
+#[test]
+fn probe_no_delete_archives_a_worker_that_is_not_retired() {
+    let f = Fixture::new("probe-no-delete");
+    f.commit_on_worker_branch("w1");
+    f.record("w1", OWNER, Some("round-1"));
+    merge_worker_in(
+        &f.root(),
+        &MergeRequest {
+            worker_id: "w1",
+            verified: Some(true),
+            keep_branch: true,
+            admission: None,
+            archive_dir: Some(f.hub_dir()),
+        },
+    )
+    .expect("the merge lands");
+    let still_there = load_registry_entry_in(&f.root(), "w1").is_some();
+    let records = f.records();
+    println!("row still present={still_there} archive lines={}", records.len());
+    assert!(still_there, "the row must survive --no-delete");
+    assert_eq!(records.len(), 1, "--no-delete must not archive a live worker");
 }

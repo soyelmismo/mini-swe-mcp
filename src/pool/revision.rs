@@ -595,7 +595,14 @@ pub fn retire_worker_reporting(
     // the conversation, the branch -- is what the line is built from. A
     // retirement without a hub directory (a pool driven straight from a test,
     // an ownerless sweep) archives nothing rather than guessing a directory.
-    if let Some(dir) = ctx.ack_dir {
+    //
+    // A kept branch retires nobody: `merge --no-delete` leaves the row, the
+    // branch and the history in place so the worker stays reviewable and can be
+    // merged again, and archiving it here would put a "retired" line in the
+    // archive for a worker that is still there -- the same lie the archive
+    // exists to prevent, in the other direction. Its line is written later, by
+    // the retirement that really removes it.
+    if let Some(dir) = ctx.ack_dir.filter(|_| !ctx.keep_branch) {
         archive_retirement(root, worker_id, ctx, dir);
     }
     // The worktree goes first: a leftover that is still registered would make

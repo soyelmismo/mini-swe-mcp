@@ -31,23 +31,20 @@ impl McpServer {
         let last = args.get("last").and_then(Value::as_u64).map(|n| n as usize);
         let dir = crate::hub::hub_dir()?;
         // Reading two files off disk, so it runs off the runtime thread like
-        // every other blocking step here.
-        let requested_owner = owner.clone();
+        // every other blocking step here. The owner filter goes *into* the
+        // read, before `--last`: applied afterwards it would make `--last` a
+        // window over the whole archive, and a busy hub's newest five lines
+        // would be somebody else's, leaving this agent with an empty answer to
+        // "my last five". A line with no owner (a row written before ownership
+        // was tracked) is unattributed and never shown to a non-admin caller.
+        let scoped_owner = owner.clone();
         let records = tokio::task::spawn_blocking(move || {
-            crate::pool::archive::read_records(&dir, group.as_deref(), last)
+            crate::pool::archive::read_records(&dir, scoped_owner.as_deref(), group.as_deref(), last)
         })
         .await
         .map_err(|e| anyhow::anyhow!("archive read failed: {e}"))??;
-        // The filter is applied here rather than in the reader: one reader for
-        // every caller, and the scoping rule lives with the handler that knows
-        // who is asking. A line with no owner (a row written before ownership
-        // was tracked) is unattributed and never shown to a non-admin caller.
         let entries: Vec<Value> = records
             .iter()
-            .filter(|record| match &requested_owner {
-                Some(owner) => record.owner == *owner,
-                None => true,
-            })
             .map(|record| {
                 json!({
                     "worker_id": record.worker_id,
