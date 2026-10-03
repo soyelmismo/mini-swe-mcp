@@ -292,13 +292,21 @@ impl SecurityScope {
     }
 }
 
-/// The merged worker branches a consolidator may leave out of its own audit.
+/// The approvals a consolidator may treat as already audited, one approved
+/// commit per merged worker that has one.
 ///
-/// Dropping a merged branch is a claim that the code it carries was already
-/// reviewed at its own approved commit. `integrated` proves only that the merge
-/// happened, so the approval has to be checked separately: a worker merged
-/// without one -- never reviewed, or reviewed before the field existed -- keeps
-/// its branch in scope and is audited by the consolidator rather than by nobody.
+/// Dropping a merged worker's code is a claim that it was reviewed at its own
+/// approved commit. `integrated` proves only that the merge happened, so the
+/// approval has to be checked separately: a worker merged without one -- never
+/// reviewed, or reviewed before the field existed -- keeps its branch in scope
+/// and is audited by the consolidator rather than by nobody.
+///
+/// The exclusion is the **approved commit**, never the branch name. A branch
+/// keeps growing after its review: the worker that merged it went on, and a
+/// consolidator steering that worker lands new commits on it. Excluding the
+/// branch's current tip would subtract those commits too and audit nothing --
+/// the exact hole this rule closes. Only what is reachable from the approved
+/// commit is known to be reviewed, so only that much is subtracted.
 ///
 /// `approvals` maps a worker id to the commit its security review approved, so
 /// the rule is one predicate the pipeline and the tests read alike.
@@ -306,11 +314,7 @@ pub fn approved_merged_branches(
     integrated: &[String],
     approvals: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    integrated
-        .iter()
-        .filter(|id| approvals(id).is_some())
-        .map(|id| format!("worker-{id}"))
-        .collect()
+    integrated.iter().filter_map(|id| approvals(id)).collect()
 }
 
 /// The review the pipeline will actually run, given the scope's skip decision,
@@ -358,8 +362,9 @@ pub fn plan_review(
 ///
 /// * `approved` is the commit an earlier security review approved on this
 ///   branch, if any.
-/// * `merged` names the worker branches a consolidator integrated; a
-///   consolidator's scope excludes them.
+/// * `merged` names the commits a consolidator's merged workers were each
+///   security-approved at; a consolidator's scope excludes what those commits
+///   already cover, and nothing else.
 /// * `role` decides the exclusion; a plain worker is never treated as a
 ///   consolidator even if it names branches.
 pub async fn scope_for(
@@ -513,6 +518,45 @@ pub(super) async fn head_commit_of(path: &Path) -> Option<String> {
     })
     .await
     .unwrap_or(None)
+}
+
+/// Whether the checkout at `path` has nothing uncommitted, so the commit the
+/// harness just made is exactly the tree `head` named.
+///
+/// This is the guard on recording a security approval as the harness's commit:
+/// the reviewer left the tree at `head`, and if nothing has touched it since,
+/// the harness's commit contains precisely the reviewed code. Anything else --
+/// the artifact sync, a steer landing mid-flight, a second checkpoint -- means
+/// that commit covers code no reviewer saw, and the approval must stay at `head`,
+/// which re-reviews the difference rather than missing it.
+///
+/// `false` whenever `head` is unknown: an unmeasurable tree is not a clean one.
+pub(super) async fn tree_matches_head(path: &Path, head: &Option<String>) -> bool {
+    let Some(head) = head.clone() else {
+        return false;
+    };
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // The branch must still point where the reviewer left it: a commit
+        // landing after the review (a second checkpoint, a steer that ran on)
+        // moved the tree even when the files are clean.
+        let still_at_head = crate::worktree::git(&path, "rev-parse", &["rev-parse", "HEAD"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head);
+        if !still_at_head {
+            return false;
+        }
+        // Intent-to-add first so a new file counts as a change, the same way the
+        // diff probe sees one.
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        crate::worktree::git(&path, "status", &["status", "--porcelain"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The repository-relative files a worker's working tree changed against its

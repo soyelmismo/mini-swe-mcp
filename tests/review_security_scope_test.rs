@@ -364,8 +364,8 @@ fn a_merged_branch_leaves_the_audit_only_when_it_was_security_approved() {
         approved_merged_branches(&integrated, |id| (id == "w1").then(|| "abc123".to_string()));
     assert_eq!(
         reviewed,
-        vec!["worker-w1".to_string()],
-        "only a branch whose worker carries an approved commit may be excluded"
+        vec!["abc123".to_string()],
+        "only a worker carrying an approved commit may leave the audit, and it leaves it at that commit"
     );
 
     // No worker row at all, or a row from before the field existed, is not an
@@ -373,13 +373,66 @@ fn a_merged_branch_leaves_the_audit_only_when_it_was_security_approved() {
     assert!(approved_merged_branches(&integrated, |_| None).is_empty());
 }
 
+/// The exclusion is the approved **commit**, never the branch name: a branch
+/// keeps growing after its review, and excluding its current tip would subtract
+/// commits nobody ever audited -- the consolidator would be the only reviewer
+/// that could still have caught them.
+#[test]
+async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() {
+    let (dir, base) = repo("scope_beyond_approval");
+    // The worker is security-reviewed at `approved`, then lands more work.
+    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "reviewed change");
+    let unaudited = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/identity.rs",
+        "change after the approval",
+    );
+    assert_ne!(approved, unaudited);
+
+    // A consolidator merges the branch at its tip.
+    common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", "master"]);
+    common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"]);
+    let own = commit(dir.path(), "worker-c1", "src/hub/handshake.rs", "resolve the interaction");
+
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        &approved_merged_branches(&["w1".to_string()], |_| Some(approved.clone())),
+    )
+    .await;
+
+    assert!(
+        scope.reviewed_commits().contains(&unaudited),
+        "a commit the merged branch carries past its approval must be audited by the consolidator: {:?}",
+        scope.reviewed_commits()
+    );
+    assert!(
+        !scope.reviewed_commits().contains(&approved),
+        "the approved commit itself is already audited and must not be repeated"
+    );
+    assert!(
+        scope.reviewed_commits().contains(&own),
+        "the consolidator's own commit is its to audit"
+    );
+    assert!(
+        scope.reviewed_files(dir.path()).await.contains(&"src/hub/identity.rs".to_string()),
+        "the unaudited sensitive change must be probed, or the trigger never fires: {:?}",
+        scope.reviewed_files(dir.path()).await
+    );
+    assert_eq!(scope.skip_log(), None);
+}
+
 /// The exclusion stays sound when every merged worker was in fact reviewed: the
-/// point of the optimisation is that a reviewed branch is not audited twice.
+/// point of the optimisation is that a reviewed commit is not audited twice.
 #[test]
 fn every_approved_merged_branch_leaves_the_audit() {
     let integrated = vec!["w1".to_string(), "w2".to_string()];
     assert_eq!(
         approved_merged_branches(&integrated, |id| Some(format!("approved-{id}"))),
-        vec!["worker-w1".to_string(), "worker-w2".to_string()],
+        vec!["approved-w1".to_string(), "approved-w2".to_string()],
     );
 }

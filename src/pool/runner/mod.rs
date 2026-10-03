@@ -553,6 +553,9 @@ impl WorkerPool {
             }
         }
 
+        // The security review's approval, resolved after the tree is finalized.
+        let mut security_review_head: Option<String> = None;
+        let mut security_approved = false;
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
@@ -667,10 +670,16 @@ impl WorkerPool {
             completed |= outcome.completed;
             if let Some(security) = outcome.security {
                 meta.security_review = Some(security);
-                // The commit this review approved rides the registry row, so a
-                // later revision reviews from here instead of re-auditing the
-                // whole diff since the base commit.
-                meta.security_approved_commit = self::review::head_commit_of(&worktree.path).await;
+                // The tree as the reviewer left it. The commit that *contains*
+                // the audited code is the harness's, made after this block, so
+                // this is the fallback approval for the case where that commit
+                // cannot be trusted to be the same tree.
+                security_review_head = self::review::head_commit_of(&worktree.path).await;
+                // Only a review that actually completed approves anything. A
+                // reviewer that gave up quietly or ran out of turns audited
+                // nothing, and recording an approval for it would suppress every
+                // later security review of this branch.
+                security_approved = outcome.completed;
             }
         }
 
@@ -721,6 +730,28 @@ impl WorkerPool {
             .await
             .context("Worktree finalization task failed")??;
         worktree.preserve_branch = worktree.preserve_branch || branch.is_some();
+        // The commit that carries the code the security review audited is the
+        // harness's own commit, made just above -- not the HEAD the reviewer
+        // started from. Recording the latter would leave the reviewed tree
+        // itself outside the approval, so the next revision would re-audit it and
+        // a consolidator would re-audit it too.
+        //
+        // The harness's commit is only that tree's commit if the tree still is
+        // the tree the reviewer left: anything that touched it afterwards (the
+        // artifact sync, a steer landing mid-flight) makes that commit cover
+        // code no reviewer saw, and approving it would suppress a real audit.
+        // In that case the pre-commit HEAD stands, which is conservative -- it
+        // names less code than was reviewed, so the difference is re-reviewed
+        // rather than missed.
+        if security_approved {
+            let unchanged =
+                self::review::tree_matches_head(&worktree.path, &security_review_head).await;
+            meta.security_approved_commit = if unchanged {
+                head_commit.clone().or(security_review_head.clone())
+            } else {
+                security_review_head.clone()
+            };
+        }
         if !artifacts.is_empty() {
             info!(
                 worker = %worker_id,
