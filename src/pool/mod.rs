@@ -94,10 +94,10 @@ pub use self::runner::{
 pub use self::state::{
     ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
     DEFAULT_WORKER_RETIRED_GRACE_SECS, FileStat, TOP_FILE_LIMIT, TURN_BUDGET_EXHAUSTED,
-    WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord, WorkerReport,
-    WorkerState, churn_line, compact_artifacts, diff_sections_of, file_stats_of_diff,
-    normalize_diff_path, retention_expired, same_diff_path, terminal_retention_secs,
-    within_retired_grace, worker_retired_grace_secs,
+    VERDICT_BYTES, WorkerMetrics, WorkerOwner, WorkerPhase, WorkerProgress, WorkerRecord,
+    WorkerReport, WorkerState, WorkerVerdicts, churn_line, compact_artifacts, diff_sections_of,
+    file_stats_of_diff, normalize_diff_path, parse_verdict_lines, retention_expired,
+    same_diff_path, terminal_retention_secs, within_retired_grace, worker_retired_grace_secs,
 };
 pub use self::steer::{
     drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
@@ -842,6 +842,7 @@ impl WorkerPool {
             report: None,
             verified: None,
             security_review: None,
+            verdicts: None,
         };
 
         let initial_record = WorkerRecord {
@@ -2437,6 +2438,7 @@ impl WorkerPool {
                 metrics: entry.metrics,
                 revision: entry.revision,
                 report: entry.report.clone(),
+                verdicts: entry.verdicts.clone(),
             },
             RegistryStatus::Exhausted => WorkerState::Exhausted {
                 turns: entry.step,
@@ -2448,6 +2450,7 @@ impl WorkerPool {
                 metrics: entry.metrics,
                 revision: entry.revision,
                 report: entry.report.clone(),
+                verdicts: entry.verdicts.clone(),
             },
             _ => WorkerState::Failed {
                 error: entry.last_command.clone(),

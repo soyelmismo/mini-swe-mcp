@@ -406,6 +406,9 @@ impl WorkerPool {
         let mut report = None;
         let mut report_asked = false;
         let mut report_text = String::new();
+        // The reviewer stores no report, so its verdicts are a sink too: only
+        // the implementer's completion is a round's record of its workers.
+        let mut verdicts = None;
         let mut combined_max_turns = current_max_turns + review_max_turns;
 
         while review_step < review_max_turns {
@@ -444,6 +447,7 @@ impl WorkerPool {
                 report: &mut report,
                 report_asked: &mut report_asked,
                 report_text: &mut report_text,
+                verdicts: &mut verdicts,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { .. } => {

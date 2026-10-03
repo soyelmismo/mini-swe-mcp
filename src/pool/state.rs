@@ -578,6 +578,7 @@ impl WorkerState {
                 metrics,
                 revision,
                 report,
+                verdicts,
                 diff,
             } => {
                 let (artifacts, artifacts_total) = compact_artifacts(artifacts);
@@ -593,6 +594,10 @@ impl WorkerState {
                     "metrics": metrics,
                     "revision": revision,
                     "report": report,
+                    // The round's per-worker verdicts ride in the compact view
+                    // too: this projection is what `list` and a cold `status`
+                    // read, and they are the round's detail.
+                    "verdicts": verdicts,
                     "per_file": file_stats_of_diff(diff),
                 })
             }
@@ -619,6 +624,7 @@ impl WorkerState {
                 metrics,
                 revision,
                 report,
+                verdicts,
                 diff,
             } => {
                 let (artifacts, artifacts_total) = compact_artifacts(artifacts);
@@ -633,6 +639,7 @@ impl WorkerState {
                     "metrics": metrics,
                     "revision": revision,
                     "report": report,
+                    "verdicts": verdicts,
                     "reason": TURN_BUDGET_EXHAUSTED,
                     "per_file": file_stats_of_diff(diff),
                 })
@@ -1028,6 +1035,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         };
         let failed = WorkerState::Failed {
             error: "e".into(),
@@ -1072,6 +1080,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         }
     }
 
@@ -1096,6 +1105,7 @@ mod tests {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         }
     }
 

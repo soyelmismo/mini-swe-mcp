@@ -435,6 +435,10 @@ impl WorkerPool {
         let mut report: Option<crate::pool::WorkerReport> = None;
         let mut report_asked = false;
         let mut report_text = String::new();
+        // A consolidator's per-worker verdicts live across turns like the
+        // report: the completion turn is replayed on a verify failure, and the
+        // verdicts it already gave must survive that replay.
+        let mut verdicts: Option<crate::pool::WorkerVerdicts> = None;
 
         while step < current_max_turns {
             step += 1;
@@ -471,6 +475,7 @@ impl WorkerPool {
                 report: &mut report,
                 report_asked: &mut report_asked,
                 report_text: &mut report_text,
+                verdicts: &mut verdicts,
             };
             match engine.run_turn(&turn_config).await? {
                 TurnOutcome::Completed { verified: v } => {
@@ -662,10 +667,15 @@ impl WorkerPool {
                 metrics: meta.metrics,
                 revision,
                 report: report.clone(),
+                verdicts: verdicts.clone(),
             };
             self.update_worker(worker_id, |w| w.state = exhausted_state)
                 .await;
             meta.report = report;
+            // An exhausted consolidator reports the workers it had reached a
+            // verdict on before the budget ran out; the row carries them like
+            // the report it already writes here.
+            meta.verdicts = verdicts;
             self.save_status(
                 meta,
                 &model,
@@ -707,6 +717,7 @@ impl WorkerPool {
             metrics: meta.metrics,
             revision,
             report: report.clone(),
+            verdicts: verdicts.clone(),
         };
         self.update_worker(worker_id, |w| w.state = completed_state)
             .await;
@@ -716,6 +727,7 @@ impl WorkerPool {
         // TTL, the row is not.
         meta.report = report;
         meta.verified = verified;
+        meta.verdicts = verdicts;
         self.save_status(
             meta,
             &model,

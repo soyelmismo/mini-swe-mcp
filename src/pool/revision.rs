@@ -1841,6 +1841,9 @@ impl super::WorkerPool {
             security_review: None,
             integrated: Vec::new(),
             absorbed: Vec::new(),
+            // A revision changes the branch, so the round it reported on is
+            // no longer the round this row describes.
+            verdicts: None,
             keep_branch: false,
         };
 
@@ -1865,6 +1868,7 @@ impl super::WorkerPool {
             report: None,
             verified: None,
             security_review: None,
+            verdicts: None,
         };
         let mut meta_for_fail = meta;
         let config = WorkerLaunchConfig {

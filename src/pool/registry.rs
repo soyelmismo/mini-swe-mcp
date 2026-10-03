@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::SecurityReviewOutcome;
-use super::state::{WorkerMetrics, WorkerReport};
+use super::state::{WorkerMetrics, WorkerReport, WorkerVerdicts};
 use crate::worktree::ScratchRoot;
 
 /// Lifecycle status of a worker, as recorded in the on-disk registry.
@@ -208,6 +208,14 @@ pub struct WorkerRegistryEntry {
     /// readable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absorbed: Vec<String>,
+    /// A consolidator's per-worker `REPORT` lines and `RISK:` lines, bounded
+    /// to [`super::VERDICT_BYTES`]. Recorded on its row for the same reason the
+    /// report is: the round's per-worker detail is otherwise only in the
+    /// consolidator's history JSONL, and a completion event or a `review` built
+    /// from the row has to show it. `#[serde(default)]` keeps a row written
+    /// before the field readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdicts: Option<WorkerVerdicts>,
     /// The operator asked to keep this worker's branch (`merge --no-delete`).
     ///
     /// Durable, unlike a one-off sweep exemption: the retirement sweep skips a
@@ -258,6 +266,7 @@ impl WorkerRegistryEntry {
             security_review: None,
             integrated: Vec::new(),
             absorbed: Vec::new(),
+            verdicts: None,
             keep_branch: false,
         }
     }
@@ -310,6 +319,9 @@ pub struct WorkerMeta {
     /// The security review the phase loop ran, written with the terminal row
     /// so a view built from the row alone still shows it ran and its count.
     pub security_review: Option<SecurityReviewOutcome>,
+    /// A consolidator's per-worker verdicts, set by the phase loop once the
+    /// round has finished and written with the terminal row, like the report.
+    pub verdicts: Option<WorkerVerdicts>,
 }
 
 impl WorkerMeta {
@@ -334,6 +346,7 @@ impl WorkerMeta {
             report: None,
             verified: None,
             security_review: None,
+            verdicts: None,
         }
     }
 
@@ -379,6 +392,7 @@ impl WorkerMeta {
             security_review: self.security_review,
             integrated: Vec::new(),
             absorbed: Vec::new(),
+            verdicts: self.verdicts.clone(),
             keep_branch: false,
         }
     }
