@@ -2,7 +2,7 @@ use super::*;
 
 /// Description of the `merge` `force` property, beside the handler that reads
 /// it: what the property overrides and what a forced merge still does.
-pub(in crate::mcp) const FORCE_DESCRIPTION: &str = "Land a round with unintegrated commits; see help merge.";
+pub(in crate::mcp) const FORCE_DESCRIPTION: &str = "Land a round with unintegrated commits.";
 
 impl McpServer {
     /// `merge` action: land one finished worker's branch on its base branch.

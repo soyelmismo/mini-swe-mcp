@@ -34,7 +34,7 @@
             "type": "boolean"
           },
           "approved": {
-            "description": "Merge every approved worker.",
+            "description": "Merge every approved worker (--approved).",
             "type": "boolean"
           },
           "consolidate": {
@@ -66,7 +66,7 @@
             "type": "array"
           },
           "force": {
-            "description": "Land a round with unintegrated commits; see help merge.",
+            "description": "Land a round with unintegrated commits.",
             "type": "boolean"
           },
           "full": {
@@ -206,7 +206,7 @@
             "type": "string"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.",
+            "description": "Completion gate: auto-detect if omitted; empty disables. Consolidator gate.",
             "type": "string"
           },
           "worker_id": {
