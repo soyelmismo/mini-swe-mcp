@@ -162,7 +162,8 @@ impl McpServer {
         let agent = ctx.agent();
         // Fairness gate: one agent may not fill the pool, so its dispatches
         // stop at `MAX_WORKERS_PER_AGENT` running workers (0 = unlimited).
-        self.check_agent_cap(&agent, self.max_workers_per_agent).await?;
+        self.check_agent_cap(&agent, self.max_workers_per_agent)
+            .await?;
         let repo_path = Self::get_repo_path(args, ctx);
         let requested_model = args
             .get("model")
