@@ -24,7 +24,9 @@ mod common;
 
 use std::path::Path;
 
-use mini_swe_mcp::pool::{ReviewMode, WorkerRole, plan_review, scope_for};
+use mini_swe_mcp::pool::{
+    ReviewMode, WorkerRole, approved_merged_branches, plan_review, scope_for,
+};
 
 /// Commit `body` into `branch` after writing `file`, and return the commit id.
 ///
@@ -258,12 +260,17 @@ async fn an_uncommitted_sensitive_change_is_never_reported_as_no_change() {
 
     let scope = worker_scope(dir.path(), "worker-w1", &base, Some(approved.clone())).await;
     assert!(
-        scope.reviewed_files(dir.path()).await.contains(&"src/hub/events.rs".to_string()),
+        scope
+            .reviewed_files(dir.path())
+            .await
+            .contains(&"src/hub/events.rs".to_string()),
         "the unaudited working-tree change must be part of what this review covers"
     );
     assert_ne!(
         scope.skip_log(),
-        Some(format!("security review skipped: no sensitive change since {approved}")),
+        Some(format!(
+            "security review skipped: no sensitive change since {approved}"
+        )),
         "an uncommitted sensitive change must not be skipped: the audit that approved \
          {approved} never saw it"
     );
@@ -337,5 +344,42 @@ fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
         plan_review(false, None, false, "strongest"),
         Some(("strongest".to_string(), ReviewMode::Security)),
         "the automatic sensitive trigger audits on the manifest's strongest tier"
+    );
+}
+
+// ----------
+// Which merged branches may leave the audit
+// ----------
+
+/// `integrated` proves a branch was merged, not that it was security-reviewed.
+/// Excluding it on the strength of the merge alone would drop that code out of
+/// every audit: the worker never got a review, and the consolidator that is
+/// supposed to cover it no longer sees it.
+#[test]
+fn a_merged_branch_leaves_the_audit_only_when_it_was_security_approved() {
+    let integrated = vec!["w1".to_string(), "w2".to_string()];
+
+    // w1 was security-reviewed; w2 was merged without ever being reviewed.
+    let reviewed =
+        approved_merged_branches(&integrated, |id| (id == "w1").then(|| "abc123".to_string()));
+    assert_eq!(
+        reviewed,
+        vec!["worker-w1".to_string()],
+        "only a branch whose worker carries an approved commit may be excluded"
+    );
+
+    // No worker row at all, or a row from before the field existed, is not an
+    // approval either.
+    assert!(approved_merged_branches(&integrated, |_| None).is_empty());
+}
+
+/// The exclusion stays sound when every merged worker was in fact reviewed: the
+/// point of the optimisation is that a reviewed branch is not audited twice.
+#[test]
+fn every_approved_merged_branch_leaves_the_audit() {
+    let integrated = vec!["w1".to_string(), "w2".to_string()];
+    assert_eq!(
+        approved_merged_branches(&integrated, |id| Some(format!("approved-{id}"))),
+        vec!["worker-w1".to_string(), "worker-w2".to_string()],
     );
 }
