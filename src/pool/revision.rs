@@ -534,7 +534,7 @@ pub struct RetireContext<'a> {
 }
 
 /// Retire every trace of `worker_id`: its branch, its registry row, its saved
-/// conversation, its steering mailbox and steer-source, its watch
+/// conversation, its steering mailbox, steer-source and steer log, its watch
 /// acknowledgements, and the worktree, scratch and build directories it held.
 ///
 /// The one deletion path, so a row can never outlive the conversation it names
@@ -639,7 +639,7 @@ pub fn retire_worker_reporting(
     // discarded round behind -- exactly the leftover a discard exists to
     // remove.
     for base in root.base_dirs() {
-        for suffix in ["steer-source", "round-base"] {
+        for suffix in ["steer-source", "round-base", "steer-log.jsonl"] {
             let _ = std::fs::remove_file(base.join(format!("swe-wt-{worker_id}.{suffix}")));
         }
     }
@@ -1074,6 +1074,7 @@ fn worker_id_from_name(name: &str) -> Option<&str> {
         ".history.json",
         ".steer",
         ".steer-source",
+        ".steer-log.jsonl",
         ".round-base",
     ]
     .iter()
@@ -1082,7 +1083,8 @@ fn worker_id_from_name(name: &str) -> Option<&str> {
 
 /// The ownership a history file states, read from its first line only.
 ///
-/// A `.steer`, `.steer-source` or `.round-base` names no repository of its own
+/// A `.steer`, `.steer-source`, `.steer-log.jsonl` or `.round-base` names no
+/// repository of its own
 /// and yields `None`; the caller shares the ownership of the same worker's
 /// history instead of assuming the file is unreachable.
 fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {
@@ -1101,7 +1103,8 @@ fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {
 /// Delete the per-worker files no row and no branch can ever claim again.
 ///
 /// Ownership is shared across a worker's files: a history states the repository
-/// and branch, and the worker's `.steer`, `.steer-source` and `.round-base`
+/// and branch, and the worker's `.steer`, `.steer-source`, `.steer-log.jsonl`
+/// and `.round-base`
 /// companions inherit that ownership rather than being assumed branch-less. A
 /// standalone ownerless companion -- one whose worker has no history and no row
 /// -- is still probed, against every repository the registry names, for its own

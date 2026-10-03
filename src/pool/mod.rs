@@ -104,8 +104,8 @@ pub use self::state::{
     same_diff_path, terminal_retention_secs, within_retired_grace, worker_retired_grace_secs,
 };
 pub use self::steer::{
-    drain_steer_messages, drain_steer_messages_in, remove_steer_file, remove_steer_file_in,
-    steer_path, steer_path_in, write_steer_message, write_steer_message_in,
+    __test_log_nonce_in, drain_steer_messages, drain_steer_messages_in, remove_steer_file,
+    remove_steer_file_in, steer_path, steer_path_in, write_steer_message, write_steer_message_in,
 };
 
 use self::revision::outcome_revision;
@@ -1511,11 +1511,13 @@ impl WorkerPool {
                 Some(WorkerState::Completed { verified, .. }) => verified.or(entry.verified),
                 _ => entry.verified,
             };
+            let steers = steer::orchestrator_steers_in(&self.scratch, &entry.id);
             rows.push(RoundRow {
                 id: entry.id,
                 task: entry.task,
                 status: entry.status,
                 verified,
+                steers,
             });
         }
         round::build(
@@ -2093,9 +2095,20 @@ impl WorkerPool {
         // Record before delivery: the resumed worker can immediately pause again.
         let previous = steer::read_source(&self.scratch, id);
         steer::write_source(&self.scratch, id, source.as_ref())?;
-        let result = self.deliver_steer(id, message, revision_turns).await;
+        // The round's own record of what the orchestrator told this worker
+        // after dispatch. Only the orchestrator's path carries no
+        // `SteerSource` -- a consolidator's own routing does -- so a
+        // consolidator reviewing the round is never shown its own steers as
+        // amendments to the task it is judging. Recorded after delivery, so
+        // the log only ever names guidance the worker actually received.
+        let from_orchestrator = source.is_none();
+        let result = self
+            .deliver_steer(id, message.clone(), revision_turns)
+            .await;
         if result.is_err() {
             steer::write_source(&self.scratch, id, previous.as_ref())?;
+        } else if from_orchestrator {
+            steer::record_orchestrator_steer_in(&self.scratch, id, &message);
         }
         self.notify_change();
         result
