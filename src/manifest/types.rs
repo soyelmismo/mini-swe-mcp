@@ -60,7 +60,7 @@ pub(crate) const BULLET_PREFIX: &str = "- ";
 
 /// Bytes the prompt spends on the framing *around* the instruction bullets
 /// whether or not the block is cut: the two leading newlines, the
-/// `Model-specific instructions` header line and its trailing newline.
+/// `MANDATORY DIRECTIVES FOR YOUR MODEL` header line and its trailing newline.
 ///
 /// This is what a *complete* block adds on top of its bullets, so
 /// [`ModelInstructions::truncate_to`] compares the emitted section against the
