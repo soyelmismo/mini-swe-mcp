@@ -192,7 +192,13 @@ fn read_arguments(code: &str) -> Vec<(String, bool)> {
     // Both the crate-local `env::var` and the fully-qualified `std::env::var`
     // are matched; the search is a prefix, so `std::env::var` also matches the
     // bare form once `std::env::var` is listed first.
-    const READERS: &[&str] = &["env_parse", "std::env::var_os", "env::var_os", "std::env::var", "env::var"];
+    const READERS: &[&str] = &[
+        "env_parse",
+        "std::env::var_os",
+        "env::var_os",
+        "std::env::var",
+        "env::var",
+    ];
     let offsets: Vec<usize> = code
         .char_indices()
         .map(|(index, _)| index)
@@ -203,12 +209,18 @@ fn read_arguments(code: &str) -> Vec<(String, bool)> {
     let mut cursor = 0;
     while cursor + 1 < offsets.len() {
         let start = offsets[cursor];
-        let reader = READERS.iter().find(|reader| code[start..].starts_with(**reader));
+        let reader = READERS
+            .iter()
+            .find(|reader| code[start..].starts_with(**reader));
         let Some(reader) = reader else {
             cursor += 1;
             continue;
         };
-        // Step over a turbofish (`::<u64>`) and any whitespace to the `(`.
+        // Step over an optional turbofish (`::<u64>`), and any whitespace, to
+        // the `(`. A turbofish is `:<...>`, so the scan consumes a `:` only
+        // while the next bytes are `<...>`; a `:` that is not the start of a
+        // turbofish (none is expected here) would stop the search, which is
+        // correct because these readers are never followed by another `:`.
         let mut at = start + reader.len();
         let open = loop {
             if at >= bytes.len() {
@@ -217,9 +229,26 @@ fn read_arguments(code: &str) -> Vec<(String, bool)> {
             if bytes[at] == b'(' {
                 break Some(at);
             }
-            if bytes[at] == b':' || bytes[at].is_ascii_whitespace() {
+            if bytes[at].is_ascii_whitespace() {
                 at += 1;
                 continue;
+            }
+            // A turbofish is `::<T>`; consume both leading colons and the
+            // `<...>` that follows, so the scan reaches the `(` either way.
+            if bytes[at] == b':' {
+                let mut at2 = at;
+                while at2 < bytes.len() && bytes[at2] == b':' {
+                    at2 += 1;
+                }
+                if bytes.get(at2) == Some(&b'<') {
+                    match code[at2..].find('>') {
+                        Some(close) => {
+                            at = at2 + close + 1;
+                            continue;
+                        }
+                        None => break None,
+                    }
+                }
             }
             break None;
         };
@@ -331,49 +360,5 @@ fn the_test_only_allowlist_is_exactly_the_declared_hooks() {
             !documented_names().contains(*hook),
             "{hook} is a test-only hook and must not be documented for operators"
         );
-    }
-}
-
-
-#[test]
-fn debug_consts() {
-    use std::path::Path;
-    let root = repo_root();
-    for f in ["src/agent/exec.rs","src/hub/auto_handover.rs","src/agent/jobs.rs"] {
-        let src = std::fs::read_to_string(root.join(f)).unwrap();
-        println!("{f}: {:?}", declared_constants(&src));
-    }
-}
-
-#[test]
-fn debug_names() {
-    let r = read_names_by_file();
-    for n in ["MINI_SWE_EXEC_LANDLOCK_PROBE","LANDLOCK_PROBE_ENV","MINI_SWE_FAKE_VERSION"] {
-        println!("{n} => {}", r.get(n).map(|v|v.join(",")).unwrap_or_default());
-    }
-}
-
-#[test]
-fn debug_const2() {
-    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
-    let c = declared_constants(&src);
-    println!("MINI_SWE_EXEC_LANDLOCK_PROBE resolved: {:?}", c.get("LANDLOCK_PROBE_ENV"));
-}
-
-#[test]
-fn debug_landlock() {
-    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
-    println!("consts: {:?}", declared_constants(&src).keys().collect::<Vec<_>>());
-    let names = env_names_read_in(&src);
-    println!("names has landlock probe: {}", names.contains("MINI_SWE_EXEC_LANDLOCK_PROBE"));
-}
-
-#[test]
-fn debug_args() {
-    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
-    for (a, q) in read_arguments(&src) {
-        if a.contains("LANDLOCK") || a.contains("PROBE") {
-            println!("arg={a:?} quoted={q}");
-        }
     }
 }
