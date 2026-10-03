@@ -149,6 +149,18 @@ pub(crate) fn pid_file_for(path: &Path) -> PathBuf {
     PathBuf::from(sibling)
 }
 
+/// The `.teardown` sibling path for a worktree directory.
+///
+/// The hub's shutdown writes it before it aborts a worker, and the guard's
+/// [`WorktreeGuard`] drop removes it when the teardown finishes; a
+/// replacement hub refuses to recover the worker while it exists, so a
+/// teardown that outlives the shutdown wait cannot race the recovery.
+pub(crate) fn teardown_marker_for(path: &Path) -> PathBuf {
+    let mut sibling = path.as_os_str().to_os_string();
+    sibling.push(".teardown");
+    PathBuf::from(sibling)
+}
+
 /// Remove a directory tree, tolerating an already-missing path.
 ///
 /// Centralises the `exists() && remove_dir_all` pattern repeated in three
