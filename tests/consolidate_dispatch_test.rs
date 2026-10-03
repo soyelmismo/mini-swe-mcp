@@ -121,6 +121,7 @@ impl Harness {
                     verified,
                     metrics: WorkerMetrics::default(),
                     revision: 0,
+                    verdicts: None,
                 },
                 metrics: WorkerMetrics::default(),
                 logs: mini_swe_mcp::pool::LogBuffer::default(),

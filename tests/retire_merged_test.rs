@@ -349,6 +349,7 @@ fn every_row_a_meta_writes_carries_its_base_branch() {
         report: None,
         verified: None,
         security_review: None,
+        verdicts: None,
     };
     let pool = WorkerPool::with_scratch(
         1,
@@ -840,6 +841,7 @@ fn a_consolidators_round_survives_its_later_status_writes() {
         report: None,
         verified: None,
         security_review: None,
+        verdicts: None,
     };
     pool.__test_reset_registry_throttle("wcons");
     pool.__test_save_status(
@@ -925,6 +927,7 @@ async fn a_retired_worker_leaves_the_live_list() {
             metrics: Default::default(),
             report: None,
             revision: 0,
+            verdicts: None,
         },
         metrics: Default::default(),
         logs: mini_swe_mcp::pool::LogBuffer::new(),
@@ -1000,6 +1003,7 @@ fn successive_round_recordings_survive_status_writes_between_them() {
         report: None,
         verified: None,
         security_review: None,
+        verdicts: None,
     };
     let status = |pool: &mini_swe_mcp::pool::WorkerPool| {
         pool.__test_reset_registry_throttle("wunion");
@@ -1093,6 +1097,7 @@ async fn the_mcp_merge_path_forgets_the_retired_workers_acknowledgements() {
             metrics: WorkerMetrics::default(),
             report: None,
             revision: 0,
+            verdicts: None,
         },
         metrics: WorkerMetrics::default(),
         logs: mini_swe_mcp::pool::LogBuffer::new(),
@@ -1244,6 +1249,7 @@ async fn the_mcp_consolidator_merge_retires_its_round_from_every_view() {
                 metrics: WorkerMetrics::default(),
                 report: None,
                 revision: 0,
+                verdicts: None,
             },
             metrics: WorkerMetrics::default(),
             logs: mini_swe_mcp::pool::LogBuffer::new(),

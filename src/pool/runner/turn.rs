@@ -49,7 +49,7 @@ use super::super::admission::AdmissionClass;
 use super::super::buffer::build_step_log;
 use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::super::revision::{WorkerHistory, append_history_message_in};
-use super::super::state::{WorkerReport, WorkerState};
+use super::super::state::{WorkerReport, WorkerState, WorkerVerdicts};
 use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
@@ -929,6 +929,10 @@ pub(super) struct TurnEngine<'a> {
     /// turn and the bash command of another -- so they are scanned together
     /// rather than one by one, but the buffer never grows past its bound.
     pub report_text: &'a mut String,
+    /// The per-worker `REPORT` lines and `RISK:` lines of a consolidator's
+    /// completion message, stored on the meta at that turn so the terminal row
+    /// carries them.
+    pub verdicts: &'a mut Option<WorkerVerdicts>,
 }
 
 /// Append one assistant message to the completion scan buffer: its prose, then
@@ -1565,6 +1569,16 @@ impl<'a> TurnEngine<'a> {
             self.pool
                 .record_consolidator_absorbed(self.meta, &fixed)
                 .await;
+            // The round's per-worker verdicts are the orchestrator's read of
+            // the round, and its completion event used to carry only the
+            // one-line headline. They are recorded here, on the meta, so the
+            // terminal state and row both carry them without a second pass
+            // over the history log.
+            let verdicts = crate::pool::state::parse_verdict_lines(&llm_resp.content);
+            if !verdicts.is_empty() {
+                *self.verdicts = Some(verdicts);
+                self.meta.verdicts = self.verdicts.clone();
+            }
         }
 
         let round_base = super::super::steer::read_source(&self.pool.scratch, self.worker_id)

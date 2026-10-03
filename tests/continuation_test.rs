@@ -543,6 +543,7 @@ fn three_continuations_number_one_two_three() {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             },
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

@@ -33,7 +33,8 @@ use tokio::task::JoinHandle;
 
 use crate::pool::{
     FileStat, LogBuffer, RegistryStatus, SecurityReviewOutcome, WorkerMetrics, WorkerPhase,
-    WorkerPool, WorkerRegistryEntry, WorkerReport, WorkerState, clamp_string, file_stats_of_diff,
+    WorkerPool, WorkerRegistryEntry, WorkerReport, WorkerState, WorkerVerdicts, clamp_string,
+    file_stats_of_diff,
 };
 
 /// How often the event task re-reads the registry for workers it does not own.
@@ -106,6 +107,12 @@ pub struct Outcome {
     pub error: Option<String>,
     /// The structured report of the completion turn, when the worker wrote one.
     pub report: Option<WorkerReport>,
+    /// A consolidator's per-worker `REPORT` lines and `RISK:` lines.
+    ///
+    /// The round's headline says the round happened; these say what happened
+    /// to each worker in it, which the orchestrator used to have to read out
+    /// of the consolidator's history log. `None` for an ordinary worker.
+    pub verdicts: Option<WorkerVerdicts>,
     /// The completion diff split per file, biggest churn first.
     pub per_file: Vec<FileStat>,
     /// The adversarial security review that ran over the diff, when one did.
@@ -311,6 +318,20 @@ fn render_event(view: &WorkerView, kind: EventKind) -> String {
                 .filter(|risks| !risks.is_empty() && !risks.eq_ignore_ascii_case("none"))
             {
                 body.push_str(&format!("risks: {risks}\n"));
+            }
+            // The round's per-worker verdicts come after the compact block, so
+            // the headline still reads first: one line per worker, then the
+            // risks. They are the reason a consolidator's completion is worth
+            // more than its one-line summary.
+            if let Some(verdicts) = view
+                .outcome
+                .verdicts
+                .as_ref()
+                .filter(|verdicts| !verdicts.is_empty())
+            {
+                for line in verdicts.lines() {
+                    body.push_str(&format!("{line}\n"));
+                }
             }
             body.push_str(&crate::pool::next_step_for(view.branch.as_deref()));
             (
@@ -1416,6 +1437,10 @@ fn registry_view(entry: &WorkerRegistryEntry) -> WorkerView {
             // what it did and whether it verified.
             verified: entry.verified,
             report: entry.report.clone(),
+            // The row carries the round's verdicts, like the report, so a
+            // consolidator whose in-memory record was already evicted still
+            // says what it decided about each worker.
+            verdicts: entry.verdicts.clone(),
             security_review: entry.security_review,
             summary: entry
                 .report
@@ -1455,6 +1480,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             metrics,
             diff,
             report,
+            verdicts,
             ..
         } => Outcome {
             summary: first_line(summary),
@@ -1462,6 +1488,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             diff_stat: diff_stat(metrics),
             error: None,
             report: report.clone(),
+            verdicts: verdicts.clone(),
             per_file: file_stats_of_diff(diff),
             // The state does not carry the security review; the registry row
             // does, and `snapshot` copies it back after this call.
@@ -1477,6 +1504,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             metrics,
             diff,
             report,
+            verdicts,
             ..
         } => Outcome {
             summary: first_line(summary),
@@ -1484,6 +1512,7 @@ fn outcome_of(state: &WorkerState) -> Outcome {
             diff_stat: diff_stat(metrics),
             error: None,
             report: report.clone(),
+            verdicts: verdicts.clone(),
             per_file: file_stats_of_diff(diff),
             security_review: None,
         },
