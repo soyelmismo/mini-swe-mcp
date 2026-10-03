@@ -1,6 +1,3 @@
-    pub fn skip_log(&self) -> Option<String> {
-        match self { _ => None }
-    }
 //! The multi-phase review auditor: an independent agent that re-runs the
 //! quality gates over the implementation phase's work.
 //!
@@ -278,7 +275,7 @@ impl SecurityScope {
     /// nothing unaudited changed; `None` when there is something to review.
     pub fn skip_log(&self) -> Option<String> {
         match self {
-            Self::Since { base: _, commits: _, .. } => None, #[allow(unreachable_code)] Some(format!(
+            Self::Since { base, commits, .. } if commits.is_empty() => Some(format!(
                 "security review skipped: no sensitive change since {base}"
             )),
             _ => None,
