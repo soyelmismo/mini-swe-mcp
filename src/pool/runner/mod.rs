@@ -594,20 +594,22 @@ impl WorkerPool {
             // implementer's own model is never the automatic answer: the model
             // that wrote the change must not be the one that audits it.
             (None, false) => {
-                let choice = self::review::select_security_reviewer(self.manifest(), &default_model);
+                let choice =
+                    self::review::select_security_reviewer(self.manifest(), &default_model);
                 Some((choice.model, ReviewMode::Security, choice.reason))
             }
             (None, true) => None,
         };
         if let Some((reviewer_model, mode, why)) = review_plan {
-            // The reviewer and the reason it was chosen: an audit nobody can
-            // account for is how a fast executor ends up reviewing itself.
+            // The reviewer and the reason it was chosen, next to the pipeline
+            // line: an audit nobody can account for is how a fast executor ends
+            // up reviewing itself.
             info!(
                 worker = %worker_id,
                 reviewer = %reviewer_model,
                 mode = mode.as_str(),
                 why,
-                "Security review reviewer selected"
+                "Reviewer selected"
             );
             let outcome = self
                 .run_review_phase(

@@ -35,14 +35,9 @@ const COMPLETION_SENTINEL: &str = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT";
 /// The catalog an operator writes: a fast default and a deeper tier, named by
 /// `strongest:`. `declare_strongest` toggles that key.
 fn catalog(strongest: bool) -> ModelManifest {
+    let strongest_line = if strongest { "strongest: nerd\n" } else { "" };
     let yaml = format!(
-        "default: ninja\n\
-         {strongest}\n\
-         models:\n\
-         \x20 ninja:\n\
-         \x20   id: combo:ninja\n\
-         \x20 nerd:\n\
-         \x20   id: combo:nerd\n"
+        "default: ninja\n{strongest_line}models:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n"
     );
     serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("catalog YAML must parse: {e}\n{yaml}"))
 }
@@ -139,13 +134,25 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
 fn models_of(bodies: &[Value]) -> Vec<String> {
     bodies
         .iter()
-        .map(|body| {
-            body["model"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
+        .map(|body| body["model"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// The model the review phase asked for.
+///
+/// One request per turn at most, with a retry allowed for a transport failure,
+/// so the *distinct* models a run asked for name the phases unambiguously:
+/// the implementer's model first, then the reviewer's. A report-only retry
+/// repeats the implementer's request, which changes nothing here.
+fn models_asked_for(bodies: &[Value]) -> Vec<String> {
+    let mut seen = Vec::new();
+    for body in bodies {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
+        if seen.last() != Some(&model) {
+            seen.push(model);
+        }
+    }
+    seen
 }
 
 /// The user message of the request that opened the review phase, if any.
@@ -183,12 +190,8 @@ async fn the_strongest_tier_reviews_the_sensitive_diff() {
 
     let bodies = llm.request_bodies().await;
     assert_eq!(
-        models_of(&bodies),
-        vec![
-            "combo:ninja".to_string(),
-            "combo:ninja".to_string(),
-            "combo:nerd".to_string()
-        ],
+        models_asked_for(&bodies),
+        vec!["combo:ninja".to_string(), "combo:nerd".to_string()],
         "the automatic security review must run on the manifest's strongest tier, \
          not on the implementer's model"
     );
@@ -228,12 +231,8 @@ async fn without_a_strongest_tier_the_default_reviews() {
 
     let bodies = llm.request_bodies().await;
     assert_eq!(
-        models_of(&bodies),
-        vec![
-            "combo:ninja".to_string(),
-            "combo:nerd".to_string(),
-            "combo:ninja".to_string()
-        ],
+        models_asked_for(&bodies),
+        vec!["combo:nerd".to_string(), "combo:ninja".to_string()],
         "the fallback is the catalog's `default:`, not the dispatched model"
     );
     let _ = review_prompt_of(&bodies).expect("a review prompt");
