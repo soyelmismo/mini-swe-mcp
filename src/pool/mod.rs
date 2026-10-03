@@ -309,6 +309,17 @@ pub struct WorkerPool {
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
     command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Worker id -> the harness-side wait label the pool itself published as
+    /// that worker's command in flight, e.g. `CONSOLIDATE_WAIT <ids>`.
+    ///
+    /// Held here, rather than inferred from the recorded `last_command`, so
+    /// only a label the pool really wrote can outrank a step. A step's own
+    /// label is model-written text, and the wait's name is a prefix of
+    /// perfectly ordinary commands: reading it out of the text would let a
+    /// model freeze its worker's reported command for good by issuing
+    /// `CONSOLIDATE_WAIT ...`, since every later step reads the same unchanged
+    /// label and skips its own write again.
+    harness_wait_label: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Background jobs of every live worker: a command that outlived its
     /// budget keeps running here, confined exactly as the command was, until
     /// it ends or its worker does.
@@ -412,6 +423,7 @@ impl WorkerPool {
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            harness_wait_label: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: JobTable::new(),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
@@ -508,6 +520,10 @@ impl WorkerPool {
     ///
     /// A harness-side wait spends no bash command, so without this the status
     /// view would keep showing the previous command for the whole wait.
+    ///
+    /// The label is also recorded as the pool's own, which is what
+    /// [`harness_wait_in_flight`](WorkerPool::harness_wait_in_flight) reads, so
+    /// the step recorder can tell this label from a step's model-written one.
     async fn set_running_command(&self, id: &str, command: &str) -> Option<String> {
         let mut previous = None;
         self.update_worker(id, |worker| {
@@ -517,7 +533,26 @@ impl WorkerPool {
             }
         })
         .await;
+        self.harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id.to_string(), command.to_string());
         previous
+    }
+
+    /// Whether the pool itself has a harness-side wait published as `id`'s
+    /// command in flight, so a step must not overwrite that label.
+    ///
+    /// The answer comes from the map [`set_running_command`](Self::set_running_command)
+    /// filled and [`restore_running_command`](Self::restore_running_command)
+    /// clears, never from the recorded `last_command`: that field holds
+    /// model-written text, and a command beginning with the wait's name would
+    /// otherwise own the label for the rest of the worker's life.
+    pub fn harness_wait_in_flight(&self, id: &str) -> bool {
+        self.harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(id)
     }
 
     /// Put back the command label a [`WorkerPool::set_running_command`] replaced.
@@ -526,6 +561,13 @@ impl WorkerPool {
     /// that ended because the worker itself stopped (killed, paused, finished)
     /// must not overwrite the state that stop wrote.
     async fn restore_running_command(&self, id: &str, wait_label: &str, previous: Option<String>) {
+        // The pool's own claim on the label goes first, and unconditionally: a
+        // wait that returns must leave no step suppressed, whichever state the
+        // worker is in by then.
+        self.harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(id);
         if let Some(previous) = previous {
             self.update_worker(id, |worker| {
                 if let WorkerState::Running { last_command, .. } = &mut worker.state

@@ -54,7 +54,7 @@ use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, HARNESS_WAIT_PREFIX, REPORT_FIELD_BYTES, REPORT_FOLLOWUP,
+    COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP,
     is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
     parse_consolidate_steer, parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job,
     parse_report, parse_request_turns, parse_wait_job, summarize_command,
@@ -955,28 +955,6 @@ fn append_report_text(buffer: &mut String, llm_resp: &LlmResponse) -> Option<Wor
     parsed
 }
 
-/// Whether `last_command` is the label the pool's own wait published, so the
-/// label in flight belongs to the wait and not to some step.
-///
-/// `CONSOLIDATE_WAIT` holds the pool's command-in-flight mark for its whole
-/// duration, so a step that starts while one is in flight must not overwrite the
-/// label with its own command: the wait is what `status` shows and what the stall
-/// detector reads as work, and replacing it made a wait report `running for 0s`
-/// and then stall as a step that had gone idle.
-///
-/// The match is on the whole first word, not a prefix of the label. A step's
-/// own label is model-written text, and a command like `CONSOLIDATE_WAITING_FOR`
-/// must not be mistaken for the harness's wait: a prefix match froze that
-/// worker's reported command for good, because every later step reads the same
-/// unchanged label and skips again.
-fn wait_label_in_flight(last_command: &str) -> bool {
-    let label = last_command.trim_start();
-    label == HARNESS_WAIT_PREFIX
-        || label
-            .strip_prefix(HARNESS_WAIT_PREFIX)
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-}
-
 impl<'a> TurnEngine<'a> {
     /// Run one turn of the agent loop.
     pub(super) async fn run_turn(&mut self, config: &TurnConfig<'_>) -> Result<TurnOutcome> {
@@ -1206,6 +1184,27 @@ impl<'a> TurnEngine<'a> {
         // `await_worker_result_until` wakes on this step instead of on the next
         // 500 ms tick. Refreshing the cached metrics in the same critical
         // section keeps a kill racing this turn reporting the counters to it.
+        //
+        // The label goes to the step unless the pool itself is holding a
+        // harness-side wait as this worker's command in flight. `status` then
+        // shows what the worker is really doing, and the stall detector reads
+        // the wait as work instead of as a step that has gone idle. The
+        // question is asked of the pool's own record of the label, never of
+        // `last_command`: that field holds model-written text, and a command
+        // beginning with the wait's name would otherwise own the label for
+        // the rest of the worker's life, every later step reading the same
+        // unchanged label and skipping its own write again.
+        let wait_owns_label = self
+            .pool
+            .worker_progress(self.worker_id)
+            .await
+            .and_then(|p| p.last_command)
+            .is_some_and(|lc| {
+                let t = lc.trim_start();
+                t == "CONSOLIDATE_WAIT"
+                    || t.strip_prefix("CONSOLIDATE_WAIT")
+                        .is_some_and(|r| r.starts_with(char::is_whitespace))
+            });
         self.pool
             .update_worker(self.worker_id, |w| {
                 w.metrics = self.meta.metrics;
@@ -1216,7 +1215,7 @@ impl<'a> TurnEngine<'a> {
                 } = w.state
                 {
                     *s = *self.step;
-                    if !wait_label_in_flight(last_command) {
+                    if !wait_owns_label {
                         *last_command = label.clone();
                     }
                 }
@@ -1224,6 +1223,9 @@ impl<'a> TurnEngine<'a> {
             .await;
 
         // --- Registry update, coalesced by the pool's writer ---
+        // The durable row records the step's own command whatever the wait
+        // label shows, so a restart never adopts a wait label as the worker's
+        // last command.
         self.pool.save_status(
             self.meta,
             config.model,
@@ -2407,45 +2409,8 @@ mod tests {
         append_report_text, edit_plan, edit_plan_text, extension_budget, isolation_block,
         named_file_defaults, parse_shortstat, parse_threshold, read_only_nudge_text,
         read_only_pause_question, read_only_plan_text, read_only_thresholds, summarized_task,
-        task_names_files, wait_label_in_flight,
+        task_names_files,
     };
-
-    /// A harness-side wait names itself as the command in flight and keeps the
-    /// label for its whole duration; an ordinary step's own command is not one
-    /// and always takes the label.
-    #[test]
-    fn a_wait_label_outranks_a_step_that_starts_during_the_wait() {
-        assert!(
-            wait_label_in_flight("CONSOLIDATE_WAIT w-abc w-def"),
-            "the wait names itself as the command in flight"
-        );
-        assert!(
-            !wait_label_in_flight("cargo test --all-targets"),
-            "an ordinary step is not a wait"
-        );
-    }
-
-    /// A step's own label is model-written text, and the wait's name is a prefix
-    /// of perfectly ordinary commands. Reading it as a prefix would leave the
-    /// worker's reported command frozen at the impostor for good: every later
-    /// step reads the same unchanged label and skips its own write again.
-    #[test]
-    fn a_command_that_only_looks_like_a_wait_never_owns_the_label() {
-        for impostor in [
-            "CONSOLIDATE_WAITING_FOR_THING",
-            "CONSOLIDATE_WAITED",
-            "CONSOLIDATE_WAIT=x",
-            "CONSOLIDATE_WAITER",
-        ] {
-            assert!(
-                !wait_label_in_flight(impostor),
-                "a model-authored command must not pass as the harness wait: {impostor}"
-            );
-        }
-        // The real label, however it is spaced, still owns the label.
-        assert!(wait_label_in_flight("CONSOLIDATE_WAIT w-abc"));
-        assert!(wait_label_in_flight("CONSOLIDATE_WAIT"));
-    }
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
     fn scanned(content: &str, command: Option<&str>) -> LlmResponse {
