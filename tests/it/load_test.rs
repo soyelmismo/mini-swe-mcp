@@ -1,7 +1,7 @@
 //! Load test: many agents of many workers through one hub daemon.
 //!
 //! `#[ignore]` by default so `cargo test` stays fast; run it with
-//! `cargo test --test load_test -- --ignored --nocapture`. The shape is
+//! `cargo test --test it load_test:: -- --ignored --nocapture`. The shape is
 //! configurable through the environment (`LOAD_AGENTS`,
 //! `LOAD_WORKERS_PER_AGENT`, `LOAD_MAX_WORKERS`, `LOAD_MAX_HEAVY`,
 //! `LOAD_HEAVY_SECS`, `LOAD_TIMEOUT_SECS`) and defaults to a small smoke run;
