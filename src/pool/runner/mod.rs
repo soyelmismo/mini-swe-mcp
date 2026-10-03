@@ -572,8 +572,9 @@ impl WorkerPool {
         // focused adversarial pass for the paths the repository declared.
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
-        // The manifest's `security` triggers union with `## Sensitive paths`:
-        // marking a path in either place runs the adversarial review.
+        // The manifest's `security` mode triggers union with `## Sensitive
+        // paths` and the top-level `sensitive_paths`: marking a path in any of
+        // the three places runs the adversarial review.
         if let Some(security_def) = self.manifest().review_mode("security") {
             patterns.extend(security_def.triggers.iter().cloned());
         }

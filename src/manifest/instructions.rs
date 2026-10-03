@@ -146,10 +146,6 @@ pub fn matches_sensitive(path: &str, patterns: &[String]) -> bool {
 
 /// Match one glob against one repository-relative path.
 fn glob_matches(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() {
-        return false;
-    }
     glob_regex(pattern)
         .map(|re| re.is_match(path))
         .unwrap_or(false)
