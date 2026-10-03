@@ -508,9 +508,13 @@ async fn a_truncated_reply_is_named_as_such_when_the_worker_parks() {
         "printf 'first\\n' > lib.rs",
         "Writing the file first.",
     )];
+    // The provider cuts every reply short with `finish_reason: "length"`, so
+    // the turn is incomplete however the content reads: the guard must name
+    // the truncation as the mechanism, not read it as a model refusal.
     for _ in 0..6 {
         script.push(vec![frame(&json!({
-            "choices": [{"delta": {"content": "I will execute a bash command."}}]
+            "choices": [{"delta": {"content": "I will execute a bash command."},
+                         "finish_reason": "length"}]
         }))]);
     }
     script.push(ScriptedServer::completion_turn(
@@ -527,6 +531,10 @@ async fn a_truncated_reply_is_named_as_such_when_the_worker_parks() {
     assert!(
         question.contains("stopped calling tools"),
         "the pause must name the mechanism, got {question:?}"
+    );
+    assert!(
+        question.contains("finish_reason=length/content_filter"),
+        "the pause must name the truncation as the cause, got {question:?}"
     );
 
     pool.steer(&worker_id, "call the bash tool".to_string())
