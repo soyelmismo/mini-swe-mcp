@@ -26,7 +26,7 @@ pub(super) const TEXT: &str = concat!(
     "\n",
     "HISTORY_FULL_TURNS and HISTORY_BUDGET_BYTES bound the turn history replayed into a worker's context, HISTORY_KEEP_ALL_REASONING=1 keeps the reasoning as well as the answer, WORKER_MAX_RETAINED_LOGS (200) and WORKER_MAX_EMITTED_LOGS (40) bound the step log, WORKER_TERMINAL_TTL_SECS (300) how long a finished record stays in memory, WORKER_RETENTION_SECS (604800) how long its registry row and conversation live while the branch exists, and WORKER_RETIRED_GRACE_SECS (86400) how long they outlive a branch that is gone.",
     "\n",
-    "Scratch and sandbox: SWE_TEMP_DIR (/var/tmp), SWE_CACHE_DIR (<SWE_TEMP_DIR>/swe-cache), CARGO_TARGET_DIR (per-worker targets by default), SWE_SHARED_CACHES, SWE_DISABLE_SANDBOX=1, SWE_DISABLE_LANDLOCK=1, SWE_DISABLE_KACHE=1, KACHE_DISABLED=1, SWE_SANDBOX (force a backend) and SWE_ALLOW_TOOLCHAIN_CREDENTIALS=1 (expose the credential files the cache directories sit beside) are described in the sandbox topic.",
+    "Scratch and sandbox: SWE_TEMP_DIR (/var/tmp), SWE_CACHE_DIR (<SWE_TEMP_DIR>/swe-cache), CARGO_TARGET_DIR (per-worker targets by default; WORKER_BUILD_DEBUG=1 keeps full debug info in them), SWE_SHARED_CACHES, SWE_DISABLE_SANDBOX=1, SWE_DISABLE_LANDLOCK=1, SWE_DISABLE_KACHE=1, KACHE_DISABLED=1, SWE_SANDBOX (force a backend) and SWE_ALLOW_TOOLCHAIN_CREDENTIALS=1 (expose the credential files the cache directories sit beside) are described in the sandbox topic.",
     "\n",
     "MONITOR_WIDTH (120) and COLUMNS override the width of the monitor view; RUST_LOG sets the tracing filter; ENV_FILE and XDG_CONFIG_HOME move the .env and models.yaml lookups. Test-only hooks exist but are deliberately not listed here; they are not operator settings.",
 );

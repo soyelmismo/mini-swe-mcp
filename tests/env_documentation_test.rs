@@ -77,7 +77,6 @@ const HOST_VARS: &[&str] = &[
     "SHELL",
     "TERM",
     "USER",
-    "WORKER_BUILD_DEBUG",
 ];
 
 /// Whether `b` can appear in an environment variable name.
