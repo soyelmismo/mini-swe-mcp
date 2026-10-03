@@ -18,6 +18,7 @@ mod common;
 
 use common::TempDir;
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_FILE, ARCHIVE_MAX_BYTES, ArchiveRecord};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn record(id: &str) -> ArchiveRecord {
@@ -169,5 +170,54 @@ fn concurrent_writers_over_the_cap_lose_no_line() {
         "no line may be lost or duplicated by a concurrent rotation: {} of {}",
         records.len(),
         WRITERS * PER_WRITER
+    );
+}
+
+/// The append lock is a sidecar file the archive creates on first use; it must
+/// be owner-only like the generations it serializes, and a concurrent run must
+/// leave it behind as a plain file.
+#[test]
+fn the_append_lock_is_a_plain_owner_only_sidecar() {
+    let hub = TempDir::new_in_tmp("archive-lock-sidecar");
+    archive::append_record(hub.path(), &record("w1")).expect("the append must succeed");
+
+    let lock = hub.path().join(archive::ARCHIVE_LOCK_FILE);
+    let meta = std::fs::symlink_metadata(&lock).expect("the lock file must exist");
+    assert!(meta.file_type().is_file(), "the lock must be a plain file");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the lock file must be owner-only"
+    );
+}
+
+/// A lock file the archive did not create -- here a symlink aimed at somebody
+/// else's file -- is not this process's to open or replace. The append must
+/// still land the report (unserialized, like a rotation that cannot be
+/// performed), and the planted link must be left exactly as it was.
+#[test]
+fn a_symlinked_lock_file_still_lands_the_report() {
+    let hub = TempDir::new_in_tmp("archive-lock-symlink-hub");
+    let elsewhere = TempDir::new_in_tmp("archive-lock-symlink-target");
+    let victim = elsewhere.path().join("victim.txt");
+    std::fs::write(&victim, "important\n").expect("the victim file must be writable");
+
+    let lock = hub.path().join(archive::ARCHIVE_LOCK_FILE);
+    std::os::unix::fs::symlink(&victim, &lock).expect("the test plants the link");
+
+    archive::append_record(hub.path(), &record("w1"))
+        .expect("a report must survive a lock that cannot be taken");
+
+    let meta = std::fs::symlink_metadata(&lock).expect("the planted link must still exist");
+    assert!(meta.file_type().is_symlink(), "the link must be left as it was");
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("the victim is readable"),
+        "important\n",
+        "nothing may be written through the planted link"
+    );
+    let live = std::fs::read_to_string(hub.path().join(ARCHIVE_FILE)).expect("the live file");
+    assert!(
+        live.contains("\"w1\""),
+        "the report must be in the archive: {live}"
     );
 }
