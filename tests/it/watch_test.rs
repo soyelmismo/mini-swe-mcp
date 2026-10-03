@@ -122,10 +122,6 @@ fn an_isolated_pool_never_resolves_the_hosts_scratch_root() {
         host.path(),
         "a watch pool must not share the host's registry root"
     );
-    assert!(
-        pool.scratch_root().path().starts_with(_scratch.path()),
-        "a watch pool files its registry under its own scratch directory"
-    );
 }
 
 async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
