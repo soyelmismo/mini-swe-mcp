@@ -32,7 +32,7 @@
 //! worktree sample cannot see, so they restart the streak rather than
 //! lengthening it ([`ProgressWatch::note_harness_progress`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -205,18 +205,187 @@ const LOOP_OUTPUT_TAIL_BYTES: usize = 300;
 /// cannot paste itself into a nudge or an orchestrator question.
 const LOOP_BASE_BYTES: usize = 160;
 
+/// One answered turn as the loop detector remembers it.
+struct LoopStep {
+    step: usize,
+    base: String,
+    code: Option<i32>,
+    /// A digest of the output, so two runs can be compared without storing
+    /// every byte a worker ever printed.
+    digest: u64,
+    /// Whether the worktree changed between the previous turn and this one.
+    changed: bool,
+    /// Bounded tail of the output, for the pause question.
+    tail: String,
+}
+
+/// What a loop window asks the turn engine to do.
+enum LoopVerdict {
+    /// The window is not a loop: keep going.
+    None,
+    /// A loop was seen; tell the worker what to do instead.
+    Nudge { count: usize },
+    /// A loop the nudge did not break; hand the decision to the orchestrator.
+    Pause { count: usize },
+}
+
+/// The equivalent-command loop detector: a sliding window of the last
+/// [`LOOP_WINDOW_TURNS`] answered turns, escalating when one base command
+/// fills it with runs that changed nothing and learned nothing.
+///
+/// Two things the older guards each missed on their own. The repetition
+/// detector compares commands byte for byte, so a worker that re-spells its
+/// command (`cargo test | tail`, `cargo test > /tmp/x`) walks straight past
+/// it; the stagnation detector counts turns with an unchanged repository, and
+/// a consolidator that is exempt from the read-only escalation was left with
+/// only nudges that never escalate. This one compares the *base* of each
+/// command over a window, and it applies to every role.
+#[derive(Default)]
+struct LoopDetector {
+    /// The last [`LOOP_WINDOW_TURNS`] answered turns, oldest first.
+    window: VecDeque<LoopStep>,
+    /// Base commands the nudge has already been sent for, with the run count
+    /// it was sent on, newest last and bounded so the table cannot grow with
+    /// the run.
+    nudged: Vec<(String, usize)>,
+    /// Base commands the worker has already been parked for, with the run
+    /// count it was parked on.
+    paused: Vec<(String, usize)>,
+    /// Worktree content fingerprint of the last recorded turn.
+    last_state: Option<u64>,
+}
+
+/// Bounded size of [`LoopDetector::nudged`] and [`LoopDetector::paused`].
+const LOOP_TRACKED_BASES: usize = 8;
+
+impl LoopDetector {
+    /// Fold one answered turn in and report the escalation it earned, if any.
+    ///
+    /// `state` is the worktree's content fingerprint for this turn, or `None`
+    /// when it could not be taken. A run only counts toward a loop while the
+    /// worktree stayed as it was, because a worker that edits between two runs
+    /// is making progress even when the command's output does not show it yet.
+    fn record(
+        &mut self,
+        step: usize,
+        base: &str,
+        code: Option<i32>,
+        digest: u64,
+        tail: &str,
+        state: Option<u64>,
+    ) -> LoopVerdict {
+        let changed = matches!((self.last_state, state), (Some(a), Some(b)) if a != b);
+        self.last_state = state;
+        self.window.push_back(LoopStep {
+            step,
+            base: base.to_string(),
+            code,
+            digest,
+            changed,
+            tail: tail.to_string(),
+        });
+        // Prune entries older than the window, and cap the buffer.
+        while let Some(front) = self.window.front() {
+            if step.saturating_sub(front.step) >= LOOP_WINDOW_TURNS {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.window.len() > LOOP_WINDOW_TURNS {
+            self.window.pop_front();
+        }
+
+        // Walk the window from the newest entry back, counting runs of the
+        // same base that produced the same result on an unchanged worktree.
+        // The walk stops at the first entry whose turn changed the worktree,
+        // so an edit between two runs ends the span.
+        let mut runs = 0usize;
+        for entry in self.window.iter().rev() {
+            if entry.changed {
+                break;
+            }
+            if entry.base == base && entry.code == code && entry.digest == digest {
+                runs += 1;
+            }
+        }
+        if runs < LOOP_RUN_COUNT {
+            return LoopVerdict::None;
+        }
+
+        // A base that was already parked is never parked again.
+        if self.paused.iter().any(|(b, _)| b == base) {
+            return LoopVerdict::None;
+        }
+
+        let nudged_on = self
+            .nudged
+            .iter()
+            .find(|(b, _)| b == base)
+            .map_or(0, |(_, n)| *n);
+        if nudged_on == 0 {
+            remember_command(&mut self.nudged, base, runs);
+            return LoopVerdict::Nudge { count: runs };
+        }
+        if runs < nudged_on + LOOP_PAUSE_RUN {
+            return LoopVerdict::None;
+        }
+        remember_command(&mut self.paused, base, 1);
+        LoopVerdict::Pause { count: runs }
+    }
+
+    /// Whether the window already holds a run of `base`: the engine uses this
+    /// to decide whether a fresh worktree sample is worth taking.
+    fn repeats(&self, base: &str) -> bool {
+        self.window.iter().any(|entry| entry.base == base)
+    }
+}
+
+/// Remember `base` in a bounded list of (base, runs), evicting the oldest
+/// entry when the list is full.
+fn remember_command(list: &mut Vec<(String, usize)>, base: &str, runs: usize) {
+    if let Some((_, recorded)) = list.iter_mut().find(|(b, _)| b == base) {
+        *recorded = runs;
+        return;
+    }
+    if list.len() >= LOOP_TRACKED_BASES {
+        list.remove(0);
+    }
+    list.push((base.to_string(), runs));
+}
+
+/// The digest of one run's output: a hash of the output text. Two runs "say
+/// the same thing" when the digests match, so the detector can hold the digest
+/// instead of the output itself.
+fn output_digest(output: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    output.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `output` trimmed to its last `limit` bytes, so the pause question quotes
+/// what the command said without a whole log in the orchestrator's terminal.
+fn bounded_tail(output: &str, limit: usize) -> String {
+    if output.len() <= limit {
+        return output.to_string();
+    }
+    let start = output.floor_char_boundary(output.len() - limit);
+    format!("...{}", &output[start..])
+}
+
 /// The base a command reduces to, for the loop detector.
 ///
 /// A worker that re-runs "the same" command rarely spells it the same way
 /// twice: the round that motivated this detector ran `cargo test 2>&1 | grep
 /// -E ...`, `cargo test 2>&1 | tail -40`, `cargo test 2>&1 > /tmp/x.txt` and
 /// `cargo fmt --check && cargo clippy ... && cargo test 2>&1 | tail` — four
-/// bytes-apart spellings of one command, which a byte-identical repetition
-/// check cannot see. [`normalize_command_base`] maps all of them to the same
-/// string, so the detector compares what the worker *did*, not what it typed.
+/// byte-different spellings of one command, which a byte-identical repetition
+/// check cannot see. [`normalize_command_base`] maps all four to `cargo test`,
+/// so the detector compares what the worker *did*, not what it typed.
 ///
 /// The map is deliberately coarse and never guesses at a language: it drops
-/// what surrounds the command rather than what the command means.
+/// what surrounds the command rather than reading what the command means.
 fn normalize_command_base(command: &str) -> String {
     let one_line: String = command
         .lines()
@@ -224,20 +393,202 @@ fn normalize_command_base(command: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let base = strip_prefixes(&one_line);
-    let base = strip_suffixes(&base);
-    // Collapse whitespace last: the splitters above leave the gaps the
-    // dropped segments occupied behind.
-    base.split_whitespace().collect::<Vec<_>>().join(" ")
+    // The command's own spelling is the last segment that is not a filter over
+    // it, so a chain of gates is compared on the one it ends with. A pipeline
+    // made only of filters (`awk ... | sort | uniq`) has no such segment, and
+    // falls back to the one that reads the data rather than to nothing.
+    let segments = raw_segments(&one_line);
+    let base = segments
+        .iter()
+        .filter(|segment| !is_output_filter(segment))
+        .next_back()
+        .or_else(|| segments.iter().find(|segment| !segment.trim().is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    // Collapse whitespace last: the splitters leave the gaps their own
+    // dropped bytes occupied behind.
+    let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    strip_prefixes(&base)
 }
 
-/// Drop the wrappers a command is dressed in: a leading `cd`, a leading
+/// Split `command` at the metacharacters that join shell segments: `|`, `&&`,
+/// `||`, `;`, an unadorned redirection and a background `&`.
+///
+/// A split is only taken outside quotes, command substitutions, subshells and
+/// backslash escapes, so `grep -E 'FAILED|panicked'` keeps its pattern and
+/// `awk '{print $2}'` keeps its program: both sit *inside* the filter, and it
+/// is the filter that goes. An fd redirection (`2>&1`, `2>/dev/null`) is not a
+/// split at all -- it is the command's own plumbing -- so it is consumed with
+/// its target instead.
+fn raw_segments(command: &str) -> Vec<String> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    // Bytes, not chars: the scan walks byte offsets, and every cut lands on an
+    // ASCII metacharacter, so each kept slice is valid UTF-8 however the
+    // command is spelled.
+    let mut current: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            current.push(b);
+            // Only a double quote honours a backslash escape, and the byte
+            // after one is copied verbatim so the scan cannot end on it.
+            if b == b'\\' && q == b'"' && i + 1 < bytes.len() {
+                current.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                quote = Some(b);
+                current.push(b);
+                i += 1;
+            }
+            // A backtick substitution is copied whole rather than parsed, so
+            // the metacharacters inside it cannot split the command.
+            b'`' => {
+                let end = command[i + 1..]
+                    .find('`')
+                    .map_or(bytes.len(), |n| i + 1 + n + 1);
+                current.extend_from_slice(&bytes[i..end]);
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                current.push(b);
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                current.push(b);
+                i += 1;
+            }
+            b'\\' => {
+                current.push(b);
+                if i + 1 < bytes.len() {
+                    current.push(bytes[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'|' | b'&' | b';' if depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+                // `&&` and `||` are two bytes; a lone `&`, `|` and `;` are one.
+                i += 1 + usize::from(bytes.get(i + 1) == Some(&b));
+            }
+            b'>' | b'<' if depth == 0 => match redirect_span(&current, bytes, i) {
+                // An fd redirection: drop the digits that named it and its
+                // target, and keep the segment the redirection belongs to.
+                Some((fd_start, end)) => {
+                    current.truncate(fd_start);
+                    i = end;
+                }
+                // A bare redirection sends the command's whole output
+                // elsewhere, which is the filter case: it ends the segment and
+                // the target it names goes with it.
+                None => {
+                    segments.push(std::mem::take(&mut current));
+                    // The operator, an optional `&`, the whitespace after it
+                    // and the word it names all belong to the redirection, so
+                    // none of them can open the next segment.
+                    i += 1 + usize::from(bytes.get(i + 1) == Some(&b'&'));
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    while i < bytes.len()
+                        && !bytes[i].is_ascii_whitespace()
+                        && !b"|&;<>".contains(&bytes[i])
+                    {
+                        i += 1;
+                    }
+                }
+            },
+            _ => {
+                current.push(b);
+                i += 1;
+            }
+        }
+    }
+    segments.push(current);
+    segments
+        .into_iter()
+        .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+        .collect()
+}
+
+/// Whether `segment` only reshapes another command's output rather than doing
+/// work of its own: a filter such as `grep`, `tail`, `head`, `sort`, `wc`,
+/// `tee`, `awk` and `sed -n`, or the empty remainder a trailing `|` leaves.
+///
+/// Only the first word is read, and only for words that mean "show me part of
+/// what the previous command printed": nothing here claims to know what the
+/// command under it does.
+fn is_output_filter(segment: &str) -> bool {
+    const FILTERS: &[&str] = &[
+        "awk", "cat", "grep", "head", "less", "more", "sed", "sort", "tail", "tee", "uniq", "wc",
+    ];
+    let first = segment
+        .split_whitespace()
+        .next()
+        .map(|word| word.trim_start_matches(|c: char| c == '\\' || c == '$' || c == '('));
+    match first {
+        None => true,
+        Some(word) => FILTERS.binary_search(&word).is_ok(),
+    }
+}
+
+/// The span of the file-descriptor redirection whose operator sits at `i`, as
+/// `(index of its fd digits inside `kept`, index just past its target in the
+/// command)`.
+///
+/// `None` when no file descriptor is named: `2>&1` and `2>/dev/null` are a
+/// command's own plumbing, while a bare `>/tmp/out.txt` hides its output, so
+/// only the former stays inside the base.
+///
+/// The fd is read off the bytes kept for this segment rather than off the
+/// command: the two are indexed differently, since the scan drops bytes as it
+/// walks.
+fn redirect_span(kept: &[u8], bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    // At most three digits: a longer run names no fd anyway, and bounding the
+    // walk keeps the scan linear with no chance of running off the front.
+    let mut start = kept.len();
+    for _ in 0..3 {
+        match start.checked_sub(1).map(|p| kept[p]) {
+            Some(b) if b.is_ascii_digit() => start -= 1,
+            _ => break,
+        }
+    }
+    if start == kept.len() {
+        return None;
+    }
+    let mut end = i + 1;
+    if bytes.get(end) == Some(&b'&') {
+        end += 1;
+    }
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !b"|&;<>".contains(&bytes[end])
+    {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Drop the wrappers a segment is dressed in: a leading `cd`, a leading
 /// environment assignment, and the `&&` / `;` glue that follows either.
 ///
-/// Only the *leading* ones go: a `cd` in the middle of a pipeline is part of
+/// Only the *leading* ones go: a `cd` in the middle of a segment is part of
 /// the command's own spelling and stays.
-fn strip_prefixes(command: &str) -> String {
-    let mut words: Vec<&str> = command.split_whitespace().collect();
+fn strip_prefixes(segment: &str) -> String {
+    let mut words: Vec<&str> = segment.split_whitespace().collect();
     loop {
         if words.len() >= 2 && words[0] == "cd" {
             // `cd x && ...`, `cd x; ...` and `cd x` alone: everything up to
@@ -268,134 +619,13 @@ fn is_shell_separator(word: &str) -> bool {
 }
 
 /// Whether `word` assigns one environment variable: `NAME=value` with a
-/// shell-legal name, so `timeout=5` inside a sentinel's argument and a bare
-/// `=` are both left alone.
+/// shell-legal name, so `timeout=5` inside a sentinel's own argument and a
+/// bare `=` are both left alone.
 fn is_env_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-/// Drop everything the command pipes or redirects *into*: a filter
-/// (`grep`, `tail`, `head`, `sort`, `wc`, `tee`, `awk`, `sed -n`), a log file,
-/// and every later `&&` segment.
-///
-/// A split is only taken outside quotes, command substitutions, subshells and
-/// backslash escapes, so `grep -E 'FAILED|panicked'` keeps its pattern and
-/// `awk '{print $2}'` keeps its program: both are *inside* the filter, and it
-/// is the filter that goes.
-fn strip_suffixes(command: &str) -> String {
-    let bytes = command.as_bytes();
-    // Bytes, not chars: the scan walks byte offsets and only ever cuts at an
-    // ASCII metacharacter, which is always a character boundary, so the kept
-    // prefix is valid UTF-8 however the command is spelled.
-    let mut keep: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut quote: Option<u8> = None;
-    let mut depth: usize = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            keep.push(b);
-            // Only a double quote honours a backslash escape, and the byte
-            // after one is copied verbatim so the scan cannot end on it.
-            if b == b'\\' && q == b'"' && i + 1 < bytes.len() {
-                keep.push(bytes[i + 1]);
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\'' | b'"' => {
-                quote = Some(b);
-                keep.push(b);
-                i += 1;
-            }
-            // A backtick substitution is copied whole rather than parsed, so
-            // the metacharacters inside it cannot end the scan.
-            b'`' => {
-                let end = command[i + 1..]
-                    .find('`')
-                    .map_or(bytes.len(), |n| i + 1 + n + 1);
-                keep.extend_from_slice(&bytes[i..end]);
-                i = end;
-            }
-            b'(' => {
-                depth += 1;
-                keep.push(b);
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                keep.push(b);
-                i += 1;
-            }
-            b'\\' => {
-                keep.push(b);
-                if i + 1 < bytes.len() {
-                    keep.push(bytes[i + 1]);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            // A pipe, a `&&` chain, a background `&` and a `;` all start a
-            // segment the base does not describe.
-            b'|' | b'&' | b';' if depth == 0 => break,
-            b'>' | b'<' if depth == 0 => match redirect_span(bytes, i) {
-                // An fd redirection (`2>&1`, `2>/dev/null`) is dropped along
-                // with its target and the digits that named it.
-                Some((fd_start, end)) => {
-                    keep.truncate(fd_start);
-                    i = end;
-                }
-                // Anything else sends the command's whole output elsewhere,
-                // which is the filter case: the rest of the line goes.
-                None => break,
-            },
-            _ => {
-                keep.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&keep).into_owned()
-}
-
-/// The span of the file-descriptor redirection whose operator sits at `i`, as
-/// `(start of its fd digits, index just past its target)`.
-///
-/// `None` when no file descriptor is named: `2>&1` and `2>/dev/null` are the
-/// command's own plumbing, while a bare `>/tmp/out.txt` hides its output, so
-/// only the former stays inside the base.
-fn redirect_span(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
-    // At most three digits: a longer run is not an fd anyway, and bounding the
-    // walk keeps the scan linear without a chance of running off the front.
-    let mut start = i;
-    for _ in 0..3 {
-        match start.checked_sub(1).map(|p| bytes[p]) {
-            Some(b) if b.is_ascii_digit() => start -= 1,
-            _ => break,
-        }
-    }
-    if start == i {
-        return None;
-    }
-    let mut end = i + 1;
-    if bytes.get(end) == Some(&b'&') {
-        end += 1;
-    }
-    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !b"|&;<>".contains(&bytes[end])
-    {
-        end += 1;
-    }
-    Some((start, end))
 }
 
 /// Nudge injected after a worker has explored long enough without changing
@@ -2932,13 +3162,14 @@ mod tests {
         ] {
             assert_eq!(normalize_command_base(cmd), "cargo test", "{cmd}");
         }
-        // And the chain that ended with the same command: the first segment is
-        // the base, so a gate run as a chain is compared on its own terms.
+        // And the chain that ended with the same command: the base is the last
+        // segment that is not a filter over it, so a gate run as a chain is
+        // compared on the command it ends with.
         assert_eq!(
             normalize_command_base(
                 "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -20"
             ),
-            "cargo fmt --check"
+            "cargo test"
         );
     }
 
@@ -2954,7 +3185,7 @@ mod tests {
             normalize_command_base("git -C . log --oneline -n 5"),
             "git -C . log --oneline -n 5"
         );
-        assert_eq!(normalize_command_base("(cd sub && make) && echo done"), "(cd sub && make)");
+        assert_eq!(normalize_command_base("(cd sub && make) && echo done"), "echo done");
         assert_eq!(
             normalize_command_base("awk '{print $2}' log.txt | sort | uniq -c"),
             "awk '{print $2}' log.txt"
