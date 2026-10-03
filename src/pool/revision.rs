@@ -686,9 +686,7 @@ fn archive_retirement(root: &ScratchRoot, worker_id: &str, ctx: &RetireContext<'
     let Some(entry) = super::load_registry_entry_in(root, worker_id) else {
         return;
     };
-    let reason = ctx
-        .reason
-        .unwrap_or(super::archive::RetireReason::Merged);
+    let reason = ctx.reason.unwrap_or(super::archive::RetireReason::Merged);
     let record = super::archive::ArchiveRecord::from_entry(
         &entry,
         reason,

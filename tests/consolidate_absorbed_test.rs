@@ -135,6 +135,7 @@ impl Harness {
                 verified: Some(true),
                 keep_branch: false,
                 admission: None,
+                archive_dir: None,
             },
         )
         .expect("the consolidator's merge lands")

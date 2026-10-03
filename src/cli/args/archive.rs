@@ -44,7 +44,14 @@ mod tests {
 
     #[test]
     fn test_archive_group_and_last_map_to_the_tool_properties() {
-        let tool_args = built(&["mini-swe-mcp", "archive", "--group", "round-1", "--last", "3"]);
+        let tool_args = built(&[
+            "mini-swe-mcp",
+            "archive",
+            "--group",
+            "round-1",
+            "--last",
+            "3",
+        ]);
         assert_eq!(tool_args["action"], "archive");
         assert_eq!(tool_args["group"], "round-1");
         assert_eq!(tool_args["last"], 3);

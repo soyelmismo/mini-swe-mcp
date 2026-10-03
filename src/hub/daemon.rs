@@ -709,8 +709,10 @@ impl HubServer {
             .await?;
         let mut shutdown = self.server.subscribe_shutdown();
 
-        let reaper =
-            crate::pool::spawn_reaper((*self.server.pool()).clone(), Some(paths.dir().to_path_buf()));
+        let reaper = crate::pool::spawn_reaper(
+            (*self.server.pool()).clone(),
+            Some(paths.dir().to_path_buf()),
+        );
         let idle_watcher = self.clone();
         let mut idle_task = tokio::spawn(async move { idle_watcher.watch_idle().await });
 

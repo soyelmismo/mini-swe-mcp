@@ -2527,7 +2527,8 @@ pub fn spawn_reaper(pool: WorkerPool, archive_dir: Option<std::path::PathBuf>) -
             since_retention += 1;
             if since_retention >= retention_every {
                 since_retention = 0;
-                pool.retire_expired_terminal_workers(archive_dir.clone()).await;
+                pool.retire_expired_terminal_workers(archive_dir.clone())
+                    .await;
             }
         }
     })

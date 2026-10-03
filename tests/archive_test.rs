@@ -12,7 +12,7 @@ mod common;
 use common::{TempDir, git};
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_MAX_BYTES, ArchiveRecord, RetireReason};
 use mini_swe_mcp::pool::{
-    MergeRequest, RegistryStatus, RetireContext, WorkerReport, WorkerRegistryEntry,
+    MergeRequest, RegistryStatus, RetireContext, WorkerRegistryEntry, WorkerReport,
     load_registry_entry_in, merge_worker_in, retire_expired_terminal_workers_in,
     retire_worker_reporting, save_registry_entry_in,
 };
@@ -105,7 +105,7 @@ impl Fixture {
 
     /// The archive's own lines, oldest first, as the reader parses them.
     fn records(&self) -> Vec<ArchiveRecord> {
-        archive::read_records(&self.hub.path(), None, None).expect("the archive must be readable")
+        archive::read_records(self.hub.path(), None, None).expect("the archive must be readable")
     }
 
     fn archive_path(&self) -> PathBuf {
@@ -133,7 +133,11 @@ fn a_merge_writes_exactly_one_line_with_the_report_fields() {
         "the merge must have retired the row the archive line was built from"
     );
     let records = f.records();
-    assert_eq!(records.len(), 1, "one retirement writes one line: {records:?}");
+    assert_eq!(
+        records.len(),
+        1,
+        "one retirement writes one line: {records:?}"
+    );
     let line = &records[0];
     assert_eq!(line.worker_id, "w1");
     assert_eq!(line.owner, OWNER);
@@ -209,7 +213,13 @@ fn an_expired_retention_archives_the_report_as_expired() {
     let f = Fixture::new("archive-expired");
     f.record("w1", OWNER, None);
 
-    // Retention 0 means every terminal row is already older than it.
+    // The row must look as old as the retention allows: `updated_at == 0` is
+    // how the library itself spells "never stamped", and the retention test
+    // never accepts it.
+    let mut entry = load_registry_entry_in(&f.root(), "w1").expect("the row is on disk");
+    entry.updated_at = 1;
+    save_registry_entry_in(&f.root(), &entry);
+
     let retired = retire_expired_terminal_workers_in(&f.root(), 0, Some(&f.hub_dir()));
 
     assert_eq!(retired, 1, "the terminal row must have been retired");
@@ -266,7 +276,7 @@ fn group_and_last_narrow_the_read() {
         );
     }
 
-    let round_a = archive::read_records(&f.hub.path(), Some("round-a"), None).expect("readable");
+    let round_a = archive::read_records(f.hub.path(), Some("round-a"), None).expect("readable");
     assert_eq!(
         round_a
             .iter()
@@ -274,7 +284,7 @@ fn group_and_last_narrow_the_read() {
             .collect::<Vec<_>>(),
         ["w1", "w2"],
     );
-    let newest = archive::read_records(&f.hub.path(), None, Some(1)).expect("readable");
+    let newest = archive::read_records(f.hub.path(), None, Some(1)).expect("readable");
     assert_eq!(
         newest
             .iter()
@@ -283,7 +293,7 @@ fn group_and_last_narrow_the_read() {
         ["w3"],
         "--last keeps the newest of the whole archive"
     );
-    let capped = archive::read_records(&f.hub.path(), Some("round-a"), Some(1)).expect("readable");
+    let capped = archive::read_records(f.hub.path(), Some("round-a"), Some(1)).expect("readable");
     assert_eq!(
         capped
             .iter()
@@ -312,14 +322,18 @@ fn the_archive_rotates_past_its_size_cap() {
         reason: "merged".to_string(),
     };
 
-    // Fill one generation past the cap.
-    let per_line = 400;
-    let writes = ARCHIVE_MAX_BYTES as usize / per_line + 4;
-    for i in 0..writes {
-        let id = format!("w{i:06}");
-        archive::append_record(&f.hub.path(), &record(&id)).expect("the append must succeed");
+    // Append until the live file crosses the cap. The bound is a backstop, not
+    // the trigger: how many lines fit depends on their length, so the loop is
+    // what actually reaches the cap.
+    let mut writes = 0usize;
+    while writes < 10_000 && !f.hub.path().join(archive::ARCHIVE_ROTATED_FILE).exists() {
+        let id = format!("w{writes:06}");
+        archive::append_record(f.hub.path(), &record(&id)).expect("the append must succeed");
+        writes += 1;
     }
-    let size = std::fs::metadata(f.archive_path()).expect("the archive exists").len();
+    let size = std::fs::metadata(f.archive_path())
+        .expect("the archive exists")
+        .len();
     assert!(
         size <= ARCHIVE_MAX_BYTES,
         "the live file must stay capped, grew to {size}"
@@ -330,11 +344,17 @@ fn the_archive_rotates_past_its_size_cap() {
         "the previous generation must be kept as archive.jsonl.1"
     );
 
-    // The reader spans both generations, and both hold real lines.
+    // The reader spans both generations, and both hold real lines: rotation
+    // moves reports into `archive.jsonl.1`, it does not drop them.
     let all = f.records();
+    let rotated_lines = std::fs::read_to_string(&rotated).expect("the rotated file is readable");
     assert!(
-        all.len() > writes as usize / 2,
-        "rotation must not lose the reports: {} of {writes}",
+        !rotated_lines.is_empty() && !all.is_empty(),
+        "both generations must be readable"
+    );
+    assert!(
+        all.len() > writes / 2,
+        "rotation must not lose most of the reports: {} of {writes}",
         all.len()
     );
     assert!(

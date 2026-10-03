@@ -122,6 +122,7 @@ impl Fixture {
                 verified,
                 keep_branch,
                 admission: None,
+                archive_dir: None,
             },
         )
         .map(|_| ())
