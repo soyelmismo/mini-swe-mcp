@@ -11,6 +11,11 @@ impl McpServer {
     /// trial merge, dirty check, gate, real merge, cleanup -- is one blocking
     /// unit in [`crate::pool::merge`], so it runs off the runtime thread and
     /// answers with a single payload the CLI renders as one line.
+    ///
+    /// A consolidator is held to the round it was dispatched for, not just to
+    /// the branches it happened to merge: every member that is not missing and
+    /// not already integrated -- by history or by content -- refuses the merge
+    /// by name, `force` aside. See [`crate::cli::help`] `merge`.
     pub(super) async fn handle_merge(
         &self,
         args: &Value,
@@ -34,9 +39,10 @@ impl McpServer {
             .get("keep_branch")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // `force`: merge a round whose members carry commits the consolidator
-        // never integrated. The refusal names each one; the forced merge lands
-        // them unretired, so nothing is lost by overriding.
+        // `force`: land a round that does not match its record -- a member
+        // left out, or one merged and then revised on. The refusal names each
+        // one with its unintegrated commit count; the forced merge lands them
+        // unretired, so nothing is lost by overriding.
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let root = self.pool.scratch_root().clone();
         let admission = self.pool.admission();
