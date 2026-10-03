@@ -21,7 +21,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -222,7 +222,7 @@ pub fn read_records(
     let mut records: Vec<ArchiveRecord> = Vec::new();
     // Oldest generation first, so the ordering stays chronological.
     for path in [rotated_path(dir), archive_path(dir)] {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = read_generation(&path) else {
             continue;
         };
         for line in text.lines() {
@@ -251,6 +251,48 @@ pub fn read_records(
         records.drain(..records.len() - last);
     }
     Ok(records)
+}
+
+/// One generation's lines, or `None` when there is nothing to read.
+///
+/// `symlink_metadata` first, and a regular file only: the write path already
+/// refuses a planted link with `O_NOFOLLOW`, so a `read_to_string` that
+/// followed links here would undo that defence on the only path a caller
+/// reaches the file through. A link, a directory, a FIFO or a device is not
+/// this archive's file, and a reader that harvested lines through one would
+/// report whatever the link's target held -- another agent's reports, or a file
+/// the hub never wrote -- as retired workers of this pool.
+fn read_generation(path: &Path) -> Result<String> {
+    // The open itself carries the `O_NOFOLLOW`, not a check that precedes it:
+    // a `symlink_metadata`/`read_to_string` pair would have a window in which
+    // a regular file is replaced by a link, so the type must be established on
+    // the handle this process actually reads from.
+    // `O_NONBLOCK` at the open, not only the type check after it: opening a
+    // FIFO read-only blocks in `open(2)` itself, until some writer shows up, so
+    // a FIFO planted as `archive.jsonl` would hang every `archive` call before
+    // any check could run. A regular file ignores `O_NONBLOCK`, so the flag
+    // costs the real generation nothing, and the read below never inherits it.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    // `O_NOFOLLOW` alone would still open a FIFO or a device that is not a
+    // link, and reading one blocks forever or reads forever; the handle's own
+    // type is the only thing that cannot be swapped out from under the read.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("could not stat {}", path.display()))?;
+    anyhow::ensure!(
+        meta.file_type().is_file(),
+        "refusing to read {}: not a regular file",
+        path.display()
+    );
+    let mut text = String::new();
+    std::io::BufReader::new(file)
+        .read_to_string(&mut text)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    Ok(text)
 }
 
 /// Create the hub directory the archive lives in, owner-only.
