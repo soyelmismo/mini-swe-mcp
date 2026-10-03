@@ -60,7 +60,7 @@ pub use self::merge::{
     MergeApprovedReport, MergeApprovedRequest, MergeReport, MergeRequest, MergedWorker,
     SkippedWorker, merge_approved, merge_approved_in, merge_worker, merge_worker_in,
 };
-pub(crate) use self::registry::recover_orphaned_workers;
+pub(crate) use self::registry::recover_orphaned_workers_in;
 pub use self::registry::{
     RegistryStatus, UNATTRIBUTED_OWNER, WorkerApproval, WorkerMeta, WorkerRegistryEntry,
     WorkerRole, check_consolidate_delegation, extract_group, load_all_registry_entries,
@@ -2311,10 +2311,11 @@ impl WorkerPool {
                 WorktreeGuard::mark_interrupted(&path);
             }
         }
-        let (count, entries) = {
+        let (count, entries, handles) = {
             let mut lock = self.workers.write().await;
             let mut count = 0usize;
             let mut entries = Vec::new();
+            let mut handles = Vec::new();
             for worker in lock.values_mut() {
                 if !matches!(
                     worker.state,
@@ -2324,6 +2325,7 @@ impl WorkerPool {
                 }
                 if let Some(handle) = worker.handle.take() {
                     handle.abort();
+                    handles.push(handle);
                 }
                 worker.fail(Self::shutdown_message(&worker.id));
                 if let Some(entry) = self.interrupted_entry(worker) {
@@ -2332,8 +2334,17 @@ impl WorkerPool {
                 self.notify_change();
                 count += 1;
             }
-            (count, entries)
+            (count, entries, handles)
         };
+        // A planned shutdown must not release the hub lock until every
+        // worker's teardown has run to completion: the abort drops each
+        // worker's `WorktreeGuard`, whose `Drop` commits, unregisters and
+        // removes the worktree. Awaiting the aborted handles waits for that
+        // drop, so the replacement daemon never recovers a worker whose
+        // worktree is still being torn down.
+        for handle in handles {
+            let _ = handle.await;
+        }
         self.persist_kills(entries);
         count
     }

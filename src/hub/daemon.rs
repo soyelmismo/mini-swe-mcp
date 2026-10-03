@@ -549,7 +549,16 @@ impl HubServer {
             info!(?delay, "Delaying startup recovery (test hook)");
             tokio::time::sleep(delay).await;
         }
-        match tokio::task::spawn_blocking(crate::pool::recover_orphaned_workers).await {
+        // Recover the workers this pool owns: the pool's scratch root is where
+        // its registry rows and worktrees live, so recovery must look there
+        // (in production it is the same root `ScratchRoot::from_env` resolves,
+        // but a test pool over a scratch root must not read the real one).
+        let recovery_root = self.server.pool().scratch_root().clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::pool::recover_orphaned_workers_in(&recovery_root)
+        })
+        .await
+        {
             Ok(recovered) => {
                 info!(workers = recovered, "Recovered orphaned hub workers");
                 append_log(
@@ -628,9 +637,28 @@ impl HubServer {
     async fn wait_for_lock(&self) -> Result<Option<HubLock>> {
         let path = self.config.paths().lock();
         let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+        let mut waited = false;
+        let mut warned_slow = false;
+        let slow_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
             if let Some(lock) = acquire_lock(&path)? {
+                if waited {
+                    info!("Predecessor released hub.lock; continuing startup");
+                }
                 return Ok(Some(lock));
+            }
+            if !waited {
+                info!("hub.lock held by a predecessor; waiting for it to finish teardown");
+                waited = true;
+            } else if tokio::time::Instant::now() + LOCK_POLL_INTERVAL >= deadline {
+                warn!(
+                    "Predecessor did not release hub.lock within {}s; not starting",
+                    LOCK_WAIT.as_secs()
+                );
+            } else if !warned_slow && tokio::time::Instant::now() >= slow_deadline {
+                // One clear line once the predecessor is provably slow.
+                warn!("Predecessor still holding hub.lock; waiting for its teardown to finish");
+                warned_slow = true;
             }
             // A predecessor owns the socket here, so this daemon never binds.
             // `endpoint()` resolves it without creating the fallback directory
@@ -770,10 +798,9 @@ impl HubServer {
         reaper.abort();
         events.abort();
         auto_consolidate.abort();
-        let killed = self.server.pool().kill_all().await;
-        if killed > 0 {
-            info!(workers = killed, "Terminated workers on hub shutdown");
-        }
+        // Stop accepting before teardown: a starter that arrives while the
+        // old daemon is still cleaning up must wait on `hub.lock`, not
+        // mistake the still-bound socket for a live hub and give up.
         let _ = std::fs::remove_file(&socket);
         // A socket moved to a short fallback directory takes it along.
         if let Some(parent) = socket.parent()
@@ -781,9 +808,13 @@ impl HubServer {
         {
             let _ = std::fs::remove_dir(parent);
         }
-        append_log(&paths.log(), "stopped");
         drop(listener);
         drop(_socket_cleanup);
+        let killed = self.server.pool().kill_all().await;
+        if killed > 0 {
+            info!(workers = killed, "Terminated workers on hub shutdown");
+        }
+        append_log(&paths.log(), "stopped");
         drop(lock);
         // A handover leaves the hub unserved until a client dials it again, and
         // the workers it just interrupted are auto-continued by whichever
