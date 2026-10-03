@@ -9,10 +9,10 @@
 //! rendered in the completion event and in `review <consolidator>` -- bounded,
 //! so a long round cannot turn a notification into a transcript.
 
+use crate::common;
 use mini_swe_mcp::cli::watch;
 use mini_swe_mcp::mcp::{EventKind, Outcome, WorkerView, render_for_test};
 use mini_swe_mcp::pool::{
-use crate::common;
     COMPLETION_SENTINEL, RegistryStatus, VERDICT_BYTES, WorkerMeta, WorkerPool,
     WorkerRegistryEntry, WorkerReport, WorkerRole, WorkerState, WorkerVerdicts,
     load_registry_entry_in, parse_verdict_lines, save_registry_entry_in,

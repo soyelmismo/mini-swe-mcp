@@ -14,13 +14,12 @@
 //! * a long legitimate reasoning block full of repeated characters never
 //!   triggers any of it (the `common::FakeLlm` script is that control).
 
+use crate::common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::common;
-
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

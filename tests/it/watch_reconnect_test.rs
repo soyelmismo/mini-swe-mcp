@@ -7,14 +7,13 @@
 //! with the same identity, replay what was missed — and the chase must end
 //! with an explanation when no daemon comes back.
 
+use crate::common;
 use mini_swe_mcp::hub::HubPaths;
 use mini_swe_mcp::pool::{RegistryStatus, WorkerMeta};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use crate::common;
-
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 

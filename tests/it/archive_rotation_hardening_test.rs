@@ -14,6 +14,7 @@
 //!
 //! Every directory here is test-owned under the temporary base dir.
 
+use crate::common;
 use crate::common::TempDir;
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_FILE, ARCHIVE_MAX_BYTES, ArchiveRecord};
 use std::path::Path;

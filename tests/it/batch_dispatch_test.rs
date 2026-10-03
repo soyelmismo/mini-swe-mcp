@@ -5,6 +5,7 @@
 //! worker here builds its worktree in a throwaway repository under a temporary
 //! scratch root, never in the crate's own checkout.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::remove_registry_entry_in;

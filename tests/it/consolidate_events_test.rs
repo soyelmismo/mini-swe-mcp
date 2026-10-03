@@ -6,6 +6,7 @@
 //! names a live consolidator the owner's watch stays quiet, and once the
 //! consolidator has finished the stopped worker is visible to its owner again.
 
+use crate::common;
 use crate::common::IsolatedPool;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{

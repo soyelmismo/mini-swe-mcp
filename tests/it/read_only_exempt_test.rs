@@ -17,10 +17,9 @@
 //! siblings could observe. The price is a turn budget sized to reach past the
 //! pause threshold.
 
+use crate::common;
 use std::path::Path;
 use std::time::Duration;
-use crate::common;
-
 use mini_swe_mcp::pool::{WorkerPool, WorkerRole, WorkerState};
 use mini_swe_mcp::worktree::ScratchRoot;
 

@@ -12,9 +12,8 @@
 //! history carries a "verify reused from step N" note exactly when the gate
 //! skipped a fresh variant A -- and carries nothing of the sort when it ran.
 
-use std::path::{Path, PathBuf};
 use crate::common;
-
+use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{WorkerPool, WorkerState};
 
 const TEST_OWNER: &str = "verify-reuse";

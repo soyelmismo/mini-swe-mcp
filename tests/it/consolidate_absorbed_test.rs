@@ -6,6 +6,7 @@
 //! `merge <consolidator>` retires it together with the consolidator -- WIP
 //! branch and all. A worker outside the consolidator's round is never touched.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, git_ref_exists, unique_suffix};
 use mini_swe_mcp::pool::{
     MergeRequest, RegistryStatus, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerRole,

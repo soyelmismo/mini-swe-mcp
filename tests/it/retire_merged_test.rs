@@ -7,6 +7,7 @@
 //! repository and its own scratch root, and passes that root to the code under
 //! test, so no test can see or remove another's registry, history or branch.
 
+use crate::common;
 use crate::common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{

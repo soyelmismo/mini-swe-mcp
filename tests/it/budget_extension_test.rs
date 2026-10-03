@@ -8,6 +8,7 @@
 //! as today. These tests drive a scripted fake LLM (no real model) to
 //! exercise the extension end to end.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

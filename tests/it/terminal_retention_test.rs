@@ -10,10 +10,9 @@
 //! These tests pin the rule from both ends: evicting a record keeps the row and
 //! the log, and only a gone branch or an expired retention retires them.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::common;
-
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
     CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_WORKER_RETIRED_GRACE_SECS, LogBuffer,

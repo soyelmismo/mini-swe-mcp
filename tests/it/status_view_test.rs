@@ -6,6 +6,7 @@
 //! running/paused/completed worker, and the size and artifact scope of a
 //! completed worker's payload.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir};
 use mini_swe_mcp::cli::format::format_status;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};

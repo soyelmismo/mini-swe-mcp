@@ -10,6 +10,7 @@
 //! This owns its hub directory, its link and its "victim", all under the
 //! temporary base dir, so nothing here touches a real hub.
 
+use crate::common;
 use crate::common::TempDir;
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_FILE, ARCHIVE_MAX_BYTES, ArchiveRecord};
 use std::path::{Path, PathBuf};

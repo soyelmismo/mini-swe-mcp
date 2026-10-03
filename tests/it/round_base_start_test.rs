@@ -1,6 +1,6 @@
 //! A continued worker integrates its consolidator's pinned base before turn one.
-use mini_swe_mcp::pool::{
 use crate::common;
+use mini_swe_mcp::pool::{
     WorkerHistory, WorkerMeta, WorkerPool, WorkerState, save_worker_history_in,
 };
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};

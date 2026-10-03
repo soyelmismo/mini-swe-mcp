@@ -17,10 +17,9 @@
 //! A quality review is not routed through the rule and keeps running on the
 //! requested model.
 
+use crate::common;
 use std::path::Path;
 use std::sync::Arc;
-use crate::common;
-
 use serde_json::{Value, json};
 
 use mini_swe_mcp::manifest::ModelManifest;

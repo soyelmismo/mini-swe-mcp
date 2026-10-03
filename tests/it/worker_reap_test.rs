@@ -8,14 +8,13 @@
 //! step, the second survives the step and is taken down by the worker-end
 //! sweep, and nothing outside the worker's directories is ever signalled.
 
+use crate::common;
 use mini_swe_mcp::agent::AgentRunner;
 use mini_swe_mcp::agent::reap::processes_in_dirs;
 use mini_swe_mcp::worktree::{WorktreeGuard, swe_base_dir};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use crate::common;
-
 /// A scratch directory under the same base the crate's worktrees use, so a
 /// test's paths are shaped like a real worker's.
 fn unique_dir(tag: &str) -> PathBuf {

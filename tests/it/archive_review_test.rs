@@ -10,6 +10,7 @@
 //! Every test owns its repository, scratch root and hub directory under the
 //! temporary base dir, so nothing here touches a developer's own hub.
 
+use crate::common;
 use crate::common::TempDir;
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_MAX_BYTES, ArchiveRecord};
 use mini_swe_mcp::pool::{

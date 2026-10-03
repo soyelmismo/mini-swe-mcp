@@ -4,6 +4,7 @@
 //! read-only turns: it names the paths the task mentions and locates the
 //! symbols it quotes, bounded, and it is absent when the task names nothing.
 
+use crate::common;
 use std::fs;
 
 use mini_swe_mcp::pool::{context_pack, extract_identifiers, extract_paths, outline_file};

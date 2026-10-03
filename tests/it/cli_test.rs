@@ -1,10 +1,9 @@
 //! Integration tests for the `mini-swe-mcp` CLI executable.
 
+use crate::common;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
-use crate::common;
-
 fn binary_path() -> PathBuf {
     if let Ok(exe) = std::env::var("CARGO_BIN_EXE_mini-swe-mcp") {
         return PathBuf::from(exe);

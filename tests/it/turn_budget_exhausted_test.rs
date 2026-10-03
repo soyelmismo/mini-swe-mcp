@@ -8,6 +8,7 @@
 //! `Exhausted` outcome, its stopped-not-done rendering, and its exclusion from
 //! the consolidator's round manifest.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

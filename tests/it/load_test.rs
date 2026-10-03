@@ -21,6 +21,7 @@
 //! The LLM is [`common::fake_llm::FakeLlm`]: turn 1 runs a light command, turn
 //! 2 runs a heavy one, turn 3 asks to finish.
 
+use crate::common;
 use crate::common::TempDir;
 use crate::common::fake_llm::FakeLlm;
 use std::collections::HashMap;

@@ -5,10 +5,10 @@
 //! (a question or a failure). The individual transitions it folds in are
 //! acknowledged, so a later plain watch does not replay them.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{
-use crate::common;
     LogBuffer, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState,
 };
 use serde_json::json;

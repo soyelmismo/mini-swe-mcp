@@ -10,12 +10,11 @@
 //! siblings could observe. The price is a turn budget sized to reach all three
 //! steps at the shipped defaults.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::common;
-
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

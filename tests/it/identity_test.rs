@@ -6,6 +6,7 @@
 //! pool and every assertion goes through the same Unix socket a thin client
 //! would dial.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubEndpoint, HubPaths, HubServer, connect_endpoint};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::{CLI_CLIENT_NAME, McpServer};
@@ -15,8 +16,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use crate::common;
-
 static TAG: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch hub directory, removed when the test ends.

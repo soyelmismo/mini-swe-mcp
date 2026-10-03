@@ -6,10 +6,9 @@
 //! reads it back for a record this process no longer holds, `round_manifest`
 //! falls back to it, and a new revision starts from a row with no verdict.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use crate::common;
-
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{

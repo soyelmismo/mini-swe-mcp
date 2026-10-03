@@ -12,6 +12,7 @@
 //! throwaway gate worktree; the file name carries the test's unique tag, so two
 //! tests running in parallel can never read each other's count.
 
+use crate::common;
 use crate::common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::RegistryStatus;

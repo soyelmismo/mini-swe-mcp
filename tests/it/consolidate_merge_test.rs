@@ -6,6 +6,7 @@
 //! tests drive [`mini_swe_mcp::pool::WorkerPool::consolidate_merge`] directly --
 //! no LLM, no sandbox -- and never touch the host repository.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, git_ref_exists, unique_suffix};
 use mini_swe_mcp::pool::{
     RegistryStatus, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerRole,

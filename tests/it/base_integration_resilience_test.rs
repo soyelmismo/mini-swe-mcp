@@ -1,8 +1,7 @@
 //! Base integration survives teardown and starts before a continued worker's first turn.
+use crate::common;
 use std::path::Path;
 use std::time::Duration;
-use crate::common;
-
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{WorkerHistory, WorkerPool, WorkerState, save_worker_history_in};
 use mini_swe_mcp::worktree::{BaseSync, ScratchRoot, WorktreeGuard};

@@ -12,8 +12,8 @@
 //! pool and every assertion goes through the same Unix socket a thin client
 //! would dial.
 
-use mini_swe_mcp::hub::{
 use crate::common;
+use mini_swe_mcp::hub::{
     HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens, connect_endpoint,
 };
 use mini_swe_mcp::manifest::ModelManifest;

@@ -4,6 +4,7 @@
 //! idle window, so no test needs an LLM or a spawned binary: every assertion
 //! goes through the same Unix socket a thin client would dial.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
@@ -12,8 +13,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
-use crate::common;
-
 /// A scratch hub directory, removed when the test ends.
 ///
 /// The name stays short (see [`common::scratch_name`]) because the daemon binds

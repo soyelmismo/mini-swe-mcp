@@ -1,8 +1,7 @@
 //! Automatic round consolidation uses the dispatch contract for CLI and MCP.
+use crate::common;
 use mini_swe_mcp::cli::args::tool_args;
 use serde_json::json;
-use crate::common;
-
 #[test]
 fn dispatch_accepts_auto_consolidation_flags() {
     for (flag, expected) in [

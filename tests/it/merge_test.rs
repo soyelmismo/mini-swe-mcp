@@ -6,6 +6,7 @@
 //! Nothing here touches the developer's repository, scratch root or registry:
 //! each test owns its own [`TempDir`] and passes it as the scratch root.
 
+use crate::common;
 use crate::common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::RegistryStatus;

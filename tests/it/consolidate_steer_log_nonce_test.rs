@@ -10,6 +10,7 @@
 //!
 //! So the property is: a nonce the pool did not create itself is not adopted.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerRecord, WorkerRegistryEntry, WorkerRole, WorkerState,

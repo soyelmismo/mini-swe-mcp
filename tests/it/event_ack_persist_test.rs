@@ -2,11 +2,11 @@
 //! the owner already acknowledged, and a worker whose branch is merged into its
 //! base or already gone must never be replayed.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{
-use crate::common;
     LogBuffer, RegistryStatus, WorkerMetrics, WorkerPool, WorkerRecord, WorkerRegistryEntry,
     WorkerState, save_registry_entry_in,
 };

@@ -15,10 +15,9 @@
 //! byte ceilings, and the emission budget that keeps a single response small
 //! (see `audits/opt_07_step_log_memory.md`).
 
+use crate::common;
 use serde_json::json;
 use std::io::Write;
-use crate::common;
-
 use mini_swe_mcp::agent::AgentStepLog;
 use mini_swe_mcp::pool::{
     DEFAULT_MAX_EMITTED_LOGS, DEFAULT_MAX_RETAINED_LOGS, LogBuffer, LogRetentionPolicy,

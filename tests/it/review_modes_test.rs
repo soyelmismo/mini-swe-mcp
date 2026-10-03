@@ -7,6 +7,7 @@
 //! same name. `--review-after <model>:<mode>` accepts any declared mode; an
 //! unknown mode is a dispatch error listing the available ones.
 
+use crate::common;
 use crate::common::fake_llm::FakeLlm;
 
 use mini_swe_mcp::manifest::ModelManifest;

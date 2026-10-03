@@ -1,9 +1,8 @@
 //! Round delivery must persist the same acknowledgments as individual delivery.
+use crate::common;
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
 use serde_json::json;
-use crate::common;
-
 #[tokio::test]
 async fn a_round_acknowledgment_survives_router_restart() {
     let isolated = common::IsolatedPool::new(2, "round-ack");

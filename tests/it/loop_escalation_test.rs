@@ -14,10 +14,9 @@
 //! to show for it. The tests below drive a consolidator and an ordinary worker
 //! through the same loop and assert the orchestrator question each one gets.
 
+use crate::common;
 use std::path::Path;
 use std::time::Duration;
-use crate::common;
-
 use mini_swe_mcp::pool::{WorkerPool, WorkerRole, WorkerState};
 use mini_swe_mcp::worktree::ScratchRoot;
 

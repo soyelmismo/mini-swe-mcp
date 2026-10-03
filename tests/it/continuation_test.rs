@@ -5,10 +5,9 @@
 //! stopped for *any* reason is continued with `steer` on the same id and
 //! branch, and that `failed` only means "this cannot continue by itself".
 
+use crate::common;
 use std::path::Path;
 use std::time::Duration;
-use crate::common;
-
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::mcp::{LOCAL_AGENT, McpServer};
 use mini_swe_mcp::pool::{

@@ -7,6 +7,7 @@
 //! long-lived hub bounded. They build their own repository, scratch root and
 //! hub directory, so nothing here touches the developer's.
 
+use crate::common;
 use crate::common::{TempDir, git};
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_MAX_BYTES, ArchiveRecord, RetireReason};
 use mini_swe_mcp::pool::{

@@ -1,8 +1,7 @@
 //! Consolidation attribution and paused-question regression tests.
+use crate::common;
 use mini_swe_mcp::agent::CONSOLIDATOR_INSTRUCTIONS;
 use mini_swe_mcp::pool::{RegistryStatus, WorkerMeta, WorkerRole, save_registry_entry_in};
-use crate::common;
-
 fn actor() -> WorkerMeta {
     WorkerMeta {
         task: "integrate".into(),

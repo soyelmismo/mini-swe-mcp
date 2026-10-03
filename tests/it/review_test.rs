@@ -11,6 +11,7 @@
 //! Every repository here is a throwaway one under a per-test scratch root, so
 //! the suite never reads or writes the crate's own git state.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir};
 
 use mini_swe_mcp::agent::AgentStepLog;

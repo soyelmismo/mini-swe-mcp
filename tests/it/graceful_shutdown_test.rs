@@ -6,9 +6,8 @@
 //! next daemon's recovery auto-continues it (see `interrupted_workers` and
 //! `auto_continue_budget`). An explicit user `kill` still ends `Failed`.
 
-use std::path::{Path, PathBuf};
 use crate::common;
-
+use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{
     LogBuffer, MAX_AUTO_CONTINUES, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool,
     WorkerRecord, WorkerState, load_registry_entry_in,

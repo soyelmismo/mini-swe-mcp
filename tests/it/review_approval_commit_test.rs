@@ -16,6 +16,7 @@
 //!    pre-commit HEAD, which names less code than was reviewed, so the
 //!    difference is re-reviewed rather than missed.
 
+use crate::common;
 use crate::common::fake_llm::FakeLlm;
 
 use mini_swe_mcp::pool::{

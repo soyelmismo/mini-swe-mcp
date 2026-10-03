@@ -15,7 +15,6 @@ use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::WorkerPool;
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
-
 const OWNER: &str = "round-owner";
 
 /// A repository with one baseline commit plus the server and scheduler a round

@@ -15,9 +15,8 @@
 //! * the orphan sweep does not treat an Interrupted worker's history as
 //!   orphaned, because that conversation is what the continuation replays.
 
-use std::path::{Path, PathBuf};
 use crate::common;
-
+use std::path::{Path, PathBuf};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerHistory, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord,
     WorkerRole, WorkerState, append_history_message_in, history_log_path_in,

@@ -21,6 +21,7 @@
 //! file pins the *public* surface — the names, signatures and visibility the rest
 //! of the crate (and any downstream binary) depends on.
 
+use crate::common;
 use crate::common::TempDir;
 use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{

@@ -7,12 +7,11 @@
 //! before the sentinel, the harness asks once when it is missing, and the
 //! completion event carries the report plus the per-file diff.
 
+use crate::common;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::common;
-
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

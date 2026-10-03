@@ -18,14 +18,13 @@
 //! plus reasoning, turn 2 with the completion sentinel. The captured turn-2
 //! request is the proof that turn 1 reached the model intact.
 
+use crate::common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::common;
-
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

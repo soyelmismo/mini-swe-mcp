@@ -6,11 +6,10 @@
 //! concurrently, and holds worker-state requests behind a recovery gate until
 //! the pool is recovered.
 
+use crate::common;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use crate::common;
-
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 

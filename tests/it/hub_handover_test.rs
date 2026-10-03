@@ -12,6 +12,7 @@
 //! `tests/hub_test.rs` starts it, so no test needs an LLM: the only worker state
 //! is a synthetic record and a held command mark.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{RegistryStatus, WorkerPool, WorkerState};
@@ -21,8 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use crate::common;
-
 /// A build clock far in the future, so this client supersedes any daemon.
 const NEWER_BUILD_TS: u64 = 4_000_000_000_000_000_000;
 

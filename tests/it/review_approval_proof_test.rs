@@ -16,6 +16,7 @@
 //!    (one an attacker could plant as `--output=<path>`) must be rejected
 //!    rather than spliced verbatim into a git revision argument.
 
+use crate::common;
 use std::path::Path;
 use std::sync::Arc;
 

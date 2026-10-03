@@ -13,6 +13,7 @@
 //! unchanged, and it polls the child pipe with a small worker thread so a
 //! missing response fails fast instead of hanging the suite.
 
+use crate::common;
 use crate::common::IsolatedPool;
 
 use mini_swe_mcp::agent::wrap_network_command;

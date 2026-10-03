@@ -7,10 +7,10 @@
 //! event for group B. A request the running watch already covers answers
 //! "already covered" instead, and another owner's workers never appear.
 
+use crate::common;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::{
-use crate::common;
     LogBuffer, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord, WorkerState,
 };
 use serde_json::json;

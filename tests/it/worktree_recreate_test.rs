@@ -23,10 +23,9 @@
 //! Every test runs against its own throwaway repository and its own scratch
 //! root, so no sweep, registry or another test's checkout is involved.
 
+use crate::common;
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use std::path::PathBuf;
-use crate::common;
-
 /// A repository with one commit on `master`, and its head sha.
 fn seed_repo(scratch: &common::TempDir) -> (PathBuf, String) {
     let repo = scratch.subdir("repo");

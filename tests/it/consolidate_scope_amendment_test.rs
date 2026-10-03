@@ -9,6 +9,7 @@
 //! consolidator, in order, after the task it amends, bounded, and the
 //! consolidator's own steers must stay out of it.
 
+use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerMeta, WorkerPool, WorkerRecord, WorkerRegistryEntry,

@@ -17,6 +17,7 @@
 //!   nobody asked for a review, and a worker that touched nothing
 //!   sensitive gets none.
 
+use crate::common;
 use std::path::Path;
 
 use crate::common::fake_llm::FakeLlm;

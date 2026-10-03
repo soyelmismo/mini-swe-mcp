@@ -1,5 +1,6 @@
 //! `watch` integration: immediate event, timeout, nothing-to-watch, governance.
 
+use crate::common;
 use mini_swe_mcp::cli::watch;
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::manifest::ModelManifest;
@@ -10,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use crate::common;
-
 /// Point this process's registry at a scratch directory.
 ///
 /// The daemon under test runs *inside* the test process, so it reads the

@@ -5,6 +5,7 @@
 //! leaves the caller's own workers (H-3), so a prefix that only matches
 //! another agent's worker reads as "not found" rather than leaking its id.
 
+use crate::common;
 use crate::common::IsolatedPool;
 
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
