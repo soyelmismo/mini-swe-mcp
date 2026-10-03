@@ -89,6 +89,7 @@ pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
     HARNESS_WAIT_PREFIX, PACK_CAP_BYTES, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome,
+    SecurityScope, scope_for,
     WorkerLaunchConfig, context_pack, extract_identifiers, extract_paths, is_completion_request,
     opening_task_message, outline_file, parse_ask_orchestrator, parse_consolidate_merge,
     parse_consolidate_steer, parse_consolidate_wait, parse_findings, parse_kill_job, parse_report,

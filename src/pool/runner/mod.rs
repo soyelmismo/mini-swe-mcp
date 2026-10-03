@@ -34,7 +34,9 @@ pub use self::context_pack::{
     PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
 };
 use self::review::ReviewPhase;
-pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
+pub use self::review::{
+    ReviewMode, SecurityReviewOutcome, SecurityScope, parse_findings, review_prompt, scope_for,
+};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
@@ -564,10 +566,6 @@ impl WorkerPool {
         patterns.sort();
         patterns.dedup();
         let requested = review_after.as_deref().map(ReviewMode::parse_model);
-        let security_wanted = matches!(
-            requested,
-            Some((_, ReviewMode::Security))
-        ) || matches!(meta.role, super::registry::WorkerRole::Consolidate);
         // What this run has to be audited over: everything since the base, or
         // only what came after the commit an earlier security review approved.
         // A consolidator's own commits are what its security review covers: the
@@ -585,7 +583,6 @@ impl WorkerPool {
             meta.role,
             meta.security_approved_commit.clone(),
             &merged_branches,
-            security_wanted,
         )
         .await;
         // Nothing changed since the last approval: the audit that already
@@ -593,8 +590,8 @@ impl WorkerPool {
         // repeated. The generic quality review is untouched by this: it is not a
         // security gate, and a revision asks for it the same way it asked before.
         let security_skip = scope.skip_log();
-        let touched = match (&scope, meta.role) {
-            (self::review::SecurityScope::Full, _) => {
+        let touched = match &scope {
+            self::review::SecurityScope::Full => {
                 self::review::touched_files(
                     &worktree.path,
                     &worktree.base_commit,
@@ -602,13 +599,11 @@ impl WorkerPool {
                 )
                 .await
             }
-            (
-                self::review::SecurityScope::Since { .. },
-                super::registry::WorkerRole::Consolidate,
-            ) => self::review::own_files(&worktree.path, &worktree.branch, &merged_branches).await,
-            (self::review::SecurityScope::Since { base, .. }, _) => {
-                self::review::files_since(&worktree.path, base, &worktree.branch).await
-            }
+            // An incremental scope is probed over what it covers only: the files
+            // of the commits after the last approval, or -- for a consolidator --
+            // the files its own commits touched. A path an approved review already
+            // covered is not sensitive again.
+            incremental => incremental.reviewed_files(&worktree.path).await,
         };
         let sensitive: Vec<String> = touched
             .into_iter()

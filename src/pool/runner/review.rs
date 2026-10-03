@@ -186,15 +186,146 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
 }
 
 impl SecurityScope {
+    /// The commits this review covers, oldest first. Empty when the review must
+    /// be skipped.
+    pub fn reviewed_commits(&self) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            Self::Since { commits, .. } => commits.clone(),
+        }
+    }
+
+    /// The commits earlier security reviews approved, oldest first, which the
+    /// reviewer is given for context so it neither re-reviews them nor mistakes
+    /// them for new code.
+    pub fn approved_commits(&self) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            Self::Since { approved, .. } => approved.clone(),
+        }
+    }
+
+    /// The files this review has to judge: the paths the covered commits
+    /// touched, or the consolidator's own commits' paths. Empty for a full
+    /// scope, whose files are measured against the worker's base commit by the
+    /// caller that owns it.
+    pub async fn reviewed_files(&self, repo: &Path) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            // A consolidator's scope is its own commits, so its files are too:
+            // measuring `base..branch` would name every merged worker's files,
+            // which is exactly the re-audit this scope exists to avoid.
+            Self::Since {
+                merged,
+                branch,
+                commits,
+                ..
+            } if !merged.is_empty() && !commits.is_empty() => own_files(repo, branch, merged).await,
+            Self::Since { base, branch, .. } => files_since(repo, base, branch).await,
+        }
+    }
+
+    /// The diff of exactly what this review covers: the changes its own commits
+    /// made, which is what a consolidator's security review sees of its own
+    /// work -- never the merged worker branches it did not write.
+    pub async fn reviewed_diff(&self, repo: &Path) -> String {
+        match self {
+            Self::Full => String::new(),
+            Self::Since {
+                commits,
+                merged,
+                ..
+            } if commits.is_empty() => String::new(),
+            // A consolidator reviews the patch of its own commits only: the
+            // merges that carried the reviewed worker branches in are not its
+            // work, and handing them to the reviewer would audit those branches
+            // a second time.
+            Self::Since {
+                commits, merged, ..
+            } if !merged.is_empty() => {
+                // The own commits are a contiguous run on this branch, so the
+                // patch between the parent of the first and the last is exactly
+                // the consolidator's own work, with the merged branches'
+                // contribution already inside the merge commit it recorded.
+                match (commits.first(), commits.last()) {
+                    (Some(first), Some(last)) => {
+                        incremental_diff(repo, &format!("{first}^..{last}")).await
+                    }
+                    _ => String::new(),
+                }
+            }
+            // A worker's revision: everything its branch added after the last
+            // approval, which is exactly the unaudited range.
+            Self::Since { base, branch, .. } => {
+                incremental_diff(repo, &format!("{base}..{branch}")).await
+            }
+        }
+    }
+
+    /// The base commit the incremental diff is measured from. `None` for a full
+    /// review, which measures from the worker's own base instead.
+    pub fn base_commit(&self) -> Option<&str> {
+        match self {
+            Self::Full => None,
+            Self::Since { base, .. } => Some(base.as_str()),
+        }
+    }
+
     /// The skip line for this scope, when the review must not run because
     /// nothing unaudited changed; `None` when there is something to review.
-    pub(super) fn skip_log(&self) -> Option<String> {
+    pub fn skip_log(&self) -> Option<String> {
         match self {
             Self::Since { base, commits, .. } if commits.is_empty() => Some(format!(
                 "security review skipped: no sensitive change since {base}"
             )),
             _ => None,
         }
+    }
+}
+
+/// Decide a worker's security review scope from a repository path and a branch.
+///
+/// The same decision [`security_scope`] makes inside the phase loop, over the
+/// facts a caller already has, so the rule — audit only what no earlier security
+/// review covered — has one implementation whether the caller is the loop or a
+/// reader asking what a worker would be reviewed over.
+///
+/// * `approved` is the commit an earlier security review approved on this
+///   branch, if any.
+/// * `merged` names the worker branches a consolidator integrated; a
+///   consolidator's scope excludes them.
+/// * `role` decides the exclusion; a plain worker is never treated as a
+///   consolidator even if it names branches.
+pub async fn scope_for(
+    repo: &Path,
+    branch: &str,
+    role: WorkerRole,
+    base_commit: &str,
+    approved: Option<String>,
+    merged: &[String],
+) -> SecurityScope {
+    match role {
+        WorkerRole::Consolidate => SecurityScope::Since {
+            base: base_commit.to_string(),
+            branch: branch.to_string(),
+            approved: Vec::new(),
+            commits: own_commits(repo, branch, merged).await,
+            merged: merged.to_vec(),
+        },
+        WorkerRole::Worker => match approved {
+            Some(base) => {
+                let commits = commits_since(repo, &base, branch).await;
+                let already = vec![base.clone()];
+                SecurityScope::Since {
+                    base,
+                    branch: branch.to_string(),
+                    approved: already,
+                    commits,
+                    merged: Vec::new(),
+                }
+            }
+            None => SecurityScope::Full,
+        },
     }
 }
 
@@ -222,31 +353,16 @@ pub(super) async fn security_scope(
     role: WorkerRole,
     approved_commit: Option<String>,
     merged_branches: &[String],
-    security_wanted: bool,
 ) -> SecurityScope {
-    let branch = worktree.branch.clone();
-    // A consolidator integrates worker branches that were already reviewed at
-    // their own approved commits, so only its own commits are unaudited.
-    if role == WorkerRole::Consolidate && security_wanted {
-        let commits = own_commits(&worktree.path, &branch, merged_branches).await;
-        return SecurityScope::Since {
-            base: worktree.base_commit.clone(),
-            approved: Vec::new(),
-            commits,
-        };
-    }
-    match approved_commit {
-        Some(base) => {
-            let commits = commits_since(&worktree.path, &base, &branch).await;
-            let approved = vec![base.clone()];
-            SecurityScope::Since {
-                base,
-                approved,
-                commits,
-            }
-        }
-        None => SecurityScope::Full,
-    }
+    scope_for(
+        &worktree.path,
+        &worktree.branch,
+        role,
+        &worktree.base_commit,
+        approved_commit,
+        merged_branches,
+    )
+    .await
 }
 
 /// The reviewer's opening message for a review that covers only what came after
@@ -652,10 +768,17 @@ pub enum SecurityScope {
     Since {
         /// Commit the earlier security review approved.
         base: String,
+        /// The branch tip this review covers: every probe below measures the
+        /// unaudited range against it, so an incremental scope needs no
+        /// second base of its own.
+        branch: String,
         /// The commits that earlier security reviews approved, oldest first.
         approved: Vec<String>,
         /// The unaudited commits this review covers, oldest first.
         commits: Vec<String>,
+        /// Branches already reviewed at their own approved commits, which a
+        /// consolidator's own commits must be measured without.
+        merged: Vec<String>,
     },
 }
 
@@ -735,10 +858,16 @@ impl WorkerPool {
         // the whole branch: what it must judge is what came after the earlier
         // approval, and the earlier approvals are named for context.
         let security_prompt = match (&scope, mode == ReviewMode::Security) {
-            (SecurityScope::Since { base, approved, .. }, true) => {
-                let range = format!("{base}..HEAD");
-                let diff = incremental_diff(&worktree.path, &range).await;
-                Some(incremental_prompt(&task, base, approved, &diff))
+            (incremental @ SecurityScope::Since { commits, approved, .. }, true)
+                if !commits.is_empty() =>
+            {
+                let diff = incremental.reviewed_diff(&worktree.path).await;
+                Some(incremental_prompt(
+                    &task,
+                    incremental.base_commit().unwrap_or_default(),
+                    approved,
+                    &diff,
+                ))
             }
             _ => None,
         };
