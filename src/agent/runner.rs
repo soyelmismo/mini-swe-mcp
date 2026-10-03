@@ -2,7 +2,7 @@
 //!
 //! Owns one worker step's conversation with the model: building the request,
 //! POSTing it with retry/backoff, pumping the streamed response into an
-//! [`SseAccumulator`], and assembling the [`LlmResponse`] the agent loop
+//! `SseAccumulator`, and assembling the [`LlmResponse`] the agent loop
 //! consumes. The command-execution half lives in [`super::exec`].
 
 use anyhow::{Context, Result};

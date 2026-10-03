@@ -55,6 +55,13 @@ pub struct WorkerMetrics {
     /// interceptor block, a sandbox that could not be prepared, or a
     /// completion side-effect audit that found leftovers.
     pub isolation_blocks: usize,
+    /// Turns the model answered without a tool call, which the engine had to
+    /// answer with the tool-contract reminder instead of a command.
+    pub no_command_turns: usize,
+    /// Times the no-command guard parked the worker on the orchestrator: the
+    /// model stopped calling tools, or its reasoning came back degenerate for
+    /// turn after turn.
+    pub no_command_pauses: usize,
 }
 
 impl WorkerMetrics {
@@ -904,7 +911,7 @@ pub fn terminal_retention_secs() -> u64 {
 /// A row that never recorded an age (`updated_at` of zero, written before the
 /// field existed) is *not* expired: an unknown age must not be read as an
 /// ancient one. Clock skew is absorbed by `saturating_sub`, exactly as
-/// [`expired_terminal_ids`] absorbs it.
+/// `expired_terminal_ids` absorbs it.
 pub fn retention_expired(updated_at: u64, retention_secs: u64, now: u64) -> bool {
     updated_at != 0 && now.saturating_sub(updated_at) >= retention_secs
 }

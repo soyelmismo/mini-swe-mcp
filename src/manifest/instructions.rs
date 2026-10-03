@@ -151,13 +151,10 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `pattern` is a valid glob in the `## Sensitive paths` / `triggers`
-/// grammar.
+/// Whether `pattern` is a valid glob in the `## Sensitive paths` grammar.
 ///
 /// A glob is valid when it compiles to a regular expression; an empty or
-/// malformed glob (one whose characters cannot form a regex) is not. The
-/// manifest validator uses this so a typo in a `review_modes:` `triggers`
-/// entry is reported instead of silently matching nothing.
+/// malformed glob (one whose characters cannot form a regex) is not.
 pub fn validate_glob(pattern: &str) -> bool {
     glob_regex(pattern).is_some()
 }

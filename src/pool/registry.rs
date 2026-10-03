@@ -363,7 +363,7 @@ impl WorkerMeta {
 
     /// The row this worker's next status update describes.
     ///
-    /// Built as a value so the pool's [`RegistryWriter`] can decide whether it
+    /// Built as a value so the pool's `RegistryWriter` can decide whether it
     /// is worth a write at all; `save_status` stays the unconditional path.
     #[allow(clippy::too_many_arguments)]
     pub fn entry(
@@ -412,7 +412,7 @@ impl WorkerMeta {
     /// Persist one status update for this worker, unconditionally.
     ///
     /// Files the row under the default scratch root; a pool routes its own
-    /// writes through [`RegistryWriter`], which carries the pool's root.
+    /// writes through `RegistryWriter`, which carries the pool's root.
     pub fn save_status(
         &self,
         model: &str,
@@ -664,7 +664,7 @@ fn branch_exists(
 
 /// Read registry rows without Git probes or pruning: the statusLine path.
 ///
-/// One scan via [`raw_registry_entries`] with dead-pid normalisation on top,
+/// One scan via `raw_registry_entries_in` with dead-pid normalisation on top,
 /// so the fast view agrees with the dashboard about liveness without ever
 /// deleting a row or shelling out to git.
 pub fn load_registry_entries_read_only() -> Vec<WorkerRegistryEntry> {

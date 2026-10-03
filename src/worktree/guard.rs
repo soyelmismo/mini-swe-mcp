@@ -898,7 +898,7 @@ impl WorktreeGuard {
     /// the worker created or changed, so a status view never has to carry the
     /// seeded files the repo already held. The copy itself is conservative:
     /// unchanged files are left untouched, dependency caches and build output
-    /// ([`SKIP_DIR_NAMES`]) are never mirrored, and each file is published
+    /// (`SKIP_DIR_NAMES`) are never mirrored, and each file is published
     /// atomically so a concurrent reader never observes a partially written
     /// artifact.
     ///
@@ -1118,7 +1118,7 @@ impl WorktreeGuard {
     /// lives inside the worker's task, which the abort drops after
     /// this method has returned -- so the mark is a file beside the
     /// worktree, named from the worktree's own directory: the guard's
-    /// [`Drop`] reads it and [`clear_interrupted_marker`] removes it
+    /// `Drop` reads it and `clear_interrupted_marker` removes it
     /// once honoured.
     pub fn mark_interrupted(path: &Path) {
         let _ = std::fs::write(interrupted_marker_path(path), b"interrupted");
@@ -1127,7 +1127,7 @@ impl WorktreeGuard {
     /// Mark the worktree at `path` as still being torn down by this process.
     ///
     /// The hub's shutdown writes it before it aborts a worker and awaits the
-    /// guard's drop; the drop removes it (via [`TeardownMarker`]) once the
+    /// guard's drop; the drop removes it (via `TeardownMarker`) once the
     /// checkpoint, the worktree removal/unregistration and the target cleanup
     /// have all finished. A replacement hub refuses to recover the worker while
     /// the marker names a live owner, so a teardown that outlived the bounded

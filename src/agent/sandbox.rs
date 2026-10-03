@@ -438,7 +438,7 @@ const COMMAND_WRAPPERS: &[&str] = &[
 ///
 /// Pure and table-driven: the command is split on shell operators, each
 /// segment's program is resolved past wrappers and `VAR=value` assignments,
-/// and the answer is a lookup in [`HEAVY_TOOLS`]. No environment or
+/// and the answer is a lookup in `HEAVY_TOOLS`. No environment or
 /// filesystem access, so the classification is deterministic and testable.
 pub fn is_heavy_command(command: &str) -> bool {
     command.split(['\n', ';', '|', '&']).any(segment_is_heavy)
@@ -1093,7 +1093,7 @@ fn toolchain_cache_paths() -> Vec<PathBuf> {
 /// environment points `GOCACHE`, `UV_CACHE_DIR` and friends at: the shared
 /// cache root, the user's `kache` directory, and any `SWE_SHARED_CACHES`
 /// host-side binds. Missing paths are skipped when the plan is applied.
-fn writable_cache_paths() -> Vec<PathBuf> {
+pub(crate) fn writable_cache_paths() -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
     paths.push(crate::cache::shared_cache_root());
     if let Some(home) = home_dir() {
@@ -2566,7 +2566,7 @@ const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 /// multi-threaded server, where only async-signal-safe operations are allowed.
 /// Building the instruction vector allocates, so the whole program is
 /// assembled here and the child is left with a pointer to a live `Vec` plus
-/// one `seccomp(2)` call - see [`SeccompFilter::apply`].
+/// one `seccomp(2)` call - see `SeccompFilter::apply`.
 #[derive(Clone)]
 pub struct SeccompFilter {
     /// Classic-BPF instructions, in execution order.

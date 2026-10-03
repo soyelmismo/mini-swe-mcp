@@ -39,7 +39,8 @@ pub use self::review::{
     plan_review, review_prompt, scope_for,
 };
 use self::turn::{
-    LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
+    AUTO_CHECKPOINT_TURNS, LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome,
+    shortstat_of,
 };
 use super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::revision::{WorkerHistory, append_history_message_in};
@@ -49,6 +50,7 @@ use super::{WorkerPool, unix_timestamp};
 use crate::worktree::ScratchRoot;
 
 pub(crate) mod context_pack;
+pub(crate) mod degenerate;
 pub(crate) mod divergent;
 pub(crate) mod history;
 mod pause;
@@ -167,19 +169,37 @@ impl Drop for JobGuard<'_> {
 }
 
 /// The worker's opening user message: the task, then -- when a completion
-/// verify is configured -- the exact command the gate will run, then the
-/// bounded context pack ([`context_pack`]) built from the task text against
-/// `root` (the worker's checkout).
+/// verify is configured -- the exact command the gate will run, then the base
+/// commit and how to see the whole change set against it, then the bounded
+/// context pack ([`context_pack`]) built from the task text against `root`
+/// (the worker's checkout).
 ///
 /// The gate reuses an identical passing run on an unchanged tree (see
 /// `TurnEngine::reusable_verify_step`), but only when the worker ran exactly
 /// the verify string. Naming it here is what lets the worker's own last check
 /// be the run the gate reuses instead of paying for a second full run.
-pub fn opening_task_message(task: &str, verify: Option<&str>, root: &std::path::Path) -> String {
+///
+/// The base commit line is load-bearing: the harness commits a checkpoint of
+/// the worker's uncommitted changes every `AUTO_CHECKPOINT_TURNS` steps, so a
+/// bare `git diff` is empty after the first checkpoint and a model that
+/// reads it as "my edits are gone" spends its remaining turns re-checking and
+/// re-applying them. `base_commit` empty (git could not answer) leaves the
+/// line out rather than naming a base that does not exist.
+pub fn opening_task_message(
+    task: &str,
+    verify: Option<&str>,
+    base_commit: &str,
+    root: &std::path::Path,
+) -> String {
     let mut message = format!("TASK:\n{task}\n\nBegin by exploring the repository.");
     if let Some(verify) = verify.filter(|v| !v.is_empty()) {
         message.push_str(&format!(
             "\n\nCompletion gate: `{verify}`. Run exactly this command as your last check; an identical passing run on the same tree is reused."
+        ));
+    }
+    if let Some(base) = Some(base_commit).filter(|b| !b.trim().is_empty()) {
+        message.push_str(&format!(
+            "\n\nBase commit: `{base}`. The harness commits a checkpoint of your work every {AUTO_CHECKPOINT_TURNS} steps, so `git diff` alone shows only what changed since the last checkpoint: use `git diff {base}` to see your whole change set."
         ));
     }
     // The bounded context pack: the paths the task names and the symbols it
@@ -321,7 +341,12 @@ impl WorkerPool {
                 ChatMessage::text(Role::System, system_prompt),
                 ChatMessage::text(
                     Role::User,
-                    opening_task_message(&task, verify.as_deref(), &worktree.path),
+                    opening_task_message(
+                        &task,
+                        verify.as_deref(),
+                        &worktree.base_commit,
+                        &worktree.path,
+                    ),
                 ),
             ],
         };
@@ -572,12 +597,6 @@ impl WorkerPool {
         // focused adversarial pass for the paths the repository declared.
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
-        // The manifest's `security` mode triggers union with `## Sensitive
-        // paths` and the top-level `sensitive_paths`: marking a path in any of
-        // the three places runs the adversarial review.
-        if let Some(security_def) = self.manifest().review_mode("security") {
-            patterns.extend(security_def.triggers.iter().cloned());
-        }
         patterns.sort();
         patterns.dedup();
         // What this run has to be audited over: everything since the base, or
@@ -668,10 +687,10 @@ impl WorkerPool {
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or(choice.model)
         };
-        // Successive review phases in stable order: the requested (or
-        // automatic security) phase first, then every manifest-declared mode
-        // whose `triggers` match the diff, sorted by mode name. A mode that
-        // already has a phase is not run twice.
+        // Successive review phases: the requested (or automatic security)
+        // phase first, then a requested manifest-declared mode the sensitive
+        // upgrade displaced, so `--review-after <model>:<mode>` always means
+        // that mode runs. A mode that already has a phase is not run twice.
         let mut review_plan: Vec<(String, ReviewMode, Vec<String>)> = Vec::new();
         let requested_review = requested.clone();
         if let Some((reviewer, mode)) = self::review::plan_review(
@@ -698,33 +717,6 @@ impl WorkerPool {
             review_plan.push((reviewer, wanted, Vec::new()));
         }
 
-        // Manifest-declared modes whose `triggers` match the diff run as
-        // successive phases in sorted name order. `security` is skipped here:
-        // its triggers already union into the sensitive check above, so it has
-        // a phase when they match. A mode that already has a phase (the
-        // requested one, or the security upgrade) is not repeated.
-        for (name, def) in self.manifest().sorted_review_modes() {
-            if def.triggers.is_empty() {
-                continue;
-            }
-            if name.eq_ignore_ascii_case("security") {
-                continue;
-            }
-            if review_plan.iter().any(|(_, mode, _)| mode.name == name) {
-                continue;
-            }
-            if !touched
-                .iter()
-                .any(|path| crate::manifest::matches_sensitive(path, &def.triggers))
-            {
-                continue;
-            }
-            let mode = ReviewMode::resolve_declared(name, self.manifest());
-            let reviewer = self::review::mode_default_reviewer(name, self.manifest())
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| model.clone());
-            review_plan.push((reviewer, mode, Vec::new()));
-        }
         if review_plan.is_empty()
             && let Some(reason) = security_skip
         {

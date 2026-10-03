@@ -58,6 +58,8 @@ LOCATION & SCOPE:
 - You are ALREADY located at the root of the repository worktree ($PWD).
 - Never execute `cd` to parent directories (like /home/rot, /repo, or /). All repository files are right here in the current directory.
 
+WRITABLE PATHS: the sandbox only allows writing inside the worktree ($PWD) and $TMPDIR (your private scratch). Write scratch files under $TMPDIR; a write to /tmp or anywhere else fails with "Permission denied".
+
 WORKFLOW:
 1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files in the current repository.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
@@ -97,7 +99,7 @@ DISCIPLINE:
 10. You are already at the repository root ($PWD); do not cd elsewhere.
 11. Scripted edits (python/sed) can silently match nothing: assert the old text is present before replacing and confirm with `git diff --stat` that the change landed.
 12. Keep each command small: never paste a whole large file into one command (tool arguments over 64 KiB are dropped); edit in targeted chunks.
-13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work; use git only to inspect.
+13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work in checkpoints during the run, so `git diff` alone shows only what changed since the last checkpoint — use `git diff <base commit>` (named in your opening message) to see everything you changed; use git only to inspect.
 14. Reuse before writing: search for an existing function that already does the job and call it, or extract a shared core that both callers use. Never copy a block of logic into a second place.
 15. Concurrency: never hold a lock, guard or permit across a wait that can be long (network, child process, another worker). Anything that joins a queue or takes a slot must give it back when the operation fails or is cancelled (release it in a guard/Drop/finally, not only on the success path).
 16. Tests must be hermetic and deterministic: give every file, directory, daemon or registry they touch a temporary location passed to the code under test; do not mutate process-global state (environment variables) in tests that run in parallel; do not depend on the order of concurrent replies; poll for a condition instead of sleeping. Never write an assertion that cannot fail: a new test must fail without your change.
@@ -164,6 +166,29 @@ pub fn with_replayed_reasoning(messages: &[ChatMessage]) -> std::borrow::Cow<'_,
     std::borrow::Cow::Owned(owned)
 }
 
+/// Drop the reasoning of every assistant turn in `messages`.
+///
+/// Thinking-mode providers need the field *present* (see
+/// [`with_replayed_reasoning`]), but a value that is degenerate -- one short
+/// pattern repeated, or the same text echoed for turn after turn -- is exactly
+/// what the model then copies, so the degenerate value has to go while the
+/// field stays. The reasoning is replaced with an empty string rather than
+/// removed, which is the shape a thinking-mode provider accepts for a turn the
+/// model answered without reasoning.
+///
+/// Returns the number of turns it emptied. The caller already holds the
+/// messages; nothing else in the conversation changes.
+pub fn strip_replayed_reasoning(messages: &mut [ChatMessage]) -> usize {
+    let mut emptied = 0usize;
+    for message in messages.iter_mut() {
+        if message.role() == Role::Assistant && message.reasoning_content().is_some() {
+            message.replace_reasoning_content(String::new());
+            emptied += 1;
+        }
+    }
+    emptied
+}
+
 /// Outbound `tool_calls` entry of an assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -174,7 +199,7 @@ pub struct ToolCall {
 
 /// The nested `function` object of a [`ToolCall`], one level deep as the wire
 /// format requires (`{"id":..,"type":"function","function":{..}}`). Reused by the
-/// non-streaming inbound path ([`ToolCallOutput`]) to avoid a duplicate type.
+/// non-streaming inbound path (`ToolCallOutput`) to avoid a duplicate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFn {
     pub name: String,
@@ -325,6 +350,10 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub(crate) delta: StreamDelta,
+    /// Why the provider stopped generating. `None` when the provider sends no
+    /// such field at all.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -388,6 +417,9 @@ pub(crate) struct ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatChoice {
     pub(crate) message: ChatMessageOutput,
+    /// Why the provider stopped generating; see [`StreamChoice::finish_reason`].
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +485,25 @@ pub struct LlmResponse {
     /// lossily. Surfaced so fleet-wide corruption is observable rather than
     /// silently absorbed.
     pub invalid_utf8_lines: usize,
+    /// The provider's own `finish_reason` for the reply, when it sent one.
+    /// `length` and `content_filter` mean the reply is incomplete, so a turn
+    /// with no command out of them is a provider problem, not a model refusal.
+    pub finish_reason: Option<String>,
+}
+
+impl LlmResponse {
+    /// Whether the provider cut the reply short: the context window filled up
+    /// (`length`) or a filter stopped the generation.
+    ///
+    /// Both leave the turn without a tool call, which the engine would
+    /// otherwise read as a model that forgot the tool contract and answer with
+    /// the same nudge forever -- the failure that ran one worker for 55 turns.
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("content_filter")
+        )
+    }
 }
 
 /// Cheap `call_xxxxxxxx` identifier derived from the low 32 bits of a UUID.
@@ -555,6 +606,18 @@ mod tests {
             "empty tool slice must be omitted, got {value}"
         );
         assert!(value.get("temperature").is_none());
+    }
+
+    /// The sandbox policy a worker cannot discover by trial and error is
+    /// stated up front: a refused write to `/tmp` costs a whole turn, so the
+    /// prompt names the two writable roots and the variable that holds them.
+    #[test]
+    fn the_system_prompt_states_the_writable_paths() {
+        assert!(
+            SYSTEM_PROMPT.contains("only allows writing inside the worktree")
+                && SYSTEM_PROMPT.contains("$TMPDIR"),
+            "the writable-paths rule must be in the system prompt"
+        );
     }
 
     #[test]

@@ -20,12 +20,12 @@
 //!   hook with no helper process and no namespace: Landlock owns the
 //!   filesystem, a seccomp filter owns the syscalls, and process hardening
 //!   (`PR_SET_PDEATHSIG`, `PR_SET_DUMPABLE`, `RLIMIT_CORE`) owns the process
-//!   itself (see [`apply_kernel_confinement`]). An offline step needs no
+//!   itself (see [`KernelConfinement`]). An offline step needs no
 //!   network namespace either: Landlock denies TCP bind/connect and seccomp
 //!   denies INET socket creation.
 //! * **bubblewrap (`SWE_SANDBOX=bwrap`)** - the child gets its own mount
 //!   namespace, PID namespace and an empty tmpfs `$HOME` instead (see
-//!   [`apply_sandbox_args`]); an offline step is additionally wrapped in a
+//!   `apply_sandbox_args`); an offline step is additionally wrapped in a
 //!   network namespace by [`wrap_network_command`].
 //!
 //! The kernel backend is deliberately *not* a weaker policy: the same
@@ -72,7 +72,7 @@ const NICE_VALUE: &str = "10";
 ///
 /// `0` leaves the inherited class alone, `idle` (or its class number, `3`)
 /// opts into the idle class, and anything else — including an unset variable —
-/// keeps the best-effort default described on [`IoClass`].
+/// keeps the best-effort default described on `IoClass`.
 pub const HEAVY_IONICE_ENV: &str = "HUB_HEAVY_IONICE";
 
 /// `IOPRIO_CLASS_SHIFT` from `<linux/ioprio.h>`: a priority value is the class
@@ -302,7 +302,9 @@ impl AgentRunner {
         // deleted with the worktree.
         let job_log_dir = self.job_handle().map(|_| tmp_dir.clone());
         match run_with_timeout(&mut cmd, timeout_secs, job_log_dir.as_deref()).await? {
-            RunOutcome::Finished { output, code } => Ok((output, code)),
+            RunOutcome::Finished { output, code } => {
+                Ok((annotate_refused_write(dir, sandbox_target, output), code))
+            }
             RunOutcome::Backgrounded(backgrounded) => {
                 Ok(self.continue_as_job(*backgrounded, command).await)
             }
@@ -357,6 +359,196 @@ impl AgentRunner {
             backgrounded_message(id, timeout_secs, &log),
             Some(TIMEOUT_EXIT_CODE),
         )
+    }
+}
+
+/// The paths a confined step may write to: the worktree it runs in, its
+/// shared build target, its private scratch (`$TMPDIR`) and the shared
+/// toolchain caches the sandbox grants read-write.
+pub(crate) struct WriteRoots {
+    /// The worker's checkout: where the code under edit lives.
+    pub worktree: PathBuf,
+    /// The shared build target the worker leased, if it has one.
+    pub target: PathBuf,
+    /// The worker's private scratch, exported as `$TMPDIR`/`$TMP`/`$TEMP`.
+    pub scratch: PathBuf,
+    /// The shared caches (`GOCACHE`, `UV_CACHE_DIR`, ...) the sandbox lets the
+    /// step write. They are writable, so a refusal naming one is not the
+    /// sandbox refusing a write and must not draw the note.
+    pub caches: Vec<PathBuf>,
+}
+
+/// [`WriteRoots`] for a step running in `worktree` with build target `target`.
+///
+/// The scratch root is derived the same way [`crate::worktree::scratch_dir`]
+/// derives it for the child environment, and the cache roots are read from the
+/// sandbox's own grant list, so a path this reports as writable is exactly a
+/// path the confinement permits: the note never contradicts the policy.
+pub(crate) fn write_roots(worktree: &Path, target: &Path) -> WriteRoots {
+    WriteRoots {
+        worktree: worktree.to_path_buf(),
+        target: target.to_path_buf(),
+        scratch: crate::worktree::scratch_dir(worktree),
+        caches: crate::agent::sandbox::writable_cache_paths(),
+    }
+}
+
+/// Host phrasings of a filesystem refusal the sandbox produced, in the
+/// languages a step's output is observed in: the shell's own `strerror`, the
+/// localized libc string (`Permiso denegado`, `Keine Berechtigung`, ...), and
+/// bubblewrap's read-only mount message. The path, not the wording, is what
+/// decides; these only say *that* a write was refused.
+const DENIAL_MARKERS: &[&str] = &[
+    "permission denied",
+    "operation not permitted",
+    "read-only file system",
+    "read-only filesystem",
+    "permiso denegado",
+    "sin permisos",
+    "no permission",
+    "zugriff verweigert",
+    "aucun droit",
+    "somente leitura",
+    "acesso negado",
+];
+
+/// Whether `line` carries a filesystem refusal, in the host's own wording.
+fn mentions_denial(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    DENIAL_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Resolve `.` and `..` inside `path` lexically, so a spelling that leaves a
+/// root before the write is compared as where it lands.
+///
+/// A refusal is reported with the path exactly as the command spelled it, and
+/// `/tmp/wt/../out` is how a worker writes to `/tmp` without typing `/tmp`:
+/// [`Path::starts_with`] is a pure component comparison and would read that
+/// token as inside `/tmp/wt`, losing the one denial the note exists to explain.
+/// The walk cannot be fooled into accepting a path outside every root, since
+/// `..` above the root is kept and never matches a root prefix.
+fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // `..` only cancels a real, already-accepted name; anything
+                // else is kept, so `/../etc` stays `/../etc`.
+                let popped = out.components().next_back().is_some_and(|last| {
+                    !matches!(
+                        last,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                });
+                if popped {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Whether `path` is inside one of the roots a confined step may write to.
+///
+/// Component-aware, so a root is never read as a mere string prefix of its
+/// neighbour (`/tmp/wt` does not cover `/tmp/wtx`), and normalised first, so a
+/// `..` spelling that leaves the root is read as the outside path it is.
+fn is_writable(roots: &WriteRoots, path: &Path) -> bool {
+    let path = normalise(path);
+    std::iter::once(roots.worktree.as_path())
+        .chain(std::iter::once(roots.target.as_path()))
+        .chain(std::iter::once(roots.scratch.as_path()))
+        .chain(roots.caches.iter().map(PathBuf::as_path))
+        .map(normalise)
+        .any(|root| path.starts_with(root))
+}
+
+/// The absolute paths a refusal line names, in the order it mentions them.
+///
+/// A denial is reported by a dozen tools in a dozen shapes
+/// (`touch: /tmp/x: Permission denied`, `opening '/tmp/y': ...`,
+/// `failed to create file via template '/tmp/tmp.XXXX': ...`,
+/// `mv: cannot move '/tmp/a' to '/root/b'`), and a message can name more than
+/// one path. Every absolute-looking token is a candidate and the note fires as
+/// soon as one of them falls outside the writable roots, so a refusal whose
+/// *second* path is the refused one is not missed. Tokens are stripped of the
+/// quoting and trailing punctuation a message wraps them in.
+fn denied_paths(line: &str) -> impl Iterator<Item = &str> {
+    line.split_whitespace().filter_map(|token| {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '\'' | '"' | '`' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '>'
+            )
+        });
+        let candidate = token.strip_suffix("'").unwrap_or(token);
+        candidate.starts_with('/').then_some(candidate)
+    })
+}
+
+/// The one line appended to an observation whose command was refused a write
+/// outside the sandbox's writable roots.
+///
+/// The model cannot see the sandbox policy -- only the refusal -- and a
+/// worker that answers `/tmp/out.txt` with `/tmp/out.txt2`, then `mktemp -p
+/// /tmp`, then a test that writes to `/tmp`, spends a whole turn per variant.
+/// Naming the writable set, and the scratch path its own `$TMPDIR` already
+/// holds, ends the guessing.
+fn scratch_write_note_text(roots: &WriteRoots) -> String {
+    format!(
+        "Note: the sandbox only allows writing inside the worktree and $TMPDIR ({}); use $TMPDIR for scratch files.",
+        roots.scratch.display()
+    )
+}
+
+/// The note [`scratch_write_note_text`] renders, or `None` when the output
+/// carries no refusal of a write outside the writable roots.
+///
+/// A refusal *inside* the roots is deliberately silent: the sandbox allowed
+/// that write (a read-only file, a missing parent directory), so pointing the
+/// model at `$TMPDIR` would misattribute an ordinary error to the sandbox.
+pub(crate) fn scratch_write_note(roots: &WriteRoots, output: &str) -> Option<String> {
+    output
+        .lines()
+        .any(|line| {
+            // The path decides whether the note applies at all, so a line naming no
+            // absolute path is rejected before the message wording is matched and
+            // nothing is allocated for it.
+            denied_paths(line).any(|path| !is_writable(roots, Path::new(path)))
+                && mentions_denial(line)
+        })
+        .then(|| scratch_write_note_text(roots))
+}
+
+/// Append the writable-roots note when the sandbox refused a write outside
+/// them, so a step that was denied writing to `/tmp` learns where it may write
+/// instead of retrying another `/tmp` spelling.
+///
+/// The note is part of the observation the model reads, not of the exit code:
+/// the command failed exactly as the sandbox decided, and only the advice is
+/// added. Only a finished command is annotated: a command that outlived its
+/// budget is handed to [`AgentRunner::continue_as_job`], whose immediate
+/// observation is the "still running" message, so there is no refusal to read
+/// yet. Such a step still learns the policy from the system prompt.
+fn annotate_refused_write(worktree: &Path, target: &Path, output: String) -> String {
+    // `write_roots` derives the scratch root the way the child's `$TMPDIR`
+    // was derived, so the path the note names is the one the command already
+    // holds.
+    let roots = write_roots(worktree, target);
+    match scratch_write_note(&roots, &output) {
+        Some(note) => format!("{output}\n{note}"),
+        None => output,
     }
 }
 
@@ -2927,6 +3119,186 @@ mod tests {
         assert_eq!(choose_backend(false, false, no, no), Unconfined);
     }
 
+    /// A write refused outside the worktree and the private scratch names the
+    /// directory the model may write to instead, in the host's message too.
+    #[test]
+    fn a_refused_write_outside_the_worktree_names_the_scratch_dir() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        for out in [
+            "bash: line 1: /tmp/out.txt: Permission denied",
+            "touch: /tmp/out.txt: Permiso denegado",
+            "mktemp: failed to create file via template '/tmp/tmp.XXXX': Permission denied",
+        ] {
+            let note = scratch_write_note(&roots, out).expect("a denied /tmp write is detected");
+            assert_eq!(note, scratch_write_note_text(&roots), "{out:?}");
+        }
+    }
+
+    /// The note names the real scratch path, not the literal `$TMPDIR`, so the
+    /// model can use the path directly.
+    #[test]
+    fn the_note_carries_the_actual_scratch_path() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        let note = scratch_write_note(
+            &roots,
+            "bash: /tmp/pytest-of-root/pytest-1/test_x0: Permission denied",
+        )
+        .expect("a denied write outside the worktree is detected");
+        assert!(
+            note.contains(roots.scratch.to_string_lossy().as_ref()),
+            "the note must name $TMPDIR itself: {note}"
+        );
+        assert!(!note.contains("Note: $"), "{note}");
+    }
+
+    /// A refusal *inside* the worktree is the model's own business (a
+    /// read-only file, a missing directory): the sandbox allowed the write, so
+    /// pointing it at the scratch would be a lie.
+    #[test]
+    fn an_unrelated_permission_error_inside_the_worktree_is_not_annotated() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        assert_eq!(
+            scratch_write_note(
+                &roots,
+                "cp: cannot open '/tmp/wt/ro' for writing: Permission denied"
+            ),
+            None
+        );
+        assert_eq!(
+            scratch_write_note(
+                &roots,
+                "error: opening '/tmp/wt/target/.git/config.lock': Permission denied"
+            ),
+            None
+        );
+        // The shared build target is writable, so a refusal there is the same
+        // "not the sandbox" case as one in the worktree.
+        assert_eq!(
+            scratch_write_note(&roots, "touch: /tmp/tgt/debug/x: Permiso denegado"),
+            None
+        );
+        // No refusal at all, and a refusal naming no path, are not annotations.
+        assert_eq!(
+            scratch_write_note(&roots, "test result: ok. 3 passed"),
+            None
+        );
+        assert_eq!(
+            scratch_write_note(&roots, "error: sandbox refused the call"),
+            None
+        );
+        assert_eq!(scratch_write_note(&roots, ""), None);
+    }
+
+    /// A denied path that is *inside* the worktree but written through another
+    /// spelling still counts as allowed: the prefix match is on the declared
+    /// root, not on a substring, so `/tmp/wtx/out.txt` is not read as inside
+    /// `/tmp/wt`.
+
+    #[test]
+    fn a_sibling_of_the_worktree_is_not_read_as_inside_it() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        assert!(scratch_write_note(&roots, "touch: /tmp/wtx/out: Permission denied").is_some());
+    }
+
+    /// A worker that writes to `/tmp` through the worktree (`../out`) is
+    /// refused exactly like one typing `/tmp`, so the `..` spelling must not
+    /// read as a write inside the worktree and lose the note.
+
+    #[test]
+    fn a_traversal_out_of_the_worktree_is_still_a_refused_outside_write() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        for out in [
+            "touch: /tmp/wt/../out: Permission denied",
+            "bash: /tmp/wt/sub/../../etc/x: Permission denied",
+            "touch: /tmp/tgt/../../tmp/out: Permiso denegado",
+            "touch: /tmp/wt/sub/./../../outside: Permission denied",
+        ] {
+            assert!(
+                scratch_write_note(&roots, out).is_some(),
+                "a path that leaves the roots is refused: {out:?}"
+            );
+        }
+        // `..` that stays inside is still inside: no note, and the walk must not
+        // be fooled by a `..` sitting above the root either.
+        assert_eq!(
+            scratch_write_note(&roots, "touch: /tmp/wt/sub/../out: Permission denied"),
+            None
+        );
+        assert_eq!(
+            scratch_write_note(&roots, "touch: /tmp/wt/./out: Permission denied"),
+            None,
+            "a `.` never leaves the worktree"
+        );
+        // A `..` that cannot be cancelled because it sits above the root is
+        // kept, so the path does not smuggle itself under a root prefix.
+        assert!(
+            scratch_write_note(&roots, "touch: /../tmp/wt/out: Permission denied").is_some(),
+            "`..` above the root must not read as inside the root"
+        );
+    }
+
+    /// A denial that names the refused path *second* is the same denial: an
+    /// `mv` out of the worktree is refused for `/root/b`, whatever `/tmp/wt/a`
+    /// did on that line.
+    #[test]
+    fn a_refusal_naming_the_denied_path_second_is_detected() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        for out in [
+            "mv: cannot move '/tmp/wt/a' to '/root/b': Permission denied",
+            "cp: '/tmp/wt/a' -> '/tmp/b': Permiso denegado",
+        ] {
+            assert!(
+                scratch_write_note(&roots, out).is_some(),
+                "the refused path may be the second one named: {out:?}"
+            );
+        }
+    }
+
+    /// The shared caches are granted read-write by the sandbox, so a refusal
+    /// naming one is the tool's own business. Telling the worker to move such a
+    /// file to `$TMPDIR` would contradict the policy the sandbox actually runs.
+    #[test]
+    fn a_refusal_inside_a_writable_shared_cache_is_not_annotated() {
+        let mut roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        roots.caches = vec![PathBuf::from("/var/tmp/swe-cache")];
+        assert_eq!(
+            scratch_write_note(
+                &roots,
+                "error: writing '/var/tmp/swe-cache/uv/x': Permission denied"
+            ),
+            None
+        );
+        // And the cache root does not swallow a sibling that merely shares its
+        // prefix: that path is refused too, so it still gets the note.
+        assert!(
+            scratch_write_note(
+                &roots,
+                "error: writing '/var/tmp/swe-cacheroot/x': Permission denied"
+            )
+            .is_some(),
+            "a sibling of the cache root is outside it"
+        );
+        assert!(
+            scratch_write_note(&roots, "touch: /tmp/out: Permission denied").is_some(),
+            "a genuinely outside path still gets the note"
+        );
+    }
+
+    /// The cache roots come from the sandbox's own grant list, so the note can
+    /// never name a policy the confinement does not implement.
+    #[test]
+    fn the_writable_cache_roots_are_the_ones_the_sandbox_grants() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        let granted = crate::agent::sandbox::writable_cache_paths();
+        for path in &granted {
+            assert!(
+                is_writable(&roots, path),
+                "{} is granted by the sandbox and must not draw the note: {path:?}",
+                path.display()
+            );
+        }
+    }
+
     /// A step's temp and nested-scratch variables point at one private dir the
     /// sandbox lets it write, whichever backend confines it.
     #[tokio::test]
@@ -2943,6 +3315,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(code, Some(0), "{out:?}");
         assert!(out.contains("scratch-ok"), "{out:?}");
+    }
+
+    /// A command that tries to write to `/tmp` is told where it may write: the
+    /// sandbox confines the step to the worktree and its private scratch, and a
+    /// worker that keeps retrying `/tmp` variants burns a turn each time.
+    #[tokio::test]
+    async fn a_refused_tmp_write_is_answered_with_the_scratch_path() {
+        if select_backend() != SandboxBackend::Kernel {
+            eprintln!("skipping: the kernel backend is not in use on this host");
+            return;
+        }
+        let scratch = crate::test_support::TestScratch::new("exec-tmp-denial");
+        let tmp = scratch.path().to_path_buf();
+        let (out, code) = runner()
+            .execute_bash(&tmp, "printf x > /tmp/mini-swe-denial-probe 2>&1")
+            .await
+            .expect("the probe must spawn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let roots = write_roots(&tmp, &tmp);
+        let denied = out.contains("Permission denied") || out.contains("Permiso denegado");
+        if denied {
+            // The refusal must survive, and the note must tell the worker where
+            // it may write instead of the /tmp it just tried.
+            assert_ne!(code, Some(0), "the write must stay refused: {out:?}");
+            assert_eq!(
+                scratch_write_note(&roots, &out).as_deref(),
+                Some(scratch_write_note_text(&roots).as_str()),
+                "{out:?}"
+            );
+        } else {
+            // A host that allows /tmp gets no annotation: claiming a denial
+            // that did not happen would teach the worker a false rule.
+            assert!(scratch_write_note(&roots, &out).is_none(), "{out:?}");
+        }
     }
 
     /// A sandbox that cannot be prepared (here: the worktree no longer exists)

@@ -72,20 +72,13 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
 }
 
 /// The parenthetical for one declared review mode: its default reviewer when
-/// one is set, and its trigger count when it declares any.
+/// one is set.
 fn review_mode_suffix(def: &serde_json::Value) -> String {
     let mut suffix = String::new();
-    if let Some(model) = def.get("model").and_then(|v| v.as_str()) {
-        if !model.trim().is_empty() {
-            suffix.push_str(&format!(" (model: {model})"));
-        }
-    }
-    let triggers = def
-        .get("triggers")
-        .and_then(|v| v.as_array())
-        .map_or(0, |a| a.len());
-    if triggers > 0 {
-        suffix.push_str(&format!(" ({triggers} trigger{})", if triggers == 1 { "" } else { "s" }));
+    if let Some(model) = def.get("model").and_then(|v| v.as_str())
+        && !model.trim().is_empty()
+    {
+        suffix.push_str(&format!(" (model: {model})"));
     }
     suffix
 }

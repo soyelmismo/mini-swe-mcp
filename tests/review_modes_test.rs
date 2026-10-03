@@ -314,4 +314,3 @@ async fn an_unknown_mode_is_a_dispatch_error() {
         "{message} must list the declared mode"
     );
 }
-
