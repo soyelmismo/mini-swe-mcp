@@ -280,12 +280,9 @@ fn only_a_wait_the_pool_publishes_counts_as_a_wait_in_flight() {
                 .consolidate_wait(&wait_meta, &[wait_worker], Some(2))
                 .await
         });
-        let _ = loop {
-            if pool.harness_wait_in_flight(&consol) {
-                break ();
-            }
+        while !pool.harness_wait_in_flight(&consol) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
+        }
         wait.await.expect("wait task");
         // Once it returns, the claim is gone: a later step writes its own
         // command again, whatever that command happens to be named.
