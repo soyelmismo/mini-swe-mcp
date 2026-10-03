@@ -324,12 +324,14 @@ impl WorkerPool {
             .await;
 
         // The system prompt carries this role's persistent memory
-        // (`.agents/memory/<alias>.md`) when the repository provides any, so a
-        // dispatch starts from what previous runs of the same role learned
-        // instead of from the static prompt alone.
+        // (`.agents/memory/<alias>.md`) when the repository provides any, plus
+        // the `instructions:` the manifest declares for this model, so a dispatch
+        // starts from what previous runs of the same role learned — and from the
+        // habits this model in particular has to correct — instead of from the
+        // static prompt alone.
         let manifest = self.manifest();
         let memory_alias = manifest.alias_for_model(&model);
-        let system_prompt = build_system_prompt(&repo_path, &memory_alias);
+        let system_prompt = build_system_prompt(manifest, &repo_path, &memory_alias);
 
         // A revision replays the finished worker's conversation (system prompt,
         // task, every assistant turn with its reasoning and every tool result)

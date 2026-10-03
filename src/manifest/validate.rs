@@ -13,7 +13,10 @@
 use std::collections::BTreeMap;
 
 use super::rules::join_known;
-use super::types::{DEFAULT_MAX_TURNS, MAX_TURNS_LIMIT, ModelManifest};
+use super::types::{
+    DEFAULT_MAX_TURNS, FRAMING_OVERHEAD, MAX_MODEL_INSTRUCTIONS_BYTES, MAX_TURNS_LIMIT,
+    ModelInstructions, ModelManifest,
+};
 
 impl ModelManifest {
     /// Collect human-readable warnings about suspicious manifest entries.
@@ -114,6 +117,13 @@ impl ModelManifest {
             if let Some(policy) = &def.policy {
                 warnings.extend(Self::validate_policy(alias, policy));
             }
+
+            // Per-model instructions (appended to this model's system prompt).
+            // A model that declares none contributes nothing, which is what
+            // keeps a pre-instructions manifest warning-free.
+            if let Some(instructions) = &def.instructions {
+                warnings.extend(Self::validate_instructions(alias, instructions));
+            }
         }
 
         // Review modes are iterated in sorted name order so the output is
@@ -166,14 +176,67 @@ impl ModelManifest {
             .map_or(DEFAULT_MAX_TURNS, |n| n.min(MAX_TURNS_LIMIT))
     }
 
+    /// Validate one model entry's `instructions:` block, returning the warnings
+    /// for that entry alone.
+    ///
+    /// Split out of [`ModelManifest::validate`] for the same reason as
+    /// [`ModelManifest::validate_policy`]: the rule is expressible against a
+    /// single definition, and pairing it with [`ModelManifest::normalize_instructions`]
+    /// keeps the warning and its repair in one place.
+    pub(crate) fn validate_instructions(
+        alias: &str,
+        instructions: &ModelInstructions,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        // The budget bounds the *emitted* section, not just the bullets, so the
+        // warning fires exactly when [`ModelInstructions::truncate_to`] would
+        // cut: a block whose bullets alone sit under the cap can still overrun
+        // it once the header framing is counted.
+        let len = FRAMING_OVERHEAD + instructions.rendered_len();
+        if len > MAX_MODEL_INSTRUCTIONS_BYTES {
+            warnings.push(format!(
+                "model \"{alias}\": instructions are {len} bytes, above the \
+                 {MAX_MODEL_INSTRUCTIONS_BYTES}-byte budget; the tail is dropped"
+            ));
+        }
+        warnings
+    }
+
+    /// Repair one model entry's `instructions:` block in place.
+    ///
+    /// Entries that are blank once trimmed were already dropped when the block
+    /// was deserialized, so the only repair left is the byte budget: the *head*
+    /// is kept, because an instruction stated first is the one that corrects the
+    /// habit, and the block is marked [`ModelInstructions::is_truncated`] so the
+    /// prompt can say it is incomplete. A block that ends up empty is removed
+    /// altogether, so "declares nothing" stays `None` and normalizing is
+    /// idempotent.
+    pub(crate) fn normalize_instructions(instructions: &mut Option<ModelInstructions>) {
+        let Some(block) = instructions else {
+            return;
+        };
+        if block.is_empty() {
+            *instructions = None;
+            return;
+        }
+        let mut block = block.clone();
+        if block.truncate_to(MAX_MODEL_INSTRUCTIONS_BYTES) && block.is_empty() {
+            *instructions = None;
+        } else {
+            *instructions = Some(block);
+        }
+    }
+
     /// Apply every fixup that [`ModelManifest::validate`] reports.
     ///
     /// Each *fixable* warning is paired with a repair: an unrecognised
     /// execution policy is replaced by its restrictive default (the
     /// `normalize_policy` fixup of the `rules` submodule), invalid temperatures
     /// are clamped or dropped, unusable turn budgets are replaced with
-    /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), and a `default` that names
-    /// no known alias is dropped so `main.rs` reaches its fallback deliberately.
+    /// [`DEFAULT_MAX_TURNS`] (or the runtime limit), an over-long
+    /// `instructions:` block is cut to [`MAX_MODEL_INSTRUCTIONS_BYTES`], and a
+    /// `default` that names no known alias is dropped so `main.rs` reaches its
+    /// fallback deliberately.
     ///
     /// One warning has no mechanical fixup and is left for the user: an empty
     /// `id` has no correct value to substitute (the alias key is the only
@@ -195,6 +258,7 @@ impl ModelManifest {
                 .max_turns
                 .map(|n| Self::sanitize_max_turns(Some(n), None));
             Self::normalize_policy(&mut def.policy);
+            Self::normalize_instructions(&mut def.instructions);
         }
 
         self.review_modes

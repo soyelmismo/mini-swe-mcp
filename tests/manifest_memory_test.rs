@@ -72,7 +72,7 @@ fn test_build_system_prompt_is_a_no_op_without_memory() {
     let repo = ScratchRepo::new("noop");
 
     assert_eq!(
-        build_system_prompt(repo.path(), "ninja"),
+        build_system_prompt(&ModelManifest::default(), repo.path(), "ninja"),
         SYSTEM_PROMPT,
         "a repository without role memory must keep the static prompt byte-identical"
     );
@@ -88,7 +88,7 @@ fn test_build_system_prompt_injects_memory_after_the_static_prompt() {
     )
     .expect("fixture written");
 
-    let prompt = build_system_prompt(repo.path(), "nerd");
+    let prompt = build_system_prompt(&ModelManifest::default(), repo.path(), "nerd");
     assert!(
         prompt.starts_with(SYSTEM_PROMPT),
         "the static instructions must come first and stay complete"
@@ -98,7 +98,8 @@ fn test_build_system_prompt_injects_memory_after_the_static_prompt() {
         "the role memory must reach the prompt"
     );
     assert!(
-        !build_system_prompt(repo.path(), "ninja").contains("Reproduce before you patch."),
+        !build_system_prompt(&ModelManifest::default(), repo.path(), "ninja")
+            .contains("Reproduce before you patch."),
         "one role's memory must never leak into another's prompt"
     );
 }
