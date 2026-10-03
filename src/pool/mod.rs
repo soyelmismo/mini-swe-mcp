@@ -89,10 +89,11 @@ pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
     HARNESS_WAIT_PREFIX, PACK_CAP_BYTES, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome,
-    WorkerLaunchConfig, context_pack, extract_identifiers, extract_paths, is_completion_request,
-    opening_task_message, outline_file, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_findings, parse_kill_job, parse_report,
-    parse_request_turns, parse_wait_job, review_prompt, summarize_command, summary_line,
+    SecurityScope, WorkerLaunchConfig, approved_merged_branches, context_pack, extract_identifiers,
+    extract_paths, is_completion_request, opening_task_message, outline_file,
+    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+    parse_consolidate_wait, parse_findings, parse_kill_job, parse_report, parse_request_turns,
+    parse_wait_job, plan_review, review_prompt, scope_for, summarize_command, summary_line,
 };
 pub use self::state::{
     ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
@@ -673,6 +674,22 @@ impl WorkerPool {
         &self.manifest
     }
 
+    /// The model a dispatch that names none gets: the manifest's `default:`
+    /// alias resolved to its id, else the literal value (an operator's
+    /// `DEFAULT_MODEL`, or a caller that dispatched a concrete id).
+    ///
+    /// A revision resumes on the model of the run it continues, so the value
+    /// is only read when a *new* run picks an automatic reviewer: without a
+    /// `strongest:` tier in the manifest that fallback is the dispatch
+    /// default, never the implementer's own model.
+    pub fn default_model(&self) -> String {
+        self.manifest
+            .default
+            .as_deref()
+            .map(|alias| self.manifest.resolve_model(alias).0)
+            .unwrap_or_else(|| crate::manifest::BUILTIN_DEFAULT_MODEL.to_string())
+    }
+
     /// Pin how long [`Self::kill_all`] waits for live workers' teardowns.
     ///
     /// The replacement hub waits on the same value for a worker's `.teardown`
@@ -925,6 +942,12 @@ impl WorkerPool {
         if role == WorkerRole::Consolidate && group.as_deref().is_none_or(|g| g.trim().is_empty()) {
             anyhow::bail!("role 'consolidate' requires 'group'");
         }
+        // An unknown review mode is a dispatch error, not a worker failure:
+        // validate the `--review-after <model>:<mode>` suffix against the
+        // manifest's declared modes before the worker starts.
+        if let Some(requested) = review_after.as_deref() {
+            ReviewMode::parse_with_manifest(requested, &self.manifest)?;
+        }
         // F6: format the low 32 UUID bits directly instead of building (and
         // immediately discarding) a full hyphenated `String` per worker.
         let worker_id = format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32);
@@ -962,6 +985,7 @@ impl WorkerPool {
             report: None,
             verified: None,
             security_review: None,
+            security_approved_commit: None,
             verdicts: None,
         };
 

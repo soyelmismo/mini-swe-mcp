@@ -146,13 +146,29 @@ pub fn matches_sensitive(path: &str, patterns: &[String]) -> bool {
 
 /// Match one glob against one repository-relative path.
 fn glob_matches(pattern: &str, path: &str) -> bool {
+    glob_regex(pattern)
+        .map(|re| re.is_match(path))
+        .unwrap_or(false)
+}
+
+/// Whether `pattern` is a valid glob in the `## Sensitive paths` grammar.
+///
+/// A glob is valid when it compiles to a regular expression; an empty or
+/// malformed glob (one whose characters cannot form a regex) is not.
+pub fn validate_glob(pattern: &str) -> bool {
+    glob_regex(pattern).is_some()
+}
+
+/// Compile one glob to its anchored regular expression.
+///
+/// A trailing `/**` matches everything under the directory, including the
+/// directory itself being absent from the diff (a diff never names a bare
+/// directory, so `src/hub/**` must match `src/hub/mod.rs`).
+fn glob_regex(pattern: &str) -> Option<regex::Regex> {
     let pattern = pattern.trim();
     if pattern.is_empty() {
-        return false;
+        return None;
     }
-    // A trailing `/**` matches everything under the directory, including the
-    // directory itself being absent from the diff (a diff never names a bare
-    // directory, so `src/hub/**` must match `src/hub/mod.rs`).
     let mut regex = String::from('^');
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -178,9 +194,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         }
     }
     regex.push('$');
-    regex::Regex::new(&regex)
-        .map(|re| re.is_match(path))
-        .unwrap_or(false)
+    regex::Regex::new(&regex).ok()
 }
 
 /// Read and label the repository's instruction files.

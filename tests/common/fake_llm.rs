@@ -53,6 +53,12 @@ enum Script {
     /// results the request already carries). A turn past the end of the script
     /// is left unanswered, so a worker can only end by exhausting its budget.
     Turns(Vec<String>),
+    /// One scripted SSE body per *request*, in arrival order: the shape the
+    /// review-pipeline tests need, where a second phase starts a fresh
+    /// conversation (so its first request is turn zero again) and each turn
+    /// carries its own prose and tool call. A request past the end of the
+    /// script is left unanswered.
+    Scripted(Vec<Vec<String>>),
 }
 
 impl FakeLlm {
@@ -137,6 +143,16 @@ impl FakeLlm {
         .await
     }
 
+    /// Serve one scripted SSE body per request, in arrival order.
+    ///
+    /// Each element is the list of `data:` payloads for one turn, as built by
+    /// [`scripted_tool_turn`]; a request past the end of the script is left
+    /// unanswered, so the caller sees the turn it scripted end and never a
+    /// turn of someone else's script.
+    pub async fn spawn_sse(turns: Vec<Vec<String>>) -> Self {
+        Self::spawn_script(Script::Scripted(turns)).await
+    }
+
     /// Every chat-completion request body received, in order. The body carries
     /// the whole conversation, so a test can read the messages the pool
     /// injected into a worker's turn.
@@ -171,6 +187,15 @@ async fn serve_turn(
         bodies.lock().await.push(value);
     }
     let turn = turn_of(&body);
+    if let Script::Scripted(turns) = script {
+        let index = requests.load(Ordering::Relaxed);
+        if let Some(chunks) = turns.get(index.wrapping_sub(1)) {
+            let _ = socket.write_all(sse_frames(chunks).as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+        let _ = socket.shutdown().await;
+        return;
+    }
     let command = match script {
         Script::LightThenHeavy { light, heavy } => match turn {
             0 => light.clone(),
@@ -204,6 +229,8 @@ async fn serve_turn(
                 return;
             }
         },
+        // Handled above, before the command is built.
+        Script::Scripted(_) => unreachable!("scripted SSE bodies are answered above"),
     };
     let response = sse_response(&command, turn);
     let _ = socket.write_all(response.as_bytes()).await;
@@ -297,4 +324,39 @@ fn sse_response(command: &str, turn: usize) -> String {
         reasoning = reasoning,
         tool_call = tool_call
     )
+}
+
+/// The full HTTP reply for a scripted turn: the streamed `chunks` and `[DONE]`.
+fn sse_frames(chunks: &[String]) -> String {
+    let mut response = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+    );
+    for chunk in chunks {
+        response.push_str("data: ");
+        response.push_str(chunk);
+        response.push_str("\n\n");
+    }
+    response.push_str("data: [DONE]\n\n");
+    response
+}
+
+/// One scripted turn: `content` as the assistant's prose plus a `bash` tool
+/// call running `command`, the shape a review-pipeline test scripts.
+pub fn scripted_tool_turn(call_id: &str, content: &str, command: &str) -> Vec<String> {
+    let arguments = json!({ "command": command }).to_string();
+    vec![
+        json!({
+            "choices": [{
+                "delta": {
+                    "content": content,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "function": { "name": "bash", "arguments": arguments }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    ]
 }

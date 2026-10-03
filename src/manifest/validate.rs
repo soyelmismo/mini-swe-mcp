@@ -126,6 +126,17 @@ impl ModelManifest {
             }
         }
 
+        // Review modes are iterated in sorted name order so the output is
+        // stable across runs. A mode with an empty checklist is an auditor
+        // with nothing to say, so it is reported and dropped by `normalize`.
+        for (name, def) in self.sorted_review_modes() {
+            if def.checklist.trim().is_empty() {
+                warnings.push(format!(
+                    "review mode \"{name}\" has an empty checklist; it will be ignored"
+                ));
+            }
+        }
+
         warnings
     }
 
@@ -249,6 +260,9 @@ impl ModelManifest {
             Self::normalize_policy(&mut def.policy);
             Self::normalize_instructions(&mut def.instructions);
         }
+
+        self.review_modes
+            .retain(|_, def| !def.checklist.trim().is_empty());
 
         self
     }

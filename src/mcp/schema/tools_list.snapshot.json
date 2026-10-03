@@ -116,7 +116,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model; `:security` = adversarial.",
+            "description": "Reviewer `<model>:<mode>`; see `manifest`.",
             "type": "string"
           },
           "role": {

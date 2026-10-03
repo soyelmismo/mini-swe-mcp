@@ -34,7 +34,10 @@ pub use self::context_pack::{
     PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
 };
 use self::review::ReviewPhase;
-pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
+pub use self::review::{
+    ReviewMode, SecurityReviewOutcome, SecurityScope, approved_merged_branches, parse_findings,
+    plan_review, review_prompt, scope_for,
+};
 use self::turn::{
     AUTO_CHECKPOINT_TURNS, LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome,
     shortstat_of,
@@ -71,6 +74,11 @@ pub use self::sentinels::{
 pub struct RunConfig<'a> {
     pub task: &'a str,
     pub model: &'a str,
+    /// The dispatch's default model: the manifest's `default:` entry, else the
+    /// pool's configured fallback. An automatic security review falls back to
+    /// this rather than to `model`, so the review never silently runs on the
+    /// implementer's own tier (see `review::select_security_reviewer`).
+    pub default_model: &'a str,
     pub temperature: Option<f32>,
     pub max_turns: usize,
     pub review_after: Option<String>,
@@ -392,11 +400,13 @@ impl WorkerPool {
         // The conversation is durable one line per message (see
         // `TurnEngine::push_message`), so nothing is rewritten here: a crash may
         // lose only the in-flight turn.
+        let default_model = self.default_model();
         self.run_phases(
             &worker_id,
             &RunConfig {
                 task: &task,
                 model: &model,
+                default_model: &default_model,
                 temperature,
                 max_turns,
                 review_after: review_after.clone(),
@@ -442,6 +452,7 @@ impl WorkerPool {
     ) -> Result<()> {
         let task = config.task.to_string();
         let model = config.model.to_string();
+        let default_model = config.default_model.to_string();
         let temperature = config.temperature;
         let max_turns = config.max_turns;
         let review_after = config.review_after.clone();
@@ -577,6 +588,9 @@ impl WorkerPool {
             }
         }
 
+        // The security review's approval, resolved after the tree is finalized.
+        let mut security_review_head: Option<String> = None;
+        let mut security_approved = false;
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
@@ -586,40 +600,141 @@ impl WorkerPool {
         // the adversarial security review, and a sensitive diff with no
         // requested review triggers it on its own. This is the harness's
         // focused adversarial pass for the paths the repository declared.
-        let touched = self::review::touched_files(
-            &worktree.path,
-            &worktree.base_commit,
-            worktree.base_branch.as_deref(),
-        )
-        .await;
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
         patterns.sort();
         patterns.dedup();
-        let sensitive: Vec<String> = touched
-            .into_iter()
-            .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
-            .collect();
-        let requested = review_after.as_deref().map(ReviewMode::parse_model);
-        let review_plan = match (requested, sensitive.is_empty()) {
-            // A requested review on a sensitive diff is upgraded to the
-            // adversarial mode; the requested model still runs it.
-            (Some((model, _)), false) => Some((model, ReviewMode::Security)),
-            (Some((model, wanted)), true) => Some((model, wanted)),
-            // No requested review, but the diff is sensitive: trigger the
-            // security review on the manifest's strongest tier, falling back
-            // to the implementer's own model when the manifest marks none.
-            (None, false) => {
-                let model = self
-                    .manifest()
-                    .strongest_alias()
-                    .map(|alias| self.manifest().resolve_model(alias).0)
-                    .unwrap_or_else(|| model.clone());
-                Some((model, ReviewMode::Security))
+        // What this run has to be audited over: everything since the base, or
+        // only what came after the commit an earlier security review approved.
+        // A consolidator's own commits are what its security review covers: the
+        // worker branches it merged were reviewed at their own approved commits.
+        let merged_branches: Vec<String> = match meta.role {
+            super::registry::WorkerRole::Consolidate => {
+                super::load_registry_entry_in(&self.scratch, worker_id)
+                    .map(|entry| {
+                        let scratch = &self.scratch;
+                        // Excluding a merged branch from this audit is a claim
+                        // that it was reviewed at its own approved commit;
+                        // `integrated` proves only that the merge happened, so
+                        // the rule checks the approval itself.
+                        self::review::approved_merged_branches(&entry.integrated, |id| {
+                            super::load_registry_entry_in(scratch, id)
+                                .and_then(|worker| worker.security_approved_commit)
+                        })
+                    })
+                    .unwrap_or_default()
             }
-            (None, true) => None,
+            _ => Vec::new(),
         };
-        if let Some((reviewer_model, mode)) = review_plan {
+        let scope = self::review::security_scope(
+            worktree,
+            meta.role,
+            meta.security_approved_commit.clone(),
+            &merged_branches,
+        )
+        .await;
+        // Nothing changed since the last approval: the audit that already
+        // stands covers this run, so the security review is skipped rather than
+        // repeated. The generic quality review is untouched by this: it is not a
+        // security gate, and a revision asks for it the same way it asked before.
+        let security_skip = scope.skip_log();
+        let touched = match &scope {
+            self::review::SecurityScope::Full => {
+                self::review::touched_files(
+                    &worktree.path,
+                    &worktree.base_commit,
+                    worktree.base_branch.as_deref(),
+                )
+                .await
+            }
+            // An incremental scope is probed over what it covers only: the files
+            // of the commits after the last approval, or -- for a consolidator --
+            // the files its own commits touched. A path an approved review already
+            // covered is not sensitive again.
+            incremental => incremental.reviewed_files(&worktree.path).await,
+        };
+        let sensitive: Vec<String> = touched
+            .iter()
+            .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
+            .cloned()
+            .collect();
+        // A requested review names its mode by suffix; an unknown mode is a
+        // dispatch error here (the dispatch already validated, so this is
+        // defensive). An empty reviewer (`--review-after :<mode>` against a
+        // mode that declares no default model) runs on the implementer's
+        // model, exactly like a triggered mode with no default: an empty
+        // model string would reach the provider verbatim and the review would
+        // quietly end inconclusive.
+        let requested = match review_after.as_deref() {
+            Some(s) => {
+                let (reviewer, mode) = ReviewMode::parse_with_manifest(s, self.manifest())?;
+                let reviewer = if reviewer.trim().is_empty() {
+                    model.clone()
+                } else {
+                    reviewer
+                };
+                Some((reviewer, mode))
+            }
+            None => None,
+        };
+        // The manifest may override the built-in security prompt.
+        let security_mode = ReviewMode::resolve_declared("security", self.manifest());
+        // The rule that picks the review lives in `plan_review`, next to the
+        // scope that decides the skip, so the mode a requested review ends up
+        // running in cannot drift from the one the rule states. The automatic
+        // trigger audits on the mode's default reviewer when the manifest
+        // declares one, else on the manifest's strongest tier, falling back to
+        // the dispatch default when the manifest marks none: the implementer's
+        // own model is never the automatic answer.
+        let automatic_security_reviewer = {
+            let choice = self::review::select_security_reviewer(self.manifest(), &default_model);
+            self::review::mode_default_reviewer("security", self.manifest())
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or(choice.model)
+        };
+        // Successive review phases: the requested (or automatic security)
+        // phase first, then a requested manifest-declared mode the sensitive
+        // upgrade displaced, so `--review-after <model>:<mode>` always means
+        // that mode runs. A mode that already has a phase is not run twice.
+        let mut review_plan: Vec<(String, ReviewMode, Vec<String>)> = Vec::new();
+        let requested_review = requested.clone();
+        if let Some((reviewer, mode)) = self::review::plan_review(
+            security_skip.is_some(),
+            requested,
+            sensitive.is_empty(),
+            &automatic_security_reviewer,
+            &security_mode,
+        ) {
+            review_plan.push((reviewer, mode, sensitive.clone()));
+        }
+        // The sensitive-path upgrade adds the adversarial pass; it must not
+        // also remove the auditor the orchestrator named. A requested
+        // manifest-declared mode the upgrade displaced still runs, as its own
+        // successive phase, so `--review-after <model>:<mode>` keeps meaning
+        // that mode runs. The built-in `quality` keeps the historical rule: the
+        // upgrade replaces it, as it did before declared modes existed.
+        if let Some((reviewer, wanted)) = requested_review
+            && wanted.checklist.is_some()
+            && !review_plan
+                .iter()
+                .any(|(_, mode, _)| mode.name == wanted.name)
+        {
+            review_plan.push((reviewer, wanted, Vec::new()));
+        }
+
+        if review_plan.is_empty()
+            && let Some(reason) = security_skip
+        {
+            info!(worker = %worker_id, "{reason}");
+        }
+        for (reviewer_model, mode, phase_sensitive) in review_plan {
+            info!(
+                worker = %worker_id,
+                reviewer = %reviewer_model,
+                mode = mode.as_str(),
+                "Reviewer selected"
+            );
+
             let outcome = self
                 .run_review_phase(
                     worktree,
@@ -636,7 +751,8 @@ impl WorkerPool {
                         meta,
                         mode,
                         verify: verify.clone(),
-                        sensitive,
+                        sensitive: phase_sensitive,
+                        scope: scope.clone(),
                     },
                 )
                 .await?;
@@ -646,6 +762,16 @@ impl WorkerPool {
             completed |= outcome.completed;
             if let Some(security) = outcome.security {
                 meta.security_review = Some(security);
+                // The tree as the reviewer left it. The commit that *contains*
+                // the audited code is the harness's, made after this block, so
+                // this is the fallback approval for the case where that commit
+                // cannot be trusted to be the same tree.
+                security_review_head = self::review::head_commit_of(&worktree.path).await;
+                // Only a review that actually completed approves anything. A
+                // reviewer that gave up quietly or ran out of turns audited
+                // nothing, and recording an approval for it would suppress every
+                // later security review of this branch.
+                security_approved = outcome.completed;
             }
         }
 
@@ -696,6 +822,28 @@ impl WorkerPool {
             .await
             .context("Worktree finalization task failed")??;
         worktree.preserve_branch = worktree.preserve_branch || branch.is_some();
+        // The commit that carries the code the security review audited is the
+        // harness's own commit, made just above -- not the HEAD the reviewer
+        // started from. Recording the latter would leave the reviewed tree
+        // itself outside the approval, so the next revision would re-audit it and
+        // a consolidator would re-audit it too.
+        //
+        // The harness's commit is only that tree's commit if the tree still is
+        // the tree the reviewer left: anything that touched it afterwards (the
+        // artifact sync, a steer landing mid-flight) makes that commit cover
+        // code no reviewer saw, and approving it would suppress a real audit.
+        // In that case the pre-commit HEAD stands, which is conservative -- it
+        // names less code than was reviewed, so the difference is re-reviewed
+        // rather than missed.
+        if security_approved {
+            let unchanged =
+                self::review::tree_matches_head(&worktree.path, &security_review_head).await;
+            meta.security_approved_commit = if unchanged {
+                head_commit.clone().or(security_review_head.clone())
+            } else {
+                security_review_head.clone()
+            };
+        }
         if !artifacts.is_empty() {
             info!(
                 worker = %worker_id,

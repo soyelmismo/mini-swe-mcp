@@ -155,6 +155,7 @@ fn test_custom_manifest_built_in_code() {
         default: Some("solo".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -290,6 +291,7 @@ fn test_model_definition_max_turns_is_returned_by_resolve_model() {
         default: Some("tight".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -397,6 +399,7 @@ fn test_resolve_model_alias_wins_over_id_lookup() {
         default: Some("a".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -461,6 +464,7 @@ fn test_build_tool_description_uses_role_fallback_when_missing() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 

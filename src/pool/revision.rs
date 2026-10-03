@@ -1895,6 +1895,12 @@ impl super::WorkerPool {
         }
         // The row that makes the revision visible to registry readers before
         // its first turn writes one; built before the conversation moves out.
+        // The security approval survives the revision: it is the commit the
+        // next revision reviews from, so dropping it here would send every
+        // revision back to reviewing the whole diff since the base commit.
+        let security_approved_commit = super::load_registry_entry_in(&self.scratch, id)
+            .and_then(|entry| entry.security_approved_commit.clone());
+
         let row = super::WorkerRegistryEntry {
             id: id.to_string(),
             pid: std::process::id(),
@@ -1923,6 +1929,7 @@ impl super::WorkerPool {
             approved: None,
             verified: None,
             security_review: None,
+            security_approved_commit: security_approved_commit.clone(),
             integrated: Vec::new(),
             absorbed: Vec::new(),
             // A revision changes the branch, so the round it reported on is
@@ -1952,6 +1959,7 @@ impl super::WorkerPool {
             report: None,
             verified: None,
             security_review: None,
+            security_approved_commit,
             verdicts: None,
         };
         let mut meta_for_fail = meta;
