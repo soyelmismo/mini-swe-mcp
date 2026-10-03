@@ -2497,10 +2497,11 @@ impl<'a> TurnEngine<'a> {
         let Some(answer) = answer else {
             return Ok(true);
         };
-        // A pause the orchestrator answered ends the streak: the guidance is
+        // A pause the orchestrator answered ends both streaks: the guidance is
         // the model's chance to produce real reasoning again, and a counter
         // left running would park the worker on the very next turn.
         self.watch.degenerate_turns = 0;
+        *self.consecutive_no_cmd = 0;
         info!(
             worker = %self.worker_id,
             step = *self.step,
@@ -2543,10 +2544,14 @@ impl<'a> TurnEngine<'a> {
         nudged: bool,
     ) -> Result<TurnOutcome> {
         self.meta.metrics.no_command_turns += 1;
+        // Either field collapsing is the same failure: a turn that is all
+        // filler carries nothing for the next one to build on, whichever
+        // channel the model put it in.
         let degenerate = llm_resp
             .reasoning_content
             .as_deref()
-            .is_some_and(is_degenerate);
+            .is_some_and(is_degenerate)
+            || is_degenerate(&llm_resp.content);
         let truncated = llm_resp.is_truncated();
         self.push_no_command_history(
             &llm_resp.content,
@@ -2569,7 +2574,9 @@ impl<'a> TurnEngine<'a> {
             }
         }
         if turns >= NO_COMMAND_PAUSE_TURNS {
-            return self.pause_on_no_command(config, &llm_resp, turns, degenerate, truncated).await;
+            return self
+                .pause_on_no_command(config, &llm_resp, turns, degenerate, truncated)
+                .await;
         }
         Ok(TurnOutcome::NoCommand)
     }
@@ -2620,6 +2627,13 @@ impl<'a> TurnEngine<'a> {
         let Some(answer) = answer else {
             return Ok(TurnOutcome::NoCommand);
         };
+        // The pause was the orchestrator's decision to make, and making it
+        // spent the streak: the worker resumes with guidance the model has not
+        // seen, so a counter left running would park it again on the very next
+        // turn -- and a worker that is still broken is asked again rather than
+        // held here.
+        *self.consecutive_no_cmd = 0;
+        self.watch.degenerate_turns = 0;
         info!(
             worker = %self.worker_id,
             step = *self.step,

@@ -282,13 +282,19 @@ mod tests {
         assert!(question.contains("stopped calling tools"), "{question}");
         assert!(question.contains("5 consecutive"), "{question}");
         assert!(question.contains("degenerate"), "{question}");
-        assert!(question.len() < 1024, "the sample must be bounded: {question}");
+        assert!(
+            question.len() < 1024,
+            "the sample must be bounded: {question}"
+        );
     }
 
     #[test]
     fn a_truncated_reply_is_named_as_such_in_the_question() {
         let question = no_command_pause_question("partial", None, 5, false, true);
-        assert!(question.contains("finish_reason=length/content_filter"), "{question}");
+        assert!(
+            question.contains("finish_reason=length/content_filter"),
+            "{question}"
+        );
     }
 
     #[test]
@@ -302,6 +308,8 @@ mod tests {
     fn a_new_test_must_fail_without_the_change() {
         // Pin the one property that makes the guard safe to ship: prose is
         // content. Removing the coverage bound would make this fail.
-        assert!(!is_degenerate("I will run the test suite and read the failure."));
+        assert!(!is_degenerate(
+            "I will run the test suite and read the failure."
+        ));
     }
 }
