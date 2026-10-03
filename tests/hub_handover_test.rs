@@ -16,7 +16,7 @@ mod common;
 
 use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer};
 use mini_swe_mcp::mcp::McpServer;
-use mini_swe_mcp::pool::{WorkerPool, WorkerState};
+use mini_swe_mcp::pool::{RegistryStatus, WorkerPool, WorkerState};
 use mini_swe_mcp::worktree::{ScratchRoot, WorktreeGuard};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -1179,13 +1179,9 @@ async fn a_teardown_past_the_wait_releases_the_lock_and_the_replacement_waits() 
     // The old daemon: its shutdown wait is one second, far less than the
     // teardown it is about to block on.
     let llm = common::fake_llm::FakeLlm::spawn("true", "sleep 2").await;
-    let old_pool = WorkerPool::with_scratch(
-        1,
-        llm.base_url().to_string(),
-        "k".to_string(),
-        root.clone(),
-    )
-    .with_teardown_wait(Duration::from_secs(1));
+    let old_pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone())
+            .with_teardown_wait(Duration::from_secs(1));
     let (paths, old_daemon) = daemon_on(&hub, old_pool.clone());
     let old_task = tokio::spawn(async move { old_daemon.run().await });
 
@@ -1241,14 +1237,10 @@ async fn a_teardown_past_the_wait_releases_the_lock_and_the_replacement_waits() 
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let new_pool = WorkerPool::with_scratch(
-        1,
-        llm.base_url().to_string(),
-        "k".to_string(),
-        root.clone(),
-    )
-    // Long enough to outlast the blocked teardown and continue the worker.
-    .with_teardown_wait(Duration::from_secs(30));
+    let new_pool =
+        WorkerPool::with_scratch(1, llm.base_url().to_string(), "k".to_string(), root.clone())
+            // Long enough to outlast the blocked teardown and continue the worker.
+            .with_teardown_wait(Duration::from_secs(30));
     let (new_paths, new_daemon) = daemon_on(&hub, new_pool.clone());
     let new_task = tokio::spawn(async move { new_daemon.run().await });
 
@@ -1267,7 +1259,22 @@ async fn a_teardown_past_the_wait_releases_the_lock_and_the_replacement_waits() 
     );
     // The teardown is still running, so the old process left its marker and the
     // replacement has not recreated the worktree.
-    assert!(marker.exists(), "the blocked teardown must leave its marker");
+    assert!(
+        marker.exists(),
+        "the blocked teardown must leave its marker"
+    );
+    // The worktree directory's identity, so a replacement that silently
+    // recreated it (the H18 remove/create race) is caught even if its worker
+    // record never reaches `Running`.
+    let inode = |path: &std::path::Path| -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    };
+    let original = inode(&worktree);
+    assert!(
+        original.is_some(),
+        "the worktree must exist while it is torn down"
+    );
     let settle = std::time::Instant::now() + Duration::from_millis(1500);
     while std::time::Instant::now() < settle {
         assert!(
@@ -1275,7 +1282,19 @@ async fn a_teardown_past_the_wait_releases_the_lock_and_the_replacement_waits() 
                 new_pool.get_worker_state(&id).await,
                 Some(WorkerState::Running { .. })
             ),
-            "the replacement must not touch the worktree while the marker exists"
+            "the replacement must not start the worker while the marker exists"
+        );
+        let row = mini_swe_mcp::pool::load_registry_entry_in(&root, &id)
+            .expect("the interrupted row survives");
+        assert_eq!(
+            row.status,
+            RegistryStatus::Interrupted,
+            "the replacement recorded the worker while the marker exists"
+        );
+        assert_eq!(
+            inode(&worktree),
+            original,
+            "the replacement recreated the worktree while the marker exists"
         );
         assert!(marker.exists(), "the marker must outlive the wait window");
         tokio::time::sleep(Duration::from_millis(50)).await;
