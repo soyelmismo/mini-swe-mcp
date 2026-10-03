@@ -1,8 +1,9 @@
 //! Plain-text renderers for the system-catalog verbs.
 //!
 //! Formatters behind `manifest`, `list` and `prune` — the actions that describe
-//! the *installation* rather than one worker: the model catalog and its
-//! defaults, the worker table, and the housekeeping confirmation.
+//! the *installation* rather than one worker: the model catalog (aliases,
+//! defaults, and the per-model instruction count appended to each model's system
+//! prompt), the worker table, and the housekeeping confirmation.
 //!
 //! Like every formatter in this package they are pure functions over
 //! [`serde_json::Value`] with no I/O, which is what makes them unit-testable
@@ -29,6 +30,16 @@ pub fn format_manifest(val: &serde_json::Value) -> String {
             }
             if let Some(turns) = def.get("max_turns").and_then(|v| v.as_u64()) {
                 meta.push(format!("max turns: {turns}"));
+            }
+            // Per-model instructions are appended to that model's system prompt,
+            // so the count is what an operator needs to confirm the rules they
+            // wrote are actually reaching workers.
+            if let Some(count) = def
+                .get("instructions")
+                .and_then(|v| v.as_array())
+                .map(|list| list.len())
+            {
+                meta.push(format!("instructions: {count}"));
             }
             out.push_str(&format!("  - {} ({})\n", name, meta.join(", ")));
             if let Some(role) = def.get("role").and_then(|v| v.as_str()) {
@@ -215,6 +226,24 @@ mod tests {
         assert!(out.contains("  - alpha (id: a-model, temp: 0.75)"));
         assert!(out.contains("  - zeta (id: z-model, temp: 0, max turns: 7)"));
         assert!(out.contains("    Role: coder"));
+    }
+
+    /// The `manifest` view reports how many model-specific instructions reach
+    /// workers, so an operator can confirm the rules they wrote are in the
+    /// catalog. A model that declares none shows nothing.
+    #[test]
+    fn test_format_manifest_counts_per_model_instructions() {
+        let out = format_manifest(&v(r#"{"models":{
+                 "small":{"id":"s","instructions":["Read whole files.","Run the cheap gate."]},
+                 "deep":{"id":"d","instructions":[]}}}"#));
+        assert!(out.contains("instructions: 2"), "{out}");
+        assert!(
+            out.contains("- deep (id: d, instructions: 0)"),
+            "an empty block is still a declared count: {out}"
+        );
+        // A model without the field at all stays as it was.
+        let plain = format_manifest(&v(r#"{"models":{"plain":{"id":"p"}}}"#));
+        assert!(plain.ends_with("  - plain (id: p)"), "{plain}");
     }
 
     #[test]

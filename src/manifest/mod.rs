@@ -3,8 +3,8 @@
 //! Split by responsibility while keeping the historical
 //! `mini_swe_mcp::manifest::*` surface identical through the re-exports below:
 //!
-//! * `types` — the serializable [`ModelManifest`] / [`ModelDefinition`] pair
-//!   and the process-wide constants that bound them.
+//! * `types` — the serializable [`ModelManifest`] / [`ModelDefinition`] /
+//!   [`ModelInstructions`] trio and the process-wide constants that bound them.
 //! * `catalog` — the markdown catalog rendering used by the MCP `tools/list`
 //!   payload ([`ModelManifest::build_tool_description`]).
 //! * `instructions` — the repository's standard instruction files (`AGENTS.md`,
@@ -44,8 +44,9 @@ pub use self::instructions::{
 };
 pub use self::memory::{MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory};
 pub use self::types::{
-    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT, ModelDefinition,
-    ModelManifest, NETWORK_POLICIES, NetworkPolicy, TEMPERATURE_RANGE,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_MODEL_INSTRUCTIONS_BYTES,
+    MAX_TURNS_LIMIT, ModelDefinition, ModelInstructions, ModelManifest, NETWORK_POLICIES,
+    NetworkPolicy, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.
@@ -201,6 +202,22 @@ impl ModelManifest {
             .get(&alias)
             .and_then(|def| def.policy.as_ref())
             .and_then(|policy| policy.network.clone())
+    }
+
+    /// The `instructions:` block of the model behind `model`, or `None` when it
+    /// declares none.
+    ///
+    /// `model` may be an alias or a full id; the owning definition is found the
+    /// same way [`Self::alias_for_model`] finds it, so the review phase can pass
+    /// the reviewer's resolved id and still get the *reviewer's* rules. A
+    /// pass-through id matching no entry yields `None`, and so does an entry whose
+    /// block held nothing but blank lines.
+    pub fn instructions_for(&self, model: &str) -> Option<&ModelInstructions> {
+        let alias = self.alias_for_model(model);
+        self.models
+            .get(&alias)
+            .and_then(|def| def.instructions.as_ref())
+            .filter(|block| !block.is_empty())
     }
 
     /// Find the first (sorted-alias) entry whose `id` equals `id`.
