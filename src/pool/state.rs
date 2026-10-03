@@ -249,8 +249,9 @@ impl WorkerVerdicts {
     /// with long `RISK:` lines would decide for itself whether the harness
     /// warning survives, and model-written text would gate what the operator is
     /// told. So the model's own lines give way first -- the trailing risks, then
-    /// the per-worker verdicts -- counted and named by the same marker
-    /// [`bounded`] uses, and the caller's lines land whatever the model wrote.
+    /// the per-worker verdicts -- counted and named by the same truncation
+    /// marker the parser uses, so the caller's lines land whatever the model
+    /// wrote.
     /// The budget still bounds the result: it is [`VERDICT_BYTES`] over, not
     /// unbounded, so a caller that hands over more lines than fit keeps the
     /// first ones that do.

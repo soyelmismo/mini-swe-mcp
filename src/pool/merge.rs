@@ -1456,9 +1456,9 @@ pub fn merge_approved_in(
         worker_id: "approved",
         verified: None,
         keep_branch: false,
-        // The batch merges approved workers one by one through the same
-        // machinery; there is no round record on this synthetic id, so nothing
-        // can be unintegrated here.
+        // The gate request is keyed by a synthetic id that carries no round
+        // record, so the refusal above is where this batch proves provenance;
+        // nothing is unintegrated under a name that was never dispatched.
         force: false,
         admission: req.admission.clone(),
         archive_dir: None,
