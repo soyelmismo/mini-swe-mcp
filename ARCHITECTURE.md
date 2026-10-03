@@ -361,8 +361,9 @@ escape it.
 ### Per-model instructions
 
 `models.yaml` may attach an `instructions:` block to any model entry: rules appended to the
-system prompt of every worker that runs on that model, under a `Model-specific
-instructions` header. It is the operator's lever for correcting one model's habits (a small
+system prompt of every worker that runs on that model, under a
+`MANDATORY DIRECTIVES FOR YOUR MODEL` header that frames them as directives rather than as
+optional background. It is the operator's lever for correcting one model's habits (a small
 model that reads files in many small ranges is told to read whole files) without touching
 the repository's own instruction files, which every model would share.
 
