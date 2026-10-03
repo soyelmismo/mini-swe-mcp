@@ -571,6 +571,19 @@ pub fn plan_review(
     }
 }
 
+/// Whether `value` is a plain git object id: 40 or 64 hex digits.
+///
+/// The approved commit is a string the registry round-trips and this module
+/// splices verbatim into git revision arguments (`git log <base>..<branch>`). A
+/// value that is not a plain object id -- one a writer with access to the
+/// registry file could plant, such as `--output=<path>` -- would be parsed by
+/// git as an option rather than a revision, so anything else is not an
+/// approval: [`scope_for`] widens to the whole diff instead of trusting it.
+fn is_object_id(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Decide a worker's security review scope from a repository path and a branch.
 ///
 /// The same decision [`security_scope`] makes inside the phase loop, over the
@@ -601,11 +614,12 @@ pub async fn scope_for(
             merged: merged.to_vec(),
             uncommitted: has_uncommitted_changes(repo).await,
         },
-        WorkerRole::Worker => match approved {
+        WorkerRole::Worker => match approved.filter(|sha| is_object_id(sha)) {
             // An approval the repository cannot resolve -- a pruned branch, a
-            // rewritten history -- is not evidence that nothing changed since.
-            // Reading it that way would skip a real audit, so the scope widens to
-            // the whole diff: re-auditing is the recoverable mistake.
+            // rewritten history, a value that is not a plain object id at all
+            // -- is not evidence that nothing changed since. Reading it that
+            // way would skip a real audit, so the scope widens to the whole
+            // diff: re-auditing is the recoverable mistake.
             Some(base) => match commits_since(repo, &base, branch).await {
                 Some(commits) => {
                     let already = vec![base.clone()];

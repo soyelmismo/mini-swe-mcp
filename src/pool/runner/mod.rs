@@ -635,9 +635,21 @@ impl WorkerPool {
             .collect();
         // A requested review names its mode by suffix; an unknown mode is a
         // dispatch error here (the dispatch already validated, so this is
-        // defensive). An empty reviewer falls back to the implementer's model.
+        // defensive). An empty reviewer (`--review-after :<mode>` against a
+        // mode that declares no default model) runs on the implementer's
+        // model, exactly like a triggered mode with no default: an empty
+        // model string would reach the provider verbatim and the review would
+        // quietly end inconclusive.
         let requested = match review_after.as_deref() {
-            Some(s) => Some(ReviewMode::parse_with_manifest(s, self.manifest())?),
+            Some(s) => {
+                let (reviewer, mode) = ReviewMode::parse_with_manifest(s, self.manifest())?;
+                let reviewer = if reviewer.trim().is_empty() {
+                    model.clone()
+                } else {
+                    reviewer
+                };
+                Some((reviewer, mode))
+            }
             None => None,
         };
         // The manifest may override the built-in security prompt.
@@ -660,6 +672,7 @@ impl WorkerPool {
         // whose `triggers` match the diff, sorted by mode name. A mode that
         // already has a phase is not run twice.
         let mut review_plan: Vec<(String, ReviewMode, Vec<String>)> = Vec::new();
+        let requested_review = requested.clone();
         if let Some((reviewer, mode)) = self::review::plan_review(
             security_skip.is_some(),
             requested,
@@ -668,6 +681,18 @@ impl WorkerPool {
             &security_mode,
         ) {
             review_plan.push((reviewer, mode, sensitive.clone()));
+        }
+        // The sensitive-path upgrade adds the adversarial pass; it must not
+        // also remove the auditor the orchestrator named. A requested
+        // manifest-declared mode the upgrade displaced still runs, as its own
+        // successive phase, so `--review-after <model>:<mode>` keeps meaning
+        // that mode runs. The built-in `quality` keeps the historical rule: the
+        // upgrade replaces it, as it did before declared modes existed.
+        if let Some((reviewer, wanted)) = requested_review
+            && wanted.checklist.is_some()
+            && !review_plan.iter().any(|(_, mode, _)| mode.name == wanted.name)
+        {
+            review_plan.push((reviewer, wanted, Vec::new()));
         }
         // Manifest-declared modes whose `triggers` match the diff run as
         // successive phases in sorted name order. `security` is skipped here:
@@ -738,8 +763,15 @@ impl WorkerPool {
                 meta.security_review = Some(security);
                 // The commit this review approved rides the registry row, so a
                 // later revision reviews from here instead of re-auditing the
-                // whole diff since the base commit.
-                meta.security_approved_commit = self::review::head_commit_of(&worktree.path).await;
+                // whole diff since the base commit. Only a review that emitted
+                // the completion sentinel approved anything: one that gave up
+                // on an LLM error or ran out of budget left the audit
+                // inconclusive, and recording its HEAD as approved would let
+                // the next revision skip the review of code nobody audited.
+                if outcome.completed {
+                    meta.security_approved_commit =
+                        self::review::head_commit_of(&worktree.path).await;
+                }
             }
         }
 
