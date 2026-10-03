@@ -1395,17 +1395,18 @@ fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
     );
 }
 
-/// A replayed stall reports its idle time through the stall rule's own clock,
-/// not through a raw subtraction of `last_step_at`.
+/// A stall queued while a step was idle is not delivered once that step starts
+/// a command.
 ///
-/// A worker queued a stall while it was idle, then started a harness-side wait
+/// A worker queued a stall, then started a harness-side wait
 /// (`CONSOLIDATE_WAIT`, `WAIT_JOB`), which the detector holds in flight as work.
 /// The replay copies the current view over the queued event, so that view
-/// carries the command-in-flight mark -- but the idle time was recomputed from
-/// the raw step time, so the delivered event claimed 1800 s of inactivity for a
-/// step that is provably doing something.
+/// carries the command-in-flight mark -- but the idle time used to be recomputed
+/// from the raw step time, and the delivered event claimed 1800 s of inactivity
+/// for a step that was provably doing something. Such an episode is stale and is
+/// dropped instead.
 #[test]
-fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
+fn a_stall_is_not_delivered_for_a_step_that_started_a_command() {
     let mut router = EventRouter::default();
     let now = crate::pool::unix_timestamp();
     let idle = json!({
@@ -1428,17 +1429,51 @@ fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
             &json!({"worker_ids":[], "group":"g", "initial":false}),
         )
         .unwrap();
-    let stall = reply["events"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|e| e["event"] == "stalled")
-        .unwrap_or_else(|| panic!("the queued stall is replayed: {reply}"));
     assert_eq!(
-        stall["time_since_last_step"],
-        json!(0),
-        "a command in flight is not idle time: {stall}"
+        reply["events"],
+        json!([]),
+        "a stall for a step that is now running a command must not be delivered: {reply}"
+    );
+}
+
+/// A stale stall for a worker that started a command is dropped, not delivered.
+///
+/// The episode queued while the worker was idle; it then started a long
+/// harness-side wait, which the stall rule holds in flight as work. Delivering
+/// the queued stall told the owner a working consolidator had stalled and
+/// suggested killing it. The episode must be dropped and marked seen, so it does
+/// not come back on a later watch either.
+#[test]
+fn a_stale_stall_is_dropped_once_the_worker_starts_a_command() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    // The stall episode queues while the worker is idle and running.
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
+    // The worker starts a wait: same step, now with a command in flight.
+    let mut waiting = idle;
+    waiting["command_started_at"] = json!(now);
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    let params = json!({"worker_ids":[], "group":"g", "initial":false});
+    let first = router.watch_reply(&ctx, &params).unwrap();
+    assert_eq!(
+        first["events"],
+        json!([]),
+        "a stale stall must be dropped, not delivered: {first}"
+    );
+    // It is gone from the backlog too, so a later watch cannot replay it.
+    let second = router.watch_reply(&ctx, &params).unwrap();
+    assert_eq!(
+        second["events"],
+        json!([]),
+        "a dropped stall must not come back: {second}"
     );
 }
 
@@ -1717,3 +1752,73 @@ fn a_queued_stall_does_not_report_a_worker_with_a_command_in_flight() {
         "a worker with a command in flight must not be reported stalled: {round}"
     );
 }
+
+/// Suppressing a stale stall episode must not destroy the worker's *other*
+/// queued transitions.
+///
+/// A stall is an episode, not a transition, so dropping one is safe. Dropping
+/// the whole backlog for that worker is not: `mark_seen` forgets every queued
+/// event the worker has, so a group-scoped watch that suppressed `w0`'s stale
+/// stall in group `g` silently destroyed `w0`'s queued `completed` in group
+/// `other` -- a terminal event the owner then never learns about, on a watch
+/// that never delivered it either.
+#[test]
+fn suppressing_a_stale_stall_keeps_the_workers_other_queued_events() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    // The stall episode queues while the worker is idle and running.
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
+    // The worker starts a harness-side wait: same step, now in flight.
+    let mut waiting = idle;
+    waiting["command_started_at"] = json!(now);
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    // A real terminal transition for the same worker, in another group: this
+    // watch must not deliver it, and suppressing the stall must not eat it.
+    router.watch_history.get_mut("o").expect("history").pending.push_back(json!({
+        "worker_id": "w0", "owner": "o", "group": "other", "event": "completed",
+        "status": "completed", "step": 5, "revision": 2, "sequence": 99,
+        "verified": true, "branch": "worker-w0",
+        "metrics": WorkerMetrics::default()
+    }));
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    // Scoped to group g: the stale stall is suppressed, the completion is out
+    // of scope and undelivered.
+    let reply = router
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"g", "initial":false}),
+        )
+        .unwrap();
+    assert_eq!(reply["events"], json!([]), "the stale stall is suppressed: {reply}");
+    let left: Vec<String> = router.watch_history["o"]
+        .pending
+        .iter()
+        .map(|v| v["event"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert_eq!(
+        left,
+        vec!["completed".to_string()],
+        "an undelivered terminal event must survive suppressing a stale stall"
+    );
+    // And a watch of that other group still delivers it.
+    let later = router
+        .watch_reply(
+            &ctx,
+            &json!({"worker_ids":[], "group":"other", "initial":false}),
+        )
+        .unwrap();
+    assert_eq!(
+        later["events"][0]["event"], "completed",
+        "the completion must still reach the owner: {later}"
+    );
+}
+
+
+
