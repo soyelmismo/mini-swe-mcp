@@ -24,7 +24,7 @@ mod common;
 
 use std::path::Path;
 
-use mini_swe_mcp::pool::{WorkerRole, scope_for};
+use mini_swe_mcp::pool::{ReviewMode, WorkerRole, plan_review, scope_for};
 
 /// Commit `body` into `branch` after writing `file`, and return the commit id.
 ///
@@ -266,5 +266,76 @@ async fn an_uncommitted_sensitive_change_is_never_reported_as_no_change() {
         Some(format!("security review skipped: no sensitive change since {approved}")),
         "an uncommitted sensitive change must not be skipped: the audit that approved \
          {approved} never saw it"
+    );
+}
+
+// ----------
+// The mode a review actually runs in
+// ----------
+
+/// Skipping the automatic repeat must not weaken a gate the caller asked for by
+/// name: `--review-after <model>:security` names the adversarial audit, so a
+/// bookkeeping "nothing new" decision may defer the automatic trigger but may
+/// never quietly turn an explicit security request into a generic quality pass.
+#[test]
+fn an_explicitly_requested_security_review_is_never_downgraded() {
+    assert_eq!(
+        plan_review(
+            true,
+            Some(("nerd".to_string(), ReviewMode::Security)),
+            false,
+            "strongest",
+        ),
+        Some(("nerd".to_string(), ReviewMode::Security)),
+        "a requested security review stays an adversarial one even when the skip defers the trigger"
+    );
+    assert_eq!(
+        plan_review(
+            true,
+            Some(("nerd".to_string(), ReviewMode::Quality)),
+            false,
+            "strongest",
+        ),
+        Some(("nerd".to_string(), ReviewMode::Quality)),
+        "a requested quality review runs as asked"
+    );
+    // The skip still does its job: nothing asked for, so nothing runs twice.
+    assert_eq!(plan_review(true, None, false, "strongest"), None);
+    assert_eq!(plan_review(true, None, true, "strongest"), None);
+}
+
+/// Without a skip, the pre-existing rules must be unchanged: a requested review
+/// on a sensitive diff is upgraded to the adversarial mode, and the automatic
+/// sensitive-path trigger audits on the manifest's strongest tier.
+#[test]
+fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
+    assert_eq!(
+        plan_review(
+            false,
+            Some(("nerd".to_string(), ReviewMode::Quality)),
+            true,
+            "strongest",
+        ),
+        Some(("nerd".to_string(), ReviewMode::Quality))
+    );
+    assert_eq!(
+        plan_review(
+            false,
+            Some(("nerd".to_string(), ReviewMode::Quality)),
+            false,
+            "strongest",
+        ),
+        Some(("nerd".to_string(), ReviewMode::Security)),
+        "a requested review on a sensitive diff is upgraded to the adversarial mode"
+    );
+    assert_eq!(
+        plan_review(false, None, true, "strongest"),
+        None,
+        "no request and nothing sensitive means no review"
+    );
+    assert_eq!(
+        plan_review(false, None, false, "strongest"),
+        Some(("strongest".to_string(), ReviewMode::Security)),
+        "the automatic sensitive trigger audits on the manifest's strongest tier"
     );
 }

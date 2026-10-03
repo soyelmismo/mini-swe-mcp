@@ -92,8 +92,8 @@ pub use self::runner::{
     SecurityScope, WorkerLaunchConfig, context_pack, extract_identifiers, extract_paths,
     is_completion_request, opening_task_message, outline_file, parse_ask_orchestrator,
     parse_consolidate_merge, parse_consolidate_steer, parse_consolidate_wait, parse_findings,
-    parse_kill_job, parse_report, parse_request_turns, parse_wait_job, review_prompt, scope_for,
-    summarize_command, summary_line,
+    parse_kill_job, parse_report, parse_request_turns, parse_wait_job, plan_review, review_prompt,
+    scope_for, summarize_command, summary_line,
 };
 pub use self::state::{
     ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,

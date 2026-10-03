@@ -249,7 +249,7 @@ impl SecurityScope {
                 // contribution already inside the merge commit it recorded.
                 match (commits.first(), commits.last()) {
                     (Some(first), Some(last)) => {
-                        incremental_diff(repo, &format!("{first}^..{last}")).await
+                        incremental_diff(repo, &format!("{first}^..{last}"), true).await
                     }
                     _ => String::new(),
                 }
@@ -257,7 +257,7 @@ impl SecurityScope {
             // A worker's revision: everything its branch added after the last
             // approval, which is exactly the unaudited range.
             Self::Since { base, branch, .. } => {
-                incremental_diff(repo, &format!("{base}..{branch}")).await
+                incremental_diff(repo, &format!("{base}..{branch}"), true).await
             }
         }
     }
@@ -289,6 +289,42 @@ impl SecurityScope {
             )),
             _ => None,
         }
+    }
+}
+
+/// The review the pipeline will actually run, given the scope's skip decision,
+/// what the dispatch asked for and whether the scope touched a sensitive path.
+///
+/// `strongest` is the model to audit with when the manifest marks no tier of its
+/// own; it is only consulted for the automatic sensitive-path trigger, so it is
+/// the last argument and callers that never reach it may pass any model.
+///
+/// Two rules carry the security weight:
+///
+/// * A requested review is never downgraded. `--review-after <m>:security` names
+///   the adversarial audit, and an optimisation that skipped work must not
+///   quietly turn it into a generic quality pass -- that would weaken a gate the
+///   caller asked for by name, on the strength of a bookkeeping field.
+/// * The automatic trigger still defers. With nothing unaudited since the last
+///   approval and no explicit request, the sensitive-path trigger does not fire
+///   a second time over the same code.
+pub fn plan_review(
+    skip: bool,
+    requested: Option<(String, ReviewMode)>,
+    sensitive: bool,
+    strongest: &str,
+) -> Option<(String, ReviewMode)> {
+    match (skip, requested, sensitive) {
+        (true, Some((model, mode)), _) => Some((model, mode)),
+        (true, None, _) => None,
+        // A requested review on a sensitive diff is upgraded to the adversarial
+        // mode; the requested model still runs it.
+        (false, Some((model, _)), false) => Some((model, ReviewMode::Security)),
+        (false, Some((model, wanted)), true) => Some((model, wanted)),
+        // No requested review, but the diff is sensitive: trigger the security
+        // review on the manifest's strongest tier.
+        (false, None, false) => Some((strongest.to_string(), ReviewMode::Security)),
+        (false, None, true) => None,
     }
 }
 
@@ -685,16 +721,40 @@ fn commits_in(stdout: Vec<u8>) -> Vec<String> {
 
 /// The diff of the reviewed commits: what the listed commits changed since the
 /// earlier approval, uncommitted changes included.
-pub(super) async fn incremental_diff(path: &Path, range: &str) -> String {
+///
+/// A commit range never contains work the run has not committed yet, so the
+/// working-tree diff is appended when asked for: the reviewer is told to audit
+/// `git diff` as well, and handing it a range that silently omits the edits the
+/// run is about to hand on would make that instruction a lie.
+pub(super) async fn incremental_diff(path: &Path, range: &str, working_tree: bool) -> String {
     let path = path.to_path_buf();
     let range = range.to_string();
     tokio::task::spawn_blocking(move || {
         let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
-        crate::worktree::git(&path, "diff", &["diff", &range])
+        let mut diff = crate::worktree::git(&path, "diff", &["diff", &range])
             .ok()
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if working_tree {
+            let uncommitted = crate::worktree::git(&path, "diff", &["diff"])
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default();
+            if !uncommitted.is_empty() {
+                if !diff.is_empty() && !diff.ends_with('\n') {
+                    diff.push('\n');
+                }
+                if !diff.is_empty() {
+                    diff.push_str(
+                        "\n--- uncommitted working tree changes, also unaudited ---\n",
+                    );
+                }
+                diff.push_str(&uncommitted);
+            }
+        }
+        diff
     })
     .await
     .unwrap_or_default()

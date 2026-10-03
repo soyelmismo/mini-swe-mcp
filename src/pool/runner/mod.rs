@@ -35,7 +35,8 @@ pub use self::context_pack::{
 };
 use self::review::ReviewPhase;
 pub use self::review::{
-    ReviewMode, SecurityReviewOutcome, SecurityScope, parse_findings, review_prompt, scope_for,
+    ReviewMode, SecurityReviewOutcome, SecurityScope, parse_findings, plan_review, review_prompt,
+    scope_for,
 };
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
@@ -577,6 +578,18 @@ impl WorkerPool {
                         entry
                             .integrated
                             .iter()
+                            // Excluding a merged branch from this audit is a
+                            // claim that it was reviewed at its own approved
+                            // commit. `integrated` proves only that the merge
+                            // happened, so the approval is checked here: a worker
+                            // that was merged without one (never reviewed, or
+                            // reviewed before the field existed) keeps its branch
+                            // in scope, and is audited here rather than nowhere.
+                            .filter(|id| {
+                                super::load_registry_entry_in(&self.scratch, id)
+                                    .and_then(|worker| worker.security_approved_commit)
+                                    .is_some()
+                            })
                             .map(|w| format!("worker-{w}"))
                             .collect()
                     })
@@ -615,29 +628,22 @@ impl WorkerPool {
             .into_iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
             .collect();
-        // A skip is absolute for the security review: neither a requested
-        // `--review-after <m>:security` nor the automatic sensitive-path
-        // trigger may re-run the audit that already stands. A requested *quality*
-        // review still runs, because it is not the audit this scope defers.
-        let review_plan = match (&security_skip, requested, sensitive.is_empty()) {
-            (Some(_), requested, _) => requested.map(|(model, _)| (model, ReviewMode::Quality)),
-            // A requested review on a sensitive diff is upgraded to the
-            // adversarial mode; the requested model still runs it.
-            (None, Some((model, _)), false) => Some((model, ReviewMode::Security)),
-            (None, Some((model, wanted)), true) => Some((model, wanted)),
-            // No requested review, but the diff is sensitive: trigger the
-            // security review on the manifest's strongest tier, falling back
-            // to the implementer's own model when the manifest marks none.
-            (None, None, false) => {
-                let model = self
-                    .manifest()
-                    .strongest_alias()
-                    .map(|alias| self.manifest().resolve_model(alias).0)
-                    .unwrap_or_else(|| model.clone());
-                Some((model, ReviewMode::Security))
-            }
-            (None, None, true) => None,
-        };
+        // The rule that picks the review lives in `plan_review`, next to the
+        // scope that decides the skip, so the mode a requested review ends up
+        // running in cannot drift from the one the rule states.
+        // The automatic trigger audits on the manifest's strongest tier, and
+        // falls back to the implementer's own model when the manifest marks none.
+        let strongest = self
+            .manifest()
+            .strongest_alias()
+            .map(|alias| self.manifest().resolve_model(alias).0)
+            .unwrap_or_else(|| model.clone());
+        let review_plan = self::review::plan_review(
+            security_skip.is_some(),
+            requested,
+            !sensitive.is_empty(),
+            &strongest,
+        );
         if let Some(reason) = security_skip {
             info!(worker = %worker_id, "{reason}");
         }
