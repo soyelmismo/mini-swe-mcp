@@ -135,3 +135,230 @@ async fn amend_is_owner_scoped_pending_only_and_persisted() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The round41 window: a registry row that reads `Completed` while this
+/// process is still running the worker it describes must not be treated as a
+/// settled round.
+///
+/// The row is a cross-process view, and the round scheduler reads only rows.
+/// Between the implementer's completion and the review phase's first write
+/// (and for any racing or coalesced write), a row can read settled for a worker
+/// this process is still driving through its review phase; starting the round
+/// then dispatches a consolidator whose manifest lists that worker as *not
+/// ready*, so the round merges only part of the group and closes without it.
+/// The tick therefore cross-checks the pool's live state: a worker this process
+/// still runs is not settled, whatever its row says.
+///
+/// Fails without the gate: the row alone satisfies the tick's precondition, so
+/// the round would start.
+#[tokio::test]
+async fn a_completed_row_under_a_live_worker_does_not_settle_the_round() {
+    let dir = std::env::temp_dir().join(format!("auto-live-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = crate::worktree::ScratchRoot::new(dir.clone());
+    let pool = crate::pool::WorkerPool::with_scratch(
+        4,
+        "http://127.0.0.1:1".into(),
+        String::new(),
+        root.clone(),
+    );
+    let server = crate::mcp::McpServer::new(pool.clone(), "integrator".into());
+
+    let mut meta = crate::pool::WorkerMeta::test_meta("9c8264b1", "owner");
+    meta.group = Some("round41".into());
+    // A settled row is pruned on load unless the worker still has a worktree or
+    // a branch, so the fixture gives it one: that is the shape a real completed
+    // worker leaves behind, and without it the row would be deleted before the
+    // scheduler ever saw it.
+    std::fs::create_dir_all(root.join("swe-wt-9c8264b1")).unwrap();
+    // The durable row reads `Completed` -- the settled status the tick keys on.
+    pool.__test_save_status(
+        &meta,
+        "ninja",
+        crate::pool::RegistryStatus::Completed,
+        40,
+        40,
+        "completed",
+        None,
+    );
+    // The pool itself is still running the worker: it is in its review phase,
+    // which the row has not caught up with (and, before the row write, cannot).
+    pool.__test_insert_worker(crate::pool::WorkerRecord {
+        id: "9c8264b1".into(),
+        task: "implement the thing".into(),
+        model: "ninja".into(),
+        owner: "owner".into(),
+        state: crate::pool::WorkerState::Running {
+            step: 41,
+            last_command: "reviewing".into(),
+            started_at: 0,
+        },
+        metrics: Default::default(),
+        logs: crate::pool::LogBuffer::default(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    })
+    .await;
+
+    let round = Round {
+        owner: "owner".into(),
+        group: "round41".into(),
+        repo: dir.clone(),
+        model: None,
+        verify: None,
+        generation: 0,
+        consumed: false,
+        baseline: Vec::new(),
+        consolidators: Vec::new(),
+    };
+    let entries = crate::pool::load_all_registry_entries_in(&root);
+    let members: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.owner.as_deref() == Some(&round.owner) && e.group.as_deref() == Some(&round.group)
+        })
+        .collect();
+    assert_eq!(members.len(), 1, "the round must own the one worker");
+    assert_eq!(
+        members[0].status,
+        crate::pool::RegistryStatus::Completed,
+        "the fixture must reproduce the stale settled row"
+    );
+
+    // This is the scheduler's own decision, the one the tick takes before it
+    // claims and starts a round.
+    assert!(
+        matches!(
+            server.round_decision(&round, &entries).await,
+            crate::mcp::auto_consolidate::RoundDecision::Wait
+        ),
+        "a worker this process is still running is not settled: the round would \
+         start a consolidator whose manifest lists 9c8264b1 as not ready"
+    );
+
+    // Once the run itself ends the worker, the row and the live state agree and
+    // the round may start; the gate must not deadlock a settled round.
+    pool.__test_set_worker_state(
+        "9c8264b1",
+        crate::pool::WorkerState::Completed {
+            turns: 42,
+            diff: String::new(),
+            summary: "done".into(),
+            completed_at: 0,
+            artifacts: Vec::new(),
+            branch: None,
+            verified: Some(true),
+            metrics: Default::default(),
+            revision: 0,
+            report: None,
+            verdicts: None,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            server.round_decision(&round, &entries).await,
+            crate::mcp::auto_consolidate::RoundDecision::Start
+        ),
+        "a finished worker settles its round"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A worker paused on an orchestrator question is not settled either.
+///
+/// `Running` is only one of the two non-terminal states the pool holds: a
+/// worker that stopped to ask its orchestrator a question sits in `Paused`
+/// until it is answered, and its durable row can lag the same way a running
+/// worker's does. Treating only `Running` as live would let a round start on a
+/// row that reads settled while the pool is still holding the worker open.
+///
+/// Fails without the `Paused` arm: the record is not `Running`, so the round
+/// would start.
+#[tokio::test]
+async fn a_paused_worker_under_a_completed_row_does_not_settle_the_round() {
+    let dir = std::env::temp_dir().join(format!("auto-paused-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = crate::worktree::ScratchRoot::new(dir.clone());
+    let pool = crate::pool::WorkerPool::with_scratch(
+        4,
+        "http://127.0.0.1:1".into(),
+        String::new(),
+        root.clone(),
+    );
+    let server = crate::mcp::McpServer::new(pool.clone(), "integrator".into());
+
+    let mut meta = crate::pool::WorkerMeta::test_meta("9c8264b1", "owner");
+    meta.group = Some("round41".into());
+    // Keeps the settled row from being pruned on load, as above.
+    std::fs::create_dir_all(root.join("swe-wt-9c8264b1")).unwrap();
+    pool.__test_save_status(
+        &meta,
+        "ninja",
+        crate::pool::RegistryStatus::Completed,
+        40,
+        40,
+        "completed",
+        None,
+    );
+    pool.__test_insert_worker(crate::pool::WorkerRecord {
+        id: "9c8264b1".into(),
+        task: "implement the thing".into(),
+        model: "ninja".into(),
+        owner: "owner".into(),
+        state: crate::pool::WorkerState::Paused {
+            question: "which approach?".into(),
+            step: 41,
+            paused_at: 0,
+        },
+        metrics: Default::default(),
+        logs: crate::pool::LogBuffer::default(),
+        pending_steer: Vec::new(),
+        resume_tx: None,
+        handle: None,
+        revision: 0,
+    })
+    .await;
+
+    let round = Round {
+        owner: "owner".into(),
+        group: "round41".into(),
+        repo: dir.clone(),
+        model: None,
+        verify: None,
+        generation: 0,
+        consumed: false,
+        baseline: Vec::new(),
+        consolidators: Vec::new(),
+    };
+    let entries = crate::pool::load_all_registry_entries_in(&root);
+    let members: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.owner.as_deref() == Some(&round.owner) && e.group.as_deref() == Some(&round.group)
+        })
+        .collect();
+    assert_eq!(
+        members.len(),
+        1,
+        "the settled row must survive the load for this fixture to mean anything"
+    );
+    assert_eq!(
+        members[0].status,
+        crate::pool::RegistryStatus::Completed,
+        "the fixture must reproduce the stale settled row"
+    );
+
+    assert!(
+        matches!(
+            server.round_decision(&round, &entries).await,
+            crate::mcp::auto_consolidate::RoundDecision::Wait
+        ),
+        "a worker the pool still holds open is not settled, paused or not: the \
+         round would start a consolidator whose manifest lists 9c8264b1 as not \
+         ready and close without it"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

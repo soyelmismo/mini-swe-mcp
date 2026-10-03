@@ -37,5 +37,7 @@ Then, in order:
    risks: <security, contract or behaviour risks, or none>
    Then one line per worker you integrated, `REPORT <id> approved|returned|fixed: <one line>`, and a `RISK: <...>` line for anything that touches the sandbox, governance or identity, then the completion sentinel. The block comes first on purpose: `done:` is the headline every consumer reads for this round, so a message that leads with the per-worker lines leaves the round without one.
 
+A worker the ROUND MANIFEST lists as not ready is NOT finished work: it is a member of this round whose branch is still unmerged. Wait for it with `echo CONSOLIDATE_WAIT <id> [timeout=<secs>]` (answering it with CONSOLIDATE_STEER if it pauses on a question), and merge it with CONSOLIDATE_MERGE once it stops, exactly as you would one of the ready workers. Completing this round without a worker listed as not ready is correct only when the orchestrator explicitly told you to drop that worker; on your own initiative, leaving a listed member unintegrated silently loses its branch, so wait for it instead of closing the round.
+
 Never edit another worker's branch: steer it, or fix the interaction yourself. Only your branch is merged by the orchestrator, so it must carry the whole integrated round.
 ";
