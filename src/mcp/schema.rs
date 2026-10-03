@@ -185,7 +185,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static("Consolidator's gate; `sh -n` checked."),
+        DescriptionSource::Static("Consolidator's gate."),
     ),
     (
         "set",

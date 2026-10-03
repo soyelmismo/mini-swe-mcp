@@ -34,18 +34,18 @@
             "type": "boolean"
           },
           "approved": {
-            "description": "Merge every approved worker (--approved).",
+            "description": "Merge every approved worker.",
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate the group when it stops: boolean or model.",
+            "description": "Auto-consolidate the group when it stops: bool or model.",
             "type": [
               "boolean",
               "string"
             ]
           },
           "consolidate_verify": {
-            "description": "Consolidator's gate; `sh -n` checked.",
+            "description": "Consolidator's gate.",
             "type": "string"
           },
           "diff": {
@@ -66,7 +66,7 @@
             "type": "array"
           },
           "force": {
-            "description": "Land a round with unintegrated commits.",
+            "description": "Land a stale round.",
             "type": "boolean"
           },
           "full": {
@@ -206,7 +206,7 @@
             "type": "string"
           },
           "verify": {
-            "description": "Completion gate: auto-detect if omitted; empty disables. Consolidator gate.",
+            "description": "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.",
             "type": "string"
           },
           "worker_id": {
