@@ -164,6 +164,29 @@ pub fn with_replayed_reasoning(messages: &[ChatMessage]) -> std::borrow::Cow<'_,
     std::borrow::Cow::Owned(owned)
 }
 
+/// Drop the reasoning of every assistant turn in `messages`.
+///
+/// Thinking-mode providers need the field *present* (see
+/// [`with_replayed_reasoning`]), but a value that is degenerate -- one short
+/// pattern repeated, or the same text echoed for turn after turn -- is exactly
+/// what the model then copies, so the degenerate value has to go while the
+/// field stays. The reasoning is replaced with an empty string rather than
+/// removed, which is the shape a thinking-mode provider accepts for a turn the
+/// model answered without reasoning.
+///
+/// Returns the number of turns it emptied. The caller already holds the
+/// messages; nothing else in the conversation changes.
+pub fn strip_replayed_reasoning(messages: &mut [ChatMessage]) -> usize {
+    let mut emptied = 0usize;
+    for message in messages.iter_mut() {
+        if message.role() == Role::Assistant && message.reasoning_content().is_some() {
+            message.replace_reasoning_content(String::new());
+            emptied += 1;
+        }
+    }
+    emptied
+}
+
 /// Outbound `tool_calls` entry of an assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {

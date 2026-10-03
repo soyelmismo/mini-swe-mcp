@@ -51,7 +51,10 @@ use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::super::revision::{WorkerHistory, append_history_message_in};
 use super::super::state::{WorkerReport, WorkerState, WorkerVerdicts};
 use super::super::steer::drain_steer_messages_in;
-use super::degenerate::{degenerate_nudge, is_degenerate, no_command_pause_question};
+use super::degenerate::{
+    DEGENERATE_PAUSE_STREAK, DEGENERATE_REPEAT_TURNS, DEGENERATE_REPLAY_WINDOW, degenerate_nudge,
+    degenerate_pause_question, is_degenerate, no_command_pause_question,
+};
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
@@ -975,16 +978,22 @@ impl ProgressWatch {
             return None;
         };
         let repeated = self.last_reasoning.as_deref() == Some(reasoning);
-        let filler = is_degenerate(reasoning);
         self.last_reasoning = Some(reasoning.to_string());
-        if !repeated && !filler {
+        // Filler is judged on its own text: one turn of it is already a model
+        // that has stopped thinking, and the value has to leave the replay
+        // before the model copies it a second time.
+        if is_degenerate(reasoning) {
+            self.degenerate_turns += 1;
+            return Some(self.degenerate_turns);
+        }
+        if !repeated {
             self.degenerate_turns = 0;
             return None;
         }
+        // Byte-identical to the previous turn: a model quoting itself. Two
+        // turns of the same sentence can happen; the third consecutive
+        // identical value is the echo the observed run looped on.
         self.degenerate_turns += 1;
-        // One repeat is a model quoting itself; the streak starts to count
-        // once the value has been seen the number of turns a real reasoning
-        // block would never reproduce verbatim.
         (self.degenerate_turns >= DEGENERATE_REPEAT_TURNS).then_some(self.degenerate_turns)
     }
 
@@ -1188,6 +1197,24 @@ impl<'a> TurnEngine<'a> {
         // A provider outage is waited out (up to `outage_patience`) before the
         // orchestrator is asked, and a resume retries the step rather than
         // failing the worker on the next error.
+        // --- Degeneracy guard (both phases) ---
+        // The replayed reasoning of a turn that came back degenerate is what
+        // the model copies, so it is dropped from the request before the call
+        // rather than nagged about afterwards. The guard fires on the turn
+        // that produced the value and lapses one turn later, so a model that
+        // recovers gets its history back intact.
+        let drop_replayed = self.watch.replayed_reasoning_dropped(*self.step);
+        if drop_replayed {
+            let emptied = crate::agent::strip_replayed_reasoning(self.messages);
+            if emptied > 0 {
+                warn!(
+                    worker = %self.worker_id,
+                    step = *self.step,
+                    turns = emptied,
+                    "Dropping degenerate replayed reasoning from this request"
+                );
+            }
+        }
         let mut outage_waited = std::time::Duration::ZERO;
         let llm_resp = loop {
             compact_history(self.messages);
@@ -1293,6 +1320,7 @@ impl<'a> TurnEngine<'a> {
         config: &TurnConfig<'_>,
         llm_resp: LlmResponse,
     ) -> Result<TurnOutcome> {
+        let nudged = self.note_reasoning(config, &llm_resp).await?;
         // The REPORT block is not guaranteed to sit in the same assistant
         // message as the sentinel: the completion turn can carry the sentinel
         // while the block arrives in the one follow-up, or both are written
@@ -1338,7 +1366,7 @@ impl<'a> TurnEngine<'a> {
                     step = *self.step,
                     "No bash command in response; prompting subagent directly"
                 );
-                return self.no_command_turn(config, llm_resp).await;
+                return self.no_command_turn(config, llm_resp, nudged).await;
             }
         };
 
@@ -2419,6 +2447,75 @@ impl<'a> TurnEngine<'a> {
             .reusable_verify_step(verify, &self.current_fingerprint().await?)
     }
 
+    /// Judge this turn's reasoning and, when it is degenerate, drop the
+    /// replayed reasoning from the next request, nudge the worker, and park it
+    /// on the orchestrator if it keeps happening.
+    ///
+    /// Runs before the rest of the turn so the drop is decided against the
+    /// turn that produced the value: a model that answers with filler gets a
+    /// history without that filler on the very next call, not three turns
+    /// later. The no-command path never reaches here, because that turn is
+    /// answered by [`Self::no_command_turn`] instead.
+    async fn note_reasoning(
+        &mut self,
+        config: &TurnConfig<'_>,
+        llm_resp: &LlmResponse,
+    ) -> Result<bool> {
+        let Some(streak) = self
+            .watch
+            .register_reasoning(llm_resp.reasoning_content.as_deref())
+        else {
+            return Ok(false);
+        };
+        let reasoning = llm_resp.reasoning_content.clone().unwrap_or_default();
+        self.watch.note_degenerate(*self.step);
+        self.push_message(ChatMessage::text(Role::User, degenerate_nudge()));
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            streak,
+            bytes = reasoning.len(),
+            "Reasoning came back degenerate; dropping the replayed reasoning"
+        );
+        if streak < DEGENERATE_PAUSE_STREAK {
+            return Ok(true);
+        }
+        self.meta.metrics.loop_pauses += 1;
+        let question = degenerate_pause_question(streak, Some(&reasoning));
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question: &question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: &format!("paused_degenerate_reasoning: {streak} turns"),
+                model: config.model,
+                meta: self.meta,
+            })
+            .await?;
+        let Some(answer) = answer else {
+            return Ok(true);
+        };
+        // A pause the orchestrator answered ends the streak: the guidance is
+        // the model's chance to produce real reasoning again, and a counter
+        // left running would park the worker on the very next turn.
+        self.watch.degenerate_turns = 0;
+        info!(
+            worker = %self.worker_id,
+            step = *self.step,
+            msg = %answer,
+            "Worker resumed from the degeneracy pause by orchestrator guidance"
+        );
+        if !answer.trim().is_empty() && answer.trim() != "resume" {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Handle a turn the model answered without a bash command.
     ///
     /// The turn is always replayed (with its reasoning and any `tool_calls` it
@@ -2443,6 +2540,7 @@ impl<'a> TurnEngine<'a> {
         &mut self,
         config: &TurnConfig<'_>,
         llm_resp: LlmResponse,
+        nudged: bool,
     ) -> Result<TurnOutcome> {
         self.meta.metrics.no_command_turns += 1;
         let degenerate = llm_resp
@@ -2455,14 +2553,20 @@ impl<'a> TurnEngine<'a> {
             llm_resp.reasoning_content.clone(),
             llm_resp.tool_calls.clone(),
         );
-        if *self.consecutive_no_cmd < NO_COMMAND_REMIND_TURNS {
-            *self.consecutive_no_cmd += 1;
+        // The streak is what escalates, so it has to keep counting past the
+        // turns that are free; only the *budget* stops being refunded.
+        *self.consecutive_no_cmd += 1;
+        if *self.consecutive_no_cmd <= NO_COMMAND_REMIND_TURNS {
             *self.step = self.step.saturating_sub(1);
         }
         let turns = *self.consecutive_no_cmd;
         if degenerate {
+            // The drop stays in force however the turn is answered; only the
+            // message is skipped when the reasoning guard already sent it.
             self.watch.note_degenerate(*self.step);
-            self.push_message(ChatMessage::text(Role::User, degenerate_nudge()));
+            if !nudged {
+                self.push_message(ChatMessage::text(Role::User, degenerate_nudge()));
+            }
         }
         if turns >= NO_COMMAND_PAUSE_TURNS {
             return self.pause_on_no_command(config, &llm_resp, turns, degenerate, truncated).await;
@@ -2707,6 +2811,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             invalid_utf8_lines: 0,
+            finish_reason: None,
         }
     }
 

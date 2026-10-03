@@ -35,7 +35,7 @@ pub(crate) const DEGENERATE_REPEAT_TURNS: usize = 3;
 ///
 /// The first one earns a nudge and a history without the replayed reasoning;
 /// two more that ignore it mean the run is not going to recover on its own.
-pub(crate) const DEGENERATE_PAUSE_STREAK: usize = 3;
+pub(crate) const DEGENERATE_PAUSE_STREAK: usize = 4;
 
 /// Turns after a degeneracy guard fire during which the replayed reasoning
 /// stays dropped.
