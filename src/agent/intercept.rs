@@ -129,7 +129,7 @@ fn scan_form(command: &str) -> String {
 /// Reject destructive invocations, including simple whitespace, quote and
 /// variable-expansion obfuscation. Returns the reason shown to the model.
 ///
-/// Only what would run is judged: command words (see [`invocations`]) and
+/// Only what would run is judged: command words (see `invocations`) and
 /// heredoc bodies a shell executes. Data that merely *mentions* a pattern - a
 /// source file or fixture written through a heredoc, a `grep` or `echo`
 /// argument - is allowed, so work on this very guard is not blocked by it.

@@ -2,8 +2,8 @@
 //!
 //! * [`args`] — argv → `worker` tool arguments, plus the `--json` / `--stdio`
 //!   selectors and the dispatch usage line.
-//! * [`format`] — the plain-text renderer for every tool payload, behind the
-//!   single [`format_output`](format::format_output) entry point.
+//! * [`mod@format`] — the plain-text renderer for every tool payload, behind
+//!   the single [`format::format_output`] entry point.
 //! * [`suggest`] — the "did you mean …?" machinery behind the unknown-action
 //!   error, and the single source of truth for the accepted verb list.
 //! * [`help`] — the `--help` text, so the flag reference lives next to the
@@ -23,5 +23,5 @@ pub use self::args::{
     strip_json_flag, tool_args,
 };
 pub use self::format::format_output;
-pub use self::help::HELP_FLAGS;
+pub use self::help::{HELP_FLAGS, index};
 pub use self::suggest::{available_actions, suggest_action};

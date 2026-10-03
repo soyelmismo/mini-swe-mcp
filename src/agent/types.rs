@@ -97,7 +97,7 @@ DISCIPLINE:
 10. You are already at the repository root ($PWD); do not cd elsewhere.
 11. Scripted edits (python/sed) can silently match nothing: assert the old text is present before replacing and confirm with `git diff --stat` that the change landed.
 12. Keep each command small: never paste a whole large file into one command (tool arguments over 64 KiB are dropped); edit in targeted chunks.
-13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work; use git only to inspect.
+13. Do not run git commit/stash/checkout/reset: the repository metadata is read-only in the sandbox and the harness commits your work in checkpoints during the run, so `git diff` alone shows only what changed since the last checkpoint — use `git diff <base commit>` (named in your opening message) to see everything you changed; use git only to inspect.
 14. Reuse before writing: search for an existing function that already does the job and call it, or extract a shared core that both callers use. Never copy a block of logic into a second place.
 15. Concurrency: never hold a lock, guard or permit across a wait that can be long (network, child process, another worker). Anything that joins a queue or takes a slot must give it back when the operation fails or is cancelled (release it in a guard/Drop/finally, not only on the success path).
 16. Tests must be hermetic and deterministic: give every file, directory, daemon or registry they touch a temporary location passed to the code under test; do not mutate process-global state (environment variables) in tests that run in parallel; do not depend on the order of concurrent replies; poll for a condition instead of sleeping. Never write an assertion that cannot fail: a new test must fail without your change.
@@ -174,7 +174,7 @@ pub struct ToolCall {
 
 /// The nested `function` object of a [`ToolCall`], one level deep as the wire
 /// format requires (`{"id":..,"type":"function","function":{..}}`). Reused by the
-/// non-streaming inbound path ([`ToolCallOutput`]) to avoid a duplicate type.
+/// non-streaming inbound path (`ToolCallOutput`) to avoid a duplicate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFn {
     pub name: String,

@@ -149,9 +149,9 @@ impl RoundManifest {
     /// can diff two rounds by eye; the consolidator judges whether each diff
     /// respected its task's scope and so needs the whole text. Every worker
     /// listed (ready first, then not ready) contributes one entry, each task
-    /// bounded by [`FULL_TASK_BUDGET`] with a `[truncated]` marker when it is
+    /// bounded by `FULL_TASK_BUDGET` with a `[truncated]` marker when it is
     /// cut, and the whole section — the omitted-count footer included,
-    /// when one is written — bounded by [`FULL_TASKS_BUDGET`] bytes, so
+    /// when one is written — bounded by `FULL_TASKS_BUDGET` bytes, so
     /// a verbose round cannot flood the prompt; work the budget leaves
     /// out is counted rather than silently dropped.
     ///
