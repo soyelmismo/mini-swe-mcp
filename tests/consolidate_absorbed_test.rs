@@ -142,6 +142,38 @@ impl Harness {
         .expect("the consolidator's merge lands")
     }
 
+    /// `merge <id>` returning the result rather than unwrapping it, for the
+    /// tests that assert a refusal.
+    fn try_merge(&self, id: &str) -> anyhow::Result<mini_swe_mcp::pool::MergeReport> {
+        merge_worker_in(
+            &self.root(),
+            &MergeRequest {
+                worker_id: id,
+                verified: Some(true),
+                keep_branch: false,
+                force: false,
+                admission: None,
+                archive_dir: None,
+            },
+        )
+    }
+
+    /// `merge <id> --force`: the same merge with the round check overridden.
+    fn force_merge(&self, id: &str) -> mini_swe_mcp::pool::MergeReport {
+        merge_worker_in(
+            &self.root(),
+            &MergeRequest {
+                worker_id: id,
+                verified: Some(true),
+                keep_branch: false,
+                force: true,
+                admission: None,
+                archive_dir: None,
+            },
+        )
+        .expect("the forced consolidator merge lands")
+    }
+
     fn row_exists(&self, id: &str) -> bool {
         load_registry_entry_in(&self.root(), id).is_some()
     }
@@ -305,7 +337,20 @@ fn a_steered_worker_that_is_running_again_is_not_discarded() {
     let row = load_registry_entry_in(&h.root(), &consolidator).expect("consolidator row");
     assert!(row.absorbed.is_empty(), "a running worker is not absorbed");
 
-    let report = h.merge(&consolidator);
+    // The round is refused: the resumed worker is a member of the round and
+    // its branch carries work the consolidator never took.
+    let refusal = h
+        .try_merge(&consolidator)
+        .expect_err("a round missing a resumed member's work must be refused")
+        .to_string();
+    assert!(
+        refusal.contains(&resumed),
+        "the refusal names the resumed worker: {refusal}"
+    );
+
+    // Forced, the round lands and the resumed worker still survives: it is not
+    // absorbed and its live branch is never discarded.
+    let report = h.force_merge(&consolidator);
     assert!(!report.retired.contains(&resumed), "{:?}", report.retired);
     assert!(git_ref_exists(h.path(), &format!("worker-{resumed}")));
     assert!(h.row_exists(&resumed));
