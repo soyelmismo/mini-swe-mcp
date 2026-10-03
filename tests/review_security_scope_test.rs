@@ -571,3 +571,96 @@ fn every_approved_merged_branch_leaves_the_audit() {
         vec!["approved-w1".to_string(), "approved-w2".to_string()],
     );
 }
+
+// ----------
+// A consolidator's conflict resolutions are its own work
+// ----------
+
+/// The one part of a merge nobody else reviewed is the resolution itself: the
+/// consolidator decides which of two workers' versions of a sensitive file
+/// wins, and that decision lands *in the merge commit*. A scope that drops
+/// merge commits drops the resolution with them, so a consolidator whose only
+/// own work was resolving a `src/hub/**` conflict would see an empty commit
+/// list, find no sensitive file, and skip the audit of a file both workers
+/// disagreed about.
+#[tokio::test]
+async fn a_conflict_resolved_in_a_merge_commit_stays_in_the_consolidators_scope() {
+    let dir = common::TempDir::new_in_tmp("scope_resolution");
+    let path = dir.path().to_path_buf();
+    common::git(&path, &["init", "-q", "-b", "master", "."]);
+    common::git(
+        &path,
+        &["config", "user.email", "review-scope@example.invalid"],
+    );
+    common::git(&path, &["config", "user.name", "Review Scope Test"]);
+    let base = commit(&path, "master", "README.md", "base");
+    let socket = "src/hub/socket.rs";
+
+    // Two workers branch off the same base and edit the same sensitive file, so
+    // integrating them conflicts and the consolidator has to decide the result.
+    common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
+    let w1 = commit(&path, "worker-w1", socket, "worker's handshake");
+    common::git(&path, &["checkout", "-q", "-b", "worker-w2", "master"]);
+    let w2 = commit(&path, "worker-w2", socket, "other worker's handshake");
+    common::git(&path, &["checkout", "-q", "-b", "worker-c1", "master"]);
+
+    // Merge, resolve the conflict, and record the resolution in the merge
+    // commit -- which is what git does and what the consolidator agent does.
+    common::git(
+        &path,
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let conflicted = std::fs::read_to_string(path.join(socket)).expect("the conflicted file");
+    assert!(
+        conflicted.contains("<<<<<<<"),
+        "the two workers' edits must really conflict, or this test proves nothing"
+    );
+    std::fs::write(path.join(socket), "the resolved handshake").expect("write the resolution");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "--no-edit"]);
+    let resolution = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    let merged = vec![w1.clone(), w2.clone()];
+    let scope = scope_for(
+        &path,
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        &merged,
+    )
+    .await;
+
+    assert!(
+        scope.reviewed_commits().contains(&resolution),
+        "the merge commit that carries the conflict resolution is the consolidator's own \
+         unaudited work and must be in scope; got {:?}",
+        scope.reviewed_commits()
+    );
+    for reviewed in [&w1, &w2] {
+        assert!(
+            !scope.reviewed_commits().contains(reviewed),
+            "{reviewed} was reviewed at its own approved commit and must not come back"
+        );
+    }
+    assert_eq!(
+        scope.reviewed_files(&path).await,
+        vec![socket.to_string()],
+        "the sensitive probe must see the file whose conflict the consolidator resolved"
+    );
+    assert_eq!(
+        scope.skip_log(),
+        None,
+        "a consolidator whose only work is a conflict resolution has something to review"
+    );
+
+    // And the diff it hands the reviewer must actually carry the resolution.
+    let diff = scope.reviewed_diff(&path).await;
+    assert!(
+        diff.contains("+the resolved handshake"),
+        "the reviewer's diff must contain the resolution, or it is told to audit code it \
+         cannot see; diff was:\n{diff}"
+    );
+}
