@@ -9,9 +9,12 @@ pub(super) fn build(
         tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
     }
     // `approve <id> ["note"]`: the note is the same `message` argument
-    // the MCP action reads.
+    // the MCP action reads, and every unquoted word after the id belongs to it.
     if action == "approve" && cli_args.len() > 3 {
-        tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
+        tool_args.insert(
+            "message".into(),
+            Value::String(join_words(cli_args, 3, &[], &[])),
+        );
     }
 
     Ok(())
