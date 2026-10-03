@@ -1259,23 +1259,21 @@ fn job_label(command: &str) -> String {
     label
 }
 
-/// Drop an incomplete trailing code point from `head`.
+/// Drop an incomplete trailing code point from `bytes`.
 ///
-/// A chunk boundary or the byte budget can leave the head holding the leading
-/// bytes of a multi-byte character whose continuation bytes were not retained.
-/// The walk back is bounded by the 3 bytes of the longest code point.
-fn trim_partial_tail(head: &mut Vec<u8>) {
-    // At most three trailing continuation bytes can belong to one code point.
-    let mut drop = 0usize;
-    while drop < 3 && drop < head.len() && is_continuation(head[head.len() - 1 - drop]) {
-        drop += 1;
+/// Every cut the buffer makes -- the head budget, the tail window, the seam
+/// where the two halves join -- can fall inside a multi-byte character. The
+/// orphaned bytes have no complete sequence to decode to, so `combine_streams`
+/// would turn each of them into U+FFFD: the mangled text the model and the
+/// watch renderer would show. Snapping here is what keeps `captured()` decodable
+/// whatever the cut did.
+fn trim_partial_tail(bytes: &mut Vec<u8>) {
+    // `from_utf8` reports the first invalid byte; a valid prefix ends just
+    // before it, which is exactly the longest whole-code-point prefix.
+    match std::str::from_utf8(bytes) {
+        Ok(_) => {}
+        Err(err) => bytes.truncate(err.valid_up_to()),
     }
-    if drop == 3 {
-        // Three continuation bytes with no start byte among them is not a code
-        // point this buffer could have cut cleanly; leave the data alone.
-        return;
-    }
-    head.truncate(head.len() - drop);
 }
 
 /// Whether `byte` is a UTF-8 continuation byte (`0b10xxxxxx`).
@@ -1290,17 +1288,17 @@ fn is_continuation(byte: u8) -> bool {
 /// continuation bytes have no start byte to attach to, and decoding the buffer
 /// would replace each with U+FFFD.
 fn trim_partial_lead(tail: &mut Vec<u8>) {
-    // Fast path: the overwhelmingly common all-ASCII case costs one compare.
-    if tail.first().is_none_or(|byte| !is_continuation(*byte)) {
+    // Drop the whole incomplete leading sequence, lead byte included: those
+    // bytes have no start byte ahead of them, so decoding the buffer would
+    // replace each with U+FFFD. At most 4 bytes can belong to one code point.
+    let mut lead = 0usize;
+    while lead < tail.len() && lead < 4 && is_continuation(tail[lead]) {
+        lead += 1;
+    }
+    if lead == 0 {
         return;
     }
-    // Drop up to three leading continuation bytes: at most that many can belong
-    // to one (the longest) code point.
-    let lead = tail
-        .iter()
-        .position(|byte| !is_continuation(*byte))
-        .unwrap_or(tail.len())
-        .min(3);
+    // The byte after the run is the start of the next code point, so it stays.
     tail.drain(..lead);
 }
 
@@ -1346,11 +1344,12 @@ impl Captured {
             rest = &rest[take..];
             // Snap the head's tail down to a code point boundary. The cut lands
             // mid-character whenever the budget is not a multiple of the stream
-            //'s code point width, and those trailing bytes have no start byte
-            // left to attach to: `combine_streams` would decode each of them as
-            // U+FFFD, which is the mangled text the model and the watch
+            //'s code point width, and those trailing bytes have no complete
+            // sequence to decode to: `combine_streams` would turn each of them
+            // into U+FFFD, which is the mangled text the model and the watch
             // renderer would show. Dropping them keeps `head` decodable and
-            // only ever loses at most 3 bytes of the budget.
+            // costs at most 3 bytes of the budget. Re-run on every later chunk
+            // too, because the next append would otherwise re-split a character.
             trim_partial_tail(&mut self.head);
         }
         if rest.is_empty() {
@@ -1371,11 +1370,11 @@ impl Captured {
         // and O(1) amortised per byte.
         self.tail.extend_from_slice(rest);
         if self.tail.len() > TRUNCATE_TAIL {
-            self.tail.drain(..self.tail.len() - TRUNCATE_TAIL);
+            let drop = self.tail.len() - TRUNCATE_TAIL;
+            self.tail.drain(..drop);
         }
-        // The drain above can leave the front of the window sitting in the
-        // middle of a multi-byte code point. Drop the incomplete code point so
-        // `captured()` always hands `combine_streams` decodable bytes.
+        // The drain above can leave the window starting inside a multi-byte code
+        // point whose start byte was just discarded.
         trim_partial_lead(&mut self.tail);
     }
 
@@ -1390,6 +1389,13 @@ impl Captured {
         let mut out = Vec::with_capacity(self.head.len() + self.tail.len());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.tail);
+        trim_partial_tail(&mut out);
+        // Snap the seam: head and tail are bounded independently, so a code
+        // point can straddle the join and leave `out` undecodable. Dropping the
+        // incomplete sequence on the head side keeps the contract -- valid
+        // UTF-8 out of `captured()` -- in one place instead of trusting every
+        // cut path to have got it right. At most 3 bytes of a 16 KiB budget.
+        trim_partial_tail(&mut out);
         out
     }
 

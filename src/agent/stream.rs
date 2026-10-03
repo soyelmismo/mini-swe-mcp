@@ -525,20 +525,6 @@ mod tests {
     use super::*;
     use crate::agent::types::StreamFunction;
 
-    #[test]
-    fn probe_sse_utf8_survives_the_stream() {
-        let done = "Fixed the last gate failure \u{2014} `cargo fmt --check` \u{f1} \u{65e5}\u{672c} \u{1f642}";
-        let frame = serde_json::json!({"choices":[{"delta":{"content": done}}]});
-        let mut body = format!("data: {frame}\n\n").into_bytes();
-        body.extend_from_slice(b"data: [DONE]\n\n");
-        let mut acc = SseAccumulator::default();
-        let mut buf: Vec<u8> = Vec::new();
-        acc.push(&body, &mut buf);
-        let resp = acc.finish();
-        println!("content = {:?}", resp.content);
-        assert_eq!(resp.content, done, "SSE mangled UTF-8: {:?}", resp.content);
-    }
-
     fn sse_body(frames: &[&str]) -> Vec<u8> {
         let mut v = Vec::new();
         for f in frames {
