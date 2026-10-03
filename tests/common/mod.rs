@@ -464,3 +464,115 @@ pub fn stdout_of(output: &Output) -> String {
 pub fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
+
+// ----------
+// Dispatched-worker scratch repositories
+// ----------
+
+/// A throwaway git repository a dispatched worker runs against.
+///
+/// The pool clones the repository it is given into its own worktree, so a test
+/// that dispatches a worker needs a real (but throwaway) repository: one
+/// baseline commit, an optional `AGENTS.md` declaring sensitive paths, and a
+/// `Drop` that releases the build-dir lease and removes the directory.
+pub struct TestRepo {
+    dir: PathBuf,
+}
+
+impl TestRepo {
+    /// Create and commit a one-file baseline repository under the process's
+    /// scratch root, tagged so parallel runs cannot collide.
+    pub fn new(tag: &str) -> Self {
+        let dir = process_temp_dir(&format!("test-repo-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch repo");
+        let dir = dir.canonicalize().expect("canonicalize scratch repo");
+        git(&dir, &["init", "-b", "master"]);
+        git(&dir, &["config", "user.name", "mini-swe-test"]);
+        git(&dir, &["config", "user.email", "test@localhost"]);
+        std::fs::write(dir.join("README.md"), "# scratch\n").expect("seed file");
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "-m", "baseline"]);
+        Self { dir }
+    }
+
+    /// Write `AGENTS.md` declaring `globs` as sensitive paths.
+    ///
+    /// The pool reads the sensitive globs from the repository it is given, not
+    /// from the worktree it creates, so the file needs no commit to take
+    /// effect.
+    pub fn declare_sensitive(&self, globs: &[&str]) {
+        let mut text = String::from("## Sensitive paths\n\n");
+        for glob in globs {
+            text.push_str(&format!("- {glob}\n"));
+        }
+        std::fs::write(self.dir.join("AGENTS.md"), text).expect("write AGENTS.md");
+    }
+
+    /// Commit every change in the repository, so a test can build on a history
+    /// the worker's worktree actually carries.
+    pub fn commit_all(&self, message: &str) {
+        git(&self.dir, &["add", "-A"]);
+        git(&self.dir, &["commit", "-m", message]);
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for TestRepo {
+    fn drop(&mut self) {
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// ----------
+// Dispatched-worker helpers
+// ----------
+
+/// Poll a dispatched worker until it reaches a terminal state.
+///
+/// A dispatched worker runs on the pool's own task, so a test cannot await it
+/// directly; polling the registry is the public API's own view of progress.
+pub async fn wait_for_terminal(
+    pool: &mini_swe_mcp::pool::WorkerPool,
+    worker_id: &str,
+) -> mini_swe_mcp::pool::WorkerState {
+    for _ in 0..600 {
+        if let Some(state) = pool.get_worker_state(worker_id).await {
+            match state {
+                mini_swe_mcp::pool::WorkerState::Completed { .. }
+                | mini_swe_mcp::pool::WorkerState::Failed { .. }
+                | mini_swe_mcp::pool::WorkerState::Exhausted { .. } => return state,
+                mini_swe_mcp::pool::WorkerState::Running { .. }
+                | mini_swe_mcp::pool::WorkerState::Paused { .. } => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("worker {worker_id} did not reach a terminal state");
+}
+
+/// The user message of the first request whose prompt mentions the review
+/// phase, or `None` when no review ran.
+pub async fn review_prompt_of(llm: &fake_llm::FakeLlm) -> Option<String> {
+    for request in llm.request_bodies().await {
+        for message in request["messages"].as_array().unwrap_or(&Vec::new()) {
+            if message["role"] == "user" {
+                let content = message["content"].as_str().unwrap_or_default();
+                if content.contains("REVIEW PHASE") {
+                    return Some(content.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `bash` tool call a scripted turn runs: `command` with `content` as the
+/// assistant's prose.
+pub fn tool_turn(call_id: &str, content: &str, command: &str) -> Vec<String> {
+    fake_llm::scripted_tool_turn(call_id, content, command)
+}
