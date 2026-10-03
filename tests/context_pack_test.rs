@@ -205,3 +205,81 @@ fn a_task_naming_nothing_yields_no_pack() {
     let pack = context_pack("Fix the flaky retry logic, please.", tmp.path());
     assert!(pack.is_none(), "got:\n{pack:?}");
 }
+
+/// A task that names a path escaping the worktree must not put it in the
+/// pack: `root.join(token)` on `../secret` or an absolute path reads outside
+/// the checkout, so the extractor only keeps paths that resolve inside it.
+#[test]
+fn traversal_paths_outside_the_worktree_are_ignored() {
+    let tmp = TempDir::new_in_tmp("context-pack-traversal");
+    let src = tmp.subdir("src");
+    fs::write(src.join("worker.rs"), RUST_SAMPLE).unwrap();
+    // A real file outside the worktree the token points at, so the test fails
+    // if the extractor ever reads through the escape.
+    let outside = tmp
+        .path()
+        .parent()
+        .expect("the scratch base has a parent")
+        .join("context-pack-outside-secret.txt");
+    fs::write(&outside, "TOP SECRET OUTSIDE THE WORKTREE\n").unwrap();
+
+    let task = "Read ../context-pack-outside-secret.txt and src/worker.rs for context.";
+    let paths = extract_paths(task, tmp.path());
+    assert!(
+        !paths.iter().any(|p| p.to_string_lossy().contains("..")),
+        "no escaping path may be extracted: {paths:?}"
+    );
+    assert_eq!(paths, vec![std::path::PathBuf::from("src/worker.rs")]);
+
+    let pack = context_pack(task, tmp.path()).expect("the in-tree path still packs");
+    assert!(
+        !pack.contains("TOP SECRET"),
+        "the pack must not carry bytes from outside the worktree:\n{pack}"
+    );
+    assert!(pack.contains("src/worker.rs"), "got:\n{pack}");
+
+    let _ = std::fs::remove_file(&outside);
+}
+
+/// Absolute paths and interior `..` segments must not escape the worktree
+/// either: `root.join("/abs")` replaces the base and `root.join("a/../../b")`
+/// resolves outside it, so either token would put an arbitrary file's outline
+/// into the pack.
+#[test]
+fn absolute_and_interior_dotdot_paths_are_ignored() {
+    let tmp = TempDir::new_in_tmp("context-pack-absescape");
+    let src = tmp.subdir("src");
+    fs::write(src.join("worker.rs"), RUST_SAMPLE).unwrap();
+    // A credentials-shaped file outside the worktree, so a leak is visible.
+    let outside_dir = tmp
+        .path()
+        .parent()
+        .expect("the scratch base has a parent")
+        .join("context-pack-absescape-outside");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let secret = outside_dir.join("creds.ini");
+    fs::write(&secret, "aws_secret_access_key = TOPSECRETLEAK\n").unwrap();
+
+    let abs_token = secret.to_string_lossy().to_string();
+    let task = format!("Read {abs_token} and src/worker.rs for context.");
+    let paths = extract_paths(&task, tmp.path());
+    assert_eq!(
+        paths,
+        vec![std::path::PathBuf::from("src/worker.rs")],
+        "an absolute path outside the worktree must never be extracted"
+    );
+    let pack = context_pack(&task, tmp.path()).expect("the in-tree path still packs");
+    assert!(
+        !pack.contains("TOPSECRETLEAK"),
+        "the pack must not carry bytes from an absolute path:\n{pack}"
+    );
+
+    // Interior `..`: lexically inside-looking, resolved outside.
+    let task2 = "Read src/../../context-pack-absescape-outside/creds.ini for context.";
+    let paths2 = extract_paths(task2, tmp.path());
+    assert!(
+        paths2.is_empty(),
+        "an interior `..` escape must never be extracted: {paths2:?}"
+    );
+    let _ = std::fs::remove_dir_all(&outside_dir);
+}

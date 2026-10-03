@@ -92,6 +92,9 @@ pub fn extract_paths(task: &str, root: &Path) -> Vec<PathBuf> {
         if token.is_empty() || !path_like(token) || !seen.insert(token.to_string()) {
             continue;
         }
+        if token_contains_escape(token) {
+            continue;
+        }
         if root.join(token).is_file() {
             out.push(PathBuf::from(token));
         }
@@ -174,6 +177,28 @@ fn path_item_regex() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+")
             .expect("path::item regex must compile")
+    })
+}
+
+/// Whether `token` could name a file outside the worktree.
+///
+/// The task is free text and the token is joined onto the worktree root, so an
+/// absolute token replaces the root outright and any `..` segment climbs out
+/// of it. The pack is prompt text the worker is told to act on, so a token
+/// that can point anywhere on disk is a prompt-injection read primitive: the
+/// outline would carry that file's top-level lines into the first message.
+/// Refuse both, and let the identifier locator (which only greps inside the
+/// checkout) carry genuinely useful absolute-looking names instead.
+fn token_contains_escape(token: &str) -> bool {
+    let path = Path::new(token);
+    if path.is_absolute() {
+        return true;
+    }
+    path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)
+        )
     })
 }
 
