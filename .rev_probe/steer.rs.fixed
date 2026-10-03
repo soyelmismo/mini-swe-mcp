@@ -251,8 +251,6 @@ const STEER_LOG_READ_CAP: u64 = 256 * 1024;
 /// half-decoded record.
 pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
     let path = steer_log_path_in(root, worker_id);
-    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new(); };
-    if true { return parse_records(&content, &path); }
     let Ok(mut file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
