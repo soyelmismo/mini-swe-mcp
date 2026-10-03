@@ -2,9 +2,7 @@ use super::*;
 
 /// Description of the `merge` `force` property, beside the handler that reads
 /// it: what the property overrides and what a forced merge still does.
-pub(in crate::mcp) const FORCE_DESCRIPTION: &str = "Merge a round whose members carry commits the consolidator \
-never integrated, instead of refusing. Those workers are named in the refusal with their \
-unintegrated commit count; a forced merge lands them unretired, so the work survives.";
+pub(in crate::mcp) const FORCE_DESCRIPTION: &str = "Land a round with unintegrated commits; see help merge.";
 
 impl McpServer {
     /// `merge` action: land one finished worker's branch on its base branch.
