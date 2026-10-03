@@ -102,6 +102,12 @@ pub(crate) struct SseAccumulator {
     pub(crate) reasoning_capped: bool,
     /// Frames that were not valid UTF-8 (decoded lossily).
     pub(crate) invalid_utf8_lines: usize,
+    /// The provider's `finish_reason`, from the last choice that carried one.
+    /// `None` until a frame names it, so an absent field is indistinguishable
+    /// from a provider that never sends it -- which is exactly what the caller
+    /// needs to know, because `length` and `content_filter` mean the reply was
+    /// cut short and the turn must not be read as a model refusal.
+    pub(crate) finish_reason: Option<String>,
     /// Latch so the unframed-tail cap is reported once per stream, not once per
     /// offending chunk (a runaway stream would otherwise log in a hot loop).
     frame_cap_logged: bool,
@@ -226,6 +232,9 @@ impl SseAccumulator {
         match serde_json::from_str::<StreamChunk>(data) {
             Ok(chunk) => {
                 if let Some(choice) = chunk.choices.first() {
+                    if choice.finish_reason.is_some() {
+                        self.finish_reason = choice.finish_reason.clone();
+                    }
                     if let Some(r) = choice.delta.reasoning() {
                         self.push_reasoning_content(r);
                     }
@@ -430,6 +439,7 @@ impl SseAccumulator {
             reasoning_content,
             tools,
             invalid_utf8_lines,
+            finish_reason,
             ..
         } = self;
 
@@ -487,6 +497,20 @@ impl SseAccumulator {
 
         let reasoning = (!reasoning_content.trim().is_empty()).then_some(reasoning_content);
 
+        // A reply the provider cut short is incomplete whatever it looks like:
+        // the tool call may be missing simply because the generation never
+        // reached it. Surfaced once here rather than at every caller, so the
+        // turn engine can tell a truncation from a refusal.
+        if matches!(
+            finish_reason.as_deref(),
+            Some("length") | Some("content_filter")
+        ) {
+            tracing::warn!(
+                finish_reason = finish_reason.as_deref().unwrap_or_default(),
+                "Provider cut the reply short; the turn is incomplete"
+            );
+        }
+
         LlmResponse {
             content,
             reasoning_content: reasoning,
@@ -494,6 +518,7 @@ impl SseAccumulator {
             tool_calls,
             tool_call_id,
             invalid_utf8_lines,
+            finish_reason,
         }
     }
 
@@ -508,6 +533,9 @@ impl SseAccumulator {
         {
             if let Some(r) = choice.message.reasoning() {
                 self.push_reasoning_content(r);
+            }
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason.clone();
             }
             self.push_content(choice.message.content.as_deref().unwrap_or(""));
             for (n, tc) in choice.message.tool_calls.iter().enumerate() {

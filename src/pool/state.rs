@@ -55,6 +55,13 @@ pub struct WorkerMetrics {
     /// interceptor block, a sandbox that could not be prepared, or a
     /// completion side-effect audit that found leftovers.
     pub isolation_blocks: usize,
+    /// Turns the model answered without a tool call, which the engine had to
+    /// answer with the tool-contract reminder instead of a command.
+    pub no_command_turns: usize,
+    /// Times the no-command guard parked the worker on the orchestrator: the
+    /// model stopped calling tools, or its reasoning came back degenerate for
+    /// turn after turn.
+    pub no_command_pauses: usize,
 }
 
 impl WorkerMetrics {

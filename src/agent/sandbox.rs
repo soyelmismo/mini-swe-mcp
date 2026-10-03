@@ -1093,7 +1093,7 @@ fn toolchain_cache_paths() -> Vec<PathBuf> {
 /// environment points `GOCACHE`, `UV_CACHE_DIR` and friends at: the shared
 /// cache root, the user's `kache` directory, and any `SWE_SHARED_CACHES`
 /// host-side binds. Missing paths are skipped when the plan is applied.
-fn writable_cache_paths() -> Vec<PathBuf> {
+pub(crate) fn writable_cache_paths() -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(4);
     paths.push(crate::cache::shared_cache_root());
     if let Some(home) = home_dir() {

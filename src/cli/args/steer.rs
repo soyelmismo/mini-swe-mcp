@@ -1,9 +1,19 @@
 use super::*;
 
+/// Turn `steer <id> <message...>` into the tool arguments.
+///
+/// The message is every remaining word: an unquoted `steer <id> sal del loop!`
+/// arrives as four argv words, and reading only the first one would drop the
+/// rest of the instruction without a word of complaint. `--max-turns`/`-t` is
+/// the one flag, and it may sit anywhere after the id.
 pub(super) fn build(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Result<()> {
     if cli_args.len() > 3 {
         tool_args.insert("worker_id".into(), Value::String(cli_args[2].clone()));
-        tool_args.insert("message".into(), Value::String(cli_args[3].clone()));
+        let message = join_words(cli_args, 3, &[], &["--max-turns", "-t"]);
+        if message.is_empty() {
+            anyhow::bail!("steer needs a message: mini-swe-mcp steer <worker_id> <message>");
+        }
+        tool_args.insert("message".into(), Value::String(message));
         // `--max-turns <n>` on a steer is the fresh turn budget of a
         // revision (steering a finished worker); the same tool
         // argument `dispatch` uses, so the budget has one spelling.
