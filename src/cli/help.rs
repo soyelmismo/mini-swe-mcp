@@ -21,6 +21,7 @@ mod discard;
 mod env;
 mod identity;
 mod merge;
+mod models;
 mod review;
 mod sandbox;
 mod steer;
@@ -45,6 +46,7 @@ pub const TOPICS: &[&str] = &[
     "env",
     "consolidate",
     "discard",
+    "models",
 ];
 
 /// The whole `--help` page, one string, so the index is composed and tested in
@@ -103,7 +105,7 @@ pub fn index() -> String {
         "  prune\n",
         "           Clean stale worktrees and caches.\n",
         "  manifest\n",
-        "           Print the models catalog.\n",
+        "           Print the models catalog, with the instruction count per model.\n",
         "  monitor [--once]\n",
         "           Full-screen view of the pool.\n",
         "  supervisor [--once]\n",
@@ -141,6 +143,7 @@ pub fn topic_text(topic: &str) -> Option<&'static str> {
         "env" => env::TEXT,
         "consolidate" => consolidate::TEXT,
         "discard" => discard::TEXT,
+        "models" => models::TEXT,
         _ => return None,
     })
 }
@@ -187,7 +190,7 @@ mod tests {
     /// not, so `help <topic>` can refuse it with the available list.
     #[test]
     fn every_topic_has_text_and_unknown_ones_do_not() {
-        assert_eq!(TOPICS.len(), 12);
+        assert_eq!(TOPICS.len(), 13);
         for topic in TOPICS {
             let text = topic_text(topic).unwrap_or_else(|| panic!("'{topic}' has no text"));
             assert!(!text.trim().is_empty(), "'{topic}' is empty");

@@ -7,9 +7,19 @@
 //! `validate` rules and the `normalize` fixups.
 
 use super::{
-    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_MEMORY_PROMPT_BYTES, MAX_TURNS_LIMIT, MEMORY_DIR,
-    ModelDefinition, ModelManifest, agent_memory_path, build_system_prompt, load_agent_memory,
+    BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, MAX_MEMORY_PROMPT_BYTES,
+    MAX_MODEL_INSTRUCTIONS_BYTES, MAX_TURNS_LIMIT, MEMORY_DIR, ModelDefinition, ModelInstructions,
+    ModelManifest, agent_memory_path, build_system_prompt, load_agent_memory,
 };
+
+/// Parse one model entry from the YAML a `models.yaml` holds, the way the loader
+/// does, and return its `instructions:` block.
+fn single_model_from_yaml(yaml: &str) -> ModelInstructions {
+    let definition: ModelDefinition = serde_yaml::from_str(yaml).expect("model entry must parse");
+    definition
+        .instructions
+        .expect("entry declares instructions")
+}
 
 fn single(definition: ModelDefinition) -> ModelManifest {
     let mut models = std::collections::HashMap::new();
@@ -997,5 +1007,141 @@ fn test_normalizing_an_undeclared_or_empty_policy_preserves_the_declaration_shap
         absent.normalize().models["solo"].policy,
         None,
         "normalize must never invent a policy the manifest did not declare",
+    );
+}
+// ----------
+// Per-model instructions (`instructions:` in models.yaml)
+// ----------
+
+/// Both YAML spellings a catalog author reaches for mean the same thing, and
+/// normalize to the same ordered entries.
+#[test]
+fn test_instructions_parse_from_both_a_string_and_a_list() {
+    let from_string = single_model_from_yaml(
+        r#"
+id: combo:solo
+instructions: |
+  Read whole files instead of many small ranges.
+  - Run the cheap gate first.
+"#,
+    );
+    let from_list = single_model_from_yaml(
+        r#"
+id: combo:solo
+instructions:
+  - Read whole files instead of many small ranges.
+  - "- Run the cheap gate first."
+"#,
+    );
+
+    let expected = [
+        "Read whole files instead of many small ranges.".to_string(),
+        "Run the cheap gate first.".to_string(),
+    ];
+    assert_eq!(from_string.entries(), expected);
+    assert_eq!(
+        from_list.entries(),
+        from_string.entries(),
+        "the two spellings must not diverge downstream"
+    );
+}
+
+/// The block reaches only the model that declared it, and only in its own
+/// prompt: the review phase resolves the reviewer's alias, so the two never mix.
+#[test]
+fn test_instructions_reach_the_prompt_of_their_own_model_only() {
+    let repo = MemoryRepo::new("model-instructions");
+    let mut models = std::collections::HashMap::new();
+    models.insert(
+        "small".to_string(),
+        ModelDefinition {
+            id: "combo:small".to_string(),
+            role: None,
+            temperature: None,
+            max_turns: None,
+            policy: None,
+            instructions: Some(
+                serde_yaml::from_str("- Prefer one whole-file read.\n").expect("block"),
+            ),
+        },
+    );
+    models.insert(
+        "deep".to_string(),
+        ModelDefinition {
+            id: "combo:deep".to_string(),
+            role: None,
+            temperature: None,
+            max_turns: None,
+            policy: None,
+            instructions: None,
+        },
+    );
+    let manifest = ModelManifest {
+        default: Some("small".to_string()),
+        strongest: None,
+        sensitive_paths: Vec::new(),
+        models,
+    };
+
+    let implementer = manifest.alias_for_model("combo:small");
+    let reviewer = manifest.alias_for_model("combo:deep");
+    let prompt = build_system_prompt(&manifest, &repo.path, &implementer);
+    assert!(
+        prompt.contains("Prefer one whole-file read."),
+        "the declaring model must be told: {prompt}"
+    );
+    assert!(
+        !build_system_prompt(&manifest, &repo.path, &reviewer)
+            .contains("Prefer one whole-file read."),
+        "a model that declares nothing must not inherit another model's rules"
+    );
+}
+
+/// The cut is recorded on the block, not merely applied, so the prompt can mark
+/// it and a second normalize pass cannot cut it again.
+#[test]
+fn test_truncating_an_instructions_block_is_idempotent_and_marked() {
+    let oversized = "z".repeat(MAX_MODEL_INSTRUCTIONS_BYTES + 500);
+    let manifest = single(ModelDefinition {
+        id: "combo:solo".to_string(),
+        role: None,
+        temperature: None,
+        max_turns: None,
+        policy: None,
+        instructions: Some(
+            serde_yaml::from_str(&format!("- {oversized}\n- tail\n")).expect("block"),
+        ),
+    });
+
+    let warnings = manifest.validate();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("instructions") && w.contains("budget")),
+        "the budget breach must be reported: {warnings:?}"
+    );
+
+    let normalized = manifest.clone().normalize();
+    let block = normalized.models["solo"]
+        .instructions
+        .as_ref()
+        .expect("block");
+    assert!(block.is_truncated());
+    assert!(
+        block.rendered_len() <= MAX_MODEL_INSTRUCTIONS_BYTES,
+        "the kept block must fit: {}",
+        block.rendered_len()
+    );
+
+    // Re-running the repair changes nothing and reports nothing new.
+    let twice = normalized.clone().normalize();
+    assert_eq!(
+        twice.models["solo"].instructions,
+        normalized.models["solo"].instructions
+    );
+    assert!(
+        twice.validate().is_empty(),
+        "a repaired manifest must stop warning: {:?}",
+        twice.validate()
     );
 }

@@ -228,6 +228,24 @@ mod tests {
         assert!(out.contains("    Role: coder"));
     }
 
+    /// The `manifest` view reports how many model-specific instructions reach
+    /// workers, so an operator can confirm the rules they wrote are in the
+    /// catalog. A model that declares none shows nothing.
+    #[test]
+    fn test_format_manifest_counts_per_model_instructions() {
+        let out = format_manifest(&v(r#"{"models":{
+                 "small":{"id":"s","instructions":["Read whole files.","Run the cheap gate."]},
+                 "deep":{"id":"d","instructions":[]}}}"#));
+        assert!(out.contains("instructions: 2"), "{out}");
+        assert!(
+            out.contains("- deep (id: d, instructions: 0)"),
+            "an empty block is still a declared count: {out}"
+        );
+        // A model without the field at all stays as it was.
+        let plain = format_manifest(&v(r#"{"models":{"plain":{"id":"p"}}}"#));
+        assert!(plain.ends_with("  - plain (id: p)"), "{plain}");
+    }
+
     #[test]
     fn test_format_list_renders_worker_rows_and_previews() {
         let out = format_list(&v(r#"{"workers":[{

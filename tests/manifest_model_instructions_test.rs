@@ -133,7 +133,7 @@ models:
   small:
     id: combo:small
     instructions: |
-      Read whole files instead of many small ranges.
+      Prefer one whole-file read over a dozen small ranges.
   deep:
     id: combo:deep
 "#,
@@ -143,11 +143,11 @@ models:
     let without = build_system_prompt(&manifest, repo.path(), "deep");
 
     assert!(
-        with.contains("Read whole files instead of many small ranges."),
+        with.contains("Prefer one whole-file read over a dozen small ranges."),
         "a worker of `small` must be told to read whole files: {with}"
     );
     assert!(
-        without.contains("Read whole files"),
+        !without.contains("Prefer one whole-file read"),
         "a worker of `deep` must not inherit `small`'s rules: {without}"
     );
     // The heading names the source, so a worker can tell these rules from the
@@ -221,7 +221,9 @@ models:
 
     let implementer = manifest.alias_for_model("combo:small");
     let reviewer = manifest.alias_for_model("combo:deep");
-    let reviewer_block = manifest.instructions_for(&reviewer).expect("reviewer block");
+    let reviewer_block = manifest
+        .instructions_for(&reviewer)
+        .expect("reviewer block");
 
     assert_eq!(
         reviewer_block.entries()[0],
@@ -230,13 +232,18 @@ models:
     // The implementer's own model is what the implementation prompt carries, and
     // neither block mentions the other's rule.
     assert_eq!(
-        manifest.instructions_for(&implementer).expect("implementer block").entries()[0],
+        manifest
+            .instructions_for(&implementer)
+            .expect("implementer block")
+            .entries()[0],
         "Read whole files instead of many small ranges."
     );
-    assert!(!reviewer_block
-        .entries()
-        .iter()
-        .any(|e| e.contains("many small ranges")));
+    assert!(
+        !reviewer_block
+            .entries()
+            .iter()
+            .any(|e| e.contains("many small ranges"))
+    );
 }
 
 /// An unknown model passes through and finds no block, which keeps a
@@ -274,13 +281,18 @@ fn test_instructions_over_the_budget_are_warned_about_and_truncated() {
          never reached\n"
     );
 
-    let raw = parse_manifest(&yaml);
+    // The warning belongs to the un-repaired manifest: `normalize` is what cuts
+    // the block, and it runs after validation on the load path.
+    let raw: ModelManifest = serde_yaml::from_str(&yaml).expect("parses");
     let warnings = raw.validate();
     assert!(
-        warnings.iter().any(|w| w.contains("instructions") && w.contains("budget")),
+        warnings
+            .iter()
+            .any(|w| w.contains("instructions") && w.contains("budget")),
         "an over-long block must be reported: {warnings:?}"
     );
 
+    let raw = raw.normalize();
     let block = raw.instructions_for("small").expect("block");
     assert!(
         block.rendered_len() <= MAX_MODEL_INSTRUCTIONS_BYTES,
@@ -291,7 +303,10 @@ fn test_instructions_over_the_budget_are_warned_about_and_truncated() {
 
     let repo = TempDir::new_in_tmp("model-instructions-cap");
     let prompt = build_system_prompt(&raw, repo.path(), "small");
-    assert!(prompt.contains("never reached") == false, "the tail is dropped");
+    assert!(
+        prompt.contains("never reached") == false,
+        "the tail is dropped"
+    );
     assert!(prompt.contains("[truncated"), "the cut is marked: {prompt}");
 }
 
@@ -311,8 +326,13 @@ fn test_normalizing_a_truncated_block_is_idempotent() {
     assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
     assert_eq!(
         serde_yaml::to_string(&block).expect("serializes"),
-        serde_yaml::to_string(manifest.models["small"].instructions.as_ref().expect("declares"))
-            .expect("serializes"),
+        serde_yaml::to_string(
+            manifest.models["small"]
+                .instructions
+                .as_ref()
+                .expect("declares")
+        )
+        .expect("serializes"),
         "the list form is what serializes back out"
     );
 }

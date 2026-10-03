@@ -265,9 +265,11 @@ impl ModelInstructions {
         if kept == 0 {
             // One entry bigger than the budget: keep its head, rounded down so
             // the block stays inside the budget and the slice cannot split a
-            // multi-byte code point.
+            // multi-byte code point. Everything behind it is dropped — the head
+            // alone already fills the budget.
             let head = max_bytes.saturating_sub(1).min(self.entries[0].len());
             let head = floor_char_boundary(&self.entries[0], head);
+            self.entries.truncate(1);
             self.entries[0] = self.entries[0][..head].to_string();
         } else {
             self.entries.truncate(kept);
