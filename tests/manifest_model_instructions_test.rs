@@ -28,6 +28,7 @@ use mini_swe_mcp::agent::SYSTEM_PROMPT;
 use mini_swe_mcp::manifest::{
     MAX_MODEL_INSTRUCTIONS_BYTES, ModelInstructions, ModelManifest, build_system_prompt,
 };
+use std::path::Path;
 
 /// Parse a `models.yaml` the way the loader does.
 fn parse_manifest(yaml: &str) -> ModelManifest {
@@ -334,5 +335,171 @@ fn test_normalizing_a_truncated_block_is_idempotent() {
         )
         .expect("serializes"),
         "the list form is what serializes back out"
+    );
+}
+
+// ----------
+// 5. End to end: the review phase of a real dispatch
+// ----------
+
+/// Dispatch a worker with `--review-after` against the fake LLM and return the
+/// system prompt of every request the run made, implementation turns first.
+async fn system_prompts_of_a_reviewed_run(repo: &Path, manifest_yaml: &str) -> Vec<String> {
+    // `echo` completes immediately; the reviewer then gets one completion turn.
+    let llm = common::fake_llm::FakeLlm::spawn_gate_then_complete("echo baseline").await;
+    let scratch = TempDir::new_in_tmp("model-instructions-e2e");
+    let manifest = parse_manifest(manifest_yaml);
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        llm.base_url().to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(std::sync::Arc::new(manifest));
+
+    let worker_id = pool
+        .dispatch(
+            "e2e-owner".to_string(),
+            "exercise the review phase".to_string(),
+            "small".to_string(),
+            None,
+            repo.to_path_buf(),
+            12,
+            Some("e2e".to_string()),
+            Some("deep".to_string()),
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+
+    // Poll for the terminal state rather than sleeping a fixed amount: the run
+    // ends when both phases have finished.
+    let mut state = None;
+    for _ in 0..600 {
+        if let Some(s) = pool.get_worker_state(&worker_id).await {
+            if matches!(
+                s,
+                mini_swe_mcp::pool::WorkerState::Completed { .. }
+                    | mini_swe_mcp::pool::WorkerState::Failed { .. }
+                    | mini_swe_mcp::pool::WorkerState::Exhausted { .. }
+            ) {
+                state = Some(s);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    state.expect("worker reaches a terminal state");
+
+    llm.request_bodies()
+        .await
+        .iter()
+        .filter_map(|body| {
+            body["messages"]
+                .as_array()?
+                .first()
+                .filter(|m| m["role"] == "system")?
+                .get("content")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// A git repository a worker can be dispatched against.
+struct TestRepo(std::path::PathBuf);
+
+impl TestRepo {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("model-instructions-e2e-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch repo");
+        let dir = dir.canonicalize().expect("canonicalize scratch repo");
+        git(&dir, &["init", "-b", "master"]);
+        git(&dir, &["config", "user.name", "mini-swe-test"]);
+        git(&dir, &["config", "user.email", "test@localhost"]);
+        std::fs::write(dir.join("README.md"), "# scratch\n").expect("seed file");
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "-m", "baseline"]);
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestRepo {
+    fn drop(&mut self) {
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The review phase is a second conversation with a different model, and it must
+/// be corrected by *that* model's block: the implementer's rule never reaches the
+/// reviewer, and the reviewer's rule never reached the implementer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_review_phase_carries_the_reviewer_model_instructions() {
+    let repo = TestRepo::new("reviewer");
+    let prompts = system_prompts_of_a_reviewed_run(
+        repo.path(),
+        r#"
+models:
+  small:
+    id: combo:small
+    instructions: |
+      IMPLEMENTER-ONLY-RULE: prefer one whole-file read.
+  deep:
+    id: combo:deep
+    instructions: |
+      REVIEWER-ONLY-RULE: question the assumption before accepting it.
+"#,
+    )
+    .await;
+
+    let implementer: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.contains("IMPLEMENTER-ONLY-RULE"))
+        .collect();
+    let reviewer: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.contains("REVIEWER-ONLY-RULE"))
+        .collect();
+
+    assert!(
+        !implementer.is_empty(),
+        "the implementation prompt must carry its own model's rule: {prompts:?}"
+    );
+    assert!(
+        !reviewer.is_empty(),
+        "the review prompt must carry the reviewer's rule: {prompts:?}"
+    );
+    assert!(
+        implementer
+            .iter()
+            .all(|p| !p.contains("REVIEWER-ONLY-RULE")),
+        "the implementer must not be given the reviewer's rules: {implementer:?}"
+    );
+    assert!(
+        reviewer
+            .iter()
+            .all(|p| !p.contains("IMPLEMENTER-ONLY-RULE")),
+        "the reviewer must not inherit the implementer's rules: {reviewer:?}"
     );
 }
