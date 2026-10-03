@@ -348,6 +348,125 @@ fn without_a_skip_the_trigger_and_the_upgrade_are_unchanged() {
 }
 
 // ----------
+// Which commit an approval names
+// ----------
+
+/// The approval must name the commit that *contains* the reviewed code.
+///
+/// The reviewer leaves the tree at some HEAD, and the harness then commits that
+/// tree. Recording the pre-commit HEAD would leave the reviewed tree itself
+/// outside the approval: the next revision re-audits code already reviewed, and
+/// -- with the approval now a subtraction set -- a consolidator re-audits it too.
+/// So once the harness's commit is made and the tree is provably still the tree
+/// the reviewer left, the next run must find nothing new and skip.
+#[tokio::test]
+async fn the_approval_names_the_commit_that_carries_the_reviewed_tree() {
+    let (dir, base) = repo("scope_approval_commit");
+    // The reviewer approved the tree while it was still uncommitted, at this HEAD.
+    let reviewer_head = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    std::fs::create_dir_all(dir.path().join("src/hub")).unwrap();
+    std::fs::write(dir.path().join("src/hub/socket.rs"), "reviewed change").unwrap();
+    common::git(dir.path(), &["add", "src/hub/socket.rs"]);
+
+    // The harness commits that tree.
+    common::git(dir.path(), &["commit", "-q", "-m", "worker(w1): reviewed"]);
+    let harness_commit = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    assert_ne!(
+        reviewer_head, harness_commit,
+        "the harness commit is after the HEAD the reviewer started from"
+    );
+
+    // The approval is the harness's commit, so nothing is left to audit.
+    let scope = scope_for(
+        dir.path(),
+        "worker-w1",
+        WorkerRole::Worker,
+        &base,
+        Some(harness_commit.clone()),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        scope.skip_log().as_deref(),
+        Some(
+            format!("security review skipped: no sensitive change since {harness_commit}").as_str()
+        ),
+        "a revision with no new change after an approved review must skip the security review"
+    );
+
+    // The pre-commit HEAD would not have: it names nothing of the reviewed tree,
+    // which is exactly the re-review this fix removes.
+    let stale = scope_for(
+        dir.path(),
+        "worker-w1",
+        WorkerRole::Worker,
+        &base,
+        Some(reviewer_head.clone()),
+        &[],
+    )
+    .await;
+    assert_ne!(
+        stale.skip_log(),
+        Some(format!(
+            "security review skipped: no sensitive change since {reviewer_head}"
+        )),
+        "approving the pre-commit HEAD leaves the reviewed commit itself unaudited"
+    );
+}
+
+/// The approval follows the tree only while the tree is still the one that was
+/// reviewed. A commit landing after the review means the harness's commit is not
+/// that tree's commit, so the approval stays behind and the difference is
+/// re-reviewed rather than silently waved through.
+#[tokio::test]
+async fn a_tree_changed_after_the_review_is_not_approved_by_the_newer_commit() {
+    let (dir, base) = repo("scope_approval_moved");
+    let reviewer_head = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    std::fs::create_dir_all(dir.path().join("src/hub")).unwrap();
+    std::fs::write(dir.path().join("src/hub/socket.rs"), "reviewed change").unwrap();
+    common::git(dir.path(), &["add", "src/hub/socket.rs"]);
+    common::git(dir.path(), &["commit", "-q", "-m", "worker(w1): reviewed"]);
+    let reviewed_commit = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // Something the reviewer never saw lands on the branch afterwards.
+    let after = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/identity.rs",
+        "later change",
+    );
+    assert_ne!(reviewer_head, after);
+
+    let scope = scope_for(
+        dir.path(),
+        "worker-w1",
+        WorkerRole::Worker,
+        &base,
+        Some(reviewer_head),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        scope.skip_log(),
+        None,
+        "a commit after the review must be audited; approving the newer commit would skip it"
+    );
+    assert_eq!(
+        scope.reviewed_commits(),
+        vec![reviewed_commit, after],
+        "a stale approval re-reviews the reviewed commit too -- conservative, and never a missed audit"
+    );
+}
+
+// ----------
 // Which merged branches may leave the audit
 // ----------
 
@@ -377,11 +496,16 @@ fn a_merged_branch_leaves_the_audit_only_when_it_was_security_approved() {
 /// keeps growing after its review, and excluding its current tip would subtract
 /// commits nobody ever audited -- the consolidator would be the only reviewer
 /// that could still have caught them.
-#[test]
+#[tokio::test]
 async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() {
     let (dir, base) = repo("scope_beyond_approval");
     // The worker is security-reviewed at `approved`, then lands more work.
-    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "reviewed change");
+    let approved = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "reviewed change",
+    );
     let unaudited = commit(
         dir.path(),
         "worker-w1",
@@ -392,8 +516,16 @@ async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() 
 
     // A consolidator merges the branch at its tip.
     common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", "master"]);
-    common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"]);
-    let own = commit(dir.path(), "worker-c1", "src/hub/handshake.rs", "resolve the interaction");
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let own = commit(
+        dir.path(),
+        "worker-c1",
+        "src/hub/handshake.rs",
+        "resolve the interaction",
+    );
 
     let scope = scope_for(
         dir.path(),
@@ -419,7 +551,10 @@ async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() 
         "the consolidator's own commit is its to audit"
     );
     assert!(
-        scope.reviewed_files(dir.path()).await.contains(&"src/hub/identity.rs".to_string()),
+        scope
+            .reviewed_files(dir.path())
+            .await
+            .contains(&"src/hub/identity.rs".to_string()),
         "the unaudited sensitive change must be probed, or the trigger never fires: {:?}",
         scope.reviewed_files(dir.path()).await
     );
