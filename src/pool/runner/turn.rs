@@ -2459,6 +2459,7 @@ mod tests {
             last_gate_step: None,
             last_guard_step: None,
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, false, 10), Some(10));
     }
@@ -2471,6 +2472,7 @@ mod tests {
             last_gate_step: Some(25),
             last_guard_step: None,
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, false, 10), Some(10));
     }
@@ -2483,6 +2485,7 @@ mod tests {
             last_gate_step: None,
             last_guard_step: None,
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, false, 10), None);
     }
@@ -2495,6 +2498,7 @@ mod tests {
             last_gate_step: None,
             last_guard_step: Some(28),
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, false, 10), None);
     }
@@ -2507,6 +2511,7 @@ mod tests {
             last_gate_step: None,
             last_guard_step: None,
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, true, 10), None);
     }
@@ -2519,6 +2524,7 @@ mod tests {
             last_gate_step: None,
             last_guard_step: None,
             step: 30,
+            last_sample_step: Some(30),
         };
         assert_eq!(grant_extension(&recent, false, 0), None);
     }

@@ -1128,6 +1128,7 @@ fn measured_entry() -> WorkerRegistryEntry {
             turns_used: 142,
             extensions_granted: 4,
             extensions_refused: 2,
+            auto_extensions_granted: 0,
             repeat_blocks: 3,
             stagnation_nudges: 1,
             loop_pauses: 1,

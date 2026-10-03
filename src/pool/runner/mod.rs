@@ -442,38 +442,38 @@ impl WorkerPool {
                 step += 1;
                 let max_turns_for_config = current_max_turns;
                 let turn_config = TurnConfig {
-                label_prefix: "",
-                steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
-                apply_sentinels: true,
-                llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
-                status: RegistryStatus::Running,
-                model: &model,
-                max_turns: max_turns_for_config,
-                task: &task,
-                temperature,
-                review_after: review_after.as_deref(),
-                network_offline,
-            };
-            let mut engine = TurnEngine {
-                pool: self,
-                worktree,
-                runner: &runner,
-                worker_id,
-                meta,
-                messages,
-                unsaved_messages: Vec::new(),
-                step: &mut step,
-                current_max_turns: &mut current_max_turns,
-                last_assistant_text: &mut last_assistant_text,
-                consecutive_no_cmd: &mut consecutive_no_cmd,
-                verify: verify.as_deref(),
-                client_env: &client_env,
-                dispatch_max_turns: max_turns,
-                watch: &mut watch,
-                report: &mut report,
-                report_asked: &mut report_asked,
-                report_text: &mut report_text,
-            };
+                    label_prefix: "",
+                    steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
+                    apply_sentinels: true,
+                    llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
+                    status: RegistryStatus::Running,
+                    model: &model,
+                    max_turns: max_turns_for_config,
+                    task: &task,
+                    temperature,
+                    review_after: review_after.as_deref(),
+                    network_offline,
+                };
+                let mut engine = TurnEngine {
+                    pool: self,
+                    worktree,
+                    runner: &runner,
+                    worker_id,
+                    meta,
+                    messages,
+                    unsaved_messages: Vec::new(),
+                    step: &mut step,
+                    current_max_turns: &mut current_max_turns,
+                    last_assistant_text: &mut last_assistant_text,
+                    consecutive_no_cmd: &mut consecutive_no_cmd,
+                    verify: verify.as_deref(),
+                    client_env: &client_env,
+                    dispatch_max_turns: max_turns,
+                    watch: &mut watch,
+                    report: &mut report,
+                    report_asked: &mut report_asked,
+                    report_text: &mut report_text,
+                };
                 match engine.run_turn(&turn_config).await? {
                     TurnOutcome::Completed { verified: v } => {
                         // Flush the completion turn too: a reused verify pushes its
@@ -498,7 +498,11 @@ impl WorkerPool {
             // The budget ran out before the completion sentinel: decide on one
             // automatic extension, or fall through to the exhausted branch.
             let summary = watch.progress_summary(step);
-            match turn::grant_extension(&summary, auto_extended, turn::auto_extension_budget(max_turns)) {
+            match turn::grant_extension(
+                &summary,
+                auto_extended,
+                turn::auto_extension_budget(max_turns),
+            ) {
                 Some(n) => {
                     auto_extended = true;
                     current_max_turns += n;
