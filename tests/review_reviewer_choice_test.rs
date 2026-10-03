@@ -19,9 +19,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -40,43 +39,6 @@ fn catalog(strongest: bool) -> ModelManifest {
         "default: ninja\n{strongest_line}models:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n"
     );
     serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("catalog YAML must parse: {e}\n{yaml}"))
-}
-
-/// A throwaway git repository whose `AGENTS.md` declares a sensitive glob.
-struct TestRepo {
-    dir: PathBuf,
-}
-
-impl TestRepo {
-    fn new(tag: &str, sensitive: &[&str]) -> Self {
-        let dir = common::process_temp_dir(&format!("review-reviewer-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch repo");
-        let dir = dir.canonicalize().expect("canonicalize scratch repo");
-        common::git(&dir, &["init", "-b", "master"]);
-        common::git(&dir, &["config", "user.name", "mini-swe-test"]);
-        common::git(&dir, &["config", "user.email", "test@localhost"]);
-        std::fs::write(dir.join("README.md"), "# scratch\n").expect("seed file");
-        let mut agents = String::from("## Sensitive paths\n\n");
-        for glob in sensitive {
-            agents.push_str(&format!("- {glob}\n"));
-        }
-        std::fs::write(dir.join("AGENTS.md"), agents).expect("write AGENTS.md");
-        common::git(&dir, &["add", "README.md", "AGENTS.md"]);
-        common::git(&dir, &["commit", "-m", "baseline"]);
-        Self { dir }
-    }
-
-    fn path(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for TestRepo {
-    fn drop(&mut self) {
-        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
 }
 
 /// Dispatch one worker on `model` with `review_after` and wait for it to stop.
@@ -111,24 +73,10 @@ async fn dispatch_and_wait(
         )
         .await
         .expect("dispatch the worker");
-    let state = wait_for_terminal(&pool, &worker_id).await;
+    let state = common::wait_for_terminal(&pool, &worker_id).await;
     (pool, worker_id, state, scratch)
 }
 
-async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
-    for _ in 0..600 {
-        if let Some(state) = pool.get_worker_state(worker_id).await {
-            match state {
-                WorkerState::Completed { .. }
-                | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { .. } => return state,
-                WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("worker {worker_id} did not reach a terminal state");
-}
 
 /// The model each request in the run asked for, in order.
 fn models_of(bodies: &[Value]) -> Vec<String> {
@@ -171,7 +119,8 @@ fn review_prompt_of(bodies: &[Value]) -> Option<String> {
 /// `combo:nerd`, not on the `combo:ninja` worker that wrote the diff.
 #[tokio::test]
 async fn the_strongest_tier_reviews_the_sensitive_diff() {
-    let repo = TestRepo::new("strongest", &["src/hub/**"]);
+    let repo = common::TestRepo::new("strongest");
+    repo.declare_sensitive(&["src/hub/**"]);
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
         "mkdir -p src/hub && echo changed > src/hub/mod.rs",
         &format!("echo {COMPLETION_SENTINEL}"),
@@ -212,7 +161,8 @@ async fn the_strongest_tier_reviews_the_sensitive_diff() {
 /// `default:` -- and still not to the worker's own `--model`.
 #[tokio::test]
 async fn without_a_strongest_tier_the_default_reviews() {
-    let repo = TestRepo::new("default", &["src/hub/**"]);
+    let repo = common::TestRepo::new("default");
+    repo.declare_sensitive(&["src/hub/**"]);
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
         "mkdir -p src/hub && echo changed > src/hub/mod.rs",
         &format!("echo {COMPLETION_SENTINEL}"),
@@ -248,7 +198,8 @@ async fn without_a_strongest_tier_the_default_reviews() {
 /// orchestrator's instruction is the reviewer's choice, not the harness's.
 #[tokio::test]
 async fn an_explicit_review_after_wins() {
-    let repo = TestRepo::new("explicit", &["src/hub/**"]);
+    let repo = common::TestRepo::new("explicit");
+    repo.declare_sensitive(&["src/hub/**"]);
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
         "mkdir -p src/hub && echo changed > src/hub/mod.rs",
         &format!("echo {COMPLETION_SENTINEL}"),
@@ -283,7 +234,7 @@ async fn an_explicit_review_after_wins() {
 /// and a requested one is not rerouted through the strongest tier.
 #[tokio::test]
 async fn a_requested_quality_review_keeps_its_model() {
-    let repo = TestRepo::new("quality", &[]);
+    let repo = common::TestRepo::new("quality");
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&[
         "echo changed > src/ordinary.rs",
         &format!("echo {COMPLETION_SENTINEL}"),
