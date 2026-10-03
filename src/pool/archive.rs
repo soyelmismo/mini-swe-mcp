@@ -162,8 +162,17 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     ensure_dir(dir)?;
     // Rotation before the open: the rename and the append cannot interleave
     // into the same file, so the rotated generation is always a whole file.
-    if let Ok(size) = std::fs::metadata(&path).map(|meta| meta.len())
-        && size.saturating_add(line.len() as u64) > ARCHIVE_MAX_BYTES
+    //
+    // `symlink_metadata`, never `metadata`: a planted `archive.jsonl` symlink
+    // would otherwise be measured by its *target's* size and, over the cap,
+    // renamed into the rotated generation -- leaving a symlink the archive
+    // itself would later read through, aimed at whatever the hub directory's
+    // owner pointed it at. A path that is a symlink is not this process's file
+    // and is never rotated; the open below refuses it with `ELOOP`, which is
+    // the same refusal the write itself would have earned.
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_file()
+        && meta.len().saturating_add(line.len() as u64) > ARCHIVE_MAX_BYTES
     {
         let rotated = rotated_path(dir);
         // Replace the previous generation outright rather than appending to it:
