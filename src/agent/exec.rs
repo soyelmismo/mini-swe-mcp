@@ -2104,6 +2104,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The retained head/tail must be decodable: `Captured::push` cuts at the
+    /// raw byte budget, so a stream whose head or tail boundary falls inside a
+    /// multi-byte code point used to hand `combine_streams` bytes that decoded
+    /// to U+FFFD.
+    #[test]
+    fn captured_keeps_head_and_tail_on_char_boundaries() {
+        // Every char is 3 bytes and the budget is a multiple of 3, but the
+        // chunked push below lands the cut mid-char regardless of alignment
+        // once the stream is padded by a leading ASCII byte.
+        let mut captured = Captured::new();
+        let mut stream = String::from("x");
+        stream.push_str(&"\u{65e5}".repeat(20_000));
+        captured.push(stream.as_bytes());
+
+        let retained = captured.captured();
+        let text = std::str::from_utf8(&retained)
+            .unwrap_or_else(|err| panic!("retained bytes are not valid UTF-8: {err}"));
+        assert!(
+            !text.contains('\u{fffd}'),
+            "a truncated code point must not become a replacement character"
+        );
+        assert!(
+            text.starts_with('x') && text.ends_with('\u{65e5}'),
+            "the kept head and tail must be whole code points"
+        );
+    }
+
     #[test]
     fn combine_streams_joins_both_streams_and_truncates() {
         // Both streams non-empty: stdout, the separator, then stderr.
