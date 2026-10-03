@@ -435,6 +435,81 @@ fn a_worker_integrated_by_squash_is_not_unintegrated() {
     assert!(f.repo().join("round.md").exists());
 }
 
+/// A member whose commits cancel out is still unintegrated, and is refused.
+///
+/// This is the blind spot a *net* content proof has. `worker-wa` adds a file and
+/// a second commit deletes it again: the net tree of the round and of the member
+/// are identical, so "merging this member changes nothing" is true -- while two
+/// commits that exist only on `worker-wa` are still unlanded. A round proved
+/// that way lands silently with work stranded on a branch nobody owns, which is
+/// the failure this whole check exists to prevent, so the proof has to be per
+/// commit rather than per tree.
+#[test]
+fn a_member_whose_commits_cancel_out_is_refused() {
+    let f = Fixture::new("round-cancel");
+    f.consolidator("c1", &["wa"]);
+    // Two commits, one adding work and one removing it again: the branch and
+    // the round end up with identical trees.
+    f.commit_on("worker-wa", "cancel.md", "work\n", "add then remove");
+    git(f.repo(), &["checkout", "-q", "worker-wa"]);
+    git(f.repo(), &["rm", "-q", "cancel.md"]);
+    git(f.repo(), &["commit", "-q", "-m", "remove it again"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+
+    // The premise, asserted: merging the member into the round changes no tree,
+    // so a proof that compares net trees would call this member integrated. Only
+    // a per-commit proof can tell it apart from an integrated one.
+    assert!(
+        !is_ancestor(f.repo(), "worker-wa", "worker-c1"),
+        "the member's commits must be unreachable from the round"
+    );
+    let merged = std::process::Command::new("git")
+        .args(["merge-tree", "--write-tree", "worker-c1", "worker-wa"])
+        .current_dir(f.repo())
+        .output()
+        .expect("merge-tree must run");
+    assert!(
+        merged.status.success(),
+        "the member must merge cleanly, or this is not the case under test"
+    );
+    let merged_tree = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert_eq!(
+        merged_tree,
+        git(f.repo(), &["rev-parse", "worker-c1^{tree}"]).trim(),
+        "merging the member must leave the round's tree unchanged, or this is not the \
+         case under test"
+    );
+
+    let reported = unintegrated_workers_in(&f.root(), "c1");
+    assert_eq!(
+        reported.len(),
+        1,
+        "commits that cancel out are still unintegrated commits: {reported:?}"
+    );
+    assert_eq!(reported[0].worker_id, "wa");
+    assert_eq!(
+        reported[0].commits,
+        Some(2),
+        "both commits are unlanded, so both are counted"
+    );
+    let err = f
+        .merge("c1", false)
+        .expect_err("a member whose commits only exist on its branch must refuse the round");
+    assert!(
+        format!("{err:#}").contains("wa"),
+        "the refusal names the member: {err:#}"
+    );
+    assert!(
+        !f.repo().join("round.md").exists(),
+        "a refused merge must not land the round"
+    );
+}
+
 /// A member whose change the round does not carry at all is still refused,
 /// even when the merge is textually clean: git says what merges, the tree says
 /// what would change.
