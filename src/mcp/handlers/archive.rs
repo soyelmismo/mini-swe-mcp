@@ -39,7 +39,12 @@ impl McpServer {
         // was tracked) is unattributed and never shown to a non-admin caller.
         let scoped_owner = owner.clone();
         let records = tokio::task::spawn_blocking(move || {
-            crate::pool::archive::read_records(&dir, scoped_owner.as_deref(), group.as_deref(), last)
+            crate::pool::archive::read_records(
+                &dir,
+                scoped_owner.as_deref(),
+                group.as_deref(),
+                last,
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("archive read failed: {e}"))??;

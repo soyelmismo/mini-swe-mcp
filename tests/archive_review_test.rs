@@ -81,8 +81,11 @@ impl Fixture {
     fn commit_on_worker_branch(&self, id: &str) {
         let branch = format!("worker-{id}");
         common::git(self.repo.path(), &["checkout", "-q", "-b", &branch]);
-        std::fs::write(self.repo.path().join(format!("{id}.txt")), "from the worker\n")
-            .expect("writable");
+        std::fs::write(
+            self.repo.path().join(format!("{id}.txt")),
+            "from the worker\n",
+        )
+        .expect("writable");
         common::git(self.repo.path(), &["add", "."]);
         common::git(self.repo.path(), &["commit", "-m", &format!("worker {id}")]);
         common::git(self.repo.path(), &["checkout", "-q", "main"]);
@@ -139,9 +142,7 @@ fn last_counts_the_callers_own_lines() {
     // of the whole file.
     let all = archive::read_records(hub.path(), None, None, Some(2)).expect("readable");
     assert_eq!(
-        all.iter()
-            .map(|r| r.worker_id.as_str())
-            .collect::<Vec<_>>(),
+        all.iter().map(|r| r.worker_id.as_str()).collect::<Vec<_>>(),
         ["theirs3", "theirs4"],
         "{all:?}"
     );
@@ -199,6 +200,11 @@ fn no_delete_archives_nobody() {
     // The same worker's real retirement does archive it, so the fix is not
     // "the merge stopped archiving": a merge that really deletes the branch
     // writes the line the `--no-delete` merge did not.
+    // The gate needs something to run: a repository with no recognised manifest
+    // has no detectable verify command, and "unknown" never skips the gate.
+    std::fs::write(f.repo.path().join("Makefile"), "test:\n\t@true\n").expect("writable");
+    common::git(f.repo.path(), &["add", "."]);
+    common::git(f.repo.path(), &["commit", "-m", "a gate that passes"]);
     common::git(f.repo.path(), &["checkout", "-q", "worker-w1"]);
     std::fs::write(f.repo.path().join("w1.txt"), "more from the worker\n").expect("writable");
     common::git(f.repo.path(), &["add", "."]);
@@ -267,10 +273,18 @@ fn an_existing_loose_archive_is_tightened() {
     std::fs::write(&path, b"").expect("writable");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
-    archive::append_record(hub.path(), &record("w1", OWNER, None)).expect("the append must succeed");
+    archive::append_record(hub.path(), &record("w1", OWNER, None))
+        .expect("the append must succeed");
 
-    let mode = std::fs::metadata(&path).expect("the archive exists").permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "an existing archive is tightened to owner-only: {mode:o}");
+    let mode = std::fs::metadata(&path)
+        .expect("the archive exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "an existing archive is tightened to owner-only: {mode:o}"
+    );
 }
 
 /// The cap is a bound on what is kept, so it holds for both generations and for
@@ -290,7 +304,8 @@ fn both_generations_stay_inside_the_cap() {
     };
 
     for i in 0..200 {
-        archive::append_record(hub.path(), &big(&format!("w{i}"))).expect("the append must succeed");
+        archive::append_record(hub.path(), &big(&format!("w{i}")))
+            .expect("the append must succeed");
     }
 
     let live = std::fs::metadata(hub.path().join(archive::ARCHIVE_FILE))
@@ -299,7 +314,10 @@ fn both_generations_stay_inside_the_cap() {
     let rotated = std::fs::metadata(hub.path().join(archive::ARCHIVE_ROTATED_FILE))
         .expect("200 maximal lines must have crossed the cap and rotated")
         .len();
-    assert!(live <= ARCHIVE_MAX_BYTES, "the live generation grew past the cap: {live}");
+    assert!(
+        live <= ARCHIVE_MAX_BYTES,
+        "the live generation grew past the cap: {live}"
+    );
     assert!(
         rotated <= ARCHIVE_MAX_BYTES,
         "the rotated generation grew past the cap: {rotated}"

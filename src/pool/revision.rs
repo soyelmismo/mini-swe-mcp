@@ -659,7 +659,7 @@ pub fn retire_worker_reporting(
         // then would drop this worker from the merge report, leaving its watch
         // acknowledgement and replay state behind.
         row_removed = super::load_registry_entry_in(root, worker_id).is_none();
-        if let Some(dir) = ctx.ack_dir {
+        if let Some(dir) = ctx.ack_dir.filter(|_| !ctx.keep_branch) {
             crate::mcp::events::forget_watch_acks(dir, worker_id);
         }
     } else if let Some(mut row) = super::load_registry_entry_in(root, worker_id)

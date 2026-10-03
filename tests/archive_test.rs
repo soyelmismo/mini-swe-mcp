@@ -105,7 +105,8 @@ impl Fixture {
 
     /// The archive's own lines, oldest first, as the reader parses them.
     fn records(&self) -> Vec<ArchiveRecord> {
-        archive::read_records(self.hub.path(), None, None, None).expect("the archive must be readable")
+        archive::read_records(self.hub.path(), None, None, None)
+            .expect("the archive must be readable")
     }
 
     fn archive_path(&self) -> PathBuf {
@@ -250,12 +251,12 @@ fn the_read_is_owner_scoped() {
     // Both lines are on disk; scoping is what decides who reads them.
     assert_eq!(f.records().len(), 2, "both retirements are archived");
 
-    let owned = read_scoped(&f, OWNER);
+    let owned = archive::read_records(f.hub.path(), Some(OWNER), None, None).expect("readable");
     assert_eq!(owned.len(), 1, "{owned:?}");
     assert_eq!(owned[0].worker_id, "w1");
 
     // The admin override is the only way to see every owner's.
-    let all = read_scoped(&f, "");
+    let all = archive::read_records(f.hub.path(), None, None, None).expect("readable");
     assert_eq!(all.len(), 2, "{all:?}");
 }
 
@@ -276,7 +277,8 @@ fn group_and_last_narrow_the_read() {
         );
     }
 
-    let round_a = archive::read_records(f.hub.path(), None, Some("round-a"), None).expect("readable");
+    let round_a =
+        archive::read_records(f.hub.path(), None, Some("round-a"), None).expect("readable");
     assert_eq!(
         round_a
             .iter()
@@ -293,7 +295,8 @@ fn group_and_last_narrow_the_read() {
         ["w3"],
         "--last keeps the newest of the whole archive"
     );
-    let capped = archive::read_records(f.hub.path(), None, Some("round-a"), Some(1)).expect("readable");
+    let capped =
+        archive::read_records(f.hub.path(), None, Some("round-a"), Some(1)).expect("readable");
     assert_eq!(
         capped
             .iter()
@@ -369,15 +372,14 @@ fn the_archive_rotates_past_its_size_cap() {
 #[test]
 fn an_owner_with_nothing_retired_reads_an_empty_archive() {
     let f = Fixture::new("archive-empty");
-    assert!(read_scoped(&f, OWNER).is_empty());
-    assert!(read_scoped(&f, "").is_empty());
-}
-
-/// `read_scoped` applies the handler's owner rule to the lines on disk.
-fn read_scoped(f: &Fixture, owner: &str) -> Vec<ArchiveRecord> {
-    let all = f.records();
-    if owner.is_empty() {
-        return all;
-    }
-    all.into_iter().filter(|r| r.owner == owner).collect()
+    assert!(
+        archive::read_records(f.hub.path(), Some(OWNER), None, None)
+            .expect("readable")
+            .is_empty()
+    );
+    assert!(
+        archive::read_records(f.hub.path(), None, None, None)
+            .expect("readable")
+            .is_empty()
+    );
 }

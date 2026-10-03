@@ -259,10 +259,7 @@ pub fn read_records(
 fn ensure_dir(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!(
-                "refusing to archive through the symlink {}",
-                dir.display()
-            );
+            anyhow::bail!("refusing to archive through the symlink {}", dir.display());
         }
         Ok(meta) if meta.is_dir() => return Ok(()),
         Ok(_) => {
