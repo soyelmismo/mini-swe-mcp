@@ -61,7 +61,10 @@ impl ServerOutput {
 
 // ---------------------------------------------------------------------------
 // Subprocess harness
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+//
+// Process-global env mutation is serialised behind [`common::ENV_MUTEX`], the
+// same lock every other module that mutates the process environment takes, so
+// no test in this binary observes a half-set value.
 
 /// One test's override of a process-wide environment variable, restored on drop.
 ///

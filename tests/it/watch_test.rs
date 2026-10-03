@@ -25,9 +25,14 @@ fn isolate_registry() -> PathBuf {
             // keeps reading it for as long as the test binary runs, so it is
             // removed at process exit rather than by a single test's guard.
             let path = common::process_temp_dir("watch-registry");
+            // Set `SWE_TEMP_DIR` under the shared env lock so no other module
+            // in this binary observes a half-set value while it is mutated.
+            let _env = common::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // SAFETY: `OnceLock` runs this closure exactly once and blocks every
-            // other caller until it returns, so no thread observes a half-set
-            // environment.
+            // other caller until it returns, and the env lock above excludes
+            // every other env-mutating test in this binary.
             unsafe { std::env::set_var("SWE_TEMP_DIR", &path) };
             path
         })

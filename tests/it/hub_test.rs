@@ -295,6 +295,11 @@ async fn world_writable_hub_dir_is_refused() {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
             .expect("chmod scratch dir");
     }
+    // `hub_dir()` reads `SWE_HUB_DIR` from the process environment, so this
+    // test must hold the shared env lock while it mutates the variable.
+    let _env = crate::common::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let before = std::env::var_os("SWE_HUB_DIR");
     unsafe { std::env::set_var("SWE_HUB_DIR", &dir) };
     let refused = hub_dir().is_err();

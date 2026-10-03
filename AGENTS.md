@@ -27,7 +27,7 @@ system prompt at dispatch time, so keep them short and actionable.
 
 ## Iterating
 
-- While working, build and run only what you touch: `cargo test --test <file>`
+- While working, build and run only what you touch: `cargo test --test it <module>::`
   or `cargo test <name>`, and `cargo check` instead of a full build.
 - A round's consolidator runs the full suite once, on the integrated result, so
   you do not have to run it per worker while you implement.
