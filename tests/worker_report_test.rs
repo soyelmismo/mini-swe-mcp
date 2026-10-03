@@ -478,6 +478,7 @@ fn json_channel_and_watch_events_keep_the_full_report_and_stats() {
         metrics: WorkerMetrics::default(),
         revision: 0,
         report: Some(report.clone()),
+    verdicts: None,
     };
     let mut view = json!({"worker_id":"json", "task":"probe"});
     watch::enrich_state(&mut view, &state);
@@ -557,6 +558,7 @@ async fn report_survives_eviction_in_status_review_and_collect() {
                 metrics: entry.metrics,
                 revision: 0,
                 report: Some(report.clone()),
+                verdicts: None,
             },
             metrics: entry.metrics,
             logs: LogBuffer::new(),

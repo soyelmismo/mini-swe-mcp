@@ -23,6 +23,7 @@ use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view, norm
 /// Owner label used when neither the pool nor the registry has a row.
 const UNKNOWN_OWNER: &str = "unknown";
 
+pub(super) mod archive;
 mod collect;
 pub(super) mod consolidate;
 mod discard;
@@ -247,6 +248,7 @@ impl McpServer {
             "logs" => self.handle_logs(args, ctx).await,
             "reap" => self.handle_reap().await,
             "list" => self.handle_list(args, ctx).await,
+            "archive" => self.handle_archive(args, ctx).await,
             "kill" => self.handle_kill(args, ctx).await,
             "discard" => self.handle_discard(args, ctx).await,
             "steer" => self.handle_steer(args, token, tx, ctx).await,

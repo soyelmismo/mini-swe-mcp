@@ -46,6 +46,9 @@ enum Script {
     /// A distinct benign command on every turn and never the sentinel, so a
     /// worker under this script can only end by exhausting its turn budget.
     Loop,
+    /// A heavy command on turn 1, a distinct benign command on turns 2 and 3,
+    /// then the completion sentinel from turn 4 on.
+    GateThenComplete { heavy: String },
     /// One scripted command per turn, by turn number (the number of `tool`
     /// results the request already carries). A turn past the end of the script
     /// is left unanswered, so a worker can only end by exhausting its budget.
@@ -68,6 +71,15 @@ impl FakeLlm {
     /// turn budget runs out.
     pub async fn spawn_looping() -> Self {
         Self::spawn_script(Script::Loop).await
+    }
+
+    /// Serve a heavy command on turn 1, benign commands on turns 2 and 3,
+    /// then the completion sentinel from turn 4 on.
+    pub async fn spawn_gate_then_complete(heavy: &str) -> Self {
+        Self::spawn_script(Script::GateThenComplete {
+            heavy: heavy.to_string(),
+        })
+        .await
     }
 
     async fn spawn_script(script: Script) -> Self {
@@ -173,6 +185,15 @@ async fn serve_turn(
         // Each turn writes a distinct file, so neither the repetition detector
         // nor the stagnation guard fires; the run ends only at the budget.
         Script::Loop => format!("echo loop > loop-turn-{turn}.txt"),
+        Script::GateThenComplete { heavy } => match turn {
+            0 => {
+                heavy_served.fetch_add(1, Ordering::Relaxed);
+                heavy.clone()
+            }
+            1 => "echo gate-turn-2 > gate-turn-2.txt".to_string(),
+            2 => "echo gate-turn-3 > gate-turn-3.txt".to_string(),
+            _ => format!("echo {}", mini_swe_mcp::pool::COMPLETION_SENTINEL),
+        },
         // Past the end of a scripted run there is nothing left to answer: the
         // socket closes empty, so the caller sees the turn it scripted end and
         // never a turn of someone else's script.

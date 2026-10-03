@@ -98,6 +98,7 @@ fn completed(id: &str, verified: bool) -> WorkerState {
         verified: Some(verified),
         metrics: WorkerMetrics::default(),
         revision: 0,
+        verdicts: None,
     }
 }
 

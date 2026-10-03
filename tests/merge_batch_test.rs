@@ -165,6 +165,7 @@ impl Fixture {
                 owner,
                 group,
                 admission: None,
+                archive_dir: None,
             },
         )
     }

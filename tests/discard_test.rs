@@ -282,6 +282,8 @@ async fn discard_removes_the_round_base_from_every_swept_directory() {
         &mini_swe_mcp::pool::RetireContext {
             repo: Some(f.repo()),
             ack_dir: None,
+            reason: None,
+            merge_commit: None,
             keep_branch: false,
         },
     );

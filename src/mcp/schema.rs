@@ -25,6 +25,7 @@ pub const WORKER_ACTIONS: &[&str] = &[
     "unapprove",
     "logs",
     "list",
+    "archive",
     "kill",
     "discard",
     "reap",
@@ -164,7 +165,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "temperature",
         "number",
-        DescriptionSource::Static("Model temperature (overrides default)."),
+        DescriptionSource::Static("Model temperature."),
     ),
     (
         "review_after",
@@ -199,7 +200,12 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "scope",
         "string",
-        DescriptionSource::Static("'list' scope: 'mine' (default) or 'all' (admin)."),
+        DescriptionSource::Static("'list'/'archive' scope: 'mine' (default) or 'all' (admin)."),
+    ),
+    (
+        "last",
+        "integer",
+        DescriptionSource::Static(super::handlers::archive::ARCHIVE_LAST_DESCRIPTION),
     ),
     (
         "full",

@@ -54,6 +54,19 @@ pub fn format_review(val: &serde_json::Value) -> String {
     {
         out.push_str(&format!("Summary: {summary}\n"));
     }
+    // A consolidator's per-worker verdicts, one line each: the round's
+    // headline says the round happened, these say what happened to each worker
+    // in it. They come after the summary, so the compact view still reads
+    // first.
+    if let Some(verdicts) = val
+        .get("verdicts")
+        .and_then(|v| v.as_array())
+        .filter(|verdicts| !verdicts.is_empty())
+    {
+        for line in verdicts.iter().filter_map(|v| v.as_str()) {
+            out.push_str(&format!("{line}\n"));
+        }
+    }
     if let Some(branch) = val.get("branch").and_then(|v| v.as_str()) {
         out.push_str(&format!("Branch: {branch}\n"));
     }

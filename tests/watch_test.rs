@@ -241,6 +241,7 @@ async fn completed_worker_is_reported_immediately_with_missed_marker() {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         },
     )])
     .await;
@@ -391,6 +392,7 @@ async fn an_interaction_marks_the_workers_events_seen() {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         },
     )])
     .await;
@@ -580,6 +582,7 @@ async fn the_binary_watches_through_the_hub() {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             },
         ),
         // Another agent's live worker: never watchable, never leaked.
@@ -755,6 +758,7 @@ async fn a_no_arg_watch_action_follows_late_dispatches() {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         },
     ))
     .await;
@@ -832,6 +836,7 @@ async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
             metrics: WorkerMetrics::default(),
             revision: 0,
             report: None,
+            verdicts: None,
         },
     ))
     .await;

@@ -25,7 +25,8 @@ impl McpServer {
                 logs_dropped: collected.logs_dropped,
                 logs_truncation_notice: collected.logs_truncation_notice,
             };
-            let (summary, verified, branch, report) = completed_fields(Some(&collected.state));
+            let (summary, verified, branch, report, _verdicts) =
+                completed_fields(Some(&collected.state));
             // Collect ends the worker's reviewable life, so the guidance is
             // about the branch it leaves behind rather than a further steer.
             let next_step = crate::pool::next_step_for(branch.as_deref());
