@@ -220,18 +220,21 @@ impl ReviewDiffScope {
 /// How many step logs a review looks back through for a failed verify.
 const VERIFY_TAIL_STEPS: usize = 8;
 
-/// The fields a finished worker carries: its summary, whether the gate
-/// verified it (always `None` for an exhausted worker, which never verified),
-/// and the branch it leaves behind.
-pub(super) fn completed_fields(
-    state: Option<&crate::pool::WorkerState>,
-) -> (
+/// What a terminal state carries that `collect` and `review` both show: the
+/// summary, whether the gate verified it (always `None` for an exhausted
+/// worker, which never verified), the branch, the structured report and a
+/// consolidator's per-worker verdicts. `None` throughout for a live worker,
+/// which has produced none of them yet.
+pub(super) type CompletedFields = (
     Option<String>,
     Option<bool>,
     Option<String>,
     Option<crate::pool::WorkerReport>,
     Option<crate::pool::WorkerVerdicts>,
-) {
+);
+
+/// The fields of a finished worker, read off its state.
+pub(super) fn completed_fields(state: Option<&crate::pool::WorkerState>) -> CompletedFields {
     match state {
         Some(crate::pool::WorkerState::Completed {
             summary,

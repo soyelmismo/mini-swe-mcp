@@ -14,9 +14,9 @@ mod common;
 use mini_swe_mcp::cli::watch;
 use mini_swe_mcp::mcp::{EventKind, Outcome, WorkerView, render_for_test};
 use mini_swe_mcp::pool::{
-    RegistryStatus, VERDICT_BYTES, WorkerMeta, WorkerPool, WorkerRegistryEntry, WorkerReport,
-    WorkerRole, WorkerState, WorkerVerdicts, load_registry_entry_in, parse_verdict_lines,
-    save_registry_entry_in,
+    COMPLETION_SENTINEL, RegistryStatus, VERDICT_BYTES, WorkerMeta, WorkerPool,
+    WorkerRegistryEntry, WorkerReport, WorkerRole, WorkerState, WorkerVerdicts,
+    load_registry_entry_in, parse_verdict_lines, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 
@@ -47,9 +47,7 @@ fn expected_verdicts() -> WorkerVerdicts {
             "REPORT 2a9aaca3 approved: the parser change stands".to_string(),
             "REPORT 41b0fde1 fixed: resolved the interaction in src/b.rs".to_string(),
         ],
-        risks: vec![
-            "RISK: the sandbox policy edit touched src/agent/sandbox.rs".to_string(),
-        ],
+        risks: vec!["RISK: the sandbox policy edit touched src/agent/sandbox.rs".to_string()],
     }
 }
 
@@ -107,11 +105,13 @@ fn a_consolidator_final_message_yields_its_verdicts_and_risks_in_order() {
 /// having a worker named `risks`.
 #[test]
 fn the_round_block_is_not_mistaken_for_a_verdict() {
-    let verdicts = parse_verdict_lines(
-        "REPORT\ndone: integrated\nrisks: none\nREPORT\nREPORT risK: hmm",
-    );
+    let verdicts =
+        parse_verdict_lines("REPORT\ndone: integrated\nrisks: none\nREPORT\nREPORT risK: hmm");
     assert!(verdicts.is_empty(), "{verdicts:?}");
-    assert_eq!(parse_verdict_lines("Nothing to report.").workers, Vec::<String>::new());
+    assert_eq!(
+        parse_verdict_lines("Nothing to report.").workers,
+        Vec::<String>::new()
+    );
 }
 
 /// A message with no per-worker lines yields nothing, so an ordinary worker's
@@ -127,7 +127,9 @@ fn a_message_without_per_worker_lines_yields_nothing() {
 #[test]
 fn the_completion_event_shows_the_verdicts_after_the_headline() {
     let text = completion_event(Some(expected_verdicts()));
-    let headline = text.find("Done: integrated 2 branches").expect("the headline leads");
+    let headline = text
+        .find("Done: integrated 2 branches")
+        .expect("the headline leads");
     let first = text
         .find("REPORT 2a9aaca3 approved: the parser change stands")
         .expect("the first verdict is shown");
@@ -151,20 +153,12 @@ fn the_completion_event_shows_the_verdicts_after_the_headline() {
 /// round reporting thousands of workers must not produce a transcript.
 #[test]
 fn the_completion_event_stays_bounded() {
-    let message = [
-        "REPORT\ndone: integrated everything\nrisks: none",
-        &format!(
-            "REPORT w{i} approved: branch {i} integrated cleanly and the gate is green",
-            i = 0
-        ),
-    ]
-    .join("\n");
+    // A round big enough that the ceiling is the only thing that stops it.
     let huge: String = (0..4000)
         .map(|i| {
             format!("REPORT w{i:05} approved: integrated branch {i} with the full gate green\n")
         })
         .collect();
-    let _ = message;
     let verdicts = parse_verdict_lines(&(String::from("REPORT\ndone: all\nrisks: none\n") + &huge));
     let payload = serde_json::to_string(&verdicts).expect("verdicts serialize");
     assert!(
@@ -224,7 +218,14 @@ async fn the_row_carries_the_verdicts_and_a_cold_reader_renders_them() {
     );
     let verdicts = expected_verdicts();
     let meta = meta_with_verdicts("c1", Some(verdicts.clone()));
-    let row = meta.entry("test-model", RegistryStatus::Completed, 6, 12, "cargo test", None);
+    let row = meta.entry(
+        "test-model",
+        RegistryStatus::Completed,
+        6,
+        12,
+        "cargo test",
+        None,
+    );
     save_registry_entry_in(&ScratchRoot::new(root.clone()), &row);
     drop(pool);
 
@@ -256,7 +257,14 @@ async fn a_worker_without_verdicts_carries_none() {
     let scratch = common::TempDir::new_in_tmp("verdict-none");
     let root = scratch.path().to_path_buf();
     let meta = meta_with_verdicts("c2", None);
-    let row = meta.entry("test-model", RegistryStatus::Completed, 1, 4, "cargo test", None);
+    let row = meta.entry(
+        "test-model",
+        RegistryStatus::Completed,
+        1,
+        4,
+        "cargo test",
+        None,
+    );
     save_registry_entry_in(&ScratchRoot::new(root.clone()), &row);
     let entry = load_registry_entry_in(&ScratchRoot::new(root), "c2").expect("the row exists");
     assert!(entry.verdicts.is_none());
@@ -315,9 +323,13 @@ fn the_completed_state_carries_the_verdicts_beside_the_report() {
     let details = json
         .get("details")
         .expect("a tagged state keeps its payload under `details`");
-    let back: Option<WorkerVerdicts> =
-        serde_json::from_value(details.get("verdicts").cloned().expect("verdicts serialize"))
-            .expect("the verdict payload deserializes");
+    let back: Option<WorkerVerdicts> = serde_json::from_value(
+        details
+            .get("verdicts")
+            .cloned()
+            .expect("verdicts serialize"),
+    )
+    .expect("the verdict payload deserializes");
     assert_eq!(back.as_ref(), Some(&verdicts));
 }
 
@@ -330,13 +342,16 @@ async fn review_of_a_consolidator_carries_its_verdicts() {
     let scratch = common::TempDir::new_in_tmp("verdict-review-repo");
     common::git(scratch.path(), &["init", "-q", "-b", "main", "."]);
     common::git(scratch.path(), &["config", "user.name", "verdict-test"]);
-    common::git(scratch.path(), &["config", "user.email", "verdict@localhost"]);
+    common::git(
+        scratch.path(),
+        &["config", "user.email", "verdict@localhost"],
+    );
     std::fs::write(scratch.path().join("seed.txt"), "seed\n").expect("seed");
     common::git(scratch.path(), &["add", "-A"]);
     common::git(scratch.path(), &["commit", "-qm", "seed"]);
 
     let verdicts = expected_verdicts();
-    let meta = meta_with_verdicts("c-review", Some(verdicts));
+    let meta = meta_with_verdicts("c-review", Some(verdicts.clone()));
     save_registry_entry_in(
         &owned.root(),
         &meta.entry(
@@ -431,4 +446,140 @@ fn consolidator_record(
         handle: None,
         revision: 0,
     }
+}
+
+/// The whole path, not just the parser: a consolidator dispatched against a
+/// scripted model closes with the round's block and its per-worker verdicts,
+/// and the finished state and the registry row both carry them. This is the
+/// signal the task is about -- before it, the verdicts existed only in the
+/// consolidator's history log.
+#[tokio::test]
+async fn a_consolidator_run_stores_its_verdicts_on_the_state_and_the_row() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    // One scripted completion: the round's block, then one line per worker and
+    // the risks, in the same message.
+    let content = [
+        "REPORT",
+        "done: integrated 2 branches, gate green",
+        "files: src/a.rs, src/b.rs",
+        "tests: cargo test: passed",
+        "risks: none",
+        "REPORT 2a9aaca3 approved: the parser change stands",
+        "REPORT 41b0fde1 fixed: resolved the interaction in src/b.rs",
+        "RISK: the sandbox policy edit touched src/agent/sandbox.rs",
+    ]
+    .join("\n");
+    let command = format!("echo {COMPLETION_SENTINEL}");
+    let body = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": content,
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-0",
+                    "function": {
+                        "name": "bash",
+                        "arguments": serde_json::json!({ "command": command }).to_string()
+                    }
+                }]
+            }
+        }]
+    });
+    let frame = format!("data: {body}\n\n");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                continue;
+            }
+            if socket.write_all(frame.as_bytes()).await.is_err() {
+                continue;
+            }
+            let _ = socket.flush().await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    let repo = common::TempDir::new_in_tmp("verdict-run-repo");
+    common::git(repo.path(), &["init", "-q", "-b", "main", "."]);
+    common::git(repo.path(), &["config", "user.name", "verdict-run"]);
+    common::git(repo.path(), &["config", "user.email", "run@localhost"]);
+    std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("seed");
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(repo.path(), &["commit", "-qm", "seed"]);
+
+    let scratch = common::TempDir::new_in_tmp("verdict-run-pool");
+    let pool = WorkerPool::with_scratch(
+        2,
+        base_url,
+        "test-key".to_string(),
+        ScratchRoot::new(scratch.path().to_path_buf()),
+    );
+    let id = pool
+        .dispatch_with_role(
+            OWNER.to_string(),
+            "integrate the round".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            4,
+            Some("round-1".to_string()),
+            None,
+            false,
+            None,
+            Vec::new(),
+            WorkerRole::Consolidate,
+        )
+        .await
+        .expect("dispatch");
+
+    let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut changes = pool.subscribe_changes();
+        loop {
+            if let Some(state) = pool.get_worker_state(&id).await
+                && matches!(
+                    state,
+                    WorkerState::Completed { .. } | WorkerState::Failed { .. }
+                )
+            {
+                return state;
+            }
+            changes.changed().await.expect("pool notification");
+        }
+    })
+    .await
+    .expect("the consolidator finishes");
+
+    server.abort();
+    let WorkerState::Completed {
+        verdicts, report, ..
+    } = &state
+    else {
+        panic!("the consolidator must complete, got {state:?}");
+    };
+    assert_eq!(
+        verdicts.as_ref(),
+        Some(&expected_verdicts()),
+        "the run must store the round's verdicts on the completed state"
+    );
+    assert_eq!(
+        report.as_ref().map(|report| report.done.as_str()),
+        Some("integrated 2 branches, gate green"),
+        "the compact headline is unchanged"
+    );
+
+    let entry = load_registry_entry_in(pool.scratch_root(), &id).expect("the terminal row exists");
+    assert_eq!(
+        entry.verdicts.as_ref(),
+        Some(&expected_verdicts()),
+        "the registry row carries the verdicts too"
+    );
+    assert_eq!(
+        entry.report.as_ref().map(|report| report.done.as_str()),
+        Some("integrated 2 branches, gate green"),
+    );
 }
