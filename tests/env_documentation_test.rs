@@ -80,13 +80,15 @@ const HOST_VARS: &[&str] = &[
     "WORKER_BUILD_DEBUG",
 ];
 
+/// Whether `b` can appear in an environment variable name.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+}
+
 /// A name is a candidate when it is all-caps, so a local `let Some(x) = ...`
 /// binding and a `Some(...)` value never look like a variable.
 fn looks_like_env_name(candidate: &str) -> bool {
-    !candidate.is_empty()
-        && candidate
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    !candidate.is_empty() && candidate.bytes().all(is_ident_byte)
 }
 
 /// Every `.rs` file under `src/`, sorted so a failure names the same first file
@@ -149,14 +151,19 @@ fn env_names_read_in(source: &str) -> BTreeSet<String> {
     let constants = declared_constants(&code);
     let mut names = BTreeSet::new();
 
-    for name in literal_arguments(&code) {
-        if looks_like_env_name(&name) {
-            names.insert(name);
+    for (argument, quoted) in read_arguments(&code) {
+        if quoted {
+            // A literal argument: the name is right there.
+            if let Some((name, _)) = read_string_literal(&argument)
+                && looks_like_env_name(&name)
+            {
+                names.insert(name);
+            }
+            continue;
         }
-    }
-    // Call sites that pass a constant resolve through the declarations above.
-    for ident in call_identifiers(&code) {
-        if let Some(name) = constants.get(&ident)
+        // A bare argument: the name lives in a `*_ENV` / `*_VAR` declaration,
+        // which is exactly what `constants` resolved above.
+        if let Some(name) = constants.get(argument.trim())
             && looks_like_env_name(name)
         {
             names.insert(name.clone());
@@ -165,75 +172,67 @@ fn env_names_read_in(source: &str) -> BTreeSet<String> {
     names
 }
 
-/// The string literal each environment read passes, with a turbofish stripped
-/// (`env_parse::<u64>("NAME")`).
+/// What every environment read in `code` passes as its first argument: the
+/// text between the `(` and the matching `)`, and whether it was a quoted
+/// string literal or a bare identifier.
 ///
-/// Deliberately narrow: it only looks inside the parentheses of the crate's own
-/// read paths, so an unrelated string constant cannot be reported as a variable.
-fn literal_arguments(code: &str) -> Vec<String> {
-    const READERS: &[&str] = &["env_parse", "env::var", "env::var_os"];
+/// The scan walks `char_indices`, so every index it slices on is a character
+/// boundary even in a source file that carries non-ASCII text in a string
+/// literal.
+fn read_arguments(code: &str) -> Vec<(String, bool)> {
+    // Longest first: `env::var_os` also starts with `env::var`.
+    const READERS: &[&str] = &["env_parse", "env::var_os", "env::var"];
+    let offsets: Vec<usize> = code
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(code.len()))
+        .collect();
     let bytes = code.as_bytes();
     let mut out = Vec::new();
-    let mut index = 0;
-    while index < code.len() {
-        let rest = &code[index..];
-        let Some(reader) = READERS.iter().find(|r| rest.starts_with(**r)) else {
-            index += 1;
+    let mut cursor = 0;
+    while cursor + 1 < offsets.len() {
+        let start = offsets[cursor];
+        let reader = READERS.iter().find(|reader| {
+            code[start..].starts_with(**reader)
+                // A bare `var` is not the read: it must be `env::var`.
+                && (***reader != *"var" || code[..start].ends_with("env::"))
+        });
+        let Some(reader) = reader else {
+            cursor += 1;
             continue;
         };
-        let mut cursor = index + reader.len();
-        // Step over `::<T>`, then whitespace, then the opening parenthesis.
-        while cursor < bytes.len() && (bytes[cursor] == b':' || bytes[cursor].is_ascii_whitespace())
-        {
-            cursor += 1;
-        }
-        if bytes.get(cursor) == Some(&b'(') {
-            if let Some((argument, _)) = read_string_literal(&code[cursor + 1..]) {
-                out.push(argument);
+        // Step over a turbofish (`::<u64>`) and any whitespace to the `(`.
+        let mut at = start + reader.len();
+        let open = loop {
+            if at >= bytes.len() {
+                break None;
             }
-        }
-        index += reader.len();
-    }
-    out
-}
-
-/// The identifier each environment read passes instead of a literal
-/// (`env_parse(POLL_ENV)`), for a constant the caller resolves elsewhere.
-fn call_identifiers(code: &str) -> Vec<String> {
-    const READERS: &[&str] = &["env_parse", "env::var", "env::var_os"];
-    let bytes = code.as_bytes();
-    let mut out = Vec::new();
-    let mut index = 0;
-    while index < code.len() {
-        let rest = &code[index..];
-        let Some(reader) = READERS.iter().find(|r| rest.starts_with(**r)) else {
-            index += 1;
+            if bytes[at] == b'(' {
+                break Some(at);
+            }
+            if bytes[at] == b':' || bytes[at].is_ascii_whitespace() {
+                at += 1;
+                continue;
+            }
+            break None;
+        };
+        let Some(open) = open else {
+            cursor += 1;
             continue;
         };
-        let mut cursor = index + reader.len();
-        while cursor < bytes.len() && (bytes[cursor] == b':' || bytes[cursor].is_ascii_whitespace())
-        {
-            cursor += 1;
-        }
-        if bytes.get(cursor) == Some(&b'(') {
-            let argument = &code[cursor + 1..];
-            let trimmed = argument.trim_start().trim_start_matches(|c: char| {
-                c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
-            });
-            if trimmed.len() < argument.len() {
-                out.push(trimmed[..ident_len(trimmed)].to_string());
-            }
-        }
-        index += reader.len();
+        // The argument runs to the first `)` or `,` at the top level of the
+        // call, which for these single-argument reads is the closing paren.
+        let end = code[open + 1..]
+            .find([')', ','])
+            .map(|offset| open + 1 + offset)
+            .unwrap_or(bytes.len());
+        out.push((code[open + 1..end].to_string(), true));
+        cursor = offsets
+            .iter()
+            .position(|offset| *offset >= end)
+            .unwrap_or(offsets.len() - 1);
     }
     out
-}
-
-/// The length of the leading all-caps identifier in `text`.
-fn ident_len(text: &str) -> usize {
-    text.bytes()
-        .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
-        .count()
 }
 
 /// The first `"..."` literal in `text`, with no escape in it (a name never has
@@ -321,5 +320,16 @@ fn the_test_only_allowlist_is_exactly_the_declared_hooks() {
             !documented_names().contains(*hook),
             "{hook} is a test-only hook and must not be documented for operators"
         );
+    }
+}
+
+
+#[test]
+fn debug_consts() {
+    use std::path::Path;
+    let root = repo_root();
+    for f in ["src/agent/exec.rs","src/hub/auto_handover.rs","src/agent/jobs.rs"] {
+        let src = std::fs::read_to_string(root.join(f)).unwrap();
+        println!("{f}: {:?}", declared_constants(&src));
     }
 }
