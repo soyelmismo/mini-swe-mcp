@@ -17,7 +17,9 @@
 //!   text can do with every new path, socket, file, environment variable and
 //!   IPC message. It is selected by the `:security` suffix of `--review-after`
 //!   (`review_after`), and it is also what the automatic sensitive-path
-//!   trigger runs.
+//!   trigger runs -- on the mode's default reviewer when the manifest names
+//!   one, else on the manifest's strongest tier, since the model that wrote a
+//!   sensitive diff must not be the model that audits it ([`ReviewerChoice`]).
 //! * A manifest-declared mode — its `checklist` appended to the common review
 //!   frame, selected by `--review-after <model>:<mode>`.
 //!
@@ -32,12 +34,59 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
-use crate::manifest::build_system_prompt;
+use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
+
+/// Which model runs an automatic security review.
+///
+/// A sensitive-path diff is audited by the *strongest* reviewer the manifest
+/// declares, not by whatever model happened to implement it: the fast executor
+/// that wrote the change is the one model whose blind spots the audit exists to
+/// catch, so reusing it as the reviewer silently downgrades the pass to a
+/// self-review.
+///
+/// The order is fixed and logged (see [`select_security_reviewer`]):
+///
+/// 1. an explicit `--review-after <model>[:security]` -- the orchestrator's
+///    own instruction, which always wins;
+/// 2. the manifest's `strongest:` tier, resolved to its id;
+/// 3. the dispatch's default model, supplied by the caller as
+///    `RunConfig::default_model`.
+///
+/// A quality review keeps its own rule and is not routed through here: it runs
+/// on the requested model, and the sensitive-path upgrade swaps only the mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewerChoice {
+    /// The model id the review phase runs.
+    pub(crate) model: String,
+    /// Why this model, for the hub log line.
+    pub(crate) reason: &'static str,
+}
+
+/// Resolve the reviewer for an automatic (no `review_after`) security review.
+///
+/// An explicit `--review-after` never reaches here: the caller keeps that
+/// reviewer and only upgrades its mode, so the orchestrator's own instruction
+/// wins over the manifest's tier.
+pub(crate) fn select_security_reviewer(
+    manifest: &ModelManifest,
+    default_model: &str,
+) -> ReviewerChoice {
+    match manifest.strongest_alias() {
+        Some(alias) => ReviewerChoice {
+            model: manifest.resolve_model(alias).0,
+            reason: "manifest's strongest tier",
+        },
+        None => ReviewerChoice {
+            model: default_model.to_string(),
+            reason: "manifest declares no strongest tier; dispatch default",
+        },
+    }
+}
 
 /// Which auditor runs over the finished implementation.
 ///
@@ -661,5 +710,43 @@ impl WorkerPool {
             completed: false,
             security,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(yaml: &str) -> ModelManifest {
+        serde_yaml::from_str(yaml).expect("manifest YAML must parse")
+    }
+
+    #[test]
+    fn the_strongest_tier_is_resolved_to_its_id() {
+        let manifest = manifest(
+            "default: ninja\nstrongest: nerd\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(choice.model, "combo:nerd");
+        assert!(choice.reason.contains("strongest"), "{}", choice.reason);
+    }
+
+    #[test]
+    fn an_unmarked_catalog_falls_back_to_the_dispatch_default() {
+        let manifest = manifest("default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n");
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(choice.model, "combo:default");
+        assert!(choice.reason.contains("no strongest"), "{}", choice.reason);
+    }
+
+    #[test]
+    fn a_dangling_strongest_key_is_ignored() {
+        let manifest =
+            manifest("default: ninja\nstrongest: absent\nmodels:\n  ninja:\n    id: combo:ninja\n");
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(
+            choice.model, "combo:default",
+            "a `strongest:` alias the catalog does not define must fall back"
+        );
     }
 }
