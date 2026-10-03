@@ -21,7 +21,6 @@
 //!
 //! Every directory, link and target here is under the temporary base dir.
 
-use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerRecord, WorkerRegistryEntry, WorkerRole, WorkerState,

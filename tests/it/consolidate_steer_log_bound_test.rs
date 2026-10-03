@@ -6,7 +6,6 @@
 //! by default), which any local user can write, so the reader must bound what
 //! it will read rather than trusting the file to stay small.
 
-use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::pool::{
     __test_log_nonce_in, RegistryStatus, WorkerRegistryEntry, WorkerRole, save_registry_entry_in,

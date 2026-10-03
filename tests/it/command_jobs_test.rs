@@ -6,7 +6,6 @@
 //! after the 600 s a heavy command would take. The scratch each test touches is
 //! a temporary directory handed to the code under test.
 
-use crate::common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

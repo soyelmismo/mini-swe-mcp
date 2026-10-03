@@ -13,7 +13,6 @@
 //! whose manifest alone decides which gate is detected, and every pool, log
 //! and worktree lives under a temporary scratch root.
 
-use crate::common;
 use crate::common::{IsolatedPool, TempDir, git};
 use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::history_log_path_in;

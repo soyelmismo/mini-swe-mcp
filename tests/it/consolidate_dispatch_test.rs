@@ -6,7 +6,6 @@
 //! it is driven through [`mini_swe_mcp::pool::WorkerPool::round_manifest`] on a
 //! temporary repository -- no LLM, no sandbox, and never the host repository.
 
-use crate::common;
 use crate::common::{IsolatedPool, TempDir, git, unique_suffix};
 use mini_swe_mcp::cli::args::tool_args;
 use mini_swe_mcp::cli::help::topic_text;

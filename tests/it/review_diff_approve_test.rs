@@ -9,7 +9,6 @@
 //! Every repository and registry row here lives under a per-test scratch root,
 //! so the suite never touches the crate's own git state.
 
-use crate::common;
 use crate::common::{IsolatedPool, TempDir};
 
 use mini_swe_mcp::agent::{ChatMessage, Role};

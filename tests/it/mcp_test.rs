@@ -75,7 +75,7 @@ struct ScopedEnv {
 
 impl ScopedEnv {
     fn set(name: &'static str, value: &str) -> Self {
-        let guard = ENV_LOCK
+        let guard = crate::common::ENV_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var(name).ok();

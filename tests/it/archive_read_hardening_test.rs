@@ -15,7 +15,6 @@
 //! Every hub directory, link and target here is created under the temporary
 //! base dir, so nothing touches a real hub.
 
-use crate::common;
 use crate::common::TempDir;
 use mini_swe_mcp::pool::archive::{self, ArchiveRecord};
 

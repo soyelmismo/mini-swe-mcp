@@ -1,7 +1,6 @@
 //! Amending a round's auto-consolidation settings: a gate that cannot be parsed
 //! is refused where it enters (the dispatch), and a gate that was accepted can
 //! still be replaced on a round nobody has consumed yet.
-use crate::common;
 //
 // Both failures this covers were found the hard way -- once from a
 //! `--consolidate-verify` whose shell quoting split it and once from editing
@@ -15,6 +14,7 @@ use mini_swe_mcp::mcp::{ConnectionContext, McpServer};
 use mini_swe_mcp::pool::WorkerPool;
 use mini_swe_mcp::worktree::ScratchRoot;
 use serde_json::json;
+use crate::common;
 const OWNER: &str = "round-owner";
 
 /// A repository with one baseline commit plus the server and scheduler a round

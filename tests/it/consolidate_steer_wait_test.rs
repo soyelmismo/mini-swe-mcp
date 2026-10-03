@@ -8,7 +8,6 @@
 //! [`mini_swe_mcp::pool::WorkerPool::consolidate_wait`] directly -- no LLM, no
 //! sandbox -- and never touch the host repository.
 
-use crate::common;
 use crate::common::{IsolatedPool, unique_suffix};
 use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerMeta, WorkerMetrics, WorkerPool, WorkerRecord,

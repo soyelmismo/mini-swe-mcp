@@ -28,6 +28,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ----------
+// Process-global environment serialization
+// ----------
+
+/// Serialises tests that mutate process-global environment variables.
+///
+/// In a single test binary, a test that calls `set_var`/`remove_var` races with
+/// every other module that reads the same variable. Tests that truly need to
+/// mutate the process environment (rather than pass a value explicitly or set
+/// it on a child `Command`) take this lock for the duration of the mutation, so
+/// no other test observes a half-set value.
+pub static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+// ----------
 // Binary location
 // ----------
 

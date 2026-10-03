@@ -4,7 +4,6 @@
 //! These tests drive [`WorkerPool::consolidate_wait`] directly -- no LLM, no
 //! sandbox -- and never touch the host repository.
 
-use crate::common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::{IsolatedPool, unique_suffix};
