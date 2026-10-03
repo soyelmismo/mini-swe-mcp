@@ -29,12 +29,55 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::agent::{AgentRunner, ChatMessage, Role};
-use crate::manifest::build_system_prompt;
+use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
 use super::super::registry::{RegistryStatus, WorkerMeta};
 use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
+
+/// Which model runs an automatic security review.
+///
+/// A sensitive-path diff is audited by the *strongest* reviewer the manifest
+/// declares, not by whatever model happened to implement it: the fast executor
+/// that wrote the change is the one model whose blind spots the audit exists to
+/// catch, so reusing it as the reviewer silently downgrades the pass to a
+/// self-review.
+///
+/// The order is fixed and logged (see [`select_security_reviewer`]):
+///
+/// 1. an explicit `--review-after <model>[:security]` -- the orchestrator's
+///    own instruction, which always wins;
+/// 2. the manifest's `strongest:` tier, resolved to its id;
+/// 3. the dispatch's default model, supplied by the caller as
+///    `RunConfig::default_model`.
+///
+/// A quality review keeps its own rule and is not routed through here: it runs
+/// on the requested model, and the sensitive-path upgrade swaps only the mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewerChoice {
+    /// The model id the review phase runs.
+    pub(crate) model: String,
+    /// Why this model, for the hub log line.
+    pub(crate) reason: &'static str,
+}
+
+/// Resolve the reviewer for an automatic (no `review_after`) security review.
+pub(crate) fn select_security_reviewer(
+    manifest: &ModelManifest,
+    default_model: &str,
+) -> ReviewerChoice {
+    match manifest.strongest_alias() {
+        Some(alias) => ReviewerChoice {
+            model: manifest.resolve_model(alias).0,
+            reason: "manifest's strongest tier",
+        },
+        None => ReviewerChoice {
+            model: default_model.to_string(),
+            reason: "manifest declares no strongest tier; dispatch default",
+        },
+    }
+}
 
 /// Which auditor runs over the finished implementation.
 ///

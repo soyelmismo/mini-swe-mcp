@@ -69,6 +69,11 @@ pub use self::sentinels::{
 pub struct RunConfig<'a> {
     pub task: &'a str,
     pub model: &'a str,
+    /// The dispatch's default model: the manifest's `default:` entry, else the
+    /// pool's configured fallback. An automatic security review falls back to
+    /// this rather than to `model`, so the review never silently runs on the
+    /// implementer's own tier (see `review::select_security_reviewer`).
+    pub default_model: &'a str,
     pub temperature: Option<f32>,
     pub max_turns: usize,
     pub review_after: Option<String>,
@@ -365,11 +370,13 @@ impl WorkerPool {
         // The conversation is durable one line per message (see
         // `TurnEngine::push_message`), so nothing is rewritten here: a crash may
         // lose only the in-flight turn.
+        let default_model = self.default_model();
         self.run_phases(
             &worker_id,
             &RunConfig {
                 task: &task,
                 model: &model,
+                default_model: &default_model,
                 temperature,
                 max_turns,
                 review_after: review_after.clone(),
@@ -415,6 +422,7 @@ impl WorkerPool {
     ) -> Result<()> {
         let task = config.task.to_string();
         let model = config.model.to_string();
+        let default_model = config.default_model.to_string();
         let temperature = config.temperature;
         let max_turns = config.max_turns;
         let review_after = config.review_after.clone();
@@ -576,23 +584,31 @@ impl WorkerPool {
         let requested = review_after.as_deref().map(ReviewMode::parse_model);
         let review_plan = match (requested, sensitive.is_empty()) {
             // A requested review on a sensitive diff is upgraded to the
-            // adversarial mode; the requested model still runs it.
-            (Some((model, _)), false) => Some((model, ReviewMode::Security)),
-            (Some((model, wanted)), true) => Some((model, wanted)),
+            // adversarial mode; the requested model still runs it, because an
+            // explicit `--review-after` is the orchestrator's own instruction.
+            (Some((model, _)), false) => Some((model, ReviewMode::Security, "review_after model")),
+            (Some((model, wanted)), true) => Some((model, wanted, "review_after model")),
             // No requested review, but the diff is sensitive: trigger the
-            // security review on the manifest's strongest tier, falling back
-            // to the implementer's own model when the manifest marks none.
+            // security review on the manifest's strongest tier, falling back to
+            // the dispatch default when the manifest marks none. The
+            // implementer's own model is never the automatic answer: the model
+            // that wrote the change must not be the one that audits it.
             (None, false) => {
-                let model = self
-                    .manifest()
-                    .strongest_alias()
-                    .map(|alias| self.manifest().resolve_model(alias).0)
-                    .unwrap_or_else(|| model.clone());
-                Some((model, ReviewMode::Security))
+                let choice = self::review::select_security_reviewer(self.manifest(), &default_model);
+                Some((choice.model, ReviewMode::Security, choice.reason))
             }
             (None, true) => None,
         };
-        if let Some((reviewer_model, mode)) = review_plan {
+        if let Some((reviewer_model, mode, why)) = review_plan {
+            // The reviewer and the reason it was chosen: an audit nobody can
+            // account for is how a fast executor ends up reviewing itself.
+            info!(
+                worker = %worker_id,
+                reviewer = %reviewer_model,
+                mode = mode.as_str(),
+                why,
+                "Security review reviewer selected"
+            );
             let outcome = self
                 .run_review_phase(
                     worktree,

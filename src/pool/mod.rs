@@ -673,6 +673,22 @@ impl WorkerPool {
         &self.manifest
     }
 
+    /// The model a dispatch that names none gets: the manifest's `default:`
+    /// alias resolved to its id, else the literal value (an operator's
+    /// `DEFAULT_MODEL`, or a caller that dispatched a concrete id).
+    ///
+    /// A revision resumes on the model of the run it continues, so the value
+    /// is only read when a *new* run picks an automatic reviewer: without a
+    /// `strongest:` tier in the manifest that fallback is the dispatch
+    /// default, never the implementer's own model.
+    pub fn default_model(&self) -> String {
+        self.manifest
+            .default
+            .as_deref()
+            .map(|alias| self.manifest.resolve_model(alias).0)
+            .unwrap_or_else(|| crate::manifest::BUILTIN_DEFAULT_MODEL.to_string())
+    }
+
     /// Pin how long [`Self::kill_all`] waits for live workers' teardowns.
     ///
     /// The replacement hub waits on the same value for a worker's `.teardown`

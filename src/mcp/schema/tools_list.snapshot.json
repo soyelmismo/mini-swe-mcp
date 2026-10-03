@@ -116,7 +116,7 @@
             "type": "string"
           },
           "review_after": {
-            "description": "Reviewer model; `:security` = adversarial.",
+            "description": "Reviewer model; `:security` = adversarial. Omitted on a sensitive diff: the manifest's `strongest:` tier.",
             "type": "string"
           },
           "role": {
