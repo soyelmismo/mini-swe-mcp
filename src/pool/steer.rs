@@ -251,15 +251,11 @@ const STEER_LOG_READ_CAP: u64 = 256 * 1024;
 /// half-decoded record.
 pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
     let path = steer_log_path_in(root, worker_id);
-    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new(); };
-    if true { return parse_records(&content, &path); }
-    let Ok(mut file) = std::fs::File::open(&path) else {
+    let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
     let mut content = String::new();
-    if let Err(e) = file
-        .take(STEER_LOG_READ_CAP)
-        .read_to_string(&mut content)
+    if let Err(e) = file.take(STEER_LOG_READ_CAP).read_to_string(&mut content)
         && e.kind() != std::io::ErrorKind::UnexpectedEof
     {
         warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to read orchestrator steer log");
@@ -282,7 +278,9 @@ fn parse_records(content: &str, source: &Path) -> Vec<String> {
         }
         match serde_json::from_str::<SteerRecord>(line) {
             Ok(record) => out.push(record.message),
-            Err(e) => warn!(path = %source.display(), error = %e, "Skipping unparsable steering mailbox line"),
+            Err(e) => {
+                warn!(path = %source.display(), error = %e, "Skipping unparsable steering mailbox line")
+            }
         }
     }
     out
