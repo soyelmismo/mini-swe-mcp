@@ -2171,12 +2171,11 @@ impl EventRouter {
                     // it was queued as *idle* and its stall episode is real,
                     // so that episode is still delivered. `round_idle_secs`
                     // reports a slot waiter as 0 too, hence the explicit test.
-                    let in_flight =
-                        !current["waiting_for_slot"].is_number()
-                            && crate::cli::watch::round_idle_secs(
-                                current,
-                                crate::pool::unix_timestamp(),
-                            ) == 0;
+                    let in_flight = !current["waiting_for_slot"].is_number()
+                        && crate::cli::watch::round_idle_secs(
+                            current,
+                            crate::pool::unix_timestamp(),
+                        ) == 0;
                     if in_flight {
                         // Collected, not acted on: the loop below holds the
                         // backlog borrowed, so the drop happens once it is
