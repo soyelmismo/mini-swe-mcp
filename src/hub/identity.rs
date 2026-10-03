@@ -297,7 +297,7 @@ pub fn process(pid: u32) -> Option<Process> {
     })
 }
 
-/// Read `pid`'s ancestry from `/proc`, bounded by [`MAX_DEPTH`] and guarded
+/// Read `pid`'s ancestry from `/proc`, bounded by `MAX_DEPTH` and guarded
 /// against a cycle.
 pub fn ancestry(pid: u32) -> Ancestry {
     let mut table = Ancestry::new();

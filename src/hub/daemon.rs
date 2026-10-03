@@ -1,4 +1,5 @@
-//! The hub daemon: one process, one [`WorkerPool`], many connections.
+//! The hub daemon: one process, one
+//! [`WorkerPool`](crate::pool::WorkerPool), many connections.
 //!
 //! Lifecycle, in order: take the exclusive `flock` on `hub.lock` (a second
 //! daemon on the same directory gives up instead of stealing the socket),
@@ -139,7 +140,7 @@ impl HubPaths {
     /// fallback directory created for such a probe outlives the process that
     /// made it -- an empty `/tmp/mswe-<uid>-<hash>` nobody ever owned. Only the
     /// binder creates the directory, and it removes it with the socket (see
-    /// [`FallbackSocketGuard`]).
+    /// `FallbackSocketGuard`).
     pub fn fallback_dir(&self) -> Option<PathBuf> {
         let natural = self.dir.join("hub.sock");
         if natural.as_os_str().len() < MAX_SOCKET_PATH {
@@ -215,7 +216,7 @@ impl std::fmt::Display for HubEndpoint {
 /// is predictable and `/tmp` is shared: a local attacker can squat either a
 /// filesystem socket or an abstract name. Refusing the peer before the client
 /// sends an identity or a task means a squat can only deny service, never
-/// impersonate the hub. [`HubServer::serve`] performs the mirror check on the
+/// impersonate the hub. `HubServer::serve` performs the mirror check on the
 /// accepted side, so both directions of the connection are verified.
 pub async fn connect_endpoint(endpoint: &HubEndpoint) -> std::io::Result<UnixStream> {
     let stream = match endpoint {
@@ -366,7 +367,7 @@ fn fallback_dir_is_creatable(dir: &Path) -> bool {
 /// fallback directory is only trusted when it is this user's and private, an
 /// absent one is probed and undone by [`fallback_dir_is_creatable`], and the
 /// directory that is finally used is created by `harden_hub_dir` and removed
-/// again by [`FallbackSocketGuard`], so resolving an endpoint leaves no empty
+/// again by `FallbackSocketGuard`, so resolving an endpoint leaves no empty
 /// `/tmp/mswe-<uid>-<hash>` behind.
 fn fallback_endpoint(dir: &Path) -> HubEndpoint {
     let fallback = fallback_socket_dir(dir);

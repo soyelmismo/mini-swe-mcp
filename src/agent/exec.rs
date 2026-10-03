@@ -20,12 +20,12 @@
 //!   hook with no helper process and no namespace: Landlock owns the
 //!   filesystem, a seccomp filter owns the syscalls, and process hardening
 //!   (`PR_SET_PDEATHSIG`, `PR_SET_DUMPABLE`, `RLIMIT_CORE`) owns the process
-//!   itself (see [`apply_kernel_confinement`]). An offline step needs no
+//!   itself (see [`KernelConfinement`]). An offline step needs no
 //!   network namespace either: Landlock denies TCP bind/connect and seccomp
 //!   denies INET socket creation.
 //! * **bubblewrap (`SWE_SANDBOX=bwrap`)** - the child gets its own mount
 //!   namespace, PID namespace and an empty tmpfs `$HOME` instead (see
-//!   [`apply_sandbox_args`]); an offline step is additionally wrapped in a
+//!   `apply_sandbox_args`); an offline step is additionally wrapped in a
 //!   network namespace by [`wrap_network_command`].
 //!
 //! The kernel backend is deliberately *not* a weaker policy: the same
@@ -72,7 +72,7 @@ const NICE_VALUE: &str = "10";
 ///
 /// `0` leaves the inherited class alone, `idle` (or its class number, `3`)
 /// opts into the idle class, and anything else — including an unset variable —
-/// keeps the best-effort default described on [`IoClass`].
+/// keeps the best-effort default described on `IoClass`.
 pub const HEAVY_IONICE_ENV: &str = "HUB_HEAVY_IONICE";
 
 /// `IOPRIO_CLASS_SHIFT` from `<linux/ioprio.h>`: a priority value is the class

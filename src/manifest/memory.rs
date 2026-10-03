@@ -63,7 +63,7 @@ fn memory_slug(alias: &str) -> Option<String> {
 
 /// Path of the memory file backing `model_alias` inside `repo_path`.
 ///
-/// `None` when the alias contains no usable characters (see [`memory_slug`]).
+/// `None` when the alias contains no usable characters (see `memory_slug`).
 pub fn agent_memory_path(repo_path: &Path, model_alias: &str) -> Option<PathBuf> {
     memory_slug(model_alias).map(|slug| repo_path.join(MEMORY_DIR).join(format!("{slug}.md")))
 }
