@@ -1999,12 +1999,8 @@ impl EventRouter {
                 // ends it. Drop the worker's queued stalls so the stale
                 // episode neither replays at delivery nor keeps the round
                 // oracle fresh after the transition it preceded was read.
-                if event["event"] != "stalled"
-                    && let Some(history) = self.watch_history.get_mut(&owner)
-                {
-                    history.pending.retain(|queued| {
-                        !(queued["worker_id"] == *id && queued["event"] == "stalled")
-                    });
+                if event["event"] != "stalled" {
+                    self.drop_stalled_episode(&owner, id);
                 }
                 let sequence = self.sequence;
                 let history = self.history(&owner);
@@ -2363,12 +2359,17 @@ impl EventRouter {
 
     /// Forget only the queued *stall* episodes of `wid` under `agent`.
     ///
-    /// A stall is an episode, not a transition: a worker that has since started
-    /// a command made the queued stall stale, and the stall rule would never
-    /// have raised it. Dropping just the episode leaves every other queued
-    /// transition -- including a terminal `completed`/`failed` the owner has
-    /// not read yet -- in place, and records no acknowledgement, so the replay
-    /// guard cannot swallow a real event either.
+    /// A stall is an episode, not a transition, and two things end one: the
+    /// worker starting a command (a harness-side wait such as `CONSOLIDATE_WAIT`
+    /// or `WAIT_JOB`, a long gate, a live background job), which makes the
+    /// episode stale because the stall rule would never have raised it, and a
+    /// later transition of the same worker, which supersedes it. Both callers
+    /// share this one rule.
+    ///
+    /// Dropping just the episode leaves every other queued transition --
+    /// including a terminal `completed`/`failed` the owner has not read yet --
+    /// in place, and records no acknowledgement, so the replay guard cannot
+    /// swallow a real event either.
     fn drop_stalled_episode(&mut self, agent: &str, wid: &str) {
         if let Some(history) = self.watch_history.get_mut(agent) {
             history

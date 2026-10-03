@@ -54,10 +54,10 @@ use super::super::steer::drain_steer_messages_in;
 use super::history::compact_history;
 use super::pause::PauseRequest;
 use super::sentinels::{
-    COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP,
-    is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
-    parse_consolidate_steer, parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job,
-    parse_report, parse_request_turns, parse_wait_job, summarize_command,
+    COMPLETION_SENTINEL, REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request,
+    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
+    parse_consolidate_wait, parse_consolidator_verdicts, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, summarize_command,
 };
 
 /// Prefix used by both tool results and code-block command output messages.
