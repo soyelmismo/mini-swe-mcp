@@ -30,8 +30,10 @@ use crate::agent::{AgentRunner, ChatMessage, Role};
 use crate::manifest::build_system_prompt;
 use crate::worktree::{FileFingerprint, WorktreeGuard};
 
+pub use self::context_pack::{
+    PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
+};
 use self::review::ReviewPhase;
-pub use self::context_pack::{context_pack, extract_identifiers, extract_paths, outline_file};
 pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,

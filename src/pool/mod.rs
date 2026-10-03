@@ -85,9 +85,9 @@ pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
-    ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig, is_completion_request,
-    context_pack, extract_identifiers, extract_paths, opening_task_message, outline_file,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, PACK_CAP_BYTES,
+    REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig, context_pack,
+    extract_identifiers, extract_paths, is_completion_request, opening_task_message, outline_file,
     parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
     parse_consolidate_wait, parse_findings, parse_kill_job, parse_report, parse_request_turns,
     parse_wait_job, review_prompt, summarize_command, summary_line,

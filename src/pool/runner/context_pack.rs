@@ -166,9 +166,7 @@ fn token_regex() -> &'static Regex {
 
 fn backtick_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"`([^`\n]{1,120})`").expect("backticked span regex must compile")
-    })
+    RE.get_or_init(|| Regex::new(r"`([^`\n]{1,120})`").expect("backticked span regex must compile"))
 }
 
 fn path_item_regex() -> &'static Regex {
@@ -191,15 +189,13 @@ fn path_like(token: &str) -> bool {
 fn is_identifier(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= 120
-        && raw
-            .split("::")
-            .all(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
+        && raw.split("::").all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 // ----------
@@ -459,7 +455,7 @@ fn cap_lines(lines: &[String]) -> String {
     let mut out = String::new();
     let mut shown = 0usize;
     for line in lines {
-        if out.len() + line.len() + 1 > PACK_CAP_BYTES {
+        if out.len() + line.len() >= PACK_CAP_BYTES {
             break;
         }
         out.push_str(line);
@@ -468,7 +464,7 @@ fn cap_lines(lines: &[String]) -> String {
     }
     if shown < lines.len() {
         let note = "(context pack truncated)";
-        if out.len() + note.len() + 1 <= PACK_CAP_BYTES {
+        if out.len() + note.len() < PACK_CAP_BYTES {
             out.push_str(note);
             out.push('\n');
         }

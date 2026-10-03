@@ -11,7 +11,11 @@ const VERIFY: &str = "cargo test --test verify_gate_line_test";
 
 #[test]
 fn the_first_message_names_the_exact_completion_gate() {
-    let message = opening_task_message("do the thing", Some(VERIFY), std::path::Path::new("/nonexistent"));
+    let message = opening_task_message(
+        "do the thing",
+        Some(VERIFY),
+        std::path::Path::new("/nonexistent"),
+    );
     assert!(
         message.contains("TASK:\ndo the thing"),
         "the task must still lead the message, got:\n{message}"
