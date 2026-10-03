@@ -573,22 +573,56 @@ impl WorkerPool {
             .into_iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
             .collect();
-        let requested = review_after.as_deref().map(ReviewMode::parse_model);
+        // A requested review names its mode by suffix; an unknown mode is a
+        // dispatch error here (the dispatch already validated, so this is
+        // defensive). An empty reviewer falls back to the implementer's model.
+        let requested = match review_after.as_deref() {
+            Some(s) => Some(ReviewMode::parse_with_manifest(s, self.manifest())?),
+            None => None,
+        };
+        // The manifest may override the built-in security prompt.
+        let security_mode = ReviewMode::resolve_declared("security", self.manifest());
+        // An empty reviewer (a bare `:mode`) falls back to the mode's default
+        // reviewer, then to the implementer's own model.
+        let resolve_reviewer = |requested_model: String,
+                                mode_name: &str,
+                                manifest: &crate::manifest::ModelManifest,
+                                implementer: &str|
+         -> String {
+            if !requested_model.trim().is_empty() {
+                return requested_model;
+            }
+            self::review::mode_default_reviewer(mode_name, manifest)
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| implementer.to_string())
+        };
         let review_plan = match (requested, sensitive.is_empty()) {
             // A requested review on a sensitive diff is upgraded to the
             // adversarial mode; the requested model still runs it.
-            (Some((model, _)), false) => Some((model, ReviewMode::Security)),
-            (Some((model, wanted)), true) => Some((model, wanted)),
+            (Some((requested_model, _)), false) => {
+                let reviewer =
+                    resolve_reviewer(requested_model, "security", self.manifest(), &model);
+                Some((reviewer, security_mode))
+            }
+            (Some((requested_model, wanted)), true) => {
+                let mode_name = wanted.name.clone();
+                let reviewer =
+                    resolve_reviewer(requested_model, &mode_name, self.manifest(), &model);
+                Some((reviewer, wanted))
+            }
             // No requested review, but the diff is sensitive: trigger the
-            // security review on the manifest's strongest tier, falling back
+            // security review on the mode's default reviewer when the manifest
+            // declares one, else on the manifest's strongest tier, falling back
             // to the implementer's own model when the manifest marks none.
             (None, false) => {
-                let model = self
-                    .manifest()
-                    .strongest_alias()
-                    .map(|alias| self.manifest().resolve_model(alias).0)
+                let reviewer = self::review::mode_default_reviewer("security", self.manifest())
+                    .or_else(|| {
+                        self.manifest()
+                            .strongest_alias()
+                            .map(|alias| self.manifest().resolve_model(alias).0)
+                    })
                     .unwrap_or_else(|| model.clone());
-                Some((model, ReviewMode::Security))
+                Some((reviewer, security_mode))
             }
             (None, true) => None,
         };

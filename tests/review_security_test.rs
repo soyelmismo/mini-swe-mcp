@@ -32,12 +32,12 @@ use mini_swe_mcp::pool::{ReviewMode, parse_findings, review_prompt};
 fn parse_model_splits_the_security_suffix() {
     assert_eq!(
         ReviewMode::parse_model("nerd:security"),
-        ("nerd".to_string(), ReviewMode::Security)
+        ("nerd".to_string(), ReviewMode::security())
     );
     // Case-insensitive, and the model may be a resolved id.
     assert_eq!(
         ReviewMode::parse_model("combo:nerd:SECURITY"),
-        ("combo:nerd".to_string(), ReviewMode::Security)
+        ("combo:nerd".to_string(), ReviewMode::security())
     );
 }
 
@@ -47,15 +47,15 @@ fn parse_model_keeps_colon_ids_as_quality() {
     // `:security` is a mode marker.
     assert_eq!(
         ReviewMode::parse_model("combo:nerd"),
-        ("combo:nerd".to_string(), ReviewMode::Quality)
+        ("combo:nerd".to_string(), ReviewMode::quality())
     );
     assert_eq!(
         ReviewMode::parse_model("some/unknown"),
-        ("some/unknown".to_string(), ReviewMode::Quality)
+        ("some/unknown".to_string(), ReviewMode::quality())
     );
     assert_eq!(
         ReviewMode::parse_model("nerd:"),
-        ("nerd:".to_string(), ReviewMode::Quality)
+        ("nerd:".to_string(), ReviewMode::quality())
     );
 }
 
@@ -66,7 +66,7 @@ fn parse_model_keeps_colon_ids_as_quality() {
 #[test]
 fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
     let security = review_prompt(
-        ReviewMode::Security,
+        &ReviewMode::security(),
         "harden the socket",
         Some("make check"),
         &["src/hub/mod.rs".to_string()],
@@ -81,7 +81,7 @@ fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
     );
 
     let quality = review_prompt(
-        ReviewMode::Quality,
+        &ReviewMode::quality(),
         "harden the socket",
         Some("make check"),
         &[],
@@ -98,8 +98,8 @@ fn security_prompt_is_used_for_the_suffix_and_generic_otherwise() {
 
 #[test]
 fn the_prompt_names_no_language_specific_command() {
-    for mode in [ReviewMode::Quality, ReviewMode::Security] {
-        let prompt = review_prompt(mode, "task", Some("make check"), &[]);
+    for mode in [ReviewMode::quality(), ReviewMode::security()] {
+        let prompt = review_prompt(&mode, "task", Some("make check"), &[]);
         for forbidden in ["cargo test", "cargo clippy", "cargo test --all-targets"] {
             assert!(
                 !prompt.contains(forbidden),
@@ -115,7 +115,7 @@ fn the_prompt_names_no_language_specific_command() {
 
 #[test]
 fn a_disabled_gate_is_stated_not_invented() {
-    let prompt = review_prompt(ReviewMode::Quality, "task", Some(""), &[]);
+    let prompt = review_prompt(&ReviewMode::quality(), "task", Some(""), &[]);
     assert!(
         prompt.contains("(none: this dispatch disabled the completion gate)"),
         "a disabled gate must be stated, not replaced by an invented suite"

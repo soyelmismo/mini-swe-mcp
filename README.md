@@ -56,7 +56,7 @@ mini-swe-mcp dispatch "fix the flaky retry test in src/retry.rs; gate: cargo tes
 `dispatch <task>` takes:
 
 - `--model <alias>` — otherwise `DEFAULT_MODEL` or the manifest default.
-- `--review-after <alias>` — run a reviewer phase over the produced diff before completing.
+- `--review-after <model>[:<mode>]` — run a reviewer phase over the produced diff before completing (`quality`, `security`, or a `review_modes:` entry from `models.yaml`; e.g. `review_modes: {perf: {checklist: "Check for N+1 queries.", model: nerd}}` selected via `--review-after nerd:perf`).
 - `--repo <path>` — operate on a different repository.
 - `--max-turns <n>` — turn budget.
 - `--group <g>` — tag workers for `watch --group` and `list`.

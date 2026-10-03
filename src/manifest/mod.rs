@@ -45,7 +45,7 @@ pub use self::instructions::{
 pub use self::memory::{MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, load_agent_memory};
 pub use self::types::{
     BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_TURNS_LIMIT, ModelDefinition,
-    ModelManifest, NETWORK_POLICIES, NetworkPolicy, TEMPERATURE_RANGE,
+    ModelManifest, NETWORK_POLICIES, NetworkPolicy, ReviewModeDefinition, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.
@@ -170,6 +170,63 @@ impl ModelManifest {
             .as_deref()
             .map(str::trim)
             .filter(|alias| self.models.contains_key(*alias))
+    }
+
+    /// The declared review mode `name`, or `None` when no such mode exists.
+    ///
+    /// The built-in modes `quality` and `security` are always available even
+    /// when the manifest does not declare them; a manifest-declared entry of
+    /// the same name overrides the built-in prompt. Any other name resolves
+    /// only when the manifest declares it.
+    pub fn review_mode(&self, name: &str) -> Option<&ReviewModeDefinition> {
+        self.review_modes.get(name)
+    }
+
+    /// Review-mode entries in sorted name order.
+    ///
+    /// `self.review_modes` is a `HashMap` with a randomly seeded `RandomState`,
+    /// so iteration order differs between processes. Every user-visible
+    /// derivation (the `manifest` action, `help review`) goes through this
+    /// helper so the output is reproducible.
+    pub fn sorted_review_modes(&self) -> Vec<(&str, &ReviewModeDefinition)> {
+        let mut entries: Vec<(&str, &ReviewModeDefinition)> = self
+            .review_modes
+            .iter()
+            .map(|(name, def)| (name.as_str(), def))
+            .collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        entries
+    }
+
+    /// Whether `name` is an available review mode.
+    ///
+    /// The built-in modes `quality` and `security` are always available, even
+    /// when the manifest does not declare them; any other name is available
+    /// only when the manifest declares it under `review_modes:`.
+    pub fn is_review_mode(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case("quality")
+            || name.eq_ignore_ascii_case("security")
+            || self.review_modes.contains_key(name)
+    }
+
+    /// Every available review-mode name in stable order: the built-ins first,
+    /// then the manifest-declared modes in sorted order.
+    ///
+    /// Used for the "unknown mode" dispatch error, so the caller can list what
+    /// `--review-after <model>:<mode>` actually accepts.
+    pub fn available_review_modes(&self) -> Vec<String> {
+        let mut modes = vec!["quality".to_string(), "security".to_string()];
+        let mut declared: Vec<String> = self
+            .review_modes
+            .keys()
+            .filter(|name| {
+                !name.eq_ignore_ascii_case("quality") && !name.eq_ignore_ascii_case("security")
+            })
+            .cloned()
+            .collect();
+        declared.sort();
+        modes.extend(declared);
+        modes
     }
 
     /// Resolve the *alias* that owns `model`, whether `model` is already an alias
