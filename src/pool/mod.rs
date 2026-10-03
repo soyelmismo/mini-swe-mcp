@@ -2343,13 +2343,22 @@ impl WorkerPool {
             }
         }
         // The worktree each live worker owns, read once under a short guard so
-        // the abort loop below can mark a teardown without taking the lock.
+        // the teardown marking below runs without holding the lock.
         let worktrees: std::collections::HashMap<String, PathBuf> = {
             let map = self.worktrees.read().await;
             live.iter()
                 .filter_map(|id| map.get(id).map(|path| (id.clone(), path.clone())))
                 .collect()
         };
+        // Mark each live worker's worktree teardown *before* the lock and the
+        // abort: the marker is what makes the replacement hub wait for a
+        // teardown that outlives the bounded wait below, and it must exist
+        // before the aborted guard's `Drop` can remove it. The write is
+        // blocking, so -- exactly as `kill` says -- it runs outside the pool
+        // write-lock, never inside it.
+        for path in worktrees.values() {
+            WorktreeGuard::mark_teardown(path);
+        }
         let (count, entries, handles) = {
             let mut lock = self.workers.write().await;
             let mut count = 0usize;
@@ -2363,12 +2372,6 @@ impl WorkerPool {
                     continue;
                 }
                 if let Some(handle) = worker.handle.take() {
-                    // Mark the worktree's teardown *before* the abort drops the
-                    // guard: the marker is what makes the replacement hub wait
-                    // for a teardown that outlives the bounded wait below.
-                    if let Some(path) = worktrees.get(&worker.id) {
-                        WorktreeGuard::mark_teardown(path);
-                    }
                     handle.abort();
                     handles.push((worker.id.clone(), handle));
                 }
