@@ -1,24 +1,30 @@
-//! Adversarial review regressions for the retired-worker archive.
+//! Regression tests for defects found reviewing the retired-worker archive.
 //!
-//! Each test here pins a defect found reviewing `audit X4`: the `--last`
-//! window applied before owner scoping, the rotation that could lose a whole
-//! generation, the rotation that ignored a symlinked hub path, and the archive
-//! growing without a bound when the hub directory did not exist yet.
+//! Four properties the archive must hold that a reviewer's probes turned up:
+//! `--last` is a window over the *caller's own* lines rather than over every
+//! owner's; `merge --no-delete`, which retires nobody, archives nobody; the
+//! archive never writes through a symlinked hub directory and never leaves a
+//! world-readable `archive.jsonl` behind it; and both generations stay inside
+//! the size cap.
+//!
+//! Every test owns its repository, scratch root and hub directory under the
+//! temporary base dir, so nothing here touches a developer's own hub.
 
 mod common;
 
 use common::TempDir;
-
-const OWNER: &str = "agent-one";
 use mini_swe_mcp::pool::archive::{self, ARCHIVE_MAX_BYTES, ArchiveRecord};
 use mini_swe_mcp::pool::{
-    MergeRequest, RegistryStatus, RetireContext, WorkerRegistryEntry, WorkerReport,
-    load_registry_entry_in, merge_worker_in, retire_worker_reporting, save_registry_entry_in,
+    MergeRequest, RegistryStatus, WorkerRegistryEntry, WorkerReport, load_registry_entry_in,
+    merge_worker_in, save_registry_entry_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::{Path, PathBuf};
 
-/// A repo, scratch root and hub directory the tests own, plus a terminal row.
+const OWNER: &str = "agent-one";
+const OTHER_OWNER: &str = "agent-two";
+
+/// A repo, a scratch root and a stand-in hub directory, all owned by the test.
 struct Fixture {
     repo: TempDir,
     scratch: TempDir,
@@ -31,7 +37,7 @@ impl Fixture {
         common::git(repo.path(), &["init", "--initial-branch=main"]);
         common::git(repo.path(), &["config", "user.email", "review@test"]);
         common::git(repo.path(), &["config", "user.name", "review test"]);
-        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        std::fs::write(repo.path().join("README.md"), "base\n").expect("writable");
         common::git(repo.path(), &["add", "."]);
         common::git(repo.path(), &["commit", "-m", "base"]);
         Self {
@@ -75,17 +81,15 @@ impl Fixture {
     fn commit_on_worker_branch(&self, id: &str) {
         let branch = format!("worker-{id}");
         common::git(self.repo.path(), &["checkout", "-q", "-b", &branch]);
-        std::fs::write(self.repo.path().join(format!("{id}.txt")), "from the worker\n").unwrap();
+        std::fs::write(self.repo.path().join(format!("{id}.txt")), "from the worker\n")
+            .expect("writable");
         common::git(self.repo.path(), &["add", "."]);
         common::git(self.repo.path(), &["commit", "-m", &format!("worker {id}")]);
         common::git(self.repo.path(), &["checkout", "-q", "main"]);
     }
-
-    fn records(&self) -> Vec<ArchiveRecord> {
-        archive::read_records(self.hub.path(), None, None).expect("the archive must be readable")
-    }
 }
 
+/// A line with no report, as the reader parses it back.
 fn record(id: &str, owner: &str, group: Option<&str>) -> ArchiveRecord {
     ArchiveRecord {
         worker_id: id.to_string(),
@@ -102,117 +106,74 @@ fn record(id: &str, owner: &str, group: Option<&str>) -> ArchiveRecord {
 }
 
 fn write(hub: &Path, id: &str, owner: &str, group: Option<&str>) {
-    archive::append_record(hub, &record(id, owner, group)).expect("append");
+    archive::append_record(hub, &record(id, owner, group)).expect("the append must succeed");
 }
 
-/// PROBE 1: `--last` is a window over the whole archive, so a non-admin owner
-/// asking for "my last 5" is answered with lines that are all somebody else's
-/// and an empty result.
+/// `--last` is a window over the caller's own lines. Scoping it after the
+/// window means a busy hub's newest five lines -- all another agent's -- leave
+/// the caller with an empty answer to "my last five".
 #[test]
-fn probe_last_before_owner_scope() {
-    let hub = TempDir::new_in_tmp("probe-last-scope");
-    // Interleave: the newest five lines in the file are all OTHER_OWNER's.
+fn last_counts_the_callers_own_lines() {
+    let hub = TempDir::new_in_tmp("archive-last-owner");
     for i in 0..3 {
-        write(hub.path(), &format!("mine{i}"), "mine", None);
+        write(hub.path(), &format!("mine{i}"), OWNER, None);
     }
     for i in 0..5 {
-        write(hub.path(), &format!("theirs{i}"), "theirs", None);
+        write(hub.path(), &format!("theirs{i}"), OTHER_OWNER, None);
     }
-    let all = archive::read_records(hub.path(), None, Some(5)).expect("read");
-    assert_eq!(all.len(), 5);
+
+    let mine = archive::read_records(hub.path(), Some(OWNER), None, Some(2)).expect("readable");
+    assert_eq!(
+        mine.iter()
+            .map(|r| r.worker_id.as_str())
+            .collect::<Vec<_>>(),
+        ["mine1", "mine2"],
+        "--last 2 is this agent's two most recent, not the file's two newest: {mine:?}"
+    );
     assert!(
-        all.iter().all(|r| r.owner == "theirs"),
-        "the --last window is taken over the whole archive: {all:?}"
+        mine.iter().all(|r| r.owner == OWNER),
+        "another owner's report must never reach a scoped read: {mine:?}"
+    );
+
+    // The admin read still sees everything, and its own `--last` is the newest
+    // of the whole file.
+    let all = archive::read_records(hub.path(), None, None, Some(2)).expect("readable");
+    assert_eq!(
+        all.iter()
+            .map(|r| r.worker_id.as_str())
+            .collect::<Vec<_>>(),
+        ["theirs3", "theirs4"],
+        "{all:?}"
+    );
+
+    // Owner and group compose, and `--last` applies after both.
+    for i in 0..2 {
+        write(hub.path(), &format!("r{i}"), OWNER, Some("round-7"));
+    }
+    for i in 2..5 {
+        write(hub.path(), &format!("r{i}"), OTHER_OWNER, Some("round-7"));
+    }
+    let scoped =
+        archive::read_records(hub.path(), Some(OWNER), Some("round-7"), Some(1)).expect("readable");
+    assert_eq!(
+        scoped
+            .iter()
+            .map(|r| r.worker_id.as_str())
+            .collect::<Vec<_>>(),
+        ["r1"],
+        "--last applies after the owner and group filters: {scoped:?}"
     );
 }
 
-/// PROBE 2: rotation renames over whatever `archive.jsonl.1` is, and the
-/// rename is not checked. Report text for one owner is then reachable by anyone
-/// who can open the target.
+/// `merge --no-delete` keeps the branch, the row and the history, so the worker
+/// is still there to be merged again. Archiving it would put a "retired" line
+/// in the archive for a worker that has not retired.
 #[test]
-fn probe_rotation_follows_a_symlinked_rotated_path() {
-    let hub = TempDir::new_in_tmp("probe-rot-symlink");
-    let outside = TempDir::new_in_tmp("probe-rot-outside");
-    let victim = outside.path().join("someone-elses-file");
-    std::fs::write(&victim, b"private\n").unwrap();
-    std::os::unix::fs::symlink(&victim, hub.path().join(archive::ARCHIVE_ROTATED_FILE)).unwrap();
-
-    // Push the live file past the cap so rotation fires.
-    let mut i = 0;
-    while i < 20_000 && !hub.path().join(archive::ARCHIVE_ROTATED_FILE).exists() {
-        archive::append_record(hub.path(), &record(&format!("w{i}"), "mine", None)).unwrap();
-        i += 1;
-    }
-    // Force a rotation deterministically.
-    let big = hub.path().join(archive::ARCHIVE_FILE);
-    std::fs::write(&big, "x".repeat(ARCHIVE_MAX_BYTES as usize + 1)).unwrap();
-    archive::append_record(hub.path(), &record("trigger", "mine", None)).unwrap();
-
-    let link = hub.path().join(archive::ARCHIVE_ROTATED_FILE);
-    let meta = std::fs::symlink_metadata(&link).unwrap();
-    println!("rotated is_symlink={} target={:?}", meta.file_type().is_symlink(), std::fs::read_link(&link));
-}
-
-/// PROBE 3: the cap. The doc says the file is bounded by
-/// `ARCHIVE_MAX_BYTES + the longest single line`, but nothing enforces a floor:
-/// what happens when the file already sits *just under* the cap and the next
-/// line is large? More importantly: does rotation actually keep total disk
-/// usage bounded across many appends?
-#[test]
-fn probe_cap_is_a_real_bound_on_total_bytes() {
-    let hub = TempDir::new_in_tmp("probe-cap-total");
-    let mut i = 0u64;
-    while i < 400 {
-        // A report at its clamp (4 fields x 4096 B) is the largest line the
-        // archive can ever be handed.
-        let mut big = record(&format!("w{i}"), "mine", None);
-        big.report = Some(mini_swe_mcp::pool::WorkerReport {
-            done: "d".repeat(4096),
-            files: "f".repeat(4096),
-            tests: "t".repeat(4096),
-            risks: "r".repeat(4096),
-        });
-        archive::append_record(hub.path(), &big).unwrap();
-        i += 1;
-    }
-    let live = std::fs::metadata(hub.path().join(archive::ARCHIVE_FILE)).unwrap().len();
-    let rotated = std::fs::metadata(hub.path().join(archive::ARCHIVE_ROTATED_FILE)).unwrap().len();
-    println!("live={live} rotated={rotated} total={} cap={ARCHIVE_MAX_BYTES}", live + rotated);
-    assert!(
-        live <= ARCHIVE_MAX_BYTES,
-        "the live generation grew past the cap: {live}"
-    );
-    assert!(
-        rotated <= ARCHIVE_MAX_BYTES,
-        "the rotated generation grew past the cap: {rotated}"
-    );
-}
-
-/// PROBE 4: `ensure_dir` treats a symlink-to-a-directory as "the hub dir is
-/// there", so `append_record` writes owner names and REPORT text through it.
-#[test]
-fn probe_ensure_dir_follows_a_symlinked_hub_dir() {
-    let parent = TempDir::new_in_tmp("probe-symlink-hub");
-    let outside = TempDir::new_in_tmp("probe-symlink-hub-target");
-    let link = parent.path().join("hub");
-    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
-
-    archive::append_record(&link, &record("w1", "mine", None)).unwrap();
-
-    let written = std::fs::read_to_string(outside.path().join(archive::ARCHIVE_FILE));
-    println!("wrote through the symlink: {:?}", written.is_ok());
-    println!("mode={:o}", std::fs::metadata(outside.path().join(archive::ARCHIVE_FILE)).map(|m| {
-        use std::os::unix::fs::PermissionsExt; m.permissions().mode() & 0o777
-    }).unwrap_or(0));
-}
-
-/// PROBE 5: `merge --no-delete` keeps the branch, the row and the history, but
-/// the retirement still archives the worker as retired.
-#[test]
-fn probe_no_delete_archives_a_worker_that_is_not_retired() {
-    let f = Fixture::new("probe-no-delete");
+fn no_delete_archives_nobody() {
+    let f = Fixture::new("archive-no-delete");
     f.commit_on_worker_branch("w1");
     f.record("w1", OWNER, Some("round-1"));
+
     merge_worker_in(
         &f.root(),
         &MergeRequest {
@@ -224,9 +185,170 @@ fn probe_no_delete_archives_a_worker_that_is_not_retired() {
         },
     )
     .expect("the merge lands");
-    let still_there = load_registry_entry_in(&f.root(), "w1").is_some();
-    let records = f.records();
-    println!("row still present={still_there} archive lines={}", records.len());
-    assert!(still_there, "the row must survive --no-delete");
-    assert_eq!(records.len(), 1, "--no-delete must not archive a live worker");
+
+    assert!(
+        load_registry_entry_in(&f.root(), "w1").is_some(),
+        "--no-delete must leave the row in place"
+    );
+    let archived = archive::read_records(f.hub.path(), None, None, None).expect("readable");
+    assert!(
+        archived.is_empty(),
+        "--no-delete retires nobody, so it archives nobody: {archived:?}"
+    );
+
+    // The same worker's real retirement does archive it, so the fix is not
+    // "the merge stopped archiving": a merge that really deletes the branch
+    // writes the line the `--no-delete` merge did not.
+    common::git(f.repo.path(), &["checkout", "-q", "worker-w1"]);
+    std::fs::write(f.repo.path().join("w1.txt"), "more from the worker\n").expect("writable");
+    common::git(f.repo.path(), &["add", "."]);
+    common::git(f.repo.path(), &["commit", "-m", "worker w1 again"]);
+    common::git(f.repo.path(), &["checkout", "-q", "main"]);
+    let mut row = load_registry_entry_in(&f.root(), "w1").expect("the row survived");
+    row.keep_branch = false;
+    save_registry_entry_in(&f.root(), &row);
+    // The gate needs something to run: an empty manifest makes
+    // `detect_verify_command` fall through, and "unknown" never skips it.
+    // The gate needs something to run: a repository with no recognised manifest
+    // has no detectable verify command, and "unknown" never skips the gate.
+    std::fs::write(f.repo.path().join("Makefile"), "test:\n\t@true\n").expect("writable");
+    merge_worker_in(
+        &f.root(),
+        &MergeRequest {
+            worker_id: "w1",
+            verified: Some(true),
+            keep_branch: false,
+            admission: None,
+            archive_dir: Some(f.hub_dir()),
+        },
+    )
+    .expect("the deleting merge lands");
+    let archived = archive::read_records(f.hub.path(), None, None, None).expect("readable");
+    assert_eq!(
+        archived.len(),
+        1,
+        "the retirement that really removes the worker archives it: {archived:?}"
+    );
+    assert_eq!(archived[0].worker_id, "w1");
+    assert_eq!(archived[0].reason, "merged");
+}
+
+/// The archive names owners and carries REPORT text, so it goes in the
+/// directory the caller named and nowhere else: a hub directory that is a
+/// symlink is refused rather than written through.
+#[test]
+fn a_symlinked_hub_dir_is_refused() {
+    let parent = TempDir::new_in_tmp("archive-symlink-parent");
+    let elsewhere = TempDir::new_in_tmp("archive-symlink-target");
+    let link = parent.path().join("hub");
+    std::os::unix::fs::symlink(elsewhere.path(), &link).expect("the test creates the link");
+
+    let outcome = archive::append_record(&link, &record("w1", OWNER, None));
+
+    assert!(
+        outcome.is_err(),
+        "a symlinked hub dir must be refused, not written through"
+    );
+    assert!(
+        !elsewhere.path().join(archive::ARCHIVE_FILE).exists(),
+        "no archive may appear in the directory the symlink pointed at"
+    );
+}
+
+/// `mode(0o600)` only applies to a file this call creates, so an
+/// `archive.jsonl` that already existed world-readable would keep that mode
+/// while the append added one more agent's owner and REPORT to it.
+#[test]
+fn an_existing_loose_archive_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hub = TempDir::new_in_tmp("archive-loose-mode");
+    let path = hub.path().join(archive::ARCHIVE_FILE);
+    std::fs::write(&path, b"").expect("writable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    archive::append_record(hub.path(), &record("w1", OWNER, None)).expect("the append must succeed");
+
+    let mode = std::fs::metadata(&path).expect("the archive exists").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "an existing archive is tightened to owner-only: {mode:o}");
+}
+
+/// The cap is a bound on what is kept, so it holds for both generations and for
+/// the largest line the archive can ever be handed (four clamped REPORT
+/// fields).
+#[test]
+fn both_generations_stay_inside_the_cap() {
+    let hub = TempDir::new_in_tmp("archive-cap-both");
+    let big = |id: &str| ArchiveRecord {
+        report: Some(WorkerReport {
+            done: "d".repeat(4096),
+            files: "f".repeat(4096),
+            tests: "t".repeat(4096),
+            risks: "r".repeat(4096),
+        }),
+        ..record(id, OWNER, None)
+    };
+
+    for i in 0..200 {
+        archive::append_record(hub.path(), &big(&format!("w{i}"))).expect("the append must succeed");
+    }
+
+    let live = std::fs::metadata(hub.path().join(archive::ARCHIVE_FILE))
+        .expect("the live generation exists")
+        .len();
+    let rotated = std::fs::metadata(hub.path().join(archive::ARCHIVE_ROTATED_FILE))
+        .expect("200 maximal lines must have crossed the cap and rotated")
+        .len();
+    assert!(live <= ARCHIVE_MAX_BYTES, "the live generation grew past the cap: {live}");
+    assert!(
+        rotated <= ARCHIVE_MAX_BYTES,
+        "the rotated generation grew past the cap: {rotated}"
+    );
+
+    // Two generations are the whole promise: at most two maximal lines' worth
+    // of reports is kept, and both generations are readable.
+    let all = archive::read_records(hub.path(), None, None, None).expect("readable");
+    assert!(
+        !all.is_empty() && all.len() <= 32,
+        "the archive keeps two bounded generations, not every line: {}",
+        all.len()
+    );
+}
+
+/// The reader spans both generations oldest first, so `--last` answers "the N
+/// most recent" across the rotation boundary rather than only within the live
+/// file.
+#[test]
+fn last_spans_the_rotation_boundary() {
+    let hub = TempDir::new_in_tmp("archive-last-across-rotation");
+    // Maximal lines: a generation holds ~15 of them, so the cap is crossed
+    // inside the first two passes.
+    for i in 0..20 {
+        archive::append_record(
+            hub.path(),
+            &ArchiveRecord {
+                report: Some(WorkerReport {
+                    done: "d".repeat(4096),
+                    files: "f".repeat(4096),
+                    tests: "t".repeat(4096),
+                    risks: "r".repeat(4096),
+                }),
+                ..record(&format!("w{i:04}"), OWNER, None)
+            },
+        )
+        .expect("the append must succeed");
+    }
+    assert!(
+        hub.path().join(archive::ARCHIVE_ROTATED_FILE).exists(),
+        "20 maximal lines must have crossed the cap"
+    );
+    let newest = archive::read_records(hub.path(), None, None, Some(3)).expect("readable");
+    assert_eq!(
+        newest
+            .iter()
+            .map(|r| r.worker_id.as_str())
+            .collect::<Vec<_>>(),
+        ["w0017", "w0018", "w0019"],
+        "{newest:?}"
+    );
 }

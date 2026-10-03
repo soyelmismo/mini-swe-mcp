@@ -105,7 +105,7 @@ impl Fixture {
 
     /// The archive's own lines, oldest first, as the reader parses them.
     fn records(&self) -> Vec<ArchiveRecord> {
-        archive::read_records(self.hub.path(), None, None).expect("the archive must be readable")
+        archive::read_records(self.hub.path(), None, None, None).expect("the archive must be readable")
     }
 
     fn archive_path(&self) -> PathBuf {
@@ -276,7 +276,7 @@ fn group_and_last_narrow_the_read() {
         );
     }
 
-    let round_a = archive::read_records(f.hub.path(), Some("round-a"), None).expect("readable");
+    let round_a = archive::read_records(f.hub.path(), None, Some("round-a"), None).expect("readable");
     assert_eq!(
         round_a
             .iter()
@@ -284,7 +284,7 @@ fn group_and_last_narrow_the_read() {
             .collect::<Vec<_>>(),
         ["w1", "w2"],
     );
-    let newest = archive::read_records(f.hub.path(), None, Some(1)).expect("readable");
+    let newest = archive::read_records(f.hub.path(), None, None, Some(1)).expect("readable");
     assert_eq!(
         newest
             .iter()
@@ -293,7 +293,7 @@ fn group_and_last_narrow_the_read() {
         ["w3"],
         "--last keeps the newest of the whole archive"
     );
-    let capped = archive::read_records(f.hub.path(), Some("round-a"), Some(1)).expect("readable");
+    let capped = archive::read_records(f.hub.path(), None, Some("round-a"), Some(1)).expect("readable");
     assert_eq!(
         capped
             .iter()

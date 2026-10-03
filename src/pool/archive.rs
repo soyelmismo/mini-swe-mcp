@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::WorkerRegistryEntry;
@@ -181,6 +181,16 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("could not open {}", path.display()))?;
+    // `mode` only applies to a file this call creates, so an `archive.jsonl`
+    // that already exists keeps whatever mode it had -- a world-readable one
+    // written before this hardening, or planted in a `SWE_HUB_DIR` somebody
+    // else made. The archive names owners and carries REPORT text, so tighten
+    // an existing file to owner-only before the first byte goes in.
+    if let Ok(meta) = file.metadata()
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     file.write_all(line.as_bytes())
         .with_context(|| format!("could not append to {}", path.display()))
 }
