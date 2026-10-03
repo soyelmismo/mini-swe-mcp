@@ -313,7 +313,6 @@ fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
     // nonce cannot authenticate anything.
     match create_nonce_exclusive(&path, &fresh) {
         // This call created the file, so the value it wrote is the secret.
-        // This call created the file, so the value it wrote is the secret.
         Ok(()) => return Some(fresh),
         // The name was already taken (`O_EXCL` reports it as `AlreadyExists`):
         // the existing content is not trusted for merely having been found, so
