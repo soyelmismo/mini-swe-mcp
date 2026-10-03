@@ -429,9 +429,9 @@ fn is_writable(roots: &WriteRoots, path: &Path) -> bool {
 ///
 /// A denial is reported by a dozen tools in a dozen shapes
 /// (`touch: /tmp/x: Permission denied`, `opening '/tmp/y': ...`,
-/// `failed to create file via template '/tmp/tmp.XXXX': ...`), so every
-/// absolute-looking token on the line is a candidate and the first one outside
-/// the writable roots wins. Tokens are stripped of the quoting and trailing
+/// `failed to create file via template '/tmp/tmp.XXXX': ...`), so the first
+/// absolute-looking token on the line is taken as the refused path and checked
+/// against the writable roots. Tokens are stripped of the quoting and trailing
 /// punctuation a message wraps them in.
 fn denied_path(line: &str) -> Option<&str> {
     line.split_whitespace().find_map(|token| {
