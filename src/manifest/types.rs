@@ -1,10 +1,13 @@
 //! Data model and tuning constants for the model manifest.
 //!
-//! Owns the two serializable structs of `models.yaml` ([`ModelDefinition`],
-//! [`ModelManifest`]) plus the four process-wide constants that bound them
-//! ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`], [`MAX_TURNS_LIMIT`],
-//! [`TEMPERATURE_RANGE`]). Contains no behaviour: every rule that reads or
-//! repairs these values lives in the `validate` submodule.
+//! Owns the serializable structs of `models.yaml` ([`ModelDefinition`],
+//! [`ModelManifest`], [`ModelInstructions`]) plus the process-wide constants that
+//! bound them ([`BUILTIN_DEFAULT_MODEL`], [`DEFAULT_MAX_TURNS`],
+//! [`MAX_TURNS_LIMIT`], [`MAX_MODEL_INSTRUCTIONS_BYTES`], [`TEMPERATURE_RANGE`]).
+//! Contains no behaviour: every rule that reads or repairs these values lives
+//! in the `validate` submodule. The one exception is how an `instructions:`
+//! block is *split* into entries, which is deserialization itself and therefore
+//! belongs next to the field it deserializes.
 //!
 //! The declarative execution policy ([`ExecutionPolicy`] and its
 //! [`NetworkPolicy`] field) is the exception: it is *data* here too. Parsing
@@ -228,7 +231,49 @@ impl ModelInstructions {
 
     /// The bytes the block occupies once rendered as a newline-joined list.
     pub fn rendered_len(&self) -> usize {
-        self.entries.iter().map(|entry| entry.len() + 1).sum::<usize>()
+        self.entries
+            .iter()
+            .map(|entry| entry.len() + 1)
+            .sum::<usize>()
+    }
+
+    /// Cut the block to at most `max_bytes`, keeping the head, and report whether
+    /// anything was dropped.
+    ///
+    /// The budget is spent entry by entry, because an instruction is the unit the
+    /// author wrote: dropping a whole one is comprehensible where half a
+    /// sentence is not. A single entry larger than the whole budget is the one
+    /// exception — it is cut at a `char` boundary so the block still carries
+    /// *something* and never disappears without trace. Either way
+    /// [`Self::is_truncated`] is set, and running this on an already-cut block is
+    /// a no-op, which keeps normalizing idempotent.
+    pub(crate) fn truncate_to(&mut self, max_bytes: usize) -> bool {
+        if self.rendered_len() <= max_bytes {
+            return false;
+        }
+
+        let mut used = 0;
+        let mut kept = 0;
+        for entry in &self.entries {
+            let cost = entry.len() + 1;
+            if used + cost > max_bytes {
+                break;
+            }
+            used += cost;
+            kept += 1;
+        }
+        if kept == 0 {
+            // One entry bigger than the budget: keep its head, rounded down so
+            // the block stays inside the budget and the slice cannot split a
+            // multi-byte code point.
+            let head = max_bytes.saturating_sub(1).min(self.entries[0].len());
+            let head = floor_char_boundary(&self.entries[0], head);
+            self.entries[0] = self.entries[0][..head].to_string();
+        } else {
+            self.entries.truncate(kept);
+        }
+        self.truncated = true;
+        true
     }
 
     /// Split raw YAML forms into one entry per line/bullet, dropping blanks.
@@ -270,6 +315,15 @@ impl<'de> Deserialize<'de> for ModelInstructions {
             Repr::List(items) => Self::from_parts(items),
         })
     }
+}
+
+/// The largest index `<= index` that falls on a `char` boundary of `text`.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// Trim one raw instruction and drop it when nothing is left.

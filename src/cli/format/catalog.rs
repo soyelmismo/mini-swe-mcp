@@ -1,8 +1,9 @@
 //! Plain-text renderers for the system-catalog verbs.
 //!
 //! Formatters behind `manifest`, `list` and `prune` — the actions that describe
-//! the *installation* rather than one worker: the model catalog and its
-//! defaults, the worker table, and the housekeeping confirmation.
+//! the *installation* rather than one worker: the model catalog (aliases,
+//! defaults, and the per-model instruction count appended to each model's system
+//! prompt), the worker table, and the housekeeping confirmation.
 //!
 //! Like every formatter in this package they are pure functions over
 //! [`serde_json::Value`] with no I/O, which is what makes them unit-testable
@@ -29,6 +30,16 @@ pub fn format_manifest(val: &serde_json::Value) -> String {
             }
             if let Some(turns) = def.get("max_turns").and_then(|v| v.as_u64()) {
                 meta.push(format!("max turns: {turns}"));
+            }
+            // Per-model instructions are appended to that model's system prompt,
+            // so the count is what an operator needs to confirm the rules they
+            // wrote are actually reaching workers.
+            if let Some(count) = def
+                .get("instructions")
+                .and_then(|v| v.as_array())
+                .map(|list| list.len())
+            {
+                meta.push(format!("instructions: {count}"));
             }
             out.push_str(&format!("  - {} ({})\n", name, meta.join(", ")));
             if let Some(role) = def.get("role").and_then(|v| v.as_str()) {

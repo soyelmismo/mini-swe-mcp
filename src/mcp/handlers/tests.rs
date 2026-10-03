@@ -124,6 +124,7 @@ fn manifest_offline_policy_isolates_when_argument_omitted() {
             policy: Some(crate::manifest::ExecutionPolicy {
                 network: Some(NetworkPolicy::Offline),
             }),
+            instructions: None,
         },
     );
     assert!(

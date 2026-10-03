@@ -88,6 +88,7 @@ fn test_resolve_model() {
             temperature: None,
             max_turns: None,
             policy: None,
+            instructions: None,
         },
     );
     let sparse = ModelManifest {
@@ -140,6 +141,7 @@ fn test_tool_description_role_fallback() {
             temperature: Some(0.9),
             max_turns: Some(7),
             policy: None,
+            instructions: None,
         },
     );
     let manifest = ModelManifest {
@@ -226,6 +228,7 @@ fn test_normalize_repairs_every_fixable_warning() {
             temperature: Some(9.0),
             max_turns: Some(0),
             policy: None,
+            instructions: None,
         },
     );
     models.insert(
@@ -236,6 +239,7 @@ fn test_normalize_repairs_every_fixable_warning() {
             temperature: Some(f32::NAN),
             max_turns: Some(usize::MAX),
             policy: None,
+            instructions: None,
         },
     );
     let manifest = ModelManifest {
@@ -288,6 +292,7 @@ fn test_normalize_keeps_a_resolvable_default_and_is_idempotent() {
         temperature: Some(0.4),
         max_turns: Some(7),
         policy: None,
+        instructions: None,
     });
 
     let normalized = manifest.normalize();
@@ -313,6 +318,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
             temperature: None,
             max_turns: None,
             policy: None,
+            instructions: None,
         },
     );
     let manifest = ModelManifest {
@@ -341,6 +347,7 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
                     temperature: None,
                     max_turns: Some(0),
                     policy: None,
+                    instructions: None,
                 },
             );
         }
@@ -383,6 +390,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
             temperature: Some(0.9),
             max_turns: Some(9),
             policy: None,
+            instructions: None,
         },
     );
     models.insert(
@@ -393,6 +401,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
             temperature: Some(0.1),
             max_turns: Some(1),
             policy: None,
+            instructions: None,
         },
     );
     let manifest = ModelManifest {
@@ -429,6 +438,7 @@ fn test_validate_flags_duplicate_model_ids() {
                 temperature: Some(temperature),
                 max_turns: None,
                 policy: None,
+                instructions: None,
             },
         );
     }
@@ -460,6 +470,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
                 temperature: None,
                 max_turns: None,
                 policy: None,
+                instructions: None,
             },
         );
     }
@@ -692,7 +703,7 @@ fn test_build_system_prompt_injects_memory_only_when_present() {
 
     // No memory file: byte-identical to the static prompt.
     assert_eq!(
-        build_system_prompt(&repo.path, "ninja"),
+        build_system_prompt(&ModelManifest::default(), &repo.path, "ninja"),
         crate::agent::SYSTEM_PROMPT
     );
 
@@ -702,7 +713,7 @@ fn test_build_system_prompt_injects_memory_only_when_present() {
         "PERSISTENT ROLE MEMORY (from .agents/memory/):\n- Verify with cargo clippy.\n",
     )
     .expect("fixture written");
-    let prompt = build_system_prompt(&repo.path, "ninja");
+    let prompt = build_system_prompt(&ModelManifest::default(), &repo.path, "ninja");
     assert!(prompt.starts_with(crate::agent::SYSTEM_PROMPT));
     assert!(
         prompt.contains("Verify with cargo clippy."),
@@ -710,7 +721,7 @@ fn test_build_system_prompt_injects_memory_only_when_present() {
     );
     // Roles stay isolated: the nerd prompt is untouched by ninja's memory.
     assert_eq!(
-        build_system_prompt(&repo.path, "nerd"),
+        build_system_prompt(&ModelManifest::default(), &repo.path, "nerd"),
         crate::agent::SYSTEM_PROMPT
     );
 }
@@ -737,7 +748,10 @@ fn test_alias_for_model_bridges_resolved_ids() {
     )
     .expect("fixture written");
     let alias = manifest.alias_for_model("combo:ninja");
-    assert!(build_system_prompt(&repo.path, &alias).contains("Round trip note."));
+    assert!(
+        build_system_prompt(&ModelManifest::default(), &repo.path, &alias)
+            .contains("Round trip note.")
+    );
 }
 
 // ----------
@@ -784,6 +798,7 @@ fn test_every_declared_network_policy_value_is_accepted_verbatim() {
         policy: Some(ExecutionPolicy {
             network: Some(network),
         }),
+        instructions: None,
     };
     let manifest = ModelManifest {
         default: None,

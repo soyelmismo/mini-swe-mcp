@@ -32,6 +32,7 @@ fn definition(
         temperature,
         max_turns,
         policy: None,
+        instructions: None,
     }
 }
 

@@ -1648,7 +1648,11 @@ impl super::WorkerPool {
             anyhow::bail!("Revision budget for worker {id} must be at least 1 turn");
         }
 
-        let system = crate::manifest::build_system_prompt(&repo_path, &entry.model);
+        // A replayed conversation carries the prompt the worker started with, so
+        // a revision that continues one keeps the manifest instructions that
+        // model declared rather than silently dropping them.
+        let system =
+            crate::manifest::build_system_prompt(self.manifest(), &repo_path, &entry.model);
         let base_branch = detect_base_branch(&repo_path);
         // The base the diff is measured from: the recorded one, else the
         // merge-base of the branch with the base branch.
