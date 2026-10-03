@@ -35,8 +35,8 @@ pub use self::context_pack::{
 };
 use self::review::ReviewPhase;
 pub use self::review::{
-    ReviewMode, SecurityReviewOutcome, SecurityScope, parse_findings, plan_review, review_prompt,
-    scope_for,
+    ReviewMode, SecurityReviewOutcome, SecurityScope, approved_merged_branches, parse_findings,
+    plan_review, review_prompt, scope_for,
 };
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
@@ -575,23 +575,15 @@ impl WorkerPool {
             super::registry::WorkerRole::Consolidate => {
                 super::load_registry_entry_in(&self.scratch, worker_id)
                     .map(|entry| {
-                        entry
-                            .integrated
-                            .iter()
-                            // Excluding a merged branch from this audit is a
-                            // claim that it was reviewed at its own approved
-                            // commit. `integrated` proves only that the merge
-                            // happened, so the approval is checked here: a worker
-                            // that was merged without one (never reviewed, or
-                            // reviewed before the field existed) keeps its branch
-                            // in scope, and is audited here rather than nowhere.
-                            .filter(|id| {
-                                super::load_registry_entry_in(&self.scratch, id)
-                                    .and_then(|worker| worker.security_approved_commit)
-                                    .is_some()
-                            })
-                            .map(|w| format!("worker-{w}"))
-                            .collect()
+                        let scratch = &self.scratch;
+                        // Excluding a merged branch from this audit is a claim
+                        // that it was reviewed at its own approved commit;
+                        // `integrated` proves only that the merge happened, so
+                        // the rule checks the approval itself.
+                        self::review::approved_merged_branches(&entry.integrated, |id| {
+                            super::load_registry_entry_in(scratch, id)
+                                .and_then(|worker| worker.security_approved_commit)
+                        })
                     })
                     .unwrap_or_default()
             }

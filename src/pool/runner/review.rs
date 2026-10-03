@@ -292,6 +292,27 @@ impl SecurityScope {
     }
 }
 
+/// The merged worker branches a consolidator may leave out of its own audit.
+///
+/// Dropping a merged branch is a claim that the code it carries was already
+/// reviewed at its own approved commit. `integrated` proves only that the merge
+/// happened, so the approval has to be checked separately: a worker merged
+/// without one -- never reviewed, or reviewed before the field existed -- keeps
+/// its branch in scope and is audited by the consolidator rather than by nobody.
+///
+/// `approvals` maps a worker id to the commit its security review approved, so
+/// the rule is one predicate the pipeline and the tests read alike.
+pub fn approved_merged_branches(
+    integrated: &[String],
+    approvals: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    integrated
+        .iter()
+        .filter(|id| approvals(id).is_some())
+        .map(|id| format!("worker-{id}"))
+        .collect()
+}
+
 /// The review the pipeline will actually run, given the scope's skip decision,
 /// what the dispatch asked for and whether the scope touched a sensitive path.
 ///
@@ -630,8 +651,7 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
         // uncommitted sensitive edit from the very decision meant to catch it.
         let mut files: Vec<String> = Vec::new();
         for range in [format!("{base}..{branch}"), branch.clone()] {
-            let Ok(output) =
-                crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
+            let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
             else {
                 continue;
             };
@@ -747,9 +767,7 @@ pub(super) async fn incremental_diff(path: &Path, range: &str, working_tree: boo
                     diff.push('\n');
                 }
                 if !diff.is_empty() {
-                    diff.push_str(
-                        "\n--- uncommitted working tree changes, also unaudited ---\n",
-                    );
+                    diff.push_str("\n--- uncommitted working tree changes, also unaudited ---\n");
                 }
                 diff.push_str(&uncommitted);
             }
