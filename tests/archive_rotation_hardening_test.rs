@@ -69,9 +69,13 @@ fn a_rotation_that_cannot_complete_still_writes_the_report() {
         live.contains("\"w1\""),
         "the report must be in the archive: {live}"
     );
-    let records = archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
+    let records =
+        archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
     assert_eq!(
-        records.iter().map(|r| r.worker_id.as_str()).collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|r| r.worker_id.as_str())
+            .collect::<Vec<_>>(),
         ["w1"],
         "the only report written must be readable back: {records:?}"
     );
@@ -95,7 +99,8 @@ fn a_blocked_rotation_keeps_every_report_of_a_long_run() {
         written.push(id);
     }
 
-    let records = archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
+    let records =
+        archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
     let read: Vec<&str> = records.iter().map(|r| r.worker_id.as_str()).collect();
     for id in &written {
         assert!(read.contains(&id.as_str()), "{id} must survive: {read:?}");
@@ -146,12 +151,16 @@ fn concurrent_writers_over_the_cap_lose_no_line() {
     // order it was written. A rotation that discarded another writer's file
     // loses a contiguous run, so a per-writer sequence number catches it where
     // a mere count would not: a duplicate can mask a loss.
-    let records = archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
+    let records =
+        archive::read_records(hub.path(), None, None, None).expect("the read must not fail");
     for w in 0..WRITERS {
         for i in 0..PER_WRITER {
             let id = format!("w{w}-{i}");
             let seen = records.iter().filter(|r| r.worker_id == id).count();
-            assert_eq!(seen, 1, "{id} must be present exactly once, seen {seen} times");
+            assert_eq!(
+                seen, 1,
+                "{id} must be present exactly once, seen {seen} times"
+            );
         }
     }
     assert_eq!(
