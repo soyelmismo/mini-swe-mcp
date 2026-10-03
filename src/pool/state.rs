@@ -116,6 +116,134 @@ impl WorkerReport {
     }
 }
 
+/// A consolidator's per-worker verdicts, kept beside the round's headline.
+///
+/// The consolidator procedure asks for one line per worker it integrated
+/// (`REPORT <id> approved|returned|fixed: <one line>`) plus a `RISK:` line for
+/// anything that touches the sandbox, governance or identity. Without them the
+/// orchestrator only sees the round's one-line `done:`, and the per-worker
+/// detail is in the consolidator's history JSONL -- which is why it is recorded
+/// here, on the completed state and on the registry row, instead.
+///
+/// Bounded by construction: at most [`VERDICT_BYTES`] bytes survive, and the
+/// lines are kept in the order the consolidator wrote them, so a reader sees
+/// the same verdicts in the same order they were made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerVerdicts {
+    /// One `REPORT <id> <verdict>: <line>` per worker, in the written order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<String>,
+    /// The consolidator's `RISK:` lines, verbatim, in the written order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<String>,
+}
+
+/// Byte budget for the whole of a [`WorkerVerdicts`] payload.
+///
+/// A round reports one line per worker it integrated, so a big round is the
+/// case that matters: the lines are kept until the budget is spent and the
+/// overflow is dropped with a marker line, never an unbounded registry row.
+pub const VERDICT_BYTES: usize = 4096;
+
+impl WorkerVerdicts {
+    /// Whether the consolidator recorded anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty() && self.risks.is_empty()
+    }
+
+    /// The lines a notification shows, one per line: the per-worker verdicts
+    /// then the risks.
+    pub fn lines(&self) -> Vec<&str> {
+        self.workers
+            .iter()
+            .chain(self.risks.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Collect a consolidator's per-worker `REPORT` lines and `RISK:` lines from
+/// its closing message, bounded to [`VERDICT_BYTES`].
+///
+/// Lines are kept verbatim (markup stripped by the caller) in the order they
+/// were written, because the order is the round's history. Once the budget is
+/// spent the remaining lines are dropped and a trailing marker names how many,
+/// so a truncated round reads as truncated instead of quietly short.
+pub fn parse_verdict_lines(message: &str) -> WorkerVerdicts {
+    let mut verdicts = WorkerVerdicts::default();
+    let mut spent = 0usize;
+    let mut dropped = 0usize;
+    let mut push = |line: String, into: fn(&mut WorkerVerdicts) -> &mut Vec<String>| {
+        if spent + line.len() + 1 > VERDICT_BYTES {
+            dropped += 1;
+            return;
+        }
+        spent += line.len() + 1;
+        into(&mut verdicts).push(line);
+    };
+    for line in message.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_risk_line(line) {
+            push(risk_line(line), |v| &mut v.risks);
+        } else if is_per_worker_verdict(line) {
+            push(line.to_string(), |v| &mut v.workers);
+        }
+    }
+    if dropped > 0 {
+        let marker = format!("... [{dropped} more verdict lines dropped]");
+        // The marker is charged against the same budget as the lines it
+        // replaces: the ceiling is a ceiling, not a target.
+        let room = VERDICT_BYTES.saturating_sub(spent);
+        if marker.len() + 1 <= room {
+            verdicts.risks.push(marker);
+        }
+    }
+    verdicts
+}
+
+/// Whether `line` is a consolidator's `RISK:` line.
+fn is_risk_line(line: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(head, _)| head.trim().eq_ignore_ascii_case("RISK"))
+}
+
+/// The `RISK:` line without its marker, so every stored risk reads the same way.
+fn risk_line(line: &str) -> String {
+    match line.split_once(':') {
+        Some((_, rest)) => format!("RISK:{}", rest.trim_start()),
+        None => line.to_string(),
+    }
+}
+
+/// Whether `line` is a consolidator's per-worker verdict, `REPORT <id> <v>:`.
+///
+/// The id is what separates a verdict from the round's own block marker, and
+/// the verdict must be one of the three the procedure names, so the block's
+/// `REPORT` / `done:` / `risks:` lines are never mistaken for one.
+fn is_per_worker_verdict(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("REPORT ") else {
+        return false;
+    };
+    let mut words = rest.split_whitespace();
+    let Some(id) = words.next() else {
+        return false;
+    };
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return false;
+    }
+    matches!(
+        words.next().map(|verdict| verdict.trim_end_matches(':')),
+        Some("approved" | "APPROVED" | "returned" | "RETURNED" | "fixed" | "FIXED")
+    )
+}
+
 /// One file's share of a diff: the path, the lines added and the lines removed.
 ///
 /// The completion diff is already in memory when a worker finishes, so the
@@ -345,6 +473,11 @@ pub enum WorkerState {
         /// worker never supplied one (the summary stays the fallback).
         #[serde(default)]
         report: Option<WorkerReport>,
+        /// The per-worker `REPORT` lines and `RISK:` lines of a consolidator's
+        /// closing message. `None` for an ordinary worker, which has one
+        /// verdict to give -- its own -- already in `report`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdicts: Option<WorkerVerdicts>,
     },
     Failed {
         error: String,
@@ -382,6 +515,11 @@ pub enum WorkerState {
         /// one; the summary stays the fallback.
         #[serde(default)]
         report: Option<WorkerReport>,
+        /// Same counter as on [`WorkerState::Completed`]: a consolidator that
+        /// ran out of turns mid-round still reported the workers it had
+        /// already reached a verdict on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdicts: Option<WorkerVerdicts>,
     },
 }
 
