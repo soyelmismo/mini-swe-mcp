@@ -18,7 +18,27 @@
 //! matches `swe-wt-*` directories and `swe-wt-*.pid` leases, and a
 //! `swe-wt-<id>.steer` file matches neither. The same is true of the
 //! orchestrator steer log ([`record_orchestrator_steer_in`]), which is swept as
-//! a worker companion by retirement instead. Cleanup is therefore the worker
+//! a worker companion by retirement instead.
+//!
+//! ## What the steer log is, and what may not reach it
+//!
+//! The orchestrator steer log (`swe-wt-<id>.steer-log.jsonl`) is never drained:
+//! it is the round's record of the orchestrator's *own* scope amendments, read
+//! back when a consolidator is dispatched much later. Two properties follow from
+//! that, and both hold at the `open(2)` itself rather than in a check before it:
+//!
+//! * **It is written and read only as a regular file, never through a link.**
+//!   The name sits in the shared scratch base, so a local user can pre-create
+//!   it. Following a planted symlink would turn an orchestrator steer into an
+//!   append into an arbitrary file, and would let a planted file be read back as
+//!   the orchestrator's voice -- text the consolidator is told *supersedes* the
+//!   worker's task. `O_NOFOLLOW` plus a check of the opened handle's own type
+//!   refuses a link, a FIFO, or a device, in both directions.
+//! * **Neither direction may block.** `O_NONBLOCK` at the open is what makes
+//!   the type check reachable: `O_APPEND` on a FIFO blocks inside `open(2)`
+//!   until a reader arrives, and a read-only `open` on a FIFO blocks until a
+//!   writer does. `round_manifest` is async and reads the log on the reactor, so
+//!   either would stall every request on the pool. Cleanup is therefore the worker
 //! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
 //! held for the worker's whole lifetime), not the pruner's — a mailbox only
 //! exists while some `steer` call created it, and every worker removes its own
@@ -44,6 +64,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -219,14 +240,68 @@ pub(super) fn record_orchestrator_steer_in(root: &ScratchRoot, worker_id: &str, 
     // `to_string` on a `Value` cannot fail.
     let mut payload = serde_json::to_string(&record).unwrap_or_default();
     payload.push('\n');
-    let result = OpenOptions::new()
+    match open_steer_log_for_append(&path) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(payload.as_bytes()) {
+                warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+            }
+        }
+        Err(e) => {
+            warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+        }
+    }
+}
+
+/// Open the steer log to append one record, refusing anything but our own file.
+///
+/// The log lives in the shared scratch base, which any local user can write, so
+/// the name alone proves nothing: a symlink planted at the path would turn
+/// this append into an append into whatever the link names -- a file the
+/// attacker cannot otherwise write -- with orchestrator-authored bytes in it.
+/// `O_NOFOLLOW` refuses a link at the open itself, rather than a `symlink_metadata`
+/// check that precedes it and leaves a window to swap a regular file for one.
+///
+/// `O_NONBLOCK` is here for the type that is not a link: `O_APPEND` on a FIFO
+/// blocks inside `open(2)` until a reader shows up, which would park the whole
+/// pool on a steer. The handle's own `fstat` then proves the type on the object
+/// actually opened, so a FIFO or a device cannot be substituted for the log
+/// either. A regular file ignores `O_NONBLOCK`, so the real log pays nothing.
+fn open_steer_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
-        .and_then(|mut file| file.write_all(payload.as_bytes()));
-    if let Err(e) = result {
-        warn!(worker = %worker_id, path = %path.display(), error = %e, "Failed to record orchestrator steer");
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "steer log is not a regular file",
+        ));
     }
+    Ok(file)
+}
+
+/// Open the steer log to read it, refusing a link and any non-regular file.
+///
+/// The companion of [`open_steer_log_for_append`] on the read side: this text is
+/// rendered to the consolidator as the orchestrator's scope amendments, so what
+/// is read here is treated as the orchestrator's own voice. A planted file must
+/// never be able to speak in that voice, and a FIFO must never be able to stall
+/// the async caller that builds the manifest.
+fn open_steer_log_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "steer log is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Ceiling on the bytes [`orchestrator_steers_in`] reads from one log.
@@ -251,8 +326,20 @@ const STEER_LOG_READ_CAP: u64 = 256 * 1024;
 /// half-decoded record.
 pub(super) fn orchestrator_steers_in(root: &ScratchRoot, worker_id: &str) -> Vec<String> {
     let path = steer_log_path_in(root, worker_id);
-    let Ok(file) = std::fs::File::open(&path) else {
-        return Vec::new();
+    // Opened the way the archive reader opens its own shared file: `O_NOFOLLOW`
+    // so a planted link is never harvested as the orchestrator's own words, and
+    // `O_NONBLOCK` so the type can be established without blocking in
+    // `open(2)` -- a FIFO read-only blocks until a writer arrives, which would
+    // stall every request on the pool. The handle's own type is then checked, so
+    // a FIFO or a device cannot stand in for the log either. A missing log is
+    // the common case and yields nothing.
+    let file = match open_steer_log_for_read(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!(worker = %worker_id, path = %path.display(), error = %e, "Refusing to read orchestrator steer log");
+            return Vec::new();
+        }
     };
     let mut content = String::new();
     if let Err(e) = file.take(STEER_LOG_READ_CAP).read_to_string(&mut content)
