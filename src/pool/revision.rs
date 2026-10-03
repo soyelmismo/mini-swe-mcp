@@ -2,15 +2,15 @@
 //!
 //! The orchestrator reviews a finished worker's branch and then steers it with
 //! corrections. The model must continue on its own branch with its full
-//! context rather than restart from the task, so [`WorkerPool::run_worker`]
-//! and its auto-checkpoints serialize the live conversation (system prompt,
-//! task, every assistant turn
+//! context rather than restart from the task, so the worker's agent loop and
+//! its auto-checkpoints serialize the live conversation (system prompt, task,
+//! every assistant turn
 //! with its reasoning, every tool result -- exactly what the next request
 //! replays) plus the metadata the launch took apart again, into
-//! `swe_base_dir()/swe-wt-<id>.history.json`. [`WorkerPool::steer`] reloads the
-//! file, appends the revision request, and re-launches the same loop on the
-//! same branch. History without its metadata is a dead letter, so one atomic
-//! file carries both.
+//! `swe_base_dir()/swe-wt-<id>.history.json`.
+//! [`WorkerPool::steer`](super::WorkerPool::steer) reloads the file, appends the
+//! revision request, and re-launches the same loop on the same branch. History
+//! without its metadata is a dead letter, so one atomic file carries both.
 //!
 //! The canonical store is the append-only log `swe-wt-<id>.history.jsonl`:
 //! line one is the metadata [`WorkerHistory`] carries, and every following
@@ -516,9 +516,10 @@ pub struct RetireContext<'a> {
     /// write owner names into a place nobody asked for.
     pub ack_dir: Option<&'a Path>,
     /// Why this worker is being retired, which is what the archive line says.
-    /// `None` is read as [`RetireReason::Merged`]: every retirement of a
-    /// finished worker outside the deliberate ones is a merge or the sweep that
-    /// proves it.
+    /// `None` is read as
+    /// [`RetireReason::Merged`](super::archive::RetireReason::Merged): every
+    /// retirement of a finished worker outside the deliberate ones is a merge or
+    /// the sweep that proves it.
     pub reason: Option<super::archive::RetireReason>,
     /// The commit that landed this worker, when the retirement knows one.
     /// `None` when nothing in the caller could name it.
@@ -1381,8 +1382,8 @@ pub fn prune_orphan_histories_with_retention_and_grace_in(
 use super::runner::WorkerLaunchConfig;
 use crate::worktree::ScratchRoot;
 
-/// What [`WorkerPool::steer_with_budget`] actually did, so the reply can only
-/// claim what happened.
+/// What [`WorkerPool::steer_with_budget`](super::WorkerPool::steer_with_budget)
+/// actually did, so the reply can only claim what happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
     /// A running worker took the message: it is applied on its next step.

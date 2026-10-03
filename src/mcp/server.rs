@@ -720,7 +720,7 @@ impl McpServer {
     }
 
     /// Close the recovery gate before accepting hub connections; see
-    /// [`RecoveryGate`].
+    /// `RecoveryGate`.
     pub fn begin_recovery(&self) {
         self.recovery.begin();
     }
@@ -950,10 +950,9 @@ impl McpServer {
     /// every worker state change and this loop sleeps on that subscription, so
     /// a step, a pause, a resume or a terminal state is observed as it happens
     /// instead of on a fixed tick. The only coarse tick left is
-    /// [`CROSS_PROCESS_TICK`](Self::CROSS_PROCESS_TICK), for a worker this
-    /// process does not own (another `mini-swe-mcp` process, or
-    /// `MINI_SWE_NO_DAEMON` mode): its state changes are invisible to the
-    /// subscription, so the registry has to be re-read.
+    /// `CROSS_PROCESS_TICK`, for a worker this process does not own (another
+    /// `mini-swe-mcp` process, or `MINI_SWE_NO_DAEMON` mode): its state changes
+    /// are invisible to the subscription, so the registry has to be re-read.
     pub async fn await_worker_result_until(
         &self,
         wid: &str,

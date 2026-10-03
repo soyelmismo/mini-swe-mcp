@@ -4,14 +4,14 @@
 //! `mini_swe_mcp::pool::*` surface byte-for-byte identical through the
 //! re-exports below:
 //!
-//! * [`buffer`] — bounded step-log retention window and emission view.
-//! * [`state`] — worker lifecycle state, the in-memory record, progress views
+//! * `buffer` — bounded step-log retention window and emission view.
+//! * `state` — worker lifecycle state, the in-memory record, progress views
 //!   and the terminal-record TTL.
-//! * [`registry`] — the on-disk JSON registry shared across processes.
-//! * [`steer`] — the disk-backed steering mailbox, the cross-process delivery
+//! * `registry` — the on-disk JSON registry shared across processes.
+//! * `steer` — the disk-backed steering mailbox, the cross-process delivery
 //!   path for orchestrator guidance.
-//! * [`runner`] — the agent execution loop and the orchestrator sentinels.
-//! * [`clock`] — the shared wall-clock helper.
+//! * `runner` — the agent execution loop and the orchestrator sentinels.
+//! * `clock` — the shared wall-clock helper.
 //! * [`admission`] — resource-aware admission control for heavy commands,
 //!   replacing the fixed-width build semaphore.
 //!
@@ -20,7 +20,7 @@
 //! reap) must stay in one place to keep the lock discipline auditable.
 //!
 //! A consolidator's reach is bounded by
-//! [`check_consolidate_delegation`](registry::check_consolidate_delegation):
+//! [`check_consolidate_delegation`]:
 //! its owner's own workers, in its own group, and nothing else.
 
 use anyhow::Result;
@@ -585,11 +585,11 @@ impl WorkerPool {
     /// Whether the pool itself has a harness-side wait published as `id`'s
     /// command in flight, so a step must not overwrite that label.
     ///
-    /// The answer comes from the map [`set_running_command`](Self::set_running_command)
-    /// filled and [`restore_running_command`](Self::restore_running_command)
-    /// clears, never from the recorded `last_command`: that field holds
-    /// model-written text, and a command beginning with the wait's name would
-    /// otherwise own the label for the rest of the worker's life.
+    /// The answer comes from the map `set_running_command` filled and
+    /// `restore_running_command` clears, never from the recorded
+    /// `last_command`: that field holds model-written text, and a command
+    /// beginning with the wait's name would otherwise own the label for the
+    /// rest of the worker's life.
     pub fn harness_wait_in_flight(&self, id: &str) -> bool {
         self.harness_wait_label
             .lock()
@@ -2125,7 +2125,7 @@ impl WorkerPool {
     /// Whether `id`'s lifecycle events belong to a consolidator that steered it
     /// and has not stopped.
     ///
-    /// A worker a consolidator steered ([`steer::SteerSource`]) reports its
+    /// A worker a consolidator steered (`steer::SteerSource`) reports its
     /// completion, failure or exhaustion to that consolidator, which is blocked
     /// in `CONSOLIDATE_WAIT` on exactly that stop. Until the consolidator
     /// finishes, fails or dies the owner's watch stays quiet, the same way
