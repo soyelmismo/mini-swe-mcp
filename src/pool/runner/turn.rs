@@ -1289,6 +1289,17 @@ impl<'a> TurnEngine<'a> {
         // `await_worker_result_until` wakes on this step instead of on the next
         // 500 ms tick. Refreshing the cached metrics in the same critical
         // section keeps a kill racing this turn reporting the counters to it.
+        //
+        // The label goes to the step unless the pool itself is holding a
+        // harness-side wait as this worker's command in flight. `status` then
+        // shows what the worker is really doing, and the stall detector reads
+        // the wait as work instead of as a step that has gone idle. The
+        // question is asked of the pool's own record of the label, never of
+        // `last_command`: that field holds model-written text, and a command
+        // beginning with the wait's name would otherwise own the label for
+        // the rest of the worker's life, every later step reading the same
+        // unchanged label and skipping its own write again.
+        let wait_owns_label = self.pool.harness_wait_in_flight(self.worker_id);
         self.pool
             .update_worker(self.worker_id, |w| {
                 w.metrics = self.meta.metrics;
@@ -1299,12 +1310,17 @@ impl<'a> TurnEngine<'a> {
                 } = w.state
                 {
                     *s = *self.step;
-                    *last_command = label.clone();
+                    if !wait_owns_label {
+                        *last_command = label.clone();
+                    }
                 }
             })
             .await;
 
         // --- Registry update, coalesced by the pool's writer ---
+        // The durable row records the step's own command whatever the wait
+        // label shows, so a restart never adopts a wait label as the worker's
+        // last command.
         self.pool.save_status(
             self.meta,
             config.model,

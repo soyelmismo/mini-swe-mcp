@@ -87,12 +87,12 @@ pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, PACK_CAP_BYTES,
-    REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig, context_pack,
-    extract_identifiers, extract_paths, is_completion_request, opening_task_message, outline_file,
-    parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
-    parse_consolidate_wait, parse_findings, parse_kill_job, parse_report, parse_request_turns,
-    parse_wait_job, review_prompt, summarize_command, summary_line,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    HARNESS_WAIT_PREFIX, PACK_CAP_BYTES, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome,
+    WorkerLaunchConfig, context_pack, extract_identifiers, extract_paths, is_completion_request,
+    opening_task_message, outline_file, parse_ask_orchestrator, parse_consolidate_merge,
+    parse_consolidate_steer, parse_consolidate_wait, parse_findings, parse_kill_job, parse_report,
+    parse_request_turns, parse_wait_job, review_prompt, summarize_command, summary_line,
 };
 pub use self::state::{
     ARTIFACT_PREVIEW, CollectedWorker, DEFAULT_TERMINAL_RETENTION_SECS, DEFAULT_TERMINAL_TTL_SECS,
@@ -279,6 +279,37 @@ impl Drop for CommandRun {
     }
 }
 
+/// Holds a harness-side wait's claim on its worker's command label.
+///
+/// The claim is what [`WorkerPool::harness_wait_in_flight`] reads, and it is
+/// released on drop, so it lasts exactly as long as the wait does however the
+/// wait ends. A wait that returned normally drops it after restoring the label
+/// it replaced; a wait cancelled with its group still running drops it when the
+/// abort or unwind that killed the worker task unwinds the future. Without
+/// this guard a cancelled wait would own the label for good: a revision
+/// continued on the same worker id would find the claim held and skip every
+/// write of its own command, and `status` would name a wait the pool was
+/// never running.
+pub struct HarnessWait {
+    pool: WorkerPool,
+    id: String,
+}
+
+impl Drop for HarnessWait {
+    fn drop(&mut self) {
+        let removed = self
+            .pool
+            .harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.id)
+            .is_some();
+        if removed {
+            self.pool.notify_change();
+        }
+    }
+}
+
 /// The word that stands for the caller's most recently dispatched worker.
 pub const LAST_WORKER_ID: &str = "last";
 
@@ -312,6 +343,17 @@ pub struct WorkerPool {
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
     command_running: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Worker id -> the harness-side wait label the pool itself published as
+    /// that worker's command in flight, e.g. `CONSOLIDATE_WAIT <ids>`.
+    ///
+    /// Held here, rather than inferred from the recorded `last_command`, so
+    /// only a label the pool really wrote can outrank a step. A step's own
+    /// label is model-written text, and the wait's name is a prefix of
+    /// perfectly ordinary commands: reading it out of the text would let a
+    /// model freeze its worker's reported command for good by issuing
+    /// `CONSOLIDATE_WAIT ...`, since every later step reads the same unchanged
+    /// label and skips its own write again.
+    harness_wait_label: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Background jobs of every live worker: a command that outlived its
     /// budget keeps running here, confined exactly as the command was, until
     /// it ends or its worker does.
@@ -415,6 +457,7 @@ impl WorkerPool {
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            harness_wait_label: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: JobTable::new(),
             workers: Arc::new(RwLock::new(HashMap::new())),
             changes: watch::channel(0).0,
@@ -511,7 +554,13 @@ impl WorkerPool {
     ///
     /// A harness-side wait spends no bash command, so without this the status
     /// view would keep showing the previous command for the whole wait.
-    async fn set_running_command(&self, id: &str, command: &str) -> Option<String> {
+    ///
+    /// The label is also recorded as the pool's own, which is what
+    /// [`harness_wait_in_flight`](WorkerPool::harness_wait_in_flight) reads, so
+    /// the step recorder can tell this label from a step's model-written one.
+    /// The returned [`HarnessWait`] owns that claim and releases it on drop, so
+    /// a wait cancelled mid-flight leaves it behind for nobody.
+    async fn set_running_command(&self, id: &str, command: &str) -> (Option<String>, HarnessWait) {
         let mut previous = None;
         self.update_worker(id, |worker| {
             if let WorkerState::Running { last_command, .. } = &mut worker.state {
@@ -520,7 +569,32 @@ impl WorkerPool {
             }
         })
         .await;
-        previous
+        self.harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(id.to_string(), command.to_string());
+        (
+            previous,
+            HarnessWait {
+                pool: self.clone(),
+                id: id.to_string(),
+            },
+        )
+    }
+
+    /// Whether the pool itself has a harness-side wait published as `id`'s
+    /// command in flight, so a step must not overwrite that label.
+    ///
+    /// The answer comes from the map [`set_running_command`](Self::set_running_command)
+    /// filled and [`restore_running_command`](Self::restore_running_command)
+    /// clears, never from the recorded `last_command`: that field holds
+    /// model-written text, and a command beginning with the wait's name would
+    /// otherwise own the label for the rest of the worker's life.
+    pub fn harness_wait_in_flight(&self, id: &str) -> bool {
+        self.harness_wait_label
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(id)
     }
 
     /// Put back the command label a [`WorkerPool::set_running_command`] replaced.
@@ -528,6 +602,11 @@ impl WorkerPool {
     /// The restore only fires while the label is still the wait's own: a wait
     /// that ended because the worker itself stopped (killed, paused, finished)
     /// must not overwrite the state that stop wrote.
+    ///
+    /// The claim [`harness_wait_in_flight`](WorkerPool::harness_wait_in_flight)
+    /// reads is not released here but by the [`HarnessWait`] guard the wait
+    /// holds, so a wait cancelled before it ever reaches this call gives the
+    /// claim up just as a wait that ends here does.
     async fn restore_running_command(&self, id: &str, wait_label: &str, previous: Option<String>) {
         if let Some(previous) = previous {
             self.update_worker(id, |worker| {
@@ -1688,13 +1767,20 @@ impl WorkerPool {
                 .min(CONSOLIDATE_WAIT_MAX_SECS),
         );
         // Held for the whole wait: the consolidator is running a command as far
-        // as the stall detector is concerned.
+        // as the stall detector is concerned. The mark is stamped once, here,
+        // and the loop below only waits on it -- re-publishing it per
+        // iteration would keep resetting the command's start time, so a wait
+        // of half an hour would still read as `running for 0s`.
         let _running = self.command_running(&actor.id);
         // Name the wait as the command in flight, so `status` shows what the
         // consolidator is actually doing instead of its previous command, and
         // restore the previous label once the wait returns.
-        let wait_label = format!("CONSOLIDATE_WAIT {}", ids.join(" "));
-        let previous_command = self.set_running_command(&actor.id, &wait_label).await;
+        let wait_label = format!("{} {}", HARNESS_WAIT_PREFIX, ids.join(" "));
+        // `_claim` is held for the whole wait and released when it ends, however
+        // it ends: a wait that is aborted with its group still running drops the
+        // future here, and a revision continued on this worker id must find the
+        // label free to write its own command.
+        let (previous_command, _claim) = self.set_running_command(&actor.id, &wait_label).await;
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.subscribe_changes();
         let mut timed_out = false;

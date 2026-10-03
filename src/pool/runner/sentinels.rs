@@ -411,6 +411,15 @@ pub fn parse_consolidator_verdicts(message: &str) -> Vec<(String, &'static str)>
 pub const CONSOLIDATE_WAIT_DEFAULT_SECS: u64 = 900;
 pub const CONSOLIDATE_WAIT_MAX_SECS: u64 = 3600;
 
+/// First word of the label a harness-side wait publishes as the command in
+/// flight.
+///
+/// A wait spends no bash command, so it names itself instead: `status` shows
+/// what the worker is actually doing and the stall detector reads the wait as
+/// work. The step recorder consults it, so a step that ends while the wait is
+/// still in flight does not overwrite the label with its own command.
+pub const HARNESS_WAIT_PREFIX: &str = "CONSOLIDATE_WAIT";
+
 /// `echo/printf "CONSOLIDATE_STEER <id> <message...>"` → the worker to steer
 /// and the message, verbatim.
 ///

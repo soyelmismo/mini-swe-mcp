@@ -737,7 +737,11 @@ pub const ROUND_STALL_SECS: u64 = 1200;
 ///
 /// A worker waiting for a build slot, or running a command, is not inactive:
 /// same rules as [`select_event`], so a long gate never reads as a stall.
-fn round_idle(v: &Value, now: u64) -> u64 {
+///
+/// Public because a replayed stall event reports its idle time through this
+/// one rule too: a raw subtraction there would name minutes of inactivity for
+/// a worker the detector is holding in flight.
+pub fn round_idle_secs(v: &Value, now: u64) -> u64 {
     if v["waiting_for_slot"].is_number() || in_flight(v, v["status"].as_str().unwrap_or("running"))
     {
         return 0;
@@ -754,7 +758,7 @@ fn round_outcome(v: &Value, now: u64) -> &'static str {
         Some("stopped") => "stopped",
         Some("interrupted") => "interrupted",
         Some("paused") => "needs_input",
-        Some("running" | "reviewing") if round_idle(v, now) >= ROUND_STALL_SECS => "stalled",
+        Some("running" | "reviewing") if round_idle_secs(v, now) >= ROUND_STALL_SECS => "stalled",
         _ => "running",
     }
 }
@@ -781,7 +785,7 @@ fn round_line(v: &Value, now: u64) -> Value {
         "done": round_done(v),
         "question": v["question"].clone(),
         "branch": v["branch"].clone(),
-        "time_since_last_step": round_idle(v, now),
+        "time_since_last_step": round_idle_secs(v, now),
     })
 }
 
@@ -928,7 +932,7 @@ fn round_ready(selected: &[&Value], now: u64, fresh: &impl Fn(&str) -> bool) -> 
             }
             Some("running" | "reviewing") => {
                 all_stopped = false;
-                if is_fresh && round_idle(v, now) >= ROUND_STALL_SECS {
+                if is_fresh && round_idle_secs(v, now) >= ROUND_STALL_SECS {
                     attention = true;
                 }
             }
