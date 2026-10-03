@@ -2160,17 +2160,24 @@ impl EventRouter {
                     }
                     // A worker that is running a command now (a harness-side
                     // wait such as CONSOLIDATE_WAIT or WAIT_JOB, a long gate,
-                    // or a live background job) is doing work, and the stall
+                    // or a live background job) is doing work, so the stall
                     // rule would never have fired for it: the episode queued
                     // while it was idle is stale. Delivering it anyway told the
                     // owner a working consolidator had stalled and suggested
                     // killing it, so the episode is dropped instead -- the same
-                    // verdict the `--all` round reaches, and the same one
-                    // `select_event` gives the live view.
-                    if crate::cli::watch::round_idle_secs(current, crate::pool::unix_timestamp())
-                        == 0
-                        && !current["waiting_for_slot"].is_number()
-                    {
+                    // verdict the `--all` round reaches.
+                    //
+                    // A worker queued for a build slot is deliberately exempt:
+                    // it was queued as *idle* and its stall episode is real,
+                    // so that episode is still delivered. `round_idle_secs`
+                    // reports a slot waiter as 0 too, hence the explicit test.
+                    let in_flight =
+                        !current["waiting_for_slot"].is_number()
+                            && crate::cli::watch::round_idle_secs(
+                                current,
+                                crate::pool::unix_timestamp(),
+                            ) == 0;
+                    if in_flight {
                         // Collected, not acted on: the loop below holds the
                         // backlog borrowed, so the drop happens once it is
                         // released.
