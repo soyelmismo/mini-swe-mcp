@@ -275,7 +275,16 @@ impl SecurityScope {
     /// nothing unaudited changed; `None` when there is something to review.
     pub fn skip_log(&self) -> Option<String> {
         match self {
-            Self::Since { base, commits, .. } if commits.is_empty() => Some(format!(
+            // Only a commit list that is empty *and* a clean working tree is
+            // evidence that nothing is left unaudited. An agent that edited a
+            // sensitive file without committing it has changed the code, and the
+            // commit range alone would not see it.
+            Self::Since {
+                base,
+                commits,
+                uncommitted,
+                ..
+            } if commits.is_empty() && !*uncommitted => Some(format!(
                 "security review skipped: no sensitive change since {base}"
             )),
             _ => None,
@@ -311,6 +320,7 @@ pub async fn scope_for(
             approved: Vec::new(),
             commits: own_commits(repo, branch, merged).await,
             merged: merged.to_vec(),
+            uncommitted: has_uncommitted_changes(repo).await,
         },
         WorkerRole::Worker => match approved {
             // An approval the repository cannot resolve -- a pruned branch, a
@@ -326,6 +336,7 @@ pub async fn scope_for(
                         approved: already,
                         commits,
                         merged: Vec::new(),
+                        uncommitted: has_uncommitted_changes(repo).await,
                     }
                 }
                 None => SecurityScope::Full,
@@ -333,6 +344,26 @@ pub async fn scope_for(
             None => SecurityScope::Full,
         },
     }
+}
+
+/// Whether the working tree carries a change its branch tip does not: staged,
+/// unstaged or intent-to-add.
+///
+/// An agent edits before it commits and the harness checkpoints only after the
+/// review phase, so "no new commit" is not "no new change". Treating a dirty
+/// tree as nothing to audit would skip the review of exactly the edits the run
+/// is about to hand on, so the honest answer is that something is unaudited.
+async fn has_uncommitted_changes(repo: &Path) -> bool {
+    let path = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        crate::worktree::git(&path, "status", &["status", "--porcelain"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| !out.stdout.iter().all(u8::is_ascii_whitespace))
+    })
+    .await
+    .unwrap_or(true)
 }
 
 /// Decide what one run's security review has to cover, from the worktree's own
@@ -556,21 +587,29 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
     let base = base.to_string();
     let branch = branch.to_string();
     tokio::task::spawn_blocking(move || {
-        let range = format!("{base}..{branch}");
         let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
-        let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
-        else {
-            return Vec::new();
-        };
-        if !output.status.success() {
-            return Vec::new();
+        // The commit range names what the branch added; the working tree names
+        // what the run edited but has not committed yet. Both are unaudited, so
+        // the probe is the union: measuring only the range would hide an
+        // uncommitted sensitive edit from the very decision meant to catch it.
+        let mut files: Vec<String> = Vec::new();
+        for range in [format!("{base}..{branch}"), branch.clone()] {
+            let Ok(output) =
+                crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            files.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string),
+            );
         }
-        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect();
         files.sort();
         files.dedup();
         files
@@ -771,6 +810,10 @@ pub enum SecurityScope {
         /// Branches already reviewed at their own approved commits, which a
         /// consolidator's own commits must be measured without.
         merged: Vec<String>,
+        /// Whether the working tree carries a change the covered commits do
+        /// not: an agent edits before it commits, so an empty commit list is
+        /// not by itself evidence that nothing is left unaudited.
+        uncommitted: bool,
     },
 }
 

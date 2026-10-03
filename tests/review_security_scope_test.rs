@@ -235,3 +235,36 @@ async fn an_unresolvable_approval_never_reads_as_no_change() {
         "an approval the repository cannot resolve must not be read as an approval"
     );
 }
+
+/// The scope must not report a skip while the working tree carries an
+/// unaudited change: an agent that edits a sensitive file without committing it
+/// has changed the code, and a review that only looks at commit ranges would
+/// wave that through.
+#[tokio::test]
+async fn an_uncommitted_sensitive_change_is_never_reported_as_no_change() {
+    let (dir, base) = repo("scope_uncommitted");
+    let approved = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "sensitive change",
+    );
+
+    // The revision corrects a sensitive file but leaves it uncommitted: the
+    // harness checkpoints after the review, so this state is a real one.
+    let dirty = dir.path().join("src/hub/events.rs");
+    std::fs::write(&dirty, "// unaudited work\n").expect("write the uncommitted change");
+    common::git(dir.path(), &["add", "-N", "src/hub/events.rs"]);
+
+    let scope = worker_scope(dir.path(), "worker-w1", &base, Some(approved.clone())).await;
+    assert!(
+        scope.reviewed_files(dir.path()).await.contains(&"src/hub/events.rs".to_string()),
+        "the unaudited working-tree change must be part of what this review covers"
+    );
+    assert_ne!(
+        scope.skip_log(),
+        Some(format!("security review skipped: no sensitive change since {approved}")),
+        "an uncommitted sensitive change must not be skipped: the audit that approved \
+         {approved} never saw it"
+    );
+}
