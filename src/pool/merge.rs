@@ -23,13 +23,17 @@
 //! * **A round never lands as more than it integrated.** A consolidator's row
 //!   records the workers it merged *at that moment*; a worker revised afterwards
 //!   commits again on its own branch, so the round the orchestrator is about to
-//!   merge is no longer the round the consolidator integrated. Every member is
-//!   re-proved against the consolidator's own branch before the merge -- by
-//!   `merge <consolidator>` and by the `--approved` batch alike -- and a member
-//!   whose tip is not an ancestor refuses the merge by name and by unintegrated
-//!   commit count. `merge --force` is the only way past it. A probe that fails
-//!   to prove integration reports the member too: "cannot be proved" is never
-//!   read as "integrated".
+//!   merge is no longer the round the consolidator integrated. And a member the
+//!   consolidator *left out* of its round is just as absent from its branch as
+//!   one it merged and then missed. Every member of the round the consolidator
+//!   was dispatched for -- ready or not, the `integrated` set alone being only
+//!   the branches it chose to merge -- is re-proved against the consolidator's
+//!   own branch before the merge, by `merge <consolidator>` and by the
+//!   `--approved` batch alike, and a member that is neither missing nor
+//!   integrated refuses the merge by name and by unintegrated commit count.
+//!   `merge --force` is the only way past it. A probe that fails to prove
+//!   integration reports the member too: "cannot be proved" is never read as
+//!   "integrated".
 //!
 //! The gate itself is deliberately the same command the worker ran -- the one
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
@@ -43,7 +47,8 @@ use anyhow::{Context, Result};
 use super::admission::{AdmissionClass, AdmissionController};
 use super::archive::RetireReason;
 use super::registry::{
-    RegistryStatus, WorkerRegistryEntry, WorkerRole, load_all_registry_entries_in, load_registry_entry_in,
+    RegistryStatus, WorkerRegistryEntry, WorkerRole, load_all_registry_entries_in,
+    load_registry_entry_in,
 };
 use super::revision::{
     RetireContext, WorkerHistory, load_worker_history_log_in, retire_worker_reporting,
@@ -947,11 +952,23 @@ pub struct UnintegratedWorker {
     /// `None` when git could not count them -- which is "unproven", not
     /// "none".
     pub commits: Option<usize>,
+    /// Whether the member was left out of the round rather than merged and
+    /// then revised on.
+    pub left_out: bool,
 }
 
 impl UnintegratedWorker {
     /// The one line a completion event and the orchestrator's `watch` show.
     pub fn line(&self) -> String {
+        if self.left_out {
+            return format!(
+                "UNINTEGRATED worker {}: left out of the round, {} on worker-{} that \
+                 the round never integrated",
+                self.worker_id,
+                commit_phrase(self.commits),
+                self.worker_id
+            );
+        }
         format!(
             "UNINTEGRATED worker {}: {} on worker-{} never reached the round; the \
              round does not carry this work",
@@ -984,6 +1001,7 @@ pub fn unintegrated_workers_in(root: &ScratchRoot, worker_id: &str) -> Vec<Unint
         .map(|worker| UnintegratedWorker {
             worker_id: worker.worker_id,
             commits: worker.commits,
+            left_out: worker.left_out,
         })
         .collect()
 }
@@ -1241,11 +1259,19 @@ fn unintegrated_refusal(consolidator: &str, unintegrated: &[Unintegrated]) -> St
     let named: Vec<String> = unintegrated
         .iter()
         .map(|worker| {
-            format!(
-                "worker {} carries {}",
-                worker.worker_id,
-                commit_phrase(worker.commits)
-            )
+            if worker.left_out {
+                format!(
+                    "worker {} was left out of the round, carrying {}",
+                    worker.worker_id,
+                    commit_phrase(worker.commits)
+                )
+            } else {
+                format!(
+                    "worker {} carries {}",
+                    worker.worker_id,
+                    commit_phrase(worker.commits)
+                )
+            }
         })
         .collect();
     format!(
