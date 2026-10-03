@@ -70,7 +70,7 @@ pub fn index() -> String {
         "  review <worker_id> [--diff code|all|none]\n",
         "           One compact view of a finished worker: task, verification, the code\n",
         "           diff, per-file stat, tests summarised, and whether it still merges.\n",
-        "  approve <worker_id> [\\\"note\\\"]\n",
+        "  approve <worker_id> [\"note\"]\n",
         "           Record your verdict on a completed worker (owner-only).\n",
         "  unapprove <worker_id>\n",
         "           Withdraw that approval.\n",
@@ -119,13 +119,11 @@ pub fn index() -> String {
         "\nFlags:\n",
         "{HELP_FLAGS}\n",
     );
-    let body = BODY
-        .replace("{VERSION}", env!("CARGO_PKG_VERSION"))
+    BODY.replace("{VERSION}", env!("CARGO_PKG_VERSION"))
         .replace("{DISPATCH_USAGE}", super::args::DISPATCH_USAGE)
         .replace("{CONSOLIDATE_USAGE}", super::args::CONSOLIDATE_USAGE)
         .replace("{TOPICS}", &TOPICS.join(", "))
-        .replace("{HELP_FLAGS}", HELP_FLAGS);
-    body
+        .replace("{HELP_FLAGS}", HELP_FLAGS)
 }
 
 /// Text of one help topic, or `None` for an unknown topic.
