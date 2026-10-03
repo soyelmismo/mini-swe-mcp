@@ -24,7 +24,13 @@
 //! that ignored two nudges will ignore a third: it first demands the edit,
 //! then hands back the plan its own task spells out (see [`edit_plan`]), and
 //! finally parks the worker on the orchestrator instead of paying for more
-//! turns of reading.
+//! turns of reading. It is a guard against an *implementer* that reads instead
+//! of writing, so it is armed only for that role: a consolidator and the
+//! review phases both make their progress without editing (see
+//! [`TurnConfig::read_only_exempt`]). The turns the harness answers itself --
+//! the consolidator verbs and a background-job wait -- are progress the
+//! worktree sample cannot see, so they restart the streak rather than
+//! lengthening it ([`ProgressWatch::note_harness_progress`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -479,6 +485,18 @@ impl ReadOnlyStreak {
         self.recent_commands.push(summary);
     }
 
+    /// Start the streak over without a new repository sample: a turn the
+    /// harness answered itself is progress the sample cannot see, so the
+    /// counters and the nudges this streak earned are dropped and the next
+    /// unchanged turn is counted as the first of a fresh streak.
+    fn restart_streak(&mut self) {
+        self.read_only_turns = 0;
+        self.nudged = false;
+        self.planned = false;
+        self.paused = false;
+        self.recent_commands.clear();
+    }
+
     /// What this streak read, as one clause for the pause question.
     fn read_summary(&self) -> String {
         if self.recent_commands.is_empty() {
@@ -752,6 +770,14 @@ impl ProgressWatch {
         }
     }
 
+    /// Record a turn the harness answered itself -- a consolidator verb, a
+    /// background-job wait -- as progress, for every role. Neither changes
+    /// the worktree, so without this they would read to the detector as one
+    /// more turn spent looking instead of the work the turn actually did.
+    fn note_harness_progress(&mut self) {
+        self.read_only.restart_streak();
+    }
+
     /// Record a repository sample and return the turns the repository has been
     /// unchanged for. A sample that could not be taken is ignored rather than
     /// counted as "no change".
@@ -819,6 +845,12 @@ pub(super) struct TurnConfig<'a> {
     pub steer_prefix: &'a str,
     /// Whether REQUEST_TURNS / ASK_ORCHESTRATOR sentinels apply.
     pub apply_sentinels: bool,
+    /// Whether the read-only nudge/plan/pause escalation is armed at all.
+    /// It is a guard against an implementer that reads instead of writing, so
+    /// a consolidator and the review phases set this: reviewing, merging,
+    /// steering, waiting and running the gate are their job, and a long
+    /// read-only streak there is the work itself, not a stuck worker.
+    pub read_only_exempt: bool,
     /// How an LLM API error is handled.
     pub llm_error_policy: LlmErrorPolicy,
     /// Registry status to record for this phase.
@@ -1194,13 +1226,13 @@ impl<'a> TurnEngine<'a> {
             if let Some(job) = parse_kill_job(&cmd_str) {
                 let (output, code) = self.stop_job(job);
                 return self
-                    .record_command_result(&llm_resp, &label, output, code)
+                    .record_harness_result(&llm_resp, &label, output, code)
                     .await;
             }
             if let Some(job) = parse_wait_job(&cmd_str) {
                 let (output, code) = self.wait_on_job(job).await;
                 return self
-                    .record_command_result(&llm_resp, &label, output, code)
+                    .record_harness_result(&llm_resp, &label, output, code)
                     .await;
             }
         }
@@ -1355,6 +1387,22 @@ impl<'a> TurnEngine<'a> {
             .await
     }
 
+    /// Record one turn the harness answered itself: the job sentinels and the
+    /// consolidator verbs. Such a turn is progress for the read-only detector
+    /// -- it never touches the worktree -- and its answer reaches the history
+    /// exactly as an executed command's does.
+    async fn record_harness_result(
+        &mut self,
+        llm_resp: &LlmResponse,
+        label: &str,
+        output: String,
+        code: Option<i32>,
+    ) -> Result<TurnOutcome> {
+        self.watch.note_harness_progress();
+        self.record_command_result(llm_resp, label, output, code)
+            .await
+    }
+
     /// Record one answered turn: the tool result the model sees, the bounded
     /// step log and the durable history append.
     ///
@@ -1414,7 +1462,7 @@ impl<'a> TurnEngine<'a> {
         if preserve {
             self.worktree.preserve_branch = true;
         }
-        self.record_command_result(llm_resp, label, observation, Some(0))
+        self.record_harness_result(llm_resp, label, observation, Some(0))
             .await
     }
 
@@ -1897,7 +1945,14 @@ impl<'a> TurnEngine<'a> {
     /// [`STAGNATION_SAMPLE_TURNS`] cadence it has today, so a dispatch that
     /// names no file pays nothing new.
     async fn check_changes(&mut self, config: &TurnConfig<'_>) -> Result<()> {
-        let read_only = read_only_thresholds(config.task);
+        // An exempt phase never walks the escalation, and so also keeps the
+        // every-ten-turns sample cadence the stagnation detector has always
+        // had: it pays nothing for a detector that would never fire.
+        let read_only = if config.read_only_exempt {
+            None
+        } else {
+            read_only_thresholds(config.task)
+        };
         let stagnation_due = *self.step > 0 && (*self.step).is_multiple_of(STAGNATION_SAMPLE_TURNS);
         if read_only.is_none() && !stagnation_due {
             return Ok(());
@@ -2575,6 +2630,48 @@ mod tests {
             streak.record(same(), limits),
             Some(ReadOnlyNudge::First { read_only_turns: 3 }),
             "after an edit the streak starts over and nudges again"
+        );
+    }
+
+    /// A turn the harness answered itself is progress the worktree sample
+    /// cannot see: it restarts the streak rather than lengthening it, so a
+    /// consolidator that spends its turns on `CONSOLIDATE_WAIT` is never
+    /// nudged for "not editing" -- whatever nudges the streak had earned go
+    /// with it.
+    #[test]
+    fn a_harness_answered_turn_is_progress_not_another_read_only_turn() {
+        let limits = ReadOnlyThresholds {
+            first: 3,
+            plan: 6,
+            pause: 9,
+        };
+        let mut watch = ProgressWatch::default();
+        let same = || Some("head-a\nstat".to_string());
+        // One sample past the baseline is one read-only turn, so this reaches
+        // the streak's first threshold -- and earns the first nudge.
+        for _ in 0..=limits.first {
+            watch.read_only.record(same(), limits);
+        }
+        assert_eq!(watch.read_only.read_only_turns, limits.first);
+
+        // A consolidator verb or a job wait leaves the worktree untouched, so
+        // nothing in the sample moves: the turn must be counted as progress.
+        watch.note_harness_progress();
+        assert_eq!(watch.read_only.read_only_turns, 0);
+
+        // The turns after it are therefore the start of a fresh streak, which
+        // is still short of the plan threshold the old streak had earned.
+        for turns in 1..limits.first {
+            assert_eq!(
+                watch.read_only.record(same(), limits),
+                None,
+                "the streak must start over: no plan after only {turns} read-only turns"
+            );
+        }
+        assert_eq!(
+            watch.read_only.record(same(), limits),
+            Some(ReadOnlyNudge::First { read_only_turns: 3 }),
+            "the fresh streak still walks its steps, from the first threshold"
         );
     }
 
