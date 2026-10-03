@@ -205,6 +205,199 @@ const LOOP_OUTPUT_TAIL_BYTES: usize = 300;
 /// cannot paste itself into a nudge or an orchestrator question.
 const LOOP_BASE_BYTES: usize = 160;
 
+/// The base a command reduces to, for the loop detector.
+///
+/// A worker that re-runs "the same" command rarely spells it the same way
+/// twice: the round that motivated this detector ran `cargo test 2>&1 | grep
+/// -E ...`, `cargo test 2>&1 | tail -40`, `cargo test 2>&1 > /tmp/x.txt` and
+/// `cargo fmt --check && cargo clippy ... && cargo test 2>&1 | tail` — four
+/// bytes-apart spellings of one command, which a byte-identical repetition
+/// check cannot see. [`normalize_command_base`] maps all of them to the same
+/// string, so the detector compares what the worker *did*, not what it typed.
+///
+/// The map is deliberately coarse and never guesses at a language: it drops
+/// what surrounds the command rather than what the command means.
+fn normalize_command_base(command: &str) -> String {
+    let one_line: String = command
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base = strip_prefixes(&one_line);
+    let base = strip_suffixes(&base);
+    // Collapse whitespace last: the splitters above leave the gaps the
+    // dropped segments occupied behind.
+    base.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Drop the wrappers a command is dressed in: a leading `cd`, a leading
+/// environment assignment, and the `&&` / `;` glue that follows either.
+///
+/// Only the *leading* ones go: a `cd` in the middle of a pipeline is part of
+/// the command's own spelling and stays.
+fn strip_prefixes(command: &str) -> String {
+    let mut words: Vec<&str> = command.split_whitespace().collect();
+    loop {
+        if words.len() >= 2 && words[0] == "cd" {
+            // `cd x && ...`, `cd x; ...` and `cd x` alone: everything up to
+            // and including the target directory and its separator goes.
+            let mut used = 2;
+            if words.get(used).is_some_and(|w| is_shell_separator(w)) {
+                used += 1;
+            }
+            words.drain(..used);
+            continue;
+        }
+        if words.first().is_some_and(|w| is_env_assignment(w)) {
+            words.remove(0);
+            continue;
+        }
+        if words.first().is_some_and(|w| is_shell_separator(w)) {
+            words.remove(0);
+            continue;
+        }
+        break;
+    }
+    words.join(" ")
+}
+
+/// Whether `word` is glue between two segments rather than part of one.
+fn is_shell_separator(word: &str) -> bool {
+    word == "&&" || word == ";" || word == "||"
+}
+
+/// Whether `word` assigns one environment variable: `NAME=value` with a
+/// shell-legal name, so `timeout=5` inside a sentinel's argument and a bare
+/// `=` are both left alone.
+fn is_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Drop everything the command pipes or redirects *into*: a filter
+/// (`grep`, `tail`, `head`, `sort`, `wc`, `tee`, `awk`, `sed -n`), a log file,
+/// and every later `&&` segment.
+///
+/// A split is only taken outside quotes, command substitutions, subshells and
+/// backslash escapes, so `grep -E 'FAILED|panicked'` keeps its pattern and
+/// `awk '{print $2}'` keeps its program: both are *inside* the filter, and it
+/// is the filter that goes.
+fn strip_suffixes(command: &str) -> String {
+    let bytes = command.as_bytes();
+    // Bytes, not chars: the scan walks byte offsets and only ever cuts at an
+    // ASCII metacharacter, which is always a character boundary, so the kept
+    // prefix is valid UTF-8 however the command is spelled.
+    let mut keep: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            keep.push(b);
+            // Only a double quote honours a backslash escape, and the byte
+            // after one is copied verbatim so the scan cannot end on it.
+            if b == b'\\' && q == b'"' && i + 1 < bytes.len() {
+                keep.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                quote = Some(b);
+                keep.push(b);
+                i += 1;
+            }
+            // A backtick substitution is copied whole rather than parsed, so
+            // the metacharacters inside it cannot end the scan.
+            b'`' => {
+                let end = command[i + 1..]
+                    .find('`')
+                    .map_or(bytes.len(), |n| i + 1 + n + 1);
+                keep.extend_from_slice(&bytes[i..end]);
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                keep.push(b);
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                keep.push(b);
+                i += 1;
+            }
+            b'\\' => {
+                keep.push(b);
+                if i + 1 < bytes.len() {
+                    keep.push(bytes[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // A pipe, a `&&` chain, a background `&` and a `;` all start a
+            // segment the base does not describe.
+            b'|' | b'&' | b';' if depth == 0 => break,
+            b'>' | b'<' if depth == 0 => match redirect_span(bytes, i) {
+                // An fd redirection (`2>&1`, `2>/dev/null`) is dropped along
+                // with its target and the digits that named it.
+                Some((fd_start, end)) => {
+                    keep.truncate(fd_start);
+                    i = end;
+                }
+                // Anything else sends the command's whole output elsewhere,
+                // which is the filter case: the rest of the line goes.
+                None => break,
+            },
+            _ => {
+                keep.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&keep).into_owned()
+}
+
+/// The span of the file-descriptor redirection whose operator sits at `i`, as
+/// `(start of its fd digits, index just past its target)`.
+///
+/// `None` when no file descriptor is named: `2>&1` and `2>/dev/null` are the
+/// command's own plumbing, while a bare `>/tmp/out.txt` hides its output, so
+/// only the former stays inside the base.
+fn redirect_span(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    // At most three digits: a longer run is not an fd anyway, and bounding the
+    // walk keeps the scan linear without a chance of running off the front.
+    let mut start = i;
+    for _ in 0..3 {
+        match start.checked_sub(1).map(|p| bytes[p]) {
+            Some(b) if b.is_ascii_digit() => start -= 1,
+            _ => break,
+        }
+    }
+    if start == i {
+        return None;
+    }
+    let mut end = i + 1;
+    if bytes.get(end) == Some(&b'&') {
+        end += 1;
+    }
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !b"|&;<>".contains(&bytes[end])
+    {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 /// Nudge injected after a worker has explored long enough without changing
 /// anything: the answer to a stuck agent is a decision, not another turn.
 fn stagnation_nudge() -> String {
@@ -2540,9 +2733,9 @@ mod tests {
         ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
         append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
-        isolation_block, named_file_defaults, parse_shortstat, parse_threshold,
-        read_only_nudge_text, read_only_pause_question, read_only_plan_text, read_only_thresholds,
-        summarized_task, task_names_files,
+        isolation_block, named_file_defaults, normalize_command_base, parse_shortstat,
+        parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
+        read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2721,6 +2914,62 @@ mod tests {
             extension_budget(usize::MAX) <= MAX_TURNS_LIMIT,
             "a saturating dispatch budget must not overflow the ceiling"
         );
+    }
+
+    /// The spellings round31's consolidator cycled over for one command: a
+    /// pipe into a filter, a pipe into a tail, a chain whose last segment is
+    /// the command, and a redirection that hides the output. Four different
+    /// byte strings, one command.
+    #[test]
+    fn every_spelling_of_one_command_maps_to_one_base() {
+        for cmd in [
+            "cargo test 2>&1 | grep -E 'FAILED|panicked'",
+            "cargo test 2>&1 | tail -40",
+            "cargo test 2>&1 > /tmp/testout.txt",
+            "cargo test 2>&1 | tee /tmp/test.log | head -30",
+            "cd /repo && cargo test 2>&1 | tail -5",
+            "RUST_BACKTRACE=1 CARGO_TERM_COLOR=never cargo test 2>&1 | wc -l",
+        ] {
+            assert_eq!(normalize_command_base(cmd), "cargo test", "{cmd}");
+        }
+        // And the chain that ended with the same command: the first segment is
+        // the base, so a gate run as a chain is compared on its own terms.
+        assert_eq!(
+            normalize_command_base(
+                "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -20"
+            ),
+            "cargo fmt --check"
+        );
+    }
+
+    /// The map is coarse, not greedy: a metacharacter inside quotes, a
+    /// substitution or a subshell belongs to the command's own spelling.
+    #[test]
+    fn a_metacharacter_inside_a_quote_or_a_subshell_is_not_a_split() {
+        assert_eq!(
+            normalize_command_base("grep -rn 'pub fn | private' src/"),
+            "grep -rn 'pub fn | private' src/"
+        );
+        assert_eq!(
+            normalize_command_base("git -C . log --oneline -n 5"),
+            "git -C . log --oneline -n 5"
+        );
+        assert_eq!(normalize_command_base("(cd sub && make) && echo done"), "(cd sub && make)");
+        assert_eq!(
+            normalize_command_base("awk '{print $2}' log.txt | sort | uniq -c"),
+            "awk '{print $2}' log.txt"
+        );
+        assert_eq!(
+            normalize_command_base("echo \"CONSOLIDATE_WAIT nobody timeout=1\""),
+            "echo \"CONSOLIDATE_WAIT nobody timeout=1\""
+        );
+        // A bare `>` hides the output and is dropped; the sentinel's own
+        // `timeout=` is not an environment assignment.
+        assert_eq!(normalize_command_base("ls -la > out.txt"), "ls -la");
+        assert_eq!(normalize_command_base("  cargo   test  "), "cargo test");
+        // An empty or separator-only command has no base, and the detector
+        // below therefore never sees it.
+        assert_eq!(normalize_command_base("   "), "");
     }
 
     #[test]
