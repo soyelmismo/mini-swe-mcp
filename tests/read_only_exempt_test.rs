@@ -6,7 +6,9 @@
 //! the gate are their job, and a long read-only streak there is the work
 //! itself. Independently of the role, a turn the harness answered itself -- a
 //! consolidator verb, a background-job wait -- is progress the worktree sample
-//! cannot see, so it never counts towards the streak.
+//! cannot see, but only when its answer changed: a wait that reports the same
+//! states again taught the worker nothing, so it does not restart the streak
+//! (and the loop detector in `loop_escalation_test` parks it instead).
 //!
 //! The tests run against the thresholds the pool ships (15, 30 and 45 read-only
 //! turns), which the code under test reads from the environment at dispatch
@@ -210,15 +212,25 @@ async fn an_ordinary_worker_is_still_paused_by_the_same_run() {
 /// its reads with `WAIT_JOB` -- the sanctioned alternative to sleep-polling --
 /// never reaches the escalation, though every one of those turns leaves the
 /// worktree unchanged.
+///
+/// The waits here report a *different* job each turn, which is what makes each
+/// answer new information. A wait that comes back with the states it already
+/// reported is not progress, and `loop_escalation_test` covers that side.
 #[tokio::test]
-async fn a_wait_job_turn_does_not_count_as_a_read_only_turn() {
+async fn a_wait_job_turn_whose_answer_changed_is_progress() {
     let repo = repo("read-only-exempt-wait-job");
     // Reads interleaved with waits, one more turn than the pause threshold:
     // every turn here leaves the worktree exactly as it found it.
-    let commands: Vec<&str> = (0..PAUSE_TURN + 5)
-        .flat_map(|n| [review_turn(n), "echo WAIT_JOB 1"])
+    let commands: Vec<String> = (0..PAUSE_TURN + 5)
+        .flat_map(|n| {
+            [
+                review_turn(n).to_string(),
+                format!("echo WAIT_JOB {}", n + 1),
+            ]
+        })
         .collect();
-    let llm = common::fake_llm::FakeLlm::spawn_scripted(&commands).await;
+    let scripted: Vec<&str> = commands.iter().map(String::as_str).collect();
+    let llm = common::fake_llm::FakeLlm::spawn_scripted(&scripted).await;
     let (pool, _scratch) = pool_for("read-only-exempt-wait-pool", llm.base_url()).await;
     let worker_id = dispatch(&pool, repo.path(), WorkerRole::Worker, commands.len()).await;
 

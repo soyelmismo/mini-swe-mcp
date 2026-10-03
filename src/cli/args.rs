@@ -125,6 +125,43 @@ fn collect_dispatch_flags(
     }
 }
 
+/// Join the message/task words of a verb that takes free text.
+///
+/// A shell hands an unquoted `steer <id> sal del loop!` over as four argv
+/// words, so a positional read of one word (`cli_args[3]`) silently throws
+/// everything after it away. Here every word that is neither a flag nor a
+/// flag's value is joined with single spaces, which is exactly what the shell
+/// would have produced had the words been quoted: flags keep working anywhere
+/// after the fixed positionals, and no word is ever dropped.
+///
+/// `skip` names the words already consumed by fixed positionals (the worker id,
+/// the `-f` path); `value_flags` the flags that consume the following word.
+pub(super) fn join_words(
+    cli_args: &[String],
+    start: usize,
+    skip: &[usize],
+    value_flags: &[&str],
+) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = start;
+    while i < cli_args.len() {
+        if skip.contains(&i) {
+            i += 1;
+            continue;
+        }
+        if cli_args[i].starts_with('-') {
+            if value_flags.contains(&cli_args[i].as_str()) {
+                i += 1; // a flag takes its value with it, never as a word
+            }
+            i += 1;
+            continue;
+        }
+        words.push(&cli_args[i]);
+        i += 1;
+    }
+    words.join(" ")
+}
+
 /// Position of the first of `flags` in `cli_args`, if the operator passed one.
 fn flag_index(cli_args: &[String], flags: &[&str]) -> Option<usize> {
     cli_args
