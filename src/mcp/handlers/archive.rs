@@ -1,8 +1,7 @@
 use super::*;
 
 /// Description of the `last` property.
-pub(crate) const ARCHIVE_LAST_DESCRIPTION: &str =
-    "Only the N most recently retired workers, newest first.";
+pub(crate) const ARCHIVE_LAST_DESCRIPTION: &str = "Only the N most recent.";
 
 impl McpServer {
     /// `archive`: the final REPORTs of workers this pool has already retired.
