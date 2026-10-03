@@ -270,7 +270,7 @@ LOAD_AGENTS=5 LOAD_WORKERS_PER_AGENT=20 \
     cargo test --test it load_test:: -- --ignored --nocapture
 ```
 
-Every worker is driven by a fake OpenAI-compatible SSE server (`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a heavy command (`cargo build` plus a bounded CPU burn, classified heavy by `is_heavy_command` so the pool's admission controller has to dose it), then the completion sentinel. The test dispatches each worker over the hub socket with a distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy commands in flight by watching the daemon's children, and records the order workers finish in. It then asserts — and prints a one-screen report of:
+Every worker is driven by a fake OpenAI-compatible SSE server (`tests/it/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a heavy command (`cargo build` plus a bounded CPU burn, classified heavy by `is_heavy_command` so the pool's admission controller has to dose it), then the completion sentinel. The test dispatches each worker over the hub socket with a distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy commands in flight by watching the daemon's children, and records the order workers finish in. It then asserts — and prints a one-screen report of:
 
 - **all workers complete** — every dispatched worker reaches `completed`;
 - **bounded daemon RSS** — peak `VmHWM` stays under a generous 300 MB;
