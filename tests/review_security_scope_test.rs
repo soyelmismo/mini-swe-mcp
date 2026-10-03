@@ -487,13 +487,16 @@ async fn a_tree_changed_after_the_review_is_not_approved_by_the_newer_commit() {
 #[test]
 fn a_merged_branch_leaves_the_audit_only_when_it_was_security_approved() {
     let integrated = vec!["w1".to_string(), "w2".to_string()];
+    // A real object id: the guard admits only a plain git object id, so a
+    // fixture that is not one would exercise the guard, not the exclusion.
+    let approved_w1 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_string();
 
     // w1 was security-reviewed; w2 was merged without ever being reviewed.
     let reviewed =
-        approved_merged_branches(&integrated, |id| (id == "w1").then(|| "abc123".to_string()));
+        approved_merged_branches(&integrated, |id| (id == "w1").then(|| approved_w1.clone()));
     assert_eq!(
         reviewed,
-        vec!["abc123".to_string()],
+        vec![approved_w1.clone()],
         "only a worker carrying an approved commit may leave the audit, and it leaves it at that commit"
     );
 
@@ -576,9 +579,17 @@ async fn a_merged_branch_beyond_its_approval_stays_in_the_consolidators_scope() 
 #[test]
 fn every_approved_merged_branch_leaves_the_audit() {
     let integrated = vec!["w1".to_string(), "w2".to_string()];
+    // Distinct, valid object ids: the exclusion is the approved commit, and a
+    // real one must survive the object-id guard.
+    let approved_w1 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0".to_string();
+    let approved_w2 = "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0".to_string();
     assert_eq!(
-        approved_merged_branches(&integrated, |id| Some(format!("approved-{id}"))),
-        vec!["approved-w1".to_string(), "approved-w2".to_string()],
+        approved_merged_branches(&integrated, |id| match id {
+            "w1" => Some(approved_w1.clone()),
+            "w2" => Some(approved_w2.clone()),
+            _ => None,
+        }),
+        vec![approved_w1.clone(), approved_w2.clone()],
     );
 }
 
