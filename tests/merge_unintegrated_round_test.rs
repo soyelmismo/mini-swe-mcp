@@ -78,11 +78,26 @@ impl Fixture {
             "consolidate the round",
         );
         for id in integrated {
-            self.commit_on(&format!("worker-{id}"), &format!("{id}.md"), "first\n", "first work");
+            self.commit_on(
+                &format!("worker-{id}"),
+                &format!("{id}.md"),
+                "first\n",
+                "first work",
+            );
             let branch = format!("worker-{consolidator}");
             git(self.repo(), &["checkout", "-q", &branch]);
             let worker_branch = format!("worker-{id}");
-            git(self.repo(), &["merge", "-q", "--no-ff", "-m", &format!("integrate {id}"), &worker_branch]);
+            git(
+                self.repo(),
+                &[
+                    "merge",
+                    "-q",
+                    "--no-ff",
+                    "-m",
+                    &format!("integrate {id}"),
+                    &worker_branch,
+                ],
+            );
             git(self.repo(), &["checkout", "-q", "main"]);
             self.record_history(id);
             self.record_row(id, RegistryStatus::Completed);
@@ -169,12 +184,7 @@ fn write(dir: &Path, name: &str, contents: &str) {
 /// shared `git` helper raises on a non-zero exit (this probe exits 1 by design).
 fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
     std::process::Command::new("git")
-        .args([
-            "merge-base",
-            "--is-ancestor",
-            ancestor,
-            descendant,
-        ])
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .current_dir(repo)
         .output()
         .map(|out| out.status.success())
@@ -193,7 +203,12 @@ fn merge_refuses_a_member_revised_after_it_was_integrated() {
     f.consolidator("c1", &["wa"]);
     // The revision: the worker commits again on its own branch after the
     // consolidator integrated its first tip.
-    f.commit_on("worker-wa", "late.md", "late work\n", "revision after integration");
+    f.commit_on(
+        "worker-wa",
+        "late.md",
+        "late work\n",
+        "revision after integration",
+    );
 
     let err = f
         .merge("c1", false)
@@ -243,7 +258,12 @@ fn merge_refuses_a_member_revised_after_it_was_integrated() {
 fn forced_merge_lands_and_leaves_the_unintegrated_worker_unretired() {
     let f = Fixture::new("round-forced");
     f.consolidator("c1", &["wa"]);
-    f.commit_on("worker-wa", "late.md", "late work\n", "revision after integration");
+    f.commit_on(
+        "worker-wa",
+        "late.md",
+        "late work\n",
+        "revision after integration",
+    );
 
     f.merge("c1", true).expect("--force must merge anyway");
 
@@ -286,7 +306,8 @@ fn merge_lands_a_round_whose_every_member_is_integrated() {
     let f = Fixture::new("round-clean");
     f.consolidator("c1", &["wa", "wb"]);
 
-    f.merge("c1", false).expect("an all-integrated round must merge");
+    f.merge("c1", false)
+        .expect("an all-integrated round must merge");
 
     assert!(
         f.repo().join("wa.md").exists() && f.repo().join("wb.md").exists(),
@@ -389,7 +410,12 @@ fn consolidator_completion_reports_the_unintegrated_member() {
         "a round that still matches its record reports nothing"
     );
 
-    f.commit_on("worker-wa", "late.md", "late work\n", "revision after integration");
+    f.commit_on(
+        "worker-wa",
+        "late.md",
+        "late work\n",
+        "revision after integration",
+    );
     let reported = unintegrated_workers_in(&f.root(), "c1");
     assert_eq!(reported.len(), 1, "the revised member must be reported");
     assert_eq!(reported[0].worker_id, "wa");
@@ -413,6 +439,7 @@ fn a_missing_member_branch_counts_as_integrated() {
         unintegrated_workers_in(&f.root(), "c1").is_empty(),
         "a pruned member branch must not hold the round back"
     );
-    f.merge("c1", false).expect("a round with a pruned member must merge");
+    f.merge("c1", false)
+        .expect("a round with a pruned member must merge");
     assert!(f.repo().join("round.md").exists());
 }

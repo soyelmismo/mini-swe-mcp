@@ -254,9 +254,13 @@ impl WorkerVerdicts {
             .chain(self.risks.iter())
             .map(|line| line.len() + 1)
             .sum();
-        if spent + line.len() + 1 <= VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
-            self.risks.push(line);
+        // Charged the way `parse_verdict_lines` charges a line: the newline
+        // that joins it to the next one, and the notice held back for the
+        // truncation marker.
+        if spent + line.len() + 1 > VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
+            return;
         }
+        self.risks.push(line);
     }
 
     /// The lines a notification shows, one per line: the per-worker verdicts
