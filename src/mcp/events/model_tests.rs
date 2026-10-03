@@ -1395,6 +1395,50 @@ fn a_stale_stall_does_not_reopen_an_acknowledged_round() {
     );
 }
 
+/// A replayed stall reports its idle time through the stall rule's own clock,
+/// not through a raw subtraction of `last_step_at`.
+///
+/// A worker queued a stall while it was idle, then started a harness-side wait
+/// (`CONSOLIDATE_WAIT`, `WAIT_JOB`), which the detector holds in flight as work.
+/// The replay copies the current view over the queued event, so that view
+/// carries the command-in-flight mark -- but the idle time was recomputed from
+/// the raw step time, so the delivered event claimed 1800 s of inactivity for a
+/// step that is provably doing something.
+#[test]
+fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    // The stall episode queues while the worker is idle and running.
+    router.observe_watch([("w0".to_string(), idle)].into());
+    // The worker starts a wait: the same step, now with a command in flight.
+    let mut waiting = idle.clone();
+    waiting["command_started_at"] = json!(now);
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    let reply = router
+        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .unwrap();
+    let stall = reply["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| e["event"] == "stalled")
+        .unwrap_or_else(|| panic!("the queued stall is replayed: {reply}"));
+    assert_eq!(
+        stall["time_since_last_step"],
+        json!(0),
+        "a command in flight is not idle time: {stall}"
+    );
+}
+
 /// A dead consolidator owns no question: it must reach the owner's watch.
 ///
 /// A consolidator steered the worker, so a `SteerSource` names it; then the
