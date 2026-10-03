@@ -16,7 +16,9 @@
 //!
 //! Note that `prune_stale_worktrees` does *not* reclaim these files: its sweep
 //! matches `swe-wt-*` directories and `swe-wt-*.pid` leases, and a
-//! `swe-wt-<id>.steer` file matches neither. Cleanup is therefore the worker
+//! `swe-wt-<id>.steer` file matches neither. The same is true of the
+//! orchestrator steer log ([`record_orchestrator_steer_in`]), which is swept as
+//! a worker companion by retirement instead. Cleanup is therefore the worker
 //! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
 //! held for the worker's whole lifetime), not the pruner's — a mailbox only
 //! exists while some `steer` call created it, and every worker removes its own
@@ -217,11 +219,7 @@ pub(super) fn steer_log_path_in(root: &ScratchRoot, worker_id: &str) -> PathBuf 
 /// A log that cannot be written is a warning, never a failed steer: the
 /// message has already been delivered and the round loses an amendment, which
 /// is strictly less bad than refusing guidance the worker needs.
-pub(super) fn record_orchestrator_steer_in(
-    root: &ScratchRoot,
-    worker_id: &str,
-    message: &str,
-) {
+pub(super) fn record_orchestrator_steer_in(root: &ScratchRoot, worker_id: &str, message: &str) {
     let path = steer_log_path_in(root, worker_id);
     let record = SteerRecord {
         message: message.to_string(),

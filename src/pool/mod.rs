@@ -2078,7 +2078,9 @@ impl WorkerPool {
         // amendments to the task it is judging. Recorded after delivery, so
         // the log only ever names guidance the worker actually received.
         let from_orchestrator = source.is_none();
-        let result = self.deliver_steer(id, message.clone(), revision_turns).await;
+        let result = self
+            .deliver_steer(id, message.clone(), revision_turns)
+            .await;
         if result.is_err() {
             steer::write_source(&self.scratch, id, previous.as_ref())?;
         } else if from_orchestrator {

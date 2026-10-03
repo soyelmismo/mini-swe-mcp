@@ -16,7 +16,6 @@ use mini_swe_mcp::pool::{
     LogBuffer, RegistryStatus, WorkerMeta, WorkerRecord, WorkerRegistryEntry, WorkerRole,
     WorkerState, save_registry_entry_in,
 };
-use std::path::Path;
 
 const OWNER: &str = "agent-a";
 const GROUP: &str = "round-amend";
@@ -107,20 +106,11 @@ impl Harness {
     }
 
     /// The round manifest this group consolidates into.
-    fn manifest(&self) -> mini_swe_mcp::pool::RoundManifest {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(
-                self.pool
-                    .pool
-                    .round_manifest(OWNER, GROUP, self.repo.path()),
-            )
-    }
-
-    fn path(&self) -> &Path {
-        self.repo.path()
+    async fn manifest(&self) -> mini_swe_mcp::pool::RoundManifest {
+        self.pool
+            .pool
+            .round_manifest(OWNER, GROUP, self.repo.path())
+            .await
     }
 }
 
@@ -138,11 +128,14 @@ async fn a_orchestrator_steer_reaches_the_consolidator_after_the_task_it_amends(
 
     h.pool
         .pool
-        .steer(&worker, "user approved a scope change: do NOT add `triggers`".into())
+        .steer(
+            &worker,
+            "user approved a scope change: do NOT add `triggers`".into(),
+        )
         .await
         .unwrap();
 
-    let text = h.manifest().task_text(Some("cargo test"));
+    let text = h.manifest().await.task_text(Some("cargo test"));
 
     let amendment = "ORCHESTRATOR STEERS AFTER DISPATCH";
     assert!(
@@ -189,7 +182,7 @@ async fn the_steers_of_one_worker_keep_their_arrival_order() {
             .unwrap();
     }
 
-    let text = h.manifest().task_text(Some("cargo test"));
+    let text = h.manifest().await.task_text(Some("cargo test"));
     let first = text.find("FIRST-STEER").expect("first steer embedded");
     let second = text.find("SECOND-STEER").expect("second steer embedded");
     assert!(first < second, "steers must be in arrival order: {text}");
@@ -211,24 +204,27 @@ async fn a_consolidators_own_steer_is_not_listed_as_a_scope_amendment() {
     h.row(&worker, "heading\nbody");
     h.insert_running(&worker).await;
 
-    let mut actor = WorkerMeta {
-        task: "integrate".into(),
-        group: Some(GROUP.to_string()),
-        role: WorkerRole::Consolidate,
-        ..WorkerMeta::test_meta(&format!("consol-{}", unique_suffix("c")), OWNER)
-    };
-    actor.id = format!("consol-{}", unique_suffix("c"));
+    // A consolidator id distinct from the worker's: the exclusion is keyed on
+    // the actor being a consolidator, not on the id.
+    let mut actor = WorkerMeta::test_meta(format!("consol-{}", unique_suffix("c")), OWNER);
+    actor.task = "integrate".into();
+    actor.group = Some(GROUP.to_string());
+    actor.role = WorkerRole::Consolidate;
     let refusal = h
         .pool
         .pool
-        .consolidate_steer(&actor, &worker, "CONSOLIDATOR-OWN-STEER: revert the field".into())
+        .consolidate_steer(
+            &actor,
+            &worker,
+            "CONSOLIDATOR-OWN-STEER: revert the field".into(),
+        )
         .await;
     assert!(
         refusal.contains("refused") || refusal.contains("revision"),
         "the harness must have attempted the steer, got: {refusal}"
     );
 
-    let text = h.manifest().task_text(Some("cargo test"));
+    let text = h.manifest().await.task_text(Some("cargo test"));
     assert!(
         !text.contains("CONSOLIDATOR-OWN-STEER"),
         "a consolidator's own steer must not appear as a scope amendment: {text}"
@@ -263,7 +259,8 @@ async fn the_amendment_block_is_bounded_per_worker() {
     let (_, block) = section
         .split_once("ORCHESTRATOR STEERS AFTER DISPATCH")
         .expect("the block is rendered");
-    let block = format!("ORCHESTRATOR STEERS AFTER DISPATCH{block}");
+    // The section's own trailing newline ends the entry, not the block.
+    let block = format!("ORCHESTRATOR STEERS AFTER DISPATCH{}", block.trim_end());
     assert!(
         block.len() <= 2 * 1024,
         "the per-worker steer budget is 2 KiB, got {} bytes",

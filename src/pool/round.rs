@@ -264,7 +264,8 @@ fn render_steers(steers: &[String]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "ORCHESTRATOR STEERS AFTER DISPATCH (these SUPERSEDE the task above wherever they          conflict):\n",
+        "ORCHESTRATOR STEERS AFTER DISPATCH (these SUPERSEDE the task above wherever they \
+         conflict):\n",
     );
     for (i, steer) in steers.iter().enumerate() {
         // A steer is the orchestrator's own words: rendered verbatim, so the
@@ -577,7 +578,7 @@ mod round_tests {
         let section = small.render_full_tasks();
         assert_eq!(
             section,
-            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the worker's own text below; the manifest above keeps only each task's first line):\n### w1:\none task\nbody\n",
+            "FULL TASKS OF THE ROUND'S WORKERS (judge each worker's diff against the worker's own text below, as amended by the orchestrator steers that follow it; the manifest above keeps only each task's first line):\n### w1:\none task\nbody\n",
             "{section}"
         );
         assert!(section.len() <= FULL_TASKS_BUDGET);
