@@ -194,11 +194,12 @@ impl Drop for ArchiveDirLock {
 /// would carry the file past [`ARCHIVE_MAX_BYTES`].
 ///
 /// Concurrent retirements are safe: the whole measure-rename-append sequence
-/// runs under [`ArchiveDirLock`], and the append itself is `O_APPEND`, so one
-/// writer's rotation can never displace a generation another writer's lines
-/// are still landing in. A line that does not fit at all is still written --
-/// capping the file is not a reason to lose the only copy of a report -- so
-/// the file is bounded by [`ARCHIVE_MAX_BYTES`] plus the longest single line.
+/// runs under the `ArchiveDirLock` directory lock, and the append itself is
+/// `O_APPEND`, so one writer's rotation can never displace a generation
+/// another writer's lines are still landing in. A line that does not fit at
+/// all is still written -- capping the file is not a reason to lose the only
+/// copy of a report -- so the file is bounded by [`ARCHIVE_MAX_BYTES`] plus
+/// the longest single line.
 pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     let mut line = serde_json::to_string(record).context("archive record did not serialize")?;
     line.push('\n');
