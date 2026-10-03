@@ -218,7 +218,7 @@ impl McpServer {
         let review_after = args
             .get("review_after")
             .and_then(|v| v.as_str())
-            .map(|s| {
+            .map(|s| -> anyhow::Result<String> {
                 let (model, mode) =
                     crate::pool::ReviewMode::parse_with_manifest(s, &self.manifest)?;
                 // An empty model part uses the mode's default reviewer; the

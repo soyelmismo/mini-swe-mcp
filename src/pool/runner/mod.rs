@@ -34,9 +34,7 @@ pub use self::context_pack::{
     PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
 };
 use self::review::ReviewPhase;
-pub use self::review::{
-    ReviewMode, SecurityReviewOutcome, mode_default_reviewer, parse_findings, review_prompt,
-};
+pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };

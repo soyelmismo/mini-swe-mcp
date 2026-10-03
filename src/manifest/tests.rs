@@ -18,6 +18,7 @@ fn single(definition: ModelDefinition) -> ModelManifest {
         default: Some("solo".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     }
 }
@@ -94,6 +95,7 @@ fn test_resolve_model() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
     assert_eq!(
@@ -146,6 +148,7 @@ fn test_tool_description_role_fallback() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -242,6 +245,7 @@ fn test_normalize_repairs_every_fixable_warning() {
         default: Some("ghost".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -319,6 +323,7 @@ fn test_normalize_drops_a_padded_default_that_names_nothing() {
         default: Some("  ghost  ".to_string()),
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -348,6 +353,7 @@ fn test_validate_order_is_stable_regardless_of_insertion_order() {
             default: None,
             strongest: None,
             sensitive_paths: Vec::new(),
+            review_modes: std::collections::HashMap::new(),
             models,
         }
         .validate()
@@ -399,6 +405,7 @@ fn test_resolve_model_duplicate_id_uses_first_alias_in_sorted_order() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -436,6 +443,7 @@ fn test_validate_flags_duplicate_model_ids() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -467,6 +475,7 @@ fn test_tool_description_lists_aliases_in_sorted_order() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models,
     };
 
@@ -789,6 +798,7 @@ fn test_every_declared_network_policy_value_is_accepted_verbatim() {
         default: None,
         strongest: None,
         sensitive_paths: Vec::new(),
+        review_modes: std::collections::HashMap::new(),
         models: [
             ("a".to_string(), def("combo:a", NetworkPolicy::Offline)),
             ("b".to_string(), def("combo:b", NetworkPolicy::Allow)),

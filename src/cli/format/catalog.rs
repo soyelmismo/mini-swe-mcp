@@ -36,7 +36,48 @@ pub fn format_manifest(val: &serde_json::Value) -> String {
             }
         }
     }
+    push_review_modes(&mut out, val);
     out.trim_end().to_string()
+}
+
+/// The available review modes: the built-ins plus the manifest-declared ones.
+///
+/// A declared mode names its default reviewer when one is set; the built-ins
+/// `quality` and `security` are always available even when the manifest
+/// declares none, and a declared entry of the same name overrides the
+/// built-in prompt.
+fn push_review_modes(out: &mut String, val: &serde_json::Value) {
+    let declared = val
+        .get("review_modes")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    out.push_str("\n\nReview modes:\n");
+    for builtin in ["quality", "security"] {
+        if let Some(def) = declared.get(builtin) {
+            out.push_str(&format!("  - {builtin}{}\n", review_mode_suffix(def)));
+        } else {
+            out.push_str(&format!("  - {builtin} (built-in)\n"));
+        }
+    }
+    let mut extra: Vec<&String> = declared
+        .keys()
+        .filter(|name| *name != "quality" && *name != "security")
+        .collect();
+    extra.sort();
+    for name in extra {
+        let def = &declared[name];
+        out.push_str(&format!("  - {name}{}\n", review_mode_suffix(def)));
+    }
+}
+
+/// The parenthetical for one declared review mode: its default reviewer when
+/// one is set.
+fn review_mode_suffix(def: &serde_json::Value) -> String {
+    match def.get("model").and_then(|v| v.as_str()) {
+        Some(model) if !model.trim().is_empty() => format!(" (model: {model})"),
+        _ => String::new(),
+    }
 }
 
 /// The retired workers' final reports, oldest first.

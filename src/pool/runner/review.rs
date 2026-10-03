@@ -512,7 +512,7 @@ impl WorkerPool {
             }
         }
 
-        let review_prompt = review_prompt(mode, &task, verify.as_deref(), &sensitive);
+        let review_prompt = review_prompt(&mode, &task, verify.as_deref(), &sensitive);
 
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),
