@@ -83,8 +83,8 @@ impl ModelManifest {
 ///
 /// The model passed as `model_alias` is the one whose `instructions:` block is
 /// appended, which is what makes the review phase carry the *reviewer's*
-/// habits rather than the implementer's: [`crate::pool::runner::review`] resolves
-/// its own alias before calling here.
+/// habits rather than the implementer's: the review phase resolves its own
+/// reviewer alias before calling here.
 pub fn build_system_prompt(
     manifest: &ModelManifest,
     repo_path: &Path,

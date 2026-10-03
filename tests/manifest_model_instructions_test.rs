@@ -408,47 +408,39 @@ async fn system_prompts_of_a_reviewed_run(repo: &Path, manifest_yaml: &str) -> V
         .collect()
 }
 
-/// A git repository a worker can be dispatched against.
-struct TestRepo(std::path::PathBuf);
+/// A git repository a worker can be dispatched against, over a uniquely named
+/// scratch directory (see [`common::TempDir`]) so two runs can never collide on
+/// one predictable `/tmp` path.
+struct TestRepo {
+    dir: std::path::PathBuf,
+    _scratch: common::TempDir,
+}
 
 impl TestRepo {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("model-instructions-e2e-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch repo");
-        let dir = dir.canonicalize().expect("canonicalize scratch repo");
-        git(&dir, &["init", "-b", "master"]);
-        git(&dir, &["config", "user.name", "mini-swe-test"]);
-        git(&dir, &["config", "user.email", "test@localhost"]);
+        let scratch = common::TempDir::new_in_tmp(tag);
+        let dir = scratch.path().to_path_buf();
+        common::git(&dir, &["init", "-b", "master"]);
+        common::git(&dir, &["config", "user.name", "mini-swe-test"]);
+        common::git(&dir, &["config", "user.email", "test@localhost"]);
         std::fs::write(dir.join("README.md"), "# scratch\n").expect("seed file");
-        git(&dir, &["add", "README.md"]);
-        git(&dir, &["commit", "-m", "baseline"]);
-        Self(dir)
+        common::git(&dir, &["add", "README.md"]);
+        common::git(&dir, &["commit", "-m", "baseline"]);
+        Self {
+            dir,
+            _scratch: scratch,
+        }
     }
 
     fn path(&self) -> &std::path::Path {
-        &self.0
+        &self.dir
     }
 }
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        mini_swe_mcp::cache::remove_build_dir_leases(&self.0);
-        let _ = std::fs::remove_dir_all(&self.0);
+        mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
     }
-}
-
-fn git(dir: &std::path::Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// The review phase is a second conversation with a different model, and it must
