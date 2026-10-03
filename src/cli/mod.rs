@@ -23,5 +23,5 @@ pub use self::args::{
     strip_json_flag, tool_args,
 };
 pub use self::format::format_output;
-pub use self::help::HELP_FLAGS;
+pub use self::help::{HELP_FLAGS, index};
 pub use self::suggest::{available_actions, suggest_action};
