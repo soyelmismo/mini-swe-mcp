@@ -1165,3 +1165,131 @@ async fn a_handover_waits_for_the_predecessors_worker_teardown() {
     let _ = new_task.await;
     assert!(!new_paths.socket().exists(), "teardown removes the socket");
 }
+
+/// A teardown that blocks past the shutdown wait must not hang the handover:
+/// the old daemon releases the lock on the bound, and the replacement waits on
+/// the worker's `.teardown` marker instead of racing its worktree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_teardown_past_the_wait_releases_the_lock_and_the_replacement_waits() {
+    let hub = common::TempDir::new_in_tmp("handover-bound");
+    let repo = dispatch_repo("handover-bound-repo");
+    let scratch = common::TempDir::new_in_tmp("handover-bound-root");
+    let root = ScratchRoot::new(scratch.path());
+
+    // The old daemon: its shutdown wait is one second, far less than the
+    // teardown it is about to block on.
+    let llm = common::fake_llm::FakeLlm::spawn("true", "sleep 2").await;
+    let old_pool = WorkerPool::with_scratch(
+        1,
+        llm.base_url().to_string(),
+        "k".to_string(),
+        root.clone(),
+    )
+    .with_teardown_wait(Duration::from_secs(1));
+    let (paths, old_daemon) = daemon_on(&hub, old_pool.clone());
+    let old_task = tokio::spawn(async move { old_daemon.run().await });
+
+    let id = old_pool
+        .dispatch(
+            "handover-test".to_string(),
+            "slow worker".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            10,
+            None,
+            None,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let worktree = root.join(format!("swe-wt-{id}"));
+    let marker = root.join(format!("swe-wt-{id}.teardown"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if worktree.is_dir()
+            && let Some(WorkerState::Running { last_command, .. }) =
+                old_pool.get_worker_state(&id).await
+            && last_command.contains("sleep")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never reached its slow command"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Block the teardown for longer than the shutdown wait.
+    WorktreeGuard::__test_set_teardown_delay(&id, Duration::from_secs(5));
+
+    let mut client = Client::connect(&paths.socket()).await;
+    let started = std::time::Instant::now();
+    let reply = client.handover(1).await;
+    assert_eq!(reply["result"]["deadline_secs"], 1, "{reply}");
+
+    // The old daemon stops accepting first; start the replacement while the old
+    // one is still inside its bounded (and here, exceeded) teardown wait.
+    let socket_gone = std::time::Instant::now() + Duration::from_secs(10);
+    while paths.socket().exists() {
+        assert!(
+            std::time::Instant::now() < socket_gone,
+            "the old daemon never stopped accepting connections"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let new_pool = WorkerPool::with_scratch(
+        1,
+        llm.base_url().to_string(),
+        "k".to_string(),
+        root.clone(),
+    )
+    // Long enough to outlast the blocked teardown and continue the worker.
+    .with_teardown_wait(Duration::from_secs(30));
+    let (new_paths, new_daemon) = daemon_on(&hub, new_pool.clone());
+    let new_task = tokio::spawn(async move { new_daemon.run().await });
+
+    // The shutdown wait is bounded: the old daemon releases the lock well
+    // before the five-second teardown finishes, instead of hanging on it.
+    let old_done = tokio::time::timeout(Duration::from_secs(10), old_task)
+        .await
+        .expect("the old daemon stops")
+        .expect("the old daemon task joins")
+        .expect("the old daemon shuts down cleanly");
+    assert!(old_done);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "a teardown past the wait must not block shutdown, took {:?}",
+        started.elapsed()
+    );
+    // The teardown is still running, so the old process left its marker and the
+    // replacement has not recreated the worktree.
+    assert!(marker.exists(), "the blocked teardown must leave its marker");
+    let settle = std::time::Instant::now() + Duration::from_millis(1500);
+    while std::time::Instant::now() < settle {
+        assert!(
+            !matches!(
+                new_pool.get_worker_state(&id).await,
+                Some(WorkerState::Running { .. })
+            ),
+            "the replacement must not touch the worktree while the marker exists"
+        );
+        assert!(marker.exists(), "the marker must outlive the wait window");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Once the old teardown finishes it removes its marker, and only then does
+    // the replacement continue the worker to completion.
+    let state = wait_for_terminal(&new_pool, &id).await;
+    assert!(
+        matches!(state, WorkerState::Completed { .. }),
+        "the replacement must continue the worker once the marker is gone, got {state:?}"
+    );
+    assert!(!marker.exists(), "the teardown must remove its marker");
+    let _ = new_paths;
+    new_task.abort();
+    let _ = new_task.await;
+}

@@ -1124,6 +1124,44 @@ impl WorktreeGuard {
         let _ = std::fs::write(interrupted_marker_path(path), b"interrupted");
     }
 
+    /// Mark the worktree at `path` as still being torn down by this process.
+    ///
+    /// The hub's shutdown writes it before it aborts a worker and awaits the
+    /// guard's drop; the drop removes it (via [`TeardownMarker`]) once the
+    /// checkpoint, the worktree removal/unregistration and the target cleanup
+    /// have all finished. A replacement hub refuses to recover the worker while
+    /// the marker names a live owner, so a teardown that outlived the bounded
+    /// shutdown wait can never race the recovery that recreates the worktree
+    /// (H18). The marker carries this process's pid so a marker left by a
+    /// crashed teardown is recognised as stale instead of blocking forever.
+    pub fn mark_teardown(path: &Path) {
+        let _ = std::fs::write(
+            crate::worktree::teardown_marker_for(path),
+            std::process::id().to_string(),
+        );
+    }
+
+    /// Whether `path`'s worktree teardown is still owned by a live process.
+    ///
+    /// A marker left by a process that is gone (a crash mid-teardown) names no
+    /// owner, so it is removed here and reported as not pending: failing open
+    /// keeps a crashed teardown from stranding the worker forever.
+    pub fn teardown_pending(path: &Path) -> bool {
+        let marker = crate::worktree::teardown_marker_for(path);
+        let Ok(contents) = std::fs::read_to_string(&marker) else {
+            return false;
+        };
+        let owner = contents
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<u32>().ok());
+        if owner.is_some_and(crate::worktree::is_process_alive) {
+            return true;
+        }
+        let _ = std::fs::remove_file(&marker);
+        false
+    }
+
     /// Whether this guard belongs to an interrupted worker.
     ///
     /// The marker file is what both the shutdown path and the
@@ -1224,6 +1262,12 @@ fn take_teardown_delay(worker_id: &str) -> Option<std::time::Duration> {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        // Hold the teardown marker for the whole drop, on every exit path
+        // including the early `return` below: the hub writes it before the
+        // abort, and this removes it only once the teardown is really done, so
+        // a replacement hub waiting on it can never recreate the worktree while
+        // it is still being removed.
+        let _teardown = TeardownMarker(self.path.clone());
         // A test can hold teardown open to prove the replacement daemon waits
         // for it; production never sets a delay, so this is a no-op there.
         if let Some(delay) = take_teardown_delay(&self.worker_id()) {
@@ -1326,6 +1370,19 @@ fn interrupted_marker_path(path: &Path) -> PathBuf {
     let mut marker = path.as_os_str().to_os_string();
     marker.push(".interrupted");
     PathBuf::from(marker)
+}
+
+/// Removes a worktree's teardown marker when the teardown that owns it ends.
+///
+/// Constructed at the start of [`WorktreeGuard`]'s drop and dropped at its end,
+/// so the marker outlives the checkpoint, worktree removal, unregistration and
+/// target cleanup on *every* exit path, including an early return and a panic.
+struct TeardownMarker(PathBuf);
+
+impl Drop for TeardownMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(crate::worktree::teardown_marker_for(&self.0));
+    }
 }
 
 fn checked_git(path: &Path, operation: &str, args: &[&str]) -> Result<std::process::Output> {
