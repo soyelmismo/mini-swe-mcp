@@ -531,7 +531,8 @@ impl SecurityScope {
 /// `approvals` maps a worker id to the commit its security review approved, so
 /// the rule is one predicate the pipeline and the tests read alike.
 ///
-/// Only a plain git object id is an approval (see [`is_object_id`]): a value
+/// Only a plain git object id is an approval (see the `is_object_id`
+/// predicate): a value
 /// that is not one -- a pruned branch's stale row, or a value a writer with
 /// registry access planted, such as `--output=<path>` -- is not trusted and
 /// keeps the merged worker's branch in the consolidator's audit. The worker
@@ -767,40 +768,96 @@ pub(super) async fn head_commit_of(path: &Path) -> Option<String> {
     .unwrap_or(None)
 }
 
-/// Whether the checkout at `path` has nothing uncommitted, so the commit the
-/// harness just made is exactly the tree `head` named.
+/// The tree object of the working tree at `path`, as the reviewer left it.
 ///
-/// This is the guard on recording a security approval as the harness's commit:
-/// the reviewer left the tree at `head`, and if nothing has touched it since,
-/// the harness's commit contains precisely the reviewed code. Anything else --
-/// the artifact sync, a steer landing mid-flight, a second checkpoint -- means
-/// that commit covers code no reviewer saw, and the approval must stay at `head`,
-/// which re-reviews the difference rather than missing it.
+/// This is the identity a security review approves: a *content* identity, not
+/// a commit. The harness commits the worktree only after the review phase
+/// returns, so the commit that carries the audited code does not exist yet at
+/// the moment the review finishes; comparing the tree to the pre-commit HEAD
+/// instead can never match, and the approval would silently fall back to the
+/// pre-commit HEAD and re-audit the reviewed code on the next revision.
 ///
-/// `false` whenever `head` is unknown: an unmeasurable tree is not a clean one.
-pub(super) async fn tree_matches_head(path: &Path, head: &Option<String>) -> bool {
-    let Some(head) = head.clone() else {
-        return false;
-    };
+/// The tree is written through a *temporary index* (`GIT_INDEX_FILE` pointing
+/// at a scratch file), so the worker's real index -- and the tree the harness's
+/// own commit is built from -- is never touched by the probe. `.gitignore`d
+/// paths are still excluded, so the snapshot is the same tree `git add -A`
+/// would stage.
+///
+/// `None` whenever git cannot resolve it: an unmeasurable tree approves nothing.
+pub(super) async fn snapshot_worktree_tree(path: &Path) -> Option<String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        // The branch must still point where the reviewer left it: a commit
-        // landing after the review (a second checkpoint, a steer that ran on)
-        // moved the tree even when the files are clean.
-        let still_at_head = crate::worktree::git(&path, "rev-parse", &["rev-parse", "HEAD"])
-            .ok()
-            .filter(|out| out.status.success())
-            .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == head);
-        if !still_at_head {
-            return false;
+        let index = crate::worktree::scratch_dir(&path).join("review-tree.index");
+        if let Some(parent) = index.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        // Intent-to-add first so a new file counts as a change, the same way the
-        // diff probe sees one.
-        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
-        crate::worktree::git(&path, "status", &["status", "--porcelain"])
-            .ok()
-            .filter(|out| out.status.success())
-            .is_some_and(|out| out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+        // A stale index from an earlier snapshot would be read back by `write
+        // -tree`, so start from nothing every time.
+        let _ = std::fs::remove_file(&index);
+        let run = |args: &[&str]| -> Result<std::process::Output> {
+            let mut command = std::process::Command::new("git");
+            command
+                .current_dir(&path)
+                .args(args)
+                .env("LC_ALL", "C")
+                .env("GIT_INDEX_FILE", &index);
+            command
+                .output()
+                .map_err(|e| anyhow::anyhow!("Failed to execute git snapshot: {e}"))
+        };
+        let staged = run(&["add", "-A", "--"]).ok()?;
+        if !staged.status.success() {
+            let _ = std::fs::remove_file(&index);
+            return None;
+        }
+        let written = run(&["write-tree"]).ok()?;
+        let _ = std::fs::remove_file(&index);
+        written
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&written.stdout).trim().to_string())
+            .filter(|tree| !tree.is_empty())
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Whether the commit `head_commit` is exactly the tree the security review
+/// left behind, as `snapshot` recorded it.
+///
+/// This is the guard on recording a security approval as the harness's commit:
+/// the harness commits the worktree after the review, and that commit *is* the
+/// audited code only when the tree it captured is the tree the reviewer
+/// approved. Anything else -- the artifact sync, a steer landing mid-flight, a
+/// second checkpoint -- means the commit covers code no reviewer saw, and the
+/// approval must stay at the pre-commit HEAD, which names less code than was
+/// reviewed (so the difference is re-reviewed rather than missed).
+///
+/// `false` whenever the snapshot or the commit is unknown, or git cannot
+/// resolve the commit's tree: an unmeasurable tree approves nothing.
+pub(super) async fn commit_matches_snapshot(
+    path: &Path,
+    snapshot: &Option<String>,
+    head_commit: &Option<String>,
+) -> bool {
+    let (Some(snapshot), Some(head_commit)) = (snapshot.clone(), head_commit.clone()) else {
+        return false;
+    };
+    // A value that is not a plain object id must never reach git as a revision
+    // argument: the registry is attacker-influenceable input.
+    if !is_object_id(&snapshot) || !is_object_id(&head_commit) {
+        return false;
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::worktree::git(
+            &path,
+            "rev-parse",
+            &["rev-parse", &format!("{head_commit}^{{tree}}")],
+        )
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == snapshot)
     })
     .await
     .unwrap_or(false)

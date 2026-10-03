@@ -86,6 +86,8 @@ pub use self::revision::{
 pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
+#[doc(hidden)]
+pub use self::runner::{__test_commit_matches_snapshot, __test_snapshot_worktree_tree};
 pub use self::runner::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
     HARNESS_WAIT_PREFIX, PACK_CAP_BYTES, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome,
