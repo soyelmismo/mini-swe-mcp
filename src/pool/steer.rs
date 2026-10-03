@@ -38,11 +38,11 @@
 //!   the type check reachable: `O_APPEND` on a FIFO blocks inside `open(2)`
 //!   until a reader arrives, and a read-only `open` on a FIFO blocks until a
 //!   writer does. `round_manifest` is async and reads the log on the reactor, so
-//!   either would stall every request on the pool. Cleanup is therefore the worker
-//! loop's own responsibility ([`remove_steer_file`], invoked by a `Drop` guard
-//! held for the worker's whole lifetime), not the pruner's — a mailbox only
-//! exists while some `steer` call created it, and every worker removes its own
-//! on exit.
+//!   either would stall every request on the pool. Cleanup is therefore the
+//!   worker loop's own responsibility ([`remove_steer_file`], invoked by a
+//!   `Drop` guard held for the worker's whole lifetime), not the pruner's — a
+//!   mailbox only exists while some `steer` call created it, and every worker
+//!   removes its own on exit.
 //!
 //! Messages are **JSON lines**, one object per line:
 //! `{"message": "…", "sent_at": 1700000000, "pid": 4242}`.
