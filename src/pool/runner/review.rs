@@ -163,7 +163,7 @@ impl ReviewMode {
     /// Everything else — `combo:nerd`, `some/unknown`, a trailing `:` — stays
     /// the model verbatim, which is what keeps today's `--review-after` values
     /// parsing exactly as they did. Manifest-declared modes are resolved by
-    /// [`crate::manifest::ModelManifest::parse_review_after`], which has the
+    /// [`ReviewMode::parse_with_manifest`], which has the
     /// catalog to validate them against.
     pub fn parse_model(requested: &str) -> (String, Self) {
         let trimmed = requested.trim();
@@ -585,7 +585,7 @@ fn is_object_id(value: &str) -> bool {
 
 /// Decide a worker's security review scope from a repository path and a branch.
 ///
-/// The same decision [`security_scope`] makes inside the phase loop, over the
+/// The same decision the phase loop's `security_scope` adapter makes, over the
 /// facts a caller already has, so the rule — audit only what no earlier security
 /// review covered — has one implementation whether the caller is the loop or a
 /// reader asking what a worker would be reviewed over.
