@@ -573,7 +573,13 @@ impl WorkerPool {
         let merged_branches: Vec<String> = match meta.role {
             super::registry::WorkerRole::Consolidate => {
                 super::load_registry_entry_in(&self.scratch, worker_id)
-                    .map(|entry| entry.integrated.iter().map(|w| format!("worker-{w}")).collect())
+                    .map(|entry| {
+                        entry
+                            .integrated
+                            .iter()
+                            .map(|w| format!("worker-{w}"))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }
             _ => Vec::new(),
@@ -668,8 +674,7 @@ impl WorkerPool {
                 // The commit this review approved rides the registry row, so a
                 // later revision reviews from here instead of re-auditing the
                 // whole diff since the base commit.
-                meta.security_approved_commit =
-                    self::review::head_commit_of(&worktree.path).await;
+                meta.security_approved_commit = self::review::head_commit_of(&worktree.path).await;
             }
         }
 

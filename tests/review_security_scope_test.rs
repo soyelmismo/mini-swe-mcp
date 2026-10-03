@@ -57,7 +57,10 @@ fn repo(tag: &str) -> (common::TempDir, String) {
     // Repo-scoped identity: the test's commits need an author, and writing it
     // into this temporary repository keeps the machine's global git config and
     // this process's environment untouched.
-    common::git(&path, &["config", "user.email", "review-scope@example.invalid"]);
+    common::git(
+        &path,
+        &["config", "user.email", "review-scope@example.invalid"],
+    );
     common::git(&path, &["config", "user.name", "Review Scope Test"]);
     let base = commit(&path, "master", "README.md", "base");
     common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
@@ -77,7 +80,12 @@ async fn worker_scope(
 #[tokio::test]
 async fn a_revision_with_no_sensitive_change_since_the_approval_skips_the_review() {
     let (dir, base) = repo("scope_skip");
-    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+    let approved = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "sensitive change",
+    );
 
     // A first run has no approval to start from: it reviews everything.
     let first = worker_scope(dir.path(), "worker-w1", &base, None).await;
@@ -110,7 +118,12 @@ async fn a_revision_with_no_sensitive_change_since_the_approval_skips_the_review
 #[tokio::test]
 async fn a_revision_with_a_sensitive_change_reviews_only_the_new_commits() {
     let (dir, base) = repo("scope_incremental");
-    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+    let approved = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "sensitive change",
+    );
     // The correction the consolidator routed back touches a sensitive path too.
     let correction = commit(dir.path(), "worker-w1", "src/hub/identity.rs", "correction");
 
@@ -151,9 +164,20 @@ async fn a_consolidator_reviews_only_its_own_commits() {
 
     // The consolidator integrates both and then resolves the interaction.
     common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", "master"]);
-    common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"]);
-    common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w2", "worker-w2"]);
-    let own = commit(dir.path(), "worker-c1", "src/hub/handshake.rs", "resolve the interaction");
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w2", "worker-w2"],
+    );
+    let own = commit(
+        dir.path(),
+        "worker-c1",
+        "src/hub/handshake.rs",
+        "resolve the interaction",
+    );
 
     let merged = vec!["worker-w1".to_string(), "worker-w2".to_string()];
     let scope = scope_for(
@@ -192,7 +216,12 @@ async fn a_consolidator_reviews_only_its_own_commits() {
 #[tokio::test]
 async fn an_unresolvable_approval_never_reads_as_no_change() {
     let (dir, base) = repo("scope_unknown");
-    commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+    commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "sensitive change",
+    );
     // A pruned branch can leave an approved commit the repository cannot resolve.
     // Reading that gap as "nothing changed" would skip a real audit, so the
     // scope must fall back to reviewing the whole diff.
@@ -200,7 +229,9 @@ async fn an_unresolvable_approval_never_reads_as_no_change() {
     let scope = worker_scope(dir.path(), "worker-w1", &base, Some(unknown.clone())).await;
     assert_ne!(
         scope.skip_log(),
-        Some(format!("security review skipped: no sensitive change since {unknown}")),
+        Some(format!(
+            "security review skipped: no sensitive change since {unknown}"
+        )),
         "an approval the repository cannot resolve must not be read as an approval"
     );
 }

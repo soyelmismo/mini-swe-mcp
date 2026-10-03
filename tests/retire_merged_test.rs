@@ -352,6 +352,7 @@ fn every_row_a_meta_writes_carries_its_base_branch() {
         report: None,
         verified: None,
         security_review: None,
+        security_approved_commit: None,
         verdicts: None,
     };
     let pool = WorkerPool::with_scratch(
@@ -844,6 +845,7 @@ fn a_consolidators_round_survives_its_later_status_writes() {
         report: None,
         verified: None,
         security_review: None,
+        security_approved_commit: None,
         verdicts: None,
     };
     pool.__test_reset_registry_throttle("wcons");
@@ -1006,6 +1008,7 @@ fn successive_round_recordings_survive_status_writes_between_them() {
         report: None,
         verified: None,
         security_review: None,
+        security_approved_commit: None,
         verdicts: None,
     };
     let status = |pool: &mini_swe_mcp::pool::WorkerPool| {

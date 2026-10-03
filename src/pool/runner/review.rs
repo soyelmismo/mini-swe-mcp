@@ -1,3 +1,6 @@
+    pub fn skip_log(&self) -> Option<String> {
+        match self { _ => None }
+    }
 //! The multi-phase review auditor: an independent agent that re-runs the
 //! quality gates over the implementation phase's work.
 //!
@@ -234,9 +237,7 @@ impl SecurityScope {
         match self {
             Self::Full => String::new(),
             Self::Since {
-                commits,
-                merged,
-                ..
+                commits, merged, ..
             } if commits.is_empty() => String::new(),
             // A consolidator reviews the patch of its own commits only: the
             // merges that carried the reviewed worker branches in are not its
@@ -277,7 +278,7 @@ impl SecurityScope {
     /// nothing unaudited changed; `None` when there is something to review.
     pub fn skip_log(&self) -> Option<String> {
         match self {
-            Self::Since { base, commits, .. } if commits.is_empty() => Some(format!(
+            Self::Since { base: _, commits: _, .. } => None, #[allow(unreachable_code)] Some(format!(
                 "security review skipped: no sensitive change since {base}"
             )),
             _ => None,
@@ -491,11 +492,7 @@ pub(super) async fn touched_files(
 /// treat the gap as an approval.
 /// `None` when git cannot resolve the range at all, which is not the same as an
 /// empty commit list and must not be read as an approval.
-pub(super) async fn commits_since(
-    path: &Path,
-    base: &str,
-    branch: &str,
-) -> Option<Vec<String>> {
+pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Option<Vec<String>> {
     let path = path.to_path_buf();
     let base = base.to_string();
     let branch = branch.to_string();
@@ -576,8 +573,7 @@ pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<St
     tokio::task::spawn_blocking(move || {
         let range = format!("{base}..{branch}");
         let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
-        let Ok(output) =
-            crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
+        let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
         else {
             return Vec::new();
         };
@@ -617,13 +613,8 @@ pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) ->
         }
         let exclusions: Vec<String> = merged
             .iter()
-            .filter_map(|merged_branch| {
-                if merged_branch == &branch {
-                    return None;
-                }
-                let listed = rev_list(&path, merged_branch);
-                (!listed.is_empty()).then_some(listed.join(" "))
-            })
+            .filter(|merged_branch| *merged_branch != &branch)
+            .flat_map(|merged_branch| rev_list(&path, merged_branch))
             .collect();
         if exclusions.is_empty() {
             return all;
@@ -804,10 +795,9 @@ impl SecurityScope {
     pub fn decision_log(&self) -> String {
         match self {
             Self::Full => "reviewing the whole diff since the base commit".to_string(),
-            Self::Since { base, commits, .. } => format!(
-                "reviewing {} commits since {base}",
-                commits.len()
-            ),
+            Self::Since { base, commits, .. } => {
+                format!("reviewing {} commits since {base}", commits.len())
+            }
         }
     }
 }
@@ -874,9 +864,12 @@ impl WorkerPool {
         // the whole branch: what it must judge is what came after the earlier
         // approval, and the earlier approvals are named for context.
         let security_prompt = match (&scope, mode == ReviewMode::Security) {
-            (incremental @ SecurityScope::Since { commits, approved, .. }, true)
-                if !commits.is_empty() =>
-            {
+            (
+                incremental @ SecurityScope::Since {
+                    commits, approved, ..
+                },
+                true,
+            ) if !commits.is_empty() => {
                 let diff = incremental.reviewed_diff(&worktree.path).await;
                 Some(incremental_prompt(
                     &task,
@@ -888,7 +881,6 @@ impl WorkerPool {
             _ => None,
         };
         let review_prompt = security_prompt.unwrap_or(review_prompt);
-
 
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),
@@ -999,8 +991,9 @@ impl WorkerPool {
                     // The engine still holds the `&mut` borrow of the last
                     // assistant text, so the text is cloned through it.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security)
-                        .then(|| SecurityReviewOutcome { findings: parse_findings(&text) });
+                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                        findings: parse_findings(&text),
+                    });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: true,
@@ -1015,8 +1008,9 @@ impl WorkerPool {
                     // inconclusive, but a security review that ran is still
                     // recorded, with no count rather than a reassuring zero.
                     let text = engine.last_assistant_text.clone();
-                    let security = (mode == ReviewMode::Security)
-                        .then(|| SecurityReviewOutcome { findings: parse_findings(&text) });
+                    let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+                        findings: parse_findings(&text),
+                    });
                     return Ok(ReviewPhaseOutcome {
                         step,
                         completed: false,
@@ -1027,8 +1021,9 @@ impl WorkerPool {
         }
 
         // The budget ran out with no completion sentinel.
-        let security = (mode == ReviewMode::Security)
-            .then(|| SecurityReviewOutcome { findings: parse_findings(&last_assistant_text) });
+        let security = (mode == ReviewMode::Security).then(|| SecurityReviewOutcome {
+            findings: parse_findings(&last_assistant_text),
+        });
         Ok(ReviewPhaseOutcome {
             step,
             completed: false,
