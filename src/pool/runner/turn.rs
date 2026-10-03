@@ -120,7 +120,7 @@ fn isolation_block(output: &str) -> Option<(&'static str, String)> {
 
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
-const AUTO_CHECKPOINT_TURNS: usize = 20;
+pub(super) const AUTO_CHECKPOINT_TURNS: usize = 20;
 
 /// Cap on the assistant text scanned for a REPORT block. A block is at most the
 /// four [`REPORT_FIELD_BYTES`] fields plus the command that carries it, so the
