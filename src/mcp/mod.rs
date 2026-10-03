@@ -30,4 +30,4 @@ pub use server::{
     ANONYMOUS_AGENT_PREFIX, CLI_AGENT, CLI_CLIENT_NAME, ConnectionContext, LOCAL_AGENT, McpServer,
 };
 
-mod auto_consolidate;
+pub(crate) mod auto_consolidate;

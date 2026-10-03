@@ -606,7 +606,51 @@ pub fn save_registry_entry_in(root: &ScratchRoot, entry: &WorkerRegistryEntry) {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{}.json", entry.id));
     if let Ok(json) = serde_json::to_string(entry) {
-        let _ = std::fs::write(path, json);
+        // The row is the cross-process view of the pool, so it must never read
+        // torn. A plain `std::fs::write` truncates then writes: a reader that
+        // opens the file between the two sees an empty or half-written row and
+        // skips it (round41: the hub's tick read mid-write, saw no row for a
+        // worker that was in fact still live, and started the round without
+        // it). Write to a uniquely named sibling and rename over the row, so a
+        // reader always sees either the old row or the complete new one.
+        atomic_write_registry_row(&path, json.as_bytes());
+    }
+}
+
+/// Write one registry row atomically: a uniquely named temporary file created
+/// exclusively in the same directory, then renamed over the row.
+///
+/// The temp name is unpredictable (a fresh UUID), so a name an attacker could
+/// pre-create is never used; `create_new` refuses to adopt an existing file
+/// and `O_NOFOLLOW` refuses a symlink, so a planted file or link cannot be
+/// followed or silently adopted. The rename is atomic within the directory, so
+/// a concurrent reader sees the old row or the complete new one, never a torn
+/// write. The temp file is created with the same default permissions a plain
+/// write would give the row, and is removed if the rename fails.
+fn atomic_write_registry_row(path: &std::path::Path, json: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path
+        .parent()
+        .expect("a registry row has a parent directory");
+    let tmp = dir.join(format!(
+        "{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("row"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(json)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(path = %path.display(), error = %e, "Failed to write registry row atomically");
     }
 }
 
@@ -941,6 +985,77 @@ mod recovery_cleanup_tests {
             "the orphan's scratch dir must be removed"
         );
         assert!(!pid.exists(), "the orphan's lease must be removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Registry rows are the cross-process view of the pool, so a row must never
+/// read torn: a reader that opens the file mid-write sees an empty or
+/// half-written row and skips it, which is exactly what started round41 early
+/// (the hub's tick read a partially written row, saw no worker, and closed the
+/// round without it). The write path is atomic (temp sibling + rename), so a
+/// reader always sees the old row or the complete new one. This test hammers a
+/// row with repeated writes from one thread while another reads the file back
+/// directly, and asserts the row parses on every read: a torn write would make
+/// one of them miss it.
+#[cfg(test)]
+mod registry_atomic_write_tests {
+    use super::*;
+    use crate::worktree::ScratchRoot;
+
+    #[test]
+    fn a_reader_concurrent_with_repeated_writes_never_misses_the_row() {
+        let base = std::env::temp_dir().join(format!(
+            "swe-reg-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let root = ScratchRoot::new(&base);
+        let id = format!("atomic-{}", uuid::Uuid::new_v4().simple());
+        // A large row makes a torn `std::fs::write` visible: the truncate lands
+        // first and the reader would parse an empty file. The task text is the
+        // bulk, so it is sized well past any page boundary.
+        let mut row = WorkerRegistryEntry::test_row(&id, "agent-a");
+        row.task = "t".repeat(64 * 1024);
+        row.status = RegistryStatus::Running;
+        save_registry_entry_in(&root, &row);
+        let path = registry_dir_in(&root).join(format!("{id}.json"));
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let write_root = root.clone();
+        let writer = std::thread::spawn(move || {
+            let mut step = 0usize;
+            let mut row = row;
+            while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
+                step = step.wrapping_add(1);
+                row.step = step;
+                row.status = if step.is_multiple_of(2) {
+                    RegistryStatus::Running
+                } else {
+                    RegistryStatus::Reviewing
+                };
+                save_registry_entry_in(&write_root, &row);
+            }
+        });
+
+        // Read the row file back directly many times while the writer churns
+        // it. Every read must parse the row: a torn write would make one of
+        // them see an empty or half-written file.
+        for reads in 0..2000 {
+            let raw = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("a read of the row failed after {reads} successful reads: {e}")
+            });
+            let entry: WorkerRegistryEntry = serde_json::from_slice(&raw).unwrap_or_else(|e| {
+                panic!(
+                    "a read saw a torn row after {reads} successful reads ({} bytes): {e}",
+                    raw.len()
+                )
+            });
+            assert_eq!(entry.id, id, "the row must keep its identity");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

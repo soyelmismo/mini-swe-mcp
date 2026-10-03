@@ -10,6 +10,21 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// What the scheduler makes of one round.
+///
+/// The tick needs three answers, not one: start it, leave it for now, or retire
+/// it. A round whose consolidator already ran is *retired* -- it is consumed on
+/// disk so the scheduler stops reconsidering it, which is different from
+/// waiting for one more worker.
+pub(crate) enum RoundDecision {
+    /// Every worker has settled and none of them is still being run here.
+    Start,
+    /// Not yet: a worker is still running, or its row is behind the run.
+    Wait,
+    /// Already consolidated; consume the round so it stops being a candidate.
+    Retire,
+}
+
 impl McpServer {
     pub(super) fn auto_store(&self) -> Option<Arc<AutoConsolidate>> {
         self.auto_consolidate.lock().unwrap().clone()
@@ -122,44 +137,95 @@ impl McpServer {
         }))
     }
 
+    /// Decide whether this round may start now.
+    ///
+    /// Both facts are cross-process-visible, so neither alone decides:
+    ///
+    /// * the *rows* say who has settled durably. A row is rewritten on every
+    ///   status change, but it is a file: a racing or coalesced write can leave
+    ///   it reading a settled status for a worker that is not, and only the
+    ///   run itself can fix that.
+    /// * this process's own *live records* say what it is still driving. A
+    ///   worker the pool still runs is not settled whatever its row says -- the
+    ///   window between the implementer's completion and the review phase's
+    ///   first write lives exactly there, and a round started in it would
+    ///   dispatch a consolidator whose manifest lists that worker as *not
+    ///   ready*, merging the rest of the group and closing without it.
+    pub(crate) async fn round_decision(
+        &self,
+        round: &Round,
+        entries: &[crate::pool::WorkerRegistryEntry],
+    ) -> RoundDecision {
+        let members: Vec<&crate::pool::WorkerRegistryEntry> = entries
+            .iter()
+            .filter(|e| {
+                e.owner.as_deref() == Some(&round.owner) && e.group.as_deref() == Some(&round.group)
+            })
+            .collect();
+        // A round whose consolidator already ran, or is running, is settled or
+        // being settled: neither is a reason to start another one.
+        if members
+            .iter()
+            .any(|e| e.role == WorkerRole::Consolidate && !round.consolidators.contains(&e.id))
+        {
+            return RoundDecision::Retire;
+        }
+        if members
+            .iter()
+            .any(|e| e.role == WorkerRole::Consolidate && e.status.is_live())
+        {
+            return RoundDecision::Wait;
+        }
+        let workers: Vec<&crate::pool::WorkerRegistryEntry> = members
+            .iter()
+            .copied()
+            .filter(|e| e.role == WorkerRole::Worker && !round.baseline.contains(&e.id))
+            .collect();
+        // Nothing finished yet, or something is still running, failed or
+        // paused: the round is not the scheduler's to close.
+        if !workers
+            .iter()
+            .any(|e| e.status == RegistryStatus::Completed)
+            || workers.iter().any(|e| {
+                !matches!(
+                    e.status,
+                    RegistryStatus::Completed | RegistryStatus::Stopped
+                )
+            })
+        {
+            return RoundDecision::Wait;
+        }
+        // The rows all read settled; the pool still driving one of these
+        // workers means a row is behind the run, so the round waits for the
+        // terminal write instead of racing it. Every non-terminal record counts,
+        // not just `Running`: a worker paused on an orchestrator question is
+        // just as unsettled as one running, and its row can lag the same way.
+        for worker in &workers {
+            if matches!(
+                self.pool.get_worker_state(&worker.id).await,
+                Some(
+                    crate::pool::WorkerState::Running { .. }
+                        | crate::pool::WorkerState::Paused { .. }
+                )
+            ) {
+                return RoundDecision::Wait;
+            }
+        }
+        RoundDecision::Start
+    }
+
     async fn auto_consolidate_tick(&self, store: &Arc<AutoConsolidate>) -> Result<()> {
         for round in store.candidates() {
             let entries = load_all_registry_entries_in(self.pool.scratch_root());
-            let members: Vec<_> = entries
-                .iter()
-                .filter(|e| {
-                    e.owner.as_deref() == Some(&round.owner)
-                        && e.group.as_deref() == Some(&round.group)
-                })
-                .collect();
-            if members
-                .iter()
-                .any(|e| e.role == WorkerRole::Consolidate && !round.consolidators.contains(&e.id))
-            {
-                store.consume(&round)?;
-                continue;
-            }
-            if members
-                .iter()
-                .any(|e| e.role == WorkerRole::Consolidate && e.status.is_live())
-            {
-                continue;
-            }
-            let workers: Vec<_> = members
-                .iter()
-                .filter(|e| e.role == WorkerRole::Worker && !round.baseline.contains(&e.id))
-                .collect();
-            if !workers
-                .iter()
-                .any(|e| e.status == RegistryStatus::Completed)
-                || workers.iter().any(|e| {
-                    !matches!(
-                        e.status,
-                        RegistryStatus::Completed | RegistryStatus::Stopped
-                    )
-                })
-            {
-                continue;
+            match self.round_decision(&round, &entries).await {
+                RoundDecision::Start => {}
+                RoundDecision::Wait => continue,
+                // Its consolidator already ran: consume the round so the
+                // scheduler stops offering it.
+                RoundDecision::Retire => {
+                    store.consume(&round)?;
+                    continue;
+                }
             }
             let Some(_claim) = store.claim(&round) else {
                 continue;
