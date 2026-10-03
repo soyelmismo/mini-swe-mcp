@@ -530,11 +530,23 @@ impl SecurityScope {
 ///
 /// `approvals` maps a worker id to the commit its security review approved, so
 /// the rule is one predicate the pipeline and the tests read alike.
+///
+/// Only a plain git object id is an approval (see [`is_object_id`]): a value
+/// that is not one -- a pruned branch's stale row, or a value a writer with
+/// registry access planted, such as `--output=<path>` -- is not trusted and
+/// keeps the merged worker's branch in the consolidator's audit. The worker
+/// path already filters through the same predicate in [`scope_for`]; this keeps
+/// the consolidator path from splicing a non-revision value verbatim into a
+/// `git rev-list` argument, where it would execute as an option.
 pub fn approved_merged_branches(
     integrated: &[String],
     approvals: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    integrated.iter().filter_map(|id| approvals(id)).collect()
+    integrated
+        .iter()
+        .filter_map(|id| approvals(id))
+        .filter(|sha| is_object_id(sha))
+        .collect()
 }
 
 /// The review the pipeline will actually run, given the scope's skip decision,

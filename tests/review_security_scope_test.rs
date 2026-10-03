@@ -712,3 +712,62 @@ fn scope_is_non_merge(dir: &Path, commit: &str) -> bool {
         .trim()
         .is_empty()
 }
+
+/// A planted approval that is not a plain git object id must not reach a git
+/// revision argument in the consolidator path either. The worker path already
+/// rejects a non-object-id approval (`scope_for` filters through
+/// `is_object_id`); the consolidator path must do the same, or a value like
+/// `--output=<path>` planted on a merged worker's registry row would be
+/// spliced verbatim into `git rev-list` and execute as an option, creating or
+/// truncating an arbitrary file. The safe direction is to treat it as no
+/// approval: the merged worker's branch stays in the consolidator's audit.
+#[tokio::test]
+async fn a_planted_non_object_id_approval_never_reaches_git_in_the_consolidator_path() {
+    let (dir, base) = repo("scope_planted_consolidator");
+    // `repo()` already left `worker-w1` checked out; add one commit to it.
+    let w1 = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "worker one");
+
+    // The consolidator merges it and adds its own work.
+    common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", "master"]);
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let own = commit(
+        dir.path(),
+        "worker-c1",
+        "src/hub/handshake.rs",
+        "resolve the interaction",
+    );
+
+    // The planted approval looks like a git option, not a revision.
+    let planted = "--output=pwned".to_string();
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        &approved_merged_branches(&["w1".to_string()], |_| Some(planted.clone())),
+    )
+    .await;
+
+    // Without the guard, `git rev-list --output=pwned` would have created this
+    // file in the repository.
+    assert!(
+        !dir.path().join("pwned").exists(),
+        "a non-object-id approval must not be executed as a git option"
+    );
+    // The safe direction: the merged worker's code is not treated as approved,
+    // so it stays in the consolidator's audit rather than being dropped.
+    assert!(
+        scope.reviewed_commits().contains(&w1),
+        "a merged branch whose approval is not a real object id must stay in scope; got {:?}",
+        scope.reviewed_commits()
+    );
+    assert!(
+        scope.reviewed_commits().contains(&own),
+        "the consolidator's own commit is still its to audit"
+    );
+    assert_eq!(scope.skip_log(), None);
+}
