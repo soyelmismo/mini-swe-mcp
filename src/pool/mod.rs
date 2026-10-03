@@ -557,11 +557,7 @@ impl WorkerPool {
     /// the step recorder can tell this label from a step's model-written one.
     /// The returned [`HarnessWait`] owns that claim and releases it on drop, so
     /// a wait cancelled mid-flight leaves it behind for nobody.
-    async fn set_running_command(
-        &self,
-        id: &str,
-        command: &str,
-    ) -> (Option<String>, HarnessWait) {
+    async fn set_running_command(&self, id: &str, command: &str) -> (Option<String>, HarnessWait) {
         let mut previous = None;
         self.update_worker(id, |worker| {
             if let WorkerState::Running { last_command, .. } = &mut worker.state {
