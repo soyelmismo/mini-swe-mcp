@@ -576,3 +576,37 @@ pub async fn review_prompt_of(llm: &fake_llm::FakeLlm) -> Option<String> {
 pub fn tool_turn(call_id: &str, content: &str, command: &str) -> Vec<String> {
     fake_llm::scripted_tool_turn(call_id, content, command)
 }
+
+/// The turn a model issues when it is done: `content` plus the completion
+/// sentinel, so a scripted conversation ends the way a real one does.
+pub fn completion_turn(call_id: &str, content: &str) -> Vec<String> {
+    tool_turn(
+        call_id,
+        content,
+        &format!("echo {}", mini_swe_mcp::pool::COMPLETION_SENTINEL),
+    )
+}
+
+/// The security reviewer's completion: the sentinel plus the finding count
+/// the harness reads back off the registry row.
+pub fn security_completion_turn(call_id: &str, findings: usize) -> Vec<String> {
+    completion_turn(
+        call_id,
+        &format!("REPORT\ndone: adversarial pass\nFINDINGS: {findings}\nrisks: none"),
+    )
+}
+
+/// A worker turn that writes `path` in its worktree, so the worker's diff
+/// touches it. The parent directory is created first so a nested path works.
+pub fn write_turn(call_id: &str, path: &str) -> Vec<String> {
+    let parent = Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let command = if parent.is_empty() {
+        format!("echo changed > {path}")
+    } else {
+        format!("mkdir -p {parent} && echo changed > {path}")
+    };
+    tool_turn(call_id, "", &command)
+}
