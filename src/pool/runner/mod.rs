@@ -34,7 +34,10 @@ pub use self::context_pack::{
     PACK_CAP_BYTES, context_pack, extract_identifiers, extract_paths, outline_file,
 };
 use self::review::ReviewPhase;
-pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
+pub use self::review::{
+    ReviewMode, SecurityReviewOutcome, SecurityScope, approved_merged_branches, parse_findings,
+    plan_review, review_prompt, scope_for,
+};
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
@@ -567,16 +570,59 @@ impl WorkerPool {
         // the adversarial security review, and a sensitive diff with no
         // requested review triggers it on its own. This is the harness's
         // focused adversarial pass for the paths the repository declared.
-        let touched = self::review::touched_files(
-            &worktree.path,
-            &worktree.base_commit,
-            worktree.base_branch.as_deref(),
-        )
-        .await;
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
         patterns.sort();
         patterns.dedup();
+        // What this run has to be audited over: everything since the base, or
+        // only what came after the commit an earlier security review approved.
+        // A consolidator's own commits are what its security review covers: the
+        // worker branches it merged were reviewed at their own approved commits.
+        let merged_branches: Vec<String> = match meta.role {
+            super::registry::WorkerRole::Consolidate => {
+                super::load_registry_entry_in(&self.scratch, worker_id)
+                    .map(|entry| {
+                        let scratch = &self.scratch;
+                        // Excluding a merged branch from this audit is a claim
+                        // that it was reviewed at its own approved commit;
+                        // `integrated` proves only that the merge happened, so
+                        // the rule checks the approval itself.
+                        self::review::approved_merged_branches(&entry.integrated, |id| {
+                            super::load_registry_entry_in(scratch, id)
+                                .and_then(|worker| worker.security_approved_commit)
+                        })
+                    })
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let scope = self::review::security_scope(
+            worktree,
+            meta.role,
+            meta.security_approved_commit.clone(),
+            &merged_branches,
+        )
+        .await;
+        // Nothing changed since the last approval: the audit that already
+        // stands covers this run, so the security review is skipped rather than
+        // repeated. The generic quality review is untouched by this: it is not a
+        // security gate, and a revision asks for it the same way it asked before.
+        let security_skip = scope.skip_log();
+        let touched = match &scope {
+            self::review::SecurityScope::Full => {
+                self::review::touched_files(
+                    &worktree.path,
+                    &worktree.base_commit,
+                    worktree.base_branch.as_deref(),
+                )
+                .await
+            }
+            // An incremental scope is probed over what it covers only: the files
+            // of the commits after the last approval, or -- for a consolidator --
+            // the files its own commits touched. A path an approved review already
+            // covered is not sensitive again.
+            incremental => incremental.reviewed_files(&worktree.path).await,
+        };
         let sensitive: Vec<String> = touched
             .into_iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
@@ -629,16 +675,18 @@ impl WorkerPool {
                 (None, false) => {
                     let choice =
                         self::review::select_security_reviewer(self.manifest(), &default_model);
-                    let reviewer = self::review::mode_default_reviewer(
-                        "security",
-                        self.manifest(),
-                    )
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or(choice.model);
+                    let reviewer = self::review::mode_default_reviewer("security", self.manifest())
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or(choice.model);
                     Some((reviewer, security_mode, choice.reason))
                 }
                 (None, true) => None,
             };
+        if review_plan.is_none()
+            && let Some(reason) = security_skip
+        {
+            info!(worker = %worker_id, "{reason}");
+        }
         if let Some((reviewer_model, mode, why)) = review_plan {
             // The reviewer and the reason it was chosen, next to the pipeline
             // line: an audit nobody can account for is how a fast executor ends
@@ -667,6 +715,7 @@ impl WorkerPool {
                         mode,
                         verify: verify.clone(),
                         sensitive,
+                        scope: scope.clone(),
                     },
                 )
                 .await?;
@@ -676,6 +725,10 @@ impl WorkerPool {
             completed |= outcome.completed;
             if let Some(security) = outcome.security {
                 meta.security_review = Some(security);
+                // The commit this review approved rides the registry row, so a
+                // later revision reviews from here instead of re-auditing the
+                // whole diff since the base commit.
+                meta.security_approved_commit = self::review::head_commit_of(&worktree.path).await;
             }
         }
 

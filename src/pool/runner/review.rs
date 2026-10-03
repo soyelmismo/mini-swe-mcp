@@ -23,6 +23,14 @@
 //! * A manifest-declared mode — its `checklist` appended to the common review
 //!   frame, selected by `--review-after <model>:<mode>`.
 //!
+//! The security review audits only what has not been audited yet. Every commit
+//! an earlier security review approved is recorded on the worker's registry row
+//! ([`SecurityScope`]), so a revision — and a consolidator, whose diff is the
+//! union of branches each already reviewed — is handed the diff since that
+//! commit, not the whole branch again: 22 full reviews of 9 workers become one
+//! review per real change. With nothing new since the approval, the review is
+//! skipped and the skip is logged rather than paid for.
+//!
 //! It runs under its own turn budget ([`ReviewPhase::review_max_turns`],
 //! resolved from the model manifest) and its own message history, so the
 //! reviewer's context never mixes with the implementer's.
@@ -38,7 +46,7 @@ use crate::manifest::{ModelManifest, build_system_prompt};
 use crate::worktree::WorktreeGuard;
 
 use super::super::WorkerPool;
-use super::super::registry::{RegistryStatus, WorkerMeta};
+use super::super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome};
 
 /// Which model runs an automatic security review.
@@ -386,6 +394,348 @@ fn custom_prompt(name: &str, task: &str, gate: &str, checklist: &str) -> String 
     )
 }
 
+impl SecurityScope {
+    /// The commits this review adds beyond what an earlier security review
+    /// already approved, oldest first. Empty for a [`SecurityScope::Full`]
+    /// review, which is measured against the worker's base commit rather than
+    /// against a list, and for a scope whose review must be skipped.
+    pub fn reviewed_commits(&self) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            Self::Since { commits, .. } => commits.clone(),
+        }
+    }
+
+    /// The commits earlier security reviews approved, oldest first, which the
+    /// reviewer is given for context so it neither re-reviews them nor mistakes
+    /// them for new code.
+    pub fn approved_commits(&self) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            Self::Since { approved, .. } => approved.clone(),
+        }
+    }
+
+    /// The files this review has to judge: the paths the covered commits
+    /// touched, or the consolidator's own commits' paths. Empty for a full
+    /// scope, whose files are measured against the worker's base commit by the
+    /// caller that owns it.
+    pub async fn reviewed_files(&self, repo: &Path) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            // A consolidator's scope is its own commits, so its files are too:
+            // measuring `base..branch` would name every merged worker's files,
+            // which is exactly the re-audit this scope exists to avoid.
+            Self::Since {
+                merged,
+                branch,
+                commits,
+                ..
+            } if !merged.is_empty() && !commits.is_empty() => own_files(repo, branch, merged).await,
+            Self::Since { base, branch, .. } => files_since(repo, base, branch).await,
+        }
+    }
+
+    /// The diff of exactly what this review covers: the changes its own commits
+    /// made, which is what a consolidator's security review sees of its own
+    /// work -- never the merged worker branches it did not write.
+    pub async fn reviewed_diff(&self, repo: &Path) -> String {
+        match self {
+            Self::Full => String::new(),
+            Self::Since {
+                commits, merged, ..
+            } if commits.is_empty() => String::new(),
+            // A consolidator reviews the patch of its own commits only: the
+            // merges that carried the reviewed worker branches in are not its
+            // work, and handing them to the reviewer would audit those branches
+            // a second time.
+            Self::Since {
+                commits, merged, ..
+            } if !merged.is_empty() => {
+                // The own commits are a contiguous run on this branch, so the
+                // patch between the parent of the first and the last is exactly
+                // the consolidator's own work, with the merged branches'
+                // contribution already inside the merge commit it recorded.
+                match (commits.first(), commits.last()) {
+                    (Some(first), Some(last)) => {
+                        incremental_diff(repo, &format!("{first}^..{last}"), true).await
+                    }
+                    _ => String::new(),
+                }
+            }
+            // A worker's revision: everything its branch added after the last
+            // approval, which is exactly the unaudited range.
+            Self::Since { base, branch, .. } => {
+                incremental_diff(repo, &format!("{base}..{branch}"), true).await
+            }
+        }
+    }
+
+    /// The base commit the incremental diff is measured from. `None` for a full
+    /// review, which measures from the worker's own base instead.
+    pub fn base_commit(&self) -> Option<&str> {
+        match self {
+            Self::Full => None,
+            Self::Since { base, .. } => Some(base.as_str()),
+        }
+    }
+
+    /// The log line that states the decision, so a skipped review is as
+    /// legible in the hub log as one that ran.
+    pub fn decision_log(&self) -> String {
+        match self {
+            Self::Full => "reviewing the whole diff since the base commit".to_string(),
+            Self::Since { base, commits, .. } => {
+                format!("reviewing {n} commits since {base}", n = commits.len())
+            }
+        }
+    }
+
+    /// The skip line for this scope, when the review must not run because
+    /// nothing unaudited changed; `None` when there is something to review.
+    pub fn skip_log(&self) -> Option<String> {
+        match self {
+            // Only a commit list that is empty *and* a clean working tree is
+            // evidence that nothing is left unaudited. An agent that edited a
+            // sensitive file without committing it has changed the code, and the
+            // commit range alone would not see it.
+            Self::Since {
+                base,
+                commits,
+                uncommitted,
+                ..
+            } if commits.is_empty() && !*uncommitted => Some(format!(
+                "security review skipped: no sensitive change since {base}"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The merged worker branches a consolidator may leave out of its own audit.
+///
+/// Dropping a merged branch is a claim that the code it carries was already
+/// reviewed at its own approved commit. `integrated` proves only that the merge
+/// happened, so the approval has to be checked separately: a worker merged
+/// without one -- never reviewed, or reviewed before the field existed -- keeps
+/// its branch in scope and is audited by the consolidator rather than by nobody.
+///
+/// `approvals` maps a worker id to the commit its security review approved, so
+/// the rule is one predicate the pipeline and the tests read alike.
+pub fn approved_merged_branches(
+    integrated: &[String],
+    approvals: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    integrated
+        .iter()
+        .filter(|id| approvals(id).is_some())
+        .map(|id| format!("worker-{id}"))
+        .collect()
+}
+
+/// The review the pipeline will actually run, given the scope's skip decision,
+/// what the dispatch asked for and whether the scope touched a sensitive path.
+///
+/// `strongest` is the model to audit with when the manifest marks no tier of its
+/// own; it is only consulted for the automatic sensitive-path trigger, so it is
+/// the last argument and callers that never reach it may pass any model.
+///
+/// Two rules carry the security weight:
+///
+/// * A requested review is never downgraded. `--review-after <m>:security` names
+///   the adversarial audit, and an optimisation that skipped work must not
+///   quietly turn it into a generic quality pass -- that would weaken a gate the
+///   caller asked for by name, on the strength of a bookkeeping field.
+/// * The automatic trigger still defers. With nothing unaudited since the last
+///   approval and no explicit request, the sensitive-path trigger does not fire
+///   a second time over the same code.
+pub fn plan_review(
+    skip: bool,
+    requested: Option<(String, ReviewMode)>,
+    sensitive: bool,
+    strongest: &str,
+    security_mode: &ReviewMode,
+) -> Option<(String, ReviewMode)> {
+    match (skip, requested, sensitive) {
+        (true, Some((model, mode)), _) => Some((model, mode)),
+        (true, None, _) => None,
+        // A requested review on a sensitive diff is upgraded to the adversarial
+        // mode; the requested model still runs it.
+        (false, Some((model, _)), false) => Some((model, security_mode.clone())),
+        (false, Some((model, wanted)), true) => Some((model, wanted)),
+        // No requested review, but the diff is sensitive: trigger the security
+        // review on the manifest's strongest tier.
+        (false, None, false) => Some((strongest.to_string(), security_mode.clone())),
+        (false, None, true) => None,
+    }
+}
+
+/// Decide a worker's security review scope from a repository path and a branch.
+///
+/// The same decision [`security_scope`] makes inside the phase loop, over the
+/// facts a caller already has, so the rule — audit only what no earlier security
+/// review covered — has one implementation whether the caller is the loop or a
+/// reader asking what a worker would be reviewed over.
+///
+/// * `approved` is the commit an earlier security review approved on this
+///   branch, if any.
+/// * `merged` names the worker branches a consolidator integrated; a
+///   consolidator's scope excludes them.
+/// * `role` decides the exclusion; a plain worker is never treated as a
+///   consolidator even if it names branches.
+pub async fn scope_for(
+    repo: &Path,
+    branch: &str,
+    role: WorkerRole,
+    base_commit: &str,
+    approved: Option<String>,
+    merged: &[String],
+) -> SecurityScope {
+    match role {
+        WorkerRole::Consolidate => SecurityScope::Since {
+            base: base_commit.to_string(),
+            branch: branch.to_string(),
+            approved: Vec::new(),
+            commits: own_commits(repo, branch, merged).await,
+            merged: merged.to_vec(),
+            uncommitted: has_uncommitted_changes(repo).await,
+        },
+        WorkerRole::Worker => match approved {
+            // An approval the repository cannot resolve -- a pruned branch, a
+            // rewritten history -- is not evidence that nothing changed since.
+            // Reading it that way would skip a real audit, so the scope widens to
+            // the whole diff: re-auditing is the recoverable mistake.
+            Some(base) => match commits_since(repo, &base, branch).await {
+                Some(commits) => {
+                    let already = vec![base.clone()];
+                    SecurityScope::Since {
+                        base,
+                        branch: branch.to_string(),
+                        approved: already,
+                        commits,
+                        merged: Vec::new(),
+                        uncommitted: has_uncommitted_changes(repo).await,
+                    }
+                }
+                None => SecurityScope::Full,
+            },
+            None => SecurityScope::Full,
+        },
+    }
+}
+
+/// Whether the working tree carries a change its branch tip does not: staged,
+/// unstaged or intent-to-add.
+///
+/// An agent edits before it commits and the harness checkpoints only after the
+/// review phase, so "no new commit" is not "no new change". Treating a dirty
+/// tree as nothing to audit would skip the review of exactly the edits the run
+/// is about to hand on, so the honest answer is that something is unaudited.
+async fn has_uncommitted_changes(repo: &Path) -> bool {
+    let path = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        crate::worktree::git(&path, "status", &["status", "--porcelain"])
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| !out.stdout.iter().all(u8::is_ascii_whitespace))
+    })
+    .await
+    .unwrap_or(true)
+}
+
+/// Decide what one run's security review has to cover, from the worktree's own
+/// facts.
+///
+/// A thin adapter over [`scope_for`], which holds the rule; this only supplies
+/// the branch, base commit and merged worker branches the guard already carries,
+/// so the phase loop and any other reader cannot drift apart on what a security
+/// review covers.
+pub(super) async fn security_scope(
+    worktree: &WorktreeGuard,
+    role: WorkerRole,
+    approved_commit: Option<String>,
+    merged_branches: &[String],
+) -> SecurityScope {
+    scope_for(
+        &worktree.path,
+        &worktree.branch,
+        role,
+        &worktree.base_commit,
+        approved_commit,
+        merged_branches,
+    )
+    .await
+}
+
+/// The reviewer's opening message for a review that covers only what came after
+/// an earlier approval.
+///
+/// The reviewer is auditing a revision, not the whole branch: the diff since
+/// `base` is what it has never seen, while the commits earlier security reviews
+/// already approved are named so it neither re-reviews them nor mistakes them
+/// for new code. It keeps the adversarial checklist -- only the scope shrinks.
+fn incremental_prompt(task: &str, base: &str, approved: &[String], diff: &str) -> String {
+    let mut prompt = String::from(
+        "ADVERSARIAL SECURITY REVIEW PHASE (incremental):\n\
+         The previous subagent implemented the following task:\n",
+    );
+    let _ = write!(prompt, "{task}\n\n");
+    let _ = write!(
+        prompt,
+        "An earlier security review already approved the branch at commit {base}, \
+         so this pass covers only what came after it.\n\
+         Commits already security-reviewed and approved: {}.\n\n",
+        if approved.is_empty() {
+            base.to_string()
+        } else {
+            approved.join(", ")
+        }
+    );
+    prompt.push_str(
+        "YOUR OBJECTIVE AS THE ADVERSARIAL REVIEWER:\n\
+         Review ONLY the incremental diff below (`git diff {base}..HEAD`, \
+         plus the working tree with `git diff`). The earlier commits were \
+         already adversarially reviewed; re-litigating them wastes the budget. \
+         Ask the same questions of the new lines as of any other diff: who else \
+         can reach every path, socket, file, environment variable and IPC message \
+         they create; what model-written text is trusted as proof; what is left \
+         behind on a crash, handover or revision; what each deletion removes and \
+         what gates it; whether each changed test would fail if the code were wrong.\n\
+         Fix every real defect you find, with a regression test that fails without the fix.\n\
+         1. Report honestly: list every finding you did NOT fix in the `risks:` line.\n\
+         2. Print a line `FINDINGS: <n>` with the total number of findings you found.\n\
+         When done, execute:\n\
+         \x20  echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\n\n\
+         INCREMENTAL DIFF SINCE {base}:\n",
+    );
+    if diff.trim().is_empty() {
+        prompt.push_str("(no committed change since the approved commit; the working tree diff is the change)\n");
+    } else {
+        prompt.push_str(diff);
+        if !diff.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    prompt
+}
+
+/// The commit the worktree's checked-out branch points at, or `None` when git
+/// cannot resolve it. Recorded as the commit a security review approved.
+pub(super) async fn head_commit_of(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = crate::worktree::git(&path, "rev-parse", &["rev-parse", "HEAD"]).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|head| !head.is_empty())
+    })
+    .await
+    .unwrap_or(None)
+}
+
 /// The repository-relative files a worker's working tree changed against its
 /// base, uncommitted changes included.
 ///
@@ -423,6 +773,227 @@ pub(super) async fn touched_files(
         files.sort();
         files.dedup();
         files
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The commits `branch` added after `base`, oldest first.
+///
+/// Empty when `base` is unknown to the repository (a pruned branch, a rewritten
+/// history) or is not an ancestor, because the honest answer is then "nothing
+/// is known to be approved" -- and the caller reviews the whole diff rather than
+/// treat the gap as an approval.
+/// `None` when git cannot resolve the range at all, which is not the same as an
+/// empty commit list and must not be read as an approval.
+pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Option<Vec<String>> {
+    let path = path.to_path_buf();
+    let base = base.to_string();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        let range = format!("{base}..{branch}");
+        let Ok(output) =
+            crate::worktree::git(&path, "log", &["log", "--reverse", "--format=%H", &range])
+        else {
+            // git itself could not run: the range's history is unknown, and an
+            // unknown history is not an approval.
+            return None;
+        };
+        output.status.success().then(|| commits_in(output.stdout))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// The files a consolidator's own commits changed: the same exclusion of the
+/// worker branches it merged, but yielding the paths those own commits touched
+/// instead of the commits themselves. This is the consolidator's sensitive-path
+/// probe -- the merged worker branches are not its to re-audit.
+pub(super) async fn own_files(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+    let path = path.to_path_buf();
+    let branch = branch.to_string();
+    let merged = merged.to_vec();
+    tokio::task::spawn_blocking(move || {
+        // Every commit of every merged branch, so `git log ... --not` leaves
+        // exactly the consolidator's own non-merge commits.
+        let mut exclusions: Vec<String> = merged
+            .iter()
+            .filter(|merged| *merged != &branch)
+            .flat_map(|merged| rev_list(&path, merged))
+            .collect();
+        exclusions.sort();
+        exclusions.dedup();
+        let mut args: Vec<String> = vec![
+            "log".to_string(),
+            "--no-merges".to_string(),
+            "--name-only".to_string(),
+            "--format=".to_string(),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                files.sort();
+                files.dedup();
+                files
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The files the commits `base..branch` changed, sorted and deduplicated.
+///
+/// This is the sensitive-path probe for an incremental review: it answers "what
+/// did this run change that nobody has reviewed yet" without ever widening back
+/// to the whole branch diff. A range git cannot resolve yields an empty list,
+/// which the caller treats as "nothing new" rather than "everything".
+pub(super) async fn files_since(path: &Path, base: &str, branch: &str) -> Vec<String> {
+    let path = path.to_path_buf();
+    let base = base.to_string();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        // The commit range names what the branch added; the working tree names
+        // what the run edited but has not committed yet. Both are unaudited, so
+        // the probe is the union: measuring only the range would hide an
+        // uncommitted sensitive edit from the very decision meant to catch it.
+        let mut files: Vec<String> = Vec::new();
+        for range in [format!("{base}..{branch}"), branch.clone()] {
+            let Ok(output) = crate::worktree::git(&path, "diff", &["diff", "--name-only", &range])
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            files.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        files.sort();
+        files.dedup();
+        files
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Commits on `branch` that none of `merged` contains: a consolidator's own
+/// work -- its interaction fixes and conflict resolutions -- with the worker
+/// branches it integrated, each already reviewed at its own approved commit,
+/// left out.
+///
+/// The exclusion is a set difference over whole histories rather than over merge
+/// commit parents, so a worker branch that is itself an ancestor of another
+/// merged one cannot smuggle that ancestor's commits back into the review.
+pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) -> Vec<String> {
+    let path = path.to_path_buf();
+    let branch = branch.to_string();
+    let merged = merged.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let all = rev_list(&path, &branch);
+        if all.is_empty() {
+            return Vec::new();
+        }
+        let exclusions: Vec<String> = merged
+            .iter()
+            .filter(|merged_branch| *merged_branch != &branch)
+            .flat_map(|merged_branch| rev_list(&path, merged_branch))
+            .collect();
+        if exclusions.is_empty() {
+            return all;
+        }
+        // `--not` flips every revision after it, so the merged branches' own
+        // commits are listed as `^sha` and subtracted from the branch.
+        let mut args: Vec<String> = vec![
+            "rev-list".to_string(),
+            "--reverse".to_string(),
+            "--no-merges".to_string(),
+            branch.clone(),
+            "--not".to_string(),
+        ];
+        args.extend(exclusions);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::worktree::git(&path, "rev-list", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| commits_in(out.stdout))
+            .unwrap_or(all)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Commits reachable from `r#ref`, or empty when git cannot resolve it.
+fn rev_list(path: &Path, r#ref: &str) -> Vec<String> {
+    crate::worktree::git(path, "rev-list", &["rev-list", r#ref])
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| commits_in(out.stdout))
+        .unwrap_or_default()
+}
+
+/// Commit ids out of a `git rev-list`/`git log --format=%H` body.
+fn commits_in(stdout: Vec<u8>) -> Vec<String> {
+    String::from_utf8_lossy(&stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The diff of the reviewed commits: what the listed commits changed since the
+/// earlier approval, uncommitted changes included.
+///
+/// A commit range never contains work the run has not committed yet, so the
+/// working-tree diff is appended when asked for: the reviewer is told to audit
+/// `git diff` as well, and handing it a range that silently omits the edits the
+/// run is about to hand on would make that instruction a lie.
+pub(super) async fn incremental_diff(path: &Path, range: &str, working_tree: bool) -> String {
+    let path = path.to_path_buf();
+    let range = range.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = crate::worktree::git(&path, "add", &["add", "-N", "."]);
+        let mut diff = crate::worktree::git(&path, "diff", &["diff", &range])
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        if working_tree {
+            let uncommitted = crate::worktree::git(&path, "diff", &["diff"])
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default();
+            if !uncommitted.is_empty() {
+                if !diff.is_empty() && !diff.ends_with('\n') {
+                    diff.push('\n');
+                }
+                if !diff.is_empty() {
+                    diff.push_str("\n--- uncommitted working tree changes, also unaudited ---\n");
+                }
+                diff.push_str(&uncommitted);
+            }
+        }
+        diff
     })
     .await
     .unwrap_or_default()
@@ -480,11 +1051,14 @@ pub struct ReviewPhase<'a> {
     /// review was triggered by one of them. Empty for a hand-requested
     /// review.
     pub sensitive: Vec<String>,
+    /// Which commits this security review covers: the whole diff since the base
+    /// for a first run, or only what came after an earlier approval.
+    pub scope: SecurityScope,
 }
 
 /// What the review phase hands back: the combined step counter and whether the
 /// reviewer itself emitted the completion sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPhaseOutcome {
     /// The combined turn counter, for the caller to fold back into its own
     /// loop state.
@@ -507,6 +1081,39 @@ pub struct ReviewPhaseOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecurityReviewOutcome {
     pub findings: Option<usize>,
+}
+
+/// Which commits one security review has to look at.
+///
+/// The whole diff since the base commit is the security review of a first run.
+/// A revision, and a consolidator integrating branches that were already
+/// reviewed at their own approved commits, have an approval to start from: only
+/// what came after it is unaudited, so only that is handed to the reviewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityScope {
+    /// No approval to start from: the reviewer sees everything since the base.
+    Full,
+    /// An earlier security review approved `base`; this review covers the
+    /// commits after it, plus the approved commit itself named for context.
+    Since {
+        /// Commit the earlier security review approved.
+        base: String,
+        /// The branch tip this review covers: every probe below measures the
+        /// unaudited range against it, so an incremental scope needs no
+        /// second base of its own.
+        branch: String,
+        /// The commits that earlier security reviews approved, oldest first.
+        approved: Vec<String>,
+        /// The unaudited commits this review covers, oldest first.
+        commits: Vec<String>,
+        /// Branches already reviewed at their own approved commits, which a
+        /// consolidator's own commits must be measured without.
+        merged: Vec<String>,
+        /// Whether the working tree carries a change the covered commits do
+        /// not: an agent edits before it commits, so an empty commit list is
+        /// not by itself evidence that nothing is left unaudited.
+        uncommitted: bool,
+    },
 }
 
 impl WorkerPool {
@@ -534,6 +1141,7 @@ impl WorkerPool {
             mode,
             verify,
             sensitive,
+            scope,
         } = review;
 
         info!(
@@ -560,8 +1168,33 @@ impl WorkerPool {
                 worktree.preserve_branch = true;
             }
         }
+        info!(
+            worker = %worker_id,
+            "{}", scope.decision_log()
+        );
 
         let review_prompt = review_prompt(&mode, &task, verify.as_deref(), &sensitive);
+        // A security review of a revision gets the unaudited diff rather than
+        // the whole branch: what it must judge is what came after the earlier
+        // approval, and the earlier approvals are named for context.
+        let security_prompt = match (&scope, mode.is_security()) {
+            (
+                incremental @ SecurityScope::Since {
+                    commits, approved, ..
+                },
+                true,
+            ) if !commits.is_empty() => {
+                let diff = incremental.reviewed_diff(&worktree.path).await;
+                Some(incremental_prompt(
+                    &task,
+                    incremental.base_commit().unwrap_or_default(),
+                    approved,
+                    &diff,
+                ))
+            }
+            _ => None,
+        };
+        let review_prompt = security_prompt.unwrap_or(review_prompt);
 
         let reviewer_runner = AgentRunner::new(
             self.api_base.clone(),

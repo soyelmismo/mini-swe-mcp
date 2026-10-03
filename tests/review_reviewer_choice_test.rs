@@ -261,14 +261,14 @@ async fn an_explicit_review_after_wins() {
         repo.path(),
         catalog(true),
         "combo:ninja",
-        Some("combo:asker"),
+        Some("combo:nerd"),
     )
     .await;
 
     let bodies = llm.request_bodies().await;
     assert_eq!(
         models_of(&bodies).last().map(String::as_str),
-        Some("combo:asker"),
+        Some("combo:nerd"),
         "an explicit --review-after must win over the strongest tier: {:?}",
         models_of(&bodies)
     );
@@ -296,14 +296,14 @@ async fn a_requested_quality_review_keeps_its_model() {
         repo.path(),
         catalog(true),
         "combo:ninja",
-        Some("combo:critic"),
+        Some("combo:nerd"),
     )
     .await;
 
     let bodies = llm.request_bodies().await;
     assert_eq!(
         models_of(&bodies).last().map(String::as_str),
-        Some("combo:critic"),
+        Some("combo:nerd"),
         "a quality review stays on the requested model: {:?}",
         models_of(&bodies)
     );
