@@ -37,7 +37,7 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use self::catalog::build_system_prompt;
+pub use self::catalog::{MODEL_INSTRUCTIONS_HEADER, build_system_prompt};
 pub use self::instructions::{
     INSTRUCTION_FILES, MAX_INSTRUCTIONS_PROMPT_BYTES, matches_sensitive, parse_sensitive_paths,
     sensitive_paths,
