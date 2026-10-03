@@ -174,7 +174,7 @@ pub struct ToolCall {
 
 /// The nested `function` object of a [`ToolCall`], one level deep as the wire
 /// format requires (`{"id":..,"type":"function","function":{..}}`). Reused by the
-/// non-streaming inbound path ([`ToolCallOutput`]) to avoid a duplicate type.
+/// non-streaming inbound path (`ToolCallOutput`) to avoid a duplicate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFn {
     pub name: String,

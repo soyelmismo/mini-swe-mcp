@@ -1,4 +1,5 @@
-//! Hub daemon: the single long-lived process owning the only [`WorkerPool`].
+//! Hub daemon: the single long-lived process owning the only
+//! [`WorkerPool`](crate::pool::WorkerPool).
 //!
 //! Thin MCP clients dial [`HubPaths::socket`] and speak the same
 //! newline-delimited JSON-RPC the stdio server speaks; every connection is
