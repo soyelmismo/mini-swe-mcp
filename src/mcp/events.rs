@@ -2158,8 +2158,16 @@ impl EventRouter {
                     for (key, value) in current.as_object().into_iter().flatten() {
                         event[key] = value.clone();
                     }
-                    event["time_since_last_step"] =
-                        json!(now.saturating_sub(current["last_step_at"].as_u64().unwrap_or(now)));
+                    // The idle clock is the stall rule's own, not a raw
+                    // subtraction: a worker with a command in flight (a
+                    // harness-side wait such as CONSOLIDATE_WAIT or WAIT_JOB,
+                    // or a live background job) is doing work, so replaying its
+                    // queued stall must not claim seconds of inactivity the
+                    // detector itself would never count.
+                    event["time_since_last_step"] = json!(crate::cli::watch::round_idle_secs(
+                        current,
+                        now
+                    ));
                     event["commands"] = json!(crate::cli::watch::commands(&event));
                 }
                 event["missed"] = json!(initial);

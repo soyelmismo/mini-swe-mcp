@@ -85,8 +85,9 @@ pub use self::round::{RoundManifest, RoundRow, RoundWorker};
 pub use self::runner::RunConfig;
 pub(crate) use self::runner::parse_shortstat;
 pub use self::runner::{
-    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
-    ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig, is_completion_request,
+    COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS,
+    HARNESS_WAIT_PREFIX, REPORT_FOLLOWUP, ReviewMode, SecurityReviewOutcome, WorkerLaunchConfig,
+    is_completion_request,
     opening_task_message, parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
     parse_consolidate_wait, parse_findings, parse_kill_job, parse_report, parse_request_turns,
     parse_wait_job, review_prompt, summarize_command, summary_line,
@@ -1654,7 +1655,7 @@ impl WorkerPool {
         // Name the wait as the command in flight, so `status` shows what the
         // consolidator is actually doing instead of its previous command, and
         // restore the previous label once the wait returns.
-        let wait_label = format!("CONSOLIDATE_WAIT {}", ids.join(" "));
+        let wait_label = format!("{} {}", HARNESS_WAIT_PREFIX, ids.join(" "));
         let previous_command = self.set_running_command(&actor.id, &wait_label).await;
         let deadline = tokio::time::Instant::now() + timeout;
         let mut changes = self.subscribe_changes();
