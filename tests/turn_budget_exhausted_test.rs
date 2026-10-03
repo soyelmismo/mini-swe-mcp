@@ -137,7 +137,8 @@ async fn a_worker_that_runs_out_of_turns_is_exhausted_not_completed() {
         other => panic!("expected Exhausted, got {other:?}"),
     }
     assert!(
-        !matches!(state, WorkerState::Completed { .. }),
+        !matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "running out of turns is not a completion"
     );
     assert_eq!(summary["status"], "Exhausted");
@@ -158,7 +159,8 @@ async fn exhausted_status_list_and_review_read_as_stopped_not_done() {
     let repo = TestRepo::new("render");
     let (pool, id, _scratch) = dispatch_exhausted(&server, repo.path(), 2).await;
     let state = wait_terminal(&pool, &id).await;
-    assert!(matches!(state, WorkerState::Exhausted { .. }));
+    assert!(matches!(state, WorkerState::Exhausted { ..
+    verdicts: None, }));
 
     let mcp = McpServer::new(pool.clone(), "ninja".to_string());
     let ctx = ConnectionContext {
@@ -223,7 +225,8 @@ async fn exhausted_event_rendering_says_stopped_not_done() {
     let repo = TestRepo::new("event");
     let (pool, id, _scratch) = dispatch_exhausted(&server, repo.path(), 2).await;
     let state = wait_terminal(&pool, &id).await;
-    assert!(matches!(state, WorkerState::Exhausted { .. }));
+    assert!(matches!(state, WorkerState::Exhausted { ..
+    verdicts: None, }));
 
     let view = WorkerView {
         worker_id: id.clone(),
@@ -250,7 +253,8 @@ async fn exhausted_worker_is_not_ready_for_the_round_manifest() {
     let repo = TestRepo::new("manifest");
     let (pool, id, _scratch) = dispatch_exhausted(&server, repo.path(), 2).await;
     let state = wait_terminal(&pool, &id).await;
-    assert!(matches!(state, WorkerState::Exhausted { .. }));
+    assert!(matches!(state, WorkerState::Exhausted { ..
+    verdicts: None, }));
 
     let manifest = pool.round_manifest(OWNER, GROUP, repo.path()).await;
     assert!(

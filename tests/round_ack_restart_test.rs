@@ -26,7 +26,8 @@ async fn a_round_acknowledgment_survives_router_restart() {
                 revision: 0,
                 branch: Some("worker-round-worker".into()),
                 verified: Some(true),
-                report: None,
+                report: None
+            verdicts: None,,
             },
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

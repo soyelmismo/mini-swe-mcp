@@ -100,7 +100,8 @@ fn completed_worker(id: &str, diff: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
-            report: None,
+            report: None
+        verdicts: None,,
         },
         metrics: WorkerMetrics::default(),
         logs: LogBuffer::new(),
@@ -370,7 +371,8 @@ async fn review_never_evicts_the_worker_it_reviewed() {
         verified: Some(false),
         metrics: WorkerMetrics::default(),
         revision: 1,
-        report: None,
+        report: None
+    verdicts: None,,
     };
     record.logs.push(AgentStepLog {
         step: 3,

@@ -463,9 +463,11 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(id).await {
             match state {
-                WorkerState::Completed { .. }
+                WorkerState::Completed { ..
+                verdicts: None, }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { .. } => return state,
+                | WorkerState::Exhausted { ..
+                verdicts: None, } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
@@ -477,9 +479,11 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
 /// The revision a payload carries, from whichever terminal state it is in.
 fn payload_revision(state: &WorkerState) -> Option<usize> {
     match state {
-        WorkerState::Completed { revision, .. }
+        WorkerState::Completed { revision, ..
+        verdicts: None, }
         | WorkerState::Failed { revision, .. }
-        | WorkerState::Exhausted { revision, .. } => Some(*revision),
+        | WorkerState::Exhausted { revision, ..
+        verdicts: None, } => Some(*revision),
         WorkerState::Running { .. } | WorkerState::Paused { .. } => None,
     }
 }
@@ -542,7 +546,8 @@ fn three_continuations_number_one_two_three() {
                 verified: None,
                 metrics: WorkerMetrics::default(),
                 revision: 0,
-                report: None,
+                report: None
+            verdicts: None,,
             },
             metrics: WorkerMetrics::default(),
             logs: LogBuffer::new(),

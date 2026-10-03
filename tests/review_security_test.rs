@@ -458,9 +458,11 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
-                WorkerState::Completed { .. }
+                WorkerState::Completed { ..
+                verdicts: None, }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { .. } => return state,
+                | WorkerState::Exhausted { ..
+                verdicts: None, } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
@@ -534,7 +536,8 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
         .expect("the row records the security review");
     assert_eq!(security.findings, Some(2));
 
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&worker_id).await;
@@ -568,7 +571,8 @@ async fn an_insensitive_diff_gets_no_review_phase() {
         review_prompt_of(&server).await.is_none(),
         "no review prompt must be sent"
     );
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&_worker_id).await;
@@ -597,7 +601,8 @@ async fn no_declared_patterns_means_no_trigger() {
         2,
         "write turn and completion, but no trigger"
     );
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&_worker_id).await;
@@ -642,7 +647,8 @@ async fn the_security_suffix_selects_the_adversarial_review() {
     // Nothing sensitive was touched, so the trigger adds no paths.
     assert!(!prompt.contains("declared sensitive"));
 
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&_worker_id).await;
@@ -674,7 +680,8 @@ async fn a_bare_review_after_keeps_the_generic_prompt() {
     assert!(prompt.contains("AUDIT & REVIEW PHASE"));
     assert!(!prompt.contains("ADVERSARIAL"));
 
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&_worker_id).await;
@@ -711,7 +718,8 @@ async fn a_sensitive_diff_upgrades_a_requested_review() {
     assert!(prompt.contains("ADVERSARIAL SECURITY REVIEW PHASE"));
     assert!(prompt.contains("src/hub/mod.rs"));
 
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&_worker_id).await;
@@ -767,7 +775,8 @@ async fn the_reviewer_runs_the_dispatch_verify_command() {
     );
     assert!(!prompt.contains("cargo"));
 
-    let WorkerState::Completed { .. } = &state else {
+    let WorkerState::Completed { ..
+    verdicts: None, } = &state else {
         panic!("worker must complete, got {state:?}")
     };
     let _ = pool.kill(&worker_id).await;

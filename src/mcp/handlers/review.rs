@@ -23,8 +23,12 @@ impl McpServer {
         if state.is_none() && entry.is_none() {
             anyhow::bail!("Worker not found: {wid}");
         }
-        let (summary, verified, state_branch, report) = completed_fields(state.as_ref());
+        let (summary, verified, state_branch, report, verdicts) = completed_fields(state.as_ref());
         let report = report.or_else(|| entry.as_ref().and_then(|entry| entry.report.clone()));
+        // The row carries the round's verdicts like the report, so a
+        // consolidator whose in-memory record was already evicted still says
+        // what it decided about each worker.
+        let verdicts = verdicts.or_else(|| entry.as_ref().and_then(|entry| entry.verdicts.clone()));
         let branch = state_branch.unwrap_or_else(|| format!("worker-{wid}"));
         // The registry row is the only cross-process record of where the
         // worker's repository is and which branch it integrates with.
@@ -121,6 +125,7 @@ impl McpServer {
             "docs": docs_value(&summaries),
             "summary": summary,
             "report": report,
+            "verdicts": verdicts,
             "revision": revision_of(state.as_ref(), entry.as_ref()),
             "branch": branch,
             "merge": merge,
@@ -225,6 +230,7 @@ pub(super) fn completed_fields(
     Option<bool>,
     Option<String>,
     Option<crate::pool::WorkerReport>,
+    Option<crate::pool::WorkerVerdicts>,
 ) {
     match state {
         Some(crate::pool::WorkerState::Completed {
@@ -232,20 +238,29 @@ pub(super) fn completed_fields(
             verified,
             branch,
             report,
+            verdicts,
             ..
         }) => (
             Some(summary.clone()),
             *verified,
             branch.clone(),
             report.clone(),
+            verdicts.clone(),
         ),
         Some(crate::pool::WorkerState::Exhausted {
             summary,
             branch,
             report,
+            verdicts,
             ..
-        }) => (Some(summary.clone()), None, branch.clone(), report.clone()),
-        _ => (None, None, None, None),
+        }) => (
+            Some(summary.clone()),
+            None,
+            branch.clone(),
+            report.clone(),
+            verdicts.clone(),
+        ),
+        _ => (None, None, None, None, None),
     }
 }
 

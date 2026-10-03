@@ -1239,7 +1239,8 @@ fn completed_worker(id: &str) -> WorkerRecord {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
-            report: None,
+            report: None
+        verdicts: None,,
         },
     )
 }

@@ -924,7 +924,8 @@ async fn a_retired_worker_leaves_the_live_list() {
             verified: Some(true),
             metrics: Default::default(),
             report: None,
-            revision: 0,
+            revision: 0
+        verdicts: None,,
         },
         metrics: Default::default(),
         logs: mini_swe_mcp::pool::LogBuffer::new(),
@@ -1092,7 +1093,8 @@ async fn the_mcp_merge_path_forgets_the_retired_workers_acknowledgements() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             report: None,
-            revision: 0,
+            revision: 0
+        verdicts: None,,
         },
         metrics: WorkerMetrics::default(),
         logs: mini_swe_mcp::pool::LogBuffer::new(),
@@ -1243,7 +1245,8 @@ async fn the_mcp_consolidator_merge_retires_its_round_from_every_view() {
                 verified: Some(true),
                 metrics: WorkerMetrics::default(),
                 report: None,
-                revision: 0,
+                revision: 0
+            verdicts: None,,
             },
             metrics: WorkerMetrics::default(),
             logs: mini_swe_mcp::pool::LogBuffer::new(),

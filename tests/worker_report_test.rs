@@ -222,7 +222,8 @@ async fn dispatch_and_wait(
         if let Some(state) = pool.get_worker_state(&worker_id).await
             && matches!(
                 state,
-                WorkerState::Completed { .. } | WorkerState::Failed { .. }
+                WorkerState::Completed { ..
+                verdicts: None, } | WorkerState::Failed { .. }
             )
         {
             return (scratch, pool, worker_id, state);
@@ -477,7 +478,8 @@ fn json_channel_and_watch_events_keep_the_full_report_and_stats() {
         verified: Some(true),
         metrics: WorkerMetrics::default(),
         revision: 0,
-        report: Some(report.clone()),
+        report: Some(report.clone())
+    verdicts: None,,
     };
     let mut view = json!({"worker_id":"json", "task":"probe"});
     watch::enrich_state(&mut view, &state);
@@ -500,7 +502,8 @@ fn json_channel_and_watch_events_keep_the_full_report_and_stats() {
             outcome: mini_swe_mcp::mcp::Outcome {
                 report: Some(report),
                 per_file: mini_swe_mcp::pool::file_stats_of_diff(match &state {
-                    WorkerState::Completed { diff, .. } => diff,
+                    WorkerState::Completed { diff, ..
+                    verdicts: None, } => diff,
                     _ => unreachable!(),
                 }),
                 ..Default::default()
@@ -556,7 +559,8 @@ async fn report_survives_eviction_in_status_review_and_collect() {
                 verified: None,
                 metrics: entry.metrics,
                 revision: 0,
-                report: Some(report.clone()),
+                report: Some(report.clone())
+            verdicts: None,,
             },
             metrics: entry.metrics,
             logs: LogBuffer::new(),

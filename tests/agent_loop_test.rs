@@ -343,9 +343,11 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
     for _ in 0..600 {
         if let Some(state) = pool.get_worker_state(worker_id).await {
             match state {
-                WorkerState::Completed { .. }
+                WorkerState::Completed { ..
+                verdicts: None, }
                 | WorkerState::Failed { .. }
-                | WorkerState::Exhausted { .. } => return state,
+                | WorkerState::Exhausted { ..
+                verdicts: None, } => return state,
                 WorkerState::Running { .. } | WorkerState::Paused { .. } => {}
             }
         }
@@ -362,7 +364,8 @@ async fn wait_for_paused(pool: &WorkerPool, worker_id: &str) -> Option<String> {
         }
         if matches!(
             pool.get_worker_state(worker_id).await,
-            Some(WorkerState::Completed { .. } | WorkerState::Failed { .. })
+            Some(WorkerState::Completed { ..
+            verdicts: None, } | WorkerState::Failed { .. })
         ) {
             return None;
         }
@@ -386,7 +389,8 @@ fn user_messages(request: &Value) -> Vec<String> {
 /// exercise a guard assert on the number the guard moved.
 fn metrics_of(state: &WorkerState) -> WorkerMetrics {
     match state {
-        WorkerState::Completed { metrics, .. } => *metrics,
+        WorkerState::Completed { metrics, ..
+        verdicts: None, } => *metrics,
         other => panic!("expected a completed worker, got {other:?}"),
     }
 }
@@ -463,7 +467,8 @@ async fn implementer_replays_the_unparseable_tool_call_turn_with_its_reasoning()
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     match state {
-        WorkerState::Completed { .. } => {}
+        WorkerState::Completed { ..
+        verdicts: None, } => {}
         other => panic!("worker must complete on the sentinel turn, got {other:?}"),
     }
 
@@ -543,7 +548,8 @@ async fn implementer_replays_a_prose_only_turn_before_the_error_message() {
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
 
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete, got {state:?}"
     );
 
@@ -601,7 +607,8 @@ async fn the_parse_error_quotes_at_most_two_hundred_argument_bytes() {
     let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete, got {state:?}"
     );
 
@@ -655,13 +662,15 @@ async fn reviewer_replays_the_unparseable_turn_with_its_reasoning() {
     .await;
 
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete after review, got {state:?}"
     );
 
     // One counter for the whole worker: the reviewer's turns land on the same
     // run as the implementer's, and a turn the engine refunded is not counted.
-    let WorkerState::Completed { turns, .. } = &state else {
+    let WorkerState::Completed { turns, ..
+    verdicts: None, } = &state else {
         panic!("worker must complete after review, got {state:?}");
     };
     assert_eq!(metrics_of(&state).turns_used, *turns);
@@ -723,7 +732,8 @@ async fn verify_gate_passes_and_worker_completes() {
     .await;
 
     match state {
-        WorkerState::Completed { verified, .. } => {
+        WorkerState::Completed { verified, ..
+        verdicts: None, } => {
             assert_eq!(
                 verified,
                 Some(true),
@@ -759,7 +769,8 @@ async fn verify_gate_fails_then_passes_after_fix_turn() {
     .await;
 
     match state {
-        WorkerState::Completed { verified, .. } => {
+        WorkerState::Completed { verified, ..
+        verdicts: None, } => {
             assert_eq!(
                 verified,
                 Some(true),
@@ -873,7 +884,8 @@ async fn a_repeated_command_is_answered_without_being_executed() {
     let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 5, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete after the repetition, got {state:?}"
     );
 
@@ -969,7 +981,8 @@ async fn three_blocked_repetitions_park_the_worker_for_the_orchestrator() {
     .expect("steer the paused worker");
     let state = wait_for_terminal(&pool, &worker_id).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "the worker must finish once the orchestrator guides it, got {state:?}"
     );
 
@@ -1002,7 +1015,8 @@ async fn a_turn_extension_within_the_budget_extends_the_loop() {
     let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete, got {state:?}"
     );
 
@@ -1045,7 +1059,8 @@ async fn a_turn_extension_beyond_the_budget_is_refused() {
     let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 4, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete on the sentinel turn, got {state:?}"
     );
 
@@ -1093,7 +1108,8 @@ async fn every_twenty_turns_a_dirty_worktree_is_checkpointed() {
     let (_pool, worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 25, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete, got {state:?}"
     );
 
@@ -1222,7 +1238,8 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
     let (_pool, _worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
     assert!(
-        matches!(state, WorkerState::Completed { .. }),
+        matches!(state, WorkerState::Completed { ..
+        verdicts: None, }),
         "worker must complete, got {state:?}"
     );
 
@@ -1284,7 +1301,8 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     let server = ScriptedSseServer::spawn(script).await;
     let (pool, worker_id, state, _scratch) =
         dispatch_and_wait(&server.base_url, repo.path(), 41, None, None).await;
-    assert!(matches!(state, WorkerState::Completed { .. }), "{state:?}");
+    assert!(matches!(state, WorkerState::Completed { ..
+    verdicts: None, }), "{state:?}");
     let requests = server.requests.all().await;
     assert_eq!(requests.len(), 41);
     for request in &requests {

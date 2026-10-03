@@ -926,6 +926,7 @@ mod tests {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             }
             .step(),
             12
@@ -952,6 +953,7 @@ mod tests {
                 metrics: WorkerMetrics::default(),
                 revision: 0,
                 report: None,
+                verdicts: None,
             }
             .step(),
             7

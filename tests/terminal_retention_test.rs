@@ -195,6 +195,7 @@ async fn a_reaped_completed_worker_keeps_its_row_and_history_and_stays_continuab
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 1,
+            verdicts: None,
         },
     ))
     .await;
@@ -294,6 +295,7 @@ async fn collect_answers_from_the_registry_row_after_the_record_is_reaped() {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 1,
+            verdicts: None,
         },
     ))
     .await;
@@ -382,9 +384,11 @@ async fn wait_until_terminal(pool: &WorkerPool, id: &str) -> WorkerState {
         if let Some(state) = pool.get_worker_state(id).await
             && matches!(
                 state,
-                WorkerState::Completed { .. }
+                WorkerState::Completed { ..
+                verdicts: None, }
                     | WorkerState::Failed { .. }
-                    | WorkerState::Exhausted { .. }
+                    | WorkerState::Exhausted { ..
+                    verdicts: None, }
             )
             && !pool.scratch_root().join(format!("swe-wt-{id}")).exists()
         {

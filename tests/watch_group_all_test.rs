@@ -104,7 +104,8 @@ async fn set_completed(pool: &WorkerPool, id: &str) {
             verified: Some(true),
             metrics: WorkerMetrics::default(),
             revision: 0,
-            report: None,
+            report: None
+        verdicts: None,,
         },
     )
     .await;
@@ -757,9 +758,11 @@ async fn set_completed_owned(pool: &WorkerPool, id: &str, owner: &str) {
         verified: Some(false),
         metrics: WorkerMetrics::default(),
         revision: 0,
-        report: None,
+        report: None
+    verdicts: None,,
     };
-    if let WorkerState::Completed { summary, .. } = &mut state {
+    if let WorkerState::Completed { summary, ..
+    verdicts: None, } = &mut state {
         *summary = format!("Owned by {owner}.");
     }
     pool.__test_set_worker_state(id, state).await;
