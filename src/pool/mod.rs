@@ -1646,7 +1646,10 @@ impl WorkerPool {
                 .min(CONSOLIDATE_WAIT_MAX_SECS),
         );
         // Held for the whole wait: the consolidator is running a command as far
-        // as the stall detector is concerned.
+        // as the stall detector is concerned. The mark is stamped once, here,
+        // and the loop below only waits on it -- re-publishing it per
+        // iteration would keep resetting the command's start time, so a wait
+        // of half an hour would still read as `running for 0s`.
         let _running = self.command_running(&actor.id);
         // Name the wait as the command in flight, so `status` shows what the
         // consolidator is actually doing instead of its previous command, and

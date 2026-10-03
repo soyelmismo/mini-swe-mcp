@@ -1194,7 +1194,15 @@ impl<'a> TurnEngine<'a> {
                 } = w.state
                 {
                     *s = *self.step;
-                    *last_command = label.clone();
+                    // A harness-side wait (CONSOLIDATE_WAIT, WAIT_JOB) names
+                    // itself as the command in flight for the whole wait, so
+                    // `status` shows what the worker is doing and the stall
+                    // detector reads the wait as work. This step's own label
+                    // must not overwrite it: the wait is still the command in
+                    // flight until it returns.
+                    if !last_command.starts_with(HARNESS_WAIT_PREFIX) {
+                        *last_command = label.clone();
+                    }
                 }
             })
             .await;
