@@ -1752,3 +1752,51 @@ fn a_queued_stall_does_not_report_a_worker_with_a_command_in_flight() {
         "a worker with a command in flight must not be reported stalled: {round}"
     );
 }
+
+/// PROOF (adversarial): suppressing a stale stall must not destroy the
+/// worker's *other* queued transitions that this same watch does not deliver.
+#[test]
+fn zz_proof_suppressing_a_stall_keeps_other_queued_events() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
+    let mut waiting = idle;
+    waiting["command_started_at"] = json!(now);
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    // A genuine queued transition for the SAME worker that a *paused* status
+    // will not be delivered by: the stall replay path `continue`s on a
+    // non-running status, dropping the event WITHOUT delivering it, yet
+    // mark_seen also wipes it from the backlog. Simulate: the owner asks for
+    // a DIFFERENT group, so neither event is in scope for delivery, but the
+    // suppression still fires for the stall.
+    router.watch_history.get_mut("o").expect("history").pending.push_back(json!({
+        "worker_id": "w0", "owner": "o", "group": "other", "event": "completed",
+        "status": "completed", "step": 5, "revision": 2, "sequence": 99,
+        "verified": true, "branch": "worker-w0",
+        "metrics": WorkerMetrics::default()
+    }));
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    // This watch is scoped to group g, so the `other`-group event is not
+    // matched and never delivered, but the stall IS suppressed+mark_seen.
+    let reply = router
+        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false}))
+        .unwrap();
+    assert_eq!(reply["events"], json!([]), "stall suppressed: {reply}");
+    let left: Vec<String> = router.watch_history["o"]
+        .pending
+        .iter()
+        .map(|v| v["event"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert_eq!(
+        left,
+        vec!["completed".to_string()],
+        "PROBE: an out-of-scope queued completion must survive suppressing a stale stall"
+    );
+}
