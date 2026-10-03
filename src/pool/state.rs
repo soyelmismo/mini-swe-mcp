@@ -128,14 +128,54 @@ impl WorkerReport {
 /// Bounded by construction: at most [`VERDICT_BYTES`] bytes survive, and the
 /// lines are kept in the order the consolidator wrote them, so a reader sees
 /// the same verdicts in the same order they were made.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// It serializes as the flat array of lines a consumer renders (the per-worker
+/// verdicts, then the risks), which is what the notification text shows and
+/// what the compact views carry; the two groups stay available on the value
+/// for code that wants them separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "WorkerVerdictsWire")]
 pub struct WorkerVerdicts {
     /// One `REPORT <id> <verdict>: <line>` per worker, in the written order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<String>,
     /// The consolidator's `RISK:` lines, verbatim, in the written order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub risks: Vec<String>,
+}
+
+/// The on-the-wire shape of a [`WorkerVerdicts`]: one flat array of the lines
+/// a notification shows, which is also the wire shape this type parses back.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum WorkerVerdictsWire {
+    /// The compact views carry the lines as an array.
+    Lines(Vec<String>),
+    /// The two-group form, for a payload that keeps them apart.
+    Grouped {
+        #[serde(default)]
+        workers: Vec<String>,
+        #[serde(default)]
+        risks: Vec<String>,
+    },
+}
+
+impl From<WorkerVerdictsWire> for WorkerVerdicts {
+    fn from(wire: WorkerVerdictsWire) -> Self {
+        match wire {
+            WorkerVerdictsWire::Lines(lines) => {
+                let (workers, risks) = lines
+                    .into_iter()
+                    .partition(|line| !line.starts_with("RISK:"));
+                Self { workers, risks }
+            }
+            WorkerVerdictsWire::Grouped { workers, risks } => Self { workers, risks },
+        }
+    }
+}
+
+impl serde::Serialize for WorkerVerdicts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.lines().serialize(serializer)
+    }
 }
 
 /// Byte budget for the whole of a [`WorkerVerdicts`] payload.
@@ -144,6 +184,10 @@ pub struct WorkerVerdicts {
 /// case that matters: the lines are kept until the budget is spent and the
 /// overflow is dropped with a marker line, never an unbounded registry row.
 pub const VERDICT_BYTES: usize = 4096;
+
+/// Budget held back from [`VERDICT_BYTES`] for the truncation notice, so a
+/// round that hit the ceiling can always say so.
+const TRUNCATION_NOTICE_BYTES: usize = 64;
 
 impl WorkerVerdicts {
     /// Whether the consolidator recorded anything at all.
@@ -171,10 +215,13 @@ impl WorkerVerdicts {
 /// so a truncated round reads as truncated instead of quietly short.
 pub fn parse_verdict_lines(message: &str) -> WorkerVerdicts {
     let mut verdicts = WorkerVerdicts::default();
+    // The notice is charged against the budget from the first line, so a
+    // truncated round can always afford to say that it is truncated.
+    let notice_room = TRUNCATION_NOTICE_BYTES;
     let mut spent = 0usize;
     let mut dropped = 0usize;
     let mut push = |line: String, into: fn(&mut WorkerVerdicts) -> &mut Vec<String>| {
-        if spent + line.len() + 1 > VERDICT_BYTES {
+        if spent + line.len() + 1 > VERDICT_BYTES - notice_room {
             dropped += 1;
             return;
         }
@@ -193,13 +240,11 @@ pub fn parse_verdict_lines(message: &str) -> WorkerVerdicts {
         }
     }
     if dropped > 0 {
-        let marker = format!("... [{dropped} more verdict lines dropped]");
-        // The marker is charged against the same budget as the lines it
-        // replaces: the ceiling is a ceiling, not a target.
-        let room = VERDICT_BYTES.saturating_sub(spent);
-        if marker.len() + 1 <= room {
-            verdicts.risks.push(marker);
-        }
+        // The count is fixed-width so the notice can never itself be the thing
+        // that does not fit.
+        verdicts
+            .risks
+            .push(format!("... [{dropped} more verdict lines dropped]"));
     }
     verdicts
 }
@@ -213,7 +258,7 @@ fn is_risk_line(line: &str) -> bool {
 /// The `RISK:` line without its marker, so every stored risk reads the same way.
 fn risk_line(line: &str) -> String {
     match line.split_once(':') {
-        Some((_, rest)) => format!("RISK:{}", rest.trim_start()),
+        Some((_, rest)) => format!("RISK: {}", rest.trim()),
         None => line.to_string(),
     }
 }
