@@ -115,16 +115,24 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn declared_constants(source: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for line in source.lines() {
-        let line = line.trim();
+        let trimmed = line.trim();
         // A doc comment or prose mentioning a name is not a declaration.
-        if !line.starts_with("const ") && !line.starts_with("pub const ") {
+        if !trimmed.starts_with("const ") && !trimmed.starts_with("pub const ") {
             continue;
         }
-        let Some((name, value)) = line.split_once(": &str = \"") else {
+        // `const NAME_ENV: &str = "VALUE";` — the name is the last token before
+        // the `:`, and the value is the literal right of `= "`. A doc comment
+        // joined to the same logical line is split off by `line`, and a constant
+        // that is not an environment name carries no `_ENV`/`_VAR` suffix, so it
+        // is skipped.
+        let Some((ident, after_colon)) = trimmed.split_once(':') else {
             continue;
         };
-        let (ident, value) = name.rsplit_once(' ').unwrap_or((name, value));
-        let Some(value) = value.split('"').next() else {
+        let ident = ident.split_whitespace().last().unwrap_or(ident);
+        let Some(value) = after_colon
+            .split_once("= \"")
+            .and_then(|(_, v)| v.split('"').next())
+        else {
             continue;
         };
         if ident.ends_with("_ENV") || ident.ends_with("_VAR") {
@@ -181,7 +189,10 @@ fn env_names_read_in(source: &str) -> BTreeSet<String> {
 /// literal.
 fn read_arguments(code: &str) -> Vec<(String, bool)> {
     // Longest first: `env::var_os` also starts with `env::var`.
-    const READERS: &[&str] = &["env_parse", "env::var_os", "env::var"];
+    // Both the crate-local `env::var` and the fully-qualified `std::env::var`
+    // are matched; the search is a prefix, so `std::env::var` also matches the
+    // bare form once `std::env::var` is listed first.
+    const READERS: &[&str] = &["env_parse", "std::env::var_os", "env::var_os", "std::env::var", "env::var"];
     let offsets: Vec<usize> = code
         .char_indices()
         .map(|(index, _)| index)
@@ -192,11 +203,7 @@ fn read_arguments(code: &str) -> Vec<(String, bool)> {
     let mut cursor = 0;
     while cursor + 1 < offsets.len() {
         let start = offsets[cursor];
-        let reader = READERS.iter().find(|reader| {
-            code[start..].starts_with(**reader)
-                // A bare `var` is not the read: it must be `env::var`.
-                && (***reader != *"var" || code[..start].ends_with("env::"))
-        });
+        let reader = READERS.iter().find(|reader| code[start..].starts_with(**reader));
         let Some(reader) = reader else {
             cursor += 1;
             continue;
@@ -226,7 +233,11 @@ fn read_arguments(code: &str) -> Vec<(String, bool)> {
             .find([')', ','])
             .map(|offset| open + 1 + offset)
             .unwrap_or(bytes.len());
-        out.push((code[open + 1..end].to_string(), true));
+        let argument = code[open + 1..end].trim();
+        // A quoted string literal is a name written inline; a bare token is a
+        // `*_ENV` / `*_VAR` constant resolved through `declared_constants`.
+        let quoted = argument.starts_with('"') && argument.ends_with('"');
+        out.push((argument.to_string(), quoted));
         cursor = offsets
             .iter()
             .position(|offset| *offset >= end)
@@ -331,5 +342,38 @@ fn debug_consts() {
     for f in ["src/agent/exec.rs","src/hub/auto_handover.rs","src/agent/jobs.rs"] {
         let src = std::fs::read_to_string(root.join(f)).unwrap();
         println!("{f}: {:?}", declared_constants(&src));
+    }
+}
+
+#[test]
+fn debug_names() {
+    let r = read_names_by_file();
+    for n in ["MINI_SWE_EXEC_LANDLOCK_PROBE","LANDLOCK_PROBE_ENV","MINI_SWE_FAKE_VERSION"] {
+        println!("{n} => {}", r.get(n).map(|v|v.join(",")).unwrap_or_default());
+    }
+}
+
+#[test]
+fn debug_const2() {
+    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
+    let c = declared_constants(&src);
+    println!("MINI_SWE_EXEC_LANDLOCK_PROBE resolved: {:?}", c.get("LANDLOCK_PROBE_ENV"));
+}
+
+#[test]
+fn debug_landlock() {
+    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
+    println!("consts: {:?}", declared_constants(&src).keys().collect::<Vec<_>>());
+    let names = env_names_read_in(&src);
+    println!("names has landlock probe: {}", names.contains("MINI_SWE_EXEC_LANDLOCK_PROBE"));
+}
+
+#[test]
+fn debug_args() {
+    let src = std::fs::read_to_string(repo_root().join("src/agent/exec.rs")).unwrap();
+    for (a, q) in read_arguments(&src) {
+        if a.contains("LANDLOCK") || a.contains("PROBE") {
+            println!("arg={a:?} quoted={q}");
+        }
     }
 }
