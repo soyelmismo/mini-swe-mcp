@@ -415,7 +415,7 @@ fn a_worker_whose_content_is_absent_is_refused() {
 
     let reported = unintegrated_workers_in(&f.root(), "c1");
     assert_eq!(reported.len(), 1, "the new commit must be reported");
-    assert_eq!(reported[0].commits, 1);
+    assert_eq!(reported[0].commits, Some(1));
     let err = f
         .merge("c1", false)
         .expect_err("a member holding unintegrated work must refuse the round");
@@ -445,7 +445,7 @@ fn consolidator_completion_reports_the_unintegrated_member() {
     let reported = unintegrated_workers_in(&f.root(), "c1");
     assert_eq!(reported.len(), 1, "the revised member must be reported");
     assert_eq!(reported[0].worker_id, "wa");
-    assert_eq!(reported[0].commits, 1);
+    assert_eq!(reported[0].commits, Some(1));
     let line = reported[0].line();
     assert!(
         line.contains("wa") && line.contains("UNINTEGRATED"),
@@ -516,5 +516,35 @@ fn the_approved_batch_lands_a_round_whose_members_are_integrated() {
     assert!(
         f.repo().join("round.md").exists() && f.repo().join("wa.md").exists(),
         "the batch must land the whole round"
+    );
+}
+
+/// A probe git cannot answer is not proof that a member is integrated: the
+/// harness holds the round back with an unknown count rather than reading a
+/// failed question as "nothing unintegrated".
+#[test]
+fn a_probe_git_cannot_answer_is_not_read_as_integrated() {
+    let f = Fixture::new("round-unprobeable");
+    f.consolidator("c1", &["wa"]);
+    // The round's own branch is gone, so every probe about it -- ancestry, the
+    // content proof, the commit count -- has no answer to give. The member's
+    // work is still not provably on the round.
+    git(f.repo(), &["branch", "-D", "worker-c1"]);
+
+    let reported = unintegrated_workers_in(&f.root(), "c1");
+    assert_eq!(
+        reported.len(),
+        1,
+        "an unprovable round must not read as an integrated one: {reported:?}"
+    );
+    assert_eq!(reported[0].worker_id, "wa");
+    assert_eq!(
+        reported[0].commits, None,
+        "an uncountable member must report no count, never a zero"
+    );
+    assert!(
+        !reported[0].line().contains("0 commit"),
+        "an unknown count must not be rendered as none: {}",
+        reported[0].line()
     );
 }

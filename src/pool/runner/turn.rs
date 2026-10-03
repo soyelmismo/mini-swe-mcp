@@ -2533,11 +2533,18 @@ impl<'a> TurnEngine<'a> {
             // reviewed. One line per worker, counted, charged to the verdict
             // budget as the harness's own -- a padded report cannot decide
             // whether the operator is told.
-            verdicts.push_risks_bounded(
-                crate::pool::unintegrated_workers_in(&self.pool.scratch, self.worker_id)
-                    .iter()
-                    .map(|worker| worker.line()),
-            );
+            //
+            // The proof is git subprocesses, one per round member, so it runs
+            // off the runtime thread like every other blocking probe in this
+            // engine: a big round must not stall the workers sharing it.
+            let root = self.pool.scratch.clone();
+            let worker_id = self.worker_id.to_string();
+            let unintegrated = tokio::task::spawn_blocking(move || {
+                crate::pool::unintegrated_workers_in(&root, &worker_id)
+            })
+            .await
+            .unwrap_or_default();
+            verdicts.push_risks_bounded(unintegrated.iter().map(|worker| worker.line()));
             if !verdicts.is_empty() {
                 *self.verdicts = Some(verdicts);
                 self.meta.verdicts = self.verdicts.clone();

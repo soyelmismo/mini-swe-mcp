@@ -24,9 +24,12 @@
 //!   records the workers it merged *at that moment*; a worker revised afterwards
 //!   commits again on its own branch, so the round the orchestrator is about to
 //!   merge is no longer the round the consolidator integrated. Every member is
-//!   re-proved against the consolidator's own branch before the merge, and a
-//!   member whose tip is not an ancestor refuses the merge by name and by
-//!   unintegrated commit count -- `merge --force` is the only way past it.
+//!   re-proved against the consolidator's own branch before the merge -- by
+//!   `merge <consolidator>` and by the `--approved` batch alike -- and a member
+//!   whose tip is not an ancestor refuses the merge by name and by unintegrated
+//!   commit count. `merge --force` is the only way past it. A probe that fails
+//!   to prove integration reports the member too: "cannot be proved" is never
+//!   read as "integrated".
 //!
 //! The gate itself is deliberately the same command the worker ran -- the one
 //! its dispatch named, or the auto-detected one -- replayed verbatim; nothing
@@ -937,17 +940,21 @@ fn cleanup(
 pub struct UnintegratedWorker {
     /// The worker id, as the orchestrator names it.
     pub worker_id: String,
-    /// Commits on `worker-<id>` the consolidator branch does not contain.
-    pub commits: usize,
+    /// Commits on `worker-<id>` the consolidator branch does not contain, or
+    /// `None` when git could not count them -- which is "unproven", not
+    /// "none".
+    pub commits: Option<usize>,
 }
 
 impl UnintegratedWorker {
     /// The one line a completion event and the orchestrator's `watch` show.
     pub fn line(&self) -> String {
         format!(
-            "UNINTEGRATED worker {}: {} commit(s) on worker-{} never reached the round; the \
+            "UNINTEGRATED worker {}: {} on worker-{} never reached the round; the \
              round does not carry this work",
-            self.worker_id, self.commits, self.worker_id
+            self.worker_id,
+            commit_phrase(self.commits),
+            self.worker_id
         )
     }
 }
@@ -982,8 +989,22 @@ pub fn unintegrated_workers_in(root: &ScratchRoot, worker_id: &str) -> Vec<Unint
 struct Unintegrated {
     /// The worker id, as the orchestrator names it.
     worker_id: String,
-    /// Commits on `worker-<id>` that the consolidator branch does not contain.
-    commits: usize,
+    /// Commits on `worker-<id>` that the consolidator branch does not contain,
+    /// or `None` when git could not count them. `None` is "unproven", never
+    /// "none": a member the harness cannot put a number on still holds the
+    /// round back.
+    commits: Option<usize>,
+}
+
+/// How many commits a member is holding back, worded for a refusal.
+///
+/// `None` says the count is unknown rather than printing a zero the orchestrator
+/// would read as "this worker is clean".
+fn commit_phrase(commits: Option<usize>) -> String {
+    match commits {
+        Some(count) => format!("{count} unintegrated commit(s)"),
+        None => "unintegrated commits git could not count".to_string(),
+    }
 }
 
 /// The round members of `branch` whose own tip did not reach it.
@@ -1004,12 +1025,14 @@ struct Unintegrated {
 /// the second proof is the one that matters, and it is checked whenever
 /// ancestry fails.
 ///
-/// A member that cannot be probed is *not* reported. No branch (already pruned
-/// or never created) means there is nothing left to integrate, and a repository
-/// that refuses the probe cannot be asked about any of its refs; both answer
-/// "integrated" so a broken probe never blocks an unrelated merge. A member
-/// that is reported is reported with its unintegrated commit count, so the
-/// orchestrator can see how much work is at stake before deciding.
+/// A member with no branch at all (already pruned, or never created) is not
+/// reported: there is nothing left to integrate, so it cannot be holding the
+/// round back. Every *other* failure to prove integration -- git that will not
+/// answer, a ref it cannot resolve -- reports the member instead of waving it
+/// through: this check's whole value is that "the round matches its record" is
+/// proved, so a probe that failed to prove it must not read as proof. A
+/// reported member carries its unintegrated commit count where git can give
+/// one, so the orchestrator can see how much work is at stake before deciding.
 fn unintegrated_members(
     root: &ScratchRoot,
     repo: &Path,
@@ -1022,10 +1045,23 @@ fn unintegrated_members(
     let mut unintegrated = Vec::new();
     for id in &row.integrated {
         let member = format!("worker-{id}");
+        let mut report = |commits: Option<usize>| {
+            unintegrated.push(Unintegrated {
+                worker_id: id.clone(),
+                commits,
+            });
+        };
         // No branch means nothing left to integrate: the worker was already
         // merged or its branch pruned, so it cannot be holding back the round.
-        if !branch_exists(repo, &member).unwrap_or(false) {
-            continue;
+        // A branch the probe cannot answer for is not the same thing: nothing
+        // was proved, so it holds the round back with an unknown count.
+        match branch_exists(repo, &member) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(_) => {
+                report(None);
+                continue;
+            }
         }
         match is_ancestor(repo, &member, branch) {
             // Contained: whatever the member carries is already in the branch
@@ -1034,20 +1070,19 @@ fn unintegrated_members(
             // Not reachable, which is not yet proof of absence: the round may
             // have been integrated by content rather than by history.
             Ok(false) => {}
-            // An unprobeable repository is not evidence of lost work.
-            Err(_) => continue,
+            // Git could not answer whether the tip is in the round, so nothing
+            // was proved and the round is not known to match its record.
+            Err(_) => {
+                report(None);
+                continue;
+            }
         }
         // The content proof. A tree that merges to no change is a round that
         // already carries this worker, however it got there.
         if tree_already_in(repo, branch, &member) {
             continue;
         }
-        if let Some(count) = unintegrated_commit_count(repo, &member, branch) {
-            unintegrated.push(Unintegrated {
-                worker_id: id.clone(),
-                commits: count,
-            });
-        }
+        report(unintegrated_commit_count(repo, &member, branch));
     }
     unintegrated
 }
@@ -1126,8 +1161,9 @@ fn unintegrated_refusal(consolidator: &str, unintegrated: &[Unintegrated]) -> St
         .iter()
         .map(|worker| {
             format!(
-                "worker {} carries {} unintegrated commit(s)",
-                worker.worker_id, worker.commits
+                "worker {} carries {}",
+                worker.worker_id,
+                commit_phrase(worker.commits)
             )
         })
         .collect();
