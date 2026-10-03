@@ -73,7 +73,7 @@ impl ModelManifest {
 /// conversation, so both the implementer loop and the review phase get identical
 /// treatment (they previously both passed the static prompt straight to
 /// `ChatMessage::text`). Both sources are read from disk on every build — never
-/// memoized, see [`super::instructions`] and [`super::memory`] — so an edit made
+/// memoized, see `super::instructions` and `super::memory` — so an edit made
 /// between dispatches is visible to the very next one.
 ///
 /// Returns the static prompt **unchanged** when the repository has no

@@ -120,7 +120,7 @@ fn isolation_block(output: &str) -> Option<(&'static str, String)> {
 
 /// Turns between automatic checkpoint commits, so work left behind by a kill
 /// or a crash is never more than this old.
-const AUTO_CHECKPOINT_TURNS: usize = 20;
+pub(super) const AUTO_CHECKPOINT_TURNS: usize = 20;
 
 /// Cap on the assistant text scanned for a REPORT block. A block is at most the
 /// four [`REPORT_FIELD_BYTES`] fields plus the command that carries it, so the
@@ -2014,6 +2014,12 @@ impl<'a> TurnEngine<'a> {
     /// Commit whatever the worker has uncommitted, so a kill or a crash never
     /// costs more than one checkpoint interval of work.
     ///
+    /// The commit empties the working tree, so a bare `git diff` afterwards
+    /// shows nothing and reads as "my edits are gone" — the failure worker
+    /// affab410 spent turns re-checking. The commit therefore tells the model
+    /// how many files went in and names the base commit it can diff against to
+    /// see the whole change set.
+    ///
     /// `commit_changes` shells out to git, so it runs off the runtime thread.
     async fn checkpoint(&mut self) {
         let message = format!(
@@ -2032,6 +2038,14 @@ impl<'a> TurnEngine<'a> {
         match committed {
             Ok(Some(kept)) => {
                 self.worktree.preserve_branch = true;
+                let files = self.changed_file_count().await;
+                self.push_message(ChatMessage::text(
+                    Role::User,
+                    format!(
+                        "Checkpoint committed ({files} files); your full change set: `git diff {base}`.",
+                        base = self.worktree.base_commit,
+                    ),
+                ));
                 info!(
                     worker = %self.worker_id,
                     step = *self.step,
@@ -2047,6 +2061,34 @@ impl<'a> TurnEngine<'a> {
                 "Checkpoint commit failed; the worktree still holds uncommitted changes"
             ),
         }
+    }
+
+    /// Number of files this worker's whole change set touches, counted against
+    /// its base commit so the checkpoint commits along the way count too.
+    ///
+    /// `None` when git could not answer, and the notice then says "0 files"
+    /// rather than claiming the change set is empty.
+    async fn changed_file_count(&self) -> usize {
+        let path = self.worktree.path.clone();
+        let base = self.worktree.base_commit.clone();
+        let base_branch = self.worktree.base_branch.clone();
+        tokio::task::spawn_blocking(move || {
+            let base = WorktreeGuard::diff_base_at(&path, &base, base_branch.as_deref())
+                .unwrap_or_else(|_| "HEAD".to_string());
+            let _ = git(&path, "add -N", &["add", "-N", "."]);
+            let Ok(output) = git(&path, "diff --name-only", &["diff", "--name-only", &base]) else {
+                return 0;
+            };
+            if !output.status.success() {
+                return 0;
+            }
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .await
+        .unwrap_or(0)
     }
 
     /// Persist the conversation at an auto-checkpoint, so a killed hub leaves a

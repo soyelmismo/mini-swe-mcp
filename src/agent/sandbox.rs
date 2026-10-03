@@ -438,7 +438,7 @@ const COMMAND_WRAPPERS: &[&str] = &[
 ///
 /// Pure and table-driven: the command is split on shell operators, each
 /// segment's program is resolved past wrappers and `VAR=value` assignments,
-/// and the answer is a lookup in [`HEAVY_TOOLS`]. No environment or
+/// and the answer is a lookup in `HEAVY_TOOLS`. No environment or
 /// filesystem access, so the classification is deterministic and testable.
 pub fn is_heavy_command(command: &str) -> bool {
     command.split(['\n', ';', '|', '&']).any(segment_is_heavy)
@@ -2566,7 +2566,7 @@ const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 /// multi-threaded server, where only async-signal-safe operations are allowed.
 /// Building the instruction vector allocates, so the whole program is
 /// assembled here and the child is left with a pointer to a live `Vec` plus
-/// one `seccomp(2)` call - see [`SeccompFilter::apply`].
+/// one `seccomp(2)` call - see `SeccompFilter::apply`.
 #[derive(Clone)]
 pub struct SeccompFilter {
     /// Classic-BPF instructions, in execution order.

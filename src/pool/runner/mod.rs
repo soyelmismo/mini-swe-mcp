@@ -36,7 +36,8 @@ pub use self::context_pack::{
 use self::review::ReviewPhase;
 pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review_prompt};
 use self::turn::{
-    LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
+    AUTO_CHECKPOINT_TURNS, LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome,
+    shortstat_of,
 };
 use super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::revision::{WorkerHistory, append_history_message_in};
@@ -159,19 +160,37 @@ impl Drop for JobGuard<'_> {
 }
 
 /// The worker's opening user message: the task, then -- when a completion
-/// verify is configured -- the exact command the gate will run, then the
-/// bounded context pack ([`context_pack`]) built from the task text against
-/// `root` (the worker's checkout).
+/// verify is configured -- the exact command the gate will run, then the base
+/// commit and how to see the whole change set against it, then the bounded
+/// context pack ([`context_pack`]) built from the task text against `root`
+/// (the worker's checkout).
 ///
 /// The gate reuses an identical passing run on an unchanged tree (see
 /// `TurnEngine::reusable_verify_step`), but only when the worker ran exactly
 /// the verify string. Naming it here is what lets the worker's own last check
 /// be the run the gate reuses instead of paying for a second full run.
-pub fn opening_task_message(task: &str, verify: Option<&str>, root: &std::path::Path) -> String {
+///
+/// The base commit line is load-bearing: the harness commits a checkpoint of
+/// the worker's uncommitted changes every [`AUTO_CHECKPOINT_TURNS`](super::turn::AUTO_CHECKPOINT_TURNS)
+/// steps, so a bare `git diff` is empty after the first checkpoint and a model
+/// that reads it as "my edits are gone" spends its remaining turns re-checking
+/// and re-applying them. `base_commit` empty (git could not answer) leaves the
+/// line out rather than naming a base that does not exist.
+pub fn opening_task_message(
+    task: &str,
+    verify: Option<&str>,
+    base_commit: &str,
+    root: &std::path::Path,
+) -> String {
     let mut message = format!("TASK:\n{task}\n\nBegin by exploring the repository.");
     if let Some(verify) = verify.filter(|v| !v.is_empty()) {
         message.push_str(&format!(
             "\n\nCompletion gate: `{verify}`. Run exactly this command as your last check; an identical passing run on the same tree is reused."
+        ));
+    }
+    if let Some(base) = Some(base_commit).filter(|b| !b.trim().is_empty()) {
+        message.push_str(&format!(
+            "\n\nBase commit: `{base}`. The harness commits a checkpoint of your work every {AUTO_CHECKPOINT_TURNS} steps, so `git diff` alone shows only what changed since the last checkpoint: use `git diff {base}` to see your whole change set."
         ));
     }
     // The bounded context pack: the paths the task names and the symbols it
@@ -315,7 +334,12 @@ impl WorkerPool {
                 ChatMessage::text(Role::System, system_prompt),
                 ChatMessage::text(
                     Role::User,
-                    opening_task_message(&task, verify.as_deref(), &worktree.path),
+                    opening_task_message(
+                        &task,
+                        verify.as_deref(),
+                        &worktree.base_commit,
+                        &worktree.path,
+                    ),
                 ),
             ],
         };

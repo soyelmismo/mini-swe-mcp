@@ -145,87 +145,60 @@ pub fn rotated_path(dir: &Path) -> PathBuf {
     dir.join(ARCHIVE_ROTATED_FILE)
 }
 
-/// `<dir>/archive.lock`, whose exclusive `flock` serializes concurrent appends
-/// so that a rotation by one writer never displaces lines another writer just
-/// appended.
+/// The hub directory itself, locked exclusively for one archive write.
 ///
-/// The lock is advisory and released on drop or process exit. A lock file that
-/// cannot be opened (a planted symlink, for instance) makes the append proceed
-/// without the lock — the report must never be dropped because of a lock.
-pub const ARCHIVE_LOCK_FILE: &str = "archive.lock";
-
-pub fn archive_lock_path(dir: &Path) -> PathBuf {
-    dir.join(ARCHIVE_LOCK_FILE)
-}
-
-/// The exclusive `flock` held for one whole append, released on drop.
-struct AppendGuard {
-    file: std::fs::File,
-}
-
-impl Drop for AppendGuard {
-    fn drop(&mut self) {
-        // SAFETY: unlocking the same fd this guard locked.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-/// Take the exclusive blocking `flock` on the archive lock file.
+/// Rotation is a check-then-act over state every writer shares: a writer
+/// measures the live generation, renames it over the rotated one, then appends
+/// to the fresh file. Two writers that both measure past the cap can each run
+/// that rename in turn, and every rename displaces the rotated generation the
+/// previous writer just produced -- silently dropping the lines appended
+/// between the two. `O_APPEND` alone cannot prevent it: it makes each *write*
+/// atomic, not the measure-rename-write sequence around it.
 ///
-/// Returns `None` when the lock file cannot be opened (e.g. a planted symlink
-/// at that path) — the caller must proceed without the lock rather than drop
-/// the report. The lock is blocking, so concurrent callers wait their turn.
-fn acquire_append_lock(dir: &Path) -> Option<AppendGuard> {
-    let path = archive_lock_path(dir);
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "Could not open archive lock; appending without serialization"
-            );
+/// The directory is the one object every writer already names, no rename can
+/// displace, and nothing else in the hub locks, so an exclusive `flock` on it
+/// serializes the whole sequence -- across the threads of this process and
+/// across any other process writing the same hub. The lock is advisory and
+/// best-effort by design: a directory that cannot be locked (a host without
+/// `flock`, a directory this process may only read) still appends, because
+/// losing the lock must not cost the report; it only narrows the window back
+/// to what an unlocked writer had. The guard releases on drop, so an error in
+/// the append never leaves the directory locked behind it.
+struct ArchiveDirLock {
+    _file: std::fs::File,
+}
+
+impl ArchiveDirLock {
+    /// Lock `dir` exclusively, blocking until the current writer is done.
+    /// `None` when the lock cannot be taken, which the caller treats as
+    /// "append anyway".
+    fn acquire(dir: &Path) -> Option<Self> {
+        let file = std::fs::File::open(dir).ok()?;
+        // SAFETY: `flock` reads only the live descriptor and integer flags.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return None;
         }
-    };
-    // SAFETY: flock reads the live fd and an integer flag; no pointers.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(
-            path = %path.display(),
-            error = %error,
-            "Could not lock archive lock; appending without serialization"
-        );
-        return None;
+        Some(Self { _file: file })
     }
-    Some(AppendGuard { file })
+}
+
+impl Drop for ArchiveDirLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock` reads only the live descriptor and integer flags.
+        // The descriptor is closed right after, by `File`'s own drop.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Append one record to `<dir>/archive.jsonl`, rotating it first if the line
 /// would carry the file past [`ARCHIVE_MAX_BYTES`].
 ///
-/// An exclusive `flock` on `<dir>/archive.lock` serializes the whole
-/// measure→rotate→append sequence so that a rotation by one writer never
-/// displaces lines another writer just appended. The lock is released as soon
-/// as the byte lands. A lock file that cannot be opened (a planted symlink, for
-/// instance) makes the append proceed without the lock — the report must never
-/// be dropped because of a lock.
-///
-/// `O_APPEND` keeps concurrent retirements from overwriting each other's line:
-/// the append is atomic in the kernel. A line that does not fit at all is still
-/// written -- capping the file is not a reason to lose the only copy of a
-/// report -- so the file is bounded by [`ARCHIVE_MAX_BYTES`] plus the longest
-/// single line.
+/// Concurrent retirements are safe: the whole measure-rename-append sequence
+/// runs under [`ArchiveDirLock`], and the append itself is `O_APPEND`, so one
+/// writer's rotation can never displace a generation another writer's lines
+/// are still landing in. A line that does not fit at all is still written --
+/// capping the file is not a reason to lose the only copy of a report -- so
+/// the file is bounded by [`ARCHIVE_MAX_BYTES`] plus the longest single line.
 pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     let mut line = serde_json::to_string(record).context("archive record did not serialize")?;
     line.push('\n');
@@ -234,9 +207,7 @@ pub fn append_record(dir: &Path, record: &ArchiveRecord) -> Result<()> {
     // that does not exist yet would make the rename fail and lose the report on
     // the very call meant to keep it.
     ensure_dir(dir)?;
-    // Serialize with every other concurrent writer: the measure, the rename
-    // and the append must be atomic as a group, not just the append alone.
-    let _lock = acquire_append_lock(dir);
+    let _lock = ArchiveDirLock::acquire(dir);
     // Rotation before the open: the rename and the append cannot interleave
     // into the same file, so the rotated generation is always a whole file.
     //
