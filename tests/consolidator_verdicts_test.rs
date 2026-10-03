@@ -583,3 +583,90 @@ async fn a_consolidator_run_stores_its_verdicts_on_the_state_and_the_row() {
         Some("integrated 2 branches, gate green"),
     );
 }
+
+/// A verdict the harness acts on and a verdict it displays must be the same
+/// line. The absorption path already peels markdown before reading a verdict
+/// (`parse_consolidator_verdicts`), so a consolidator that wraps its verdicts
+/// in a bullet has its workers absorbed; without the same peel on the recorded
+/// path the round then displays as having decided nothing about them.
+#[test]
+fn a_markdown_wrapped_verdict_is_shown_as_the_harness_read_it() {
+    let message = [
+        "REPORT",
+        "done: integrated 1 branch",
+        "risks: none",
+        "- REPORT 2a9aaca3 fixed: applied the correction on its branch",
+        "> REPORT 41b0fde1 approved: the parser change stands",
+    ]
+    .join("\n");
+
+    let verdicts = parse_verdict_lines(&message);
+    assert_eq!(
+        verdicts.workers,
+        vec![
+            "REPORT 2a9aaca3 fixed: applied the correction on its branch".to_string(),
+            "REPORT 41b0fde1 approved: the parser change stands".to_string(),
+        ],
+        "a bullet or a quote is markdown, not part of the verdict: {verdicts:?}"
+    );
+
+    // Each stored line is the bare verdict line, so re-reading the recorded
+    // payload yields the same verdicts: what the round displays is what a
+    // consumer can act on, not markdown it has to strip again.
+    let text = completion_event(Some(verdicts));
+    for line in [
+        "REPORT 2a9aaca3 fixed: applied the correction on its branch",
+        "REPORT 41b0fde1 approved: the parser change stands",
+    ] {
+        assert!(
+            text.lines().any(|shown| shown == line),
+            "the completion event shows the bare verdict line: {text}"
+        );
+    }
+}
+
+
+/// The budget is a property of the type, not only of the parser that builds
+/// it. A registry row is plain JSON in a directory another local user can
+/// write, so an oversized array read back off disk must be bounded exactly like
+/// one written by a run -- otherwise the promise the type makes ("at most
+/// `VERDICT_BYTES` survive", "never an unbounded registry row") holds on only
+/// one of the two paths.
+#[test]
+fn an_oversized_row_is_bounded_when_it_is_read_back() {
+    let huge: Vec<String> = (0..2_000)
+        .map(|i| format!("REPORT w{i:05} approved: {}", "y".repeat(400)))
+        .collect();
+
+    let row = serde_json::json!({
+        "id": "c-huge",
+        "pid": 1,
+        "task": "integrate the round",
+        "model": "test-model",
+        "status": "completed",
+        "step": 3,
+        "max_turns": 8,
+        "last_command": "cargo test",
+        "started_at": 1,
+        "updated_at": 2,
+        "verdicts": huge,
+    });
+    let entry: mini_swe_mcp::pool::WorkerRegistryEntry =
+        serde_json::from_value(row).expect("the row parses");
+    let verdicts = entry.verdicts.expect("the row carries verdicts");
+
+    let rendered: usize = verdicts.lines().iter().map(|line| line.len() + 1).sum();
+    assert!(
+        rendered <= VERDICT_BYTES,
+        "a read-back row stays inside the budget: {rendered} > {VERDICT_BYTES}"
+    );
+    // Bounded is not silent: the reader is told lines went missing.
+    assert!(
+        verdicts
+            .lines()
+            .iter()
+            .any(|line| line.contains("verdict lines dropped")),
+        "a truncated row says so: {:?}",
+        verdicts.lines()
+    );
+}

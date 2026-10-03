@@ -160,6 +160,11 @@ enum WorkerVerdictsWire {
 
 impl From<WorkerVerdictsWire> for WorkerVerdicts {
     fn from(wire: WorkerVerdictsWire) -> Self {
+        // The budget is enforced on the way *in* as well as on the way out: a
+        // registry row is plain JSON in a directory another local user can
+        // write, and the type promises at most `VERDICT_BYTES` survive. Without
+        // this an oversized array off disk is read whole and rendered whole
+        // into the completion event, the review payload and every watch view.
         match wire {
             WorkerVerdictsWire::Lines(lines) => {
                 let (workers, risks) = lines
@@ -170,6 +175,38 @@ impl From<WorkerVerdictsWire> for WorkerVerdicts {
             WorkerVerdictsWire::Grouped { workers, risks } => Self { workers, risks },
         }
     }
+}
+
+/// Charge `workers` then `risks` against [`VERDICT_BYTES`], dropping whatever
+/// does not fit and naming the count, exactly as [`parse_verdict_lines`] does
+/// when the value is built. One rule, so a stored payload and a read-back one
+/// are bounded the same way.
+#[allow(dead_code)]
+fn bounded(workers: Vec<String>, risks: Vec<String>) -> WorkerVerdicts {
+    let mut out = WorkerVerdicts::default();
+    // Charged from the first line, so a truncated payload can still afford the
+    // notice that says it is truncated.
+    let mut spent = 0usize;
+    let mut dropped = 0usize;
+    let mut push = |line: String, into: fn(&mut WorkerVerdicts) -> &mut Vec<String>| {
+        if spent + line.len() + 1 > VERDICT_BYTES - TRUNCATION_NOTICE_BYTES {
+            dropped += 1;
+            return;
+        }
+        spent += line.len() + 1;
+        into(&mut out).push(line);
+    };
+    for line in workers {
+        push(line, |v| &mut v.workers);
+    }
+    for line in risks {
+        push(line, |v| &mut v.risks);
+    }
+    if dropped > 0 {
+        out.risks
+            .push(format!("... [{dropped} more verdict lines dropped]"));
+    }
+    out
 }
 
 impl serde::Serialize for WorkerVerdicts {
@@ -229,14 +266,19 @@ pub fn parse_verdict_lines(message: &str) -> WorkerVerdicts {
         into(&mut verdicts).push(line);
     };
     for line in message.lines() {
-        let line = line.trim();
+        // The same peel the authoritative verdict parser applies, so a line the
+        // harness absorbed a worker on is the line the round displays. A
+        // consolidator that wraps its verdicts in a markdown bullet is read
+        // identically by both, and a round never renders as having no verdicts
+        // for the workers it did act on.
+        let line = crate::pool::runner::strip_markup(line);
         if line.is_empty() {
             continue;
         }
-        if is_risk_line(line) {
-            push(risk_line(line), |v| &mut v.risks);
-        } else if is_per_worker_verdict(line) {
-            push(line.to_string(), |v| &mut v.workers);
+        if is_risk_line(&line) {
+            push(risk_line(&line), |v| &mut v.risks);
+        } else if is_per_worker_verdict(&line) {
+            push(line, |v| &mut v.workers);
         }
     }
     if dropped > 0 {

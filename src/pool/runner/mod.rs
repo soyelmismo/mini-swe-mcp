@@ -50,6 +50,8 @@ mod sentinels;
 mod turn;
 pub(crate) use self::turn::parse_shortstat;
 
+pub(crate) use self::sentinels::strip_markup;
+
 pub use self::sentinels::{
     COMPLETION_SENTINEL, CONSOLIDATE_WAIT_DEFAULT_SECS, CONSOLIDATE_WAIT_MAX_SECS, REPORT_FOLLOWUP,
     is_completion_request, parse_ask_orchestrator, parse_consolidate_merge,
