@@ -72,6 +72,8 @@ defect, not a style one; the section is parsed as one glob per line.
 
 ## Sensitive paths
 
+- AGENTS.md
+- CLAUDE.md
 - src/hub/**
 - src/agent/sandbox*
 - src/agent/exec*

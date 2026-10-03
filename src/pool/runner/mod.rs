@@ -35,7 +35,7 @@ pub use self::review::{ReviewMode, SecurityReviewOutcome, parse_findings, review
 use self::turn::{
     LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOutcome, shortstat_of,
 };
-use super::registry::{RegistryStatus, WorkerMeta};
+use super::registry::{RegistryStatus, WorkerMeta, WorkerRole};
 use super::revision::{WorkerHistory, append_history_message_in};
 use super::state::{TURN_BUDGET_EXHAUSTED, WorkerState};
 use super::steer::remove_steer_file_in;
@@ -447,6 +447,10 @@ impl WorkerPool {
                 label_prefix: "",
                 steer_prefix: "STEER / ORCHESTRATOR GUIDANCE:\n",
                 apply_sentinels: true,
+                // A consolidator reviews, merges, steers and waits; it is not
+                // paid to edit, so the read-only escalation would pause it for
+                // doing its job. An ordinary implementer keeps the guard.
+                read_only_exempt: meta.role == WorkerRole::Consolidate,
                 llm_error_policy: LlmErrorPolicy::PauseForOrchestrator,
                 status: RegistryStatus::Running,
                 model: &model,
