@@ -9,16 +9,25 @@
 //! is handled. Those four knobs live in [`TurnConfig`]; everything else is
 //! shared here so the two loops cannot drift.
 //!
-//! The engine also carries the four guards that keep a worker honest, all of
-//! them stateless per turn and driven by [`ProgressWatch`] plus the turn
-//! counter: a command byte-identical to the previous turn's is answered
-//! instead of re-run (and three of those in a row park the worker on the
-//! orchestrator), a worktree that stops changing gets a "make the edit or
-//! escalate" nudge -- earned earlier, once and never fatally, by a worker whose
-//! dispatch already named the files to edit and that only reads anyway --
-//! `REQUEST_TURNS` may only add half the dispatch's budget,
-//! and every 20 turns the worktree is checkpoint-committed so a kill or a
-//! crash cannot lose the work.
+//! The engine also carries the guards that keep a worker honest, all of them
+//! stateless per turn and driven by [`ProgressWatch`] plus the turn counter: a
+//! command byte-identical to the previous turn's is answered instead of re-run
+//! (and three of those in a row park the worker on the orchestrator), a
+//! worktree that stops changing gets a "make the edit or escalate" nudge --
+//! earned earlier, once and never fatally, by a worker whose dispatch already
+//! named the files to edit and that only reads anyway -- `REQUEST_TURNS` may
+//! only add half the dispatch's budget, and every 20 turns the worktree is
+//! checkpoint-committed so a kill or a crash cannot lose the work.
+//!
+//! One more guard applies to *every* role, the read-only exemption included:
+//! the equivalent-command loop detector. A worker that re-runs one command
+//! spelled four different ways (`cargo test | tail`, `cargo test > /tmp/x`,
+//! `cargo fmt --check && ... && cargo test`) with an unchanged worktree and an
+//! unchanged answer is stuck, whether it is an implementer, a round
+//! consolidator or a reviewer. [`normalize_command_base`] maps each spelling
+//! to one base command, [`LoopDetector`] counts the runs inside a sliding
+//! window, and the escalation is a concrete nudge followed by an orchestrator
+//! pause that quotes the loop back.
 //!
 //! The read-only detector is the one guard with three steps, because a worker
 //! that ignored two nudges will ignore a third: it first demands the edit,
@@ -29,10 +38,13 @@
 //! review phases both make their progress without editing (see
 //! [`TurnConfig::read_only_exempt`]). The turns the harness answers itself --
 //! the consolidator verbs and a background-job wait -- are progress the
-//! worktree sample cannot see, so they restart the streak rather than
-//! lengthening it ([`ProgressWatch::note_harness_progress`]).
+//! worktree sample cannot see, but only when their answer changed: a `WAIT`
+//! that reports the same states again taught the worker nothing, so it neither
+//! restarts the read-only streak nor ends a loop window
+//! ([`ProgressWatch::note_harness_progress`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::time::Duration;
 
@@ -183,6 +195,562 @@ const REPEAT_BLOCK_LIMIT: usize = 3;
 
 /// Answer handed to the model that re-issues the command of the turn before.
 const REPEAT_REFUSAL: &str = "You already ran this exact command; its output has not changed (see above). Take a different action.";
+
+/// Runs of one base command inside one window that make a loop.
+///
+/// Four runs of one command inside twelve turns, with nothing changed and
+/// nothing new in the answer, is repetition rather than work: a worker that is
+/// narrowing a failure re-runs the command with a different filter, a different
+/// result or an edit in between, and a worker that alternates its steps never
+/// reaches four.
+const LOOP_RUN_COUNT: usize = 4;
+
+/// Turns of the sliding window the loop detector looks back over.
+const LOOP_WINDOW_TURNS: usize = 12;
+
+/// Runs of the same base command that earn the orchestrator pause, counting
+/// from the run the nudge was sent on: the first detection nudges, and a
+/// recurrence the worker did not answer is what pauses.
+const LOOP_PAUSE_RUN: usize = 2;
+
+/// Bytes of the last output a loop pause quotes back, so the orchestrator is
+/// told what the command said without a whole log in its terminal.
+const LOOP_OUTPUT_TAIL_BYTES: usize = 300;
+
+/// Bytes one base command may occupy in a message, so a pathological command
+/// cannot paste itself into a nudge or an orchestrator question.
+const LOOP_BASE_BYTES: usize = 160;
+
+/// One answered turn as the loop detector remembers it.
+struct LoopStep {
+    step: usize,
+    base: String,
+    code: Option<i32>,
+    /// A digest of the output, so two runs can be compared without storing
+    /// every byte a worker ever printed.
+    digest: u64,
+    /// Whether the worktree changed between the previous turn and this one.
+    changed: bool,
+}
+
+/// What a loop window asks the turn engine to do.
+#[derive(Debug)]
+enum LoopVerdict {
+    /// The window is not a loop: keep going.
+    None,
+    /// A loop was seen; tell the worker what to do instead.
+    Nudge { count: usize },
+    /// A loop the nudge did not break; hand the decision to the orchestrator.
+    Pause { count: usize },
+}
+
+/// The equivalent-command loop detector: a sliding window of the last
+/// [`LOOP_WINDOW_TURNS`] answered turns, escalating when one base command
+/// fills it with runs that changed nothing and learned nothing.
+///
+/// Two things the older guards each missed on their own. The repetition
+/// detector compares commands byte for byte, so a worker that re-spells its
+/// command (`cargo test | tail`, `cargo test > /tmp/x`) walks straight past
+/// it; the stagnation detector counts turns with an unchanged repository, and
+/// a consolidator that is exempt from the read-only escalation was left with
+/// only nudges that never escalate. This one compares the *base* of each
+/// command over a window, and it applies to every role.
+#[derive(Default)]
+struct LoopDetector {
+    /// The last [`LOOP_WINDOW_TURNS`] answered turns, oldest first.
+    window: VecDeque<LoopStep>,
+    /// Base commands the nudge has already been sent for, newest last and
+    /// bounded so the table cannot grow with the run.
+    nudged: Vec<String>,
+    /// Base commands the worker has already been parked for.
+    paused: Vec<String>,
+    /// Worktree content fingerprint of the last recorded turn.
+    last_state: Option<u64>,
+}
+
+/// Bounded size of [`LoopDetector::nudged`] and [`LoopDetector::paused`].
+const LOOP_TRACKED_BASES: usize = 8;
+
+impl LoopDetector {
+    /// Fold one answered turn in and report the escalation it earned, if any.
+    ///
+    /// `state` is the worktree's content fingerprint for this turn, or `None`
+    /// when it could not be taken. A run only counts toward a loop while the
+    /// worktree stayed as it was, because a worker that edits between two runs
+    /// is making progress even when the command's output does not show it yet.
+    fn record(
+        &mut self,
+        step: usize,
+        base: &str,
+        code: Option<i32>,
+        digest: u64,
+        state: Option<u64>,
+    ) -> LoopVerdict {
+        // An empty window is a fresh episode: the worker ran nothing for a
+        // whole window, so a base it looped on before earns its nudge again.
+        if self.window.is_empty() {
+            self.nudged.clear();
+        }
+        let changed = matches!((self.last_state, state), (Some(a), Some(b)) if a != b);
+        // A sample git could not answer leaves the last known state in place:
+        // a failed sample is never read as "nothing changed".
+        if state.is_some() {
+            self.last_state = state;
+        }
+        self.window.push_back(LoopStep {
+            step,
+            base: base.to_string(),
+            code,
+            digest,
+            changed,
+        });
+        // Prune entries older than the window, and cap the buffer.
+        while let Some(front) = self.window.front() {
+            if step.saturating_sub(front.step) >= LOOP_WINDOW_TURNS {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.window.len() > LOOP_WINDOW_TURNS {
+            self.window.pop_front();
+        }
+
+        // Walk the window from the newest entry back, counting runs of the
+        // same base that produced the same result on an unchanged worktree.
+        // The walk stops at the first entry whose turn changed the worktree,
+        // so an edit between two runs ends the span.
+        let mut runs = 0usize;
+        for entry in self.window.iter().rev() {
+            if entry.changed {
+                break;
+            }
+            if entry.base == base && entry.code == code && entry.digest == digest {
+                runs += 1;
+            }
+        }
+        if runs < LOOP_RUN_COUNT {
+            return LoopVerdict::None;
+        }
+
+        // A base that was already parked is never parked again: the
+        // orchestrator has been told, and a second question about the same
+        // loop would only cost it another decision.
+        if self.paused.iter().any(|b| b == base) {
+            return LoopVerdict::None;
+        }
+
+        if !self.nudged.iter().any(|b| b == base) {
+            remember_base(&mut self.nudged, base);
+            return LoopVerdict::Nudge { count: runs };
+        }
+        if runs < LOOP_RUN_COUNT + LOOP_PAUSE_RUN {
+            return LoopVerdict::None;
+        }
+        remember_base(&mut self.paused, base);
+        LoopVerdict::Pause { count: runs }
+    }
+
+    /// Whether the window already holds a run of `base`: the engine uses this
+    /// to decide whether a fresh worktree sample is worth taking.
+    fn repeats(&self, base: &str) -> bool {
+        self.window.iter().any(|entry| entry.base == base)
+    }
+
+    /// Drop the window: something changed that the runs in it cannot describe,
+    /// so the next run starts the count over.
+    fn clear(&mut self) {
+        self.window.clear();
+    }
+}
+
+/// Remember `base` in a bounded list, evicting the oldest entry when the list
+/// is full: the detector remembers which commands it already answered so it
+/// can escalate on a recurrence, and a table that grew with the run would be
+/// the unbounded growth the crate forbids.
+fn remember_base(list: &mut Vec<String>, base: &str) {
+    if list.iter().any(|b| b == base) {
+        return;
+    }
+    if list.len() >= LOOP_TRACKED_BASES {
+        list.remove(0);
+    }
+    list.push(base.to_string());
+}
+
+/// The digest of one run's output for the loop detector: a hash of the output
+/// with every run of digits folded to a single `#`.
+///
+/// Counts, timings, line numbers and addresses move between two runs of one
+/// command without changing what the output *says*, so they must not read as
+/// new information. The words around them still do, which is what tells a
+/// worker that its last edit moved the failure somewhere else.
+fn output_digest(output: &str) -> u64 {
+    digest(output, true)
+}
+
+/// The digest of a harness answer for the progress check: the text exactly as
+/// it came back.
+///
+/// A different job number is a different answer even though the sentence has
+/// the same shape, so this one folds nothing. The loop detector still sees the
+/// two as one run, because it asks whether the *states* changed.
+fn answer_digest(answer: &str) -> u64 {
+    digest(answer, false)
+}
+
+/// A hash of `text`, with every run of digits folded to a single `#` when
+/// `fold_digits` is set.
+fn digest(text: &str, fold_digits: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut in_digits = false;
+    for byte in text.bytes() {
+        if fold_digits && byte.is_ascii_digit() {
+            if !in_digits {
+                hasher.write_u8(b'#');
+                in_digits = true;
+            }
+            continue;
+        }
+        in_digits = false;
+        hasher.write_u8(byte);
+    }
+    hasher.finish()
+}
+
+/// `output` trimmed to its last `limit` bytes, so the pause question quotes
+/// what the command said without a whole log in the orchestrator's terminal.
+fn bounded_tail(output: &str, limit: usize) -> String {
+    if output.len() <= limit {
+        return output.to_string();
+    }
+    let start = output.floor_char_boundary(output.len() - limit);
+    format!("...{}", &output[start..])
+}
+
+/// The nudge a first loop detection injects: name the loop, name what the
+/// worker is not learning, and demand a different action.
+///
+/// Deliberately general: the detector fires for any command in any language --
+/// a build, a test runner, `curl`, a script, a grep -- so the advice names no
+/// tool and assumes no ecosystem.
+const LOOP_NUDGE: &str = "Loop detected: you have run `{base}` {count} times in the last {window} turns without changing the worktree and without getting new information (same exit code {code}, same output). Repeating it will not help. Before your next action: (1) state in one sentence what the last output tells you and what is still unknown; (2) take a different action that can reduce that unknown - narrow the command to the specific item you need, inspect the relevant file or log, make the edit you have been deferring, or ask the orchestrator with ASK_ORCHESTRATOR if you are blocked.";
+
+/// The question a recurring loop parks on the orchestrator: the base command,
+/// how often it ran, what it last exited with and what it last said.
+///
+/// General for the same reason as [`LOOP_NUDGE`]: it describes a loop, not a
+/// toolchain.
+const LOOP_PAUSE_QUESTION: &str = "Worker {worker} is stuck in a loop: `{base}` ran {count} times in {window} turns with no worktree change and no new output (last exit code {code}). Last output (tail): {tail}. It needs a redirection or a decision.";
+
+/// The nudge text for one loop.
+fn loop_nudge_text(base: &str, count: usize, code: Option<i32>) -> String {
+    fill_template(
+        LOOP_NUDGE,
+        &[
+            ("base", base.to_string()),
+            ("count", count.to_string()),
+            ("window", LOOP_WINDOW_TURNS.to_string()),
+            ("code", exit_code_text(code)),
+        ],
+    )
+}
+
+/// The orchestrator question for one loop.
+fn loop_pause_question(
+    worker_id: &str,
+    base: &str,
+    count: usize,
+    code: Option<i32>,
+    tail: &str,
+) -> String {
+    fill_template(
+        LOOP_PAUSE_QUESTION,
+        &[
+            ("worker", worker_id.to_string()),
+            ("base", base.to_string()),
+            ("count", count.to_string()),
+            ("window", LOOP_WINDOW_TURNS.to_string()),
+            ("code", exit_code_text(code)),
+            ("tail", tail.to_string()),
+        ],
+    )
+}
+
+/// The exit code as the loop messages quote it: a run the harness answered
+/// without a process behind it has no code to report.
+fn exit_code_text(code: Option<i32>) -> String {
+    code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+}
+
+/// Fill a `{name}` template with its values, in the order they are given.
+fn fill_template(template: &str, values: &[(&str, String)]) -> String {
+    let mut text = template.to_string();
+    for (name, value) in values {
+        text = text.replace(&format!("{{{name}}}"), value);
+    }
+    text
+}
+
+/// The base a command reduces to, for the loop detector.
+///
+/// A worker that re-runs "the same" command rarely spells it the same way
+/// twice: the round that motivated this detector ran `cargo test 2>&1 | grep
+/// -E ...`, `cargo test 2>&1 | tail -40`, `cargo test 2>&1 > /tmp/x.txt` and
+/// `cargo fmt --check && cargo clippy ... && cargo test 2>&1 | tail` — four
+/// byte-different spellings of one command, which a byte-identical repetition
+/// check cannot see. [`normalize_command_base`] maps all four to `cargo test`,
+/// so the detector compares what the worker *did*, not what it typed.
+///
+/// The map is deliberately coarse and never guesses at a language: it drops
+/// what surrounds the command rather than reading what the command means.
+fn normalize_command_base(command: &str) -> String {
+    let one_line: String = command
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // The command's own spelling is the last segment that is not a filter over
+    // it, so a chain of gates is compared on the one it ends with. A pipeline
+    // made only of filters (`awk ... | sort | uniq`) has no such segment, and
+    // falls back to the one that reads the data rather than to nothing.
+    let segments = raw_segments(&one_line);
+    let base = segments
+        .iter()
+        .rfind(|segment| !is_output_filter(segment))
+        .or_else(|| segments.iter().find(|segment| !segment.trim().is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    // Collapse whitespace last: the splitters leave the gaps their own
+    // dropped bytes occupied behind.
+    let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    let base = strip_prefixes(&base);
+    // Bound the base itself, not just its message: a command can be
+    // arbitrarily long, and the window holds one base per run.
+    if base.len() > LOOP_BASE_BYTES {
+        let cut = base.floor_char_boundary(LOOP_BASE_BYTES.saturating_sub(3));
+        return format!("{}...", &base[..cut]);
+    }
+    base
+}
+
+/// Split `command` at the metacharacters that join shell segments: `|`, `&&`,
+/// `||`, `;`, an unadorned redirection and a background `&`.
+///
+/// A split is only taken outside quotes, command substitutions, subshells and
+/// backslash escapes, so `grep -E 'FAILED|panicked'` keeps its pattern and
+/// `awk '{print $2}'` keeps its program: both sit *inside* the filter, and it
+/// is the filter that goes. An fd redirection (`2>&1`, `2>/dev/null`) is not a
+/// split at all -- it is the command's own plumbing -- so it is consumed with
+/// its target instead.
+fn raw_segments(command: &str) -> Vec<String> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    // Bytes, not chars: the scan walks byte offsets, and every cut lands on an
+    // ASCII metacharacter, so each kept slice is valid UTF-8 however the
+    // command is spelled.
+    let mut current: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            current.push(b);
+            // Only a double quote honours a backslash escape, and the byte
+            // after one is copied verbatim so the scan cannot end on it.
+            if b == b'\\' && q == b'"' && i + 1 < bytes.len() {
+                current.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => {
+                quote = Some(b);
+                current.push(b);
+                i += 1;
+            }
+            // A backtick substitution is copied whole rather than parsed, so
+            // the metacharacters inside it cannot split the command.
+            b'`' => {
+                let end = command[i + 1..]
+                    .find('`')
+                    .map_or(bytes.len(), |n| i + 1 + n + 1);
+                current.extend_from_slice(&bytes[i..end]);
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                current.push(b);
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                current.push(b);
+                i += 1;
+            }
+            b'\\' => {
+                current.push(b);
+                if i + 1 < bytes.len() {
+                    current.push(bytes[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'|' | b'&' | b';' if depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+                // `&&` and `||` are two bytes; a lone `&`, `|` and `;` are one.
+                i += 1 + usize::from(bytes.get(i + 1) == Some(&b));
+            }
+            b'>' | b'<' if depth == 0 => match redirect_span(&current, bytes, i) {
+                // An fd redirection: drop the digits that named it and its
+                // target, and keep the segment the redirection belongs to.
+                Some((fd_start, end)) => {
+                    current.truncate(fd_start);
+                    i = end;
+                }
+                // A bare redirection sends the command's whole output
+                // elsewhere, which is the filter case: it ends the segment and
+                // the target it names goes with it.
+                None => {
+                    segments.push(std::mem::take(&mut current));
+                    // The operator, an optional `&`, the whitespace after it
+                    // and the word it names all belong to the redirection, so
+                    // none of them can open the next segment.
+                    i += 1 + usize::from(bytes.get(i + 1) == Some(&b'&'));
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    while i < bytes.len()
+                        && !bytes[i].is_ascii_whitespace()
+                        && !b"|&;<>".contains(&bytes[i])
+                    {
+                        i += 1;
+                    }
+                }
+            },
+            _ => {
+                current.push(b);
+                i += 1;
+            }
+        }
+    }
+    segments.push(current);
+    segments
+        .into_iter()
+        .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+        .collect()
+}
+
+/// Whether `segment` only reshapes another command's output rather than doing
+/// work of its own: a filter such as `grep`, `tail`, `head`, `sort`, `wc`,
+/// `tee`, `awk` and `sed -n`, or the empty remainder a trailing `|` leaves.
+///
+/// Only the first word is read, and only for words that mean "show me part of
+/// what the previous command printed": nothing here claims to know what the
+/// command under it does.
+fn is_output_filter(segment: &str) -> bool {
+    const FILTERS: &[&str] = &[
+        "awk", "cat", "grep", "head", "less", "more", "sed", "sort", "tail", "tee", "uniq", "wc",
+    ];
+    let first = segment
+        .split_whitespace()
+        .next()
+        .map(|word| word.trim_start_matches(['\\', '$', '(']));
+    match first {
+        None => true,
+        Some(word) => FILTERS.binary_search(&word).is_ok(),
+    }
+}
+
+/// The span of the file-descriptor redirection whose operator sits at `i`, as
+/// `(index of its fd digits inside `kept`, index just past its target in the
+/// command)`.
+///
+/// `None` when no file descriptor is named: `2>&1` and `2>/dev/null` are a
+/// command's own plumbing, while a bare `>/tmp/out.txt` hides its output, so
+/// only the former stays inside the base.
+///
+/// The fd is read off the bytes kept for this segment rather than off the
+/// command: the two are indexed differently, since the scan drops bytes as it
+/// walks.
+fn redirect_span(kept: &[u8], bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    // At most three digits: a longer run names no fd anyway, and bounding the
+    // walk keeps the scan linear with no chance of running off the front.
+    let mut start = kept.len();
+    for _ in 0..3 {
+        match start.checked_sub(1).map(|p| kept[p]) {
+            Some(b) if b.is_ascii_digit() => start -= 1,
+            _ => break,
+        }
+    }
+    if start == kept.len() {
+        return None;
+    }
+    let mut end = i + 1;
+    if bytes.get(end) == Some(&b'&') {
+        end += 1;
+    }
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !b"|&;<>".contains(&bytes[end])
+    {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Drop the wrappers a segment is dressed in: a leading `cd`, a leading
+/// environment assignment, and the `&&` / `;` glue that follows either.
+///
+/// Only the *leading* ones go: a `cd` in the middle of a segment is part of
+/// the command's own spelling and stays.
+fn strip_prefixes(segment: &str) -> String {
+    let mut words: Vec<&str> = segment.split_whitespace().collect();
+    loop {
+        if words.len() >= 2 && words[0] == "cd" {
+            // `cd x && ...`, `cd x; ...` and `cd x` alone: everything up to
+            // and including the target directory and its separator goes.
+            let mut used = 2;
+            if words.get(used).is_some_and(|w| is_shell_separator(w)) {
+                used += 1;
+            }
+            words.drain(..used);
+            continue;
+        }
+        if words.first().is_some_and(|w| is_env_assignment(w)) {
+            words.remove(0);
+            continue;
+        }
+        if words.first().is_some_and(|w| is_shell_separator(w)) {
+            words.remove(0);
+            continue;
+        }
+        break;
+    }
+    words.join(" ")
+}
+
+/// Whether `word` is glue between two segments rather than part of one.
+fn is_shell_separator(word: &str) -> bool {
+    word == "&&" || word == ";" || word == "||"
+}
+
+/// Whether `word` assigns one environment variable: `NAME=value` with a
+/// shell-legal name, so `timeout=5` inside a sentinel's own argument and a
+/// bare `=` are both left alone.
+fn is_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
 
 /// Nudge injected after a worker has explored long enough without changing
 /// anything: the answer to a stuck agent is a decision, not another turn.
@@ -622,6 +1190,22 @@ fn repository_sample(path: &Path) -> Option<String> {
     ))
 }
 
+/// Hash of `git status --porcelain` in `path`: the worktree's content, tracked
+/// and untracked alike, in one subprocess.
+///
+/// The loop detector compares this between two runs of the same command: a
+/// worker that edits, adds or deletes anything in between is making progress,
+/// and the digest of the command's own output cannot see that on its own.
+fn worktree_state_of(path: &Path) -> Option<u64> {
+    let output = git(path, "status --porcelain", &["status", "--porcelain"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    output.stdout.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// Read a `git diff --shortstat` line as `(files, insertions, deletions)`.
 ///
 /// Git pluralises by count (`1 file changed`) and omits a section entirely when
@@ -829,6 +1413,12 @@ pub(super) struct ProgressWatch {
     last_guard_step: Option<usize>,
     /// Step of the last repository sample taken by the stagnation detector.
     last_sample_step: Option<usize>,
+    /// The equivalent-command loop detector, fed every answered turn whatever
+    /// the role.
+    command_loop: LoopDetector,
+    /// Digest of the last answer the harness gave a turn itself, so a repeated
+    /// answer is not read as progress.
+    last_harness_answer: Option<u64>,
 }
 
 impl ProgressWatch {
@@ -851,11 +1441,40 @@ impl ProgressWatch {
     }
 
     /// Record a turn the harness answered itself -- a consolidator verb, a
-    /// background-job wait -- as progress, for every role. Neither changes
-    /// the worktree, so without this they would read to the detector as one
-    /// more turn spent looking instead of the work the turn actually did.
-    fn note_harness_progress(&mut self) {
+    /// background-job wait -- as progress, but only when its answer changed.
+    ///
+    /// A `WAIT` that reports the same states again, or a verb that answers the
+    /// same observation, taught the worker nothing: it is one more run of the
+    /// loop, not the progress the older detector read every such turn as. A
+    /// changed answer is progress the worktree sample cannot see, so it
+    /// restarts the read-only streak and ends any loop window.
+    fn note_harness_progress(&mut self, answer: &str) {
+        let digest = answer_digest(answer);
+        if self.last_harness_answer == Some(digest) {
+            return;
+        }
+        self.last_harness_answer = Some(digest);
         self.read_only.restart_streak();
+        self.command_loop.clear();
+    }
+
+    /// Whether the loop window already holds a run of `base`: the engine only
+    /// pays for a worktree sample when a repeat makes one informative.
+    fn loop_repeats(&self, base: &str) -> bool {
+        self.command_loop.repeats(base)
+    }
+
+    /// Fold one answered turn into the loop detector and report the escalation
+    /// it earned, if any.
+    fn note_loop_run(
+        &mut self,
+        step: usize,
+        base: &str,
+        code: Option<i32>,
+        digest: u64,
+        state: Option<u64>,
+    ) -> LoopVerdict {
+        self.command_loop.record(step, base, code, digest, state)
     }
 
     /// Record a repository sample and return the turns the repository has been
@@ -1347,13 +1966,13 @@ impl<'a> TurnEngine<'a> {
             if let Some(job) = parse_kill_job(&cmd_str) {
                 let (output, code) = self.stop_job(job);
                 return self
-                    .record_harness_result(&llm_resp, &label, output, code)
+                    .record_harness_result(config, &cmd_str, &llm_resp, &label, output, code)
                     .await;
             }
             if let Some(job) = parse_wait_job(&cmd_str) {
                 let (output, code) = self.wait_on_job(job).await;
                 return self
-                    .record_harness_result(&llm_resp, &label, output, code)
+                    .record_harness_result(config, &cmd_str, &llm_resp, &label, output, code)
                     .await;
             }
         }
@@ -1405,7 +2024,14 @@ impl<'a> TurnEngine<'a> {
                     .consolidate_merge(self.meta, self.worktree, &ids)
                     .await;
                 return self
-                    .consolidator_reply(&label, merged.observation, merged.integrated, &llm_resp)
+                    .consolidator_reply(
+                        config,
+                        &cmd_str,
+                        &label,
+                        merged.observation,
+                        merged.integrated,
+                        &llm_resp,
+                    )
                     .await;
             }
             // A steer routes a failure or a conflict back to the worker that
@@ -1413,14 +2039,14 @@ impl<'a> TurnEngine<'a> {
             if let Some((id, message)) = parse_consolidate_steer(&cmd_str) {
                 let observation = self.pool.consolidate_steer(self.meta, &id, message).await;
                 return self
-                    .consolidator_reply(&label, observation, false, &llm_resp)
+                    .consolidator_reply(config, &cmd_str, &label, observation, false, &llm_resp)
                     .await;
             }
             // A wait blocks until the group stops, spending no turn on it.
             if let Some((ids, timeout)) = parse_consolidate_wait(&cmd_str) {
                 let observation = self.pool.consolidate_wait(self.meta, &ids, timeout).await;
                 return self
-                    .consolidator_reply(&label, observation, false, &llm_resp)
+                    .consolidator_reply(config, &cmd_str, &label, observation, false, &llm_resp)
                     .await;
             }
         }
@@ -1505,38 +2131,50 @@ impl<'a> TurnEngine<'a> {
             );
         }
 
-        self.record_command_result(&llm_resp, &label, output, code)
+        self.record_command_result(config, &cmd_str, &llm_resp, &label, output, code)
             .await
     }
 
     /// Record one turn the harness answered itself: the job sentinels and the
     /// consolidator verbs. Such a turn is progress for the read-only detector
-    /// -- it never touches the worktree -- and its answer reaches the history
-    /// exactly as an executed command's does.
+    /// only when its answer changed -- it never touches the worktree -- and its
+    /// answer reaches the history exactly as an executed command's does.
     async fn record_harness_result(
         &mut self,
+        config: &TurnConfig<'_>,
+        command: &str,
         llm_resp: &LlmResponse,
         label: &str,
         output: String,
         code: Option<i32>,
     ) -> Result<TurnOutcome> {
-        self.watch.note_harness_progress();
-        self.record_command_result(llm_resp, label, output, code)
+        self.watch.note_harness_progress(&output);
+        self.record_command_result(config, command, llm_resp, label, output, code)
             .await
     }
 
     /// Record one answered turn: the tool result the model sees, the bounded
-    /// step log and the durable history append.
+    /// step log, the durable history append, and the equivalent-command loop
+    /// detector.
     ///
     /// Shared by an executed command and by the job sentinels, which answer a
-    /// turn without running bash, so all three reach the history the same way.
+    /// turn without running bash, so all three reach the history the same way
+    /// and all three are measured against the loop detector.
     async fn record_command_result(
         &mut self,
+        config: &TurnConfig<'_>,
+        command: &str,
         llm_resp: &LlmResponse,
         label: &str,
         output: String,
         code: Option<i32>,
     ) -> Result<TurnOutcome> {
+        // Read off the output before it is moved into the history: the loop
+        // detector compares runs by digest and quotes the tail back.
+        let base = normalize_command_base(command);
+        let digest = output_digest(&output);
+        let tail = bounded_tail(&output, LOOP_OUTPUT_TAIL_BYTES);
+
         let output_text = format!(
             "{COMMAND_OUTPUT_PREFIX}{}):\n```\n{}\n```",
             code.unwrap_or(-1),
@@ -1565,7 +2203,109 @@ impl<'a> TurnEngine<'a> {
             output_text,
         );
 
+        // --- Equivalent-command loop detector ---
+        // Every answered turn is folded in, whatever the role: a consolidator
+        // or a reviewer that re-runs one command with nothing to show for it
+        // is as stuck as an implementer, and the read-only exemption is about
+        // reading, not about this.
+        if !base.is_empty() {
+            // The worktree sample is only worth a subprocess once the base has
+            // repeated: an ordinary run of distinct commands pays nothing.
+            let state = if self.watch.loop_repeats(&base) {
+                self.worktree_state().await
+            } else {
+                None
+            };
+            match self
+                .watch
+                .note_loop_run(*self.step, &base, code, digest, state)
+            {
+                LoopVerdict::None => {}
+                LoopVerdict::Nudge { count } => {
+                    self.watch.note_guard(*self.step);
+                    warn!(
+                        worker = %self.worker_id,
+                        step = *self.step,
+                        op = %base,
+                        runs = count,
+                        "Equivalent-command loop detected; nudging the worker to change approach"
+                    );
+                    self.push_message(ChatMessage::text(
+                        Role::User,
+                        loop_nudge_text(&base, count, code),
+                    ));
+                }
+                LoopVerdict::Pause { count } => {
+                    return self
+                        .pause_on_command_loop(config, &base, count, code, &tail)
+                        .await;
+                }
+            }
+        }
+
         Ok(TurnOutcome::Continue)
+    }
+
+    /// Park a worker whose loop survived the nudge.
+    ///
+    /// Every role reaches this: the read-only exemption is about *reading*,
+    /// not about re-running one command with nothing to show for it, so a
+    /// consolidator or a reviewer stuck in such a loop gets the same
+    /// orchestrator question an implementer does.
+    async fn pause_on_command_loop(
+        &mut self,
+        config: &TurnConfig<'_>,
+        base: &str,
+        count: usize,
+        code: Option<i32>,
+        tail: &str,
+    ) -> Result<TurnOutcome> {
+        self.meta.metrics.loop_pauses += 1;
+        self.watch.note_guard(*self.step);
+        let question = loop_pause_question(self.worker_id, base, count, code, tail);
+        warn!(
+            worker = %self.worker_id,
+            step = *self.step,
+            op = %base,
+            runs = count,
+            "Equivalent-command loop survived the nudge; pausing for the orchestrator"
+        );
+        let answer = self
+            .pool
+            .pause_for_orchestrator(PauseRequest {
+                worker_id: self.worker_id,
+                question: &question,
+                step: *self.step,
+                max_turns: *self.current_max_turns,
+                last_command: base,
+                model: config.model,
+                meta: self.meta,
+            })
+            .await?;
+        if let Some(answer) = answer
+            && !answer.trim().is_empty()
+        {
+            self.push_message(ChatMessage::text(
+                Role::User,
+                format!("ORCHESTRATOR RESPONSE / GUIDANCE:\n{answer}"),
+            ));
+        }
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// A fingerprint of the worktree's *content* for the loop detector: one
+    /// `git status --porcelain`, hashed.
+    ///
+    /// One subprocess, and it sees untracked files -- a worker that writes a
+    /// new file between two runs of the same command is making progress even
+    /// though `git diff --stat HEAD` would not show it. `None` when git could
+    /// not answer, so a failed sample is never read as "nothing changed".
+    async fn worktree_state(&self) -> Option<u64> {
+        let path = self.worktree.path.clone();
+        tokio::task::spawn_blocking(move || worktree_state_of(&path))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Answer a harness-mediated consolidator verb: the observation stands in
@@ -1576,6 +2316,8 @@ impl<'a> TurnEngine<'a> {
     /// which only a merge that landed other workers' commits needs.
     async fn consolidator_reply(
         &mut self,
+        config: &TurnConfig<'_>,
+        command: &str,
         label: &str,
         observation: String,
         preserve: bool,
@@ -1584,7 +2326,7 @@ impl<'a> TurnEngine<'a> {
         if preserve {
             self.worktree.preserve_branch = true;
         }
-        self.record_harness_result(llm_resp, label, observation, Some(0))
+        self.record_harness_result(config, command, llm_resp, label, observation, Some(0))
             .await
     }
 
@@ -2557,13 +3299,14 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, MAX_TURNS_LIMIT, ProgressSummary,
-        ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
-        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
-        isolation_block, named_file_defaults, parse_shortstat, parse_threshold,
-        read_only_nudge_text, read_only_pause_question, read_only_plan_text, read_only_thresholds,
-        summarized_task, task_names_files,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, LoopDetector, LoopVerdict,
+        MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
+        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
+        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
+        edit_plan_text, extension_budget, grant_extension, isolation_block, loop_nudge_text,
+        loop_pause_question, named_file_defaults, normalize_command_base, output_digest,
+        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
+        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
@@ -2744,6 +3487,266 @@ mod tests {
         );
     }
 
+    /// The observed sequence: a consolidator re-runs the suite four different
+    /// ways, nothing changes and nothing new comes back. The detector nudges
+    /// on the fourth run, and every spelling is one base command.
+    #[test]
+    fn the_observed_consolidator_sequence_triggers() {
+        let mut detector = LoopDetector::default();
+        let sequence = [
+            "cargo test 2>&1 | grep -E 'FAILED|panicked'",
+            "cargo test 2>&1 | tail -40",
+            "cargo test 2>&1 > /tmp/testout.txt",
+            "cargo test 2>&1 | tee /tmp/test.log | head -30",
+        ];
+        let mut nudges = 0;
+        for (step, command) in sequence.iter().enumerate() {
+            let base = normalize_command_base(command);
+            assert_eq!(base, "cargo test", "{command}");
+            match detector.record(step, &base, Some(1), output_digest("837 passed"), Some(7)) {
+                LoopVerdict::None => {}
+                LoopVerdict::Nudge { count } => {
+                    assert_eq!(step, 3, "the fourth run is the one that nudges");
+                    assert_eq!(count, 4);
+                    nudges += 1;
+                }
+                LoopVerdict::Pause { .. } => {
+                    panic!("the first detection nudges, it does not pause")
+                }
+            }
+        }
+        assert_eq!(nudges, 1);
+    }
+
+    /// A test -> edit -> test cycle is work, not a loop: the edit changes the
+    /// worktree, so the walk back over the window stops at it and the window
+    /// never fills with unchanged runs.
+    #[test]
+    fn a_test_edit_test_cycle_is_not_a_loop() {
+        let mut detector = LoopDetector::default();
+        let mut state = 0u64;
+        for step in 0..12 {
+            let (base, digest) = if step % 2 == 0 {
+                ("cargo test", output_digest("837 passed, 1 failed"))
+            } else {
+                // The edit itself, which changes the worktree state below.
+                state += 1;
+                ("sed -i 's/a/b/' src/lib.rs", output_digest(""))
+            };
+            match detector.record(step, base, Some(1), digest, Some(state)) {
+                LoopVerdict::None => {}
+                other => panic!("a test/edit cycle is not a loop, got {other:?} at turn {step}"),
+            }
+        }
+    }
+
+    /// A loop that survives the nudge pauses, once, with the summary question.
+    #[test]
+    fn a_recurring_loop_pauses_with_the_summary() {
+        let mut detector = LoopDetector::default();
+        let mut nudged = false;
+        let mut paused = false;
+        for step in 0..10 {
+            match detector.record(
+                step,
+                "cargo test",
+                Some(1),
+                output_digest("837 passed"),
+                Some(3),
+            ) {
+                LoopVerdict::None => {}
+                LoopVerdict::Nudge { count } => {
+                    assert_eq!(count, 4);
+                    assert!(!nudged, "the nudge fires once per loop");
+                    nudged = true;
+                }
+                LoopVerdict::Pause { count } => {
+                    assert!(nudged, "the pause only follows the nudge");
+                    assert_eq!(count, 6);
+                    paused = true;
+                }
+            }
+        }
+        assert!(nudged);
+        assert!(paused);
+    }
+
+    /// A run whose output changed is new information, not another turn of the
+    /// loop, and a run whose worktree changed is the worker acting.
+    #[test]
+    fn new_information_and_edits_break_the_loop() {
+        // Same base, but the output keeps changing: never a loop.
+        let mut detector = LoopDetector::default();
+        for (step, word) in [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let digest = output_digest(&format!("failure in {word}"));
+            assert!(matches!(
+                detector.record(step, "cargo test", Some(1), digest, Some(5)),
+                LoopVerdict::None
+            ));
+        }
+        // Same base and output, but the worker edits between runs: not a loop.
+        let mut detector = LoopDetector::default();
+        for step in 0..8 {
+            let state = 100 + (step / 2) as u64;
+            assert!(matches!(
+                detector.record(
+                    step,
+                    "cargo test",
+                    Some(1),
+                    output_digest("837 passed"),
+                    Some(state)
+                ),
+                LoopVerdict::None
+            ));
+        }
+    }
+
+    /// A count or a timing that moved is not new information: the same
+    /// failure with a different number in it is still the same answer.
+    #[test]
+    fn a_digit_only_change_is_not_new_information() {
+        let first = output_digest("837 passed; 1 failed; finished in 0.42s");
+        let second = output_digest("838 passed; 1 failed; finished in 0.51s");
+        assert_eq!(first, second);
+        // The words around the numbers still count.
+        assert_ne!(
+            output_digest("test result: FAILED. 1 failed"),
+            output_digest("test result: ok. 0 failed")
+        );
+
+        let mut detector = LoopDetector::default();
+        let mut nudges = 0;
+        for step in 0..4 {
+            let digest = output_digest(&format!("837 passed; 1 failed; finished in 0.{step}s"));
+            if let LoopVerdict::Nudge { count } =
+                detector.record(step, "cargo test", Some(1), digest, Some(2))
+            {
+                assert_eq!(count, 4);
+                nudges += 1;
+            }
+        }
+        assert_eq!(nudges, 1);
+    }
+
+    /// The nudge and the pause question carry the phrases the orchestrator and
+    /// the worker are told to look for, and name the base command.
+    #[test]
+    fn the_loop_messages_carry_the_required_phrases() {
+        let nudge = loop_nudge_text("cargo test", 4, Some(1));
+        assert!(nudge.contains("Loop detected"), "{nudge}");
+        assert!(nudge.contains("`cargo test`"), "{nudge}");
+        assert!(nudge.contains("4 times"), "{nudge}");
+        assert!(nudge.contains("ASK_ORCHESTRATOR"), "{nudge}");
+
+        let question = loop_pause_question("w-1", "cargo test", 6, Some(1), "837 passed, 1 failed");
+        assert!(question.contains("is stuck in a loop"), "{question}");
+        assert!(question.contains("`cargo test`"), "{question}");
+        assert!(question.contains("6 times"), "{question}");
+        assert!(question.contains("837 passed, 1 failed"), "{question}");
+    }
+
+    /// A harness answer that repeats what the turn before said is not progress:
+    /// it must not clear the loop window the way a changed answer does.
+    #[test]
+    fn a_repeated_harness_answer_is_not_progress() {
+        let mut watch = ProgressWatch::default();
+        let fill = |watch: &mut ProgressWatch| {
+            for step in 0..4 {
+                watch.note_loop_run(
+                    step,
+                    "cargo test",
+                    Some(1),
+                    output_digest("837 passed"),
+                    Some(7),
+                );
+            }
+        };
+        // The first answer has nothing to be compared against, so it is
+        // progress and ends whatever window stood before it.
+        fill(&mut watch);
+        watch.note_harness_progress("job 1 is still running");
+        assert!(!watch.loop_repeats("cargo test"));
+        // The same states again, however, is not progress: the window it would
+        // have cleared is still there.
+        fill(&mut watch);
+        watch.note_harness_progress("job 1 is still running");
+        assert!(
+            watch.loop_repeats("cargo test"),
+            "the same states again is not progress, so the window stands"
+        );
+        // A changed answer is progress, and does end the window.
+        watch.note_harness_progress("job 1 exited with code 0");
+        assert!(
+            !watch.loop_repeats("cargo test"),
+            "a changed answer is progress and ends the window"
+        );
+    }
+
+    /// The spellings round31's consolidator cycled over for one command: a
+    /// pipe into a filter, a pipe into a tail, a chain whose last segment is
+    /// the command, and a redirection that hides the output. Four different
+    /// byte strings, one command.
+    #[test]
+    fn every_spelling_of_one_command_maps_to_one_base() {
+        for cmd in [
+            "cargo test 2>&1 | grep -E 'FAILED|panicked'",
+            "cargo test 2>&1 | tail -40",
+            "cargo test 2>&1 > /tmp/testout.txt",
+            "cargo test 2>&1 | tee /tmp/test.log | head -30",
+            "cd /repo && cargo test 2>&1 | tail -5",
+            "RUST_BACKTRACE=1 CARGO_TERM_COLOR=never cargo test 2>&1 | wc -l",
+        ] {
+            assert_eq!(normalize_command_base(cmd), "cargo test", "{cmd}");
+        }
+        // And the chain that ended with the same command: the base is the last
+        // segment that is not a filter over it, so a gate run as a chain is
+        // compared on the command it ends with.
+        assert_eq!(
+            normalize_command_base(
+                "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -20"
+            ),
+            "cargo test"
+        );
+    }
+
+    /// The map is coarse, not greedy: a metacharacter inside quotes, a
+    /// substitution or a subshell belongs to the command's own spelling.
+    #[test]
+    fn a_metacharacter_inside_a_quote_or_a_subshell_is_not_a_split() {
+        assert_eq!(
+            normalize_command_base("grep -rn 'pub fn | private' src/"),
+            "grep -rn 'pub fn | private' src/"
+        );
+        assert_eq!(
+            normalize_command_base("git -C . log --oneline -n 5"),
+            "git -C . log --oneline -n 5"
+        );
+        assert_eq!(
+            normalize_command_base("(cd sub && make) && echo done"),
+            "echo done"
+        );
+        assert_eq!(
+            normalize_command_base("awk '{print $2}' log.txt | sort | uniq -c"),
+            "awk '{print $2}' log.txt"
+        );
+        assert_eq!(
+            normalize_command_base("echo \"CONSOLIDATE_WAIT nobody timeout=1\""),
+            "echo \"CONSOLIDATE_WAIT nobody timeout=1\""
+        );
+        // A bare `>` hides the output and is dropped; the sentinel's own
+        // `timeout=` is not an environment assignment.
+        assert_eq!(normalize_command_base("ls -la > out.txt"), "ls -la");
+        assert_eq!(normalize_command_base("  cargo   test  "), "cargo test");
+        // An empty or separator-only command has no base, and the detector
+        // below therefore never sees it.
+        assert_eq!(normalize_command_base("   "), "");
+    }
+
     #[test]
     fn only_a_byte_identical_repeat_counts_as_a_repetition() {
         let mut watch = ProgressWatch::default();
@@ -2913,8 +3916,9 @@ mod tests {
         assert_eq!(watch.read_only.read_only_turns, limits.first);
 
         // A consolidator verb or a job wait leaves the worktree untouched, so
-        // nothing in the sample moves: the turn must be counted as progress.
-        watch.note_harness_progress();
+        // nothing in the sample moves: a turn whose answer changed must be
+        // counted as progress.
+        watch.note_harness_progress("job 1 exited with code 0");
         assert_eq!(watch.read_only.read_only_turns, 0);
 
         // The turns after it are therefore the start of a fresh streak, which
