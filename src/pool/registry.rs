@@ -630,7 +630,9 @@ pub fn save_registry_entry_in(root: &ScratchRoot, entry: &WorkerRegistryEntry) {
 fn atomic_write_registry_row(path: &std::path::Path, json: &[u8]) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().expect("a registry row has a parent directory");
+    let dir = path
+        .parent()
+        .expect("a registry row has a parent directory");
     let tmp = dir.join(format!(
         "{}.{}.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("row"),
@@ -987,7 +989,6 @@ mod recovery_cleanup_tests {
     }
 }
 
-
 /// Registry rows are the cross-process view of the pool, so a row must never
 /// read torn: a reader that opens the file mid-write sees an empty or
 /// half-written row and skips it, which is exactly what started round41 early
@@ -1029,7 +1030,7 @@ mod registry_atomic_write_tests {
             while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
                 step = step.wrapping_add(1);
                 row.step = step;
-                row.status = if step % 2 == 0 {
+                row.status = if step.is_multiple_of(2) {
                     RegistryStatus::Running
                 } else {
                     RegistryStatus::Reviewing
@@ -1041,8 +1042,7 @@ mod registry_atomic_write_tests {
         // Read the row file back directly many times while the writer churns
         // it. Every read must parse the row: a torn write would make one of
         // them see an empty or half-written file.
-        let mut reads = 0usize;
-        for _ in 0..2000 {
+        for reads in 0..2000 {
             let raw = std::fs::read(&path).unwrap_or_else(|e| {
                 panic!("a read of the row failed after {reads} successful reads: {e}")
             });
@@ -1053,7 +1053,6 @@ mod registry_atomic_write_tests {
                 )
             });
             assert_eq!(entry.id, id, "the row must keep its identity");
-            reads += 1;
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
