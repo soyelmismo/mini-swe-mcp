@@ -185,7 +185,7 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
     (
         "consolidate_verify",
         "string",
-        DescriptionSource::Static("Consolidator's gate; `sh -n` checked."),
+        DescriptionSource::Static("Consolidator's gate."),
     ),
     (
         "set",
@@ -236,6 +236,11 @@ const WORKER_PROPERTIES: &[(&str, &str, DescriptionSource)] = &[
         "keep_branch",
         "boolean",
         DescriptionSource::Static("Keep the branch."),
+    ),
+    (
+        "force",
+        "boolean",
+        DescriptionSource::Static(super::handlers::merge::FORCE_DESCRIPTION),
     ),
 ];
 

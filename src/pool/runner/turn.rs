@@ -2524,7 +2524,27 @@ impl<'a> TurnEngine<'a> {
             // one-line headline. They are recorded here, on the meta, so the
             // terminal state and row both carry them without a second pass
             // over the history log.
-            let verdicts = crate::pool::state::parse_verdict_lines(&llm_resp.content);
+            let mut verdicts = crate::pool::state::parse_verdict_lines(&llm_resp.content);
+            // A round that no longer matches its own record is the orchestrator's
+            // last chance to hear about it: a member revised after the
+            // integration commits again, so `merge <consolidator>` will refuse.
+            // Said here, on the completion event and in the watch line, rather
+            // than only at merge time, where the whole round has already been
+            // reviewed. One line per worker, counted, charged to the verdict
+            // budget as the harness's own -- a padded report cannot decide
+            // whether the operator is told.
+            //
+            // The proof is git subprocesses, one per round member, so it runs
+            // off the runtime thread like every other blocking probe in this
+            // engine: a big round must not stall the workers sharing it.
+            let root = self.pool.scratch.clone();
+            let worker_id = self.worker_id.to_string();
+            let unintegrated = tokio::task::spawn_blocking(move || {
+                crate::pool::unintegrated_workers_in(&root, &worker_id)
+            })
+            .await
+            .unwrap_or_default();
+            verdicts.push_risks_bounded(unintegrated.iter().map(|worker| worker.line()));
             if !verdicts.is_empty() {
                 *self.verdicts = Some(verdicts);
                 self.meta.verdicts = self.verdicts.clone();

@@ -60,7 +60,8 @@ pub use self::buffer::{
 pub use self::clock::unix_timestamp;
 pub use self::merge::{
     MergeApprovedReport, MergeApprovedRequest, MergeReport, MergeRequest, MergedWorker,
-    SkippedWorker, merge_approved, merge_approved_in, merge_worker, merge_worker_in,
+    SkippedWorker, UnintegratedWorker, merge_approved, merge_approved_in, merge_worker,
+    merge_worker_in, unintegrated_workers_in,
 };
 pub(crate) use self::registry::recover_orphaned_workers_in;
 pub use self::registry::{

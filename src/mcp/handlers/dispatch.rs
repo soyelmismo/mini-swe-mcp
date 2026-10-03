@@ -338,7 +338,7 @@ pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
     "Reviewer `<model>:<mode>`; see `manifest`.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
-    "Auto-consolidate the group when it stops: boolean or model.";
+    "Auto-consolidate the group when it stops.";
 
 pub(in crate::mcp) const VERIFY_DESCRIPTION: &str = "Completion gate: auto-detect if omitted; empty string disables. On consolidate: Cheap for workers, full consolidator.";
 

@@ -38,14 +38,14 @@
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate the group when it stops: boolean or model.",
+            "description": "Auto-consolidate the group when it stops.",
             "type": [
               "boolean",
               "string"
             ]
           },
           "consolidate_verify": {
-            "description": "Consolidator's gate; `sh -n` checked.",
+            "description": "Consolidator's gate.",
             "type": "string"
           },
           "diff": {
@@ -65,6 +65,10 @@
             },
             "type": "array"
           },
+          "force": {
+            "description": "Land a stale round.",
+            "type": "boolean"
+          },
           "full": {
             "description": "The whole diff for 'collect'.",
             "type": "boolean"
@@ -83,6 +87,10 @@
           "keep_branch": {
             "description": "Keep the branch.",
             "type": "boolean"
+          },
+          "last": {
+            "description": "Only the N most recent.",
+            "type": "integer"
           },
           "max_turns": {
             "description": "Max bash turns; on 'steer', a stopped worker's budget.",
@@ -120,7 +128,7 @@
             "type": "string"
           },
           "role": {
-            "description": "'consolidate': integrate this group's completed workers.",
+            "description": "'consolidate': integrate this group.",
             "type": "string"
           },
           "scope": {
@@ -194,7 +202,7 @@
             "type": "integer"
           },
           "topic": {
-            "description": "Help topic; omitted: the index",
+            "description": "Help topic; omitted: index",
             "type": "string"
           },
           "verify": {
@@ -211,10 +219,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "last": {
-            "description": "Only the N most recent.",
-            "type": "integer"
           }
         },
         "required": [

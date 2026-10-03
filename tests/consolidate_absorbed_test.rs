@@ -134,6 +134,7 @@ impl Harness {
                 worker_id: id,
                 verified: Some(true),
                 keep_branch: false,
+                force: false,
                 admission: None,
                 archive_dir: None,
             },
