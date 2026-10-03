@@ -12,16 +12,6 @@ pub(super) fn build(
     }
     match batch_tasks(cli_args)? {
         Some((file_index, tasks)) => {
-            // Every entry's task comes from the file, so a bare word beside
-            // `-f <path>` has nowhere to go: refuse it rather than dispatch the
-            // file and drop what the operator asked for.
-            if let Some(extra) = extra_batch_word(cli_args, file_index) {
-                anyhow::bail!(
-                    "dispatch -f <{path}> takes flags only, but got the extra word {extra:?}; \
-                     put the tasks in the file or dispatch one task without -f",
-                    path = cli_args[file_index + 1]
-                );
-            }
             tool_args.insert("tasks".into(), tasks);
             // Flags after the file are shared defaults for every entry;
             // the file flag and its path are skipped, never parsed.
@@ -41,56 +31,13 @@ pub(super) fn build(
 
 /// Fold the `dispatch` flags after the task into the tool arguments.
 ///
-/// The task is every word that is not a flag or a flag's value, so an unquoted
-/// `dispatch fix the flaky test` arrives whole; a value flag consumes the next
-/// word verbatim, and one with nothing after it is dropped rather than
-/// defaulted to an empty string.
+/// A value flag consumes the next word verbatim; one with nothing after it is
+/// dropped rather than defaulted to an empty string.
 pub(super) fn dispatch_args(cli_args: &[String], tool_args: &mut Map<String, Value>) -> Result<()> {
-    tool_args.insert(
-        "task".into(),
-        Value::String(join_words(cli_args, 2, &[], DISPATCH_VALUE_FLAGS)),
-    );
+    tool_args.insert("task".into(), Value::String(cli_args[2].clone()));
     collect_dispatch_flags(cli_args, 3, &[], tool_args);
     Ok(())
 }
-
-/// The first bare word beside a batch dispatch's `-f <path>`, if there is one.
-///
-/// Only the words no flag claims are reported, so the documented
-/// `dispatch -f tasks.yaml --group g` spellings stay silent.
-fn extra_batch_word(cli_args: &[String], file_index: usize) -> Option<String> {
-    let skip = [file_index, file_index + 1];
-    let mut i = 3;
-    while i < cli_args.len() {
-        if !skip.contains(&i) && !cli_args[i].starts_with('-') {
-            return Some(cli_args[i].clone());
-        }
-        if DISPATCH_VALUE_FLAGS.contains(&cli_args[i].as_str()) {
-            i += 1;
-        }
-        i += 1;
-    }
-    None
-}
-
-/// The `dispatch` flags that consume the following word as their value.
-///
-/// Shared by the positional task and the flag fold, so a word that is one
-/// flag's value can never leak into the other one.
-pub(super) const DISPATCH_VALUE_FLAGS: &[&str] = &[
-    "--model",
-    "-m",
-    "--review-after",
-    "--repo",
-    "-r",
-    "--max-turns",
-    "-t",
-    "--group",
-    "-g",
-    "--verify",
-    "--consolidate-verify",
-    "--role",
-];
 
 /// Read the batch list named by `-f`/`--file`, returning the flag's position
 /// and the parsed `tasks` array. `Ok(None)` means the flag was not passed.
@@ -292,9 +239,7 @@ mod tests {
         let mut tool_args = Map::new();
         dispatch_args(&cli_args, &mut tool_args).expect("valid flags");
 
-        // An unknown flag is ignored but the word after it is still a task word,
-        // so nothing the operator typed is silently dropped.
-        assert_eq!(tool_args["task"], "t x");
+        assert_eq!(tool_args["task"], "t");
         assert_eq!(
             tool_args.len(),
             1,
