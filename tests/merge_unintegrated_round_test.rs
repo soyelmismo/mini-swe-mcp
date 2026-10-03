@@ -16,8 +16,9 @@ mod common;
 use common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
-    MergeRequest, RegistryStatus, WorkerHistory, WorkerRegistryEntry, append_history_message_in,
-    load_registry_entry_in, merge_worker_in, save_registry_entry_in, unintegrated_workers_in,
+    MergeApprovedRequest, MergeRequest, RegistryStatus, WorkerApproval, WorkerHistory,
+    WorkerRegistryEntry, append_history_message_in, load_registry_entry_in, merge_approved_in,
+    merge_worker_in, save_registry_entry_in, unintegrated_workers_in,
 };
 use mini_swe_mcp::worktree::ScratchRoot;
 use std::path::Path;
@@ -128,7 +129,10 @@ impl Fixture {
             base_branch: Some("main".to_string()),
             branch: format!("worker-{id}"),
             network_offline: false,
-            verify: None,
+            // A trivial gate: the batch runs one shared gate over the composed
+            // round, and it must run for a test that is about what happens
+            // before it.
+            verify: Some("exit 0".to_string()),
             client_env: Vec::new(),
             max_turns: 10,
             review_after: None,
@@ -157,6 +161,28 @@ impl Fixture {
             ..WorkerRegistryEntry::test_row(id, "agent-a")
         };
         save_registry_entry_in(&self.root(), &entry);
+    }
+
+    /// Mark `id` approved, exactly as the `approve` action records it.
+    fn approve(&self, id: &str) {
+        let mut entry =
+            load_registry_entry_in(&self.root(), id).expect("the fixture records a row");
+        entry.approved = Some(WorkerApproval { at: 1, note: None });
+        save_registry_entry_in(&self.root(), &entry);
+    }
+
+    /// Land every approved worker, as `merge --approved` does.
+    fn merge_approved(&self) -> anyhow::Result<()> {
+        merge_approved_in(
+            &self.root(),
+            &MergeApprovedRequest {
+                owner: None,
+                group: None,
+                admission: None,
+                archive_dir: None,
+            },
+        )
+        .map(|_| ())
     }
 
     /// Merge `id`, with `force` as given, exactly as the MCP handler does.
@@ -442,4 +468,53 @@ fn a_missing_member_branch_counts_as_integrated() {
     f.merge("c1", false)
         .expect("a round with a pruned member must merge");
     assert!(f.repo().join("round.md").exists());
+}
+
+/// The batch path lands an approved consolidator exactly as `merge <id>` does,
+/// so it owes the orchestrator the same refusal: an approved round whose member
+/// moved on after the integration must not land through `--approved` either.
+#[test]
+fn the_approved_batch_refuses_a_stale_round_too() {
+    let f = Fixture::new("round-batch-stale");
+    f.consolidator("c1", &["wa"]);
+    f.commit_on(
+        "worker-wa",
+        "late.md",
+        "late work\n",
+        "revision after integration",
+    );
+    f.approve("c1");
+
+    let err = f
+        .merge_approved()
+        .expect_err("a batch must not land a round whose member moved on either");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("wa"),
+        "the batch refusal must name the worker: {message}"
+    );
+    assert!(
+        message.contains("1 unintegrated commit"),
+        "the batch refusal must count the unintegrated commits: {message}"
+    );
+    assert!(
+        !f.repo().join("round.md").exists(),
+        "a refused batch must not land the round"
+    );
+}
+
+/// The same batch, with every member proven integrated, lands as before: the
+/// refusal above is about the stale member, not about batching.
+#[test]
+fn the_approved_batch_lands_a_round_whose_members_are_integrated() {
+    let f = Fixture::new("round-batch-clean");
+    f.consolidator("c1", &["wa"]);
+    f.approve("c1");
+
+    f.merge_approved()
+        .expect("a batch whose every member is integrated must land");
+    assert!(
+        f.repo().join("round.md").exists() && f.repo().join("wa.md").exists(),
+        "the batch must land the whole round"
+    );
 }
