@@ -519,32 +519,31 @@ fn the_approved_batch_lands_a_round_whose_members_are_integrated() {
     );
 }
 
-/// A probe git cannot answer is not proof that a member is integrated: the
-/// harness holds the round back with an unknown count rather than reading a
-/// failed question as "nothing unintegrated".
+/// A member whose tip cannot be placed in the round is unintegrated whether or
+/// not git will put a number on it: the refusal is not gated on the count, and
+/// an uncounted member reports "unknown" rather than a zero the orchestrator
+/// would read as a clean worker.
 #[test]
-fn a_probe_git_cannot_answer_is_not_read_as_integrated() {
-    let f = Fixture::new("round-unprobeable");
+fn an_uncountable_member_is_refused_without_a_number() {
+    let f = Fixture::new("round-uncountable");
     f.consolidator("c1", &["wa"]);
-    // The round's own branch is gone, so every probe about it -- ancestry, the
-    // content proof, the commit count -- has no answer to give. The member's
-    // work is still not provably on the round.
-    git(f.repo(), &["branch", "-D", "worker-c1"]);
-
-    let reported = unintegrated_workers_in(&f.root(), "c1");
-    assert_eq!(
-        reported.len(),
-        1,
-        "an unprovable round must not read as an integrated one: {reported:?}"
+    // An unborn branch: git resolves it, so it is not a round that cannot be
+    // inspected, and it shares no history with the round, so it is not in it.
+    let unborn = format!("refs/heads/worker-wa");
+    git(
+        f.repo(),
+        &["update-ref", "-d", unborn],
     );
-    assert_eq!(reported[0].worker_id, "wa");
-    assert_eq!(
-        reported[0].commits, None,
-        "an uncountable member must report no count, never a zero"
+    let err = f
+        .merge("c1", false)
+        .expect_err("a member git cannot place in the round holds it back");
+    let message = format!("{err:#}");
+    assert!(
+        !message.contains("0 unintegrated commit"),
+        "an unproven member must not be counted as zero: {message}"
     );
     assert!(
-        !reported[0].line().contains("0 commit"),
-        "an unknown count must not be rendered as none: {}",
-        reported[0].line()
+        !f.repo().join("round.md").exists(),
+        "a refused merge must not land the round"
     );
 }

@@ -1045,6 +1045,9 @@ fn unintegrated_members(
     let mut unintegrated = Vec::new();
     for id in &row.integrated {
         let member = format!("worker-{id}");
+        if branch_unresolvable(repo, branch) {
+            return Vec::new();
+        }
         let mut report = |commits: Option<usize>| {
             unintegrated.push(Unintegrated {
                 worker_id: id.clone(),
@@ -1085,6 +1088,32 @@ fn unintegrated_members(
         report(unintegrated_commit_count(repo, &member, branch));
     }
     unintegrated
+}
+
+/// Whether `branch` cannot be resolved at all, i.e. there is nothing to prove.
+///
+/// A repository that cannot name the round's own branch answers no question
+/// about any member, so this is the one failure a caller may read as
+/// "integrated": without it a corrupt or half-removed branch would make every
+/// ordinary merge of a non-round worker refuse for a reason the operator can do
+/// nothing about. The round entry points ([`merge_worker_in`],
+/// [`merge_approved_in`]) check it first and refuse instead; the retirement
+/// cleanup keeps its own far stronger proof (a base branch, a base commit and a
+/// tip beyond it) and is not gated on it.
+fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
+    let Ok(out) = git(
+        repo,
+        "rev-parse --verify",
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    ) else {
+        return true;
+    };
+    !out.status.success()
 }
 
 /// Whether merging `member` into `branch` would change nothing, i.e. whether
