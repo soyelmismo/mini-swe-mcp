@@ -28,19 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ----------
-// Process-global environment serialization
-// ----------
-
-/// Serialises tests that mutate process-global environment variables.
-///
-/// In a single test binary, a test that calls `set_var`/`remove_var` races with
-/// every other module that reads the same variable. Tests that truly need to
-/// mutate the process environment (rather than pass a value explicitly or set
-/// it on a child `Command`) take this lock for the duration of the mutation, so
-/// no other test observes a half-set value.
-pub static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-// ----------
 // Binary location
 // ----------
 
@@ -332,10 +319,10 @@ fn remember_for_exit_sweep(path: &Path) {
 
 /// A scratch directory that lives for the whole test binary.
 ///
-/// Some tests point process-global state (`SWE_TEMP_DIR`, the registry) at a
-/// directory every sibling test in the binary needs, so one test's [`TempDir`]
-/// must not own it. Registering the directory with `atexit` gives it the
-/// binary's lifetime while still leaving nothing behind.
+/// A test whose scratch state outlives itself - a fixture several sibling tests
+/// read - cannot be owned by one test's [`TempDir`], which would delete it while
+/// another test still needs it. Registering the directory with `atexit` gives
+/// it the binary's lifetime while still leaving nothing behind.
 pub fn process_temp_dir(tag: &str) -> PathBuf {
     let path = mini_swe_mcp::worktree::swe_base_dir().join(scratch_name(tag));
     let _ = std::fs::remove_dir_all(&path);
