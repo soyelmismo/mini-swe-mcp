@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 fn llm_concurrency_cap_limits_in_flight_requests() {
     for cap in [0, 1, 2] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "llm_cap_child", "--nocapture"])
+            .args(["--exact", "fairness_test::llm_cap_child", "--nocapture"])
             .env("HUB_LLM_CONCURRENCY", cap.to_string())
             .env("MINI_SWE_LLM_CAP_CHILD", "1")
             .output()

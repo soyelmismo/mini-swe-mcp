@@ -158,7 +158,7 @@ fn a_worker_step_is_confined_without_bubblewrap() {
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(&exe)
         .arg("--exact")
-        .arg("a_worker_step_is_confined_without_bubblewrap")
+        .arg("landlock_test::a_worker_step_is_confined_without_bubblewrap")
         .arg("--nocapture")
         .env(EXEC_PROBE_ENV, "1")
         .env("PATH", &sanitized)

@@ -918,7 +918,7 @@ fn sync_base_env_zero_leaves_worker_untouched() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "sync_base_env_zero_leaves_worker_untouched",
+                "worktree_test::sync_base_env_zero_leaves_worker_untouched",
                 "--nocapture",
             ])
             .env(CHILD, "1")
