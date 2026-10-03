@@ -304,10 +304,7 @@ fn test_instructions_over_the_budget_are_warned_about_and_truncated() {
 
     let repo = TempDir::new_in_tmp("model-instructions-cap");
     let prompt = build_system_prompt(&raw, repo.path(), "small");
-    assert!(
-        prompt.contains("never reached") == false,
-        "the tail is dropped"
-    );
+    assert!(!prompt.contains("never reached"), "the tail is dropped");
     assert!(prompt.contains("[truncated"), "the cut is marked: {prompt}");
 }
 
@@ -376,22 +373,25 @@ async fn system_prompts_of_a_reviewed_run(repo: &Path, manifest_yaml: &str) -> V
 
     // Poll for the terminal state rather than sleeping a fixed amount: the run
     // ends when both phases have finished.
-    let mut state = None;
+    let terminal = |s: &mini_swe_mcp::pool::WorkerState| {
+        matches!(
+            s,
+            mini_swe_mcp::pool::WorkerState::Completed { .. }
+                | mini_swe_mcp::pool::WorkerState::Failed { .. }
+                | mini_swe_mcp::pool::WorkerState::Exhausted { .. }
+        )
+    };
+    let mut finished = false;
     for _ in 0..600 {
-        if let Some(s) = pool.get_worker_state(&worker_id).await {
-            if matches!(
-                s,
-                mini_swe_mcp::pool::WorkerState::Completed { .. }
-                    | mini_swe_mcp::pool::WorkerState::Failed { .. }
-                    | mini_swe_mcp::pool::WorkerState::Exhausted { .. }
-            ) {
-                state = Some(s);
-                break;
-            }
+        if let Some(s) = pool.get_worker_state(&worker_id).await
+            && terminal(&s)
+        {
+            finished = true;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    state.expect("worker reaches a terminal state");
+    assert!(finished, "worker reaches a terminal state");
 
     llm.request_bodies()
         .await
