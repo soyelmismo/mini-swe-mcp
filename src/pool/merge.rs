@@ -995,6 +995,15 @@ struct Unintegrated {
 /// check exists to stop. So every recorded member is re-proved the only way
 /// that survives a revision: `git merge-base --is-ancestor <tip> <branch>`.
 ///
+/// A member counts as integrated on either proof: the ancestry one, or the
+/// tree one. Ancestry alone would refuse a perfectly integrated round -- a
+/// consolidator that takes a worker's *content* by squash or cherry-pick leaves
+/// the worker's commits out of its own history, so the tip is not an ancestor
+/// although every line of the work is on the branch. Since the round's
+/// guarantee is "the work is on this branch", not "the commits are reachable",
+/// the second proof is the one that matters, and it is checked whenever
+/// ancestry fails.
+///
 /// A member that cannot be probed is *not* reported. No branch (already pruned
 /// or never created) means there is nothing left to integrate, and a repository
 /// that refuses the probe cannot be asked about any of its refs; both answer
@@ -1021,20 +1030,76 @@ fn unintegrated_members(
         match is_ancestor(repo, &member, branch) {
             // Contained: whatever the member carries is already in the branch
             // the merge will land, so the round is the round that was reviewed.
-            Ok(true) => {}
-            Ok(false) => {
-                if let Some(count) = unintegrated_commit_count(repo, &member, branch) {
-                    unintegrated.push(Unintegrated {
-                        worker_id: id.clone(),
-                        commits: count,
-                    });
-                }
-            }
+            Ok(true) => continue,
+            // Not reachable, which is not yet proof of absence: the round may
+            // have been integrated by content rather than by history.
+            Ok(false) => {}
             // An unprobeable repository is not evidence of lost work.
             Err(_) => continue,
         }
+        // The content proof. A tree that merges to no change is a round that
+        // already carries this worker, however it got there.
+        if tree_already_in(repo, branch, &member) {
+            continue;
+        }
+        if let Some(count) = unintegrated_commit_count(repo, &member, branch) {
+            unintegrated.push(Unintegrated {
+                worker_id: id.clone(),
+                commits: count,
+            });
+        }
     }
     unintegrated
+}
+
+/// Whether merging `member` into `branch` would change nothing, i.e. whether
+/// the round already carries this worker's content.
+///
+/// This is the squash/cherry-pick case: the worker's commits are not ancestors
+/// of the consolidator branch, but its *tree* is, because the consolidator took
+/// the change and committed it its own way. Refusing that round would punish the
+/// cleanest integration there is.
+///
+/// `git merge-tree --write-tree <branch> <member>` writes the merged tree
+/// without touching a single file or index entry. A clean merge answers with
+/// the tree it computed on stdout and exit code 0; comparing it with the
+/// branch's own tree is what makes "changes nothing" decidable. A conflict
+/// answers exit code 1 (or 128 for an unrelated failure) and is emphatically
+/// *not* integration -- the work is not on the branch, which is exactly what
+/// this check exists to catch.
+fn tree_already_in(repo: &Path, branch: &str, member: &str) -> bool {
+    let merged = git(
+        repo,
+        "merge-tree --write-tree",
+        &["merge-tree", "--write-tree", branch, member],
+    );
+    let Ok(merged) = merged else {
+        return false;
+    };
+    // Exit 1 is a conflict and anything above it is a git failure; only a
+    // clean merge (0) carries a tree to compare.
+    if !merged.status.success() {
+        return false;
+    }
+    let merged_tree = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let Ok(branch_tree) = git(
+        repo,
+        "rev-parse <branch>^{tree}",
+        &["rev-parse", &format!("{branch}^{{tree}}")],
+    ) else {
+        return false;
+    };
+    if !branch_tree.status.success() {
+        return false;
+    }
+    let branch_tree = String::from_utf8_lossy(&branch_tree.stdout);
+    let branch_tree = branch_tree.trim();
+    !merged_tree.is_empty() && merged_tree == branch_tree
 }
 
 /// Commits on `branch` that `ancestor` does not contain.

@@ -190,7 +190,6 @@ impl McpServer {
     }
 }
 
-pub(in crate::mcp) const ROLE_DESCRIPTION: &str =
-    "'consolidate': integrate this group's completed workers.";
+pub(in crate::mcp) const ROLE_DESCRIPTION: &str = "'consolidate': integrate this group.";
 
 pub(in crate::mcp) const SET_DESCRIPTION: &str = "'consolidate': amend, do not dispatch.";

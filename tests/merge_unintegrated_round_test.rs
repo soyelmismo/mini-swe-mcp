@@ -165,6 +165,22 @@ fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).expect("fixture file must be writable");
 }
 
+/// Whether `ancestor` is reachable from `descendant`, without the panic the
+/// shared `git` helper raises on a non-zero exit (this probe exits 1 by design).
+fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
+        .current_dir(repo)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// A member revised after the integration refuses the round, by name and with
 /// its unintegrated commit count.
 ///
@@ -285,6 +301,81 @@ fn merge_lands_a_round_whose_every_member_is_integrated() {
         );
     }
     assert!(!git_ref_exists(f.repo(), "worker-wa"));
+}
+
+/// A consolidator that integrated a worker by content, not by history, is
+/// integrated and merges without an override.
+///
+/// Round38's shape: the consolidator took worker-ce1813b4's change by squash or
+/// cherry-pick, so the worker's commits are not ancestors of the consolidator
+/// branch even though every line of the work is on it. An ancestry-only check
+/// refuses that round and pushes the orchestrator to steer or force a merge that
+/// is already correct -- so the content has to count as proof too.
+#[test]
+fn a_worker_integrated_by_squash_is_not_unintegrated() {
+    let f = Fixture::new("round-squash");
+    f.consolidator("c1", &["wa"]);
+    // Replace the merge of the worker's branch with an equivalent squash: the
+    // consolidated tree is unchanged, the history is not -- which is exactly
+    // what `cherry-pick` into the round leaves behind.
+    let consolidator = "worker-c1".to_string();
+    let before = git(
+        f.repo(),
+        &["rev-parse", &format!("{consolidator}^{{tree}}")],
+    );
+    git(f.repo(), &["checkout", "-q", &consolidator]);
+    git(f.repo(), &["reset", "-q", "--soft", "HEAD~1"]);
+    git(f.repo(), &["commit", "-q", "-m", "integrate wa (squashed)"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+    let after = git(
+        f.repo(),
+        &["rev-parse", &format!("{consolidator}^{{tree}}")],
+    );
+    assert_eq!(
+        before.trim(),
+        after.trim(),
+        "the squash must not change the round's content"
+    );
+
+    // The tree really is the same: only the history differs.
+    // The worker's commit is no longer reachable from the round: only history
+    // was rewritten, so the ancestry proof alone would refuse this merge. The
+    // test is meaningless without that, so it is asserted rather than assumed.
+    assert!(
+        !is_ancestor(f.repo(), "worker-wa", &consolidator),
+        "the squash must leave the worker's tip unreachable, or this is not the squash case"
+    );
+
+    assert!(
+        unintegrated_workers_in(&f.root(), "c1").is_empty(),
+        "a squash-integrated worker holds the round back"
+    );
+    f.merge("c1", false)
+        .expect("a round whose worker was integrated by content must merge");
+    assert!(f.repo().join("round.md").exists());
+}
+
+/// A member whose change the round does not carry at all is still refused,
+/// even when the merge is textually clean: git says what merges, the tree says
+/// what would change.
+#[test]
+fn a_worker_whose_content_is_absent_is_refused() {
+    let f = Fixture::new("round-absent");
+    f.consolidator("c1", &["wa"]);
+    // A second, unrelated commit on the worker's branch: it merges cleanly
+    // (different file) but its content is not on the round.
+    f.commit_on("worker-wa", "elsewhere.md", "not integrated\n", "more work");
+
+    let reported = unintegrated_workers_in(&f.root(), "c1");
+    assert_eq!(reported.len(), 1, "the new commit must be reported");
+    assert_eq!(reported[0].commits, 1);
+    let err = f
+        .merge("c1", false)
+        .expect_err("a member holding unintegrated work must refuse the round");
+    assert!(
+        format!("{err:#}").contains("wa"),
+        "the refusal names the worker"
+    );
 }
 
 /// The consolidator's completion path names the unintegrated worker, so the

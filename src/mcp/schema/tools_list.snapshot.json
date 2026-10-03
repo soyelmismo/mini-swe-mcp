@@ -38,7 +38,7 @@
             "type": "boolean"
           },
           "consolidate": {
-            "description": "Auto-consolidate the group when it stops: bool or model.",
+            "description": "Auto-consolidate the group when it stops.",
             "type": [
               "boolean",
               "string"
@@ -128,7 +128,7 @@
             "type": "string"
           },
           "role": {
-            "description": "'consolidate': integrate this group's completed workers.",
+            "description": "'consolidate': integrate this group.",
             "type": "string"
           },
           "scope": {
@@ -202,7 +202,7 @@
             "type": "integer"
           },
           "topic": {
-            "description": "Help topic; omitted: the index",
+            "description": "Help topic; omitted: index",
             "type": "string"
           },
           "verify": {
