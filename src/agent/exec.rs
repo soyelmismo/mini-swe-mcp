@@ -302,10 +302,9 @@ impl AgentRunner {
         // deleted with the worktree.
         let job_log_dir = self.job_handle().map(|_| tmp_dir.clone());
         match run_with_timeout(&mut cmd, timeout_secs, job_log_dir.as_deref()).await? {
-            RunOutcome::Finished { output, code } => Ok((
-                annotate_refused_write(dir, sandbox_target, &tmp_dir, output),
-                code,
-            )),
+            RunOutcome::Finished { output, code } => {
+                Ok((annotate_refused_write(dir, sandbox_target, output), code))
+            }
             RunOutcome::Backgrounded(backgrounded) => {
                 Ok(self.continue_as_job(*backgrounded, command).await)
             }
@@ -406,14 +405,24 @@ const DENIAL_MARKERS: &[&str] = &[
     "acesso negado",
 ];
 
+/// Whether `line` carries a filesystem refusal, in the host's own wording.
+fn mentions_denial(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    DENIAL_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Whether `path` is inside one of the roots a confined step may write to.
 ///
 /// Component-aware, so a root is never read as a mere string prefix of its
 /// neighbour (`/tmp/wt` does not cover `/tmp/wtx`).
 fn is_writable(roots: &WriteRoots, path: &Path) -> bool {
-    [roots.worktree.as_path(), roots.target.as_path(), roots.scratch.as_path()]
-        .iter()
-        .any(|root| path.starts_with(root))
+    [
+        roots.worktree.as_path(),
+        roots.target.as_path(),
+        roots.scratch.as_path(),
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
 }
 
 /// The absolute path a refusal line names, if it names one.
@@ -427,7 +436,10 @@ fn is_writable(roots: &WriteRoots, path: &Path) -> bool {
 fn denied_path(line: &str) -> Option<&str> {
     line.split_whitespace().find_map(|token| {
         let token = token.trim_matches(|c: char| {
-            matches!(c, '\'' | '"' | '`' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '>')
+            matches!(
+                c,
+                '\'' | '"' | '`' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '>'
+            )
         });
         let candidate = token.strip_suffix("'").unwrap_or(token);
         candidate.starts_with('/').then_some(candidate)
@@ -456,12 +468,16 @@ fn scratch_write_note_text(roots: &WriteRoots) -> String {
 /// that write (a read-only file, a missing parent directory), so pointing the
 /// model at `$TMPDIR` would misattribute an ordinary error to the sandbox.
 pub(crate) fn scratch_write_note(roots: &WriteRoots, output: &str) -> Option<String> {
-    output.lines().any(|line| {
-        let lower = line.to_lowercase();
-        DENIAL_MARKERS.iter().any(|marker| lower.contains(marker))
-            && denied_path(line).is_some_and(|path| !is_writable(roots, Path::new(path)))
-    })
-    .then(|| scratch_write_note_text(roots))
+    output
+        .lines()
+        .any(|line| {
+            // The path decides whether the note applies at all, so a line
+            // naming no absolute path is rejected before the message wording is
+            // matched and nothing is allocated for it.
+            denied_path(line)
+                .is_some_and(|path| !is_writable(roots, Path::new(path)) && mentions_denial(line))
+        })
+        .then(|| scratch_write_note_text(roots))
 }
 
 /// Append the writable-roots note when the sandbox refused a write outside
@@ -472,17 +488,11 @@ pub(crate) fn scratch_write_note(roots: &WriteRoots, output: &str) -> Option<Str
 /// the command failed exactly as the sandbox decided, and only the advice is
 /// added. Backgrounded commands report their output when the model waits on
 /// them (`continue_as_job`), where the job's tail carries the same message.
-fn annotate_refused_write(
-    worktree: &Path,
-    target: &Path,
-    tmp_dir: &Path,
-    output: String,
-) -> String {
-    let roots = WriteRoots {
-        worktree: worktree.to_path_buf(),
-        target: target.to_path_buf(),
-        scratch: tmp_dir.to_path_buf(),
-    };
+fn annotate_refused_write(worktree: &Path, target: &Path, output: String) -> String {
+    // `write_roots` derives the scratch root the way the child's `$TMPDIR`
+    // was derived, so the path the note names is the one the command already
+    // holds.
+    let roots = write_roots(worktree, target);
     match scratch_write_note(&roots, &output) {
         Some(note) => format!("{output}\n{note}"),
         None => output,
@@ -3082,7 +3092,7 @@ mod tests {
         )
         .expect("a denied write outside the worktree is detected");
         assert!(
-            note.contains(&roots.scratch.to_string_lossy()),
+            note.contains(roots.scratch.to_string_lossy().as_ref()),
             "the note must name $TMPDIR itself: {note}"
         );
         assert!(!note.contains("Note: $"), "{note}");
@@ -3095,11 +3105,17 @@ mod tests {
     fn an_unrelated_permission_error_inside_the_worktree_is_not_annotated() {
         let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
         assert_eq!(
-            scratch_write_note(&roots, "cp: cannot open '/tmp/wt/ro' for writing: Permission denied"),
+            scratch_write_note(
+                &roots,
+                "cp: cannot open '/tmp/wt/ro' for writing: Permission denied"
+            ),
             None
         );
         assert_eq!(
-            scratch_write_note(&roots, "error: opening '/tmp/wt/target/.git/config.lock': Permission denied"),
+            scratch_write_note(
+                &roots,
+                "error: opening '/tmp/wt/target/.git/config.lock': Permission denied"
+            ),
             None
         );
         // The shared build target is writable, so a refusal there is the same
@@ -3109,8 +3125,14 @@ mod tests {
             None
         );
         // No refusal at all, and a refusal naming no path, are not annotations.
-        assert_eq!(scratch_write_note(&roots, "test result: ok. 3 passed"), None);
-        assert_eq!(scratch_write_note(&roots, "error: sandbox refused the call"), None);
+        assert_eq!(
+            scratch_write_note(&roots, "test result: ok. 3 passed"),
+            None
+        );
+        assert_eq!(
+            scratch_write_note(&roots, "error: sandbox refused the call"),
+            None
+        );
         assert_eq!(scratch_write_note(&roots, ""), None);
     }
 
@@ -3159,18 +3181,20 @@ mod tests {
             .expect("the probe must spawn");
         let _ = std::fs::remove_dir_all(&tmp);
         let roots = write_roots(&tmp, &tmp);
-        // The annotation is appended only when the sandbox really refused a
-        // write outside the roots; on a host that allows /tmp it stays silent,
-        // so the assertion below is on the pairing, not on this host's policy.
-        assert_eq!(
-            scratch_write_note(&roots, &out).as_deref(),
-            (!out.contains("Permission denied") && !out.contains("Permiso denegado"))
-                .then(|| scratch_write_note_text(&roots))
-                .as_deref(),
-            "{out:?}"
-        );
-        if out.contains("Permission denied") || out.contains("Permiso denegado") {
+        let denied = out.contains("Permission denied") || out.contains("Permiso denegado");
+        if denied {
+            // The refusal must survive, and the note must tell the worker where
+            // it may write instead of the /tmp it just tried.
             assert_ne!(code, Some(0), "the write must stay refused: {out:?}");
+            assert_eq!(
+                scratch_write_note(&roots, &out).as_deref(),
+                Some(scratch_write_note_text(&roots).as_str()),
+                "{out:?}"
+            );
+        } else {
+            // A host that allows /tmp gets no annotation: claiming a denial
+            // that did not happen would teach the worker a false rule.
+            assert!(scratch_write_note(&roots, &out).is_none(), "{out:?}");
         }
     }
 

@@ -58,6 +58,8 @@ LOCATION & SCOPE:
 - You are ALREADY located at the root of the repository worktree ($PWD).
 - Never execute `cd` to parent directories (like /home/rot, /repo, or /). All repository files are right here in the current directory.
 
+WRITABLE PATHS: the sandbox only allows writing inside the worktree ($PWD) and $TMPDIR (your private scratch). Write scratch files under $TMPDIR; a write to /tmp or anywhere else fails with "Permission denied".
+
 WORKFLOW:
 1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files in the current repository.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
@@ -555,6 +557,18 @@ mod tests {
             "empty tool slice must be omitted, got {value}"
         );
         assert!(value.get("temperature").is_none());
+    }
+
+    /// The sandbox policy a worker cannot discover by trial and error is
+    /// stated up front: a refused write to `/tmp` costs a whole turn, so the
+    /// prompt names the two writable roots and the variable that holds them.
+    #[test]
+    fn the_system_prompt_states_the_writable_paths() {
+        assert!(
+            SYSTEM_PROMPT.contains("only allows writing inside the worktree")
+                && SYSTEM_PROMPT.contains("$TMPDIR"),
+            "the writable-paths rule must be in the system prompt"
+        );
     }
 
     #[test]
