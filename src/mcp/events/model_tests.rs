@@ -1415,7 +1415,7 @@ fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
         "metrics": WorkerMetrics::default(),
     });
     // The stall episode queues while the worker is idle and running.
-    router.observe_watch([("w0".to_string(), idle)].into());
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
     // The worker starts a wait: the same step, now with a command in flight.
     let mut waiting = idle.clone();
     waiting["command_started_at"] = json!(now);
@@ -1671,4 +1671,43 @@ fn the_real_snapshot_routes_a_steered_worker_to_its_live_consolidator() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     });
+}
+
+/// A queued stall must not make an `--all` round report a worker that is now
+/// running a command.
+///
+/// The worker stalled while it was idle, then started a harness-side wait
+/// (`CONSOLIDATE_WAIT`, `WAIT_JOB`), which the detector holds in flight as
+/// work. The queued episode stays in the backlog, where the round oracle counts
+/// it as an unacknowledged transition, so the round reported the group as
+/// needing attention and its line read `no step for 1800s` -- for a worker that
+/// is provably doing something. The round must stay silent: the idle clock the
+/// round reads is the stall rule's own, and it holds the command in flight.
+#[test]
+fn a_queued_stall_does_not_report_a_worker_with_a_command_in_flight() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    // The stall episode queues while the worker is idle and running.
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
+    // The worker starts a wait: the same step, now with a command in flight.
+    let mut waiting = idle.clone();
+    waiting["command_started_at"] = json!(now);
+    waiting["last_step_at"] = json!(now.saturating_sub(1800));
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    let round = router
+        .watch_reply(&ctx, &json!({"worker_ids":[], "group":"g", "initial":false, "all":true}))
+        .unwrap();
+    assert_eq!(
+        round["events"],
+        json!([]),
+        "a worker with a command in flight must not be reported stalled: {round}"
+    );
 }
