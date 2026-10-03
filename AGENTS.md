@@ -39,7 +39,7 @@ system prompt at dispatch time, so keep them short and actionable.
 
 - Give every file, directory, daemon or registry a test touches a temporary
   location passed to the code under test; the scratch helpers live in
-  `tests/common/`.
+  `tests/it/common/`.
 - Do not mutate process-global state (environment variables) in tests that run
   in parallel.
 - Do not write to the real registry, hub or repository.
@@ -65,7 +65,7 @@ system prompt at dispatch time, so keep them short and actionable.
 - Locate code by name, not by the line numbers in the task: they may be stale.
 - List in your REPORT any file outside the task's scope you had to touch.
 - Never modify `models.yaml`: it is the operator's model catalog, not the task's.
-- Reuse existing helpers (`tests/common/`, module-level functions) instead of
+- Reuse existing helpers (`tests/it/common/`, module-level functions) instead of
   copying a block of logic into a second place.
 - Keep the diff to the task's scope, and file each test where the area's own
   tests live (`## What deserves a test`).
