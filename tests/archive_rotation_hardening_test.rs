@@ -209,7 +209,10 @@ fn a_symlinked_lock_file_still_lands_the_report() {
         .expect("a report must survive a lock that cannot be taken");
 
     let meta = std::fs::symlink_metadata(&lock).expect("the planted link must still exist");
-    assert!(meta.file_type().is_symlink(), "the link must be left as it was");
+    assert!(
+        meta.file_type().is_symlink(),
+        "the link must be left as it was"
+    );
     assert_eq!(
         std::fs::read_to_string(&victim).expect("the victim is readable"),
         "important\n",
