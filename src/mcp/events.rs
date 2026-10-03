@@ -2137,6 +2137,10 @@ impl EventRouter {
             .filter_map(|v| v["worker_id"].as_str().map(str::to_string))
             .collect();
         let mut events = Vec::new();
+        // Stale stall episodes dropped from this reply: the loop below reads the
+        // backlog through a shared borrow, so they are collected here and
+        // forgotten once that borrow is released.
+        let mut suppressed: Vec<String> = Vec::new();
         for (agent, history) in &self.watch_history {
             if !ctx.is_admin() && *agent != owner {
                 continue;
@@ -2167,7 +2171,10 @@ impl EventRouter {
                         == 0
                         && !current["waiting_for_slot"].is_number()
                     {
-                        self.suppress_stall(v["worker_id"].as_str().unwrap_or_default(), owner);
+                        // Collected, not acted on: the loop below holds the
+                        // backlog borrowed, so the drop happens once it is
+                        // released.
+                        suppressed.push(v["worker_id"].as_str().unwrap_or("").to_string());
                         continue;
                     }
                     let now = crate::pool::unix_timestamp();
@@ -2182,6 +2189,11 @@ impl EventRouter {
                 event["dropped_events"] = json!(history.dropped);
                 events.push(event);
             }
+        }
+        // The stale episodes are now dropped and marked seen, so a later watch
+        // does not replay a stall the detector itself would never have raised.
+        for wid in &suppressed {
+            self.mark_seen(&owner, wid.as_str());
         }
         events.sort_by_key(|v| v["sequence"].as_u64());
         // An explicit terminal id is reported immediately even if another

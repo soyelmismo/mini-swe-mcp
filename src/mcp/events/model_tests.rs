@@ -1442,6 +1442,47 @@ fn a_replayed_stall_does_not_count_a_command_in_flight_as_idle() {
     );
 }
 
+/// A stale stall for a worker that started a command is dropped, not delivered.
+///
+/// The episode queued while the worker was idle; it then started a long
+/// harness-side wait, which the stall rule holds in flight as work. Delivering
+/// the queued stall told the owner a working consolidator had stalled and
+/// suggested killing it. The episode must be dropped and marked seen, so it does
+/// not come back on a later watch either.
+#[test]
+fn a_stale_stall_is_dropped_once_the_worker_starts_a_command() {
+    let mut router = EventRouter::default();
+    let now = crate::pool::unix_timestamp();
+    let idle = json!({
+        "worker_id": "w0", "owner": "o", "group": "g", "model": "t",
+        "status": "running", "step": 0, "revision": 0,
+        "branch": "worker-w0", "last_step_at": now.saturating_sub(601),
+        "metrics": WorkerMetrics::default(),
+    });
+    // The stall episode queues while the worker is idle and running.
+    router.observe_watch([("w0".to_string(), idle.clone())].into());
+    // The worker starts a wait: same step, now with a command in flight.
+    let mut waiting = idle;
+    waiting["command_started_at"] = json!(now);
+    router.observe_watch([("w0".to_string(), waiting)].into());
+    let mut ctx = crate::mcp::server::ConnectionContext::hub_connection(1);
+    ctx.agent_id = Some("o".into());
+    let params = json!({"worker_ids":[], "group":"g", "initial":false});
+    let first = router.watch_reply(&ctx, &params).unwrap();
+    assert_eq!(
+        first["events"],
+        json!([]),
+        "a stale stall must be dropped, not delivered: {first}"
+    );
+    // It is gone from the backlog too, so a later watch cannot replay it.
+    let second = router.watch_reply(&ctx, &params).unwrap();
+    assert_eq!(
+        second["events"],
+        json!([]),
+        "a dropped stall must not come back: {second}"
+    );
+}
+
 /// A dead consolidator owns no question: it must reach the owner's watch.
 ///
 /// A consolidator steered the worker, so a `SteerSource` names it; then the
