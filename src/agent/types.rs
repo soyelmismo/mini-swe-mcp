@@ -325,6 +325,10 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub(crate) delta: StreamDelta,
+    /// Why the provider stopped generating. `None` when the provider sends no
+    /// such field at all.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -388,6 +392,9 @@ pub(crate) struct ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatChoice {
     pub(crate) message: ChatMessageOutput,
+    /// Why the provider stopped generating; see [`StreamChoice::finish_reason`].
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +460,25 @@ pub struct LlmResponse {
     /// lossily. Surfaced so fleet-wide corruption is observable rather than
     /// silently absorbed.
     pub invalid_utf8_lines: usize,
+    /// The provider's own `finish_reason` for the reply, when it sent one.
+    /// `length` and `content_filter` mean the reply is incomplete, so a turn
+    /// with no command out of them is a provider problem, not a model refusal.
+    pub finish_reason: Option<String>,
+}
+
+impl LlmResponse {
+    /// Whether the provider cut the reply short: the context window filled up
+    /// (`length`) or a filter stopped the generation.
+    ///
+    /// Both leave the turn without a tool call, which the engine would
+    /// otherwise read as a model that forgot the tool contract and answer with
+    /// the same nudge forever -- the failure that ran one worker for 55 turns.
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("content_filter")
+        )
+    }
 }
 
 /// Cheap `call_xxxxxxxx` identifier derived from the low 32 bits of a UUID.
