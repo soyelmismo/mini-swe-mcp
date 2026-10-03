@@ -21,7 +21,7 @@
 //! sentinel → record → next turn" is readable end to end in one place.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -590,6 +590,9 @@ impl WorkerPool {
 
         // The security review's approval, resolved after the tree is finalized.
         let mut security_review_head: Option<String> = None;
+        // The *tree* the security review approved, as the reviewer left it.
+        // The commit that carries it is the harness's, made after this block.
+        let mut security_review_tree: Option<String> = None;
         let mut security_approved = false;
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
@@ -762,11 +765,13 @@ impl WorkerPool {
             completed |= outcome.completed;
             if let Some(security) = outcome.security {
                 meta.security_review = Some(security);
-                // The tree as the reviewer left it. The commit that *contains*
-                // the audited code is the harness's, made after this block, so
-                // this is the fallback approval for the case where that commit
-                // cannot be trusted to be the same tree.
+                // The tree as the reviewer left it, snapshotted through a
+                // temporary index so the real one is untouched. The commit that
+                // *contains* the audited code is the harness's, made after this
+                // block, so the pre-commit HEAD is only the fallback for the
+                // case where that commit cannot be trusted to be the same tree.
                 security_review_head = self::review::head_commit_of(&worktree.path).await;
+                security_review_tree = self::review::snapshot_worktree_tree(&worktree.path).await;
                 // Only a review that actually completed approves anything. A
                 // reviewer that gave up quietly or ran out of turns audited
                 // nothing, and recording an approval for it would suppress every
@@ -836,9 +841,13 @@ impl WorkerPool {
         // names less code than was reviewed, so the difference is re-reviewed
         // rather than missed.
         if security_approved {
-            let unchanged =
-                self::review::tree_matches_head(&worktree.path, &security_review_head).await;
-            meta.security_approved_commit = if unchanged {
+            let reviewed = self::review::commit_matches_snapshot(
+                &worktree.path,
+                &security_review_tree,
+                &head_commit,
+            )
+            .await;
+            meta.security_approved_commit = if reviewed {
                 head_commit.clone().or(security_review_head.clone())
             } else {
                 security_review_head.clone()
@@ -1076,4 +1085,24 @@ fn finalize_worktree(input: FinalizeInput) -> Result<FinalizedWork> {
         head_commit,
         unix_timestamp(),
     ))
+}
+
+/// Snapshot the working tree at `path` the way a finishing security review
+/// does (test support).
+///
+/// The probe is what decides which commit a security approval names, and a
+/// test that cannot take the snapshot cannot drive the guard that consumes it.
+#[doc(hidden)]
+pub async fn __test_snapshot_worktree_tree(path: &Path) -> Option<String> {
+    self::review::snapshot_worktree_tree(path).await
+}
+
+/// Whether `head_commit` is the tree `snapshot` recorded (test support).
+#[doc(hidden)]
+pub async fn __test_commit_matches_snapshot(
+    path: &Path,
+    snapshot: &Option<String>,
+    head_commit: &Option<String>,
+) -> bool {
+    self::review::commit_matches_snapshot(path, snapshot, head_commit).await
 }
