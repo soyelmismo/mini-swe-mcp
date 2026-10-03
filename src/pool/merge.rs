@@ -1116,9 +1116,8 @@ fn unintegrated_members(
             }
         }
         // The content proof: a member whose commits are not reachable may still
-        // have been taken by content (squash, cherry-pick). Proved per commit,
-        // not by comparing trees -- see `every_commit_taken_by_content`.
-        if every_commit_taken_by_content(repo, branch, &member) {
+        // have been taken by content -- see `tree_already_in`.
+        if tree_already_in(repo, branch, &member) {
             continue;
         }
         report(unintegrated_commit_count(repo, &member, branch));
@@ -1190,63 +1189,64 @@ fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     members.into_iter().collect()
 }
 
-/// Whether every commit `branch` does not carry was nonetheless taken onto
-/// `branch` by content -- the squash / cherry-pick case, where the worker's
-/// commits are not ancestors of the round although every line of the work is on
-/// it. Refusing such a round would punish the cleanest integration there is.
+/// Whether merging `member` into `branch` would change nothing, i.e. whether
+/// the round already carries this worker's content.
 ///
-/// The proof is per commit, and it has to be: a *net* comparison cannot answer
-/// it. Asking only whether merging the member into the branch would change
-/// nothing cannot tell a member whose commits cancel out -- one that added a
-/// file, and a second that deleted it -- from an integrated one, and so waves a
-/// genuinely unintegrated branch through: the round lands while commits only
-/// that branch has stay unlanded, which is the failure this check exists to
-/// prevent. A patch-equivalence walk has no such blind spot.
+/// This is the squash / cherry-pick case, and the reason the check has a second
+/// proof at all: the consolidator took the worker's change and committed it its
+/// own way, so the worker's commits are not ancestors of the round although
+/// every line of the work is on it. Refusing that round would punish the
+/// cleanest integration there is.
 ///
-/// `git cherry <branch> <member>` is that walk: it lists each commit of
-/// `member` absent from `branch`, marked `-` when a patch-equivalent commit is
-/// already upstream and `+` when it is not. Only an all-`-` listing proves the
-/// round took the work; a single `+` means the member holds the round back.
+/// `git merge-tree --write-tree <branch> <member>` computes the merged tree
+/// without touching a single file or index entry. Exit code 0 with the merged
+/// tree on the first line of stdout is a *clean* merge, and that tree being the
+/// branch's own tree is what makes "changes nothing" decidable: the work is
+/// already on the branch, however it got there.
 ///
-/// A listing git could not produce is not proof: nothing is taken by content
-/// until git says so. An empty listing is not proof either -- a member that
-/// carries commits always has some to list, so emptiness means the walk
-/// answered nothing, which is "unproven" and must refuse like any other
-/// unproven probe.
-fn every_commit_taken_by_content(repo: &Path, branch: &str, member: &str) -> bool {
-    let out = git(
+/// The exit code is load-bearing and must not be ignored. A conflict answers 1,
+/// and a conflict is emphatically not integration -- the work is not on the
+/// branch, which is exactly what this check exists to catch. Anything above 1 is
+/// a git failure, which proves nothing either way, so both refuse.
+///
+/// The definition is deliberately the tree's, not each commit's: a member whose
+/// commits net out to no change at all (added a file, then deleted it) merges
+/// to the branch's own tree and is therefore integrated. That is the contract
+/// this check states -- "the round's content holds this work" -- and it is the
+/// orchestrator's to change, not a per-commit patch walk's to decide.
+fn tree_already_in(repo: &Path, branch: &str, member: &str) -> bool {
+    let merged = git(
         repo,
-        "cherry <branch> <member>",
-        &["cherry", branch, member],
+        "merge-tree --write-tree",
+        &["merge-tree", "--write-tree", branch, member],
     );
-    let Ok(out) = out else {
+    let Ok(merged) = merged else {
         return false;
     };
-    if !out.status.success() {
+    // 0 is a clean merge and only a clean merge carries a tree to compare. A
+    // conflict (1) and a git failure (anything else) both mean "not integrated".
+    if !merged.status.success() {
         return false;
     }
-    let listed = String::from_utf8_lossy(&out.stdout);
-    let mut commits = 0usize;
-    for line in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let Some(mark) = line.split_whitespace().next() else {
-            return false;
-        };
-        match mark {
-            // `-`: this commit's patch is already upstream on `branch`, which is
-            // what a squash or a cherry-pick of the member's work leaves behind.
-            "-" => commits += 1,
-            // `+`: a patch `branch` does not carry. The member is holding the
-            // round back -- even if another of its commits nets the tree out to
-            // the branch's own, the round does not contain this work.
-            "+" => return false,
-            // Anything else is not a verdict this check knows how to read.
-            _ => return false,
-        }
+    let merged_stdout = String::from_utf8_lossy(&merged.stdout);
+    let merged_tree = merged_stdout.lines().next().unwrap_or_default().trim();
+    if merged_tree.is_empty() {
+        return false;
     }
-    // Nothing to prove is nothing held back, but only when git actually
-    // answered: an empty listing from a member that *does* carry commits is
-    // exactly the shape a failed walk produces, so it must not read as proof.
-    commits > 0
+    let branch_tree = git(
+        repo,
+        "rev-parse <branch>^{tree}",
+        &["rev-parse", &format!("{branch}^{{tree}}")],
+    );
+    let Ok(branch_tree) = branch_tree else {
+        return false;
+    };
+    if !branch_tree.status.success() {
+        return false;
+    }
+    let branch_tree = String::from_utf8_lossy(&branch_tree.stdout);
+    let branch_tree = branch_tree.trim();
+    !branch_tree.is_empty() && merged_tree == branch_tree
 }
 
 /// Commits on `branch` that `ancestor` does not contain.
