@@ -532,3 +532,36 @@ fn test_the_emitted_prompt_section_fits_the_documented_cap() {
         "a block cut to fit is marked as cut: {section}"
     );
 }
+
+/// The cap bounds the *emitted* section, not just the bullets behind it: a block
+/// whose bullets total just under `MAX_MODEL_INSTRUCTIONS_BYTES` still gains the
+/// `\n\n`+header framing when rendered, so it must be cut too, or the prompt
+/// overruns the very budget the docs promise. This is the boundary the
+/// many-short-entries case above cannot reach (it is always far over budget).
+#[test]
+fn test_a_block_under_the_bullet_budget_but_over_the_section_budget_is_cut() {
+    let header = "Model-specific instructions (declared for this model in models.yaml):";
+    // Bullets alone fit within the cap...
+    let entry_len = MAX_MODEL_INSTRUCTIONS_BYTES - 2 - header.len() - 1;
+    let entry = "a".repeat(entry_len);
+    let yaml = format!(
+        "models:\n  small:\n    id: combo:small\n    instructions:\n      - {entry}\n      - tail\n"
+    );
+    let raw: ModelManifest = serde_yaml::from_str(&yaml).expect("parses");
+    let manifest = raw.normalize();
+
+    let repo = TempDir::new_in_tmp("model-instructions-section-budget");
+    let with = build_system_prompt(&manifest, repo.path(), "small");
+    let without = build_system_prompt(&manifest, repo.path(), "other");
+    let section = with.trim_start_matches(&without);
+
+    assert!(
+        section.len() <= MAX_MODEL_INSTRUCTIONS_BYTES,
+        "the emitted section must fit the {MAX_MODEL_INSTRUCTIONS_BYTES}-byte cap, but is {} bytes",
+        section.len()
+    );
+    assert!(
+        section.contains("[truncated"),
+        "a block that only fits once the framing is counted must be marked cut: {section}"
+    );
+}

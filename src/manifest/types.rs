@@ -58,19 +58,28 @@ pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 4 * 1024;
 /// section overrun the very cap it claims to enforce.
 pub(crate) const BULLET_PREFIX: &str = "- ";
 
-/// Bytes the prompt spends on everything *around* the instruction bullets: the
-/// two leading newlines, the `Model-specific instructions` header line and, for a
-/// cut block, the truncation note.
+/// Bytes the prompt spends on the framing *around* the instruction bullets
+/// whether or not the block is cut: the two leading newlines, the
+/// `Model-specific instructions` header line and its trailing newline.
+///
+/// This is what a *complete* block adds on top of its bullets, so
+/// [`ModelInstructions::truncate_to`] compares the emitted section against the
+/// budget with it, not against the bullets alone: a block whose bullets fit
+/// under the cap can still push the rendered section over it. Built from the
+/// renderer's own text by `catalog`, so the two cannot drift apart.
+pub(crate) const FRAMING_OVERHEAD: usize = 2
+    + super::catalog::MODEL_INSTRUCTIONS_HEADER.len()
+    + 1;
+
+/// Bytes the prompt spends on everything *around* the instruction bullets when
+/// the block has been cut: [`FRAMING_OVERHEAD`] plus the truncation note and its
+/// trailing newline.
 ///
 /// Reserved out of [`MAX_MODEL_INSTRUCTIONS_BYTES`] by
 /// [`ModelInstructions::truncate_to`] so the rendered section — not merely the
-/// bullets behind it — fits the budget. The value is built from the renderer's
-/// own text by `catalog`, so the two cannot drift apart.
-pub(crate) const SECTION_OVERHEAD: usize = 2
-    + super::catalog::MODEL_INSTRUCTIONS_HEADER.len()
-    + 1
-    + super::catalog::MODEL_INSTRUCTIONS_TRUNCATION_NOTE.len()
-    + 1;
+/// bullets behind it — fits the budget even after the note is appended.
+pub(crate) const SECTION_OVERHEAD: usize =
+    FRAMING_OVERHEAD + super::catalog::MODEL_INSTRUCTIONS_TRUNCATION_NOTE.len() + 1;
 
 /// Inclusive bounds every sampling temperature is clamped into before it can
 /// reach a provider. OpenAI-compatible endpoints reject values outside this
@@ -275,7 +284,11 @@ impl ModelInstructions {
     /// [`Self::is_truncated`] is set, and running this on an already-cut block is
     /// a no-op, which keeps normalizing idempotent.
     pub(crate) fn truncate_to(&mut self, max_bytes: usize) -> bool {
-        if self.rendered_len() <= max_bytes {
+        // A *complete* block adds the framing on top of its bullets, so the
+        // no-cut case must fit the section, not just the bullets: a block whose
+        // bullets alone sit under the cap can still overrun the budget once the
+        // header is counted.
+        if FRAMING_OVERHEAD + self.rendered_len() <= max_bytes {
             return false;
         }
 
