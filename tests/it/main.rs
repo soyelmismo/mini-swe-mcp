@@ -60,6 +60,7 @@ mod manifest_test;
 mod mcp_test;
 mod merge_batch_test;
 mod merge_test;
+mod merge_unintegrated_round_test;
 mod pool_test;
 mod probe_symlink;
 mod read_only_escalation_test;

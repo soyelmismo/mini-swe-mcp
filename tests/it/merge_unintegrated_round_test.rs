@@ -11,9 +11,7 @@
 //! Every test owns its own repository and its own scratch root: nothing here
 //! touches the developer's repository, the real registry or the host.
 
-mod common;
-
-use common::{TempDir, git, git_ref_exists};
+use crate::common::{TempDir, git, git_ref_exists};
 use mini_swe_mcp::agent::{ChatMessage, Role};
 use mini_swe_mcp::pool::{
     MergeApprovedRequest, MergeRequest, RegistryStatus, WorkerApproval, WorkerHistory,
