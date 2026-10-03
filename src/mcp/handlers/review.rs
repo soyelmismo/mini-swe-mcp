@@ -702,8 +702,7 @@ pub(super) fn diff_stat_value(stats: &[DiffFileStat]) -> Value {
     })
 }
 
-pub(in crate::mcp) const DIFF_DESCRIPTION: &str =
-    "Diff scope for 'review': 'code' (default) hides tests, 'all' all, 'none' none.";
+pub(in crate::mcp) const DIFF_DESCRIPTION: &str = "Diff scope for 'review'; 'code' hides tests.";
 
 #[cfg(test)]
 mod tests {

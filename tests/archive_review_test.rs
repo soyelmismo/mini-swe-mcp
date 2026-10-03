@@ -213,11 +213,6 @@ fn no_delete_archives_nobody() {
     let mut row = load_registry_entry_in(&f.root(), "w1").expect("the row survived");
     row.keep_branch = false;
     save_registry_entry_in(&f.root(), &row);
-    // The gate needs something to run: an empty manifest makes
-    // `detect_verify_command` fall through, and "unknown" never skips it.
-    // The gate needs something to run: a repository with no recognised manifest
-    // has no detectable verify command, and "unknown" never skips the gate.
-    std::fs::write(f.repo.path().join("Makefile"), "test:\n\t@true\n").expect("writable");
     merge_worker_in(
         &f.root(),
         &MergeRequest {

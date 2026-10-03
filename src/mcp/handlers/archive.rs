@@ -19,7 +19,11 @@ impl McpServer {
         args: &Value,
         ctx: &crate::mcp::server::ConnectionContext,
     ) -> Result<Value> {
-        let owner = if ctx.is_admin() {
+        // The same gate `list` uses, so the advertised `'list'/'archive' scope`
+        // knob really works here: an admin asking for every owner's archive gets
+        // it, and a non-admin asking for one is *refused* rather than silently
+        // handed their own rows, which would read as "nobody else ever retired".
+        let owner = if Self::lists_every_agent(args, ctx)? {
             None
         } else {
             Some(ctx.agent().to_string())
