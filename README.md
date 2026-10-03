@@ -259,15 +259,15 @@ Defaults are what the code uses when the variable is unset.
 
 ## Load testing
 
-`tests/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub daemon out to many agents of many workers and asserts the hub keeps the machine busy without memory pressure. It is excluded from `cargo test` so the normal suite stays fast — run it explicitly:
+`tests/it/load_test.rs` is an opt-in (`#[ignore]`) load test: it fans one real hub daemon out to many agents of many workers and asserts the hub keeps the machine busy without memory pressure. It is excluded from `cargo test` so the normal suite stays fast — run it explicitly:
 
 ```bash
 # Quick smoke: 2 agents x 3 workers (the defaults), ~5 s.
-cargo test --test load_test -- --ignored --nocapture
+cargo test --test it load_test:: -- --ignored --nocapture
 
 # Full load: 5 agents x 20 workers (100 total), ~75 s on 4 cores.
 LOAD_AGENTS=5 LOAD_WORKERS_PER_AGENT=20 \
-    cargo test --test load_test -- --ignored --nocapture
+    cargo test --test it load_test:: -- --ignored --nocapture
 ```
 
 Every worker is driven by a fake OpenAI-compatible SSE server (`tests/common/fake_llm.rs`) that scripts three turns: a light command (`ls`), a heavy command (`cargo build` plus a bounded CPU burn, classified heavy by `is_heavy_command` so the pool's admission controller has to dose it), then the completion sentinel. The test dispatches each worker over the hub socket with a distinct agent identity (`agent-1`..`agent-5`) in `hub/hello`, samples the daemon's `/proc/<pid>/status` `VmHWM`/`VmRSS` every 250 ms, counts the heavy commands in flight by watching the daemon's children, and records the order workers finish in. It then asserts — and prints a one-screen report of:
