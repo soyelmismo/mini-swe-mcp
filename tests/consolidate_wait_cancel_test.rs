@@ -83,10 +83,11 @@ fn an_aborted_wait_releases_its_claim_on_the_command_label() {
         insert_live_worker(&pool, &harness.root(), &consolidator).await;
         let wait_pool = pool.clone();
         let wait_worker = worker.clone();
+        let wait_meta = consolidator_meta(&consolidator);
         let wait = tokio::spawn(async move {
             wait_pool
                 .consolidate_wait(
-                    &consolidator_meta(&consolidator),
+                    &wait_meta,
                     &[wait_worker],
                     // Long enough that the wait is still in flight when the
                     // abort lands: the wait only ends on its own when the

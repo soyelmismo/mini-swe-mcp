@@ -1441,8 +1441,10 @@ fn a_stall_is_not_delivered_for_a_step_that_started_a_command() {
 /// The episode queued while the worker was idle; it then started a long
 /// harness-side wait, which the stall rule holds in flight as work. Delivering
 /// the queued stall told the owner a working consolidator had stalled and
-/// suggested killing it. The episode must be dropped and marked seen, so it does
-/// not come back on a later watch either.
+/// suggested killing it. The episode must leave the backlog, so it does not
+/// come back on a later watch either -- but only the episode: acknowledging it
+/// would record an ack for the worker's last reported event and swallow a
+/// later real one.
 #[test]
 fn a_stale_stall_is_dropped_once_the_worker_starts_a_command() {
     let mut router = EventRouter::default();
