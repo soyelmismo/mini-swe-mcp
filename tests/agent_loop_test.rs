@@ -1266,7 +1266,16 @@ async fn a_worker_that_stops_changing_anything_is_told_to_stop_exploring() {
 #[tokio::test]
 async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
     let repo = TestRepo::new("compact-history");
-    let reasoning = "r".repeat(60 * 1024);
+    // The reasoning is long *and* real prose that differs per turn: the
+    // degeneracy guard must not read a large thinking block as filler, and a
+    // script that repeated one value verbatim would be the collapse that guard
+    // exists to park, not a conversation worth measuring a budget on.
+    let reasonings: Vec<String> = (1..=40)
+        .map(|turn| {
+            format!("Turn {turn}: the output was large, so the next command stays short. ")
+                .repeat(60 * 1024 / 64)
+        })
+        .collect();
     let prose = "p".repeat(4096);
     let mut script: Vec<ScriptedTurn> = (1..=40)
         .map(|turn| {
@@ -1275,7 +1284,7 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
                 &format!("printf '%016000d\\n' {turn}"),
             );
             response.push(frame(&json!({
-                "choices": [{"delta": {"reasoning_content": reasoning, "content": prose}}]
+                "choices": [{"delta": {"reasoning_content": reasonings[turn - 1], "content": prose}}]
             })));
             response
         })
@@ -1327,7 +1336,7 @@ async fn long_conversation_requests_keep_full_exchanges_within_byte_budget() {
                     .ends_with(" [prose elided]")
             );
         } else {
-            assert_eq!(assistant["reasoning_content"], reasoning);
+            assert_eq!(assistant["reasoning_content"], json!(reasonings[i]));
             assert_eq!(assistant["content"], prose);
         }
     }

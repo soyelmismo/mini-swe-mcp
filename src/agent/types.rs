@@ -58,6 +58,8 @@ LOCATION & SCOPE:
 - You are ALREADY located at the root of the repository worktree ($PWD).
 - Never execute `cd` to parent directories (like /home/rot, /repo, or /). All repository files are right here in the current directory.
 
+WRITABLE PATHS: the sandbox only allows writing inside the worktree ($PWD) and $TMPDIR (your private scratch). Write scratch files under $TMPDIR; a write to /tmp or anywhere else fails with "Permission denied".
+
 WORKFLOW:
 1. Explore: Use tools like `git status`, `find`, `grep -rn`, or `ls` to locate relevant files in the current repository.
 2. Edit & Test: Make minimal, clean edits (using sed, python, cat << 'EOF', etc.) and run existing test suites to verify.
@@ -162,6 +164,29 @@ pub fn with_replayed_reasoning(messages: &[ChatMessage]) -> std::borrow::Cow<'_,
         message.reasoning_content = Some(String::new());
     }
     std::borrow::Cow::Owned(owned)
+}
+
+/// Drop the reasoning of every assistant turn in `messages`.
+///
+/// Thinking-mode providers need the field *present* (see
+/// [`with_replayed_reasoning`]), but a value that is degenerate -- one short
+/// pattern repeated, or the same text echoed for turn after turn -- is exactly
+/// what the model then copies, so the degenerate value has to go while the
+/// field stays. The reasoning is replaced with an empty string rather than
+/// removed, which is the shape a thinking-mode provider accepts for a turn the
+/// model answered without reasoning.
+///
+/// Returns the number of turns it emptied. The caller already holds the
+/// messages; nothing else in the conversation changes.
+pub fn strip_replayed_reasoning(messages: &mut [ChatMessage]) -> usize {
+    let mut emptied = 0usize;
+    for message in messages.iter_mut() {
+        if message.role() == Role::Assistant && message.reasoning_content().is_some() {
+            message.replace_reasoning_content(String::new());
+            emptied += 1;
+        }
+    }
+    emptied
 }
 
 /// Outbound `tool_calls` entry of an assistant message.
@@ -325,6 +350,10 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub(crate) delta: StreamDelta,
+    /// Why the provider stopped generating. `None` when the provider sends no
+    /// such field at all.
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -388,6 +417,9 @@ pub(crate) struct ChatCompletionResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ChatChoice {
     pub(crate) message: ChatMessageOutput,
+    /// Why the provider stopped generating; see [`StreamChoice::finish_reason`].
+    #[serde(default, deserialize_with = "deserialize_null_tolerant")]
+    pub(crate) finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +485,25 @@ pub struct LlmResponse {
     /// lossily. Surfaced so fleet-wide corruption is observable rather than
     /// silently absorbed.
     pub invalid_utf8_lines: usize,
+    /// The provider's own `finish_reason` for the reply, when it sent one.
+    /// `length` and `content_filter` mean the reply is incomplete, so a turn
+    /// with no command out of them is a provider problem, not a model refusal.
+    pub finish_reason: Option<String>,
+}
+
+impl LlmResponse {
+    /// Whether the provider cut the reply short: the context window filled up
+    /// (`length`) or a filter stopped the generation.
+    ///
+    /// Both leave the turn without a tool call, which the engine would
+    /// otherwise read as a model that forgot the tool contract and answer with
+    /// the same nudge forever -- the failure that ran one worker for 55 turns.
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("content_filter")
+        )
+    }
 }
 
 /// Cheap `call_xxxxxxxx` identifier derived from the low 32 bits of a UUID.
@@ -555,6 +606,18 @@ mod tests {
             "empty tool slice must be omitted, got {value}"
         );
         assert!(value.get("temperature").is_none());
+    }
+
+    /// The sandbox policy a worker cannot discover by trial and error is
+    /// stated up front: a refused write to `/tmp` costs a whole turn, so the
+    /// prompt names the two writable roots and the variable that holds them.
+    #[test]
+    fn the_system_prompt_states_the_writable_paths() {
+        assert!(
+            SYSTEM_PROMPT.contains("only allows writing inside the worktree")
+                && SYSTEM_PROMPT.contains("$TMPDIR"),
+            "the writable-paths rule must be in the system prompt"
+        );
     }
 
     #[test]

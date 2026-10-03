@@ -34,4 +34,5 @@ pub use stream::extract_command;
 pub use types::{
     AgentStepLog, ChatMessage, DEFAULT_STREAM_IDLE_TIMEOUT, LlmResponse,
     MAX_STREAMED_CONTENT_BYTES, MAX_TOOL_ARGUMENT_BYTES, Role, SYSTEM_PROMPT, ToolCall, ToolCallFn,
+    strip_replayed_reasoning,
 };
