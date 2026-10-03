@@ -330,7 +330,9 @@ fn log_nonce_of(root: &ScratchRoot) -> Option<String> {
     // process on a later call). Anything else -- a planted file, a link, a
     // world-readable one -- is refused, because a nonce read from it is not a
     // secret this pool holds.
-    read_back_owned_nonce(&path)
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    let our_uid = unsafe { libc::getuid() };
+    read_back_owned_nonce(&path, our_uid)
 }
 
 /// Create the nonce file exclusively, refusing a link and an existing name.
@@ -348,11 +350,17 @@ fn create_nonce_exclusive(path: &Path, value: &str) -> std::io::Result<()> {
 /// Read the nonce back, but only from a file this pool can prove it wrote.
 ///
 /// The proof is ownership plus owner-only permissions: the file was created by
-/// this process or by a peer pool process running as the same user, it is a
-/// regular file rather than a link or a device, and nothing outside this user
-/// can read it. A planted file in a shared base is readable and writable by
-/// whoever planted it, and is refused rather than believed.
-fn read_back_owned_nonce(path: &Path) -> Option<String> {
+/// this process or by a peer pool process running as the same user, it is
+/// owned by this pool's own uid, it is a regular file rather than a link or a
+/// device, and nothing outside this user can read it. A planted file in a
+/// shared base is readable and writable by whoever planted it, and is refused
+/// rather than believed. The uid check is what separates a file this pool's
+/// user created from one a *different* local user pre-created at the fixed,
+/// predictable name: the two are indistinguishable by mode alone (both can be
+/// `0600`), so without it a foreign-owner file would be adopted as this pool's
+/// secret and could sign forged steer-log records that the consolidator then
+/// renders as the orchestrator's own scope amendments.
+fn read_back_owned_nonce(path: &Path, our_uid: u32) -> Option<String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -365,6 +373,13 @@ fn read_back_owned_nonce(path: &Path) -> Option<String> {
     }
     if meta.mode() & 0o077 != 0 {
         warn!(path = %path.display(), mode = format!("{:o}", meta.mode() & 0o7777), "Refusing the steer-log nonce: readable or writable beyond this user");
+        return None;
+    }
+    // A `0600` file at the fixed name is not proof this pool wrote it: a
+    // different local user can pre-create the same mode. Only a file owned by
+    // this pool's own uid is this pool's voice.
+    if meta.uid() != our_uid {
+        warn!(path = %path.display(), uid = meta.uid(), "Refusing the steer-log nonce: owned by another user");
         return None;
     }
     let mut content = String::new();
@@ -639,4 +654,67 @@ pub(super) fn write_source(
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod nonce_ownership_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A `0600` nonce file owned by a *different* user must not be adopted:
+    /// mode alone cannot separate this pool's own file from one a foreign
+    /// local user pre-created at the fixed, predictable name, so the owner
+    /// check is what refuses it. Without it, a foreign-owner `0600` file would
+    /// be read back as this pool's secret and could sign forged steer-log
+    /// records that the consolidator renders as the orchestrator's own scope
+    /// amendments.
+    #[test]
+    fn foreign_owner_0600_nonce_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "steer-nonce-foreign-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".steer-log-nonce");
+        std::fs::write(&path, "foreign-secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // SAFETY: `getuid` takes no arguments and cannot fail.
+        let our_uid = unsafe { libc::getuid() };
+        // A uid that is not the current process's owner: simulates a file
+        // planted by a different local user. (The test cannot chown to another
+        // real user without privileges, so it exercises the check by passing
+        // the foreign uid directly.)
+        let foreign_uid = our_uid.wrapping_add(1);
+        assert_ne!(foreign_uid, our_uid, "test assumption: foreign uid differs");
+        assert!(
+            read_back_owned_nonce(&path, foreign_uid).is_none(),
+            "a nonce file owned by another user must be refused"
+        );
+    }
+
+    /// The pool's own `0600` file (owned by the pool's uid) is adopted, so a
+    /// later consolidator process can verify the records an earlier
+    /// orchestrator process wrote.
+    #[test]
+    fn own_uid_0600_nonce_is_accepted() {
+        let dir = std::env::temp_dir().join(format!(
+            "steer-nonce-own-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".steer-log-nonce");
+        std::fs::write(&path, "our-secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // SAFETY: `getuid` takes no arguments and cannot fail.
+        let our_uid = unsafe { libc::getuid() };
+        assert_eq!(
+            read_back_owned_nonce(&path, our_uid).as_deref(),
+            Some("our-secret"),
+            "the pool's own owner-only nonce file is adopted"
+        );
+    }
 }
