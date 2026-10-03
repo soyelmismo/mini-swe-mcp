@@ -27,7 +27,7 @@ system prompt at dispatch time, so keep them short and actionable.
 
 ## Iterating
 
-- While working, build and run only what you touch: `cargo test --test <file>`
+- While working, build and run only what you touch: `cargo test --test it <module>::`
   or `cargo test <name>`, and `cargo check` instead of a full build.
 - A round's consolidator runs the full suite once, on the integrated result, so
   you do not have to run it per worker while you implement.
@@ -39,22 +39,36 @@ system prompt at dispatch time, so keep them short and actionable.
 
 - Give every file, directory, daemon or registry a test touches a temporary
   location passed to the code under test; the scratch helpers live in
-  `tests/common/`.
+  `tests/it/common/`.
 - Do not mutate process-global state (environment variables) in tests that run
   in parallel.
 - Do not write to the real registry, hub or repository.
 - Poll for a condition instead of sleeping, and never assert something that
   cannot fail.
 
+## What deserves a test
+
+- Test what can break and matters: security and isolation properties, data
+  loss, the wire and CLI output contracts, and a regression test for a real bug
+  you fixed.
+- Do not test wording: prompt text, nudge or help prose, log messages, a
+  constant. Assert the behaviour instead - the block is present, it is ordered,
+  it reaches the right model - never a copied sentence.
+- One focused test per property: no re-testing what an existing test already
+  covers, and no test for a trivial or mechanical change the gate already
+  covers.
+- Put tests in the area's existing test module; a new module only for a new
+  area.
+
 ## Working style
 
 - Locate code by name, not by the line numbers in the task: they may be stale.
 - List in your REPORT any file outside the task's scope you had to touch.
 - Never modify `models.yaml`: it is the operator's model catalog, not the task's.
-- Reuse existing helpers (`tests/common/`, module-level functions) instead of
+- Reuse existing helpers (`tests/it/common/`, module-level functions) instead of
   copying a block of logic into a second place.
-- Keep the diff to the task's scope; put new tests in a file dedicated to the
-  change rather than at the end of a large shared test file.
+- Keep the diff to the task's scope, and file each test where the area's own
+  tests live (`## What deserves a test`).
 - Preserve the MCP tool contract, CLI output, wire formats and security
   properties unless the task says otherwise.
 - Never run `git commit`, `git stash` or `git checkout` in the sandbox: the
