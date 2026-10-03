@@ -1156,21 +1156,43 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
 /// The `integrated` set alone is not the round: it is only the members the
 /// consolidator chose to merge. A member it reported as "not ready" and left
 /// out is just as absent from its branch as one it merged and then missed, and
-/// merging the round lands master without either one. So the round is
-/// reconstructed from the registry the same way the consolidator saw it -- its
-/// owner's workers in its group, still carrying a branch -- and the recorded
-/// `integrated` ids are unioned in, because a member that has since been
-/// merged may already be retired and no longer listed.
+/// merging the round lands master without either one.
+///
+/// The membership is therefore read from the snapshot the dispatch took, not
+/// recomputed here. Recomputing is the bug this shape avoids: rows are retired
+/// as rounds land and groups keep being reused, so the same owner and group
+/// name a *different* set of workers by merge time -- one dispatched into the
+/// next round, or one absorbed by an earlier consolidator. Proving the wrong
+/// set refuses a round over a member it never had, and lets a real one through.
+/// The snapshot is the round as it was, which is the only thing the check can
+/// honestly assert about.
+///
+/// The recorded `integrated` ids are always unioned in: a member already
+/// merged and retired is no longer listed in the manifest, and the check must
+/// still prove the branch it left behind.
 ///
 /// A member the consolidator absorbed is excluded: that is the record of work
 /// it took over and finished itself, so its branch is not expected in the
 /// round. A member with no branch (discarded, pruned, never dispatched) has
 /// nothing left to land and is filtered by the probe in the caller.
+///
+/// A consolidator dispatched before the snapshot existed falls back to the
+/// registry scan, which is the best reconstruction available for it.
 fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
+    match read_round_members(root, &row.id) {
+        // A dispatch-time snapshot: exactly the round, in one repository.
+        Some(ids) => {
+            members.extend(ids);
+            members.retain(|id| !row.absorbed.contains(id));
+            return members.into_iter().collect();
+        }
+        // No snapshot: fall through to the reconstruction below.
+        None => {}
+    }
     let (Some(owner), Some(group)) = (row.owner.as_deref(), row.group.as_deref()) else {
-        // Without an owner and a group the round cannot be enumerated; the
-        // recorded integrations are all that is known, and the sweep still
+        // Without an owner and a group the round cannot be enumerated at all;
+        // the recorded integrations are all that is known, and the sweep still
         // protects every branch it can prove.
         return members.into_iter().collect();
     };
@@ -1187,6 +1209,34 @@ fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
         members.insert(entry.id);
     }
     members.into_iter().collect()
+}
+
+/// The worker ids the dispatch of `consolidator` snapshotted, one per line.
+///
+/// Bounded on read for the same reason the other companions are: this file is
+/// written beside a worker's scratch state, so a corrupt or hostile one must
+/// not be able to make the merge loop over an unbounded list of "members". A
+/// file too large to be a round manifest is treated as no snapshot, which
+/// leaves the legacy reconstruction rather than refusing on nonsense.
+const ROUND_MEMBERS_MAX_BYTES: u64 = 64 * 1024;
+
+fn read_round_members(root: &ScratchRoot, consolidator: &str) -> Option<Vec<String>> {
+    let path = root.join(format!("swe-wt-{consolidator}.round-members"));
+    // A manifest beyond the bound is not a manifest this check will reason
+    // about; `None` sends the caller to the legacy reconstruction, which is a
+    // decision the operator can still act on.
+    let file = std::fs::File::open(&path).ok()?;
+    if file.metadata().map(|meta| meta.len()).ok()? > ROUND_MEMBERS_MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Whether merging `member` into `branch` would change nothing, i.e. whether
