@@ -72,12 +72,22 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
 }
 
 /// The parenthetical for one declared review mode: its default reviewer when
-/// one is set.
+/// one is set, and its trigger count when it declares any.
 fn review_mode_suffix(def: &serde_json::Value) -> String {
-    match def.get("model").and_then(|v| v.as_str()) {
-        Some(model) if !model.trim().is_empty() => format!(" (model: {model})"),
-        _ => String::new(),
+    let mut suffix = String::new();
+    if let Some(model) = def.get("model").and_then(|v| v.as_str()) {
+        if !model.trim().is_empty() {
+            suffix.push_str(&format!(" (model: {model})"));
+        }
     }
+    let triggers = def
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .map_or(0, |a| a.len());
+    if triggers > 0 {
+        suffix.push_str(&format!(" ({triggers} trigger{})", if triggers == 1 { "" } else { "s" }));
+    }
+    suffix
 }
 
 /// The retired workers' final reports, oldest first.

@@ -567,11 +567,18 @@ impl WorkerPool {
         .await;
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
+        // The manifest's `security` mode triggers union with `## Sensitive
+        // paths` and the top-level `sensitive_paths`: marking a path in any of
+        // the three places runs the adversarial review.
+        if let Some(security_def) = self.manifest().review_mode("security") {
+            patterns.extend(security_def.triggers.iter().cloned());
+        }
         patterns.sort();
         patterns.dedup();
         let sensitive: Vec<String> = touched
-            .into_iter()
+            .iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
+            .cloned()
             .collect();
         // A requested review names its mode by suffix; an unknown mode is a
         // dispatch error here (the dispatch already validated, so this is
@@ -596,19 +603,24 @@ impl WorkerPool {
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| implementer.to_string())
         };
-        let review_plan = match (requested, sensitive.is_empty()) {
+        // Successive review phases in stable order: the requested (or
+        // automatic security) phase first, then every manifest-declared mode
+        // whose `triggers` match the diff, sorted by mode name. A mode that
+        // already has a phase is not run twice.
+        let mut review_plan: Vec<(String, ReviewMode, Vec<String>)> = Vec::new();
+        match (requested, sensitive.is_empty()) {
             // A requested review on a sensitive diff is upgraded to the
             // adversarial mode; the requested model still runs it.
             (Some((requested_model, _)), false) => {
                 let reviewer =
                     resolve_reviewer(requested_model, "security", self.manifest(), &model);
-                Some((reviewer, security_mode))
+                review_plan.push((reviewer, security_mode, sensitive.clone()));
             }
             (Some((requested_model, wanted)), true) => {
                 let mode_name = wanted.name.clone();
                 let reviewer =
                     resolve_reviewer(requested_model, &mode_name, self.manifest(), &model);
-                Some((reviewer, wanted))
+                review_plan.push((reviewer, wanted, Vec::new()));
             }
             // No requested review, but the diff is sensitive: trigger the
             // security review on the mode's default reviewer when the manifest
@@ -622,11 +634,38 @@ impl WorkerPool {
                             .map(|alias| self.manifest().resolve_model(alias).0)
                     })
                     .unwrap_or_else(|| model.clone());
-                Some((reviewer, security_mode))
+                review_plan.push((reviewer, security_mode, sensitive.clone()));
             }
-            (None, true) => None,
-        };
-        if let Some((reviewer_model, mode)) = review_plan {
+            (None, true) => {}
+        }
+        // Manifest-declared modes whose `triggers` match the diff run as
+        // successive phases in sorted name order. `security` is skipped here:
+        // its triggers already union into the sensitive check above, so it
+        // has a phase when they match. A mode that already has a phase (the
+        // requested one, or the security upgrade) is not repeated.
+        for (name, def) in self.manifest().sorted_review_modes() {
+            if def.triggers.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("security") {
+                continue;
+            }
+            if review_plan.iter().any(|(_, mode, _)| mode.name == name) {
+                continue;
+            }
+            if !touched
+                .iter()
+                .any(|path| crate::manifest::matches_sensitive(path, &def.triggers))
+            {
+                continue;
+            }
+            let mode = ReviewMode::resolve_declared(name, self.manifest());
+            let reviewer = self::review::mode_default_reviewer(name, self.manifest())
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| model.clone());
+            review_plan.push((reviewer, mode, Vec::new()));
+        }
+        for (reviewer_model, mode, phase_sensitive) in review_plan {
             let outcome = self
                 .run_review_phase(
                     worktree,
@@ -643,7 +682,7 @@ impl WorkerPool {
                         meta,
                         mode,
                         verify: verify.clone(),
-                        sensitive,
+                        sensitive: phase_sensitive,
                     },
                 )
                 .await?;
