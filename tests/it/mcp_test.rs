@@ -62,44 +62,10 @@ impl ServerOutput {
 // ---------------------------------------------------------------------------
 // Subprocess harness
 //
-// Process-global env mutation is serialised behind [`common::ENV_MUTEX`], the
-// same lock every other module that mutates the process environment takes, so
-// no test in this binary observes a half-set value.
-
-/// One test's override of a process-wide environment variable, restored on drop.
-///
-/// Edition 2024 makes `set_var` unsafe, which is exactly the hazard this
-/// serializes: no other test in this binary may observe the overridden value.
-struct ScopedEnv {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    name: &'static str,
-    previous: Option<String>,
-}
-
-impl ScopedEnv {
-    fn set(name: &'static str, value: &str) -> Self {
-        let guard = crate::common::ENV_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var(name).ok();
-        // SAFETY: the lock above excludes every other test in this binary.
-        unsafe { std::env::set_var(name, value) };
-        Self {
-            _guard: guard,
-            name,
-            previous,
-        }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.name, value) },
-            None => unsafe { std::env::remove_var(self.name) },
-        }
-    }
-}
+// A setting the binary resolves from the environment is handed to the code
+// under test explicitly (a constructor, a config field); nothing in this module
+// mutates the process environment, which every other test in this binary would
+// inherit through its child processes.
 
 // ---------------------------------------------------------------------------
 
@@ -1975,12 +1941,15 @@ async fn list_is_scoped_to_the_caller_and_scope_all_names_every_owner() {
 /// refused, and the error names the workers already running.
 #[tokio::test]
 async fn a_dispatch_past_the_per_agent_cap_is_refused() {
-    let (owned, server) = owned_server();
+    let owned = IsolatedPool::new(8, "mcp-cap");
+    // The cap is named on the server rather than set on the process: `1` is
+    // what the binary resolves from `MAX_WORKERS_PER_AGENT=1`, `0` unlimited.
+    let server =
+        McpServer::new(owned.pool.clone(), "ninja".to_string()).with_max_workers_per_agent(1);
     owned
         .pool
         .__test_insert_worker(owned_worker("h3-cap", "cap-agent"))
         .await;
-    let _cap = ScopedEnv::set("MAX_WORKERS_PER_AGENT", "1");
     let capped = agent_context("cap-agent");
 
     let error = server

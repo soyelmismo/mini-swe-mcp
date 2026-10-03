@@ -11,34 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-/// Point this process's registry at a scratch directory.
-///
-/// The daemon under test runs *inside* the test process, so it reads the
-/// registry through this process's environment. Without this it would report
-/// whatever workers the host's real registry happens to hold, which is both
-/// flaky and a leak of unrelated state into the assertions.
-fn isolate_registry() -> PathBuf {
-    static REGISTRY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    REGISTRY
-        .get_or_init(|| {
-            // The directory must outlive the test that created it: the daemon
-            // keeps reading it for as long as the test binary runs, so it is
-            // removed at process exit rather than by a single test's guard.
-            let path = common::process_temp_dir("watch-registry");
-            // Set `SWE_TEMP_DIR` under the shared env lock so no other module
-            // in this binary observes a half-set value while it is mutated.
-            let _env = common::ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: `OnceLock` runs this closure exactly once and blocks every
-            // other caller until it returns, and the env lock above excludes
-            // every other env-mutating test in this binary.
-            unsafe { std::env::set_var("SWE_TEMP_DIR", &path) };
-            path
-        })
-        .clone()
-}
-
 /// The hub paths a daemon under test binds, plus ownership of the short socket
 /// fallback directory that a hub directory too deep for `sun_path` moves its
 /// socket into.
@@ -136,7 +108,6 @@ async fn pool_with(records: Vec<WorkerRecord>) -> Arc<McpServer> {
 
 #[tokio::test]
 async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner() {
-    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wg");
     let server = pool_with(vec![record(
         "w-watch",
@@ -228,7 +199,6 @@ async fn agent_b_cannot_watch_agent_a_worker_and_missed_events_replay_to_owner()
 
 #[tokio::test]
 async fn completed_worker_is_reported_immediately_with_missed_marker() {
-    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wm");
     let server = pool_with(vec![record(
         "w-done",
@@ -379,7 +349,6 @@ async fn a_running_bash_command_is_published_and_then_cleared() {
 /// the event it queued must not replay on the next watch.
 #[tokio::test]
 async fn an_interaction_marks_the_workers_events_seen() {
-    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wseen");
     let server = pool_with(vec![record(
         "w-seen",
@@ -567,7 +536,6 @@ fn tool_description_stays_short_and_points_at_the_help_topics() {
 /// process, and a current-thread runtime would never let the daemon answer it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_watches_through_the_hub() {
-    isolate_registry();
     let hub = common::TempDir::new_in_tmp("watch-hub-cli");
     let swe = common::TempDir::new_in_tmp("watch-hub-swe");
     let server = pool_with(vec![
@@ -718,7 +686,6 @@ fn one_watch_call_replays_every_missed_event() {
 /// is re-evaluated on every poll instead of frozen at the first one.
 #[tokio::test]
 async fn a_no_arg_watch_action_follows_late_dispatches() {
-    isolate_registry();
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
         .with_manifest(Arc::new(ModelManifest::default()));
     pool.__test_insert_worker(record(
@@ -785,7 +752,6 @@ async fn a_no_arg_watch_action_follows_late_dispatches() {
 /// worker dispatched after it started, not the set it saw first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_no_arg_watch_through_the_hub_follows_late_dispatches() {
-    isolate_registry();
     let hub = common::TempDir::new_in_tmp("watch-late-hub");
     let swe = common::TempDir::new_in_tmp("watch-late-swe");
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
@@ -951,7 +917,6 @@ fn a_no_arg_polling_watch_follows_late_dispatches_under_a_group() {
 /// frees when the holder disconnects.
 #[tokio::test]
 async fn the_daemon_allows_one_watch_per_identity() {
-    isolate_registry();
     let dir = common::TempDir::new_in_tmp("wg-one-daemon");
     let server = pool_with(vec![
         record(
@@ -1047,7 +1012,6 @@ async fn the_daemon_allows_one_watch_per_identity() {
 /// The MCP `watch` action obeys the same one-watch-per-identity rule.
 #[tokio::test]
 async fn the_mcp_watch_action_allows_one_watch_per_identity() {
-    isolate_registry();
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
         .with_manifest(Arc::new(ModelManifest::default()));
     pool.__test_insert_worker(record(
@@ -1124,7 +1088,6 @@ async fn the_mcp_watch_action_allows_one_watch_per_identity() {
 /// accepts a fresh watch once the holder has exited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_cli_watch_for_one_session_exits_zero_when_covered() {
-    isolate_registry();
     let hub = common::TempDir::new_in_tmp("wg-cli-hub");
     let swe = common::TempDir::new_in_tmp("wg-cli-swe");
     let pool = WorkerPool::new(4, "http://localhost:1".to_string(), "test-key".to_string())
