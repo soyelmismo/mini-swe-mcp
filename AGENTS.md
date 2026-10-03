@@ -82,3 +82,7 @@ defect, not a style one; the section is parsed as one glob per line.
 - src/pool/revision.rs
 - src/hub/identity.rs
 - src/mcp/events.rs
+- src/agent/intercept.rs
+- src/agent/env.rs
+- src/pool/steer.rs
+- src/mcp/handlers/**
