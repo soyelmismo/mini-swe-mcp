@@ -193,6 +193,16 @@ pub struct ReviewModeDefinition {
     /// `None` falls back to the dispatch's own model for the review phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Repository-relative globs whose diffs run this mode automatically,
+    /// like the security trigger.
+    ///
+    /// When a finished worker's diff touches a path matching one of these
+    /// globs, the harness runs this mode (in addition to any requested review)
+    /// without the orchestrator asking. Globs use the same forms as
+    /// `## Sensitive paths` (`**` crosses segments, `*` stays inside one).
+    /// Absent means this mode is never auto-triggered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

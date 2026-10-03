@@ -534,7 +534,8 @@ pub fn approved_merged_branches(
 }
 
 /// The review the pipeline will actually run, given the scope's skip decision,
-/// what the dispatch asked for and whether the scope touched a sensitive path.
+/// what the dispatch asked for and whether the scope has no sensitive change
+/// (`true` = no sensitive change → no automatic trigger).
 ///
 /// `strongest` is the model to audit with when the manifest marks no tier of its
 /// own; it is only consulted for the automatic sensitive-path trigger, so it is
@@ -552,11 +553,11 @@ pub fn approved_merged_branches(
 pub fn plan_review(
     skip: bool,
     requested: Option<(String, ReviewMode)>,
-    sensitive: bool,
+    sensitive_is_empty: bool,
     strongest: &str,
     security_mode: &ReviewMode,
 ) -> Option<(String, ReviewMode)> {
-    match (skip, requested, sensitive) {
+    match (skip, requested, sensitive_is_empty) {
         (true, Some((model, mode)), _) => Some((model, mode)),
         (true, None, _) => None,
         // A requested review on a sensitive diff is upgraded to the adversarial

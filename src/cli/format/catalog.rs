@@ -72,11 +72,22 @@ fn push_review_modes(out: &mut String, val: &serde_json::Value) {
 }
 
 /// The parenthetical for one declared review mode: its default reviewer when
-/// one is set.
+/// one is set, and its trigger count.
 fn review_mode_suffix(def: &serde_json::Value) -> String {
-    match def.get("model").and_then(|v| v.as_str()) {
-        Some(model) if !model.trim().is_empty() => format!(" (model: {model})"),
-        _ => String::new(),
+    let model = def
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.trim().is_empty());
+    let triggers = def
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    match (model, triggers) {
+        (Some(model), 0) => format!(" (model: {model})"),
+        (Some(model), n) => format!(" (model: {model}, triggers: {n})"),
+        (None, 0) => String::new(),
+        (None, n) => format!(" (triggers: {n})"),
     }
 }
 
@@ -259,9 +270,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_manifest_lists_review_modes_with_defaults() {
+    fn test_format_manifest_lists_review_modes_with_defaults_and_triggers() {
         let out = format_manifest(&v(r#"{"default_model":"z","models":{"a":{"id":"a-model"}},
-                 "review_modes":{"perf":{"checklist":"Check.","model":"nerd"},"style":{"checklist":"Names."}}}"#));
+                 "review_modes":{"perf":{"checklist":"Check.","model":"nerd","triggers":["src/hot/**"]},"style":{"checklist":"Names."}}}"#));
         assert!(out.contains("Review modes:"), "modes are listed: {out}");
         assert!(
             out.contains("- quality (built-in)"),
@@ -272,8 +283,8 @@ mod tests {
             "built-ins are listed: {out}"
         );
         assert!(
-            out.contains("- perf (model: nerd)"),
-            "default model is shown: {out}"
+            out.contains("- perf (model: nerd, triggers: 1)"),
+            "default model and trigger count are shown: {out}"
         );
         assert!(
             out.contains("- style"),

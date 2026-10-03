@@ -572,6 +572,11 @@ impl WorkerPool {
         // focused adversarial pass for the paths the repository declared.
         let mut patterns = crate::manifest::sensitive_paths(std::path::Path::new(&repo_path_str));
         patterns.extend(self.manifest().sensitive_paths.iter().cloned());
+        // The manifest's `security` triggers union with `## Sensitive paths`:
+        // marking a path in either place runs the adversarial review.
+        if let Some(security_def) = self.manifest().review_mode("security") {
+            patterns.extend(security_def.triggers.iter().cloned());
+        }
         patterns.sort();
         patterns.dedup();
         // What this run has to be audited over: everything since the base, or
@@ -624,8 +629,9 @@ impl WorkerPool {
             incremental => incremental.reviewed_files(&worktree.path).await,
         };
         let sensitive: Vec<String> = touched
-            .into_iter()
+            .iter()
             .filter(|path| crate::manifest::matches_sensitive(path, &patterns))
+            .cloned()
             .collect();
         // A requested review names its mode by suffix; an unknown mode is a
         // dispatch error here (the dispatch already validated, so this is
@@ -636,68 +642,73 @@ impl WorkerPool {
         };
         // The manifest may override the built-in security prompt.
         let security_mode = ReviewMode::resolve_declared("security", self.manifest());
-        // An empty reviewer (a bare `:mode`) falls back to the mode's default
-        // reviewer, then to the implementer's own model.
-        let resolve_reviewer = |requested_model: String,
-                                mode_name: &str,
-                                manifest: &crate::manifest::ModelManifest,
-                                implementer: &str|
-         -> String {
-            if !requested_model.trim().is_empty() {
-                return requested_model;
-            }
-            self::review::mode_default_reviewer(mode_name, manifest)
+        // The rule that picks the review lives in `plan_review`, next to the
+        // scope that decides the skip, so the mode a requested review ends up
+        // running in cannot drift from the one the rule states. The automatic
+        // trigger audits on the mode's default reviewer when the manifest
+        // declares one, else on the manifest's strongest tier, falling back to
+        // the dispatch default when the manifest marks none: the implementer's
+        // own model is never the automatic answer.
+        let automatic_security_reviewer = {
+            let choice = self::review::select_security_reviewer(self.manifest(), &default_model);
+            self::review::mode_default_reviewer("security", self.manifest())
                 .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| implementer.to_string())
+                .unwrap_or(choice.model)
         };
-        let review_plan: Option<(String, ReviewMode, &'static str)> =
-            match (requested, sensitive.is_empty()) {
-                // A requested review on a sensitive diff is upgraded to the
-                // adversarial mode; the requested model still runs it, because an
-                // explicit `--review-after` is the orchestrator's own instruction.
-                (Some((requested_model, _)), false) => {
-                    let reviewer =
-                        resolve_reviewer(requested_model, "security", self.manifest(), &model);
-                    Some((reviewer, security_mode, "review_after model"))
-                }
-                (Some((requested_model, wanted)), true) => {
-                    let mode_name = wanted.name.clone();
-                    let reviewer =
-                        resolve_reviewer(requested_model, &mode_name, self.manifest(), &model);
-                    Some((reviewer, wanted, "review_after model"))
-                }
-                // No requested review, but the diff is sensitive: trigger the
-                // security review on the mode's default reviewer when the manifest
-                // declares one, else on the manifest's strongest tier, falling back
-                // to the dispatch default when the manifest marks none. The
-                // implementer's own model is never the automatic answer: the model
-                // that wrote the change must not be the one that audits it.
-                (None, false) => {
-                    let choice =
-                        self::review::select_security_reviewer(self.manifest(), &default_model);
-                    let reviewer = self::review::mode_default_reviewer("security", self.manifest())
-                        .filter(|m| !m.trim().is_empty())
-                        .unwrap_or(choice.model);
-                    Some((reviewer, security_mode, choice.reason))
-                }
-                (None, true) => None,
-            };
-        if review_plan.is_none()
+        // Successive review phases in stable order: the requested (or
+        // automatic security) phase first, then every manifest-declared mode
+        // whose `triggers` match the diff, sorted by mode name. A mode that
+        // already has a phase is not run twice.
+        let mut review_plan: Vec<(String, ReviewMode, Vec<String>)> = Vec::new();
+        if let Some((reviewer, mode)) = self::review::plan_review(
+            security_skip.is_some(),
+            requested,
+            sensitive.is_empty(),
+            &automatic_security_reviewer,
+            &security_mode,
+        ) {
+            review_plan.push((reviewer, mode, sensitive.clone()));
+        }
+        // Manifest-declared modes whose `triggers` match the diff run as
+        // successive phases in sorted name order. `security` is skipped here:
+        // its triggers already union into the sensitive check above, so it has
+        // a phase when they match. A mode that already has a phase (the
+        // requested one, or the security upgrade) is not repeated.
+        for (name, def) in self.manifest().sorted_review_modes() {
+            if def.triggers.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("security") {
+                continue;
+            }
+            if review_plan.iter().any(|(_, mode, _)| mode.name == name) {
+                continue;
+            }
+            if !touched
+                .iter()
+                .any(|path| crate::manifest::matches_sensitive(path, &def.triggers))
+            {
+                continue;
+            }
+            let mode = ReviewMode::resolve_declared(name, self.manifest());
+            let reviewer = self::review::mode_default_reviewer(name, self.manifest())
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| model.clone());
+            review_plan.push((reviewer, mode, Vec::new()));
+        }
+        if review_plan.is_empty()
             && let Some(reason) = security_skip
         {
             info!(worker = %worker_id, "{reason}");
         }
-        if let Some((reviewer_model, mode, why)) = review_plan {
-            // The reviewer and the reason it was chosen, next to the pipeline
-            // line: an audit nobody can account for is how a fast executor ends
-            // up reviewing itself.
+        for (reviewer_model, mode, phase_sensitive) in review_plan {
             info!(
                 worker = %worker_id,
                 reviewer = %reviewer_model,
                 mode = mode.as_str(),
-                why,
                 "Reviewer selected"
             );
+
             let outcome = self
                 .run_review_phase(
                     worktree,
@@ -714,7 +725,7 @@ impl WorkerPool {
                         meta,
                         mode,
                         verify: verify.clone(),
-                        sensitive,
+                        sensitive: phase_sensitive,
                         scope: scope.clone(),
                     },
                 )
