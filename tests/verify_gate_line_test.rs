@@ -32,8 +32,12 @@ fn the_first_message_names_the_exact_completion_gate() {
 
 #[test]
 fn the_first_message_omits_the_gate_without_a_verify() {
-    let message =
-        opening_task_message("do the thing", None, "deadbeef", std::path::Path::new("/nonexistent"));
+    let message = opening_task_message(
+        "do the thing",
+        None,
+        "deadbeef",
+        std::path::Path::new("/nonexistent"),
+    );
     assert!(
         !message.contains("Completion gate:"),
         "no configured verify means no gate line, got:\n{message}"

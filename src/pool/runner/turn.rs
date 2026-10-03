@@ -2076,8 +2076,7 @@ impl<'a> TurnEngine<'a> {
             let base = WorktreeGuard::diff_base_at(&path, &base, base_branch.as_deref())
                 .unwrap_or_else(|_| "HEAD".to_string());
             let _ = git(&path, "add -N", &["add", "-N", "."]);
-            let Ok(output) = git(&path, "diff --name-only", &["diff", "--name-only", &base])
-            else {
+            let Ok(output) = git(&path, "diff --name-only", &["diff", "--name-only", &base]) else {
                 return 0;
             };
             if !output.status.success() {

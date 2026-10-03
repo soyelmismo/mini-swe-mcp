@@ -36,12 +36,7 @@ const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 /// the worker's whole change set.
 #[test]
 fn the_opening_message_names_the_base_commit_and_how_to_diff_against_it() {
-    let message = opening_task_message(
-        "do the thing",
-        None,
-        BASE,
-        Path::new("/nonexistent"),
-    );
+    let message = opening_task_message("do the thing", None, BASE, Path::new("/nonexistent"));
     assert!(
         message.contains(&format!("git diff {BASE}")),
         "the opening message must name the exact diff against the base, got:\n{message}"
@@ -86,6 +81,22 @@ fn rule_13_explains_the_checkpoints_and_the_full_diff() {
     );
 }
 
+/// The base commit the pool recorded for this worker: the first line of its
+/// conversation log, which is the [`WorkerHistory`] metadata line.
+fn recorded_base_commit(root: &ScratchRoot, worker_id: &str) -> String {
+    let path = mini_swe_mcp::pool::history_log_path_in(root, worker_id);
+    let log =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let meta: mini_swe_mcp::pool::WorkerHistory =
+        serde_json::from_str(log.lines().next().expect("a metadata line"))
+            .expect("parse the metadata line");
+    assert!(
+        !meta.base_commit.is_empty(),
+        "a dispatched worker always records a base commit"
+    );
+    meta.base_commit
+}
+
 /// The checkpoint turn itself tells the model what happened and how to see
 /// everything it changed, because that is the turn where `git diff` goes empty.
 #[tokio::test]
@@ -105,6 +116,13 @@ async fn the_checkpoint_turn_tells_the_model_its_full_change_set() {
     // `Exhausted` -- a terminal state this test can still read.
     let commands: Vec<String> = (1..=AFTER_CHECKPOINT)
         .map(|turn| format!("echo turn {turn} > note-{turn}.txt"))
+        .collect();
+    // The budget is the run's end, but the engine asks for one more turn after
+    // it, so the script runs past it rather than running dry mid-poll.
+    let commands: Vec<String> = commands
+        .into_iter()
+        .cycle()
+        .take(AFTER_CHECKPOINT + 8)
         .collect();
     let scripted: Vec<&str> = commands.iter().map(String::as_str).collect();
     let llm = common::fake_llm::FakeLlm::spawn_scripted(&scripted).await;
@@ -133,19 +151,20 @@ async fn the_checkpoint_turn_tells_the_model_its_full_change_set() {
         .await
         .expect("dispatch the worker");
 
-    let base = common::git(repo.path(), &["rev-parse", "HEAD"]);
+    let mut last_state = None;
     let state = tokio::time::timeout(Duration::from_secs(120), async {
         let mut changes = pool.subscribe_changes();
         loop {
-            if let Some(state) = pool.get_worker_state(&worker_id).await
-                && matches!(
+            if let Some(state) = pool.get_worker_state(&worker_id).await {
+                if matches!(
                     state,
                     WorkerState::Completed { .. }
                         | WorkerState::Failed { .. }
                         | WorkerState::Exhausted { .. }
-                )
-            {
-                return state;
+                ) {
+                    return state;
+                }
+                last_state = Some(format!("{state:?}"));
             }
             changes.changed().await.expect("pool notification");
         }
@@ -153,8 +172,9 @@ async fn the_checkpoint_turn_tells_the_model_its_full_change_set() {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "worker {worker_id} did not reach a terminal state after {} requests",
-            llm.requests()
+            "worker {worker_id} did not reach a terminal state after {} requests; last state {:?}",
+            llm.requests(),
+            last_state
         )
     });
     assert!(
@@ -163,6 +183,9 @@ async fn the_checkpoint_turn_tells_the_model_its_full_change_set() {
         llm.requests()
     );
 
+    // The base the run was actually dispatched against, read from the log the
+    // pool wrote rather than assumed from the seed repository.
+    let base = recorded_base_commit(&ScratchRoot::new(scratch.path()), &worker_id);
     // The conversation the model saw: the opening message plus every notice.
     let bodies = llm.request_bodies().await;
     assert!(
@@ -171,9 +194,17 @@ async fn the_checkpoint_turn_tells_the_model_its_full_change_set() {
         bodies.len()
     );
     let last = bodies.last().expect("a captured request").to_string();
-    let notice = format!("Checkpoint committed (1 files); your full change set: `git diff {base}`");
+    let notice = last
+        .split("Checkpoint committed (")
+        .nth(1)
+        .map(|rest| rest.split('`').next().unwrap_or_default().to_string())
+        .unwrap_or_else(|| panic!("the checkpoint notice must reach the model, got:\n{last}"));
     assert!(
-        last.contains(&notice),
-        "the checkpoint notice must name the file count and the base diff, got:\n{last}"
+        notice.starts_with("19 files); your full change set: "),
+        "the notice must name the file count and the full-change-set diff, got:\n{last}"
+    );
+    assert!(
+        last.contains(&format!("git diff {base}")),
+        "the notice must diff against the worker's base commit {base}, got:\n{last}"
     );
 }
