@@ -3141,6 +3141,53 @@ mod tests {
     /// root, not on a substring, so `/tmp/wtx/out.txt` is not read as inside
     /// `/tmp/wt`.
     #[test]
+    fn zz_probe_behaviour() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        let cases = [
+            "could not write to /tmp/wt/ro: Permission denied.",
+            "ld: cannot open /lib64/ld-linux.so: Permission denied writing /tmp/wt/out",
+            "write error: No space left on device at /etc/x",
+            "curl: (7) Failed to connect to http://localhost:1/ : Permission denied",
+            "touch: '/tmp/out': Permission denied",
+            "ls: cannot access '-/tmp/x': Permission denied",
+            "touch: out/tmp: Permission denied",
+            "some ok line\nmktemp: /tmp/tmp.XXXX: Permission denied",
+            "touch: \"/tmp/out\": Permission denied",
+            "open failed: EACCES on /tmp/x",
+            "touch: /tmp/wt/: Permission denied",
+            "touch: /tmp/wt/../out: Permission denied",
+            "make: /2024/01/01 is bad: Permission denied",
+            "sh: cannot create /root/x: Permission denied",
+        ];
+        for c in cases {
+            let got = scratch_write_note(&roots, c);
+            println!("{c:?} => NOTE={}", got.is_some());
+        }
+    }
+
+    #[test]
+    fn zz_probe2() {
+        let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
+        let cases = [
+            // traversal escape: real write lands outside the worktree
+            ("touch: /tmp/wt/../out: Permission denied", "/tmp/out"),
+            // a relative path under /tmp spelled relative to cwd
+            ("cp: cannot create regular file 'out/tmp': Permission denied", "n/a"),
+            // Spanish message with a path outside roots
+            ("bash: /tmp/salida.txt: Permiso denegado", "/tmp/salida.txt"),
+            // a denial naming a path under a writable root but through ../
+            ("error: writing /tmp/wt/sub/../../etc/x: Permission denied", "/etc/x"),
+            // two paths: first inside worktree, second genuinely outside
+            ("mv: cannot move '/tmp/wt/a' to '/root/b': Permission denied", "/root/b"),
+        ];
+        for (c, _want) in cases {
+            println!("{c:?} => NOTE={}", scratch_write_note(&roots, c).is_some());
+        }
+        // path prefix check with '..'
+        println!("starts_with traversal: {}", Path::new("/tmp/wt/../out").starts_with(Path::new("/tmp/wt")));
+    }
+
+    #[test]
     fn a_sibling_of_the_worktree_is_not_read_as_inside_it() {
         let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
         assert!(scratch_write_note(&roots, "touch: /tmp/wtx/out: Permission denied").is_some());
