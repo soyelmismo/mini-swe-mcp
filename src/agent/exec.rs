@@ -473,7 +473,7 @@ fn is_writable(roots: &WriteRoots, path: &Path) -> bool {
         .chain(std::iter::once(roots.target.as_path()))
         .chain(std::iter::once(roots.scratch.as_path()))
         .chain(roots.caches.iter().map(PathBuf::as_path))
-        .map(|root| normalise(root))
+        .map(normalise)
         .any(|root| path.starts_with(root))
 }
 
@@ -540,8 +540,10 @@ pub(crate) fn scratch_write_note(roots: &WriteRoots, output: &str) -> Option<Str
 ///
 /// The note is part of the observation the model reads, not of the exit code:
 /// the command failed exactly as the sandbox decided, and only the advice is
-/// added. Backgrounded commands report their output when the model waits on
-/// them (`continue_as_job`), where the job's tail carries the same message.
+/// added. Only a finished command is annotated: a command that outlived its
+/// budget is handed to [`AgentRunner::continue_as_job`], whose immediate
+/// observation is the "still running" message, so there is no refusal to read
+/// yet. Such a step still learns the policy from the system prompt.
 fn annotate_refused_write(worktree: &Path, target: &Path, output: String) -> String {
     // `write_roots` derives the scratch root the way the child's `$TMPDIR`
     // was derived, so the path the note names is the one the command already
@@ -3204,10 +3206,6 @@ mod tests {
     /// A worker that writes to `/tmp` through the worktree (`../out`) is
     /// refused exactly like one typing `/tmp`, so the `..` spelling must not
     /// read as a write inside the worktree and lose the note.
-
-
-
-
     #[test]
     fn a_traversal_out_of_the_worktree_is_still_a_refused_outside_write() {
         let roots = write_roots(Path::new("/tmp/wt"), Path::new("/tmp/tgt"));
