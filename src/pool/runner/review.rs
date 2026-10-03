@@ -186,8 +186,10 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
 }
 
 impl SecurityScope {
-    /// The commits this review covers, oldest first. Empty when the review must
-    /// be skipped.
+    /// The commits this review adds beyond what an earlier security review
+    /// already approved, oldest first. Empty for a [`SecurityScope::Full`]
+    /// review, which is measured against the worker's base commit rather than
+    /// against a list, and for a scope whose review must be skipped.
     pub fn reviewed_commits(&self) -> Vec<String> {
         match self {
             Self::Full => Vec::new(),
@@ -313,17 +315,23 @@ pub async fn scope_for(
             merged: merged.to_vec(),
         },
         WorkerRole::Worker => match approved {
-            Some(base) => {
-                let commits = commits_since(repo, &base, branch).await;
-                let already = vec![base.clone()];
-                SecurityScope::Since {
-                    base,
-                    branch: branch.to_string(),
-                    approved: already,
-                    commits,
-                    merged: Vec::new(),
+            // An approval the repository cannot resolve -- a pruned branch, a
+            // rewritten history -- is not evidence that nothing changed since.
+            // Reading it that way would skip a real audit, so the scope widens to
+            // the whole diff: re-auditing is the recoverable mistake.
+            Some(base) => match commits_since(repo, &base, branch).await {
+                Some(commits) => {
+                    let already = vec![base.clone()];
+                    SecurityScope::Since {
+                        base,
+                        branch: branch.to_string(),
+                        approved: already,
+                        commits,
+                        merged: Vec::new(),
+                    }
                 }
-            }
+                None => SecurityScope::Full,
+            },
             None => SecurityScope::Full,
         },
     }
@@ -481,7 +489,13 @@ pub(super) async fn touched_files(
 /// history) or is not an ancestor, because the honest answer is then "nothing
 /// is known to be approved" -- and the caller reviews the whole diff rather than
 /// treat the gap as an approval.
-pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Vec<String> {
+/// `None` when git cannot resolve the range at all, which is not the same as an
+/// empty commit list and must not be read as an approval.
+pub(super) async fn commits_since(
+    path: &Path,
+    base: &str,
+    branch: &str,
+) -> Option<Vec<String>> {
     let path = path.to_path_buf();
     let base = base.to_string();
     let branch = branch.to_string();
@@ -490,15 +504,15 @@ pub(super) async fn commits_since(path: &Path, base: &str, branch: &str) -> Vec<
         let Ok(output) =
             crate::worktree::git(&path, "log", &["log", "--reverse", "--format=%H", &range])
         else {
-            return Vec::new();
+            // git itself could not run: the range's history is unknown, and an
+            // unknown history is not an approval.
+            return None;
         };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        commits_in(output.stdout)
+        output.status.success().then(|| commits_in(output.stdout))
     })
     .await
-    .unwrap_or_default()
+    .ok()
+    .flatten()
 }
 
 /// The files a consolidator's own commits changed: the same exclusion of the
@@ -614,14 +628,16 @@ pub(super) async fn own_commits(path: &Path, branch: &str, merged: &[String]) ->
         if exclusions.is_empty() {
             return all;
         }
+        // `--not` flips every revision after it, so the merged branches' own
+        // commits are listed as `^sha` and subtracted from the branch.
         let mut args: Vec<String> = vec![
             "rev-list".to_string(),
             "--reverse".to_string(),
             "--no-merges".to_string(),
             branch.clone(),
+            "--not".to_string(),
         ];
         args.extend(exclusions);
-        args.push("--not".to_string());
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         crate::worktree::git(&path, "rev-list", &borrowed)
             .ok()

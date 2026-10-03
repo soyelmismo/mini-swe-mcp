@@ -1,169 +1,206 @@
 //! The security review audits only what it has not audited yet.
 //!
-//! Each revision re-runs the review of the whole diff since the base commit, so
-//! one worker corrected seven times was security-reviewed seven times over the
-//! same approved code; a consolidator, whose diff is the union of branches each
-//! already reviewed, was reviewed in full again. Three properties are asserted:
+//! Every revision re-ran the review of the whole diff since the base commit, so
+//! a worker the consolidator corrected seven times was security-reviewed seven
+//! times over largely the same approved code, and a consolidator -- whose diff
+//! is the union of branches that were each already reviewed -- was reviewed in
+//! full again. Three properties are asserted:
 //!
 //! * **No sensitive change, no review.** A revision that changes nothing since
 //!   the commit an earlier security review approved skips the review, and says
-//!   so in the log.
+//!   so in the log rather than paying for it again.
 //! * **Only the new commits are reviewed.** A revision that does touch a
 //!   sensitive path is reviewed over the diff since that approved commit, with
-//!   the previously approved commits named for context.
+//!   the previously approved commits named for context, so the reviewer neither
+//!   re-reads approved code nor mistakes it for new.
 //! * **A consolidator reviews its own commits.** The worker branches it merged,
 //!   each already reviewed at its own approved commit, are excluded from its
 //!   security scope; only its interaction fixes and conflict resolutions remain.
 //!
-//! Every repository is a temporary directory the test creates and removes, and
-//! nothing is written to the real registry, hub or repository.
+//! Every repository is a temporary directory this test creates and removes; no
+//! registry, hub or real repository is written.
 
 mod common;
 
 use std::path::Path;
 
-use mini_swe_mcp::pool::review_security_scope::{own_files, own_scope};
-use mini_swe_mcp::registry::WorkerRole;
+use mini_swe_mcp::pool::{WorkerRole, scope_for};
 
-/// A commit id in a repository the test owns.
-fn head(dir: &Path) -> String {
-    common::git(dir, &["rev-parse", "HEAD"])
-}
-
-/// Commit `body` into `branch` after writing `path`, and return its commit id.
+/// Commit `body` into `branch` after writing `file`, and return the commit id.
 ///
-/// The identity is pinned for the whole test so a commit id never depends on
-/// when the test ran, and `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` are passed
-/// through the environment of this process only -- `git` reads them for the
-/// spawned command, never for the harness.
-fn commit(dir: &Path, branch: &str, path: &str, body: &str) -> String {
-    common::git(dir, &["checkout", "-q", branch]);
-    std::fs::write(dir.join(path), body).expect("write file");
-    common::git(dir, &["add", path]);
+/// `branch` is created from the current HEAD when it does not exist yet, so the
+/// very first commit lands on a fresh base branch without needing a checkout of
+/// a branch that has no commit yet.
+fn commit(dir: &Path, branch: &str, file: &str, body: &str) -> String {
+    if !common::git_ref_exists(dir, branch) {
+        common::git(dir, &["checkout", "-q", "-b", branch]);
+    } else {
+        common::git(dir, &["checkout", "-q", branch]);
+    }
+    let path = dir.join(file);
+    std::fs::create_dir_all(path.parent().expect("the file under test has a parent"))
+        .expect("create the directory holding the file under test");
+    std::fs::write(&path, body).expect("write the file under test");
+    common::git(dir, &["add", file]);
     common::git(dir, &["commit", "-q", "-m", body]);
-    head(dir)
+    common::git(dir, &["rev-parse", "HEAD"]).trim().to_string()
 }
 
-/// A repository with a base branch and one worker branch off it.
-fn repo(tag: &str) -> common::TempDir {
+/// A repository with a `master` base and a `worker-w1` branch one commit past it.
+///
+/// Returns the temporary directory (which removes itself on drop) and the base
+/// commit both the worker branch and `master` point at.
+fn repo(tag: &str) -> (common::TempDir, String) {
     let dir = common::TempDir::new_in_tmp(tag);
-    common::git(dir.path(), &["init", "-q", "-b", "master", "."]);
-    commit(dir.path(), "master", "README.md", "base");
-    common::git(dir.path(), &["checkout", "-q", "-b", "worker-w1"]);
-    let w1 = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "worker change");
-    (dir, w1)
+    let path = dir.path().to_path_buf();
+    common::git(&path, &["init", "-q", "-b", "master", "."]);
+    // Repo-scoped identity: the test's commits need an author, and writing it
+    // into this temporary repository keeps the machine's global git config and
+    // this process's environment untouched.
+    common::git(&path, &["config", "user.email", "review-scope@example.invalid"]);
+    common::git(&path, &["config", "user.name", "Review Scope Test"]);
+    let base = commit(&path, "master", "README.md", "base");
+    common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
+    (dir, base)
 }
 
-#[test]
-fn a_revision_with_no_new_sensitive_change_skips_the_review() {
-    let (dir, w1) = repo("scope_skip");
+/// The scope a worker on `branch` would be security-reviewed over.
+async fn worker_scope(
+    repo: &Path,
+    branch: &str,
+    base: &str,
+    approved: Option<String>,
+) -> mini_swe_mcp::pool::SecurityScope {
+    scope_for(repo, branch, WorkerRole::Worker, base, approved, &[]).await
+}
 
-    // The first security review approved the worker at this commit.
-    let scope = own_scope(dir.path(), "worker-w1", &[], Some(w1.clone()));
+#[tokio::test]
+async fn a_revision_with_no_sensitive_change_since_the_approval_skips_the_review() {
+    let (dir, base) = repo("scope_skip");
+    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+
+    // A first run has no approval to start from: it reviews everything.
+    let first = worker_scope(dir.path(), "worker-w1", &base, None).await;
     assert_eq!(
-        scope.skip_log().as_deref(),
+        first.skip_log(),
         None,
-        "the first run has no approval to start from, so it reviews everything"
+        "nothing is approved yet, so nothing may be skipped"
     );
-
-    // The consolidator's correction touched nothing new: nothing changed since
-    // the approved commit, so the approved review already stands.
-    let scope = own_scope(dir.path(), "worker-w1", &[], Some(w1.clone()));
     assert_eq!(
-        scope.skip_log().as_deref(),
-        Some(
-            format!("security review skipped: no sensitive change since {w1}")
-                .as_str()
-        ),
-        "a revision that changes nothing since the approved commit must skip the security review"
+        first.reviewed_commits(),
+        Vec::<String>::new(),
+        "a first run is measured against the base commit, not against an approval"
+    );
+    assert_eq!(first.base_commit(), None);
+
+    // The consolidator routes a correction back that changes nothing new. The
+    // security review that approved this branch already stands.
+    let revision = worker_scope(dir.path(), "worker-w1", &base, Some(approved.clone())).await;
+    assert_eq!(
+        revision.skip_log().as_deref(),
+        Some(format!("security review skipped: no sensitive change since {approved}").as_str()),
+        "a revision that adds no commit since the approved one must skip the review"
+    );
+    assert!(
+        revision.reviewed_commits().is_empty(),
+        "a skipped review covers no commits"
     );
 }
 
-#[test]
-fn a_revision_with_a_sensitive_change_reviews_only_the_new_commits() {
-    let (dir, w1) = repo("scope_incremental");
-    // The correction the consolidator routed back touches a sensitive path.
-    let w2 = commit(dir.path(), "worker-w1", "src/hub/identity.rs", "correction");
+#[tokio::test]
+async fn a_revision_with_a_sensitive_change_reviews_only_the_new_commits() {
+    let (dir, base) = repo("scope_incremental");
+    let approved = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+    // The correction the consolidator routed back touches a sensitive path too.
+    let correction = commit(dir.path(), "worker-w1", "src/hub/identity.rs", "correction");
 
-    let scope = own_scope(dir.path(), "worker-w1", &[], Some(w1.clone()));
-    assert_eq!(scope.skip_log(), None);
+    let scope = worker_scope(dir.path(), "worker-w1", &base, Some(approved.clone())).await;
+    assert_eq!(scope.skip_log(), None, "a new commit must be reviewed");
     assert_eq!(
         scope.reviewed_commits(),
-        vec![w2.clone()],
-        "only the commit after the approved one may be reviewed again"
+        vec![correction.clone()],
+        "only the commit after the approved one is unaudited"
     );
     assert_eq!(
         scope.approved_commits(),
-        vec![w1.clone()],
-        "the earlier approval is named so the reviewer does not re-audit it"
+        vec![approved.clone()],
+        "the earlier approval is named for context, not re-reviewed"
     );
-    let files = scope.reviewed_files();
-    assert!(
-        files.contains(&"src/hub/identity.rs".to_string()),
-        "the sensitive file the new commit touched must be probed: {files:?}"
+
+    let files = scope.reviewed_files(dir.path()).await;
+    assert_eq!(
+        files,
+        vec!["src/hub/identity.rs".to_string()],
+        "the sensitive probe must see the new commit's file and not the approved one"
     );
+    let diff = scope.reviewed_diff(dir.path()).await;
     assert!(
-        !files.contains(&"src/hub/socket.rs".to_string()),
-        "a file the approved review already covered is not sensitive again: {files:?}"
+        diff.contains("src/hub/identity.rs") && !diff.contains("src/hub/socket.rs"),
+        "the reviewer is handed the incremental diff, not the whole branch diff: {diff}"
     );
 }
 
-#[test]
-fn a_consolidator_reviews_its_own_commits_not_the_merged_branches() {
-    let (dir, w1) = repo("scope_consolidate");
-    // A second worker branch, each already reviewed at its own approved commit.
+#[tokio::test]
+async fn a_consolidator_reviews_only_its_own_commits() {
+    let (dir, base) = repo("scope_consolidate");
+    // Each worker branch is already security-reviewed at its own approved commit.
+    let w1 = commit(dir.path(), "worker-w1", "src/hub/socket.rs", "worker one");
     common::git(dir.path(), &["checkout", "-q", "master"]);
     common::git(dir.path(), &["checkout", "-q", "-b", "worker-w2"]);
-    let w2 = commit(dir.path(), "worker-w2", "src/hub/events.rs", "second worker");
+    let w2 = commit(dir.path(), "worker-w2", "src/hub/events.rs", "worker two");
 
-    // The consolidator merges both, then fixes the interaction between them.
+    // The consolidator integrates both and then resolves the interaction.
     common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", "master"]);
     common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"]);
     common::git(dir.path(), &["merge", "-q", "--no-ff", "-m", "merge w2", "worker-w2"]);
-    let own = commit(dir.path(), "worker-c1", "src/hub/handshake.rs", "resolve the conflict");
+    let own = commit(dir.path(), "worker-c1", "src/hub/handshake.rs", "resolve the interaction");
 
-    let scope = own_scope(
+    let merged = vec!["worker-w1".to_string(), "worker-w2".to_string()];
+    let scope = scope_for(
         dir.path(),
         "worker-c1",
-        &["worker-w1".to_string(), "worker-w2".to_string()],
+        WorkerRole::Consolidate,
+        &base,
         None,
-    );
+        &merged,
+    )
+    .await;
+
     assert_eq!(
         scope.reviewed_commits(),
         vec![own.clone()],
         "a consolidator reviews only the commits nobody has reviewed yet"
     );
-    assert!(
-        !scope.reviewed_commits().contains(&w1) && !scope.reviewed_commits().contains(&w2),
-        "the merged worker branches were reviewed at their own approved commits"
-    );
-
-    let files = own_files(dir.path(), "worker-c1", &["worker-w1".into(), "worker-w2".into()]);
+    for reviewed in [&w1, &w2] {
+        assert!(
+            !scope.reviewed_commits().contains(reviewed),
+            "{reviewed} was reviewed at its own approved commit and must not be reviewed again"
+        );
+    }
     assert_eq!(
-        files,
+        scope.reviewed_files(dir.path()).await,
         vec!["src/hub/handshake.rs".to_string()],
-        "the sensitive-path probe of a consolidator must not re-report the merged workers' files"
+        "the sensitive probe must not re-report the merged workers' files"
     );
-    assert_ne!(scope.skip_log(), None.or(scope.skip_log()));
-    assert_eq!(scope.skip_log(), None, "the consolidator has work of its own to review");
+    assert_eq!(
+        scope.skip_log(),
+        None,
+        "a consolidator with work of its own has something to review"
+    );
 }
 
-#[test]
-fn an_unknown_approved_commit_falls_back_to_reviewing_everything() {
-    let (dir, _) = repo("scope_unknown");
-    // A pruned branch leaves an approved commit the repository cannot resolve.
-    // Treating that gap as an approval would skip a real audit, so the scope
-    // must widen to everything rather than report "nothing changed".
-    let scope = own_scope(
-        dir.path(),
-        "worker-w1",
-        &[],
-        Some("0".repeat(40)),
-    );
+#[tokio::test]
+async fn an_unresolvable_approval_never_reads_as_no_change() {
+    let (dir, base) = repo("scope_unknown");
+    commit(dir.path(), "worker-w1", "src/hub/socket.rs", "sensitive change");
+    // A pruned branch can leave an approved commit the repository cannot resolve.
+    // Reading that gap as "nothing changed" would skip a real audit, so the
+    // scope must fall back to reviewing the whole diff.
+    let unknown = "0".repeat(40);
+    let scope = worker_scope(dir.path(), "worker-w1", &base, Some(unknown.clone())).await;
     assert_ne!(
         scope.skip_log(),
-        Some(format!("security review skipped: no sensitive change since {}", "0".repeat(40))),
-        "an unresolvable approval must never be read as 'nothing changed'"
+        Some(format!("security review skipped: no sensitive change since {unknown}")),
+        "an approval the repository cannot resolve must not be read as an approval"
     );
-    let _ = WorkerRole::Worker;
 }
