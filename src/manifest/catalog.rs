@@ -40,7 +40,7 @@ const CATALOG_HEADER: &str = "Available model aliases and their roles:\n";
 ///
 /// Worded as an imperative, because a framing that reads as optional
 /// background is what a model skips when it is cheap to skip.
-pub(super) const MODEL_INSTRUCTIONS_HEADER: &str = "MANDATORY DIRECTIVES FOR YOUR MODEL (set by the operator in models.yaml). Follow every one of them on every step; they are not suggestions:";
+pub const MODEL_INSTRUCTIONS_HEADER: &str = "MANDATORY DIRECTIVES FOR YOUR MODEL (set by the operator in models.yaml). Follow every one of them on every step; they are not suggestions:";
 
 /// Note appended when a model's instructions did not fit their budget, so a
 /// cut block is never mistaken for the whole one.
