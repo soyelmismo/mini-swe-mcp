@@ -2257,16 +2257,9 @@ impl EventRouter {
         {
             use std::io::Write;
             let line = format!(
-                "watch_reply initial={initial} events={} watch_current=[{}]\n",
+                "watch_reply initial={initial} events={} watch_current={}\n",
                 events.len(),
-                self.watch_current
-                    .keys()
-                    .map(|k| format!(
-                        "{k}:{}",
-                        self.watch_current[k]["status"].as_str().unwrap_or("?")
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(",")
+                serde_json::to_string(&self.watch_current).unwrap_or_default()
             );
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
