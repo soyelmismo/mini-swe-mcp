@@ -183,20 +183,23 @@ pub fn resolve_cargo_home(explicit: Option<&Path>, home: Option<&Path>) -> Optio
 /// need it to exist (command spawning) create it explicitly, which keeps this
 /// function side-effect free and cheap to call from tests.
 pub fn build_clean_environment(repo_path: &Path, worktree_path: &Path) -> Vec<(String, String)> {
-    build_clean_environment_with(
+    build_clean_environment_from(
         repo_path,
         worktree_path,
+        &|name| std::env::var_os(name),
         std::env::var_os("HOME").as_deref().map(Path::new),
         std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
     )
 }
 
-/// [`build_clean_environment`] with the host `HOME` and `CARGO_HOME` supplied by
-/// the caller, so tests can exercise toolchain-cache resolution without
-/// mutating process-global state.
-fn build_clean_environment_with(
+/// [`build_clean_environment`] with the parent environment supplied by the
+/// caller as `lookup`, so tests drive the allow-list, toolchain forwarding and
+/// secret scrubbing against a synthetic map instead of mutating
+/// process-global state. Production passes the real environment through.
+pub fn build_clean_environment_from(
     repo_path: &Path,
     worktree_path: &Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     host_home: Option<&Path>,
     explicit_cargo_home: Option<&Path>,
 ) -> Vec<(String, String)> {
@@ -207,10 +210,10 @@ fn build_clean_environment_with(
     for name in ALLOWED_VARS {
         // Empty values carry no information and can only confuse tools that
         // test "is this configured?" with a truthiness check.
-        match std::env::var(name) {
+        match lookup(name).map(|value| value.to_string_lossy().into_owned()) {
             // One allocation for the key, one for the value; nothing is
             // allocated for names that are unset or empty.
-            Ok(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
+            Some(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
             _ => {}
         }
     }
@@ -226,7 +229,7 @@ fn build_clean_environment_with(
         } else {
             // No `~/.rustup` fallback: a host with no rustup has no toolchain
             // directory to share, and an invented path would be a silent lie.
-            std::env::var_os(name)
+            lookup(name)
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
@@ -234,6 +237,24 @@ fn build_clean_environment_with(
             env.push(((*name).to_string(), value.to_string_lossy().into_owned()));
         }
     }
+
+/// Backwards-compatible core used by tests that only vary `HOME`/`CARGO_HOME`:
+/// the remaining parent variables come from the process environment.
+#[cfg(test)]
+fn build_clean_environment_with(
+    repo_path: &Path,
+    worktree_path: &Path,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) -> Vec<(String, String)> {
+    build_clean_environment_from(
+        repo_path,
+        worktree_path,
+        &|name| std::env::var_os(name),
+        host_home,
+        explicit_cargo_home,
+    )
+}
 
     // HOME is remapped, never inherited: an empty value would make many tools
     // fall back to the real home (or the passwd database), defeating the point.
@@ -592,22 +613,18 @@ mod tests {
 
     #[test]
     fn build_clean_environment_drops_secrets_from_parent() {
-        let _guard = env_guard();
         let dir = unique_dir("secrets");
-        // Inject secrets into *our* environment; the child env must not carry them.
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-test-should-not-leak");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-test-should-not-leak");
-            std::env::set_var("GITHUB_TOKEN", "gh-test-should-not-leak");
-            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
-        }
-        let env = build_clean_environment(&dir, &dir);
-        unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("SSH_AUTH_SOCK");
-        }
+        // Secrets present in the parent map must not reach the child env.
+        let lookup = |name: &str| match name {
+            "OPENAI_API_KEY" => Some(std::ffi::OsString::from("sk-test-should-not-leak")),
+            "AWS_SECRET_ACCESS_KEY" => {
+                Some(std::ffi::OsString::from("aws-test-should-not-leak"))
+            }
+            "GITHUB_TOKEN" => Some(std::ffi::OsString::from("gh-test-should-not-leak")),
+            "SSH_AUTH_SOCK" => Some(std::ffi::OsString::from("/tmp/agent.sock")),
+            other => std::env::var_os(other),
+        };
+        let env = build_clean_environment_from(&dir, &dir, &lookup, None, None);
 
         for (k, _) in &env {
             assert!(

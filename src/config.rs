@@ -30,7 +30,19 @@ fn xdg_config_dir_from(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf>
 /// yield `None` so every caller can express its own default with a single
 /// `unwrap_or` / `filter` chain.
 pub fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
-    let raw = env::var(name).ok()?;
+    env_parse_from(name, &|key| env::var(key).ok())
+}
+
+/// Parse the variable `name` from an explicit `lookup` instead of the process environment.
+///
+/// `lookup` is the process environment in production (`|key| std::env::var(key).ok()`)
+/// and a synthetic map in tests, so parsing is testable without mutating
+/// process-global state. [`env_parse`] delegates here unchanged.
+pub fn env_parse_from<T: std::str::FromStr>(
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<T> {
+    let raw = lookup(name)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -124,44 +136,44 @@ mod tests {
         assert_eq!(xdg_config_dir_from(Some("  "), Some("\t\n ")), None);
     }
 
-    /// `env_parse` returns `None` when the variable is unset.
+    /// `env_parse_from` returns `None` when the variable is unset.
     #[test]
     fn test_env_parse_unset() {
-        let name = "MINI_SWE_ENV_PARSE_UNSET_TEST";
-        unsafe { env::remove_var(name) };
-        assert_eq!(env_parse::<usize>(name), None);
+        let lookup = |_: &str| None;
+        assert_eq!(env_parse_from::<usize>("ANYTHING", &lookup), None);
+        // The wrapper still reports `None` for a name the process environment
+        // does not define.
+        assert_eq!(
+            env_parse::<usize>("MINI_SWE_ENV_PARSE_UNSET_TEST_XYZ"),
+            None
+        );
     }
 
-    /// `env_parse` returns `None` for blank/whitespace-only values.
+    /// `env_parse_from` returns `None` for blank/whitespace-only values.
     #[test]
     fn test_env_parse_blank() {
-        let name = "MINI_SWE_ENV_PARSE_BLANK_TEST";
         for blank in ["", " ", "   ", "\t", "\n", " \t\n "] {
-            unsafe { env::set_var(name, blank) };
+            let owned = blank.to_string();
+            let lookup = |_: &str| Some(owned.clone());
             assert_eq!(
-                env_parse::<usize>(name),
+                env_parse_from::<usize>("ANYTHING", &lookup),
                 None,
                 "blank {blank:?} should be None"
             );
         }
-        unsafe { env::remove_var(name) };
     }
 
-    /// `env_parse` returns `None` for unparsable values.
+    /// `env_parse_from` returns `None` for unparsable values.
     #[test]
     fn test_env_parse_unparsable() {
-        let name = "MINI_SWE_ENV_PARSE_UNPARSABLE_TEST";
-        unsafe { env::set_var(name, "not-a-number") };
-        assert_eq!(env_parse::<usize>(name), None);
-        unsafe { env::remove_var(name) };
+        let lookup = |_: &str| Some("not-a-number".to_string());
+        assert_eq!(env_parse_from::<usize>("ANYTHING", &lookup), None);
     }
 
-    /// `env_parse` parses a valid value, trimming surrounding whitespace.
+    /// `env_parse_from` parses a valid value, trimming surrounding whitespace.
     #[test]
     fn test_env_parse_valid() {
-        let name = "MINI_SWE_ENV_PARSE_VALID_TEST";
-        unsafe { env::set_var(name, "  42  ") };
-        assert_eq!(env_parse::<usize>(name), Some(42));
-        unsafe { env::remove_var(name) };
+        let lookup = |_: &str| Some("  42  ".to_string());
+        assert_eq!(env_parse_from::<usize>("ANYTHING", &lookup), Some(42));
     }
 }

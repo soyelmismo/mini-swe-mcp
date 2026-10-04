@@ -97,8 +97,17 @@ pub fn flavor_for(action: Option<&str>, no_daemon: bool) -> Flavor {
 
 /// Resolve the Tokio worker thread count from the environment.
 pub fn resolve_worker_threads() -> usize {
-    env_parse("MINI_SWE_WORKER_THREADS")
-        .filter(|n| *n > 0)
+    resolve_worker_threads_from(&|name| env::var(name).ok())
+}
+
+/// Resolve the Tokio worker thread count from an explicit `lookup`.
+///
+/// `lookup` is the process environment in production and a synthetic map in
+/// tests, so invalid values are covered without mutating process-global state.
+/// [`resolve_worker_threads`] delegates here unchanged.
+pub fn resolve_worker_threads_from(lookup: &dyn Fn(&str) -> Option<String>) -> usize {
+    crate::config::env_parse_from("MINI_SWE_WORKER_THREADS", lookup)
+        .filter(|n: &usize| *n > 0)
         .unwrap_or(DEFAULT_WORKER_THREADS)
 }
 
@@ -149,18 +158,19 @@ mod tests {
 
     #[test]
     fn test_resolve_worker_threads_ignores_nonsense_values() {
-        let saved = env::var("MINI_SWE_WORKER_THREADS").ok();
-        unsafe { env::set_var("MINI_SWE_WORKER_THREADS", "0") };
-        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
-        unsafe { env::set_var("MINI_SWE_WORKER_THREADS", "-3") };
-        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
-        unsafe { env::set_var("MINI_SWE_WORKER_THREADS", "not-a-number") };
-        assert_eq!(resolve_worker_threads(), DEFAULT_WORKER_THREADS);
-
-        match saved {
-            Some(v) => unsafe { env::set_var("MINI_SWE_WORKER_THREADS", v) },
-            None => unsafe { env::remove_var("MINI_SWE_WORKER_THREADS") },
+        for raw in ["0", "-3", "not-a-number", ""] {
+            let owned = raw.to_string();
+            let lookup = |_: &str| Some(owned.clone());
+            assert_eq!(
+                resolve_worker_threads_from(&lookup),
+                DEFAULT_WORKER_THREADS,
+                "{raw:?} must fall back to the default"
+            );
         }
+        let lookup = |_: &str| Some("7".to_string());
+        assert_eq!(resolve_worker_threads_from(&lookup), 7);
+        let unset = |_: &str| None;
+        assert_eq!(resolve_worker_threads_from(&unset), DEFAULT_WORKER_THREADS);
     }
 }
 

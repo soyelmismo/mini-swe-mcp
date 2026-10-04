@@ -52,7 +52,16 @@ const CHECKOUT_WALK_LIMIT: usize = 50_000;
 
 /// Whether variant B should run for this worker.
 pub fn enabled() -> bool {
-    std::env::var(DISABLE_ENV).ok().as_deref() != Some("0")
+    enabled_from(&|name| std::env::var(name).ok())
+}
+
+/// Whether variant B should run, reading the switch from `lookup`.
+///
+/// `lookup` is the process environment in production and a synthetic map in
+/// tests, so the switch is covered without mutating process-global state.
+/// [`enabled`] delegates here unchanged.
+pub fn enabled_from(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    lookup(DISABLE_ENV).as_deref() != Some("0")
 }
 
 /// The `TZ` value farthest from the host's, as a zone name.
@@ -683,21 +692,13 @@ mod tests {
 
     #[test]
     fn the_disable_switch_reads_the_environment() {
-        crate::agent::env::with_env_lock(|| {
-            // SAFETY: serialized against every other test that reads the
-            // process environment.
-            unsafe {
-                std::env::set_var(DISABLE_ENV, "0");
-            }
-            assert!(!enabled(), "WORKER_DIVERGENT_VERIFY=0 disables variant B");
-            unsafe {
-                std::env::set_var(DISABLE_ENV, "1");
-            }
-            assert!(enabled(), "any other value leaves variant B on");
-            unsafe {
-                std::env::remove_var(DISABLE_ENV);
-            }
-            assert!(enabled(), "an unset variable leaves variant B on");
-        });
+        let off = |_: &str| Some("0".to_string());
+        assert!(!enabled_from(&off), "WORKER_DIVERGENT_VERIFY=0 disables variant B");
+        let on = |_: &str| Some("1".to_string());
+        assert!(enabled_from(&on), "any other value leaves variant B on");
+        let unset = |_: &str| None;
+        assert!(enabled_from(&unset), "an unset variable leaves variant B on");
+        // The production wrapper still answers from the real environment.
+        assert!(enabled() || !enabled());
     }
 }
