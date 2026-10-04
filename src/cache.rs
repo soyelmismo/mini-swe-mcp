@@ -761,6 +761,7 @@ mod tests {
             name0.starts_with("swe-target-") && name0.contains(&first) && name0.ends_with("-0"),
             "got: {name0:?}"
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -902,6 +903,15 @@ mod tests {
         );
         drop(lease);
         sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
+        if target.exists() {
+            for e in std::fs::read_dir(&base).unwrap().flatten() {
+                let p = e.path();
+                let lf = lock_file(&build_dir_lock_path(&p));
+                let got = lf.as_ref().map(|f| flock(f, true, true).is_ok());
+                eprintln!("DIAG entry={p:?} lock={lf:?} flock_ok={got:?}");
+            }
+            eprintln!("DIAG still exists: {:?}\n contents: {:?}", target, std::fs::read_dir(&target).map(|d| d.flatten().map(|x| x.path().to_string_lossy().into_owned()).collect::<Vec<_>>()));
+        }
         assert!(
             !target.exists(),
             "A released dir must be swept once it is idle"

@@ -2921,9 +2921,11 @@ mod tests {
             .await
             .expect("execute_bash must run");
         assert_eq!(code, Some(0), "execute_bash failed: {home:?}");
-        assert!(
-            home.contains("target/home"),
-            "execute_bash must sanitize the child environment (isolated HOME), got: {home:?}"
+        assert_eq!(
+            home.trim(),
+            tmp.join("target/home").to_string_lossy(),
+            "execute_bash must remap HOME into the worktree it was given, \
+             not inherit this process's: {home:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
