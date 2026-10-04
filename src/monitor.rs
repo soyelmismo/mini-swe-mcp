@@ -1011,6 +1011,10 @@ pub struct HistoryReader {
 /// Number of output lines kept per turn.
 const TURN_TAIL_LINES: usize = 5;
 
+/// Turns one PgUp/PgDn moves the detail view: a page, not a line, so a long
+/// history stays navigable without repeating the key.
+const PAGE_TURNS: usize = 10;
+
 impl HistoryReader {
     /// Read every line appended to `path` since the last read and fold the new
     /// turns into `self.turns`.
@@ -1284,16 +1288,18 @@ impl UiState {
                 _ => Action::None,
             },
             View::Detail => match key {
+                // Ctrl+C arrives as `q` from `read_key`: it steps back here
+                // and quits from the list, so two presses always exit.
                 Key::Esc | Key::Char('q') => {
                     self.view = View::List;
                     Action::Back
                 }
                 Key::PageUp => {
-                    self.scroll = self.scroll.saturating_sub(1);
+                    self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
                     Action::ScrollUp
                 }
                 Key::PageDown => {
-                    self.scroll = self.scroll.saturating_add(1);
+                    self.scroll = self.scroll.saturating_add(PAGE_TURNS);
                     Action::ScrollDown
                 }
                 Key::Char('f') => {
@@ -1319,8 +1325,8 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
         [0x1b, b'[', b'6', b'~'] => Some(Key::PageDown),
         [b'\r'] | [b'\n'] => Some(Key::Enter),
         [0x1b] => Some(Key::Esc),
-        [b'j'] => Some(Key::Up),
-        [b'k'] => Some(Key::Down),
+        [b'j'] => Some(Key::Down),
+        [b'k'] => Some(Key::Up),
         [b] if b.is_ascii_graphic() || *b == b' ' => Some(Key::Char(*b as char)),
         _ => None,
     }
@@ -1333,9 +1339,9 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// the fixed columns leave behind, so no line ever overflows `width`.
 /// Completed and retired-soon workers are dimmed.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    let glyph = status_glyph(w.status);
-    let id = truncate_visible(&w.id, 8);
-    let model = truncate_visible(&w.model, 8);
+    let glyph = status_glyph(w.status).to_string();
+    let id = pad_visible(&truncate_visible(&w.id, 8), 8);
+    let model = pad_visible(&truncate_visible(&w.model, 8), 8);
     let duration_secs = if w.status.is_terminal() {
         w.updated_at.saturating_sub(w.started_at)
     } else {
@@ -1361,7 +1367,16 @@ pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> Strin
     };
     let op_text = format!("{}{op_text}", group.unwrap_or_default());
 
-    let fixed = 1 + 1 + 8 + 1 + 8 + 1 + visible_width(&turns) + 1 + visible_width(&elapsed) + 1;
+    let fixed = visible_width(&glyph)
+        + 1
+        + 8
+        + 1
+        + 8
+        + 1
+        + visible_width(&turns)
+        + 1
+        + visible_width(&elapsed)
+        + 1;
     let op_width = width.saturating_sub(fixed).max(1);
     let op = truncate_visible(&op_text, op_width);
 
@@ -1620,9 +1635,16 @@ fn render_detail(
     }
     let header_lines = out.lines().count();
     let body_height = height.saturating_sub(header_lines + 1).max(1);
-    // Collect the turn lines newest-last, then take the visible window.
+    // Window over turns first (scroll is in turns), then fit the flattened
+    // lines to the body: follow mode sticks to the newest turn.
+    let skip = if state.follow {
+        0
+    } else {
+        state.scroll.min(reader.turns.len().saturating_sub(1))
+    };
+    let end = reader.turns.len().saturating_sub(skip);
     let mut turn_lines: Vec<String> = Vec::new();
-    for turn in &reader.turns {
+    for turn in &reader.turns[..end] {
         let code = turn
             .exit_code
             .map(|c| format!(" (exit {c})"))
@@ -1638,14 +1660,8 @@ fn render_detail(
     if turn_lines.is_empty() {
         turn_lines.push("(no turns recorded yet)".to_string());
     }
-    let skip = if state.follow {
-        0
-    } else {
-        state.scroll.min(turn_lines.len().saturating_sub(1))
-    };
-    let end = turn_lines.len().saturating_sub(skip);
-    let start = end.saturating_sub(body_height);
-    for line in turn_lines.iter().skip(start).take(body_height) {
+    let start = turn_lines.len().saturating_sub(body_height);
+    for line in turn_lines.iter().skip(start) {
         out.push_str(line);
         out.push('\n');
     }
@@ -1683,7 +1699,8 @@ fn read_key() -> Option<Key> {
         }
     }
     if bytes == [0x03] {
-        // Ctrl+C in raw mode arrives as a byte, not a signal: always quit.
+        // Ctrl+C in raw mode arrives as a byte, not a signal: it steps back
+        // in the detail view and quits from the list, like `q`.
         return Some(Key::Char('q'));
     }
     // `j`/`k` move in the list; elsewhere they are plain characters.
@@ -1759,6 +1776,9 @@ async fn run_interactive() -> Result<()> {
         if !order.is_empty() {
             state.selection = state.selection.min(order.len() - 1);
         }
+        // Drop readers for workers that left the registry, so a long session
+        // never accumulates histories for workers that are gone.
+        readers.retain(|id, _| entries.iter().any(|e| e.id == *id));
 
         let output = match state.view {
             View::List => render_list(&entries, &state, now, width, height),
@@ -1821,15 +1841,10 @@ async fn run_interactive() -> Result<()> {
             Wake::Done => break,
             Wake::Tick => {}
             Wake::Key(key) => {
-                // Ctrl+C arrives as `q` from `read_key`; quit from any view.
                 let (_, order) = build_list_lines(&entries, now, width, state.groups_expanded);
-                let action = state.apply_key(key, order.len());
-                match action {
-                    Action::Quit => break,
-                    Action::Back | Action::OpenDetail => {}
-                    _ => {}
+                if state.apply_key(key, order.len()) == Action::Quit {
+                    break;
                 }
-                // Entering a detail view with no history yet still redraws.
             }
         }
     }
@@ -2593,9 +2608,13 @@ mod tests {
 
         // Detail: scroll pages, follow toggles, movement keys are ignored.
         assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
-        assert_eq!(state.scroll, 1);
+        assert_eq!(state.scroll, PAGE_TURNS);
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
+        assert_eq!(state.scroll, 2 * PAGE_TURNS);
         assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.scroll, PAGE_TURNS);
+        // Scrolling past the newest turn clamps instead of wrapping.
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
         assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
         assert_eq!(state.scroll, 0);
         assert_eq!(state.apply_key(Key::Char('f'), 3), Action::ToggleFollow);
@@ -2624,8 +2643,8 @@ mod tests {
         assert_eq!(parse_key(&[0x1b, b'[', b'6', b'~']), Some(Key::PageDown));
         assert_eq!(parse_key(b"\r"), Some(Key::Enter));
         assert_eq!(parse_key(&[0x1b]), Some(Key::Esc));
-        assert_eq!(parse_key(b"j"), Some(Key::Up));
-        assert_eq!(parse_key(b"k"), Some(Key::Down));
+        assert_eq!(parse_key(b"j"), Some(Key::Down));
+        assert_eq!(parse_key(b"k"), Some(Key::Up));
         assert_eq!(parse_key(b"q"), Some(Key::Char('q')));
         assert_eq!(parse_key(&[0x03]), None);
         assert_eq!(parse_key(&[0x1b, b'[', b'Z']), None);
