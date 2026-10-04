@@ -320,11 +320,12 @@ pub(crate) fn repo_key(repo: &Path) -> anyhow::Result<String> {
     Ok(format!("{hash:016x}"))
 }
 
-/// `n`th build directory of a repository's pool. Directories are indexed by
-/// lease order, not by admission slot: a live worker holds one exclusively for
-/// its whole lifetime, so two workers of one repository can never share a dir.
-pub(crate) fn build_dir(repo: &Path, index: usize) -> anyhow::Result<PathBuf> {
-    Ok(crate::worktree::swe_base_dir().join(format!("swe-target-{}-{index}", repo_key(repo)?)))
+/// `n`th build directory of a repository's pool, under `base`. Directories are
+/// indexed by lease order, not by admission slot: a live worker holds one
+/// exclusively for its whole lifetime, so two workers of one repository can
+/// never share a dir.
+pub(crate) fn build_dir(base: &Path, repo: &Path, index: usize) -> anyhow::Result<PathBuf> {
+    Ok(base.join(format!("swe-target-{}-{index}", repo_key(repo)?)))
 }
 
 /// Remove every build directory leased for `repo`.
@@ -509,26 +510,27 @@ impl BuildDirLease {
     /// Lease the lowest-indexed free directory of `repo`, creating a new one
     /// when every directory the repository already has is live.
     pub fn acquire(repo: &Path) -> std::io::Result<Self> {
-        Self::acquire_with_cap(repo, slot_max_bytes())
+        Self::acquire_in(&crate::worktree::swe_base_dir(), repo, slot_max_bytes())
     }
 
-    /// Lease `repo`'s lowest free slot, emptying it first when it holds more
-    /// than `max_bytes`.
+    /// Lease `repo`'s lowest free slot under `base`, emptying it first when it
+    /// holds more than `max_bytes`.
     ///
-    /// The cap is a parameter rather than read here so a test can drive the
-    /// behaviour without mutating the process-global environment variable every
-    /// other test in the binary shares; [`acquire`] passes the value parsed from
-    /// [`SLOT_MAX_GIB_ENV`].
-    fn acquire_with_cap(repo: &Path, max_bytes: u64) -> std::io::Result<Self> {
-        let base = crate::worktree::swe_base_dir();
-        std::fs::create_dir_all(&base)?;
+    /// The base is a parameter so a test can lease into a directory it owns
+    /// instead of the host's shared build root under `swe_base_dir()`, which
+    /// the background sweep scans; the cap is a parameter so a test can drive
+    /// the behaviour without mutating the process-global environment variable
+    /// every other test in the binary shares. [`acquire`] passes the shared
+    /// base and the value parsed from [`SLOT_MAX_GIB_ENV`].
+    pub fn acquire_in(base: &Path, repo: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(base)?;
         // The sweep lock keeps eviction from removing a directory between the
         // probe below and the lock that proves it free.
         let global = lock_file(&base.join(".swe-target-sweep.lock"))?;
         flock(&global, true, false)?;
         let mut index = 0usize;
         let lease = loop {
-            let dir = build_dir(repo, index).map_err(std::io::Error::other)?;
+            let dir = build_dir(base, repo, index).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&dir)?;
             let lock = lock_file(&build_dir_lock_path(&dir))?;
             if flock(&lock, true, true).is_ok() {
@@ -728,8 +730,8 @@ mod tests {
         assert_eq!(first, second, "The same repository must keep one key");
         assert_eq!(first.len(), 16, "got: {first:?}");
         let base = crate::worktree::swe_base_dir();
-        let dir0 = super::build_dir(&repo, 0).expect("Build dir must resolve");
-        let dir1 = super::build_dir(&repo, 1).expect("Build dir must resolve");
+        let dir0 = super::build_dir(&base, &repo, 0).expect("Build dir must resolve");
+        let dir1 = super::build_dir(&base, &repo, 1).expect("Build dir must resolve");
         assert_eq!(
             dir0.parent(),
             Some(base.as_path()),
@@ -959,13 +961,13 @@ mod tests {
     fn an_idle_slot_over_the_cap_is_emptied_when_it_is_leased() {
         with_slot_base(|_base| {
             let repo = slot_cap_repo("trim");
-            let first = BuildDirLease::acquire_with_cap(&repo, ONE_GIB).unwrap();
+            let first = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
             let dir = first.dir().to_path_buf();
             // The worker ends: the slot is idle again, as it is between two.
             drop(first);
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
 
-            let second = BuildDirLease::acquire_with_cap(&repo, ONE_GIB).unwrap();
+            let second = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
             assert_eq!(
                 second.dir(),
                 dir.as_path(),
@@ -997,13 +999,13 @@ mod tests {
     fn a_slot_another_worker_holds_is_never_emptied() {
         with_slot_base(|_base| {
             let repo = slot_cap_repo("held");
-            let held = BuildDirLease::acquire_with_cap(&repo, ONE_GIB).unwrap();
+            let held = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
             let dir = held.dir().to_path_buf();
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
             // A second worker of the repository leases the next free slot, so the
             // cap runs over the base again: a cap that ignored the lease lock would
             // strike here instead of here alone.
-            let other = BuildDirLease::acquire_with_cap(&repo, ONE_GIB).unwrap();
+            let other = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
             assert_ne!(other.dir(), dir);
             assert!(
                 stale.exists() && held.dir().join("debug").is_dir(),
@@ -1022,12 +1024,12 @@ mod tests {
     fn a_zero_cap_leaves_an_over_cap_slot_alone() {
         with_slot_base(|_base| {
             let repo = slot_cap_repo("off");
-            let first = BuildDirLease::acquire_with_cap(&repo, 0).unwrap();
+            let first = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, 0).unwrap();
             let dir = first.dir().to_path_buf();
             drop(first);
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
 
-            let second = BuildDirLease::acquire_with_cap(&repo, 0).unwrap();
+            let second = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, 0).unwrap();
             assert_eq!(second.dir(), dir.as_path());
             assert!(
                 stale.exists(),
