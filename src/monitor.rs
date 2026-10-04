@@ -1342,10 +1342,64 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// `[group]` prefix inside the op column. The op text is truncated to whatever
 /// the fixed columns leave behind, so no line ever overflows `width`.
 /// Completed and retired-soon workers are dimmed.
+/// Strip terminal escape sequences and control characters from untrusted text.
+///
+/// A worker's task, its last command, its pause question and above all its tool
+/// output are model- or repository-written text, and the monitor draws them into
+/// a raw-mode alternate-screen terminal. Rendered verbatim, an embedded
+/// `\x1b[?1049l` (leave the alternate screen), a screen clear, a cursor move or
+/// an OSC sequence could redraw, hide or replace what the operator is looking at
+/// -- the monitor would then show a state the worker chose, not the state the
+/// pool is in. The monitor's own styling is applied around the sanitized text,
+/// never by it.
+fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                // CSI: parameters and intermediates, then one final byte.
+                Some('[') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: a string terminated by BEL or by ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other two-byte escape (charset selection, and so on).
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\n' | '\t' => out.push(ch),
+            // Every other C0 control, DEL and the C1 range is invisible at best
+            // and a terminal command at worst; none of them is content.
+            c if (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
     let glyph = status_glyph(w.status).to_string();
-    let id = pad_visible(&truncate_visible(&w.id, 8), 8);
-    let model = pad_visible(&truncate_visible(&w.model, 8), 8);
+    let id = pad_visible(&truncate_visible(&sanitize_text(&w.id), 8), 8);
+    let model = pad_visible(&truncate_visible(&sanitize_text(&w.model), 8), 8);
     let duration_secs = if w.status.is_terminal() {
         w.updated_at.saturating_sub(w.started_at)
     } else {
@@ -1358,16 +1412,16 @@ pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> Strin
         .group
         .as_deref()
         .filter(|g| !g.trim().is_empty())
-        .map(|g| format!("[{}] ", g.trim()));
+        .map(|g| format!("[{}] ", sanitize_text(g.trim())));
     let op_text = if let Some(ref q) = w.question {
-        format!("ASK: {q}")
+        format!("ASK: {}", sanitize_text(q))
     } else if !w.last_command.is_empty()
         && w.last_command != "completed"
         && w.last_command != "initializing"
     {
-        w.last_command.clone()
+        sanitize_text(&w.last_command)
     } else {
-        w.task.lines().next().unwrap_or("").trim().to_string()
+        sanitize_text(w.task.lines().next().unwrap_or("").trim())
     };
     let op_text = format!("{}{op_text}", group.unwrap_or_default());
 
@@ -1525,7 +1579,7 @@ fn build_list_lines<'a>(
     let mut order = Vec::new();
     for (repo_path, group) in &repos {
         let summary = summary_line(&group.summary_items(), true);
-        let heading = truncate_visible(&format!("[{repo_path}]  {summary}"), width);
+        let heading = truncate_visible(&format!("[{}]  {summary}", sanitize_text(repo_path)), width);
         lines.push(ListLine::Header(format!("\x1b[1;36m{heading}\x1b[0m")));
         if expanded {
             for w in &group.workers {
@@ -1617,12 +1671,15 @@ fn render_detail(
     ));
     out.push('\n');
     out.push_str(&truncate_visible(
-        &format!("task: {}", entry.task.lines().next().unwrap_or("")),
+        &format!(
+            "task: {}",
+            sanitize_text(entry.task.lines().next().unwrap_or(""))
+        ),
         width,
     ));
     out.push('\n');
     if let Some(ref q) = entry.question {
-        out.push_str(&truncate_visible(&format!("question: {q}"), width));
+        out.push_str(&truncate_visible(&format!("question: {}", sanitize_text(q)), width));
         out.push('\n');
     }
     if let Some(ref report) = entry.report
@@ -1631,7 +1688,10 @@ fn render_detail(
         out.push_str(&truncate_visible(
             &format!(
                 "report: {} | files: {} | tests: {} | risks: {}",
-                report.done, report.files, report.tests, report.risks
+                sanitize_text(&report.done),
+                sanitize_text(&report.files),
+                sanitize_text(&report.tests),
+                sanitize_text(&report.risks)
             ),
             width,
         ));
@@ -1654,11 +1714,11 @@ fn render_detail(
             .map(|c| format!(" (exit {c})"))
             .unwrap_or_default();
         turn_lines.push(truncate_visible(
-            &format!("#{} {}{}", turn.step, turn.command, code),
+            &format!("#{} {}{}", turn.step, sanitize_text(&turn.command), code),
             width,
         ));
         for line in &turn.output_lines {
-            turn_lines.push(truncate_visible(&format!("  {line}"), width));
+            turn_lines.push(truncate_visible(&format!("  {}", sanitize_text(line)), width));
         }
     }
     if turn_lines.is_empty() {
