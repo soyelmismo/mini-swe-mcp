@@ -1663,3 +1663,147 @@ fn a_completed_worker_with_no_commits_beyond_its_base_is_not_integrated() {
         "the branch must survive"
     );
 }
+
+/// A round's consolidator can integrate a worker's *content* rather than its
+/// history: a squash or a re-merge writes the same tree on `main` under a
+/// different commit, so `worker-<id>` is not an ancestor of `main` even though
+/// every line of the work is there. Ancestry alone would leave the completed
+/// worker on the books forever, and the operator has to discard it by hand --
+/// twice, on this repository.
+///
+/// The sweep answers with the same proof a merge uses: the branch is
+/// integrated when it is contained in the base *or* when merging it into the
+/// base would change nothing. A change the base does not carry fails both
+/// proofs and keeps the worker.
+#[test]
+fn the_sweep_retires_a_worker_whose_change_reached_the_base_as_a_squash() {
+    let f = Fixture::new("retire-squashed");
+    // Two completed workers on branches off the same base: one whose content
+    // the base took over as a squash, one whose content it never took.
+    f.commit_on_worker_branch("sq1", "sq1.txt", "squashed work\n");
+    f.record_with_status("sq1", mini_swe_mcp::pool::RegistryStatus::Completed);
+    f.commit_on_worker_branch("nq1", "nq1.txt", "unmerged work\n");
+    f.record_with_status("nq1", mini_swe_mcp::pool::RegistryStatus::Completed);
+
+    // The round took `sq1`'s file onto `main` as its own commit: the content is
+    // on the base, the worker's commit is not an ancestor of it.
+    write(f.repo(), "sq1.txt", "squashed work\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-m", "consolidate the round"]);
+
+    let sweep = f.sweep();
+
+    assert_eq!(
+        sweep.workers,
+        vec!["sq1".to_string()],
+        "a worker whose change is on the base as a squash is integrated"
+    );
+    assert!(!f.row_exists("sq1"), "the row must be retired");
+    assert!(!f.history_exists("sq1"), "the conversation must be retired");
+    assert!(
+        !git_ref_exists(f.repo(), "worker-sq1"),
+        "the squashed branch must be deleted"
+    );
+    assert!(
+        f.row_exists("nq1") && git_ref_exists(f.repo(), "worker-nq1"),
+        "a change the base does not carry must keep its worker and its branch"
+    );
+}
+
+/// A worker runs git inside the repository, so it can leave *any* ref behind
+/// under its own name -- including a tag, which shares the name of its branch.
+///
+/// `branch_tip` resolves the bare name `worker-<id>`, and git resolves a tag
+/// before a branch. A worker whose `worker-<id>` branch is gone therefore still
+/// reads a tip, and `is_ancestor` resolves the tag the same way, so the sweep
+/// gets a proof about a commit the branch never pointed at. Only a ref under
+/// `refs/heads/` can answer "is this worker's branch in the base".
+#[test]
+fn a_tag_named_after_a_deleted_worker_branch_does_not_prove_integration() {
+    let f = Fixture::new("retire-tag-shadow");
+    // The worker committed, so its branch was real and did carry work...
+    f.commit_on_worker_branch("tg1", "tg1.txt", "work\n");
+    f.record_with_status("tg1", mini_swe_mcp::pool::RegistryStatus::Completed);
+
+    // ...but the branch is gone and a tag carries the name instead. The tag
+    // points at a commit the base does not contain: nothing was ever integrated.
+    git(f.repo(), &["branch", "-D", "worker-tg1"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+    echo_commit(f.repo(), "tag-only");
+    git(f.repo(), &["tag", "worker-tg1"]);
+    assert!(
+        !git_ref_exists(f.repo(), "refs/heads/worker-tg1"),
+        "the branch must really be gone: only the tag remains"
+    );
+    assert!(
+        git_ref_exists(f.repo(), "refs/tags/worker-tg1"),
+        "the shadowing tag must exist for this to prove anything"
+    );
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a tag must not stand in for the branch: {:?}",
+        sweep.workers
+    );
+    assert!(f.row_exists("tg1"), "the row must survive");
+    assert!(f.history_exists("tg1"), "the conversation must survive");
+}
+
+/// Commit an empty change so the tag lands on a commit past the base commit.
+fn echo_commit(repo: &std::path::Path, message: &str) {
+    git(repo, &["commit", "-q", "--allow-empty", "-m", message]);
+}
+
+/// The same shadowing, with the branch still there and its work still
+/// unlanded: the base has moved on independently, so the commit the worker
+/// branched from is an ancestor of the base, and a tag left under the worker's
+/// name points at exactly that commit.
+///
+/// With the bare name, git resolves the tag first and `is_ancestor` answers
+/// "yes, the work is in the base" about a commit the branch has nothing to do
+/// with -- while the branch beside it holds a commit nobody landed. Pinning the
+/// ref under `refs/heads/` is what makes the answer be about the branch.
+#[test]
+fn a_tag_shadowing_a_live_worker_branch_does_not_retire_unlanded_work() {
+    let f = Fixture::new("retire-tag-shadow-live");
+    // The worker branched from `base` and committed work of its own.
+    f.commit_on_worker_branch("tg2", "tg2.txt", "unlanded work\n");
+    f.record_with_status("tg2", mini_swe_mcp::pool::RegistryStatus::Completed);
+    // `main` then moved on by itself, so the worker's base commit is now an
+    // ancestor of `main` while its own commit is not.
+    git(f.repo(), &["checkout", "-q", "main"]);
+    write(f.repo(), "unrelated.txt", "unrelated\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-m", "main moves on"]);
+    // A tag under the worker's name, at that ancestor commit.
+    git(f.repo(), &["tag", "worker-tg2", "refs/heads/worker-tg2~1"]);
+    assert!(
+        git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
+        "the branch must still carry the unlanded work"
+    );
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a tag must not answer for the branch: {:?}",
+        sweep.workers
+    );
+    assert!(f.row_exists("tg2"), "the row must survive");
+    assert!(
+        git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
+        "the branch must survive"
+    );
+    // The work really is unlanded, so nothing is lost by keeping the worker.
+    assert_eq!(
+        git(
+            f.repo(),
+            &["rev-list", "--count", "main..refs/heads/worker-tg2"]
+        )
+        .trim(),
+        "1",
+        "the branch must still carry its one unlanded commit"
+    );
+}

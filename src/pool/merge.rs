@@ -1091,35 +1091,12 @@ fn unintegrated_members(
                 left_out,
             });
         };
-        // No branch means nothing left to integrate: the worker was already
-        // merged or its branch pruned, so it cannot be holding back the round.
-        // A branch the probe cannot answer for is not the same thing: nothing
-        // was proved, so it holds the round back with an unknown count.
-        match branch_exists(repo, &member) {
-            Ok(false) => continue,
-            Ok(true) => {}
-            Err(_) => {
-                report(None);
-                continue;
-            }
-        }
-        match is_ancestor(repo, &member, branch) {
-            // Contained: whatever the member carries is already in the branch
-            // the merge will land, so the round is the round that was reviewed.
-            Ok(true) => continue,
-            // Not reachable, which is not yet proof of absence: the round may
-            // have been integrated by content rather than by history.
-            Ok(false) => {}
-            // Git could not answer whether the tip is in the round, so nothing
-            // was proved and the round is not known to match its record.
-            Err(_) => {
-                report(None);
-                continue;
-            }
-        }
-        // The content proof: a member whose commits are not reachable may still
-        // have been taken by content -- see `tree_already_in`.
-        if tree_already_in(repo, branch, &member) {
+        // The one definition of "integrated", by history or by content: the
+        // member's work is already carried by the round, so the round is the
+        // round that was reviewed. Every failure to prove it -- an unprobeable
+        // repository, a ref git will not resolve -- falls through to the report
+        // below rather than past it.
+        if work_already_in(repo, branch, &member) {
             continue;
         }
         report(unintegrated_commit_count(repo, &member, branch));
@@ -1254,6 +1231,59 @@ fn read_round_members(root: &ScratchRoot, consolidator: &str) -> Option<Vec<Stri
     )
 }
 
+/// Whether `branch`'s work is already carried by `target`, by history or by
+/// content.
+///
+/// This is the single definition of "integrated" every caller shares, because
+/// the two places that ask the question disagreed once and the disagreement
+/// stranded work: a merge refuses a round whose member is not integrated, and
+/// the retirement sweep retires a completed worker whose branch is not in its
+/// base. Both questions are the same one -- *is this branch's work already on
+/// that branch?* -- and a consolidator that takes a worker's content by squash
+/// or by re-merge answers "yes" while the ancestry proof alone answers "no".
+/// A sweep that only knew about ancestry therefore never retired a worker the
+/// round had genuinely integrated, and the operator had to discard it by hand.
+///
+/// The three proofs, in the order they are tried, each failing closed:
+///
+/// * **No branch at all.** Nothing is left to integrate, so nothing is held
+///   back. A branch git cannot answer for is *not* the same thing: nothing was
+///   proved, so the caller must report it rather than wave it through.
+/// * **The tip is an ancestor of the target.** Whatever the branch carries is
+///   reachable from the target already.
+/// * **A clean merge that changes nothing.** [`tree_already_in`], the squash /
+///   cherry-pick case.
+///
+/// A repository git will not answer about proves nothing, so every failure
+/// falls through to the last proof and, failing that, to "not integrated" --
+/// never to "integrated". A caller that deletes work on this predicate must
+/// still gate it on its own stronger rules: the post-merge cleanup and the
+/// retirement sweep both add the "tip is beyond the commit the worker was
+/// dispatched from" half, so a worker that committed nothing is retired by
+/// neither.
+///
+/// `target` is the branch the merge landed on and is passed through as the
+/// caller wrote it; `branch` is named under `refs/heads/`, because the two
+/// proofs below resolve a bare name and git resolves a *tag* before a branch.
+/// A worker runs git inside the repository and can leave a tag named
+/// `worker-<its id>`, and every proof would then be a statement about the tag's
+/// commit while the branch beside it holds work nobody landed. Pinning the
+/// worker's ref is what keeps the answer about the branch.
+pub(crate) fn work_already_in(repo: &Path, target: &str, branch: &str) -> bool {
+    match branch_exists(repo, branch) {
+        Ok(false) => return true,
+        Ok(true) => {}
+        Err(_) => return false,
+    }
+    // `branch_exists` above already pins the name under `refs/heads/`; these two
+    // resolve a bare name, so they get the full ref themselves.
+    let branch = format!("refs/heads/{branch}");
+    if is_ancestor(repo, &branch, target).unwrap_or(false) {
+        return true;
+    }
+    tree_already_in(repo, target, &branch)
+}
+
 /// Whether merging `member` into `branch` would change nothing, i.e. whether
 /// the round already carries this worker's content.
 ///
@@ -1361,14 +1391,15 @@ fn unintegrated_refusal(consolidator: &str, unintegrated: &[Unintegrated]) -> St
     )
 }
 
-/// Whether `worker-<id>`'s current branch is proven contained in `base`.
+/// Whether `worker-<id>`'s current branch is proven carried by `base`.
 ///
 /// The round a consolidator integrated records which branches it merged *at
 /// that moment*. A worker revised afterwards commits new work on its own
-/// branch, so its recorded membership is not enough: only a fresh ancestry
-/// proof shows that whatever is on the branch right now is already in the base.
-/// Any doubt -- no row, no repository, no branch, an unprobeable repo -- answers
-/// false, so a re-revised worker survives instead of losing work.
+/// branch, so its recorded membership is not enough: only a fresh proof --
+/// [`work_already_in`], by history or by content -- shows that whatever is on
+/// the branch right now is already in the base. Any doubt -- no row, no
+/// repository, no branch, an unprobeable repo -- answers false, so a re-revised
+/// worker survives instead of losing work.
 ///
 /// Containment alone is not enough either: a branch still sitting on the
 /// commit its worker was dispatched from is contained in the base trivially,
@@ -1415,17 +1446,7 @@ fn branch_is_integrated_in(root: &ScratchRoot, repo: &Path, worker_id: &str, bas
     if !same_repo {
         return false;
     }
-    crate::worktree::git(
-        repo,
-        "merge-base --is-ancestor",
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &format!("worker-{worker_id}"),
-            base,
-        ],
-    )
-    .is_ok_and(|out| out.status.success())
+    work_already_in(repo, base, &format!("worker-{worker_id}"))
 }
 
 // ----------
