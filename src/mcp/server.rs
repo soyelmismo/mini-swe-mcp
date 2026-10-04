@@ -1238,11 +1238,31 @@ mod tests {
         assert_eq!(line.len(), MAX_FRAME_BYTES);
     }
 
-    fn server() -> McpServer {
-        McpServer::new(
-            WorkerPool::new(1, "http://localhost:1".to_string(), "test-key".to_string()),
-            "ninja".to_string(),
-        )
+    /// A temporary scratch root a test's pool writes into, removed on drop.
+    ///
+    /// [`crate::test_support::TestScratch`] also drops the private
+    /// `swe-tmp-*` / `swe-target-*` companions the sandbox derives from a
+    /// worktree's leaf name, which a bare directory would leave behind.
+    type ScratchDir = crate::test_support::TestScratch;
+
+    /// A server whose pool files every row, mailbox and steer log under a
+    /// temporary scratch root, together with the [`ScratchDir`] that removes
+    /// it on drop.
+    ///
+    /// `WorkerPool::new` resolves the *real* scratch base, so a test that
+    /// steers a worker writes this process's durable steer log and its nonce
+    /// into the operator's `/var/tmp`. The test keeps the root alive for as
+    /// long as the server lives.
+    fn server() -> (ScratchDir, McpServer) {
+        let root = ScratchDir::new("mcp-server");
+        let pool = WorkerPool::with_scratch(
+            1,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            crate::worktree::ScratchRoot::new(root.path()),
+        );
+        let server = McpServer::new(pool, "ninja".to_string());
+        (root, server)
     }
 
     /// A `steer` answer is immediate, so the admission guard it took to queue
@@ -1251,7 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn steer_returns_immediately_and_releases_its_admission_guard() {
         use crate::pool::{LogBuffer, WorkerMetrics, WorkerRecord, WorkerState};
-        let server = server();
+        let (_root, server) = server();
         server
             .pool
             .__test_insert_worker(WorkerRecord {
@@ -1293,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_advertised_action_is_dispatchable() {
-        let server = server();
+        let (_root, server) = server();
         for action in WORKER_ACTIONS {
             // Arguments are deliberately missing, so most verbs fail their own
             // validation; what matters is that the verb itself is recognised.
@@ -1405,7 +1425,7 @@ mod tests {
     /// The payload is immutable, hence built once and only cloned afterwards.
     #[test]
     fn tools_list_is_precomputed_and_stable() {
-        let server = server();
+        let (_root, server) = server();
         let clone = server.clone();
 
         // Clones share the very same precomputed payload...
