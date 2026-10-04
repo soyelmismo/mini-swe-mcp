@@ -109,8 +109,10 @@ const PROGRESS_CELLS: usize = 8;
 const BAR_WIDTH: usize = PROGRESS_CELLS + 2;
 /// Terminals at or above this width get a progress bar before `step/max`.
 const PROGRESS_THRESHOLD: usize = 100;
-/// Narrowest op column that still shows a command prefix plus its ellipsis.
-const MIN_OP_WIDTH: usize = 12;
+/// Columns the op keeps before the dropping logic starts removing columns
+/// around it: enough for a real command prefix at any usable width. A shorter
+/// op simply renders whole, so this is a floor, never a truncation target.
+const MIN_OP_WIDTH: usize = 24;
 
 // ----------
 // Text measurement helpers (width-aware, never byte-based)
@@ -287,11 +289,20 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// Prefix the review engine stamps onto a reviewing worker's command.
+const REVIEW_PREFIX: &str = "[review] ";
+
 /// The op cell: the question when the worker asks, else the last command, else
-/// the task headline. The group tag is demoted to a `[group]` prefix here.
-fn op_text(w: &WorkerRegistryEntry) -> String {
+/// the task headline.
+///
+/// The `[group]` tag is only added for a flat (ungrouped) row: a row printed
+/// under its group's header line already shows the group in the line above, so
+/// repeating it there is pure noise. The `[review] ` prefix the review engine
+/// stamps onto a command is dropped for a reviewing worker, whose glyph (`◆`)
+/// already says the same thing.
+fn op_text(w: &WorkerRegistryEntry, show_group: bool) -> String {
     let first_line = w.task.lines().next().unwrap_or("").trim();
-    let detail = if let Some(ref q) = w.question {
+    let mut detail = if let Some(ref q) = w.question {
         format!("ASK: {q}")
     } else if !w.last_command.is_empty()
         && w.last_command != "completed"
@@ -301,8 +312,14 @@ fn op_text(w: &WorkerRegistryEntry) -> String {
     } else {
         first_line.to_string()
     };
+    if w.status == RegistryStatus::Reviewing {
+        detail = detail
+            .strip_prefix(REVIEW_PREFIX)
+            .unwrap_or(&detail)
+            .to_string();
+    }
     match w.group.as_deref() {
-        Some(g) if !g.trim().is_empty() => format!("[{}] {detail}", g.trim()),
+        Some(g) if show_group && !g.trim().is_empty() => format!("[{}] {detail}", g.trim()),
         _ => detail,
     }
 }
@@ -314,7 +331,16 @@ fn op_text(w: &WorkerRegistryEntry) -> String {
 /// the glyph, the id and the op always stay. A progress bar precedes `step/max`
 /// only at [`PROGRESS_THRESHOLD`]+ columns. The op takes whatever the fixed
 /// columns leave and is truncated with `…`, so the row never overflows `inner`.
-fn compact_row(w: &WorkerRegistryEntry, now: u64, inner: usize, use_color: bool) -> String {
+///
+/// `show_group` prints the `[group]` tag in the op; callers pass `false` for a
+/// row printed under its own group header, which already names the group.
+fn compact_row(
+    w: &WorkerRegistryEntry,
+    now: u64,
+    inner: usize,
+    use_color: bool,
+    show_group: bool,
+) -> String {
     let glyph = status_glyph(w.status);
     let id = truncate_visible(&w.id, ID_WIDTH);
     let model = model_alias(&w.model);
@@ -325,7 +351,7 @@ fn compact_row(w: &WorkerRegistryEntry, now: u64, inner: usize, use_color: bool)
         now.saturating_sub(w.started_at)
     };
     let elapsed = format_elapsed(duration_secs);
-    let detail = op_text(w);
+    let detail = op_text(w, show_group);
 
     let show_bar = inner + 4 >= PROGRESS_THRESHOLD;
     let base = 1 + 1 + ID_WIDTH + 1;
@@ -574,7 +600,7 @@ fn list_content_lines(
         };
         lines.push(truncate_visible(&header, inner));
         for w in workers {
-            lines.push(compact_row(w, now, inner, use_color));
+            lines.push(compact_row(w, now, inner, use_color, false));
         }
     }
     lines
@@ -1044,9 +1070,10 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// Layout: `glyph id model step/max elapsed op`, columns dropping in the
 /// stated order as the terminal narrows. Delegates to the shared `compact_row`
 /// helper so the interactive list and the plain dashboard share one layout;
-/// plain (no ANSI codes) like the non-TTY output.
+/// plain (no ANSI codes) like the non-TTY output. This is the flat view: it
+/// keeps the `[group]` tag, since no group header precedes it.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    compact_row(w, now, width.saturating_sub(4).max(1), false)
+    compact_row(w, now, width.saturating_sub(4).max(1), false, true)
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
@@ -1233,7 +1260,7 @@ fn render_list(
         match line {
             ListLine::Header(h) => out.push_str(&box_line(h, width)),
             ListLine::Worker(w) => {
-                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color);
+                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color, false);
                 if Some(w.id.as_str()) == selected_id {
                     out.push_str(&box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
                 } else {
@@ -1763,34 +1790,121 @@ mod tests {
         assert!(wide.contains("01m"), "elapsed missing at 120:\n{wide}");
 
         let mid = render_dashboard_with_width(&entries, 1060, false, 60);
-        // At 60 every column still fits.
+        // At 60 every column still fits beside the protected op.
         assert!(mid.contains("15/250"), "step/max missing at 60:\n{mid}");
         assert!(mid.contains("ninja"), "model alias missing at 60:\n{mid}");
         assert!(mid.contains("01m"), "elapsed missing at 60:\n{mid}");
 
+        // Elapsed drops first: at 54 the model alias still fits, the clock does not.
+        let no_elapsed = render_dashboard_with_width(&entries, 1060, false, 54);
+        assert!(
+            no_elapsed.contains("ninja"),
+            "model alias should stay at 54:\n{no_elapsed}"
+        );
+        assert!(
+            !no_elapsed.contains("01m"),
+            "elapsed should be dropped at 54:\n{no_elapsed}"
+        );
+
+        // Then the model: at 50 step/max still fits, the alias does not.
+        let no_model = render_dashboard_with_width(&entries, 1060, false, 50);
+        assert!(
+            no_model.contains("15/250"),
+            "step/max should stay at 50:\n{no_model}"
+        );
+        assert!(
+            !no_model.contains("ninja"),
+            "model should be dropped at 50:\n{no_model}"
+        );
+        assert!(
+            !no_model.contains("01m"),
+            "elapsed should be dropped at 50:\n{no_model}"
+        );
+
         let narrow = render_dashboard_with_width(&entries, 1060, false, 40);
-        // Elapsed then model drop first; step/max still fits; id + op stay.
+        // Narrower still: step/max drops too; id + op stay.
         assert!(narrow.contains("925633bb"), "id lost at 40:\n{narrow}");
         assert!(narrow.contains("CONSOLI"), "op lost at 40:\n{narrow}");
         assert!(
-            narrow.contains("15/250"),
-            "step/max should stay at 40:\n{narrow}"
+            !narrow.contains("15/250"),
+            "step/max should be dropped at 40:\n{narrow}"
         );
         assert!(
             !narrow.contains("ninja"),
             "model should be dropped at 40:\n{narrow}"
         );
-        assert!(
-            !narrow.contains("01m"),
-            "elapsed should be dropped at 40:\n{narrow}"
-        );
 
         let tiny = render_dashboard_with_width(&entries, 1060, false, 25);
-        // Narrowest: step/max drops too; glyph + id + op always stay.
+        // Narrowest: glyph + id + op always stay.
         assert!(tiny.contains("925633bb"), "id lost at 25:\n{tiny}");
         assert!(
             !tiny.contains("15/250"),
             "step/max should be dropped at 25:\n{tiny}"
+        );
+    }
+
+    /// The op is the protected column: at 50 columns it keeps at least
+    /// [`MIN_OP_WIDTH`] visible characters, so the narrow layout spends its
+    /// columns on what the worker is doing rather than on the label around it.
+    #[test]
+    fn test_op_keeps_its_minimum_width_at_50_columns() {
+        let reviewing = Row::new("925633bb")
+            .status(RegistryStatus::Reviewing)
+            .turns(38, 120)
+            .command("[review] ls -d target 2>/dev/null")
+            .task("Review the diff")
+            .group("round52")
+            .build();
+        let text = render_dashboard_with_width(&[reviewing], 1060, false, 50);
+        let row = text
+            .lines()
+            .find(|l| l.contains("925633bb"))
+            .unwrap_or_else(|| panic!("no row for the worker:\n{text}"));
+        assert!(visible_width(row) <= 50, "row overflows 50: {row:?}");
+        // The group tag and the redundant review prefix are gone; what is left
+        // is the glyph, the id, step/max and a full-width op.
+        assert!(!row.contains("round52"), "group tag kept: {row:?}");
+        assert!(!row.contains("[review]"), "review prefix kept: {row:?}");
+        assert!(row.contains("38/120"), "step/max missing: {row:?}");
+        assert!(
+            row.contains("ls -d target 2>/dev/null"),
+            "op should fit whole at 50 cols: {row:?}"
+        );
+    }
+
+    /// A row that sits under its group's header line carries no `[group]` tag:
+    /// the header above already names the group, so the tag is a repeated
+    /// column that only narrows the op.
+    #[test]
+    fn test_grouped_rows_carry_no_group_tag() {
+        let entries = sample_entries();
+        let text = render_dashboard_with_width(&entries, 1060, false, 80);
+        let mut seen_groups = 0;
+        for line in text.lines() {
+            if line.contains("925633bb") {
+                assert!(
+                    !line.contains("round52"),
+                    "grouped row repeats its group tag: {line:?}"
+                );
+            }
+            if line.contains("ccbc2be1") {
+                assert!(
+                    !line.contains("round50"),
+                    "grouped row repeats its group tag: {line:?}"
+                );
+            }
+            // The headers themselves still name the group.
+            if line.contains("round52") || line.contains("round50") {
+                seen_groups += 1;
+            }
+        }
+        assert_eq!(seen_groups, 2, "group headers lost:\n{text}");
+
+        // The flat (ungrouped) view keeps the tag: it has no header to read.
+        let flat = fit_compact_row(&entries[0], 1060, 80);
+        assert!(
+            flat.contains("[round52]"),
+            "flat view must keep the group tag: {flat:?}"
         );
     }
 
