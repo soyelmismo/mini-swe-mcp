@@ -57,6 +57,7 @@ mod pause;
 mod review;
 mod sentinels;
 mod turn;
+mod whole_file;
 pub(crate) use self::turn::parse_shortstat;
 
 pub(crate) use self::sentinels::strip_markup;
