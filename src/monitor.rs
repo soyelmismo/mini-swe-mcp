@@ -972,7 +972,8 @@ fn columns_env() -> Option<usize> {
 /// The history log is append-only and can grow without bound over a long
 /// worker, so the detail view keeps only the newest turns in memory and trims
 /// the rest as it reads. Bounded by construction; the reader never grows past
-/// this even when the file on disk is much longer.
+/// this even when the file on disk is much longer, and the first open reads no
+/// more than the newest [`FIRST_READ_BYTES`] bytes of it.
 pub const MAX_TURNS_IN_MEMORY: usize = 500;
 
 /// A single parsed turn of a worker's history log, as the detail view shows it.
@@ -997,7 +998,8 @@ pub struct TurnView {
 ///
 /// Remembers the byte offset it has consumed and parses only the lines that
 /// were appended since the last read, so a refresh never re-reads the whole
-/// file. Keeps at most [`MAX_TURNS_IN_MEMORY`] turns; older ones are dropped.
+/// file. Keeps at most [`MAX_TURNS_IN_MEMORY`] turns; older ones are dropped,
+/// and the first open reads at most the newest [`FIRST_READ_BYTES`] bytes.
 /// A torn final line (a crash mid-append) is skipped and the offset advances
 /// past it, so the next read picks up after it.
 #[derive(Debug, Clone, Default)]
@@ -1010,6 +1012,14 @@ pub struct HistoryReader {
 
 /// Number of output lines kept per turn.
 const TURN_TAIL_LINES: usize = 5;
+
+/// Bytes read from a history log on the first open.
+///
+/// The detail view shows the newest turns, so opening a worker whose log has
+/// grown far past the turn cap must not cost a whole-file read and a whole-file
+/// parse for turns that are dropped again: the first read takes the newest tail
+/// of this size, the later ones only what was appended.
+const FIRST_READ_BYTES: u64 = 1024 * 1024;
 
 /// Turns one PgUp/PgDn moves the detail view: a page, not a line, so a long
 /// history stays navigable without repeating the key.
@@ -1038,14 +1048,41 @@ impl HistoryReader {
         if len <= self.offset {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = String::new();
+        // The first open of a long history reads only its newest tail; every
+        // later read starts where the previous one stopped, on a line boundary.
+        let (start, jumped) = if self.offset == 0 && self.turns.is_empty() && len > FIRST_READ_BYTES
+        {
+            (len - FIRST_READ_BYTES, true)
+        } else {
+            (self.offset, false)
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
         // The offset follows what was *read*, not the `len` stat'd above: the
         // writer appends between the two calls, and an offset taken from the
         // stale length would re-parse those bytes on the next refresh and
         // duplicate their turns.
-        let read = file.read_to_string(&mut buf)? as u64;
-        self.offset = self.offset.saturating_add(read);
+        let read = file.read_to_end(&mut bytes)? as u64;
+        self.offset = start.saturating_add(read);
+        // Bytes, not `read_to_string`: the writer appends whole lines, but a
+        // read that lands mid-append can end inside a multi-byte character, and
+        // a UTF-8 error there would stall this reader for the rest of the
+        // worker's life. A torn character becomes a replacement character and
+        // the offset still advances past it.
+        let mut buf = String::from_utf8_lossy(&bytes).into_owned();
+        if jumped {
+            // The tail begins mid-line: drop the partial line the seek landed
+            // in, so it is never parsed as a turn of its own. The newline is
+            // located in the *bytes*, because the lossy conversion above can
+            // have shifted the string's byte positions.
+            match bytes.iter().position(|b| *b == b'\n') {
+                Some(pos) => {
+                    self.offset = start + pos as u64 + 1;
+                    buf = String::from_utf8_lossy(&bytes[pos + 1..]).into_owned();
+                }
+                None => buf.clear(),
+            }
+        }
         self.consume_lines(&buf);
         Ok(())
     }
@@ -2718,13 +2755,8 @@ mod tests {
     /// the tool result attaches its exit code plus the output tail.
     #[test]
     fn test_history_reader_parses_turns_incrementally() {
-        let dir = std::env::temp_dir().join(format!(
-            "monitor-test-{}-{}",
-            std::process::id(),
-            unix_timestamp()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("swe-wt-w1.history.jsonl");
+        let scratch = crate::test_support::TestScratch::new("monitor-history");
+        let path = scratch.path().join("swe-wt-w1.history.jsonl");
 
         let meta = serde_json::json!({"task": "t", "model": "m", "repo_path": "r",
             "base_commit": "c", "branch": "b", "network_offline": false,
@@ -2790,7 +2822,6 @@ mod tests {
         assert_eq!(reader.turns[1].output_lines, vec!["boom".to_string()]);
         assert!(reader.offset > offset);
 
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reader caps its memory: far more turns than fit stay on disk.
@@ -2866,5 +2897,192 @@ mod tests {
             fit_compact_row(&stale, 10_000, 120).starts_with("\x1b[2m"),
             "a worker quiet past the TTL must dim"
         );
+    }
+
+    /// Escape sequences and control characters are stripped from untrusted
+    /// text: CSI, OSC (both terminators) and the two-byte escapes go, tabs and
+    /// newlines stay, and an unterminated sequence cannot smuggle the rest of
+    /// the string through.
+    #[test]
+    fn sanitize_text_strips_escapes_and_keeps_content() {
+        assert_eq!(
+            sanitize_text("\x1b[?1049l\x1b[2J\x1b]52;c;QUJD\x07\x1b]0;pwned\x07visible"),
+            "visible",
+            "alt-screen, clear, clipboard and title escapes must all go"
+        );
+        assert_eq!(sanitize_text("\x1bBkept"), "kept", "two-byte escape");
+        assert_eq!(sanitize_text("cut\x1b[31;"), "cut", "unterminated CSI");
+        assert_eq!(sanitize_text("cut\x1b]0;no end"), "cut", "unterminated OSC");
+        assert_eq!(sanitize_text("a\tb\nc"), "a\tb\nc", "layout characters stay");
+        assert_eq!(
+            sanitize_text("a\u{7f}b\u{9b}c\u{1}d"),
+            "abcd",
+            "DEL, C1 and C0 controls go"
+        );
+        assert_eq!(sanitize_text("caf\u{e9}"), "caf\u{e9}", "text is untouched");
+    }
+
+    /// A worker's own text (task, command, pause question, report, tool output)
+    /// must reach the screen without the escapes it embedded: the monitor draws
+    /// into a raw-mode alternate screen, so a hostile worker could otherwise
+    /// redraw or hide what the operator is looking at.
+    #[test]
+    fn the_tui_renders_no_escapes_from_a_worker() {
+        let hostile = "\x1b[?1049l\x1b[2J\x1b]0;pwned\x07";
+        let mut entry = Row::new("hostile1")
+            .task(&format!("do it{hostile}"))
+            .command(&format!("cargo test{hostile}"))
+            .repo("local")
+            .build();
+        entry.question = Some(format!("pause?{hostile}"));
+        entry.report = Some(crate::pool::WorkerReport {
+            done: format!("changed{hostile}"),
+            files: "src/a.rs".to_string(),
+            tests: "cargo test".to_string(),
+            risks: "none".to_string(),
+        });
+
+        let row = fit_compact_row(&entry, 1060, 200);
+        assert!(
+            !row.contains('\x1b'),
+            "a live row carries no styling of its own, so no escape may survive: {row:?}"
+        );
+        assert!(row.contains("ASK: pause?"), "the question must show: {row}");
+
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 1,
+            command: format!("cargo test{hostile}"),
+            exit_code: Some(0),
+            output_lines: vec![format!("out{hostile}")],
+        });
+        let detail = render_detail(&entry, &reader, &UiState::default(), 1060, 120, 24);
+        assert!(
+            !detail.contains('\x1b'),
+            "the detail view adds no styling either: {detail:?}"
+        );
+        assert!(detail.contains("out"), "the output must still show: {detail}");
+
+        // The list heading is a path the worker chose, too.
+        let listed = [entry];
+        let (lines, _) = build_list_lines(&listed, 1060, 200, true);
+        let heading = &lines[0];
+        let ListLine::Header(text) = heading else {
+            panic!("the first line is a heading")
+        };
+        assert!(
+            !text.contains("\x1b[?1049l") && !text.contains("\x1b]0;"),
+            "the heading must be sanitized: {text:?}"
+        );
+    }
+
+    /// The first open of a long history reads its newest tail, not the whole
+    /// file: the turns it shows are the newest ones and the work stays bounded.
+    #[test]
+    fn the_first_read_of_a_long_history_is_bounded_to_its_newest_tail() {
+        let scratch = crate::test_support::TestScratch::new("monitor-history");
+        let path = scratch.path().join("swe-wt-big.history.jsonl");
+
+        // Six turns whose output is large enough that the whole log is far past
+        // the first-read bound, while the newest turns alone fit it.
+        let output = "x".repeat(250_000);
+        let turn = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "bash",
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({"command": command})).expect("args")}}]})
+                .to_string()
+        };
+        let result = serde_json::json!({"role": "tool", "tool_call_id": "c1",
+            "content": format!("COMMAND OUTPUT (exit code: 0)\n{output}")})
+            .to_string();
+        let mut body = String::new();
+        for i in 1..=6 {
+            body.push_str(&turn(&format!("step {i}")));
+            body.push('\n');
+            body.push_str(&result);
+            body.push('\n');
+        }
+        std::fs::write(&path, &body).expect("write the long history");
+        assert!(
+            std::fs::metadata(&path).expect("stat").len() > FIRST_READ_BYTES,
+            "the test needs a log past the bound"
+        );
+
+        let mut reader = HistoryReader::default();
+        reader.read_incremental(&path).expect("read");
+        assert!(
+            reader.turns.len() < 6,
+            "the first read must not have parsed the whole file: {} turns",
+            reader.turns.len()
+        );
+        assert_eq!(
+            reader.turns.last().map(|t| t.command.as_str()),
+            Some("step 6"),
+            "the newest turn must be the one the view ends on"
+        );
+        assert_ne!(
+            reader.turns.first().map(|t| t.command.as_str()),
+            Some("step 1"),
+            "the oldest turns are the ones the bound drops"
+        );
+        assert!(
+            reader.turns.iter().all(|t| t.exit_code == Some(0)),
+            "every turn kept must be complete: {:?}",
+            reader.turns
+        );
+
+    }
+
+    /// A read that lands mid-append, inside a multi-byte character, must not
+    /// fail the read: a UTF-8 error there would stall this reader for the rest
+    /// of the worker's life, because the offset would never advance again.
+    #[test]
+    fn a_torn_multi_byte_character_does_not_stall_the_reader() {
+        let scratch = crate::test_support::TestScratch::new("monitor-history");
+        let path = scratch.path().join("swe-wt-torn.history.jsonl");
+
+        let turn = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "bash",
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({"command": command})).expect("args")}}]})
+                .to_string()
+        };
+        // One complete turn, then a line cut in the middle of a two-byte `\u{e9}`.
+        std::fs::write(&path, format!("{}\n", turn("cargo test"))).expect("seed");
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+            // Cut after the first byte of the two-byte character, so the file
+            // ends inside it.
+            let prefix = "{\"role\":\"assistant\",\"content\":\"caf\u{e9}";
+            let cut = prefix.len() - 1;
+            file.write_all(&prefix.as_bytes()[..cut]).expect("torn write");
+        }
+
+        let mut reader = HistoryReader::default();
+        reader.read_incremental(&path).expect("a torn read must not fail");
+        assert_eq!(reader.turns.len(), 1, "only the complete turn parses");
+        let after_torn = reader.offset;
+
+        // The rest of the line arrives; the reader moves on instead of stalling.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+            writeln!(file, " done\"}}").expect("finish the torn line");
+            writeln!(file, "{}", turn("cargo build")).expect("next turn");
+        }
+        reader.read_incremental(&path).expect("read on");
+        assert!(reader.offset > after_torn, "the offset must advance");
+        assert_eq!(
+            reader.turns.last().map(|t| t.command.as_str()),
+            Some("cargo build"),
+            "the turn after the torn line must be parsed: {:?}",
+            reader.turns
+        );
+
     }
 }

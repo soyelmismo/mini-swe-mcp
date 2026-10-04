@@ -309,6 +309,13 @@ pub fn mode_default_reviewer(
         // while the worker completes. Every caller falls back to its own
         // default instead, and `ModelManifest::validate` names the typo.
         .filter(|m| !m.is_empty() && manifest.knows_model(m))
+        // A name the catalog *does* declare is not enough either: an entry may
+        // carry an empty `id` (validate warns about it and cannot fix it), and
+        // `resolve_model` would then hand every caller an empty model string.
+        // The reviewer has to resolve to a real id, or the automatic security
+        // audit would run against no provider at all and the sensitive diff
+        // would complete unaudited.
+        .filter(|m| !manifest.resolve_model(m).0.trim().is_empty())
 }
 
 /// Whether `requested` names a model the manifest knows: an alias, or a full
@@ -1627,6 +1634,30 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w.contains("neerd")),
             "the typo must be named to the operator: {warnings:?}"
+        );
+    }
+
+    /// A `default_model` naming a catalog entry that carries no model id must
+    /// not disarm the automatic audit: `resolve_model` hands back the empty id,
+    /// so the review request would carry no model at all and the sensitive diff
+    /// would complete with no adversarial pass.
+    #[test]
+    fn a_security_default_model_that_resolves_to_no_id_falls_back() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  holed:\n    id: \"\"\nreview_modes:\n  security:\n    default_model: holed\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(
+            choice.model, "combo:default",
+            "an alias that resolves to no id must not reach the provider"
+        );
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|w| w.contains("id cannot be empty")),
+            "the catalog must name the empty id: {:?}",
+            manifest.validate()
         );
     }
 
