@@ -62,7 +62,7 @@ const WHOLE_FILE_MAX_BYTES: u64 = 48 * 1024;
 
 /// Turns within which a slice of an already-shown, unchanged file keeps its
 /// range instead of the whole file again.
-const WHOLE_FILE_REPEAT_TURNS: usize = 8;
+pub(super) const WHOLE_FILE_REPEAT_TURNS: usize = 8;
 
 /// What the harness should answer a range read with.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub(super) fn whole_file_reply(
     if line_count > WHOLE_FILE_MAX_LINES {
         return WholeFileReply::Keep;
     }
-    let spelled = read.display.clone();
+    let spelled = read.display;
     if let Some(shown_at) = guard.recent_show(&resolved, stamp, step) {
         info!(
             file = %spelled,
@@ -163,23 +163,27 @@ pub(super) struct RangeRead {
 /// the parse, because a shell-expanded name is never the literal the parser
 /// sees, and an unexpanded `*` is not a path that can resolve to one file.
 fn parse_range_read(command: &str) -> Option<RangeRead> {
-    let mut words = shell_words(command)?;
-    let mut dir = None;
-    if words.first().is_some_and(|w| w == "cd") {
-        // Only the two-word `cd <dir> &&` prefix, the one shape that changes
-        // where the file is looked for while naming no other work.
-        let target = words.get(1)?.clone();
-        if words.get(2) != Some(&"&&".to_string()) {
-            return None;
+    // The `cd <dir> &&` prefix is taken off textually, before tokenizing,
+    // because `&&` is a metacharacter the tokenizer refuses everywhere else:
+    // this is the one place the harness accepts a separator, and only as the
+    // two-word `cd` form that changes where the file is looked for while
+    // naming no other work.
+    let (dir, rest) = match command.split_once("&&") {
+        Some((head, rest)) => {
+            let head = shell_words(head.trim())?;
+            match head[..] {
+                [cd, dir] if cd == "cd" => (Some(dir), rest.trim()),
+                _ => return None,
+            }
         }
-        dir = Some(target);
-        words.drain(..3);
-    }
+        None => (None, command),
+    };
+    let words = shell_words(rest)?;
     let (verb, rest) = words.split_first()?;
     let display = match verb.as_str() {
         "sed" => sed_range(rest)?,
         "head" | "tail" => {
-            let (rest, _count) = split_count(rest);
+            let rest = split_operands(rest);
             // One operand: several files is not one range read of one file.
             if rest.len() != 1 {
                 return None;
@@ -193,17 +197,16 @@ fn parse_range_read(command: &str) -> Option<RangeRead> {
 
 /// Drop a `head`/`tail` count, in either spelling, leaving the operands.
 ///
-/// `head -n 20` and `head -20` both name a count; a bare `head` names its own
-/// default. Whatever is left must be exactly one file.
-fn split_count(words: &[String]) -> (Vec<String>, Option<String>) {
+/// `head -n 20` and `head -20` both name a count, and a bare `head` names its
+/// own default of ten; either way the operands are what is left, and they must
+/// be exactly one file.
+fn split_operands(words: &[String]) -> Vec<String> {
     match words {
-        [first, second, rest @ ..] if first == "-n" && is_number(second) => {
-            (rest.to_vec(), Some(second.clone()))
-        }
+        [first, second, rest @ ..] if first == "-n" && is_number(second) => rest.to_vec(),
         [one, rest @ ..] if one.len() > 1 && one.starts_with('-') && is_number(&one[1..]) => {
-            (rest.to_vec(), Some(one[1..].to_string()))
+            rest.to_vec()
         }
-        rest => (rest.to_vec(), None),
+        rest => rest.to_vec(),
     }
 }
 
@@ -219,7 +222,9 @@ fn sed_range(words: &[String]) -> Option<String> {
     if flag != "-n" {
         return None;
     }
-    let bounds = script.strip_suffix('p')?;
+    // `1,5p` and `1,5 p` are the same script; only the range and the `p` may
+    // be there, so the bounds are trimmed and must be plain counts.
+    let bounds = script.strip_suffix('p')?.trim_end();
     let bounds: Vec<&str> = bounds.split(',').collect();
     if !(1..=2).contains(&bounds.len()) || !bounds.iter().copied().all(is_number) {
         return None;
