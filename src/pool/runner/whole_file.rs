@@ -171,8 +171,8 @@ fn parse_range_read(command: &str) -> Option<RangeRead> {
     let (dir, rest) = match command.split_once("&&") {
         Some((head, rest)) => {
             let head = shell_words(head.trim())?;
-            match head[..] {
-                [cd, dir] if cd == "cd" => (Some(dir), rest.trim()),
+            match head.as_slice() {
+                [cd, dir] if cd == "cd" => (Some(dir.clone()), rest.trim()),
                 _ => return None,
             }
         }
