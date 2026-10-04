@@ -5,7 +5,7 @@
 //! goes through the same Unix socket a thin client would dial.
 
 use crate::common;
-use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, hub_dir_in};
+use mini_swe_mcp::hub::{HubConfig, HubPaths, HubServer, LOG_ROTATE_BYTES, hub_dir_in};
 use mini_swe_mcp::manifest::ModelManifest;
 use mini_swe_mcp::mcp::McpServer;
 use mini_swe_mcp::pool::WorkerPool;
@@ -562,6 +562,69 @@ fn thin_clients_autostart_reuse_and_proxy_through_the_hub() {
             .socket()
             .exists(),
         "MINI_SWE_NO_DAEMON=1 creates no socket"
+    );
+}
+
+/// An oversized `hub.log` does not keep growing: the daemon starts on a fresh
+/// one and the previous generation is kept as `hub.log.1`.
+///
+/// The live hub's log reached 6.6 MB with nothing to stop it, so the cap is
+/// enforced where the log is opened for the daemon a client auto-starts.
+#[test]
+fn an_oversized_hub_log_is_rotated_when_the_daemon_starts() {
+    let exe = common::binary_path();
+    let hub = common::TempDir::new_in_tmp("hub-log-rotate");
+    let hub_dir = hub.path().to_path_buf();
+    let _reaper = DaemonReaper(hub_dir.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict the hub dir to 0700");
+    }
+    let log = hub_dir.join("hub.log");
+    std::fs::write(&log, vec![b'x'; (LOG_ROTATE_BYTES + 1) as usize])
+        .expect("seed an oversized hub log");
+
+    let out = common::binary_command(&exe)
+        .args(["list", "--json"])
+        .env("SWE_HUB_DIR", &hub_dir)
+        .env("SWE_TEMP_DIR", hub.subdir("swe"))
+        .env("HUB_IDLE_SECS", "1")
+        .env("OPENAI_API_KEY", "test-key-not-used-by-list")
+        .env("ENV_FILE", "/nonexistent-mini-swe-env")
+        .output()
+        .expect("CLI call runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let previous = std::fs::metadata(hub_dir.join("hub.log.1")).expect("hub.log.1 exists");
+    assert_eq!(
+        previous.len(),
+        LOG_ROTATE_BYTES + 1,
+        "the previous generation must be kept whole"
+    );
+    // The client can be answered between the daemon's bind and its first log
+    // line, so poll for the line instead of reading once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let fresh = loop {
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        if seen.contains("listening") || std::time::Instant::now() >= deadline {
+            break seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        fresh.contains("listening"),
+        "the new daemon must log into the fresh file: {fresh}"
+    );
+    assert!(
+        (fresh.len() as u64) < LOG_ROTATE_BYTES,
+        "the fresh log must start small, got {} bytes",
+        fresh.len()
     );
 }
 

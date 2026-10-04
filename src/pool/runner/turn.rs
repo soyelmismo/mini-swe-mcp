@@ -439,14 +439,56 @@ fn digest(text: &str, fold_digits: bool) -> u64 {
     hasher.finish()
 }
 
-/// `output` trimmed to its last `limit` bytes, so the pause question quotes
-/// what the command said without a whole log in the orchestrator's terminal.
+/// What [`bounded_tail`] prepends to a tail it had to cut, so a reader can see
+/// that the head is missing.
+const TRUNCATION_MARKER: &str = "...";
+
+/// `output` trimmed to its last `limit` bytes -- `limit` counting the marker,
+/// so the returned string never exceeds it -- so the pause question quotes what
+/// the command said without a whole log in the orchestrator's terminal.
 fn bounded_tail(output: &str, limit: usize) -> String {
     if output.len() <= limit {
         return output.to_string();
     }
-    let start = output.floor_char_boundary(output.len() - limit);
-    format!("...{}", &output[start..])
+    // The marker counts towards the limit, or the returned string would be
+    // `limit + marker.len()` bytes and the ceiling it documents would be a lie.
+    let keep = limit.saturating_sub(TRUNCATION_MARKER.len());
+    let start = output.floor_char_boundary(output.len() - keep);
+    format!("{TRUNCATION_MARKER}{}", &output[start..])
+}
+
+/// How many of a command's last non-empty lines a tracing line may carry.
+pub(super) const LOG_OUTPUT_LINES: usize = 5;
+
+/// Ceiling on the bytes one tracing line may spend on a command's output.
+///
+/// The hub log only has to answer "what did this run end with": a 400-byte,
+/// five-line tail does that, while a whole `cargo test` transcript per verify
+/// grew a log nobody could read (6.6 MB over 51.7k lines, ~1.7 MB of it raw
+/// gate output) and had nothing to stop it. The model still receives the full
+/// (already truncated) output through the tool result; only the log shrinks.
+///
+/// The ceiling covers the marker [`bounded_tail`] prepends, so a tail that had
+/// to be cut still fits the budget the log is promised.
+pub(super) const LOG_OUTPUT_BYTES: usize = 400;
+
+/// A command's output as a tracing field: its last [`LOG_OUTPUT_LINES`]
+/// non-empty lines, bounded to [`LOG_OUTPUT_BYTES`].
+///
+/// Blank lines carry nothing, and the bound is applied after the line pick so a
+/// single very long line cannot smuggle a whole transcript into one field.
+pub(super) fn log_output_tail(output: &str) -> String {
+    let mut kept: VecDeque<&str> = VecDeque::with_capacity(LOG_OUTPUT_LINES + 1);
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        if kept.len() == LOG_OUTPUT_LINES {
+            kept.pop_front();
+        }
+        kept.push_back(line);
+    }
+    bounded_tail(
+        &kept.into_iter().collect::<Vec<_>>().join("\n"),
+        LOG_OUTPUT_BYTES,
+    )
 }
 
 /// The nudge a first loop detection injects: name the loop, name what the
@@ -2791,10 +2833,12 @@ impl<'a> TurnEngine<'a> {
         let (output_b, code_b) = self
             .run_gated_with_env(verify, AdmissionClass::Completion, divergent_env.clone())
             .await?;
+        // The exit code and the tail are what a reader needs; the output
+        // itself stays with the model through the observation.
         tracing::info!(
             worker = %self.worker_id,
             exit = ?code_b,
-            output = %crate::agent::sandbox::truncate_output(&output_b),
+            output = %log_output_tail(&output_b),
             "Divergent verify variant B finished"
         );
 
@@ -3656,15 +3700,68 @@ impl<'a> TurnEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LlmResponse, LoopDetector, LoopVerdict,
-        MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch, READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT,
-        REPORT_SCAN_BYTES, ReadOnlyNudge, ReadOnlyStreak, ReadOnlyThresholds,
-        STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES, append_report_text, edit_plan,
-        edit_plan_text, extension_budget, grant_extension, isolation_block, loop_nudge_text,
-        loop_pause_question, named_file_defaults, normalize_command_base, output_digest,
-        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
-        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
+        EDIT_PLAN_FILES, EDIT_PLAN_PATH_BYTES, LOG_OUTPUT_BYTES, LOG_OUTPUT_LINES, LlmResponse,
+        LoopDetector, LoopVerdict, MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch,
+        READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
+        ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
+        TRUNCATION_MARKER, append_report_text, edit_plan, edit_plan_text, extension_budget,
+        grant_extension, isolation_block, log_output_tail, loop_nudge_text, loop_pause_question,
+        named_file_defaults, normalize_command_base, output_digest, parse_shortstat,
+        parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
+        read_only_thresholds, summarized_task, task_names_files,
     };
+
+    /// A verify that ran thousands of test lines must not put them in the log:
+    /// the tracing line carries the tail only, and the worker still gets the
+    /// whole (separately truncated) output through its observation.
+    #[test]
+    fn the_log_tail_keeps_the_end_of_a_long_output_and_nothing_more() {
+        let mut output = String::new();
+        for i in 0..5000 {
+            output.push_str(&format!("test suite::case_{i} ... ok\n"));
+        }
+        let tail = log_output_tail(&output);
+
+        assert!(
+            tail.len() <= LOG_OUTPUT_BYTES,
+            "a log tail must stay under {LOG_OUTPUT_BYTES} bytes, got {}",
+            tail.len()
+        );
+        assert!(
+            !tail.contains("case_0 "),
+            "the head of a long output must not reach the log"
+        );
+        assert!(
+            tail.contains("case_4999"),
+            "the log must name the last line the run ended with"
+        );
+
+        // Blank lines carry nothing, so they never consume one of the five.
+        let padded = "a\n\n   \nb\n\nc\n\nd\n\ne\n\nf\n";
+        assert_eq!(
+            log_output_tail(padded),
+            "b\nc\nd\ne\nf",
+            "the tail must be the last {LOG_OUTPUT_LINES} non-empty lines"
+        );
+
+        // Five lines individually long enough to force the cut: the ceiling has
+        // to hold with the marker counted, or a long gate output smuggles
+        // LOG_OUTPUT_BYTES + marker.len() into every log line.
+        let mut long_lines = String::new();
+        for i in 0..LOG_OUTPUT_LINES {
+            long_lines.push_str(&format!("line{i} {}\n", "z".repeat(LOG_OUTPUT_BYTES)));
+        }
+        let long_tail = log_output_tail(&long_lines);
+        assert!(
+            long_tail.len() <= LOG_OUTPUT_BYTES,
+            "a cut tail must still fit {LOG_OUTPUT_BYTES} bytes, got {}",
+            long_tail.len()
+        );
+        assert!(
+            long_tail.starts_with(TRUNCATION_MARKER),
+            "a cut tail must say it was cut, got {long_tail:?}"
+        );
+    }
 
     /// A response with no tool call and no reasoning, for scan-buffer tests.
     fn scanned(content: &str, command: Option<&str>) -> LlmResponse {
