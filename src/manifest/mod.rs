@@ -267,12 +267,18 @@ impl ModelManifest {
         let mut out = Vec::new();
         for builtin in ["quality", "security"] {
             match self.declared_review_mode(builtin) {
-                Some((name, def)) => {
+                Some((_declared_name, def)) => {
                     let mut def = def.clone();
                     if def.checklist.as_deref().is_none_or(|c| c.trim().is_empty()) {
                         def.checklist = Self::builtin_review_checklist(builtin);
                     }
-                    out.push(((*name).to_string(), def, "models.yaml"));
+                    // The canonical built-in name, never the spelling the
+                    // catalog used: every lookup of this mode is case
+                    // insensitive, so keying the listing under `Security`
+                    // would drop `security` from the manifest view entirely
+                    // and offer a name no `--review-after` spelling is
+                    // documented to accept.
+                    out.push((builtin.to_string(), def, "models.yaml"));
                 }
                 None => out.push((
                     builtin.to_string(),

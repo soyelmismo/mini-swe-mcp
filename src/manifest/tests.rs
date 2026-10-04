@@ -1156,39 +1156,51 @@ fn test_truncating_an_instructions_block_is_idempotent_and_marked() {
         twice.validate()
     );
 }
-
+/// A built-in mode overridden under a different case is still listed under its
+/// canonical name.
+///
+/// Every lookup of `quality`/`security` is case insensitive, so a `Security:`
+/// entry overrides the built-in wherever it is read. The listing that feeds the
+/// MCP `manifest` action and `mini-swe-mcp manifest` keys the entry by the name
+/// the catalog happened to spell, which removes `security` from the manifest
+/// view entirely and offers a name no documented `--review-after` spelling
+/// carries: an orchestrator reads the listing, cannot find `security`, and so
+/// never triggers the adversarial review it is told is available.
 #[test]
-fn zz_probe_case_variant2() {
-    // A case-variant built-in override that ALSO names a default_model.
-    let yaml = "models:\n  nerd:\n    id: combo:nerd\n  ninja:\n    id: combo:ninja\nreview_modes:\n  Security:\n    default_model: nerd\n";
-    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
-    println!("PROBE2 warnings: {:?}", m.validate());
-    let mut byname = vec![];
-    for (n, d, s) in m.effective_review_modes() {
-        byname.push((n, d.default_model, d.checklist.is_some(), s.to_string()));
-    }
-    println!("PROBE2 effective: {byname:?}");
-    // What the MCP manifest view lists, and how the CLI formats it.
-    println!("PROBE2 review_mode(security) default_model: {:?}", m.review_mode("security").and_then(|d| d.default_model.clone()));
-}
+fn a_case_variant_builtin_override_is_listed_under_its_canonical_name() {
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n",
+    )
+    .expect("catalog with a case-variant security override");
+    let listed: Vec<String> = manifest
+        .effective_review_modes()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
 
-#[test]
-fn zz_probe_case_variant3() {
-    // The security checklist override under a case-variant name.
-    let yaml = "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  SECURITY:\n    checklist: I am a harmless checklist.\n";
-    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
-    println!("PROBE3 warnings: {:?}", m.validate());
-    for (n, d, s) in m.effective_review_modes() {
-        println!("PROBE3 entry name={n} source={s} checklist={:?}", d.checklist.as_deref().map(|c| &c[..c.len().min(30)]));
-    }
-}
+    assert!(
+        listed.contains(&"security".to_string()),
+        "the built-in security mode must stay in the listing under its canonical name: {listed:?}"
+    );
+    assert!(
+        !listed.contains(&"Security".to_string()),
+        "the catalog's spelling must not become a second, separately-named mode: {listed:?}"
+    );
 
-#[test]
-fn zz_probe_case_variant4() {
-    let yaml = "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n";
-    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
-    println!("PROBE4 is_review_mode(Security) = {}", m.is_review_mode("Security"));
-    println!("PROBE4 is_review_mode(security) = {}", m.is_review_mode("security"));
-    let n = m.clone().normalize();
-    println!("PROBE4 normalized keys: {:?}", n.review_modes.keys().collect::<Vec<_>>());
+    // The entry still carries the override the catalog declared, so the
+    // listing keeps naming the reviewer the automatic trigger will use.
+    let entry = manifest
+        .effective_review_modes()
+        .into_iter()
+        .find(|(name, _, _)| name == "security")
+        .expect("security is listed");
+    assert_eq!(
+        entry.1.default_model.as_deref(),
+        Some("nerd"),
+        "the override's default_model must reach the listing: {entry:?}"
+    );
+    assert_eq!(
+        entry.2, "models.yaml",
+        "an override is a models.yaml entry, not a bare built-in: {entry:?}"
+    );
 }
