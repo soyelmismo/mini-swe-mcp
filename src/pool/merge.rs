@@ -1073,14 +1073,16 @@ fn unintegrated_members(
         return Vec::new();
     };
     let mut unintegrated = Vec::new();
-    for id in round_members(root, &row) {
+    let members = round_members(root, &row);
+    // A round whose own branch cannot be named proves nothing about any member,
+    // so it is settled once for the whole round rather than per member: without
+    // it a corrupt or half-removed branch would make every ordinary merge of a
+    // non-round worker refuse for a reason the operator can do nothing about.
+    if !members.is_empty() && branch_unresolvable(repo, branch) {
+        return Vec::new();
+    }
+    for id in members {
         let member = format!("worker-{id}");
-        // A round whose own branch cannot be named proves nothing about any
-        // member. Nothing about that is provable, so it is checked before the
-        // loop rather than per member.
-        if branch_unresolvable(repo, branch) {
-            return Vec::new();
-        }
         let left_out = !row.integrated.contains(&id);
         let mut report = |commits: Option<usize>| {
             unintegrated.push(Unintegrated {
@@ -1131,10 +1133,11 @@ fn unintegrated_members(
 /// about any member, so this is the one failure a caller may read as
 /// "integrated": without it a corrupt or half-removed branch would make every
 /// ordinary merge of a non-round worker refuse for a reason the operator can do
-/// nothing about. The round entry points ([`merge_worker_in`],
-/// [`merge_approved_in`]) check it first and refuse instead; the retirement
-/// cleanup keeps its own far stronger proof (a base branch, a base commit and a
-/// tip beyond it) and is not gated on it.
+/// nothing about. Every other failure to prove a *member* integrated reports
+/// that member instead, because the member's own proof failing says nothing
+/// about the round's. The retirement cleanup keeps its own far stronger proof
+/// (a base branch, a base commit and a tip beyond it) and is not gated on this
+/// one either.
 fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
     let Ok(out) = git(
         repo,

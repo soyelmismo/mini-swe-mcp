@@ -853,32 +853,67 @@ fn an_uncountable_member_is_refused_without_a_number() {
     );
 }
 
+/// A snapshot file that exists but names nobody is not a snapshot.
+///
+/// The dispatch writes it without an atomic rename, and any writer that is
+/// interrupted -- or any other agent with scratch access -- can leave it empty
+/// or truncated. Treating that as "the round had no members" would skip the
+/// registry reconstruction and wave a real member through: the round would land
+/// on master carrying work the orchestrator was never shown, which is the
+/// failure this whole check exists to prevent. So an empty snapshot
+/// reconstructs the round instead of asserting it was empty.
 #[test]
-fn probe_force_leaves_worker_unretired() {
-    let f = Fixture::new("probe-force-unretired");
+fn an_empty_snapshot_does_not_wave_a_real_member_through() {
+    let f = Fixture::new("round-empty-snapshot");
     f.consolidator("c1", &["wa"]);
     f.left_out_member("wb");
-    f.force_merge("c1").expect("--force lands the round");
-    println!("PROBE round.md landed={}", f.repo().join("round.md").exists());
-    println!("PROBE wb branch kept={}", git_ref_exists(f.repo(), "worker-wb"));
-    println!("PROBE wb row kept={}", load_registry_entry_in(&f.root(), "wb").is_some());
-    println!("PROBE wa row kept={}", load_registry_entry_in(&f.root(), "wa").is_some());
-}
+    // The interrupted write: the file is there and it names nobody.
+    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "")
+        .expect("the snapshot file must be writable");
 
-#[test]
-fn probe_empty_snapshot_suppresses() {
-    let f = Fixture::new("probe-empty-snapshot");
-    f.consolidator("c1", &["wa"]);
-    f.left_out_member("wb");
-    // A snapshot file that exists but names nobody: a truncated write, or an
-    // orchestrator that wrote it before the manifest was complete.
-    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "").unwrap();
     let reported: Vec<String> = unintegrated_workers_in(&f.root(), "c1")
         .into_iter()
-        .map(|w| w.worker_id)
+        .map(|worker| worker.worker_id)
         .collect();
-    println!("PROBE reported={reported:?}");
-    let res = f.merge("c1", false);
-    println!("PROBE merge={:?}", res.as_ref().err().map(|e| e.to_string()));
-    println!("PROBE round.md landed={}", f.repo().join("round.md").exists());
+    assert_eq!(
+        reported,
+        vec!["wb".to_string()],
+        "an empty snapshot must not erase a real member of the round: {reported:?}"
+    );
+
+    f.merge("c1", false)
+        .expect_err("the round's unintegrated member must still refuse the merge");
+    assert!(
+        !f.repo().join("round.md").exists(),
+        "a round must not land while a member it really had is unintegrated"
+    );
+}
+
+/// `--force` is a provenance override, not a deletion: the member whose commits
+/// the round never integrated keeps its branch and its registry row, so the
+/// orchestrator can still land or discard it deliberately. Only what the round
+/// really carried is retired.
+#[test]
+fn a_forced_merge_keeps_the_unintegrated_member() {
+    let f = Fixture::new("round-forced-keeps");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+
+    f.force_merge("c1").expect("--force lands the round");
+    assert!(
+        f.repo().join("round.md").exists(),
+        "--force must actually land the round it overrides"
+    );
+    assert!(
+        git_ref_exists(f.repo(), "worker-wb"),
+        "the unintegrated member's branch is work -- a forced merge must not delete it"
+    );
+    assert!(
+        load_registry_entry_in(&f.root(), "wb").is_some(),
+        "the unintegrated member's row must survive, or nobody can steer or discard it"
+    );
+    assert!(
+        load_registry_entry_in(&f.root(), "wa").is_none(),
+        "a member the round really carried is retired as before"
+    );
 }
