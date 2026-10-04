@@ -1383,25 +1383,27 @@ pub fn build_landlock_plan(
     target_dir: &Path,
     offline: bool,
 ) -> Result<Option<LandlockPlan>> {
-    build_plan_with_abi(worktree, target_dir, query_abi_version(), offline)
+    build_plan_with_abi(
+        worktree,
+        target_dir,
+        query_abi_version(),
+        offline,
+        !landlock_disabled(),
+    )
 }
 
-/// The body of [`build_landlock_plan`], with the ABI probe as a parameter.
-///
-/// `query_abi_version` is a syscall against the machine running the test suite,
-/// which supports Landlock, so the "this kernel cannot confine" branch can
-/// never be taken there - leaving the single most important robustness
-/// property of the whole feature (a worker still runs on a host with no
-/// Landlock) as code no test ever executes. `abi == None` is exactly the state
-/// a pre-5.13, `lsm=`-disabled or seccomp-blocked kernel puts us in, so the
-/// branch is driven directly instead of being left to chance.
-fn build_plan_with_abi(
+/// [`build_landlock_plan`] with the ABI probe and the opt-out switch supplied
+/// by the caller, so tests drive both the "kernel cannot confine" and the
+/// "operator disabled Landlock" branches without mutating process-global
+/// state. [`build_landlock_plan`] delegates here unchanged.
+pub fn build_plan_with_abi(
     worktree: &Path,
     target_dir: &Path,
     abi: Option<i64>,
     offline: bool,
+    landlock_enabled: bool,
 ) -> Result<Option<LandlockPlan>> {
-    if landlock_disabled() {
+    if !landlock_enabled {
         tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
         return Ok(None);
     }
@@ -1805,7 +1807,7 @@ mod tests {
     fn a_kernel_without_landlock_yields_no_plan_instead_of_an_error() {
         let scratch = Scratch::new("noplan");
 
-        let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false);
+        let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false, true);
 
         assert!(
             built.is_ok(),
@@ -1832,7 +1834,7 @@ mod tests {
         let scratch = Scratch::new("noplan-missing");
         let missing = scratch.dir().join("does-not-exist");
 
-        let err = build_plan_with_abi(&missing, &scratch.target(), None, false).unwrap_err();
+        let err = build_plan_with_abi(&missing, &scratch.target(), None, false, true).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a malformed policy must be reported regardless of kernel support: {err:#}"

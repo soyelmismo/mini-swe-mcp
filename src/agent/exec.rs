@@ -3102,13 +3102,15 @@ mod tests {
     #[test]
     fn the_landlock_opt_out_produces_no_plan() {
         let scratch = LandlockScratch::new("disabled");
-        // SAFETY: the harness runs these environment-sensitive tests in one
-        // process; nothing else in the suite reads this variable concurrently
-        // with the window below.
-        unsafe { std::env::set_var(super::super::sandbox::DISABLE_LANDLOCK_ENV, "1") };
-        let built =
-            super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false);
-        unsafe { std::env::remove_var(super::super::sandbox::DISABLE_LANDLOCK_ENV) };
+        // Drive the opt-out through the seam that takes the switch explicitly,
+        // so the process environment is never mutated.
+        let built = super::super::sandbox::build_plan_with_abi(
+            &scratch.worktree,
+            &scratch.target,
+            Some(10),
+            false,
+            false,
+        );
 
         assert!(
             matches!(built, Ok(None)),

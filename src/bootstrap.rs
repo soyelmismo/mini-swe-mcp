@@ -3,7 +3,7 @@
 //! One-shot, side-effecting steps that must run before any CLI action is
 //! dispatched; none is interesting to the dispatch logic itself.
 
-use crate::config::{env_parse, xdg_config_dir};
+use crate::config::xdg_config_dir;
 use anyhow::Result;
 use std::env;
 

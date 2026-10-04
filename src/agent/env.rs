@@ -275,7 +275,29 @@ pub fn apply_clean_environment_cmd(
     repo_path: &Path,
     worktree_path: &Path,
 ) {
-    let env = build_clean_environment(repo_path, worktree_path);
+    apply_clean_environment_cmd_from(
+        cmd,
+        repo_path,
+        worktree_path,
+        &|name| std::env::var_os(name),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os(CARGO_HOME_VAR).as_deref().map(Path::new),
+    );
+}
+
+/// [`apply_clean_environment_cmd`] with the parent environment supplied by
+/// the caller as `lookup`/`host_home`/`explicit_cargo_home`, so tests drive
+/// the spawn path against a synthetic map instead of mutating process-global
+/// state. Production passes the real environment through.
+pub fn apply_clean_environment_cmd_from(
+    cmd: &mut tokio::process::Command,
+    repo_path: &Path,
+    worktree_path: &Path,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) {
+    let env = build_clean_environment_from(repo_path, worktree_path, lookup, host_home, explicit_cargo_home);
     let _ = std::fs::create_dir_all(isolated_home(repo_path, worktree_path));
     cmd.env_clear();
     for (key, value) in env {
