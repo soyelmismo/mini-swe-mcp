@@ -1187,6 +1187,20 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
             .messages
             .push(serde_json::from_str(line).expect("one message per line"));
     }
+    // The step counter a resume depends on lives on the registry row, and the
+    // writer coalesces step-only updates, so poll for the first one rather
+    // than assuming the dispatch's step 0 is already stale.
+    let stepped = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let row = read_registry_row(&swe.join("swe-registry"), wid);
+            if row.step > 0 || std::time::Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+    assert!(stepped.step > 0, "the row's step counter is persisted");
     assert!(mini_swe_mcp::pool::is_replayable(&checkpoint.messages));
     assert!(
         checkpoint.messages.len() >= 40,
@@ -1224,6 +1238,18 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     assert_eq!(
         recovered.last_command,
         format!("hub restarted; work salvaged on branch worker-{wid}")
+    );
+    // The budget an auto-continue must resume is on this row, written by the
+    // daemon that died: its ceiling is the one the dispatch set, and its step
+    // counter is past the first turn. A successor daemon reads the row in its
+    // own process, so these two fields are the whole contract.
+    assert_eq!(
+        recovered.max_turns, 30,
+        "the interrupted row keeps the ceiling the run was dispatched under"
+    );
+    assert!(
+        recovered.step > 0,
+        "the interrupted row keeps the step counter the run had reached"
     );
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(15),
