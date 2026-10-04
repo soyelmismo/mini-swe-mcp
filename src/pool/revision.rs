@@ -639,7 +639,12 @@ pub fn retire_worker_reporting(
     // discarded round behind -- exactly the leftover a discard exists to
     // remove.
     for base in root.base_dirs() {
-        for suffix in ["steer-source", "round-base", "steer-log.jsonl"] {
+        for suffix in [
+            "steer-source",
+            "round-base",
+            "round-members",
+            "steer-log.jsonl",
+        ] {
             let _ = std::fs::remove_file(base.join(format!("swe-wt-{worker_id}.{suffix}")));
         }
     }
@@ -1076,6 +1081,7 @@ fn worker_id_from_name(name: &str) -> Option<&str> {
         ".steer-source",
         ".steer-log.jsonl",
         ".round-base",
+        ".round-members",
     ]
     .iter()
     .find_map(|suffix| rest.strip_suffix(suffix))
@@ -1083,8 +1089,8 @@ fn worker_id_from_name(name: &str) -> Option<&str> {
 
 /// The ownership a history file states, read from its first line only.
 ///
-/// A `.steer`, `.steer-source`, `.steer-log.jsonl` or `.round-base` names no
-/// repository of its own
+/// A `.steer`, `.steer-source`, `.steer-log.jsonl`, `.round-base` or
+/// `.round-members` names no repository of its own
 /// and yields `None`; the caller shares the ownership of the same worker's
 /// history instead of assuming the file is unreachable.
 fn read_orphan_owner(path: &Path) -> Option<OrphanOwner> {

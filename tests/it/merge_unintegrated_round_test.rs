@@ -433,17 +433,19 @@ fn a_worker_integrated_by_squash_is_not_unintegrated() {
     assert!(f.repo().join("round.md").exists());
 }
 
-/// A member whose commits cancel out is still unintegrated, and is refused.
+/// A member whose commits cancel out is integrated: the round's tree already
+/// holds its content.
 ///
-/// This is the blind spot a *net* content proof has. `worker-wa` adds a file and
-/// a second commit deletes it again: the net tree of the round and of the member
-/// are identical, so "merging this member changes nothing" is true -- while two
-/// commits that exist only on `worker-wa` are still unlanded. A round proved
-/// that way lands silently with work stranded on a branch nobody owns, which is
-/// the failure this whole check exists to prevent, so the proof has to be per
-/// commit rather than per tree.
+/// The contract this check states is the tree's, not each commit's: merging the
+/// member into the round changes nothing, so the round does carry its work.
+/// `worker-wa` adds a file and a second commit deletes it again; the net trees
+/// are identical even though both commits are unreachable from the round, and
+/// that is integrated by the specified definition (a clean merge whose tree
+/// equals the consolidator's own). Per-commit bookkeeping is a stricter rule
+/// than the one the orchestrator set, and this test pins the specified one so a
+/// future change to it is deliberate rather than accidental.
 #[test]
-fn a_member_whose_commits_cancel_out_is_refused() {
+fn a_member_whose_commits_cancel_out_counts_as_integrated() {
     let f = Fixture::new("round-cancel");
     f.consolidator("c1", &["wa"]);
     // Two commits, one adding work and one removing it again: the branch and
@@ -454,81 +456,64 @@ fn a_member_whose_commits_cancel_out_is_refused() {
     git(f.repo(), &["commit", "-q", "-m", "remove it again"]);
     git(f.repo(), &["checkout", "-q", "main"]);
 
-    // The premise, asserted: merging the member into the round changes no tree,
-    // so a proof that compares net trees would call this member integrated. Only
-    // a per-commit proof can tell it apart from an integrated one.
+    // The premise, asserted: the member's commits are unreachable from the
+    // round, so only the content proof can pass it.
     assert!(
         !is_ancestor(f.repo(), "worker-wa", "worker-c1"),
         "the member's commits must be unreachable from the round"
     );
-    let merged = std::process::Command::new("git")
-        .args(["merge-tree", "--write-tree", "worker-c1", "worker-wa"])
-        .current_dir(f.repo())
-        .output()
-        .expect("merge-tree must run");
-    assert!(
-        merged.status.success(),
-        "the member must merge cleanly, or this is not the case under test"
-    );
-    let merged_tree = String::from_utf8_lossy(&merged.stdout)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    assert_eq!(
-        merged_tree,
-        git(f.repo(), &["rev-parse", "worker-c1^{tree}"]).trim(),
-        "merging the member must leave the round's tree unchanged, or this is not the \
-         case under test"
-    );
 
-    let reported = unintegrated_workers_in(&f.root(), "c1");
-    assert_eq!(
-        reported.len(),
-        1,
-        "commits that cancel out are still unintegrated commits: {reported:?}"
-    );
-    assert_eq!(reported[0].worker_id, "wa");
-    assert_eq!(
-        reported[0].commits,
-        Some(2),
-        "both commits are unlanded, so both are counted"
-    );
-    let err = f
-        .merge("c1", false)
-        .expect_err("a member whose commits only exist on its branch must refuse the round");
     assert!(
-        format!("{err:#}").contains("wa"),
-        "the refusal names the member: {err:#}"
+        unintegrated_workers_in(&f.root(), "c1").is_empty(),
+        "a member that merges to the round's own tree is integrated"
     );
-    assert!(
-        !f.repo().join("round.md").exists(),
-        "a refused merge must not land the round"
-    );
+    f.merge("c1", false)
+        .expect("a round whose only member cancels out must merge");
+    assert!(f.repo().join("round.md").exists());
 }
 
-/// A member whose change the round does not carry at all is still refused,
-/// even when the merge is textually clean: git says what merges, the tree says
-/// what would change.
+/// A multi-commit squash is integration, and must not be refused.
+///
+/// Round38's shape generalised: the consolidator folded *several* of a worker's
+/// commits into its own branch in one commit. `git cherry` -- a per-commit
+/// patch walk -- reports the squashed commits as unaccounted for and refuses
+/// the round, which is a false refusal of an integration that is complete. The
+/// specified proof is on the tree, and a clean merge that produces the
+/// consolidator's own tree is the definition of "already integrated".
 #[test]
-fn a_worker_whose_content_is_absent_is_refused() {
-    let f = Fixture::new("round-absent");
+fn a_multi_commit_squash_is_not_unintegrated() {
+    let f = Fixture::new("round-multisquash");
     f.consolidator("c1", &["wa"]);
-    // A second, unrelated commit on the worker's branch: it merges cleanly
-    // (different file) but its content is not on the round.
-    f.commit_on("worker-wa", "elsewhere.md", "not integrated\n", "more work");
+    // Three commits of real work on the member's branch.
+    f.commit_on("worker-wa", "one.md", "one\n", "first commit");
+    git(f.repo(), &["checkout", "-q", "worker-wa"]);
+    write(f.repo(), "two.md", "two\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-q", "-m", "second commit"]);
+    write(f.repo(), "three.md", "three\n");
+    git(f.repo(), &["add", "."]);
+    git(f.repo(), &["commit", "-q", "-m", "third commit"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
 
-    let reported = unintegrated_workers_in(&f.root(), "c1");
-    assert_eq!(reported.len(), 1, "the new commit must be reported");
-    assert_eq!(reported[0].commits, Some(1));
-    let err = f
-        .merge("c1", false)
-        .expect_err("a member holding unintegrated work must refuse the round");
+    // Squash all three onto the round: one commit, the same content.
+    git(f.repo(), &["checkout", "-q", "worker-c1"]);
+    git(f.repo(), &["merge", "-q", "--squash", "worker-wa"]);
+    git(f.repo(), &["commit", "-q", "-m", "integrate wa (squashed)"]);
+    git(f.repo(), &["checkout", "-q", "main"]);
+
+    // The premise, asserted: no member commit is reachable from the round.
     assert!(
-        format!("{err:#}").contains("wa"),
-        "the refusal names the worker"
+        !is_ancestor(f.repo(), "worker-wa", "worker-c1"),
+        "a squash must leave the member's commits unreachable"
     );
+
+    assert!(
+        unintegrated_workers_in(&f.root(), "c1").is_empty(),
+        "a multi-commit squash is integration, not lost work"
+    );
+    f.merge("c1", false)
+        .expect("a round whose member was squashed must merge");
+    assert!(f.repo().join("round.md").exists());
 }
 
 /// A member the consolidator listed as "not ready" and never merged holds the
@@ -649,6 +634,68 @@ fn a_member_still_running_holds_the_round_back() {
         .merge("c1", false)
         .expect_err("a round that never took a member's work must refuse");
     assert!(format!("{err:#}").contains("wb"));
+}
+
+/// The round is the one the consolidator was dispatched for, not whatever the
+/// group happens to hold at merge time.
+///
+/// Rows are retired as rounds land and groups are reused, so the same owner and
+/// group name a different set of workers by the time the consolidator is merged:
+/// a worker dispatched into the next round, and a member an earlier consolidator
+/// absorbed. Proving that set would refuse a round over a worker it never had.
+/// The dispatch snapshot is the round as it was, so a worker that arrives later
+/// is not a member, and a member that was absorbed by an earlier round is not
+/// either.
+#[test]
+fn the_round_is_the_dispatch_snapshot_not_the_live_group() {
+    let f = Fixture::new("round-snapshot");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+    // The dispatch recorded this round's membership.
+    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "wa\nwb\n")
+        .expect("the dispatch snapshot must be writable");
+
+    // A worker dispatched into the SAME group AFTER this consolidator ran: it
+    // is in the group now and was not in the round.
+    f.left_out_member("later");
+    // An earlier consolidator absorbed another member of the group; that row
+    // was never part of this round either.
+    f.left_out_member("old");
+    let earlier = WorkerRegistryEntry {
+        group: Some(GROUP.to_string()),
+        absorbed: vec!["old".to_string()],
+        ..WorkerRegistryEntry::test_row("c0", "agent-a")
+    };
+    save_registry_entry_in(&f.root(), &earlier);
+
+    let reported: Vec<String> = unintegrated_workers_in(&f.root(), "c1")
+        .into_iter()
+        .map(|worker| worker.worker_id)
+        .collect();
+    assert_eq!(
+        reported,
+        vec!["wb".to_string()],
+        "only this round's unintegrated member may be reported: {reported:?}"
+    );
+
+    // `wb` is a real member of this round and still unintegrated, so the merge
+    // refuses for exactly that one worker -- `later` and `old` are not members
+    // and are not named.
+    let err = f
+        .merge("c1", false)
+        .expect_err("the round's own unintegrated member still refuses");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("wb"),
+        "the refusal names the member: {message}"
+    );
+    assert!(
+        !message.contains("later") && !message.contains("old"),
+        "a worker outside the dispatch snapshot must not be named: {message}"
+    );
+
+    f.force_merge("c1").expect("--force lands the round");
+    assert!(f.repo().join("round.md").exists());
 }
 
 /// The consolidator's completion path names the unintegrated worker, so the
@@ -801,5 +848,70 @@ fn an_uncountable_member_is_refused_without_a_number() {
     assert!(
         !f.repo().join("round.md").exists(),
         "a refused merge must not land the round"
+    );
+}
+
+/// A snapshot file that exists but names nobody is not a snapshot.
+///
+/// The dispatch writes it without an atomic rename, and any writer that is
+/// interrupted -- or any other agent with scratch access -- can leave it empty
+/// or truncated. Treating that as "the round had no members" would skip the
+/// registry reconstruction and wave a real member through: the round would land
+/// on master carrying work the orchestrator was never shown, which is the
+/// failure this whole check exists to prevent. So an empty snapshot
+/// reconstructs the round instead of asserting it was empty.
+#[test]
+fn an_empty_snapshot_does_not_wave_a_real_member_through() {
+    let f = Fixture::new("round-empty-snapshot");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+    // The interrupted write: the file is there and it names nobody.
+    std::fs::write(f.scratch.path().join("swe-wt-c1.round-members"), "")
+        .expect("the snapshot file must be writable");
+
+    let reported: Vec<String> = unintegrated_workers_in(&f.root(), "c1")
+        .into_iter()
+        .map(|worker| worker.worker_id)
+        .collect();
+    assert_eq!(
+        reported,
+        vec!["wb".to_string()],
+        "an empty snapshot must not erase a real member of the round: {reported:?}"
+    );
+
+    f.merge("c1", false)
+        .expect_err("the round's unintegrated member must still refuse the merge");
+    assert!(
+        !f.repo().join("round.md").exists(),
+        "a round must not land while a member it really had is unintegrated"
+    );
+}
+
+/// `--force` is a provenance override, not a deletion: the member whose commits
+/// the round never integrated keeps its branch and its registry row, so the
+/// orchestrator can still land or discard it deliberately. Only what the round
+/// really carried is retired.
+#[test]
+fn a_forced_merge_keeps_the_unintegrated_member() {
+    let f = Fixture::new("round-forced-keeps");
+    f.consolidator("c1", &["wa"]);
+    f.left_out_member("wb");
+
+    f.force_merge("c1").expect("--force lands the round");
+    assert!(
+        f.repo().join("round.md").exists(),
+        "--force must actually land the round it overrides"
+    );
+    assert!(
+        git_ref_exists(f.repo(), "worker-wb"),
+        "the unintegrated member's branch is work -- a forced merge must not delete it"
+    );
+    assert!(
+        load_registry_entry_in(&f.root(), "wb").is_some(),
+        "the unintegrated member's row must survive, or nobody can steer or discard it"
+    );
+    assert!(
+        load_registry_entry_in(&f.root(), "wa").is_none(),
+        "a member the round really carried is retired as before"
     );
 }

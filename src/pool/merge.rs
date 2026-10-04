@@ -1073,14 +1073,16 @@ fn unintegrated_members(
         return Vec::new();
     };
     let mut unintegrated = Vec::new();
-    for id in round_members(root, &row) {
+    let members = round_members(root, &row);
+    // A round whose own branch cannot be named proves nothing about any member,
+    // so it is settled once for the whole round rather than per member: without
+    // it a corrupt or half-removed branch would make every ordinary merge of a
+    // non-round worker refuse for a reason the operator can do nothing about.
+    if !members.is_empty() && branch_unresolvable(repo, branch) {
+        return Vec::new();
+    }
+    for id in members {
         let member = format!("worker-{id}");
-        // A round whose own branch cannot be named proves nothing about any
-        // member. Nothing about that is provable, so it is checked before the
-        // loop rather than per member.
-        if branch_unresolvable(repo, branch) {
-            return Vec::new();
-        }
         let left_out = !row.integrated.contains(&id);
         let mut report = |commits: Option<usize>| {
             unintegrated.push(Unintegrated {
@@ -1116,9 +1118,8 @@ fn unintegrated_members(
             }
         }
         // The content proof: a member whose commits are not reachable may still
-        // have been taken by content (squash, cherry-pick). Proved per commit,
-        // not by comparing trees -- see `every_commit_taken_by_content`.
-        if every_commit_taken_by_content(repo, branch, &member) {
+        // have been taken by content -- see `tree_already_in`.
+        if tree_already_in(repo, branch, &member) {
             continue;
         }
         report(unintegrated_commit_count(repo, &member, branch));
@@ -1132,10 +1133,11 @@ fn unintegrated_members(
 /// about any member, so this is the one failure a caller may read as
 /// "integrated": without it a corrupt or half-removed branch would make every
 /// ordinary merge of a non-round worker refuse for a reason the operator can do
-/// nothing about. The round entry points ([`merge_worker_in`],
-/// [`merge_approved_in`]) check it first and refuse instead; the retirement
-/// cleanup keeps its own far stronger proof (a base branch, a base commit and a
-/// tip beyond it) and is not gated on it.
+/// nothing about. Every other failure to prove a *member* integrated reports
+/// that member instead, because the member's own proof failing says nothing
+/// about the round's. The retirement cleanup keeps its own far stronger proof
+/// (a base branch, a base commit and a tip beyond it) and is not gated on this
+/// one either.
 fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
     let Ok(out) = git(
         repo,
@@ -1157,21 +1159,46 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
 /// The `integrated` set alone is not the round: it is only the members the
 /// consolidator chose to merge. A member it reported as "not ready" and left
 /// out is just as absent from its branch as one it merged and then missed, and
-/// merging the round lands master without either one. So the round is
-/// reconstructed from the registry the same way the consolidator saw it -- its
-/// owner's workers in its group, still carrying a branch -- and the recorded
-/// `integrated` ids are unioned in, because a member that has since been
-/// merged may already be retired and no longer listed.
+/// merging the round lands master without either one.
+///
+/// The membership is therefore read from the snapshot the dispatch took, not
+/// recomputed here. Recomputing is the bug this shape avoids: rows are retired
+/// as rounds land and groups keep being reused, so the same owner and group
+/// name a *different* set of workers by merge time -- one dispatched into the
+/// next round, or one absorbed by an earlier consolidator. Proving the wrong
+/// set refuses a round over a member it never had, and lets a real one through.
+/// The snapshot is the round as it was, which is the only thing the check can
+/// honestly assert about.
+///
+/// The recorded `integrated` ids are always unioned in: a member already
+/// merged and retired is no longer listed in the manifest, and the check must
+/// still prove the branch it left behind.
 ///
 /// A member the consolidator absorbed is excluded: that is the record of work
 /// it took over and finished itself, so its branch is not expected in the
 /// round. A member with no branch (discarded, pruned, never dispatched) has
 /// nothing left to land and is filtered by the probe in the caller.
+///
+/// A consolidator dispatched before the snapshot existed -- or whose snapshot
+/// names nobody, which an interrupted or hostile write can produce -- falls back
+/// to the registry scan, the best reconstruction available for it.
 fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
+    // A dispatch-time snapshot: exactly the round, as it was, in one repository.
+    // A snapshot that names nobody is not a snapshot: the file is written
+    // without an atomic rename, and any writer that is interrupted (or any other
+    // agent with scratch access) can leave it empty or truncated. Treating that
+    // as "the round had no members" would skip the reconstruction below and
+    // wave through a member the round really had -- the stale-master failure
+    // this check exists to prevent. So the fallback below reconstructs instead.
+    if let Some(ids) = read_round_members(root, &row.id).filter(|ids| !ids.is_empty()) {
+        members.extend(ids);
+        members.retain(|id| !row.absorbed.contains(id));
+        return members.into_iter().collect();
+    }
     let (Some(owner), Some(group)) = (row.owner.as_deref(), row.group.as_deref()) else {
-        // Without an owner and a group the round cannot be enumerated; the
-        // recorded integrations are all that is known, and the sweep still
+        // Without an owner and a group the round cannot be enumerated at all;
+        // the recorded integrations are all that is known, and the sweep still
         // protects every branch it can prove.
         return members.into_iter().collect();
     };
@@ -1190,63 +1217,92 @@ fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     members.into_iter().collect()
 }
 
-/// Whether every commit `branch` does not carry was nonetheless taken onto
-/// `branch` by content -- the squash / cherry-pick case, where the worker's
-/// commits are not ancestors of the round although every line of the work is on
-/// it. Refusing such a round would punish the cleanest integration there is.
+/// The worker ids the dispatch of `consolidator` snapshotted, one per line.
 ///
-/// The proof is per commit, and it has to be: a *net* comparison cannot answer
-/// it. Asking only whether merging the member into the branch would change
-/// nothing cannot tell a member whose commits cancel out -- one that added a
-/// file, and a second that deleted it -- from an integrated one, and so waves a
-/// genuinely unintegrated branch through: the round lands while commits only
-/// that branch has stay unlanded, which is the failure this check exists to
-/// prevent. A patch-equivalence walk has no such blind spot.
+/// Bounded on read for the same reason the other companions are: this file is
+/// written beside a worker's scratch state, so a corrupt or hostile one must
+/// not be able to make the merge loop over an unbounded list of "members". A
+/// file too large to be a round manifest is treated as no snapshot, which
+/// leaves the legacy reconstruction rather than refusing on nonsense.
+const ROUND_MEMBERS_MAX_BYTES: u64 = 64 * 1024;
+
+fn read_round_members(root: &ScratchRoot, consolidator: &str) -> Option<Vec<String>> {
+    let path = root.join(format!("swe-wt-{consolidator}.round-members"));
+    // A manifest beyond the bound is not a manifest this check will reason
+    // about; `None` sends the caller to the legacy reconstruction, which is a
+    // decision the operator can still act on.
+    let file = std::fs::File::open(&path).ok()?;
+    if file.metadata().map(|meta| meta.len()).ok()? > ROUND_MEMBERS_MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Whether merging `member` into `branch` would change nothing, i.e. whether
+/// the round already carries this worker's content.
 ///
-/// `git cherry <branch> <member>` is that walk: it lists each commit of
-/// `member` absent from `branch`, marked `-` when a patch-equivalent commit is
-/// already upstream and `+` when it is not. Only an all-`-` listing proves the
-/// round took the work; a single `+` means the member holds the round back.
+/// This is the squash / cherry-pick case, and the reason the check has a second
+/// proof at all: the consolidator took the worker's change and committed it its
+/// own way, so the worker's commits are not ancestors of the round although
+/// every line of the work is on it. Refusing that round would punish the
+/// cleanest integration there is.
 ///
-/// A listing git could not produce is not proof: nothing is taken by content
-/// until git says so. An empty listing is not proof either -- a member that
-/// carries commits always has some to list, so emptiness means the walk
-/// answered nothing, which is "unproven" and must refuse like any other
-/// unproven probe.
-fn every_commit_taken_by_content(repo: &Path, branch: &str, member: &str) -> bool {
-    let out = git(
+/// `git merge-tree --write-tree <branch> <member>` computes the merged tree
+/// without touching a single file or index entry. Exit code 0 with the merged
+/// tree on the first line of stdout is a *clean* merge, and that tree being the
+/// branch's own tree is what makes "changes nothing" decidable: the work is
+/// already on the branch, however it got there.
+///
+/// The exit code is load-bearing and must not be ignored. A conflict answers 1,
+/// and a conflict is emphatically not integration -- the work is not on the
+/// branch, which is exactly what this check exists to catch. Anything above 1 is
+/// a git failure, which proves nothing either way, so both refuse.
+///
+/// The definition is deliberately the tree's, not each commit's: a member whose
+/// commits net out to no change at all (added a file, then deleted it) merges
+/// to the branch's own tree and is therefore integrated. That is the contract
+/// this check states -- "the round's content holds this work" -- and it is the
+/// orchestrator's to change, not a per-commit patch walk's to decide.
+fn tree_already_in(repo: &Path, branch: &str, member: &str) -> bool {
+    let merged = git(
         repo,
-        "cherry <branch> <member>",
-        &["cherry", branch, member],
+        "merge-tree --write-tree",
+        &["merge-tree", "--write-tree", branch, member],
     );
-    let Ok(out) = out else {
+    let Ok(merged) = merged else {
         return false;
     };
-    if !out.status.success() {
+    // 0 is a clean merge and only a clean merge carries a tree to compare. A
+    // conflict (1) and a git failure (anything else) both mean "not integrated".
+    if !merged.status.success() {
         return false;
     }
-    let listed = String::from_utf8_lossy(&out.stdout);
-    let mut commits = 0usize;
-    for line in listed.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let Some(mark) = line.split_whitespace().next() else {
-            return false;
-        };
-        match mark {
-            // `-`: this commit's patch is already upstream on `branch`, which is
-            // what a squash or a cherry-pick of the member's work leaves behind.
-            "-" => commits += 1,
-            // `+`: a patch `branch` does not carry. The member is holding the
-            // round back -- even if another of its commits nets the tree out to
-            // the branch's own, the round does not contain this work.
-            "+" => return false,
-            // Anything else is not a verdict this check knows how to read.
-            _ => return false,
-        }
+    let merged_stdout = String::from_utf8_lossy(&merged.stdout);
+    let merged_tree = merged_stdout.lines().next().unwrap_or_default().trim();
+    if merged_tree.is_empty() {
+        return false;
     }
-    // Nothing to prove is nothing held back, but only when git actually
-    // answered: an empty listing from a member that *does* carry commits is
-    // exactly the shape a failed walk produces, so it must not read as proof.
-    commits > 0
+    let branch_tree = git(
+        repo,
+        "rev-parse <branch>^{tree}",
+        &["rev-parse", &format!("{branch}^{{tree}}")],
+    );
+    let Ok(branch_tree) = branch_tree else {
+        return false;
+    };
+    if !branch_tree.status.success() {
+        return false;
+    }
+    let branch_tree = String::from_utf8_lossy(&branch_tree.stdout);
+    let branch_tree = branch_tree.trim();
+    !branch_tree.is_empty() && merged_tree == branch_tree
 }
 
 /// Commits on `branch` that `ancestor` does not contain.
