@@ -4998,6 +4998,23 @@ mod tests {
                 }
             }
 
+            /// A backslash escape keeps the character it escapes, so the harness
+            /// resolves the very name the shell read: a path spelled `a\ b.rs` is
+            /// one file called `a b.rs`, not a different file called `ab.rs`.
+            #[test]
+            fn an_escaped_character_stays_in_the_name() {
+                let tree = Tree::new("escape-name");
+                // Both names exist, so resolving the wrong one is observable.
+                tree.file("a b.rs", 6);
+                tree.file("ab.rs", 6);
+                let mut guard = WholeFileGuard::default();
+                let text = reply(&tree, &mut guard, 1, r"sed -n '1,2p' a\ b.rs");
+                assert!(
+                    text.starts_with("[harness: a b.rs has 6 lines;"),
+                    "the harness must resolve the name the shell read: {text:?}"
+                );
+            }
+
             /// A bare `head` is a range read of the default ten lines, so it expands
             /// like any other; a byte count is not a line range and does not.
             #[test]

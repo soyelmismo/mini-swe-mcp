@@ -280,10 +280,12 @@ fn shell_words(command: &str) -> Option<Vec<String>> {
                 return None;
             }
             '\\' => {
-                // An escape keeps the next character literal; the escape itself
-                // is not part of the word.
+                // An escape keeps the next character literal: the escaped
+                // character is part of the word and the backslash is not, so
+                // `a\ b.rs` resolves to the one file the shell read. Dropping it
+                // instead would resolve a different name than the command did.
                 has_word = true;
-                chars.next()?;
+                current.push(chars.next()?);
             }
             _ => {
                 has_word = true;
