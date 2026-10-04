@@ -485,7 +485,20 @@ async fn the_stdio_proxy_reconnects_to_a_replacement_daemon() {
 /// deadline carries margin. The wait returns as soon as the count is reached,
 /// so an unloaded run is unaffected.
 async fn wait_for_log(hub_dir: &std::path::Path, event: &str, count: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    wait_for_log_within(hub_dir, event, count, Duration::from_secs(30)).await
+}
+
+/// [`wait_for_log`] with an explicit deadline, for a daemon whose replacement
+/// another process (the watch) auto-starts: the product's own reconnect budget
+/// bounds how long that chase may take, so waiting longer than a direct spawn
+/// would need still fails the moment the product itself would give up.
+async fn wait_for_log_within(
+    hub_dir: &std::path::Path,
+    event: &str,
+    count: usize,
+    budget: Duration,
+) {
+    let deadline = std::time::Instant::now() + budget;
     loop {
         let seen = std::fs::read_to_string(hub_dir.join("hub.log"))
             .map(|log| {
@@ -596,13 +609,27 @@ async fn the_cli_watch_survives_a_daemon_restart() {
     let _ = daemon.wait().await;
 
     // The watch follows the daemon: it reconnects to the replacement the hub
-    // auto-starts, rather than ending with the connection it lost.
-    wait_for_log(&hub_dir, "listening", 2).await;
+    // auto-starts, rather than ending with the connection it lost. The
+    // replacement is started by the watch's own reconnect chase, so it is
+    // given the product's reconnect budget rather than a direct spawn's.
+    wait_for_log_within(
+        &hub_dir,
+        "listening",
+        2,
+        Duration::from_secs(mini_swe_mcp::hub::DEFAULT_RECONNECT_SECS),
+    )
+    .await;
     // Listening only means the socket is bound; recovery is what puts the
     // salvaged worker back in the pool. Writing the terminal status before
     // the replacement daemon has recovered the row would leave the watch
     // nothing owned to watch, and it would rightly end with no event.
-    wait_for_log(&hub_dir, "recovered", 2).await;
+    wait_for_log_within(
+        &hub_dir,
+        "recovered",
+        2,
+        Duration::from_secs(mini_swe_mcp::hub::DEFAULT_RECONNECT_SECS),
+    )
+    .await;
     assert!(
         watch.try_wait().expect("poll the watch").is_none(),
         "the watch must survive the daemon going away"

@@ -1816,16 +1816,59 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
                 (entry.id.clone(), view)
             })
             .collect();
+    // A row written after the load above is visible to the `list_workers`
+    // re-read but not to that load, so it takes the skeleton path below. A
+    // test needs to land a row in exactly that window to exercise it; without
+    // one the snapshot must never stop to ask.
+    if let Some(entry) = pool.take_snapshot_race_row() {
+        crate::pool::save_registry_entry_in(pool.scratch_root(), &entry);
+    }
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
             continue;
         };
-        let view = views.entry(id.to_string()).or_insert_with(|| json!({
-            "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
-            "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
-            "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
-            "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
-        }));
+        let view = views.entry(id.to_string()).or_insert_with(|| {
+            // The registry load that built `views` ran a moment before
+            // `list_workers` re-read the registry, so a row written in that
+            // window (a terminal status the orchestrator just recorded) is
+            // present here but was absent there. Seed the skeleton from the
+            // row's own summary so the worker is not left status-less: a
+            // status-less view produces no event, and a watch that only ever
+            // sees it would end believing there was nothing to watch.
+            let mut view = json!({
+                "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
+                "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
+                "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
+                "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
+            });
+            if let Some(status) = row["state"]["status"].as_str() {
+                view["status"] = json!(status.to_ascii_lowercase());
+            }
+            if let Some(step) = row["state"]["step"].as_u64() {
+                view["step"] = json!(step);
+                view["turns"] = json!(step);
+            }
+            if let Some(last) = row["state"]["last_command"].as_str() {
+                view["last_ops"] = json!([clamp_string(last, 256)]);
+            }
+            // The summary payload carries no revision, and the skeleton must
+            // not report one it guessed: the dedupe key and the persisted ack
+            // are both `(worker, revision, kind)`, so an event filed under
+            // revision 0 would be delivered again when the same transition is
+            // reported at its real revision. The row is read back whole, which
+            // is also what the replay suppression below needs.
+            if let Some(entry) = crate::pool::load_registry_entry_in(pool.scratch_root(), id) {
+                view["revision"] = json!(entry.revision);
+                // The seeded status re-arms the terminal transitions, so this
+                // skeleton must face the same replay-suppression proof the
+                // rows loaded above do: a completion whose branch is already
+                // merged or gone is never replayed.
+                if branch_replay_suppressed(&entry) {
+                    view[BRANCH_GONE_OR_MERGED] = json!(true);
+                }
+            }
+            view
+        });
         view["owner"] = row["owner"].clone();
         if let Some(progress) = pool.worker_progress(id).await {
             view["step"] = json!(progress.step);
@@ -2522,6 +2565,126 @@ pub(super) async fn watch_request(
     let mut guard = router.lock().await;
     guard.observe_watch(snapshot);
     guard.watch_reply(ctx, &params)
+}
+
+/// The skeleton a snapshot builds for a row that appeared between its
+/// registry load and the `list_workers` re-read must not become a hole in the
+/// replay suppression: seeding a terminal status re-arms the transition, so
+/// the same proof that suppresses a replay for a row loaded the normal way has
+/// to hold for a row that took the skeleton path.
+#[cfg(test)]
+mod snapshot_race_suppression_tests {
+    use super::*;
+    use crate::pool::{RegistryStatus, WorkerMeta, WorkerPool};
+    use crate::worktree::ScratchRoot;
+
+    /// Removes a temporary directory when it goes out of scope, so a failing
+    /// assertion still cleans up the scratch it created.
+    struct CleanupDir(PathBuf);
+
+    impl Drop for CleanupDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A repository whose `worker-` branch really is absent, so
+    /// `branch_replay_suppressed` has the proof it requires and not merely a
+    /// failed probe.
+    fn repo_without_worker_branch(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("repo dir");
+        let git = |args: &[&str]| {
+            assert!(
+                crate::worktree::git(dir, "init", args).is_ok(),
+                "git {args:?} must succeed"
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").expect("seed file");
+        git(&["add", "seed.txt"]);
+        git(&["commit", "-m", "seed"]);
+        // The worker branch existed and is gone again: exactly the state a
+        // merge leaves behind, and the proof the suppression is keyed on.
+        git(&["branch", "worker-w0"]);
+        git(&["branch", "-D", "worker-w0"]);
+    }
+
+    /// A completion written in the load/re-read window of a snapshot whose
+    /// branch is already merged is never replayed to the owner's watch.
+    ///
+    /// Without the guard on the skeleton path the view carries a terminal
+    /// status and no proof of the merge, so the router queues the completion
+    /// and the owner is told to review work that is already in the base branch.
+    #[test]
+    fn a_skeleton_completion_of_a_merged_branch_is_not_replayed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "mcp-events-race-suppression-{}-{}",
+                std::process::id(),
+                crate::pool::unix_timestamp()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _cleanup = CleanupDir(dir.clone());
+            let repo = dir.join("repo");
+            repo_without_worker_branch(&repo);
+
+            let pool = WorkerPool::with_scratch(
+                1,
+                "http://127.0.0.1:1".into(),
+                "test".into(),
+                ScratchRoot::new(dir.join("swe")),
+            );
+            let mut entry = WorkerMeta::test_meta("w0", "owner").entry(
+                "test",
+                RegistryStatus::Completed,
+                2,
+                10,
+                "merged",
+                None,
+            );
+            entry.repo_path = Some(repo.to_string_lossy().into_owned());
+            entry.base_branch = Some("main".into());
+            entry.revision = 1;
+            // A live pid keeps the liveness normalisation from reporting the
+            // row as stopped, and a worktree marker keeps the terminal-row
+            // pruning from sweeping it: both would change what is under test.
+            entry.pid = 1;
+            std::fs::create_dir_all(pool.scratch_root().join("swe-wt-w0"))
+                .expect("worktree marker");
+            // The row lands after the snapshot's registry load and before its
+            // `list_workers` re-read, which is the only way a worker reaches
+            // the skeleton path.
+            pool.__test_park_snapshot_race_row(entry);
+
+            let mut router = EventRouter::default();
+            let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
+            ctx.agent_id = Some("owner".into());
+            let snap = watch_snapshot(&pool).await;
+            assert_eq!(
+                snap["w0"]["status"], "completed",
+                "the skeleton must still report the terminal status it recovered: {snap:?}"
+            );
+            assert_eq!(
+                snap["w0"]["revision"],
+                json!(1),
+                "the skeleton must report the row's real revision, not a guessed one: {snap:?}"
+            );
+            router.observe_watch(snap);
+            let reply = router
+                .watch_reply(&ctx, &json!({"worker_ids":["w0"], "initial":false}))
+                .expect("the watch is answered");
+            assert!(
+                reply["events"].as_array().is_some_and(Vec::is_empty),
+                "a completion whose branch is already merged must never be replayed: {reply}"
+            );
+        });
+    }
 }
 
 #[cfg(test)]
