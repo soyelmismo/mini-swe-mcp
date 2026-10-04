@@ -34,8 +34,6 @@
 //! contract can be unit-tested without spawning anything, and so callers can
 //! log/inspect the child environment in a debugging story.
 
-#[allow(unused_imports)]
-use super::*;
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

@@ -374,13 +374,20 @@ fn no_test_mutates_the_process_environment() {
             // below names both calls inside quotes, and must not flag itself.
             let mut code = String::new();
             let mut in_string = false;
+            let mut escaped = false;
             for ch in line.chars() {
-                if ch == '"' {
-                    in_string = !in_string;
+                if escaped {
+                    escaped = false;
                     continue;
                 }
-                if !in_string {
-                    code.push(ch);
+                match ch {
+                    // Inside a literal a backslash escapes the next character,
+                    // so `"ends with \""` closes where a quote count alone
+                    // would say it stays open and hide the rest of the line.
+                    '\\' if in_string => escaped = true,
+                    '"' => in_string = !in_string,
+                    _ if !in_string => code.push(ch),
+                    _ => {}
                 }
             }
             if code.contains("set_var(") || code.contains("remove_var(") {

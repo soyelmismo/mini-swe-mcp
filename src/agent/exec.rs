@@ -2848,10 +2848,12 @@ mod tests {
     /// environment is invisible to the command the model runs, and the command
     /// sees the remapped, isolated `HOME` instead of the operator's.
     ///
-    /// This is the check that matters, because it exercises the real spawn
-    /// path (`env_clear` + allow-list) rather than the pure helper: a bug that
-    /// only removed the helper's redaction, or one where `env_clear` was never
-    /// called, is invisible to unit tests of `build_clean_environment` alone.
+    /// The parent environment arrives as an explicit map rather than the
+    /// process environment (no test may write the latter), and the probe child
+    /// is spawned with `env_clear` plus exactly the environment the builder
+    /// produced -- the same two steps the real spawn path performs -- so a bug
+    /// that dropped the allow-list's redaction or the `env_clear` is still
+    /// caught here rather than only by the pure helper's own unit tests.
     #[tokio::test]
     async fn a_spawned_command_cannot_read_the_operators_secrets() {
         let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
@@ -2887,9 +2889,6 @@ mod tests {
             .expect("a spawned command must not error");
         assert!(out.status.success(), "command failed with output: {out:?}");
         let out = String::from_utf8_lossy(&out.stdout).into_owned();
-        let code = Some(0);
-
-        assert_eq!(code, Some(0), "command failed with output: {out:?}");
         for var in [
             "OPENAI_API_KEY",
             "GITHUB_TOKEN",
@@ -2960,9 +2959,6 @@ mod tests {
             .expect("a spawned command must not error");
         assert!(out.status.success(), "command failed with output: {out:?}");
         let out = String::from_utf8_lossy(&out.stdout).into_owned();
-        let code = Some(0);
-
-        assert_eq!(code, Some(0), "command failed with output: {out:?}");
         assert_eq!(
             out.trim(),
             format!(
@@ -3110,19 +3106,39 @@ mod tests {
     #[test]
     fn the_landlock_opt_out_produces_no_plan() {
         let scratch = LandlockScratch::new("disabled");
-        // Drive the opt-out through the seam that takes the switch explicitly,
-        // so the process environment is never mutated.
+        // The opt-out is read through the same lookup production uses, here
+        // fed a synthetic map that reports the switch set, so the process
+        // environment is never mutated. The ABI is pinned to a value this
+        // kernel may or may not have, so the assertion says the *switch*
+        // suppressed the plan and not the probe.
+        let disabled = |name: &str| {
+            (name == super::super::sandbox::DISABLE_LANDLOCK_ENV).then(|| "1".to_string())
+        };
         let built = super::super::sandbox::build_plan_with_abi(
             &scratch.worktree,
             &scratch.target,
             Some(10),
             false,
-            false,
+            &disabled,
         );
 
         assert!(
             matches!(built, Ok(None)),
             "an explicit opt-out must skip confinement entirely, got: {built:?}"
+        );
+
+        // The inverse: with the switch absent the very same ABI and roots do
+        // produce a plan, so the assertion above is the opt-out's doing.
+        let built = super::super::sandbox::build_plan_with_abi(
+            &scratch.worktree,
+            &scratch.target,
+            Some(10),
+            false,
+            &|_| None,
+        );
+        assert!(
+            matches!(built, Ok(Some(_))),
+            "the same policy without the opt-out must still confine, got: {built:?}"
         );
     }
 

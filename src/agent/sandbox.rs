@@ -863,7 +863,16 @@ fn supported_access_fs(abi: i64) -> u64 {
 
 /// Whether Landlock confinement has been switched off for this process.
 fn landlock_disabled() -> bool {
-    std::env::var(DISABLE_LANDLOCK_ENV).as_deref() == Ok("1")
+    landlock_disabled_from(&|name| std::env::var(name).ok())
+}
+
+/// [`landlock_disabled`] reading the switch from `lookup`.
+///
+/// `lookup` is the process environment in production and a synthetic map in
+/// tests, so the operator opt-out is covered without mutating process-global
+/// state. [`landlock_disabled`] delegates here unchanged.
+fn landlock_disabled_from(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    lookup(DISABLE_LANDLOCK_ENV).as_deref() == Some("1")
 }
 
 /// Home directory of the user the worker runs as, if one is discoverable.
@@ -1388,22 +1397,22 @@ pub fn build_landlock_plan(
         target_dir,
         query_abi_version(),
         offline,
-        !landlock_disabled(),
+        &|name| std::env::var(name).ok(),
     )
 }
 
-/// [`build_landlock_plan`] with the ABI probe and the opt-out switch supplied
-/// by the caller, so tests drive both the "kernel cannot confine" and the
-/// "operator disabled Landlock" branches without mutating process-global
-/// state. [`build_landlock_plan`] delegates here unchanged.
+/// [`build_landlock_plan`] with the ABI probe and the parent environment
+/// supplied by the caller, so tests drive both the "kernel cannot confine" and
+/// the "operator disabled Landlock" branches without mutating process-global
+/// state. Production passes the real environment through.
 pub fn build_plan_with_abi(
     worktree: &Path,
     target_dir: &Path,
     abi: Option<i64>,
     offline: bool,
-    landlock_enabled: bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<LandlockPlan>> {
-    if !landlock_enabled {
+    if landlock_disabled_from(lookup) {
         tracing::debug!("landlock confinement disabled by {DISABLE_LANDLOCK_ENV}=1");
         return Ok(None);
     }
@@ -1807,7 +1816,10 @@ mod tests {
     fn a_kernel_without_landlock_yields_no_plan_instead_of_an_error() {
         let scratch = Scratch::new("noplan");
 
-        let built = build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false, true);
+        let built =
+            build_plan_with_abi(&scratch.worktree(), &scratch.target(), None, false, &|_| {
+                None
+            });
 
         assert!(
             built.is_ok(),
@@ -1834,7 +1846,8 @@ mod tests {
         let scratch = Scratch::new("noplan-missing");
         let missing = scratch.dir().join("does-not-exist");
 
-        let err = build_plan_with_abi(&missing, &scratch.target(), None, false, true).unwrap_err();
+        let err =
+            build_plan_with_abi(&missing, &scratch.target(), None, false, &|_| None).unwrap_err();
         assert!(
             format!("{err:#}").contains("does not exist"),
             "a malformed policy must be reported regardless of kernel support: {err:#}"

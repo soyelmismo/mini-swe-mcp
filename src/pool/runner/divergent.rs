@@ -704,7 +704,16 @@ mod tests {
             enabled_from(&unset),
             "an unset variable leaves variant B on"
         );
-        // The production wrapper still answers from the real environment.
-        assert!(enabled() || !enabled());
+        // The production wrapper must still answer from the real environment:
+        // reading it is allowed, only writing it is not. `direct` re-derives
+        // the rule independently of `enabled`, so a wrapper that stops
+        // delegating (say, a hardcoded `true`) fails here on any host that
+        // actually runs with the switch off.
+        let direct = std::env::var(DISABLE_ENV).ok().as_deref() != Some("0");
+        assert_eq!(
+            enabled(),
+            direct,
+            "enabled() must read {DISABLE_ENV} from the process environment"
+        );
     }
 }
