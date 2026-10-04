@@ -32,8 +32,12 @@
 //! The read-only detector is the one guard with three steps, because a worker
 //! that ignored two nudges will ignore a third: it first demands the edit,
 //! then hands back the plan its own task spells out (see [`edit_plan`]), and
-//! finally parks the worker on the orchestrator instead of paying for more
-//! turns of reading. It is a guard against an *implementer* that reads instead
+//! turns of reading. Only a turn whose command was a pure read counts toward
+//! it ([`is_pure_read_command`], read off the same base the loop detector
+//! normalizes): a worker running its experiments -- tests, builds, scripts,
+//! binaries -- leaves the worktree sample alone too, but it is not reading,
+//! and the equivalent-command loop detector is what stops one experiment
+//! repeating. It is a guard against an *implementer* that reads instead
 //! of writing, so it is armed only for that role: a consolidator and the
 //! review phases both make their progress without editing (see
 //! [`TurnConfig::read_only_exempt`]). The turns the harness answers itself --
@@ -815,6 +819,166 @@ fn is_env_assignment(word: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Base command names whose run only inspects the repository or the tree.
+///
+/// Deliberately short of every command that happens not to write: a name left
+/// out costs a streak a turn, while a name included in error makes the guard
+/// pause a worker that was busy experimenting, which is the failure this
+/// detector exists to avoid.
+const READ_COMMANDS: &[&str] = &[
+    "cat",
+    "cmp",
+    "comm",
+    "diff",
+    "du",
+    "file",
+    "find",
+    "grep",
+    "head",
+    "less",
+    "ls",
+    "md5sum",
+    "more",
+    "od",
+    "printenv",
+    "pwd",
+    "rg",
+    "sha256sum",
+    "stat",
+    "tail",
+    "tree",
+    "uname",
+    "wc",
+    "whereis",
+    "which",
+    "whoami",
+];
+
+/// `git` subcommands that only read the repository. Everything else -- `add`,
+/// `commit`, `checkout`, `reset`, `merge` -- changes it, so it is not a read.
+const GIT_READ_SUBCOMMANDS: &[&str] = &[
+    "blame",
+    "cat-file",
+    "describe",
+    "diff",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "show",
+    "status",
+];
+
+/// `find` primaries that act on what they match rather than only naming it, so
+/// a `find` carrying one of them is a write however read-only it looks.
+const FIND_ACTIONS: &[&str] = &["-delete", "-exec", "-execdir", "-fls", "-fprint", "-ok"];
+
+/// `git` options that take a value, so the subcommand is the word *after* the
+/// one that follows the option: `git -C . log` is a `log`, not a `-C`.
+const GIT_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--work-tree",
+];
+
+/// Whether `command` only inspects the repository rather than acting on it.
+///
+/// The base is read exactly the way the loop detector reads it
+/// ([`normalize_command_base`]), so the two guards agree on what a command *is*:
+/// a chain or a pipeline is judged on the segment that runs last, the `cd` and
+/// environment-assignment wrappers are dropped, and the filters over a
+/// command's output (`| tail`, `2>&1`) go with them. `cargo test | tail` is
+/// therefore a test run, not a read, however much of it is a `tail`.
+///
+/// A turn whose command is not on the list is an experiment: the read-only
+/// streak leaves it alone rather than guessing, because the cost of counting a
+/// read that was not one is a nudge, while the cost of counting an experiment
+/// as a read is the false pause this classifier exists to prevent. A base the
+/// normalizer cannot name -- `cd /tmp && cat notes.md`, whose last segment is a
+/// filter over the read -- is left out the same way.
+fn is_pure_read_command(command: &str) -> bool {
+    let base = normalize_command_base(command);
+    let mut words = base.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    // A command spelled with its path (`/usr/bin/grep`) is still that command.
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let args: Vec<&str> = words.collect();
+    if name == "git" {
+        return git_reads(&args);
+    }
+    if name == "sed" {
+        return sed_prints_only(&args);
+    }
+    if name == "find" {
+        // `find` only reads until it is told to act on what it matched.
+        return !args
+            .iter()
+            .any(|word| FIND_ACTIONS.iter().any(|action| word.starts_with(action)));
+    }
+    READ_COMMANDS.binary_search(&name).is_ok()
+}
+
+/// Whether the `git` spelled in `args` only reads the repository.
+///
+/// The subcommand has to be found before it can be read, because a global
+/// option can stand in front of it (`git -C . log`) and an option that takes
+/// a value can stand in front of the subcommand in turn
+/// (`git --git-dir /repo status`).
+fn git_reads(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if !arg.starts_with('-') {
+            return GIT_READ_SUBCOMMANDS.binary_search(arg).is_ok();
+        }
+        // An option this list knows takes a value steps over it; any other is
+        // read as the flag it spells (`--no-pager`), which is the reading that
+        // cannot mistake a path for a subcommand.
+        i += if GIT_VALUE_OPTIONS.contains(arg) {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+/// Whether `sed` is printing its input rather than editing a file in place.
+///
+/// Only an invocation that silences the default print (`-n`, `--quiet`,
+/// `--silent`) and carries no in-place flag is a read; anything else is left
+/// out of the streak rather than guessed at, because a `sed` that edits is the
+/// one command on the list that writes.
+fn sed_prints_only(args: &[&str]) -> bool {
+    let mut quiet = false;
+    for arg in args {
+        if let Some(long) = arg.strip_prefix("--") {
+            match long.split('=').next().unwrap_or(long) {
+                "quiet" | "silent" => quiet = true,
+                "in-place" => return false,
+                _ => {}
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            // `-i` and `-i.bak` edit in place; `-n` only silences the default
+            // print, and the two can be spelled as one cluster (`-ni`).
+            if short.contains('i') {
+                return false;
+            }
+            quiet |= short.contains('n');
+        } else {
+            // The first argument that is not a flag is the script, and every
+            // flag that matters comes before it.
+            break;
+        }
+    }
+    quiet
+}
+
 /// Nudge injected after a worker has explored long enough without changing
 /// anything: the answer to a stuck agent is a decision, not another turn.
 fn stagnation_nudge() -> String {
@@ -1071,13 +1235,21 @@ enum ReadOnlyNudge {
 /// Consecutive read-only turns and the nudges that streak has already earned.
 ///
 /// Fed one repository sample per turn -- the same sample the stagnation
-/// detector compares against -- so "read-only" means "the worktree did not
-/// change", not "the command looked like a read".
+/// detector compares against -- and the command the turn before it ran, so
+/// "read-only" means "the worktree did not change *and* the command was a pure
+/// read": a turn that ran a test, a build or a script left the sample alone
+/// too, but it is an experiment, not a turn spent reading, and
+/// [`is_pure_read_command`] is what tells the two apart.
 #[derive(Default)]
 struct ReadOnlyStreak {
     /// Last sample seen: the baseline the next one is compared against.
     last_sample: Option<String>,
-    /// Consecutive turns whose command left the worktree unchanged.
+    /// Whether the command of the turn this streak is folding in was a pure
+    /// read. Only such a turn counts toward the streak; a turn that ran
+    /// anything else leaves the counters exactly as they are.
+    last_command_was_read: bool,
+    /// Consecutive read-only turns: turns whose command was a pure read and
+    /// that left the worktree unchanged.
     read_only_turns: usize,
     /// The first nudge has been sent for this streak.
     nudged: bool,
@@ -1103,6 +1275,11 @@ impl ReadOnlyStreak {
         if command.is_empty() {
             return;
         }
+        // Whether this turn counts toward the streak is decided here, when the
+        // command runs, because the sample that judges it is only taken on the
+        // turn after: the streak folds in the worktree as the *previous*
+        // command left it.
+        self.last_command_was_read = is_pure_read_command(command);
         let summary = summarize_command(command);
         if let Some(index) = self.recent_commands.iter().position(|c| *c == summary) {
             // Move it to the newest slot instead of duplicating it: a loop
@@ -1116,10 +1293,18 @@ impl ReadOnlyStreak {
         self.recent_commands.push(summary);
     }
 
+    /// Note that the turn just answered ran no command of its own: a
+    /// harness-answered turn -- a job wait, a consolidator verb -- is neither a
+    /// read nor an experiment, so it must not inherit the classification of the
+    /// bash command before it.
+    fn note_no_command(&mut self) {
+        self.last_command_was_read = false;
+    }
+
     /// Start the streak over without a new repository sample: a turn the
     /// harness answered itself is progress the sample cannot see, so the
     /// counters and the nudges this streak earned are dropped and the next
-    /// unchanged turn is counted as the first of a fresh streak.
+    /// read-only turn is counted as the first of a fresh streak.
     fn restart_streak(&mut self) {
         self.read_only_turns = 0;
         self.nudged = false;
@@ -1138,11 +1323,14 @@ impl ReadOnlyStreak {
 }
 
 impl ReadOnlyStreak {
-    /// Fold one turn's repository sample in, remember the command the turn
-    /// ran, and report the nudge, if any, the streak has earned. Each of the
-    /// three thresholds fires once per streak and in order, so a streak of
-    /// unchanged worktree reaches the plan and then the pause no matter where
-    /// its thresholds sit.
+    /// Fold one turn's repository sample in and report the nudge, if any, the
+    /// streak has earned. The command the turn ran was already classified by
+    /// [`ReadOnlyStreak::note_command`], because the sample that judges it is
+    /// only taken on the turn after: a turn counts toward the streak when the
+    /// worktree it left behind is unchanged *and* its command was a pure read.
+    /// Each of the three thresholds fires once per streak and in order, so a
+    /// streak of unchanged worktree reaches the plan and then the pause no
+    /// matter where its thresholds sit.
     ///
     /// `None` is a sample git could not answer: it is not evidence of progress,
     /// so it neither extends nor resets the streak.
@@ -1159,6 +1347,14 @@ impl ReadOnlyStreak {
             self.paused = false;
             self.recent_commands.clear();
             self.last_sample = Some(sample);
+            return None;
+        }
+        // A turn whose command was not a pure read -- a test, a build, a
+        // script, a binary -- is an experiment, not a turn spent reading: it
+        // neither lengthens the streak nor resets it. The equivalent-command
+        // loop detector is what stops the same experiment running over and
+        // over, so this guard stays out of its way.
+        if !self.last_command_was_read {
             return None;
         }
         self.read_only_turns += 1;
@@ -1526,6 +1722,10 @@ impl ProgressWatch {
     /// changed answer is progress the worktree sample cannot see, so it
     /// restarts the read-only streak and ends any loop window.
     fn note_harness_progress(&mut self, answer: &str) {
+        // Whether the answer changed, the turn ran no bash command, so it is
+        // not a read: the streak must not count it on the strength of the
+        // command the turn before it ran.
+        self.read_only.note_no_command();
         let digest = answer_digest(answer);
         if self.last_harness_answer == Some(digest) {
             return;
@@ -3111,10 +3311,15 @@ impl<'a> TurnEngine<'a> {
     /// Only called for a dispatch whose spec already named the files to edit,
     /// where a long read-only streak means the worker is stuck rather than
     /// still looking for the code, so the streak is counted per turn rather
-    /// than per [`STAGNATION_SAMPLE_TURNS`] window. The first two steps only
-    /// inject guidance; the third hands the decision to the orchestrator,
-    /// because a worker that has already ignored two nudges will not read a
-    /// third.
+    /// than per [`STAGNATION_SAMPLE_TURNS`] window. A turn joins the streak
+    /// only when the command the turn before it ran was a pure read
+    /// ([`is_pure_read_command`]): a worker building a reproduction loop under
+    /// a scratch directory -- running it, reading the failures, narrowing a
+    /// race -- leaves the worktree sample alone for turn after turn, but it is
+    /// not reading instead of writing, and the loop detector is what catches
+    /// an experiment that repeats. The first two steps only inject guidance;
+    /// the third hands the decision to the orchestrator, because a worker that
+    /// has already ignored two nudges will not read a third.
     async fn check_read_only(
         &mut self,
         config: &TurnConfig<'_>,
@@ -3705,10 +3910,10 @@ mod tests {
         READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
         TRUNCATION_MARKER, append_report_text, edit_plan, edit_plan_text, extension_budget,
-        grant_extension, isolation_block, log_output_tail, loop_nudge_text, loop_pause_question,
-        named_file_defaults, normalize_command_base, output_digest, parse_shortstat,
-        parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
-        read_only_thresholds, summarized_task, task_names_files,
+        grant_extension, is_pure_read_command, isolation_block, log_output_tail, loop_nudge_text,
+        loop_pause_question, named_file_defaults, normalize_command_base, output_digest,
+        parse_shortstat, parse_threshold, read_only_nudge_text, read_only_pause_question,
+        read_only_plan_text, read_only_thresholds, summarized_task, task_names_files,
     };
 
     /// A verify that ran thousands of test lines must not put them in the log:
@@ -4281,6 +4486,18 @@ mod tests {
         );
     }
 
+    /// One read-only turn as the engine sees it: the command is classified
+    /// when the turn runs, and the sample folded in on the *next* turn is what
+    /// counts it, so the classification has to be noted before the record.
+    fn read_turn(
+        streak: &mut ReadOnlyStreak,
+        sample: Option<String>,
+        limits: ReadOnlyThresholds,
+    ) -> Option<ReadOnlyNudge> {
+        streak.note_command("cat README.md");
+        streak.record(sample, limits)
+    }
+
     /// The read-only detector over a sequence of samples: each of its three
     /// steps lands on its threshold turn exactly once, an edit resets the
     /// streak, and the next streak starts over from the first nudge.
@@ -4294,56 +4511,56 @@ mod tests {
         let mut streak = ReadOnlyStreak::default();
         let same = || Some("head-a\nstat".to_string());
         // The first sample only fixes the baseline the next one is compared to.
-        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(read_turn(&mut streak, same(), limits), None);
         for turns in 1..limits.first {
             assert_eq!(
-                streak.record(same(), limits),
+                read_turn(&mut streak, same(), limits),
                 None,
                 "no nudge after only {turns} read-only turns"
             );
         }
         assert_eq!(
-            streak.record(same(), limits),
+            read_turn(&mut streak, same(), limits),
             Some(ReadOnlyNudge::First { read_only_turns: 3 })
         );
         // The first nudge is sent once, not on every following turn.
-        assert_eq!(streak.record(same(), limits), None);
-        assert_eq!(streak.record(same(), limits), None);
+        assert_eq!(read_turn(&mut streak, same(), limits), None);
+        assert_eq!(read_turn(&mut streak, same(), limits), None);
         assert_eq!(
-            streak.record(same(), limits),
+            read_turn(&mut streak, same(), limits),
             Some(ReadOnlyNudge::Plan { read_only_turns: 6 }),
             "the second threshold carries the plan"
         );
         for turns in 7..limits.pause {
             assert_eq!(
-                streak.record(same(), limits),
+                read_turn(&mut streak, same(), limits),
                 None,
                 "no pause after only {turns} read-only turns"
             );
         }
         assert_eq!(
-            streak.record(same(), limits),
+            read_turn(&mut streak, same(), limits),
             Some(ReadOnlyNudge::Pause { read_only_turns: 9 }),
             "the third threshold parks the worker on the orchestrator"
         );
         assert_eq!(
-            streak.record(same(), limits),
+            read_turn(&mut streak, same(), limits),
             None,
             "the pause is sent once per streak"
         );
         // An edit resets the streak, and the next streak nudges again: the
         // sample taken right after the edit is the new baseline.
         assert_eq!(
-            streak.record(Some("head-a\nedit".to_string()), limits),
+            read_turn(&mut streak, Some("head-a\nedit".to_string()), limits),
             None
         );
         // The first of these fixes the post-edit baseline; the rest are the
         // start of the new streak, still short of the threshold.
         for _ in 1..=limits.first {
-            assert_eq!(streak.record(same(), limits), None);
+            assert_eq!(read_turn(&mut streak, same(), limits), None);
         }
         assert_eq!(
-            streak.record(same(), limits),
+            read_turn(&mut streak, same(), limits),
             Some(ReadOnlyNudge::First { read_only_turns: 3 }),
             "after an edit the streak starts over and nudges again"
         );
@@ -4363,6 +4580,8 @@ mod tests {
         };
         let mut watch = ProgressWatch::default();
         let same = || Some("head-a\nstat".to_string());
+        // Every turn of this streak runs a pure read, so each of them counts.
+        watch.read_only.note_command("cat README.md");
         // One sample past the baseline is one read-only turn, so this reaches
         // the streak's first threshold -- and earns the first nudge.
         for _ in 0..=limits.first {
@@ -4376,17 +4595,26 @@ mod tests {
         watch.note_harness_progress("job 1 exited with code 0");
         assert_eq!(watch.read_only.read_only_turns, 0);
 
+        // The harness-answered turn ran no command, so the record that counts
+        // it is not a read either: the streak it restarted stays at zero.
+        assert_eq!(
+            watch.read_only.record(same(), limits),
+            None,
+            "a turn that ran nothing is not a turn spent reading"
+        );
+        assert_eq!(watch.read_only.read_only_turns, 0);
+
         // The turns after it are therefore the start of a fresh streak, which
         // is still short of the plan threshold the old streak had earned.
         for turns in 1..limits.first {
             assert_eq!(
-                watch.read_only.record(same(), limits),
+                read_turn(&mut watch.read_only, same(), limits),
                 None,
                 "the streak must start over: no plan after only {turns} read-only turns"
             );
         }
         assert_eq!(
-            watch.read_only.record(same(), limits),
+            read_turn(&mut watch.read_only, same(), limits),
             Some(ReadOnlyNudge::First { read_only_turns: 3 }),
             "the fresh streak still walks its steps, from the first threshold"
         );
@@ -4437,17 +4665,162 @@ mod tests {
             pause: 6,
         };
         let mut streak = ReadOnlyStreak::default();
-        assert_eq!(streak.record(Some("a".to_string()), limits), None);
-        assert_eq!(streak.record(None, limits), None);
+        assert_eq!(read_turn(&mut streak, Some("a".to_string()), limits), None);
+        assert_eq!(read_turn(&mut streak, None, limits), None);
         assert_eq!(
-            streak.record(Some("a".to_string()), limits),
+            read_turn(&mut streak, Some("a".to_string()), limits),
             None,
             "the streak is at one turn, not two: the failed sample did not count"
         );
         assert_eq!(
-            streak.record(Some("a".to_string()), limits),
+            read_turn(&mut streak, Some("a".to_string()), limits),
             Some(ReadOnlyNudge::First { read_only_turns: 2 })
         );
+    }
+
+    /// A turn the harness answered runs no bash command, so it is neither a
+    /// read nor an experiment: even a wait that reports the same states again
+    /// -- which is not progress -- must not be counted as a read on the
+    /// strength of the command the turn before it ran.
+    #[test]
+    fn a_harness_answered_turn_is_not_a_read_either() {
+        let limits = ReadOnlyThresholds {
+            first: 2,
+            plan: 4,
+            pause: 6,
+        };
+        let mut watch = ProgressWatch::default();
+        let same = || Some("head-a\nstat".to_string());
+        // The command reaches the streak the way the engine delivers it, and
+        // the first sample only fixes the baseline.
+        assert_eq!(watch.register_command("cat README.md"), None);
+        assert_eq!(watch.read_only.record(same(), limits), None);
+        // Two waits reporting the same state: the second is not progress, so
+        // the streak is not restarted -- and it must not be lengthened either.
+        watch.note_harness_progress("job 1 is still running");
+        watch.note_harness_progress("job 1 is still running");
+        assert_eq!(
+            watch.read_only.record(same(), limits),
+            None,
+            "a turn that ran nothing is not a turn spent reading"
+        );
+        assert_eq!(watch.read_only.read_only_turns, 0);
+    }
+
+    /// A turn that runs an experiment -- a test, a build, a script, a binary --
+    /// leaves the worktree sample alone just as a read does, but it is not a
+    /// turn spent reading: the streak must not walk towards the pause while a
+    /// worker is building and running a reproduction loop.
+    #[test]
+    fn an_experiment_turn_does_not_count_toward_the_read_only_streak() {
+        let limits = named_file_defaults();
+        let mut streak = ReadOnlyStreak::default();
+        let same = || Some("head-a\nstat".to_string());
+        // One more record than the threshold, because the first sample only
+        // fixes the baseline the next one is compared to: this is the run of
+        // turns that parks a reader.
+        for n in 0..=limits.pause {
+            let command = if n.is_multiple_of(2) {
+                "cargo test --lib runner 2>&1 | tail -40"
+            } else {
+                "./repro.sh"
+            };
+            streak.note_command(command);
+            assert_eq!(
+                streak.record(same(), limits),
+                None,
+                "turn {n} ran {command:?}: an experiment is not a turn spent reading"
+            );
+        }
+        assert_eq!(
+            streak.read_only_turns, 0,
+            "an experiment neither lengthens nor resets the streak"
+        );
+    }
+
+    /// The guard still fires on the reads it was built for: a run of pure
+    /// reads over an unchanged worktree reaches the pause at the shipped
+    /// thresholds, whatever else the streak has survived.
+    #[test]
+    fn pure_reads_over_an_unchanged_worktree_still_reach_the_pause() {
+        let limits = named_file_defaults();
+        let mut streak = ReadOnlyStreak::default();
+        let same = || Some("head-a\nstat".to_string());
+        let reads = [
+            "sed -n '1,80p' src/pool/runner/turn.rs",
+            "grep -rn read_only src/",
+            "git diff --stat",
+            "cat README.md",
+        ];
+        let mut nudge = None;
+        for n in 0..=limits.pause {
+            streak.note_command(reads[n % reads.len()]);
+            nudge = streak.record(same(), limits);
+        }
+        assert_eq!(
+            nudge,
+            Some(ReadOnlyNudge::Pause {
+                read_only_turns: limits.pause
+            }),
+            "the shipped pause threshold is still reached by reading alone"
+        );
+    }
+
+    /// The classifier reads the base the loop detector reads, so the spellings
+    /// that collapse for one collapse for the other: a chain or a pipeline is
+    /// judged on the command that runs last, and a filter over its output does
+    /// not make the command a read.
+    #[test]
+    fn only_an_inspection_command_counts_as_a_pure_read() {
+        let reads = [
+            "cat README.md",
+            "head -40 src/lib.rs",
+            "tail -20 build.log",
+            "sed -n '1,80p' src/pool/runner/turn.rs",
+            "sed -n 's/a/b/p' lib.rs",
+            "grep -rn read_only src/",
+            "rg -n 'read-only' src",
+            "ls -la",
+            "find src -name '*.rs'",
+            "wc -l src/*.rs",
+            "git status",
+            "git diff --stat",
+            "git log --oneline -5",
+            "git show HEAD",
+            "git blame src/lib.rs",
+            "git -C . log --oneline -n 5",
+            "git --no-pager diff --stat",
+            "cd /tmp && ls -la",
+            "/usr/bin/grep -rn x src",
+        ];
+        for command in reads {
+            assert!(
+                is_pure_read_command(command),
+                "{command:?} only inspects the repository"
+            );
+        }
+
+        let experiments = [
+            "cargo test --lib runner 2>&1 | tail -40",
+            "cargo fmt --check && cargo clippy --all-targets -- -D warnings",
+            "./repro.sh",
+            "bash /tmp/repro.sh",
+            "python3 -m pytest -q",
+            "sed -i 's/a/b/' lib.rs",
+            "sed 's/a/b/' lib.rs",
+            "git add -N .",
+            "git commit -m 'wip'",
+            "git -C . checkout other",
+            "find . -name '*.rs' -delete",
+            "echo hello",
+            "",
+        ];
+        for command in experiments {
+            assert!(
+                !is_pure_read_command(command),
+                "{command:?} runs something, it does not only read"
+            );
+        }
     }
 
     /// The plan is read out of the dispatch the way a dispatch is written:
