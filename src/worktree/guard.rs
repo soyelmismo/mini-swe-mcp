@@ -1329,10 +1329,6 @@ impl WorktreeGuard {
         }
         log_skipped(path, &skipped);
         if !keep.is_empty() {
-            // `-A` scoped to these pathspecs, so a path the worker staged and
-            // then deleted records the deletion: a plain `add` cannot name it
-            // any more, and the blob its earlier `add` left in the index would
-            // otherwise reach the commit anyway.
             run_pathspecs(path, "add", &["add"], &keep);
         }
         Ok(Staging {
@@ -2170,21 +2166,31 @@ mod tests {
         path
     }
 
+    /// Run one git command in `dir`, failing the test when git refuses it.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = git(dir, args[0], args).expect("git must run");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A throwaway repository with one baseline commit, plus the scratch root
     /// its checkouts are filed under. Both live under the process temp dir, so
     /// the test never touches the real scratch base.
     fn repo_with_worktree(tag: &str) -> (PathBuf, WorktreeGuard) {
-        let scratch = std::env::temp_dir()
-            .join(format!("swe-guard-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        let scratch =
+            std::env::temp_dir().join(format!("swe-guard-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&scratch).expect("create scratch root");
         let repo = scratch.join("repo");
         std::fs::create_dir_all(&repo).expect("create repo");
-        git(&repo, "init", &["init", "-b", "master"]);
-        git(&repo, "config", &["config", "user.name", "mini-swe-test"]);
-        git(&repo, "config", &["config", "user.email", "test@localhost"]);
+        git_ok(&repo, &["init", "-b", "master"]);
+        git_ok(&repo, &["config", "user.name", "mini-swe-test"]);
+        git_ok(&repo, &["config", "user.email", "test@localhost"]);
         std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed file");
-        git(&repo, "add", &["add", "README.md"]);
-        git(&repo, "commit", &["commit", "-m", "baseline"]);
+        git_ok(&repo, &["add", "README.md"]);
+        git_ok(&repo, &["commit", "-m", "baseline"]);
         let root = scratch.join("worktrees");
         std::fs::create_dir_all(&root).expect("create worktree root");
         let guard = WorktreeGuard::new_in(&ScratchRoot::new(&root), &repo, tag)
@@ -2198,7 +2204,7 @@ mod tests {
     /// must not.
     #[test]
     fn commit_all_reports_the_commit_it_made() {
-        let (scratch, mut guard) = repo_with_worktree("commit-all-report");
+        let (scratch, guard) = repo_with_worktree("commit-all-report");
 
         let clean = WorktreeGuard::commit_all(
             &guard.path,
