@@ -1010,8 +1010,8 @@ pub(super) async fn own_files(
         // `--remerge-diff` reports a merge commit's *resolution* -- what the
         // consolidator decided on top of the automatic merge -- so a resolved
         // sensitive file is named while a clean merge contributes none of the
-        // merged worker's files. It needs git 2.36; the fallback below keeps
-        // the resolutions in scope on an older git.
+        // merged worker's files. It needs git 2.36; `own_history_args` below
+        // keeps the resolutions in scope on an older git.
         let mut args: Vec<String> = vec![
             "log".to_string(),
             "--remerge-diff".to_string(),
@@ -1040,14 +1040,7 @@ pub(super) async fn own_files(
         {
             return files;
         }
-        let mut args: Vec<String> = vec![
-            "log".to_string(),
-            "--name-only".to_string(),
-            "--format=".to_string(),
-            branch.clone(),
-            "--not".to_string(),
-        ];
-        args.extend(exclusions);
+        let args = own_history_args(&branch, exclusions, false);
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         crate::worktree::git(&path, "log", &borrowed)
             .ok()
@@ -1162,20 +1155,15 @@ async fn own_history(
         if let Some(parsed) = parsed {
             return parsed;
         }
-        // `--remerge-diff` needs git 2.36. On an older git the same query
-        // without it is a superset -- every merge comes back, resolutions
-        // included -- so the audit is wider, never narrower. Returning `None`
-        // rather than an empty scope is the point: an empty scope would skip
-        // the review of a resolution nobody else wrote.
-        let mut args: Vec<String> = vec![
-            "log".to_string(),
-            "--reverse".to_string(),
-            "--name-only".to_string(),
-            format!("--format={OWN_COMMIT_MARKER}%H"),
-            branch.clone(),
-            "--not".to_string(),
-        ];
-        args.extend(exclusions);
+        // `--remerge-diff` needs git 2.36. The fallback below is a real
+        // superset: `-m` diffs a merge against each parent, so a resolution --
+        // including one that takes a parent's version verbatim -- is named,
+        // where plain `--name-only` names no file at all for a merge. The audit
+        // is therefore wider (a clean merge also reports what it carried),
+        // never narrower. Returning `None` rather than an empty scope is the
+        // point: an empty scope would skip the review of a resolution nobody
+        // else wrote.
+        let args = own_history_args(&branch, exclusions, true);
         run_own_history(&path, &args).unwrap_or_else(|| (rev_list(&path, &branch), Vec::new()))
     })
     .await
@@ -1185,6 +1173,87 @@ async fn own_history(
 /// The commit-list prefix every line of the own-history query starts with, so
 /// the parser can tell a commit id from a file name without guessing.
 const OWN_COMMIT_MARKER: &str = "\u{1}own-commit\u{1}";
+
+/// The own-history query for a git too old for `--remerge-diff` (pre-2.36).
+///
+/// `-m` is what makes the fallback a superset rather than a silent hole: a merge
+/// commit's file list is empty under plain `--name-only` (git prints no diff for
+/// a merge by default), so a conflict resolution would be dropped from the scope
+/// on an old git -- exactly the code nobody else reviewed. `-m` splits the merge
+/// into one diff per parent, which names the resolved file however it was
+/// resolved. `--cc` is not enough: it lists only files whose result differs from
+/// *every* parent, so a resolution that takes one parent's version verbatim --
+/// a real decision by the consolidator, and the one `--remerge-diff` does report
+/// -- comes back empty. The cost is width, never narrowness: a clean merge also
+/// names what it carried, which re-audits an already-reviewed worker branch.
+///
+/// `reverse` asks for the oldest commit first, which only the own-history parser
+/// needs; the sensitive-path probe sorts and deduplicates instead.
+fn own_history_args(branch: &str, exclusions: Vec<String>, reverse: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["log".to_string()];
+    if reverse {
+        args.push("--reverse".to_string());
+    }
+    args.push("-m".to_string());
+    args.push("--name-only".to_string());
+    args.push(if reverse {
+        format!("--format={OWN_COMMIT_MARKER}%H")
+    } else {
+        "--format=".to_string()
+    });
+    args.push(branch.to_string());
+    args.push("--not".to_string());
+    args.extend(exclusions);
+    args
+}
+
+/// The files the pre-2.36 own-history fallback reports for a consolidator
+/// (test support).
+///
+/// The fallback only runs when git rejects `--remerge-diff`, which a current git
+/// never does, so the query it builds would otherwise be unreachable from a test.
+/// Exposing it lets the pre-2.36 behaviour be asserted on the git in hand.
+#[doc(hidden)]
+pub(super) async fn __test_own_files_fallback(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> Vec<String> {
+    let path = path.to_path_buf();
+    let branch = branch.to_string();
+    let merged = merged.to_vec();
+    let base_tip = base_tip.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let mut exclusions: Vec<String> = merged
+            .iter()
+            .filter(|merged_branch| *merged_branch != &branch)
+            .flat_map(|merged_branch| rev_list(&path, merged_branch))
+            .collect();
+        exclude_base_tip(&mut exclusions, base_tip.as_deref());
+        exclusions.sort();
+        exclusions.dedup();
+        let args = own_history_args(&branch, exclusions, false);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut files: Vec<String> = crate::worktree::git(&path, "log", &borrowed)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        files.dedup();
+        files
+    })
+    .await
+    .unwrap_or_default()
+}
 
 /// Run the own-history query and split its output into commits and files.
 ///

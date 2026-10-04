@@ -793,6 +793,153 @@ async fn a_planted_non_object_id_approval_never_reaches_git_in_the_consolidator_
     assert_eq!(scope.skip_log(), None);
 }
 
+/// The pre-2.36 fallback of the own-files probe must still name a merge commit's
+/// resolved file. A current git never reaches the fallback (it always accepts
+/// `--remerge-diff`), so the test drives the fallback query through a test-only
+/// export of the args the production code would build for an old git, on a
+/// repository whose merge carries a real conflict resolution. A bug that dropped
+/// the file list of a merge from the fallback query would slip the resolved
+/// sensitive file out of a consolidator's scope on a pre-2.36 git: the very code
+/// nobody else reviewed. The test asserts the file is named, and the test-only
+/// driver is the only way to take the fallback path on a modern git.
+#[tokio::test]
+async fn a_pre_2_36_fallback_own_files_query_names_a_merge_resolutions_file() {
+    let dir = common::TempDir::new_in_tmp("scope_fallback_merge");
+    let path = dir.path().to_path_buf();
+    common::git(&path, &["init", "-q", "-b", "master", "."]);
+    common::git(
+        &path,
+        &["config", "user.email", "review-scope@example.invalid"],
+    );
+    common::git(&path, &["config", "user.name", "Review Scope Test"]);
+    let socket = "src/hub/socket.rs";
+    std::fs::create_dir_all(path.join("src/hub")).expect("create the sensitive directory");
+    std::fs::write(path.join(socket), "the original handshake").expect("seed the sensitive file");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "-m", "base"]);
+    let _base = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    // Two workers disagree on the same sensitive file; the consolidator resolves.
+    common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
+    std::fs::write(path.join(socket), "worker's handshake").expect("worker one edits the file");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w1"]);
+    let w1 = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    common::git(&path, &["checkout", "-q", "-b", "worker-w2", "master"]);
+    std::fs::write(path.join(socket), "other worker's handshake")
+        .expect("worker two edits the same file");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w2"]);
+    let w2 = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    common::git(&path, &["checkout", "-q", "-b", "worker-c1", "master"]);
+    common::git(
+        &path,
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let conflict = std::process::Command::new("git")
+        .args(["merge", "--no-ff", "-m", "merge w2", "worker-w2"])
+        .current_dir(&path)
+        .output()
+        .expect("run the conflicting merge");
+    assert!(
+        !conflict.status.success(),
+        "the two workers' edits must really conflict, or this test proves nothing"
+    );
+    std::fs::write(path.join(socket), "the resolved handshake").expect("write the resolution");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "--no-edit"]);
+
+    // Drive the fallback query directly: it is the args `own_files` would
+    // build on a pre-2.36 git, so the assertion exercises exactly the bug the
+    // fallback must not have.
+    let files = mini_swe_mcp::pool::__test_own_files_fallback(
+        &path,
+        "worker-c1",
+        &[w1, w2],
+        Some("master"),
+    )
+    .await;
+    assert!(
+        files.contains(&socket.to_string()),
+        "the fallback query must name the file whose conflict the consolidator resolved; got {files:?}"
+    );
+}
+
+/// The resolution is a decision even when the resolved content happens to equal
+/// one parent's version: the consolidator chose that side, and nothing else in
+/// the history records the choice. The fallback must name the file anyway, so
+/// the query has to diff the merge against *each* parent (`-m`) rather than only
+/// against the parents it differs from everywhere (`--cc`, which stays silent
+/// here -- the one case where the narrower flag would drop the resolution).
+#[tokio::test]
+async fn a_pre_2_36_fallback_names_a_resolution_that_matches_one_parent() {
+    let dir = common::TempDir::new_in_tmp("scope_fallback_takes_side");
+    let path = dir.path().to_path_buf();
+    common::git(&path, &["init", "-q", "-b", "master", "."]);
+    common::git(
+        &path,
+        &["config", "user.email", "review-scope@example.invalid"],
+    );
+    common::git(&path, &["config", "user.name", "Review Scope Test"]);
+    let socket = "src/hub/socket.rs";
+    std::fs::create_dir_all(path.join("src/hub")).expect("create the sensitive directory");
+    std::fs::write(path.join(socket), "original\nkeep\nend").expect("seed the sensitive file");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "-m", "base"]);
+
+    // The two workers change the same middle line, so integrating them conflicts.
+    common::git(&path, &["checkout", "-q", "-b", "worker-w1"]);
+    std::fs::write(path.join(socket), "worker's line\nkeep\nend").expect("worker one edits");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w1"]);
+    let w1 = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    common::git(&path, &["checkout", "-q", "-b", "worker-w2", "master"]);
+    std::fs::write(path.join(socket), "other worker's line\nkeep\nend")
+        .expect("worker two edits the same line");
+    common::git(&path, &["commit", "-q", "-a", "-m", "w2"]);
+    let w2 = common::git(&path, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    common::git(&path, &["checkout", "-q", "-b", "worker-c1", "master"]);
+    common::git(
+        &path,
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    let conflict = std::process::Command::new("git")
+        .args(["merge", "--no-ff", "-m", "merge w2", "worker-w2"])
+        .current_dir(&path)
+        .output()
+        .expect("run the conflicting merge");
+    assert!(
+        !conflict.status.success(),
+        "the two workers' edits must really conflict, or this test proves nothing"
+    );
+    // The consolidator resolves by taking worker one's version wholesale.
+    std::fs::write(path.join(socket), "worker's line\nkeep\nend").expect("take w1's version");
+    common::git(&path, &["add", socket]);
+    common::git(&path, &["commit", "-q", "--no-edit"]);
+
+    let files = mini_swe_mcp::pool::__test_own_files_fallback(
+        &path,
+        "worker-c1",
+        &[w1, w2],
+        Some("master"),
+    )
+    .await;
+    assert!(
+        files.contains(&socket.to_string()),
+        "a resolution that takes one parent's version is still the consolidator's decision and \
+         must be named by the fallback; got {files:?}"
+    );
+}
+
 // ----------
 // The base branch a consolidator merged in
 // ----------
