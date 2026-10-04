@@ -78,7 +78,7 @@ pub struct RunConfig<'a> {
     /// The dispatch's default model: the manifest's `default:` entry, else the
     /// pool's configured fallback. An automatic security review falls back to
     /// this rather than to `model`, so the review never silently runs on the
-    /// implementer's own tier (see `review::select_security_reviewer`).
+    /// security mode's `default_model` (see `review::select_security_reviewer`).
     pub default_model: &'a str,
     pub temperature: Option<f32>,
     pub max_turns: usize,
@@ -685,15 +685,15 @@ impl WorkerPool {
         // A requested review names its mode by suffix; an unknown mode is a
         // dispatch error here (the dispatch already validated, so this is
         // defensive). An empty reviewer (`--review-after :<mode>` against a
-        // mode that declares no default model) runs on the implementer's
-        // model, exactly like a triggered mode with no default: an empty
+        // mode that declares no default model) runs on the dispatch default,
+        // exactly like a triggered mode with no default: an empty
         // model string would reach the provider verbatim and the review would
         // quietly end inconclusive.
         let requested = match review_after.as_deref() {
             Some(s) => {
                 let (reviewer, mode) = ReviewMode::parse_with_manifest(s, self.manifest())?;
                 let reviewer = if reviewer.trim().is_empty() {
-                    model.clone()
+                    default_model.clone()
                 } else {
                     reviewer
                 };
@@ -706,16 +706,11 @@ impl WorkerPool {
         // The rule that picks the review lives in `plan_review`, next to the
         // scope that decides the skip, so the mode a requested review ends up
         // running in cannot drift from the one the rule states. The automatic
-        // trigger audits on the mode's default reviewer when the manifest
-        // declares one, else on the manifest's strongest tier, falling back to
-        // the dispatch default when the manifest marks none: the implementer's
-        // own model is never the automatic answer.
-        let automatic_security_reviewer = {
-            let choice = self::review::select_security_reviewer(self.manifest(), &default_model);
-            self::review::mode_default_reviewer("security", self.manifest())
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or(choice.model)
-        };
+        // trigger audits on the security mode's `default_model` when the
+        // manifest declares one, else on the dispatch default: the
+        // implementer's own model is never the automatic answer.
+        let automatic_security_reviewer =
+            self::review::select_security_reviewer(self.manifest(), &default_model).model;
         // Successive review phases: the requested (or automatic security)
         // phase first, then a requested manifest-declared mode the sensitive
         // upgrade displaced, so `--review-after <model>:<mode>` always means

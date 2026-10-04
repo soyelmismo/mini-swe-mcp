@@ -477,8 +477,8 @@ impl<'de> Deserialize<'de> for ReviewModeDefinition {
         let raw = Raw::deserialize(d)?;
         Ok(Self {
             checklist: raw.checklist,
-            default_model: raw.default_model.or(raw.model),
             model_key_deprecated: raw.model.is_some(),
+            default_model: raw.default_model.or(raw.model),
         })
     }
 }

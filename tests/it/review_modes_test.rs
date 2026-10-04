@@ -34,8 +34,8 @@ fn a_declared_mode_parses_its_checklist_and_model() {
         "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: nerd\n",
     );
     let def = manifest.review_mode("perf").expect("perf mode");
-    assert_eq!(def.checklist, "Check for N+1 queries.");
-    assert_eq!(def.model.as_deref(), Some("nerd"));
+    assert_eq!(def.checklist.as_deref(), Some("Check for N+1 queries."));
+    assert_eq!(def.default_model.as_deref(), Some("nerd"));
     assert!(manifest.validate().is_empty());
 }
 
@@ -45,7 +45,7 @@ fn a_declared_mode_without_a_model_has_none() {
         "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  style:\n    checklist: Check naming.\n",
     );
     let def = manifest.review_mode("style").expect("style mode");
-    assert_eq!(def.model, None);
+    assert_eq!(def.default_model, None);
     assert!(manifest.validate().is_empty());
 }
 

@@ -46,7 +46,7 @@ pub use self::memory::{MAX_MEMORY_PROMPT_BYTES, MEMORY_DIR, agent_memory_path, l
 pub use self::types::{
     BUILTIN_DEFAULT_MODEL, DEFAULT_MAX_TURNS, ExecutionPolicy, MAX_MODEL_INSTRUCTIONS_BYTES,
     MAX_TURNS_LIMIT, ModelDefinition, ModelInstructions, ModelManifest, NETWORK_POLICIES,
-    NetworkPolicy, ReviewModeDefinition, TEMPERATURE_RANGE,
+    NetworkPolicy, QUALITY_CHECKLIST, ReviewModeDefinition, SECURITY_CHECKLIST, TEMPERATURE_RANGE,
 };
 
 /// Role shown for a model that declares none.
@@ -218,9 +218,9 @@ impl ModelManifest {
     /// The built-in checklist for `name` (`quality`/`security`), else `None`.
     pub fn builtin_review_checklist(name: &str) -> Option<String> {
         if name.eq_ignore_ascii_case("quality") {
-            Some(super::types::QUALITY_CHECKLIST.to_string())
+            Some(types::QUALITY_CHECKLIST.to_string())
         } else if name.eq_ignore_ascii_case("security") {
-            Some(super::types::SECURITY_CHECKLIST.to_string())
+            Some(types::SECURITY_CHECKLIST.to_string())
         } else {
             None
         }
@@ -344,14 +344,6 @@ impl ModelManifest {
     /// from the same YAML. Every user-visible derivation (catalog rendering,
     /// id resolution, warnings) goes through this helper so the output is
     /// reproducible.
-    /// Every model alias in stable (sorted) order, for error messages that
-    /// list what `--review-after` accepts.
-    pub fn sorted_model_aliases(&self) -> Vec<String> {
-        let mut aliases: Vec<String> = self.models.keys().cloned().collect();
-        aliases.sort();
-        aliases
-    }
-
     fn sorted_models(&self) -> Vec<(&str, &ModelDefinition)> {
         let mut entries: Vec<(&str, &ModelDefinition)> = self
             .models
@@ -360,6 +352,14 @@ impl ModelManifest {
             .collect();
         entries.sort_unstable_by_key(|(alias, _)| *alias);
         entries
+    }
+
+    /// Every model alias in stable (sorted) order, for error messages that
+    /// list what `--review-after` accepts.
+    pub fn sorted_model_aliases(&self) -> Vec<String> {
+        let mut aliases: Vec<String> = self.models.keys().cloned().collect();
+        aliases.sort();
+        aliases
     }
 }
 

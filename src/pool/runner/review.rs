@@ -342,7 +342,7 @@ pub fn review_prompt(
     let checklist = mode
         .checklist
         .as_deref()
-        .unwrap_or(crate::manifest::types::QUALITY_CHECKLIST);
+        .unwrap_or(crate::manifest::QUALITY_CHECKLIST);
     custom_prompt(&mode.name, task, gate, checklist, sensitive)
 }
 
@@ -549,9 +549,10 @@ pub fn approved_merged_branches(
 /// what the dispatch asked for and whether the scope has no sensitive change
 /// (`true` = no sensitive change → no automatic trigger).
 ///
-/// `strongest` is the model to audit with when the manifest marks no tier of its
-/// own; it is only consulted for the automatic sensitive-path trigger, so it is
-/// the last argument and callers that never reach it may pass any model.
+/// `automatic` is the model to audit with when the dispatch named no reviewer
+/// (the security mode's `default_model`, else the dispatch default); it is only
+/// consulted for the automatic sensitive-path trigger, so it is the last
+/// argument and callers that never reach it may pass any model.
 ///
 /// Two rules carry the security weight:
 ///
@@ -566,7 +567,7 @@ pub fn plan_review(
     skip: bool,
     requested: Option<(String, ReviewMode)>,
     sensitive_is_empty: bool,
-    strongest: &str,
+    automatic: &str,
     security_mode: &ReviewMode,
 ) -> Option<(String, ReviewMode)> {
     match (skip, requested, sensitive_is_empty) {
@@ -577,8 +578,8 @@ pub fn plan_review(
         (false, Some((model, _)), false) => Some((model, security_mode.clone())),
         (false, Some((model, wanted)), true) => Some((model, wanted)),
         // No requested review, but the diff is sensitive: trigger the security
-        // review on the manifest's strongest tier.
-        (false, None, false) => Some((strongest.to_string(), security_mode.clone())),
+        // review on the security mode's reviewer.
+        (false, None, false) => Some((automatic.to_string(), security_mode.clone())),
         (false, None, true) => None,
     }
 }
@@ -1577,13 +1578,13 @@ mod tests {
     }
 
     #[test]
-    fn the_strongest_tier_is_resolved_to_its_id() {
+    fn the_security_modes_default_model_is_resolved_to_its_id() {
         let manifest = manifest(
-            "default: ninja\nstrongest: nerd\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n",
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: nerd\n",
         );
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:nerd");
-        assert!(choice.reason.contains("strongest"), "{}", choice.reason);
+        assert!(choice.reason.contains("default_model"), "{}", choice.reason);
     }
 
     #[test]
@@ -1591,17 +1592,22 @@ mod tests {
         let manifest = manifest("default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n");
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:default");
-        assert!(choice.reason.contains("no strongest"), "{}", choice.reason);
+        assert!(choice.reason.contains("no default_model"), "{}", choice.reason);
     }
 
     #[test]
-    fn a_dangling_strongest_key_is_ignored() {
+    fn a_strongest_key_is_ignored_and_warned() {
         let manifest =
             manifest("default: ninja\nstrongest: absent\nmodels:\n  ninja:\n    id: combo:ninja\n");
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(
             choice.model, "combo:default",
-            "a `strongest:` alias the catalog does not define must fall back"
+            "a retired `strongest:` key must not pick the reviewer"
+        );
+        let warnings = manifest.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("strongest")),
+            "a `strongest:` key must warn: {warnings:?}"
         );
     }
 }

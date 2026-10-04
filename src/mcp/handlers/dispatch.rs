@@ -255,13 +255,20 @@ impl McpServer {
                 } else {
                     self.manifest.resolve_model(&model).0
                 };
-                if mode.is_security() && mode.checklist.is_none() {
+                // The stored string re-parses to the same mode in the phase
+                // loop: the plain built-ins keep their short form, everything
+                // else names its mode explicitly.
+                let builtin_quality = mode.name.eq_ignore_ascii_case("quality")
+                    && self.manifest.review_mode("quality").is_none();
+                let builtin_security = mode.is_security()
+                    && self.manifest.review_mode("security").is_none();
+                if builtin_quality {
+                    Ok(resolved)
+                } else if builtin_security {
                     Ok(format!(
                         "{resolved}:{}",
                         crate::pool::ReviewMode::SECURITY_SUFFIX
                     ))
-                } else if mode.name.eq_ignore_ascii_case("quality") && mode.checklist.is_none() {
-                    Ok(resolved)
                 } else {
                     Ok(format!("{resolved}:{}", mode.name))
                 }
