@@ -627,6 +627,14 @@ pub fn save_registry_entry_in(root: &ScratchRoot, entry: &WorkerRegistryEntry) {
 /// a concurrent reader sees the old row or the complete new one, never a torn
 /// write. The temp file is created with the same default permissions a plain
 /// write would give the row, and is removed if the rename fails.
+///
+/// The rename is deliberately not preceded by an `fsync`: it is the rename,
+/// not the write, that a reader observes, and it is atomic on its own. A
+/// status row does not have to survive a machine crash -- every worker step
+/// rewrites the row, and a reader that finds a row missing or unparsable (a
+/// crash can lose the not-yet-renamed write) treats the worker as not
+/// registered rather than trusting a half-written row -- so paying one fsync
+/// per write, for every step of every worker, buys nothing.
 fn atomic_write_registry_row(path: &std::path::Path, json: &[u8]) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -645,7 +653,6 @@ fn atomic_write_registry_row(path: &std::path::Path, json: &[u8]) {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
         file.write_all(json)?;
-        file.sync_all()?;
         std::fs::rename(&tmp, path)
     })();
     if let Err(e) = result {

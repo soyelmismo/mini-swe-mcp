@@ -113,19 +113,138 @@ pub fn parse_ask_orchestrator(cmd: &str) -> Option<String> {
         && let Some(pos) = trimmed.find("ASK_ORCHESTRATOR:")
     {
         let rest = &trimmed[pos + "ASK_ORCHESTRATOR:".len()..];
-        let line = rest
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim();
-        if !line.is_empty() && line != "<your specific question>" && line != "<question>" {
-            return Some(line.to_string());
+        let question = match enclosing_quote(&trimmed[..pos]) {
+            Some(quote) => quoted_question(rest, quote),
+            None => unquoted_question(rest),
+        };
+        if !question.is_empty() && !is_question_placeholder(question) {
+            return Some(bound_question(question));
         }
     }
     None
+}
+
+/// The quote still open at `text`'s end, if the keyword sits inside one.
+///
+/// This is what makes a multi-line question readable: the quote was opened
+/// before `ASK_ORCHESTRATOR:`, so the text after the keyword continues an
+/// argument rather than starting one. Backslash escapes are honoured so an
+/// escaped quote never opens a string.
+fn enclosing_quote(text: &str) -> Option<char> {
+    let mut open: Option<char> = None;
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if let Some(quote) = open {
+            if c == quote {
+                open = None;
+            }
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' || c == '\'' {
+            open = Some(c);
+        }
+    }
+    open
+}
+
+/// The whole quoted argument that `rest` continues, up to the quote closing it,
+/// line breaks included.
+///
+/// A question is a decision request, and a decision request is often more than
+/// one line: the worker describes the options it is stuck between, what each
+/// costs, and what it would do. Read as one line, the first half of that reached
+/// the orchestrator and the rest was lost, so the reply answered a question the
+/// worker never asked.
+fn quoted_question(rest: &str, quote: char) -> &str {
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return rest[..i].trim();
+        }
+    }
+    // The closing quote is missing: the worker wrote one long question, and
+    // cutting it at a quote that is not there would drop the answer it waits
+    // for.
+    rest.trim()
+}
+
+/// The text an unquoted `ASK_ORCHESTRATOR:` argument carries: the rest of the
+/// command up to the first separator, with its own quotes peeled.
+///
+/// Here the shell is the authority on where the question ends, not the keyword:
+/// `echo "ASK_ORCHESTRATOR: q"; ls` is a question followed by a command, and
+/// only the `q` is the question.
+fn unquoted_question(rest: &str) -> &str {
+    // The gap the worker left after the colon is not a separator: `echo
+    // ASK_ORCHESTRATOR: q` is one question, not an empty one followed by `q`.
+    let rest = rest.trim_start();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' | '\'' => quoted = !quoted,
+            _ if !quoted && is_shell_separator(c) => return peel_question(&rest[..i]),
+            _ => {}
+        }
+    }
+    peel_question(rest)
+}
+
+/// Trim the unquoted question, dropping the quotes `echo ASK_ORCHESTRATOR:
+/// "Proceed?"` wraps it in, which are the argument's syntax, not its text.
+fn peel_question(rest: &str) -> &str {
+    rest.trim().trim_matches('"').trim_matches('\'').trim()
+}
+
+/// Whether `c` ends an unquoted shell command: a separator or a line break.
+///
+/// Spaces are part of the question, not a break in it — `echo
+/// ASK_ORCHESTRATOR: is this ok?` is one four-word question — so only the
+/// characters that would really end the command count.
+fn is_shell_separator(c: char) -> bool {
+    c == '\n' || c == '\r' || matches!(c, ';' | '|' | '&')
+}
+
+/// The angle-bracket templates of the system prompt, echoed back verbatim.
+fn is_question_placeholder(question: &str) -> bool {
+    matches!(question, "<your specific question>" | "<question>")
+}
+
+/// Byte budget of one orchestrator question, the trailing [`QUESTION_TRUNCATED`]
+/// marker included.
+///
+/// The question is carried by the pause, the event and the registry row until
+/// someone answers it, so a worker that pastes a whole file into its question
+/// must not be able to flood those. 4 KiB is far longer than a decision request
+/// needs, and the cut is on a char boundary so multi-byte text is never sliced
+/// mid-code-point.
+const QUESTION_BYTES: usize = 4000;
+
+/// Marker appended to a question cut to [`QUESTION_BYTES`], so a short
+/// question reaches the orchestrator as asked and a long one is visibly short.
+const QUESTION_TRUNCATED: &str = " [truncated]";
+
+/// `question` bounded to [`QUESTION_BYTES`].
+fn bound_question(question: &str) -> String {
+    if question.len() <= QUESTION_BYTES {
+        return question.to_string();
+    }
+    if QUESTION_BYTES <= QUESTION_TRUNCATED.len() {
+        return QUESTION_TRUNCATED.to_string();
+    }
+    let cut = question.floor_char_boundary(QUESTION_BYTES - QUESTION_TRUNCATED.len());
+    format!("{}{QUESTION_TRUNCATED}", &question[..cut])
 }
 
 /// `echo "WAIT_JOB: <n>"` → the background job to block on.
@@ -488,10 +607,10 @@ pub fn parse_consolidate_wait(cmd: &str) -> Option<(Vec<String>, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPORT_FIELD_BYTES, REPORT_FOLLOWUP, is_completion_request, opens_report_block,
-        parse_ask_orchestrator, parse_consolidate_merge, parse_consolidate_steer,
-        parse_consolidate_wait, parse_kill_job, parse_report, parse_request_turns, parse_wait_job,
-        summarize_command, summary_line,
+        QUESTION_BYTES, QUESTION_TRUNCATED, REPORT_FIELD_BYTES, REPORT_FOLLOWUP,
+        is_completion_request, opens_report_block, parse_ask_orchestrator, parse_consolidate_merge,
+        parse_consolidate_steer, parse_consolidate_wait, parse_kill_job, parse_report,
+        parse_request_turns, parse_wait_job, summarize_command, summary_line,
     };
     use crate::pool::WorkerReport;
 
@@ -794,5 +913,59 @@ mod tests {
             None
         );
         assert_eq!(parse_ask_orchestrator("ls -la"), None);
+    }
+
+    #[test]
+    fn a_multi_line_ask_orchestrator_reaches_the_orchestrator_whole() {
+        let cmd = "echo \"ASK_ORCHESTRATOR: Two decisions.\n1. keep the old\n   parser or replace it?\n2. which branch?\"";
+        assert_eq!(
+            parse_ask_orchestrator(cmd),
+            Some(
+                "Two decisions.\n1. keep the old\n   parser or replace it?\n2. which branch?"
+                    .to_string()
+            )
+        );
+        // A single-line question inside the same kind of quote is unchanged,
+        // and an escaped quote inside it does not end the argument.
+        assert_eq!(
+            parse_ask_orchestrator(
+                "echo \"ASK_ORCHESTRATOR: keep or drop \\\"the old parser\\\"?\""
+            ),
+            Some("keep or drop \\\"the old parser\\\"?".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ask_orchestrator_stops_at_the_first_unquoted_separator() {
+        // The gaps inside an unquoted question are its own, not separators.
+        assert_eq!(
+            parse_ask_orchestrator("echo ASK_ORCHESTRATOR: is this ok?"),
+            Some("is this ok?".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("echo \"ASK_ORCHESTRATOR: q\"; ls"),
+            Some("q".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("echo 'ASK_ORCHESTRATOR: q' && ls"),
+            Some("q".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("echo ASK_ORCHESTRATOR: q || ls"),
+            Some("q".to_string())
+        );
+        assert_eq!(
+            parse_ask_orchestrator("echo ASK_ORCHESTRATOR: q | tee log"),
+            Some("q".to_string())
+        );
+    }
+
+    #[test]
+    fn a_runaway_ask_orchestrator_question_is_capped_on_a_char_boundary() {
+        let cmd = format!("echo \"ASK_ORCHESTRATOR: {}\"", "\u{20ac}".repeat(2000));
+        let question = parse_ask_orchestrator(&cmd).expect("a question");
+        assert!(question.len() <= QUESTION_BYTES, "{} bytes", question.len());
+        assert!(question.ends_with(QUESTION_TRUNCATED), "{question:?}");
+        assert!(question.is_char_boundary(question.len()));
     }
 }
