@@ -48,7 +48,7 @@ impl Pool {
     fn lease(&mut self) -> BuildDirLease {
         // The cap is irrelevant here: these dirs hold only a few bytes, so a
         // generous cap never trips. The point is the lease, not the cap.
-        let lease = BuildDirLease::acquire_in(&self.base, &self.repo, u64::MAX)
+        let lease = BuildDirLease::acquire_in(&self.repo, &self.base, u64::MAX)
             .expect("a worker must lease a dir");
         self.leased.push(lease.dir().to_path_buf());
         lease

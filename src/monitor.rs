@@ -43,7 +43,7 @@
 //! detail view), and a repository line is shown only when more than one
 //! repository is present.
 
-use crate::config::env_parse;
+use crate::config::env_parse_from;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -679,14 +679,26 @@ pub fn terminal_width() -> Option<usize> {
 /// then [`DEFAULT_TERMINAL_WIDTH`]. Without this, a `mini-swe monitor | less`
 /// always rendered 80 columns wide no matter what the user had set.
 pub fn plain_width() -> usize {
-    monitor_width_override()
-        .or_else(columns_env)
+    plain_width_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`plain_width`], parameterized over the environment lookup so
+/// the precedence rules can be tested without mutating process state.
+fn plain_width_from(lookup: &dyn Fn(&str) -> Option<String>) -> usize {
+    monitor_width_override_from(lookup)
+        .or_else(|| columns_env_from(lookup))
         .unwrap_or(DEFAULT_TERMINAL_WIDTH)
 }
 
 /// The `MONITOR_WIDTH` override, ignored when unset, unparsable or zero.
 fn monitor_width_override() -> Option<usize> {
-    env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0)
+    monitor_width_override_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`monitor_width_override`], parameterized over the environment
+/// lookup so it is testable without mutating process state.
+fn monitor_width_override_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<usize> {
+    env_parse_from::<usize>("MONITOR_WIDTH", lookup).filter(|&w| w > 0)
 }
 
 /// Terminal width from `/dev/tty` (or `COLUMNS`), if it can be read.
@@ -718,7 +730,12 @@ fn terminal_size_via_tty() -> Option<usize> {
 
 /// `COLUMNS` fallback shared by both platforms.
 fn columns_env() -> Option<usize> {
-    env_parse::<usize>("COLUMNS").filter(|c| *c > 0)
+    columns_env_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`columns_env`], parameterized over the environment lookup.
+fn columns_env_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<usize> {
+    env_parse_from::<usize>("COLUMNS", lookup).filter(|c| *c > 0)
 }
 
 // ----------
@@ -2059,29 +2076,42 @@ mod tests {
     /// falling back to 80, and `MONITOR_WIDTH` still overrides both.
     #[test]
     fn test_plain_width_honours_columns_without_a_tty() {
-        // `set_var` is process-global: hold the shared lock for the whole test
-        // so no parallel test observes the overrides.
-        crate::agent::env::with_env_lock(|| {
-            unsafe {
-                std::env::set_var("COLUMNS", "50");
-                std::env::remove_var("MONITOR_WIDTH");
-            }
-            assert_eq!(plain_width(), 50, "COLUMNS must be honoured");
+        use std::collections::HashMap;
+        // A synthetic environment lookup, so the precedence rules are tested
+        // without mutating the process-global environment.
+        let lookup = |vars: &[(&str, &str)]| {
+            let map: HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |key: &str| map.get(key).cloned()
+        };
 
-            // Zero and unparsable values are ignored, as they are everywhere.
-            unsafe { std::env::set_var("COLUMNS", "0") };
-            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "COLUMNS=0");
-            unsafe { std::env::set_var("COLUMNS", "wide") };
-            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "COLUMNS=wide");
+        // COLUMNS is honoured when MONITOR_WIDTH is unset.
+        let env = lookup(&[("COLUMNS", "50")]);
+        assert_eq!(plain_width_from(&env), 50, "COLUMNS must be honoured");
 
-            unsafe {
-                std::env::remove_var("COLUMNS");
-                std::env::set_var("MONITOR_WIDTH", "72");
-            }
-            assert_eq!(plain_width(), 72, "MONITOR_WIDTH must win");
-            unsafe { std::env::remove_var("MONITOR_WIDTH") };
-            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "neither set");
-        });
+        // Zero and unparsable values are ignored, as they are everywhere.
+        let env = lookup(&[("COLUMNS", "0")]);
+        assert_eq!(plain_width_from(&env), DEFAULT_TERMINAL_WIDTH, "COLUMNS=0");
+        let env = lookup(&[("COLUMNS", "wide")]);
+        assert_eq!(
+            plain_width_from(&env),
+            DEFAULT_TERMINAL_WIDTH,
+            "COLUMNS=wide"
+        );
+
+        // MONITOR_WIDTH wins over COLUMNS.
+        let env = lookup(&[("COLUMNS", "50"), ("MONITOR_WIDTH", "72")]);
+        assert_eq!(plain_width_from(&env), 72, "MONITOR_WIDTH must win");
+
+        // Neither set: the default.
+        let env = lookup(&[]);
+        assert_eq!(
+            plain_width_from(&env),
+            DEFAULT_TERMINAL_WIDTH,
+            "neither set"
+        );
     }
 
     /// A live worker's elapsed keeps counting; a terminal one freezes.
