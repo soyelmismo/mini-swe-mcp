@@ -78,6 +78,14 @@ impl Roots {
 
 impl Drop for Roots {
     fn drop(&mut self) {
+        // A step run against a declared root makes the runner derive its
+        // private `swe-tmp-<leaf>` scratch next to the scratch *base*, so
+        // removing this directory alone would leave one `swe-tmp-worktree` and
+        // `swe-tmp-target` entry behind in the real base, filed there by every
+        // run of this suite.
+        for root in [&self.worktree, &self.target] {
+            mini_swe_mcp::worktree::remove_target_dirs(root);
+        }
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
