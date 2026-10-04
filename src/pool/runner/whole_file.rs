@@ -371,7 +371,7 @@ fn read_small_regular_file(root: &Path, path: &Path) -> Option<(FileStamp, Strin
     // size check and the read is cut short by the bound above, and answering
     // with the prefix would tell the model it has seen a file it has not, so a
     // short read is refused rather than passed off as complete.
-    if read != meta.len() {
+    if read as u64 != meta.len() {
         warn!(
             file = %path.display(),
             expected = meta.len(),

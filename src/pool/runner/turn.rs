@@ -4907,26 +4907,35 @@ mod tests {
                 let tree = Tree::new("bound");
                 let bound = 48 * 1024;
                 let path = tree.path().join("at.rs");
-                // `n
-` lines: exactly `bound` bytes, with a known last line.
+                // Few enough lines to be inside the line bound, and long ones so
+                // the file still sits exactly on the byte bound; the last line
+                // ends in a marker the answer has to carry.
                 let mut body = String::new();
-                while body.len() + 4 <= bound {
+                for _ in 0..399 {
                     body.push_str("ab\n");
                 }
+                body.push_str("theend\n");
                 while body.len() < bound {
                     body.push('x');
                 }
-                assert_eq!(body.len(), bound, "the fixture must sit exactly on the bound");
-                let last = format!("last{}\n", "y".repeat(bound - body.len() - 6));
+                // The marker line is the file's last line, so an answer that cut
+                // the file short cannot contain it.
+                body.truncate(bound - "theend\n".len());
+                body.push_str("theend\n");
+                assert_eq!(
+                    body.len(),
+                    bound,
+                    "the fixture must sit exactly on the bound"
+                );
                 std::fs::write(&path, &body).unwrap();
                 std::fs::write(tree.path().join("over.rs"), format!("{body}z")).unwrap();
 
                 let mut guard = WholeFileGuard::default();
                 let at_bound = reply(&tree, &mut guard, 1, "sed -n '1,2p' at.rs");
                 assert!(
-                    at_bound.contains(&last.trim_end()),
-                    "a file of exactly the bound must be shown whole: {:?}",
-                    &at_bound[at_bound.len().saturating_sub(80)..]
+                    at_bound.contains("\ttheend\n"),
+                    "a file of exactly the bound must be shown whole, last line included: {:?}",
+                    &at_bound[at_bound.len().saturating_sub(120)..]
                 );
 
                 let mut guard = WholeFileGuard::default();
