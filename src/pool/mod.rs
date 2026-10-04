@@ -2076,7 +2076,9 @@ impl WorkerPool {
     /// A missing sender is reported instead of silently dropping the guidance.
     ///
     /// `revision_turns` is the fresh turn budget of a revision (`None` takes
-    /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers.
+    /// [`DEFAULT_REVISION_TURNS`]); it is ignored for live workers. A
+    /// continuation that resumes an *interrupted* run keeps that run's own
+    /// budget instead (see [`WorkerPool::continue_worker`]).
     pub async fn steer(&self, id: &str, message: String) -> Result<SteerOutcome> {
         self.steer_with_budget(id, message, None).await
     }
@@ -2098,7 +2100,8 @@ impl WorkerPool {
 
     /// [`WorkerPool::steer`] with an explicit revision budget (the MCP `steer`
     /// `max_turns` argument): a finished worker restarts its loop from this
-    /// many turns instead of [`DEFAULT_REVISION_TURNS`].
+    /// many turns instead of [`DEFAULT_REVISION_TURNS`], while an interrupted
+    /// one keeps the budget it was running under.
     ///
     /// Returns what it did, so the reply can only claim what happened: a live
     /// worker was `Queued` or `Resumed`, a stopped one was `Continuing` -- as

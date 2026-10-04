@@ -1504,8 +1504,14 @@ impl super::WorkerPool {
     /// (the [`REVISION_PREFIX`] path after a completed review, the
     /// [`CONTINUE_PREFIX`] path after anything else). Without one -- a legacy
     /// worker, or one whose log was lost -- it is continued cold: the same id
-    /// and branch, a fresh conversation that names the work the branch already
+    /// and the branch, a fresh conversation that names the work the branch already
     /// holds. Only a missing branch is an error.
+    ///
+    /// `revision_turns` is the fresh budget of a revision (`None` takes
+    /// [`DEFAULT_REVISION_TURNS`]). A continuation that resumes an *interrupted*
+    /// run -- a hub restart or handover -- instead keeps the budget that run was
+    /// under, ceiling and step counter, so it costs the worker only the turns it
+    /// had already spent; an explicit budget still wins.
     pub async fn continue_worker(
         &self,
         id: &str,

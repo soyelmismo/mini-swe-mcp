@@ -540,6 +540,9 @@ impl HubServer {
                 continue;
             }
             let message = "the hub restarted".to_string();
+            // No explicit budget: the continuation resumes the run's own
+            // ceiling and step counter, so the handover costs it nothing but
+            // the turns it had already spent.
             match pool.continue_worker(&id, message, None).await {
                 Ok(_) => {
                     // Count it before anything else can, so a worker the hub
