@@ -4683,9 +4683,27 @@ mod tests {
         /// pipeline, and anything outside the worktree keep their own output.
         mod whole_file_expansion {
             use crate::pool::runner::whole_file::{
-                WHOLE_FILE_REPEAT_TURNS, WholeFileGuard, WholeFileReply, whole_file_reply,
+                WHOLE_FILE_REPEAT_TURNS, WholeFileGuard, WholeFileReply, descriptor_is_inside,
+                whole_file_reply,
             };
+            use std::os::unix::fs::OpenOptionsExt;
             use std::path::{Path, PathBuf};
+
+            /// A unique scratch directory outside any worktree, for the file a
+            /// test must never reach.
+            fn scratch_dir(tag: &str) -> PathBuf {
+                let dir = std::env::temp_dir().join(format!(
+                    "turn-whole-file-{tag}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("create scratch dir");
+                dir
+            }
 
             /// A scratch worktree unique to this test, cleaned up on drop.
             struct Tree(PathBuf);
@@ -4958,6 +4976,102 @@ mod tests {
                     again.contains("\tline 8\n"),
                     "past the window the file is shown again: {again:?}"
                 );
+            }
+
+            /// The harness reads outside the sandbox, so a directory swapped for a
+            /// symlink after the path was resolved must not hand the model a file
+            /// from outside the worktree.
+            ///
+            /// `O_NOFOLLOW` covers only the final component, so the two steps the
+            /// real path takes are driven directly here: the name is resolved while
+            /// it is still a real directory inside the worktree, then that directory
+            /// is replaced by a symlink pointing outside, and the open which
+            /// follows lands on the outside file. Only the descriptor-level check
+            /// stands between that open and the answer.
+            #[test]
+            fn a_directory_swapped_after_resolution_is_not_read() {
+                let tree = Tree::new("swap");
+                tree.file("d/secret.rs", 3);
+                let outside = scratch_dir("outside");
+                std::fs::write(outside.join("secret.rs"), "outside line\n")
+                    .expect("write outside file");
+
+                let root = tree.path().canonicalize().expect("canonical root");
+                // Step one: resolve the name while `d` is still a real directory.
+                let resolved = tree
+                    .path()
+                    .join("d/secret.rs")
+                    .canonicalize()
+                    .expect("resolve");
+                assert!(
+                    resolved.starts_with(&root),
+                    "the test must start with a path inside the worktree: {resolved:?}"
+                );
+
+                // Step two: the intermediate directory becomes a symlink out, so
+                // the same name now resolves outside the worktree.
+                std::fs::remove_dir_all(tree.path().join("d")).expect("remove the real dir");
+                std::os::unix::fs::symlink(&outside, tree.path().join("d"))
+                    .expect("plant the symlink");
+
+                // The check the harness runs after opening is exactly this one: open
+                // the escaping name and ask whether the descriptor is inside.
+                let opened = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&resolved)
+                    .expect("the swapped path still opens");
+                let before = std::fs::symlink_metadata(&resolved).expect("identity before");
+                assert!(
+                    !descriptor_is_inside(&root, &opened, &before),
+                    "a descriptor reached through a swapped directory must never pass as inside"
+                );
+
+                // And end to end: the command names the directory and the harness
+                // resolves it through the swap, so the answer must stay the
+                // command's own output.
+                let mut guard = WholeFileGuard::default();
+                assert_eq!(
+                    whole_file_reply("sed -n '1,2p' d/secret.rs", tree.path(), &mut guard, 1),
+                    WholeFileReply::Keep,
+                    "a file reached through a swapped directory must not be shown"
+                );
+                let _ = std::fs::remove_dir_all(&outside);
+            }
+
+            /// The same check must refuse a descriptor whose file is not the one the
+            /// resolution named, which a rename-over achieves without touching the
+            /// path at all.
+            #[test]
+            fn a_file_replaced_after_resolution_is_not_read() {
+                let tree = Tree::new("replace");
+                tree.file("d/lib.rs", 3);
+                // A file outside the worktree, moved onto the resolved name:
+                // the path never changes, only what it resolves to.
+                let outside = scratch_dir("replaced").join("lib.rs");
+                std::fs::write(&outside, "outside line\n").expect("write outside file");
+
+                let root = tree.path().canonicalize().expect("canonical root");
+                let resolved = tree
+                    .path()
+                    .join("d/lib.rs")
+                    .canonicalize()
+                    .expect("resolve");
+                let before = std::fs::symlink_metadata(&resolved).expect("identity before");
+                // The name now holds a different file than the one resolved.
+                std::fs::rename(&outside, &resolved).expect("swap the file under the name");
+
+                let opened = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&resolved)
+                    .expect("the replaced path still opens");
+                assert!(
+                    !descriptor_is_inside(&root, &opened, &before),
+                    "a descriptor that is not the resolved file must be refused"
+                );
+                let _ = std::fs::remove_file(&resolved);
+                let _ = std::fs::remove_dir_all(outside.parent().expect("scratch parent"));
             }
         }
 

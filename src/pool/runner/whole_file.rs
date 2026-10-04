@@ -41,12 +41,14 @@
 //! pointing at the step that already showed the file.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use tracing::info;
+use tracing::{info, warn};
 
 /// Largest file the harness will show whole, in lines.
 ///
@@ -97,7 +99,7 @@ pub(super) fn whole_file_reply(
     let Some(resolved) = resolve_inside(&root, read.dir.as_deref(), &read.display) else {
         return WholeFileReply::Keep;
     };
-    let Some((stamp, text)) = read_small_regular_file(&resolved) else {
+    let Some((stamp, text)) = read_small_regular_file(&root, &resolved) else {
         return WholeFileReply::Keep;
     };
     let line_count = text.lines().count();
@@ -305,18 +307,47 @@ fn resolve_inside(root: &Path, dir: Option<&str>, file: &str) -> Option<PathBuf>
     canonical.starts_with(root).then_some(canonical)
 }
 
-/// Read a small regular file through a handle that cannot be a link.
+/// Read a small regular file, proving on the opened descriptor that it is the
+/// file inside the worktree that was resolved.
 ///
-/// `O_NOFOLLOW` and `O_NONBLOCK` are on the open itself, not a check that
-/// precedes it: a `symlink_metadata`/`read_to_string` pair would have a window
-/// in which a regular file is replaced by a link or a FIFO, and `O_NONBLOCK`
-/// keeps a planted FIFO from blocking in `open(2)` before any type check runs.
-fn read_small_regular_file(path: &Path) -> Option<(FileStamp, String)> {
+/// Three separate races live between resolving a path and reading it, and each
+/// is closed on the handle rather than by a check that precedes the open:
+///
+/// * **The final component.** `O_NOFOLLOW` is on the open itself; a
+///   `symlink_metadata`/`read_to_string` pair would have a window in which a
+///   regular file is replaced by a link.
+/// * **An intermediate directory.** `O_NOFOLLOW` says nothing about the
+///   components above the last, and a worker's background job can replace one
+///   with a symlink to a directory outside the worktree (`d -> ~/.ssh`) after
+///   the resolution checked it and before the open lands. This is why the
+///   opened descriptor's own path is read back from `/proc/self/fd` and must
+///   still be under the canonical root: the kernel resolves the descriptor
+///   through whatever the path is *now*, so the escape cannot hide from it.
+/// * **The file itself.** A name that resolved to one inode can be swapped for
+///   another between the two steps. The `(dev, ino)` of the descriptor is
+///   compared with the identity taken from the resolved path before the open;
+///   a rename-over keeps the bytes but changes the name, and the comparison is
+///   what makes the answer describe the file that was resolved.
+///
+/// `O_NONBLOCK` is here for the same reason as elsewhere in the harness: a FIFO
+/// planted under the name would otherwise block in `open(2)` before any type
+/// check could run.
+fn read_small_regular_file(root: &Path, path: &Path) -> Option<(FileStamp, String)> {
+    // `symlink_metadata` describes the name as resolved, without following a
+    // final link -- the identity the open must still land on.
+    let before = std::fs::symlink_metadata(path).ok()?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
+    if !descriptor_is_inside(root, &file, &before) {
+        warn!(
+            file = %path.display(),
+            "Refusing a range read: the opened descriptor is not the resolved file in the worktree"
+        );
+        return None;
+    }
     let meta = file.metadata().ok()?;
     if !meta.file_type().is_file() || meta.len() > WHOLE_FILE_MAX_BYTES {
         return None;
@@ -324,11 +355,43 @@ fn read_small_regular_file(path: &Path) -> Option<(FileStamp, String)> {
     let mut text = String::new();
     // `read_to_string` fails on invalid UTF-8, which is what keeps binary
     // content out of a whole-file answer: the model's own command would have
-    // printed something, but the harness must not guess what that was.
+    // printed something, but the harness must not guess at what that was.
     file.take(WHOLE_FILE_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .ok()?;
     Some((FileStamp::of(&meta), text))
+}
+
+/// Whether the opened `file` is inside `root` and is the very file `before`
+/// described: its own resolved path must still be under the canonical root, and
+/// its device and inode must be the ones taken before the open.
+///
+/// Every failure is a refusal. A descriptor whose path cannot be read, a path
+/// that no longer starts with the root, or an identity that does not match are
+/// all "the harness cannot prove this is inside the worktree", and a read that
+/// cannot prove that must not reach the model.
+pub(super) fn descriptor_is_inside(root: &Path, file: &File, before: &std::fs::Metadata) -> bool {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if meta.dev() != before.dev() || meta.ino() != before.ino() {
+        return false;
+    }
+    let Some(descriptor_path) = descriptor_path(file) else {
+        return false;
+    };
+    descriptor_path.starts_with(root)
+}
+
+/// The path the kernel resolved this descriptor to, read back from
+/// `/proc/self/fd`.
+///
+/// Reading the link resolves it *now*, through whatever the path currently is,
+/// so a directory swapped for a symlink after the harness resolved it shows up
+/// here as the new target. `None` when the entry cannot be read, which the
+/// caller treats as a refusal.
+fn descriptor_path(file: &File) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
 /// What a shown file looked like when the harness replaced a slice with it.
