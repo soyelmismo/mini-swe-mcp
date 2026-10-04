@@ -1058,7 +1058,7 @@ mod tests {
         // cap of zero bytes.
         let lease = lock_file(&build_dir_lock_path(&current)).unwrap();
         flock(&lease, true, true).unwrap();
-        sweep_targets(base, std::time::Duration::from_secs(24 * 3600), 0).unwrap();
+        sweep_targets(&base, std::time::Duration::from_secs(24 * 3600), 0).unwrap();
         assert!(
             !legacy.exists(),
             "A legacy slot dir must be evicted without waiting for the TTL"
@@ -1068,7 +1068,7 @@ mod tests {
             "A leased current dir must be kept"
         );
         drop(lease);
-        sweep_targets(base, std::time::Duration::ZERO, 0).unwrap();
+        sweep_targets(&base, std::time::Duration::ZERO, 0).unwrap();
         assert!(
             !current.exists(),
             "A released current dir must still follow the usual rules"
