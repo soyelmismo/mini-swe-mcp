@@ -325,10 +325,10 @@ async fn a_sensitive_diff_triggers_the_security_review_automatically() {
         "write turn, implementer completion, automatic security review"
     );
     let reviewer_request = &requests[2];
-    // The default catalog marks no `strongest:` tier, so the automatic
-    // reviewer is the dispatch default (`ninja`), never the implementer's own
-    // `test-model`. See `review_reviewer_choice_test.rs` for the rule and its
-    // strongest-tier case.
+    // The default catalog declares no security `default_model`, so the
+    // automatic reviewer is the dispatch default (`ninja`), never the
+    // implementer's own `test-model`. See `review_reviewer_choice_test.rs`
+    // for the rule and its security-default case.
     assert_eq!(
         reviewer_request["model"],
         json!("combo:ninja"),

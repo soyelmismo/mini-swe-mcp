@@ -146,13 +146,13 @@ async fn a_completed_security_review_records_the_approved_commit() {
 }
 
 // ================================================================
-// 2. Empty reviewer → implementer's model
+// 2. Empty reviewer → dispatch default
 // ================================================================
 
 /// `--review-after :<mode>` against a mode that declares no default model
-/// must run on the implementer's model, not send an empty model string.
+/// must run on the dispatch default, not send an empty model string.
 #[tokio::test]
-async fn an_empty_reviewer_runs_on_the_implementers_model() {
+async fn an_empty_reviewer_runs_on_the_dispatch_default() {
     let repo = common::TestRepo::new("approval-empty-reviewer");
     let llm = FakeLlm::spawn_sse(vec![
         common::tool_turn("call_write", "", "echo changed > src/ordinary.rs"),
@@ -180,7 +180,7 @@ async fn an_empty_reviewer_runs_on_the_implementers_model() {
     assert_eq!(
         bodies[2]["model"],
         json!("test-model"),
-        "the empty reviewer falls back to the implementer's model"
+        "the empty reviewer falls back to the dispatch default"
     );
     let _ = pool.kill(&worker_id).await;
 }
