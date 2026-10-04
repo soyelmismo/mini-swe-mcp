@@ -41,7 +41,8 @@ system prompt at dispatch time, so keep them short and actionable.
   location passed to the code under test; the scratch helpers live in
   `tests/it/common/`.
 - Do not mutate process-global state (environment variables) in tests that run
-  in parallel.
+  in parallel; the gate enforces it (the env documentation test scans `src/`
+  and `tests/` for `set_var(`/`remove_var(` and fails listing `file:line`).
 - Do not write to the real registry, hub or repository.
 - Poll for a condition instead of sleeping, and never assert something that
   cannot fail.

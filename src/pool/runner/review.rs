@@ -17,8 +17,8 @@
 //!   text can do with every new path, socket, file, environment variable and
 //!   IPC message. It is selected by the `:security` suffix of `--review-after`
 //!   (`review_after`), and it is also what the automatic sensitive-path
-//!   trigger runs -- on the mode's default reviewer when the manifest names
-//!   one, else on the manifest's strongest tier, since the model that wrote a
+//!   trigger runs -- on the mode's `default_model` when the manifest names
+//!   one, else on the dispatch default, since the model that wrote a
 //!   sensitive diff must not be the model that audits it ([`ReviewerChoice`]).
 //! * A manifest-declared mode — its `checklist` appended to the common review
 //!   frame, selected by `--review-after <model>:<mode>`.
@@ -51,17 +51,16 @@ use super::turn::{LlmErrorPolicy, ProgressWatch, TurnConfig, TurnEngine, TurnOut
 
 /// Which model runs an automatic security review.
 ///
-/// A sensitive-path diff is audited by the *strongest* reviewer the manifest
-/// declares, not by whatever model happened to implement it: the fast executor
-/// that wrote the change is the one model whose blind spots the audit exists to
-/// catch, so reusing it as the reviewer silently downgrades the pass to a
-/// self-review.
+/// A sensitive-path diff is audited by the security mode's reviewer, not by
+/// whatever model happened to implement it: the fast executor that wrote the
+/// change is the one model whose blind spots the audit exists to catch, so
+/// reusing it as the reviewer silently downgrades the pass to a self-review.
 ///
 /// The order is fixed and logged (see [`select_security_reviewer`]):
 ///
 /// 1. an explicit `--review-after <model>[:security]` -- the orchestrator's
 ///    own instruction, which always wins;
-/// 2. the manifest's `strongest:` tier, resolved to its id;
+/// 2. the security mode's `default_model`, resolved to its id;
 /// 3. the dispatch's default model, supplied by the caller as
 ///    `RunConfig::default_model`.
 ///
@@ -84,14 +83,19 @@ pub(crate) fn select_security_reviewer(
     manifest: &ModelManifest,
     default_model: &str,
 ) -> ReviewerChoice {
-    match manifest.strongest_alias() {
+    // `mode_default_reviewer` already ignores a `default_model` the catalog
+    // cannot resolve: `resolve_model` passes an unknown name through verbatim,
+    // so the review would be sent to a model id no provider serves, fail
+    // quietly, and record no findings while the worker completes -- the audit
+    // silently gone. The dispatch default audits instead.
+    match mode_default_reviewer("security", manifest) {
         Some(alias) => ReviewerChoice {
-            model: manifest.resolve_model(alias).0,
-            reason: "manifest's strongest tier",
+            model: manifest.resolve_model(&alias).0,
+            reason: "security mode's default_model",
         },
         None => ReviewerChoice {
             model: default_model.to_string(),
-            reason: "manifest declares no strongest tier; dispatch default",
+            reason: "security mode declares no usable default_model; dispatch default",
         },
     }
 }
@@ -104,17 +108,17 @@ pub(crate) fn select_security_reviewer(
 /// are identical, so a security review is not a second worker to reason about.
 ///
 /// A manifest may declare its own review modes (`review_modes:` in
-/// `models.yaml`), each with a `checklist` and an optional default `model`.
-/// Declaring a mode named `quality` or `security` overrides the built-in
-/// prompt; any other name adds a new mode selectable via
-/// `--review-after <model>:<mode>`.
+/// `models.yaml`), each with a `checklist` and an optional default
+/// `default_model`. Declaring a mode named `quality` or `security` overrides
+/// the built-in fields; any other name adds a new mode selectable via
+/// `--review-after <mode>` or `--review-after <model>:<mode>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReviewMode {
     /// The mode's name: `quality`, `security`, or a manifest-declared mode.
     pub name: String,
-    /// The checklist for a manifest-declared mode (or a built-in overridden by
-    /// the manifest). `None` for the built-in quality/security modes, which
-    /// build their own full prompt.
+    /// The mode's checklist: the built-in focus instructions for the built-in
+    /// `quality`/`security` modes, or the manifest-declared one for a custom
+    /// mode (a built-in override with its own `checklist` replaces it).
     pub checklist: Option<String>,
 }
 
@@ -134,7 +138,9 @@ impl ReviewMode {
     pub fn quality() -> Self {
         Self {
             name: Self::QUALITY_SUFFIX.to_string(),
-            checklist: None,
+            checklist: crate::manifest::ModelManifest::builtin_review_checklist(
+                Self::QUALITY_SUFFIX,
+            ),
         }
     }
 
@@ -143,7 +149,9 @@ impl ReviewMode {
     pub fn security() -> Self {
         Self {
             name: Self::SECURITY_SUFFIX.to_string(),
-            checklist: None,
+            checklist: crate::manifest::ModelManifest::builtin_review_checklist(
+                Self::SECURITY_SUFFIX,
+            ),
         }
     }
 
@@ -187,23 +195,36 @@ impl ReviewMode {
         &self.name
     }
 
-    /// Parse `--review-after <model>[:<mode>]` against the manifest's declared
-    /// modes.
+    /// Parse `--review-after` against the manifest's declared modes.
     ///
-    /// A trailing `:<mode>` names the mode when `<mode>` is available
-    /// (a built-in or a manifest-declared `review_modes:` entry); the mode's
-    /// checklist is resolved here, and an empty model part falls back to the
-    /// mode's declared default reviewer. A string with no mode suffix is the
-    /// reviewer with the default `quality` mode. A `:<suffix>` that names no
-    /// available mode is a dispatch error listing the available ones — unless
-    /// the whole string is a known model (an alias or an id), in which case it
-    /// is that model with the default mode, which is what keeps a
-    /// colon-containing model id like `combo:nerd` parsing as a model.
+    /// Three spellings are accepted:
+    ///
+    /// * `<mode>` — the mode on its own reviewer (the mode's `default_model`,
+    ///   else the dispatch default, resolved by the caller);
+    /// * `<model>:<mode>` — the mode on the named reviewer;
+    /// * `<model>` — the reviewer with the default `quality` mode, kept for
+    ///   compatibility.
+    ///
+    /// A single token that names both a mode and a model alias resolves as
+    /// the mode (the manifest validator warns about the collision). A
+    /// `:<suffix>` that names no available mode is a dispatch error listing
+    /// the available ones — unless the whole string is a known model (an
+    /// alias or an id), in which case it is that model with the default mode,
+    /// which is what keeps a colon-containing model id like `combo:nerd`
+    /// parsing as a model.
     pub fn parse_with_manifest(
         requested: &str,
         manifest: &crate::manifest::ModelManifest,
     ) -> anyhow::Result<(String, Self)> {
         let trimmed = requested.trim();
+        // A bare mode name: the reviewer is the mode's default, resolved by
+        // the caller (an empty string here means "the mode's default, else the
+        // dispatch default").
+        if manifest.is_review_mode(trimmed) {
+            let mode = Self::resolve_declared(trimmed, manifest);
+            let reviewer = mode_default_reviewer(trimmed, manifest).unwrap_or_default();
+            return Ok((reviewer, mode));
+        }
         if let Some((model, suffix)) = trimmed.rsplit_once(':')
             && !suffix.trim().is_empty()
         {
@@ -212,7 +233,7 @@ impl ReviewMode {
                 let mode = Self::resolve_declared(mode_name, manifest);
                 // An empty model part uses the mode's default reviewer; a mode
                 // without one falls back to the empty string, which the caller
-                // resolves against the implementer's model.
+                // resolves against the dispatch default.
                 let reviewer = if model.trim().is_empty() {
                     mode_default_reviewer(mode_name, manifest).unwrap_or_default()
                 } else {
@@ -225,25 +246,45 @@ impl ReviewMode {
             // meant as a mode and it does not exist.
             if !is_known_model(trimmed, manifest) {
                 anyhow::bail!(
-                    "unknown review mode \"{mode_name}\"; available modes: {}",
-                    manifest.available_review_modes().join(", ")
+                    "unknown review mode \"{mode_name}\"; available modes: {}; available models: {}",
+                    manifest.available_review_modes().join(", "),
+                    manifest.sorted_model_aliases().join(", ")
                 );
             }
         }
         Ok((trimmed.to_string(), Self::quality()))
     }
 
-    /// Resolve a declared mode name to its [`ReviewMode`], filling in the
-    /// manifest's checklist when one is declared.
+    /// Resolve a mode name to its [`ReviewMode`], filling in the manifest's
+    /// checklist when one is declared.
     ///
-    /// A manifest entry named `quality` or `security` overrides the built-in
-    /// prompt; any other declared name builds a custom mode around its
-    /// checklist.
+    /// A manifest entry named `quality` or `security` with its own `checklist`
+    /// replaces the built-in prompt; an entry that names only `default_model`
+    /// keeps the built-in checklist. Any other declared name builds a custom
+    /// mode around its checklist.
     pub fn resolve_declared(name: &str, manifest: &crate::manifest::ModelManifest) -> Self {
         if let Some(def) = manifest.review_mode(name) {
+            if let Some(checklist) = def.checklist.as_deref()
+                && !checklist.trim().is_empty()
+            {
+                return Self {
+                    name: name.to_string(),
+                    checklist: Some(checklist.to_string()),
+                };
+            }
+            if name.eq_ignore_ascii_case(Self::SECURITY_SUFFIX) {
+                let mut mode = Self::security();
+                mode.name = name.to_string();
+                return mode;
+            }
+            if name.eq_ignore_ascii_case(Self::QUALITY_SUFFIX) {
+                let mut mode = Self::quality();
+                mode.name = name.to_string();
+                return mode;
+            }
             return Self {
                 name: name.to_string(),
-                checklist: Some(def.checklist.clone()),
+                checklist: def.checklist.clone(),
             };
         }
         if name.eq_ignore_ascii_case(Self::SECURITY_SUFFIX) {
@@ -260,9 +301,21 @@ pub fn mode_default_reviewer(
 ) -> Option<String> {
     manifest
         .review_mode(name)
-        .and_then(|def| def.model.clone())
+        .and_then(|def| def.default_model.clone())
         .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
+        // A name the catalog cannot resolve is not a reviewer: `resolve_model`
+        // would pass it through verbatim, so the review would be sent to a
+        // model id no provider serves, fail quietly, and record no findings
+        // while the worker completes. Every caller falls back to its own
+        // default instead, and `ModelManifest::validate` names the typo.
+        .filter(|m| !m.is_empty() && manifest.knows_model(m))
+        // A name the catalog *does* declare is not enough either: an entry may
+        // carry an empty `id` (validate warns about it and cannot fix it), and
+        // `resolve_model` would then hand every caller an empty model string.
+        // The reviewer has to resolve to a real id, or the automatic security
+        // audit would run against no provider at all and the sensitive diff
+        // would complete unaudited.
+        .filter(|m| !manifest.resolve_model(m).0.trim().is_empty())
 }
 
 /// Whether `requested` names a model the manifest knows: an alias, or a full
@@ -299,16 +352,15 @@ pub fn review_prompt(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or(DISABLED_GATE);
-    // A manifest-declared checklist overrides the built-in prompt of the same
-    // name; any other declared mode runs the common review frame with its own
-    // focus instructions appended.
-    if let Some(checklist) = mode.checklist.as_deref() {
-        return custom_prompt(&mode.name, task, gate, checklist);
-    }
-    if mode.is_security() {
-        return security_prompt(task, gate, sensitive);
-    }
-    quality_prompt(task, gate)
+    // Every mode — built-in or manifest-declared — runs the same common
+    // review frame; only the checklist differs. A built-in override with its
+    // own `checklist` replaces the built-in one; an override with only
+    // `default_model` keeps it.
+    let checklist = mode
+        .checklist
+        .as_deref()
+        .unwrap_or(crate::manifest::QUALITY_CHECKLIST);
+    custom_prompt(&mode.name, task, gate, checklist, sensitive)
 }
 
 /// What the prompt says when the dispatch disabled the completion gate.
@@ -317,61 +369,6 @@ pub fn review_prompt(
 /// would run one the dispatch never agreed to.
 const DISABLED_GATE: &str = "(none: this dispatch disabled the completion gate)";
 
-/// The generic audit: gates, diff, real defects, gates again.
-fn quality_prompt(task: &str, gate: &str) -> String {
-    format!(
-        "AUDIT & REVIEW PHASE:\nThe previous subagent implemented the following task:\n{}\n\n\
-        YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
-        1. First run the completion gate on the checkpoint and see it pass: `{}`. Then run the tests of the files you touch.\n\
-        2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
-        3. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
-        4. Re-run the gate and the tests you touched and see them pass before completing.\n\
-        5. When verified and 100% clean, execute:\n\
-           echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
-        task, gate
-    )
-}
-
-/// The adversarial audit.
-///
-/// Every item is a question the diff has to answer, not a style preference:
-/// the three defects this mode exists to catch (a predictable socket
-/// directory with no owner check, a retirement that deleted a completed
-/// worker's branch on a report that said "fixed", a test that mirrored the
-/// bug it should catch) are all instances of one of them.
-fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
-    let mut prompt = String::from(
-        "ADVERSARIAL SECURITY REVIEW PHASE:\n\
-         The previous subagent implemented the following task:\n",
-    );
-    let _ = write!(prompt, "{task}\n\n");
-    if !sensitive.is_empty() {
-        let _ = write!(
-            prompt,
-            "This diff touches paths the repository declared sensitive: {}.\n\n",
-            sensitive.join(", ")
-        );
-    }
-    prompt.push_str(
-        "YOUR OBJECTIVE AS THE ADVERSARIAL REVIEWER:\n\
-         Assume the diff is hostile until you have proved otherwise. Work through the checklist below against the *actual* diff (`git status`, `git diff HEAD~1` or `git log -1 -p`, `git diff`), and judge it as an attacker who is already an unprivileged local user or another agent in the same harness.\n\
-         1. NEW RESOURCE: for every path, socket, file, directory, environment variable, lock and IPC message the diff creates or opens -- who else can reach it? Check ownership, permissions (0600/0700 vs world-writable), predictable names (`/tmp/<fixed>`, a pid-less, random-less path), time-of-check/time-of-use races, symlink and hardlink tricks, and a name an attacker can pre-create. A temporary path must be created exclusively with the right owner and mode, and verified, not assumed.\n\
-         2. UNTRUSTED TEXT: model-written text (a report, a summary, a question, a verdict like \"fixed\" or \"merged\") is data, never proof. Find every decision that deletes, merges, retires, routes or grants on the strength of such text and ask what a lying or stale value would do. A destructive branch needs positive evidence (a git object, an exit status, a file that really exists), not a word.\n\
-         3. CRASH AND HANDOVER: for each new operation, what is left behind if the process is killed, the daemon hands over, the worker is revised or the network drops in the middle? Look for a guard, a lock, a permit, a temp file or a job slot that is only released on the success path, and for a half-written state a later pass would trust.\n\
-         4. DELETION: what exactly does each new deletion, retirement or cleanup remove, and what positive proof gates it? A path that can delete an unmerged branch, a worktree, a report or a registry row on an absence of evidence is a defect.\n\
-         5. TEST MEANING: would each new or changed test fail if the code were wrong? A test that mirrors the implementation (asserts the same literal, the same branch, the same constant), that cannot fail, or that only asserts a happy path, is not a regression test.\n\
-         6. FIX, DO NOT LIST AWAY: fix every real defect you find, with a regression test that fails without the fix. Run the completion gate `");
-    prompt.push_str(gate);
-    prompt.push_str(
-        "` and the tests of the files you touched, and see them pass.\n\
-         7. Report honestly: in your REPORT block list every finding you did NOT fix in the `risks:` line, one line each. Fixing nothing real is a valid outcome; claiming a clean bill of health you did not check is not.\n\
-         8. Before the completion sentinel, print a line `FINDINGS: <n>` giving the total number of findings you found, fixed or listed. Print `FINDINGS: 0` when you found none; the harness shows this count in the completion event and the status.\n\
-         9. When the gate and the tests pass and every finding is either fixed or listed, execute:\n\
-            echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
-    );
-    prompt
-}
-
 /// A manifest-declared review mode: the common review frame with the mode's
 /// own focus instructions appended.
 ///
@@ -379,9 +376,24 @@ fn security_prompt(task: &str, gate: &str, sensitive: &[String]) -> String {
 /// run the dispatch's verify gate, fix real defects with a regression test,
 /// list unfixed findings in REPORT risks — and the `checklist` is what the
 /// manifest author added on top of it.
-fn custom_prompt(name: &str, task: &str, gate: &str, checklist: &str) -> String {
+fn custom_prompt(
+    name: &str,
+    task: &str,
+    gate: &str,
+    checklist: &str,
+    sensitive: &[String],
+) -> String {
+    let sensitive_note = if sensitive.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "This diff touches paths the repository declared sensitive: {}.\n\n",
+            sensitive.join(", ")
+        )
+    };
     format!(
         "REVIEW PHASE ({name}):\nThe previous subagent implemented the following task:\n{task}\n\n\
+        {sensitive_note}\
         YOUR OBJECTIVE AS THE INDEPENDENT REVIEWER:\n\
         1. First run the completion gate on the checkpoint and see it pass: `{gate}`. Then run the tests of the files you touch.\n\
         2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
@@ -554,9 +566,10 @@ pub fn approved_merged_branches(
 /// what the dispatch asked for and whether the scope has no sensitive change
 /// (`true` = no sensitive change → no automatic trigger).
 ///
-/// `strongest` is the model to audit with when the manifest marks no tier of its
-/// own; it is only consulted for the automatic sensitive-path trigger, so it is
-/// the last argument and callers that never reach it may pass any model.
+/// `automatic` is the model to audit with when the dispatch named no reviewer
+/// (the security mode's `default_model`, else the dispatch default); it is only
+/// consulted for the automatic sensitive-path trigger, so it is the last
+/// argument and callers that never reach it may pass any model.
 ///
 /// Two rules carry the security weight:
 ///
@@ -571,7 +584,7 @@ pub fn plan_review(
     skip: bool,
     requested: Option<(String, ReviewMode)>,
     sensitive_is_empty: bool,
-    strongest: &str,
+    automatic: &str,
     security_mode: &ReviewMode,
 ) -> Option<(String, ReviewMode)> {
     match (skip, requested, sensitive_is_empty) {
@@ -582,8 +595,8 @@ pub fn plan_review(
         (false, Some((model, _)), false) => Some((model, security_mode.clone())),
         (false, Some((model, wanted)), true) => Some((model, wanted)),
         // No requested review, but the diff is sensitive: trigger the security
-        // review on the manifest's strongest tier.
-        (false, None, false) => Some((strongest.to_string(), security_mode.clone())),
+        // review on the security mode's reviewer.
+        (false, None, false) => Some((automatic.to_string(), security_mode.clone())),
         (false, None, true) => None,
     }
 }
@@ -1582,13 +1595,13 @@ mod tests {
     }
 
     #[test]
-    fn the_strongest_tier_is_resolved_to_its_id() {
+    fn the_security_modes_default_model_is_resolved_to_its_id() {
         let manifest = manifest(
-            "default: ninja\nstrongest: nerd\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\n",
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: nerd\n",
         );
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:nerd");
-        assert!(choice.reason.contains("strongest"), "{}", choice.reason);
+        assert!(choice.reason.contains("default_model"), "{}", choice.reason);
     }
 
     #[test]
@@ -1596,17 +1609,117 @@ mod tests {
         let manifest = manifest("default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n");
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(choice.model, "combo:default");
-        assert!(choice.reason.contains("no strongest"), "{}", choice.reason);
+        assert!(
+            choice.reason.contains("no usable default_model"),
+            "{}",
+            choice.reason
+        );
+    }
+
+    /// A typo in the security mode's `default_model` must not disarm the
+    /// automatic audit: `resolve_model` would send the unknown name straight to
+    /// the provider, so the review would fail quietly and the sensitive diff
+    /// would complete with no adversarial pass at all.
+    #[test]
+    fn an_unknown_security_default_model_falls_back_to_the_dispatch_default() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: neerd\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(
+            choice.model, "combo:default",
+            "a default_model the catalog does not define must not reach the provider"
+        );
+        let warnings = manifest.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("neerd")),
+            "the typo must be named to the operator: {warnings:?}"
+        );
+    }
+
+    /// A `default_model` naming a catalog entry that carries no model id must
+    /// not disarm the automatic audit: `resolve_model` hands back the empty id,
+    /// so the review request would carry no model at all and the sensitive diff
+    /// would complete with no adversarial pass.
+    #[test]
+    fn a_security_default_model_that_resolves_to_no_id_falls_back() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  holed:\n    id: \"\"\nreview_modes:\n  security:\n    default_model: holed\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:default");
+        assert_eq!(
+            choice.model, "combo:default",
+            "an alias that resolves to no id must not reach the provider"
+        );
+        assert!(
+            manifest
+                .validate()
+                .iter()
+                .any(|w| w.contains("id cannot be empty")),
+            "the catalog must name the empty id: {:?}",
+            manifest.validate()
+        );
+    }
+
+    /// A `default_model` given as a full model id, not an alias, is still a
+    /// usable reviewer.
+    #[test]
+    fn a_security_default_model_named_by_id_is_used() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: combo:nerd\n",
+        );
+        let choice = select_security_reviewer(&manifest, "combo:ninja");
+        assert_eq!(choice.model, "combo:nerd");
+        assert!(
+            manifest.validate().is_empty(),
+            "an id the catalog defines must not warn: {:?}",
+            manifest.validate()
+        );
+    }
+
+    /// A built-in override spelled with a different case must still be found.
+    ///
+    /// `is_review_mode`, `builtin_review_checklist` and
+    /// `effective_review_modes` all match the built-in names
+    /// case-insensitively, so an exact-only `review_mode` lookup silently
+    /// drops the override's `default_model`: the automatic adversarial audit
+    /// would then run on the dispatch default -- possibly the implementer's
+    /// own model -- with no warning at all.
+    #[test]
+    fn a_builtin_override_declared_with_a_different_case_is_still_found() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n",
+        );
+        assert!(
+            manifest.validate().is_empty(),
+            "a differently spelled built-in override must not warn: {:?}",
+            manifest.validate()
+        );
+        let choice = select_security_reviewer(&manifest, "combo:ninja");
+        assert_eq!(
+            choice.model, "combo:nerd",
+            "the security mode's default_model must be honoured whatever case it is declared in"
+        );
+        // The same mode requested by name keeps its reviewer.
+        let (reviewer, mode) =
+            ReviewMode::parse_with_manifest("SECURITY", &manifest).expect("security mode");
+        assert_eq!(mode.name, "SECURITY");
+        assert_eq!(reviewer, "nerd");
     }
 
     #[test]
-    fn a_dangling_strongest_key_is_ignored() {
+    fn a_strongest_key_is_ignored_and_warned() {
         let manifest =
             manifest("default: ninja\nstrongest: absent\nmodels:\n  ninja:\n    id: combo:ninja\n");
         let choice = select_security_reviewer(&manifest, "combo:default");
         assert_eq!(
             choice.model, "combo:default",
-            "a `strongest:` alias the catalog does not define must fall back"
+            "a retired `strongest:` key must not pick the reviewer"
+        );
+        let warnings = manifest.validate();
+        assert!(
+            warnings.iter().any(|w| w.contains("strongest")),
+            "a `strongest:` key must warn: {warnings:?}"
         );
     }
 }

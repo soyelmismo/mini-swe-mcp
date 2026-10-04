@@ -2335,13 +2335,11 @@ mod tests {
     /// from variant A.
     #[test]
     fn extra_env_reaches_the_child() {
-        crate::agent::env::with_env_lock(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            rt.block_on(extra_env_probe());
-        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(extra_env_probe());
     }
 
     async fn extra_env_probe() {
@@ -2850,41 +2848,45 @@ mod tests {
     /// environment is invisible to the command the model runs, and the command
     /// sees the remapped, isolated `HOME` instead of the operator's.
     ///
-    /// This is the check that matters, because it exercises the real spawn
-    /// path (`env_clear` + allow-list) rather than the pure helper: a bug that
-    /// only removed the helper's redaction, or one where `env_clear` was never
-    /// called, is invisible to unit tests of `build_clean_environment` alone.
+    /// The operator's environment reaches the child the way production hands it
+    /// over -- inherited by the fresh `Command` -- and is then sanitized by the
+    /// same function `execute_bash` calls. It is applied to the child rather
+    /// than to this process, so no test writes the process environment while
+    /// both halves of the guarantee stay covered: a bug that dropped the
+    /// `env_clear` or the allow-list's redaction leaves a secret readable here,
+    /// not only in the pure helper's own unit tests.
     #[tokio::test]
     async fn a_spawned_command_cannot_read_the_operators_secrets() {
         let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
         let tmp = scratch.path().to_path_buf();
 
-        // Export a secret the way an operator's shell would.
-        // SAFETY: the test binary runs its tests single-threaded, and no other
-        // thread in this process reads this variable.
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-leaked-must-not-appear");
-            std::env::set_var("GITHUB_TOKEN", "ghp-leaked-must-not-appear");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear");
-            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
+        // The operator's environment, as a fresh `Command` inherits it in
+        // production. It is applied to the child itself rather than to this
+        // process, so no process-global state is mutated while the test still
+        // runs the whole real spawn path: `apply_sanitized_environment` is what
+        // `execute_bash` calls, and it must both clear what the child inherited
+        // and rebuild from the allow-list. Dropping either step leaves one of
+        // the names below readable in the child.
+        let inherited = [
+            ("OPENAI_API_KEY", "sk-leaked-must-not-appear"),
+            ("GITHUB_TOKEN", "ghp-leaked-must-not-appear"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+        ];
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(
+            "echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"",
+        );
+        for (name, value) in inherited {
+            cmd.env(name, value);
         }
-
-        let (out, code) = runner()
-            .execute_bash(
-                &tmp,
-                "echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"",
-            )
+        super::apply_sanitized_environment(&mut cmd, &tmp);
+        let out = cmd
+            .output()
             .await
             .expect("a spawned command must not error");
-
-        unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("SSH_AUTH_SOCK");
-        }
-
-        assert_eq!(code, Some(0), "command failed with output: {out:?}");
+        assert!(out.status.success(), "command failed with output: {out:?}");
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
         for var in [
             "OPENAI_API_KEY",
             "GITHUB_TOKEN",
@@ -2921,42 +2923,47 @@ mod tests {
     /// variables -- the cache must not be the sandboxed home -- is what makes the
     /// test meaningful on a host that has no `~/.cargo` at all.
     ///
-    // Deliberately *not* a `#[tokio::test]`: the spawn has to run while the
-    // process-environment lock is held, and that lock is a std `Mutex` which
-    // cannot be held across an `.await` (`clippy::await_holding_lock`). The test
-    // therefore drives its own current-thread runtime and blocks on it, which is
-    // the only way to make "mutate the environment, spawn, assert" atomic.
-    #[test]
-    fn a_spawned_command_sees_the_host_toolchain_cache() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build a current-thread runtime");
+    #[tokio::test]
+    async fn a_spawned_command_sees_the_host_toolchain_cache() {
         let scratch = crate::test_support::TestScratch::new("env-toolchain-test");
         let tmp = scratch.path().to_path_buf();
 
         // A host cache this test controls, so the expectation does not depend on
         // whatever layout the machine running the suite happens to have, and so
-        // the forwarding is exercised even on hosts with no `~/.cargo`.
+        // the forwarding is exercised even on hosts with no `~/.cargo`. The
+        // parent environment the sanitizer reads is an explicit map -- never
+        // the process environment -- and the probe child is spawned through the
+        // same `apply_sanitized_environment` call `execute_bash` makes, so the
+        // forwarding is proven on the real spawn path, not only in the pure
+        // helper.
         let host_cargo = tmp.join("host-cargo");
         std::fs::create_dir_all(&host_cargo).expect("create host cargo home");
-
-        // The whole spawn runs under the environment lock: the child reads
-        // `CARGO_HOME` when it is built, and a concurrent mutating test would
-        // otherwise swap the value out from under the assertion.
-        let spawned = crate::agent::env::with_env_lock(|| {
-            // SAFETY: serialized against every other test that reads or writes
-            // the process environment, including the ones in `env`.
-            unsafe { std::env::set_var("CARGO_HOME", &host_cargo) };
-            let result = runtime.block_on(
-                runner().execute_bash(&tmp, "echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\""),
-            );
-            unsafe { std::env::remove_var("CARGO_HOME") };
-            result
-        });
-        let (out, code) = spawned.expect("a spawned command must not error");
-
-        assert_eq!(code, Some(0), "command failed with output: {out:?}");
+        let host_cargo_str = host_cargo.to_string_lossy().into_owned();
+        let lookup = |name: &str| match name {
+            "CARGO_HOME" => Some(std::ffi::OsString::from(&host_cargo_str)),
+            other => std::env::var_os(other),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"");
+        // What a fresh `Command` inherits in production: a `CARGO_HOME` the
+        // sanitizer has to clear before it rebuilds the allow-list, so a decoy
+        // that survived the clear is visible in the child's output.
+        cmd.env("CARGO_HOME", tmp.join("inherited-decoy-cargo"));
+        crate::agent::env::apply_clean_environment_cmd_from(
+            &mut cmd,
+            &tmp,
+            &tmp,
+            &lookup,
+            None,
+            Some(&host_cargo),
+        );
+        let out = cmd
+            .output()
+            .await
+            .expect("a spawned command must not error");
+        assert!(out.status.success(), "command failed with output: {out:?}");
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
         assert_eq!(
             out.trim(),
             format!(
@@ -3104,17 +3111,39 @@ mod tests {
     #[test]
     fn the_landlock_opt_out_produces_no_plan() {
         let scratch = LandlockScratch::new("disabled");
-        // SAFETY: the harness runs these environment-sensitive tests in one
-        // process; nothing else in the suite reads this variable concurrently
-        // with the window below.
-        unsafe { std::env::set_var(super::super::sandbox::DISABLE_LANDLOCK_ENV, "1") };
-        let built =
-            super::super::sandbox::build_landlock_plan(&scratch.worktree, &scratch.target, false);
-        unsafe { std::env::remove_var(super::super::sandbox::DISABLE_LANDLOCK_ENV) };
+        // The opt-out is read through the same lookup production uses, here
+        // fed a synthetic map that reports the switch set, so the process
+        // environment is never mutated. The ABI is pinned to a value this
+        // kernel may or may not have, so the assertion says the *switch*
+        // suppressed the plan and not the probe.
+        let disabled = |name: &str| {
+            (name == super::super::sandbox::DISABLE_LANDLOCK_ENV).then(|| "1".to_string())
+        };
+        let built = super::super::sandbox::build_plan_with_abi(
+            &scratch.worktree,
+            &scratch.target,
+            Some(10),
+            false,
+            &disabled,
+        );
 
         assert!(
             matches!(built, Ok(None)),
             "an explicit opt-out must skip confinement entirely, got: {built:?}"
+        );
+
+        // The inverse: with the switch absent the very same ABI and roots do
+        // produce a plan, so the assertion above is the opt-out's doing.
+        let built = super::super::sandbox::build_plan_with_abi(
+            &scratch.worktree,
+            &scratch.target,
+            Some(10),
+            false,
+            &|_| None,
+        );
+        assert!(
+            matches!(built, Ok(Some(_))),
+            "the same policy without the opt-out must still confine, got: {built:?}"
         );
     }
 
