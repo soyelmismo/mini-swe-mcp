@@ -208,7 +208,10 @@ pub fn build_clean_environment_from(
     for name in ALLOWED_VARS {
         // Empty values carry no information and can only confuse tools that
         // test "is this configured?" with a truthiness check.
-        match lookup(name).map(|value| value.to_string_lossy().into_owned()) {
+        // A value the parent could not express as UTF-8 is dropped, not
+        // re-encoded: `to_string_lossy` would hand the child a name the parent
+        // never wrote, and a mangled `PATH` entry is worse than a missing one.
+        match lookup(name).and_then(|value| value.into_string().ok()) {
             // One allocation for the key, one for the value; nothing is
             // allocated for names that are unset or empty.
             Some(value) if !value.is_empty() => env.push(((*name).to_string(), value)),
@@ -612,6 +615,26 @@ mod tests {
             );
         }
         assert!(env.iter().any(|(k, _)| k == HOME_VAR), "HOME must be set");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A parent value that is not valid UTF-8 is dropped rather than
+    /// re-encoded: forwarding `U+FFFD` substitutes would hand the child a
+    /// value the parent never wrote (a mangled `PATH` entry among them).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_allowlisted_value_is_dropped_not_recoded() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = unique_dir("non-utf8");
+        let lookup = |name: &str| match name {
+            "TERM" => Some(std::ffi::OsString::from_vec(vec![0xff, 0xfe])),
+            other => std::env::var_os(other),
+        };
+        let env = build_clean_environment_from(&dir, &dir, &lookup, None, None);
+        assert!(
+            env.iter().all(|(name, _)| name != "TERM"),
+            "a non-UTF-8 allow-listed value must not reach the child, got: {env:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

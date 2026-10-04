@@ -2931,9 +2931,11 @@ mod tests {
         // A host cache this test controls, so the expectation does not depend on
         // whatever layout the machine running the suite happens to have, and so
         // the forwarding is exercised even on hosts with no `~/.cargo`. The
-        // child environment is built from an explicit map -- never from the
-        // process environment -- and the probe child is spawned with exactly
-        // that environment.
+        // parent environment the sanitizer reads is an explicit map -- never
+        // the process environment -- and the probe child is spawned through the
+        // same `apply_sanitized_environment` call `execute_bash` makes, so the
+        // forwarding is proven on the real spawn path, not only in the pure
+        // helper.
         let host_cargo = tmp.join("host-cargo");
         std::fs::create_dir_all(&host_cargo).expect("create host cargo home");
         let host_cargo_str = host_cargo.to_string_lossy().into_owned();
@@ -2941,20 +2943,21 @@ mod tests {
             "CARGO_HOME" => Some(std::ffi::OsString::from(&host_cargo_str)),
             other => std::env::var_os(other),
         };
-        let child_env = crate::agent::env::build_clean_environment_from(
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"");
+        // What a fresh `Command` inherits in production: a `CARGO_HOME` the
+        // sanitizer has to clear before it rebuilds the allow-list, so a decoy
+        // that survived the clear is visible in the child's output.
+        cmd.env("CARGO_HOME", tmp.join("inherited-decoy-cargo"));
+        crate::agent::env::apply_clean_environment_cmd_from(
+            &mut cmd,
             &tmp,
             &tmp,
             &lookup,
             None,
             Some(&host_cargo),
         );
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"")
-            .env_clear()
-            .envs(child_env)
-            .output()
-            .expect("a spawned command must not error");
+        let out = cmd.output().await.expect("a spawned command must not error");
         assert!(out.status.success(), "command failed with output: {out:?}");
         let out = String::from_utf8_lossy(&out.stdout).into_owned();
         assert_eq!(
