@@ -743,8 +743,12 @@ impl HistoryReader {
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let mut buf = String::new();
-        file.read_to_string(&mut buf)?;
-        self.offset = len;
+        // The offset follows what was *read*, not the `len` stat'd above: the
+        // writer appends between the two calls, and an offset taken from the
+        // stale length would re-parse those bytes on the next refresh and
+        // duplicate their turns.
+        let read = file.read_to_string(&mut buf)? as u64;
+        self.offset = self.offset.saturating_add(read);
         self.consume_lines(&buf);
         Ok(())
     }
