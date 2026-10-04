@@ -1173,6 +1173,7 @@ pub(crate) fn append_log(path: &Path, event: &str) {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .and_then(|mut f| f.write_all(line.as_bytes()))
     {
