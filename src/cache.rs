@@ -947,6 +947,68 @@ mod tests {
         (crate::test_support::TestScratch::own(base), repo)
     }
 
+    /// A `swe-*` entry in `dir` whose name mentions `needle`.
+    ///
+    /// Scoped to the exact name the guard under test derives, never the whole
+    /// base: this binary runs tests in parallel and siblings legitimately create
+    /// entries beside it, so a base-wide scan would be racy and unfalsifiable.
+    fn swe_entry_for(dir: &Path, needle: &str) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("swe-") && name.contains(needle))
+            })
+    }
+
+    /// Run `body` and report whether it unwound, with the default hook silenced
+    /// so a deliberate panic does not print a backtrace that looks like a
+    /// failure.
+    fn panics<F: FnOnce()>(body: F) -> bool {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
+        std::panic::set_hook(previous);
+        unwound
+    }
+
+    /// The three cap tests above lease real slots under a base they build
+    /// themselves, so that base -- and every `swe-target-<key>-<n>` in it --
+    /// belongs to the test. A sequential `remove_dir_all` at the tail of the
+    /// body is not enough: a failed assertion unwinds past it, and the whole
+    /// point of these tests is to fail. Only a `Drop` guard cleans up on that
+    /// path, so this pins it, with the slot still *held* -- the state a failing
+    /// cap assertion leaves behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_panicking_slot_cap_test_leaves_no_base_and_no_slots_behind() {
+        let (guard, repo) = slot_cap_repo("hygiene-panic");
+        let base = slot_cap_base(&repo);
+
+        let unwound = panics(|| {
+            let _lease = BuildDirLease::acquire_in(&repo, &base, 0)
+                .expect("lease a build slot under the test's own base");
+            panic!("the failing assertion this fixture exists to provoke");
+        });
+        assert!(unwound, "the fixture must unwind, or nothing was proven");
+
+        drop(guard);
+        assert_eq!(
+            swe_entry_for(&base, "swe-slot-cap-base-hygiene-panic"),
+            None,
+            "{} outlived the test that created it",
+            base.display()
+        );
+        assert!(
+            !base.exists(),
+            "{} outlived the test that created it",
+            base.display()
+        );
+    }
+
     /// A file that *looks* like `bytes` of build output without occupying them:
     /// `set_len` leaves the blocks unallocated, so the GiB cap can be exercised
     /// without writing a gigabyte.

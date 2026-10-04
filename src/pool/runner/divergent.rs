@@ -718,4 +718,104 @@ mod tests {
             "enabled() must read {DISABLE_ENV} from the process environment"
         );
     }
+/// A `swe-*` entry in `dir` whose name mentions `needle`.
+///
+/// Scoped to the exact name the guard under test derives, never the whole base:
+/// this binary runs tests in parallel and siblings legitimately create entries
+/// beside it, so a base-wide scan would be racy and unfalsifiable.
+fn swe_entry_for(dir: &Path, needle: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("swe-") && name.contains(needle))
+        })
+}
+
+/// Run `body` and report whether it unwound, with the default hook silenced so
+/// a deliberate panic does not print a backtrace that looks like a failure.
+fn panics<F: FnOnce()>(body: F) -> bool {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
+    std::panic::set_hook(previous);
+    unwound
+}
+
+/// Variant B's `HOME`/`TMPDIR` are filed as `swe-tmp-<leaf>` under the scratch
+/// base, keyed on the worktree's *leaf* name -- not inside the worktree. So
+/// removing the worktree alone leaves the private scratch behind, and a test
+/// that panics after building the environment leaves it in the operator's
+/// scratch base once per run, for as long as nobody prunes it. Only a guard that
+/// owns both removes on every path, which is what this pins: the failure this
+/// test exists to catch is precisely the path a sequential cleanup skips.
+#[test]
+fn a_panicking_environment_test_leaves_no_private_scratch_behind() {
+    let guard = crate::test_support::TestScratch::new("hygiene-divergent-panic");
+    let worktree = guard.path().to_path_buf();
+    let base = crate::worktree::swe_base_dir();
+    let leaf = worktree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the scratch has a leaf name")
+        .to_string();
+
+    let unwound = panics(|| {
+        // The production code under test, not a stand-in: the leak is in which
+        // directory *it* files the scratch, so only calling it proves the guard
+        // reclaims that directory.
+        let env = divergent_environment(&worktree, &[]);
+        let home = env
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("HOME is always set");
+        assert!(home.is_dir(), "precondition: the scratch was created");
+        panic!("the failing assertion this fixture exists to provoke");
+    });
+    assert!(unwound, "the fixture must unwind, or nothing was proven");
+
+    drop(guard);
+    assert_eq!(
+        swe_entry_for(&base, &leaf),
+        None,
+        "{} outlived the test that derived it",
+        base.display()
+    );
+}
+
+/// The same reclamation on the ordinary end of a test body, which is the path
+/// that runs most often and the one a regression would most easily keep.
+#[test]
+fn the_divergent_scratch_is_reclaimed_on_the_normal_path_too() {
+    let guard = crate::test_support::TestScratch::new("hygiene-divergent-ok");
+    let worktree = guard.path().to_path_buf();
+    let base = crate::worktree::swe_base_dir();
+    let leaf = worktree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the scratch has a leaf name")
+        .to_string();
+
+    let env = divergent_environment(&worktree, &[]);
+    let home = env
+        .iter()
+        .find(|(name, _)| name == "HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .expect("HOME is always set");
+    assert!(home.is_dir(), "precondition: the scratch was created");
+
+    drop(guard);
+    assert_eq!(
+        swe_entry_for(&base, &leaf),
+        None,
+        "{} outlived the test that derived it",
+        base.display()
+    );
+}
+
+
 }
