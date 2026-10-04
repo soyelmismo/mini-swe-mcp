@@ -1156,3 +1156,14 @@ pub async fn __test_commit_matches_snapshot(
 ) -> bool {
     self::review::commit_matches_snapshot(path, snapshot, head_commit).await
 }
+
+/// The files the pre-2.36 own-history fallback reports (test support).
+#[doc(hidden)]
+pub async fn __test_own_files_fallback(
+    path: &Path,
+    branch: &str,
+    merged: &[String],
+    base_tip: Option<&str>,
+) -> Vec<String> {
+    self::review::__test_own_files_fallback(path, branch, merged, base_tip).await
+}
