@@ -97,5 +97,3 @@ mod worker_report_test;
 mod worktree_prune_test;
 mod worktree_recreate_test;
 mod worktree_test;
-mod zz_probe2_test;
-mod zz_probe_test;
