@@ -1646,6 +1646,36 @@ mod tests {
         );
     }
 
+    /// A built-in override spelled with a different case must still be found.
+    ///
+    /// `is_review_mode`, `builtin_review_checklist` and
+    /// `effective_review_modes` all match the built-in names
+    /// case-insensitively, so an exact-only `review_mode` lookup silently
+    /// drops the override's `default_model`: the automatic adversarial audit
+    /// would then run on the dispatch default -- possibly the implementer's
+    /// own model -- with no warning at all.
+    #[test]
+    fn a_builtin_override_declared_with_a_different_case_is_still_found() {
+        let manifest = manifest(
+            "default: ninja\nmodels:\n  ninja:\n    id: combo:ninja\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n",
+        );
+        assert!(
+            manifest.validate().is_empty(),
+            "a differently spelled built-in override must not warn: {:?}",
+            manifest.validate()
+        );
+        let choice = select_security_reviewer(&manifest, "combo:ninja");
+        assert_eq!(
+            choice.model, "combo:nerd",
+            "the security mode's default_model must be honoured whatever case it is declared in"
+        );
+        // The same mode requested by name keeps its reviewer.
+        let (reviewer, mode) =
+            ReviewMode::parse_with_manifest("SECURITY", &manifest).expect("security mode");
+        assert_eq!(mode.name, "SECURITY");
+        assert_eq!(reviewer, "nerd");
+    }
+
     #[test]
     fn a_strongest_key_is_ignored_and_warned() {
         let manifest =

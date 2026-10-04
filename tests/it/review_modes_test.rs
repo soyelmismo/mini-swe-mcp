@@ -375,6 +375,71 @@ async fn a_custom_mode_uses_its_checklist_and_reviewer() {
     let _ = pool.kill(&worker_id).await;
 }
 
+/// A bare `security` runs the security mode on the mode's `default_model`,
+/// resolved to the model id the provider is called -- not on the alias
+/// verbatim, which no provider serves, and not on the implementer's model.
+#[tokio::test]
+async fn a_bare_security_mode_runs_on_its_default_model() {
+    let repo = common::TestRepo::new("bare-security");
+    let manifest: ModelManifest = serde_yaml::from_str(
+        "models:\n  test-model:\n    id: test-model\n  nerd:\n    id: combo:nerd\nreview_modes:\n  security:\n    default_model: nerd\n",
+    )
+    .expect("manifest with a security default model");
+    let server = FakeLlm::spawn_sse(vec![
+        turn("call_write", "", "echo changed > src/ordinary.rs"),
+        completion_turn("call_impl", "REPORT\ndone: impl\nrisks: none"),
+        completion_turn("call_review", "REPORT\ndone: reviewed\nrisks: none"),
+    ])
+    .await;
+
+    let scratch = common::TempDir::new_in_tmp("review-modes-bare-security");
+    let pool = WorkerPool::with_scratch(
+        1,
+        server.base_url().to_string(),
+        "test-key".to_string(),
+        ScratchRoot::new(scratch.path()),
+    )
+    .with_manifest(Arc::new(manifest));
+    let worker_id = pool
+        .dispatch(
+            TEST_OWNER.to_string(),
+            "audit me".to_string(),
+            "test-model".to_string(),
+            None,
+            repo.path().to_path_buf(),
+            5,
+            Some("review-modes".to_string()),
+            Some("security".to_string()),
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("dispatch the worker");
+    let state = common::wait_for_terminal(&pool, &worker_id).await;
+
+    let requests = server.request_bodies().await;
+    assert_eq!(requests.len(), 3, "write, implementer, security review");
+    assert_eq!(
+        requests[2]["model"],
+        json!("combo:nerd"),
+        "the bare mode runs on its default_model, resolved to its id: {:?}",
+        requests[2]["model"]
+    );
+    let prompt = common::review_prompt_of(&server)
+        .await
+        .expect("a review prompt");
+    assert!(
+        prompt.contains("Assume the diff is hostile"),
+        "the bare mode selects the adversarial prompt: {prompt}"
+    );
+
+    let WorkerState::Completed { .. } = &state else {
+        panic!("worker must complete, got {state:?}")
+    };
+    let _ = pool.kill(&worker_id).await;
+}
+
 /// An unknown mode is a dispatch error, not a worker failure.
 #[tokio::test]
 async fn an_unknown_mode_is_a_dispatch_error() {
