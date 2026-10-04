@@ -22,14 +22,14 @@
 //!
 //! # Redraw contract
 //!
-//! The interactive views render to a list of lines, and [`write_frame`] is the
-//! single place that puts them on the terminal. Raw mode clears OPOST, so a
-//! bare `\n` no longer returns the carriage and every line would start where
-//! the previous one ended; [`write_frame`] therefore joins the lines with
-//! `\r\n`. A frame is one `write_all` plus one flush, drawn without clearing
-//! the screen first: the cursor moves home, every line erases its own tail and
-//! one clear-to-end-of-screen removes the leftovers, so the redraw does not
-//! flicker. An unchanged frame is not written at all.
+//! The interactive views render to a list of lines, and the private
+//! `write_frame` is the single place that puts them on the terminal. Raw mode
+//! clears OPOST, so a bare `\n` no longer returns the carriage and every line
+//! would start where the previous one ended; `write_frame` therefore joins the
+//! lines with `\r\n`. A frame is one `write_all` plus one flush, drawn without
+//! clearing the screen first: the cursor moves home, every line erases its own
+//! tail and one clear-to-end-of-screen removes the leftovers, so the redraw
+//! does not flicker. An unchanged frame is not written at all.
 //!
 //! # Row contract
 //!
@@ -1623,8 +1623,16 @@ fn render_detail(
     // phase, then the bold command and (for the tail) the dim output lines.
     // The newest turn is at the bottom of the list, so we walk newest-last.
     let mut blocks: Vec<String> = Vec::new();
+    // `selected_turn` counts back from the newest turn the reader holds, so it
+    // names the turn at that index from the end of `reader.turns`. `turns` is a
+    // prefix of `reader.turns`, so the enumerate index below is the same index.
+    let selected_idx = reader
+        .turns
+        .len()
+        .saturating_sub(1)
+        .saturating_sub(state.selected_turn);
     for (off, turn) in turns.iter().enumerate().rev() {
-        let is_selected = off == state.selected_turn;
+        let is_selected = off == selected_idx;
         blocks.push(turn_separator(turn, width, use_color, is_selected));
         let indent = "  ";
         // The command is bold after `$ ` and the output lines are dim, but only
@@ -1643,16 +1651,12 @@ fn render_detail(
             // Fully expanded (still width-clipped): every output line.
             turn.output_lines.iter().map(|l| sanitize_text(l)).collect()
         } else {
-            // Collapsed: the newest few output lines, dim and indented.
+            // Collapsed: the newest TURN_TAIL_LINES output lines only.
+            let skip = turn.output_lines.len().saturating_sub(TURN_TAIL_LINES);
             turn.output_lines
                 .iter()
-                .rev()
-                .take(TURN_TAIL_LINES)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|l| sanitize_text(&l))
+                .skip(skip)
+                .map(|l| sanitize_text(l))
                 .collect()
         };
         for line in output_lines {
@@ -1785,7 +1789,8 @@ fn read_key() -> Option<Key> {
         // in the detail view and quits from the list, like `q`.
         return Some(Key::Char('q'));
     }
-    // `j`/`k` move in the list; elsewhere they are plain characters.
+    // `j`/`k` are the arrow keys: they move the worker selection in the list
+    // and the turn cursor in the detail view.
     parse_key(&bytes)
 }
 
@@ -3260,6 +3265,47 @@ mod tests {
         assert!(
             expanded.contains("output line 19"),
             "expanded must show newest: {expanded}"
+        );
+    }
+    /// The turn cursor starts on the newest turn: its separator carries the
+    /// `\u{25b8}` marker, the older turn's does not. The cursor counts back from
+    /// the newest turn, not from the oldest line on screen.
+    #[test]
+    fn test_turn_cursor_marks_the_newest_turn_by_default() {
+        let entry = Row::new("925633bb")
+            .status(RegistryStatus::Running)
+            .turns(15, 250)
+            .command("cargo test")
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        for step in [7usize, 8] {
+            reader.turns.push(TurnView {
+                step,
+                command: format!("cmd {step}"),
+                exit_code: Some(0),
+                output_lines: vec![format!("out {step}")],
+                duration_secs: None,
+                review: false,
+            });
+        }
+        let frame = render_detail(&entry, &reader, &UiState::default(), 1060, 80, 24);
+        let newest = frame
+            .iter()
+            .find(|l| strip_escapes(l).contains("turn 8"))
+            .unwrap_or_else(|| panic!("newest turn missing: {frame:?}"));
+        assert!(
+            strip_escapes(newest).contains('\u{25b8}'),
+            "the cursor must mark the newest turn: {newest:?}"
+        );
+        let oldest = frame
+            .iter()
+            .find(|l| strip_escapes(l).contains("turn 7"))
+            .unwrap_or_else(|| panic!("oldest turn missing: {frame:?}"));
+        assert!(
+            !strip_escapes(oldest).contains('\u{25b8}'),
+            "the cursor must not mark the oldest turn: {oldest:?}"
         );
     }
 }
