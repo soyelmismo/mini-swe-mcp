@@ -418,6 +418,71 @@ fn dirty_worktree_is_salvaged_before_prune() {
     );
 }
 
+/// A dead worker's worktree is salvaged through the same gate as every other
+/// harness commit: the cache and the oversized file its tooling left behind die
+/// with the directory, while its real edit is committed onto the branch the
+/// sweep preserves.
+#[test]
+fn salvage_leaves_cache_and_oversized_paths_out_of_the_commit() {
+    let f = Fixture::new("salvage-gate");
+    let id = unique("salvage-gate");
+    let dir = f.base.join(format!("swe-wt-{id}"));
+    let branch = format!("worker-{id}");
+    let pid_file = {
+        let mut s = dir.clone().into_os_string();
+        s.push(".pid");
+        PathBuf::from(s)
+    };
+    run(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    f.write_dead_lease(&pid_file);
+    std::fs::write(dir.join("edit.rs"), "fn kept() {}\n").unwrap();
+    std::fs::write(dir.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
+    let home = dir.join(".envcheck/home");
+    std::fs::create_dir_all(home.join(".cache/kache/store")).unwrap();
+    std::fs::write(home.join(".cache/kache/store/blob"), "cache payload\n").unwrap();
+
+    f.sweep();
+
+    assert!(!dir.exists(), "the worktree directory survived the sweep");
+    assert!(
+        branch_exists(&f.repo, &branch),
+        "salvaged branch {branch} was destroyed"
+    );
+    let committed = run(&f.repo, &["ls-tree", "-r", "--name-only", &branch]);
+    assert!(
+        committed.contains("edit.rs"),
+        "the worker's edit was not salvaged: {committed:?}"
+    );
+    assert!(
+        !committed.contains("big.bin"),
+        "an oversized file was salvaged: {committed:?}"
+    );
+    assert!(
+        !committed.contains(".envcheck"),
+        "a cache path was salvaged: {committed:?}"
+    );
+    // The worktree shared the repository's object database, so a refused file
+    // must not have left a large blob behind for a later push to trip over.
+    let objects = run(&f.repo, &["cat-file", "--batch-all-objects", "--batch-check"]);
+    assert!(
+        !objects.lines().any(|line| {
+            let size = line.split_whitespace().nth(2).unwrap_or("0");
+            size.parse::<u64>().unwrap_or(0) > 1024 * 1024
+        }),
+        "a large blob reached the object database: {objects}"
+    );
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
         .current_dir(repo)
