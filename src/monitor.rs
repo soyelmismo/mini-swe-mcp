@@ -209,6 +209,60 @@ pub fn pad_visible(s: &str, width: usize) -> String {
     out
 }
 
+/// Strip terminal escape sequences and control characters from untrusted text.
+///
+/// A worker's task, its last command, its pause question and above all its tool
+/// output are model- or repository-written text, and the monitor draws them into
+/// a raw-mode alternate-screen terminal. Rendered verbatim, an embedded
+/// `\x1b[?1049l` (leave the alternate screen), a screen clear, a cursor move or
+/// an OSC sequence could redraw, hide or replace what the operator is looking at
+/// -- the monitor would then show a state the worker chose, not the state the
+/// pool is in. The monitor's own styling is applied around the sanitized text,
+/// never by it.
+fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                // CSI: parameters and intermediates, then one final byte.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: a string terminated by BEL or by ST (ESC \\).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other two-byte escape (charset selection, and so on).
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\n' | '\t' => out.push(ch),
+            // Every other C0 control, DEL and the C1 range is invisible at best
+            // and a terminal command at worst; none of them is content.
+            c if (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // ----------
 // Row cells
 // ----------
@@ -310,18 +364,20 @@ const REVIEW_PREFIX: &str = "[review] ";
 /// under its group's header line already shows the group in the line above, so
 /// repeating it there is pure noise. The `[review] ` prefix the review engine
 /// stamps onto a command is dropped for a reviewing worker, whose glyph (`◆`)
-/// already says the same thing.
+/// already says the same thing. Every cell is passed through [`sanitize_text`],
+/// so an escape sequence in a task headline, a question or a command can never
+/// reach the rendered row.
 fn op_text(w: &WorkerRegistryEntry, show_group: bool) -> String {
-    let first_line = w.task.lines().next().unwrap_or("").trim();
+    let first_line = sanitize_text(w.task.lines().next().unwrap_or("").trim());
     let mut detail = if let Some(ref q) = w.question {
-        format!("ASK: {q}")
+        format!("ASK: {}", sanitize_text(q))
     } else if !w.last_command.is_empty()
         && w.last_command != "completed"
         && w.last_command != "initializing"
     {
-        w.last_command.clone()
+        sanitize_text(&w.last_command)
     } else {
-        first_line.to_string()
+        first_line
     };
     if w.status == RegistryStatus::Reviewing {
         detail = detail
@@ -330,7 +386,9 @@ fn op_text(w: &WorkerRegistryEntry, show_group: bool) -> String {
             .to_string();
     }
     match w.group.as_deref() {
-        Some(g) if show_group && !g.trim().is_empty() => format!("[{}] {detail}", g.trim()),
+        Some(g) if show_group && !g.trim().is_empty() => {
+            format!("[{}] {detail}", sanitize_text(g.trim()))
+        }
         _ => detail,
     }
 }
@@ -786,6 +844,14 @@ pub struct HistoryReader {
 /// Number of output lines kept per turn.
 const TURN_TAIL_LINES: usize = 5;
 
+/// Bytes the first read of a history log is bounded to.
+///
+/// The log is append-only and can already be long when the operator first
+/// opens a worker, so the first read takes only its newest tail and every
+/// later read continues from where that one stopped. A refresh stays
+/// proportional to what changed, never to the whole log.
+const FIRST_READ_BYTES: u64 = 1024 * 1024;
+
 /// Turns one PgUp/PgDn moves the detail view: a page, not a line, so a long
 /// history stays navigable without repeating the key.
 const PAGE_TURNS: usize = 10;
@@ -813,14 +879,41 @@ impl HistoryReader {
         if len <= self.offset {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = String::new();
+        // The first open of a long history reads only its newest tail; every
+        // later read starts where the previous one stopped, on a line boundary.
+        let (start, jumped) = if self.offset == 0 && self.turns.is_empty() && len > FIRST_READ_BYTES
+        {
+            (len - FIRST_READ_BYTES, true)
+        } else {
+            (self.offset, false)
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
         // The offset follows what was *read*, not the `len` stat'd above: the
         // writer appends between the two calls, and an offset taken from the
         // stale length would re-parse those bytes on the next refresh and
         // duplicate their turns.
-        let read = file.read_to_string(&mut buf)? as u64;
-        self.offset = self.offset.saturating_add(read);
+        let read = file.read_to_end(&mut bytes)? as u64;
+        self.offset = start.saturating_add(read);
+        // Bytes, not `read_to_string`: the writer appends whole lines, but a
+        // read that lands mid-append can end inside a multi-byte character, and
+        // a UTF-8 error there would stall this reader for the rest of the
+        // worker's life. A torn character becomes a replacement character and
+        // the offset still advances past it.
+        let mut buf = String::from_utf8_lossy(&bytes).into_owned();
+        if jumped {
+            // The tail begins mid-line: drop the partial line the seek landed
+            // in, so it is never parsed as a turn of its own. The newline is
+            // located in the *bytes*, because the lossy conversion above can
+            // have shifted the string's byte positions.
+            match bytes.iter().position(|b| *b == b'\n') {
+                Some(pos) => {
+                    self.offset = start + pos as u64 + 1;
+                    buf = String::from_utf8_lossy(&bytes[pos + 1..]).into_owned();
+                }
+                None => buf.clear(),
+            }
+        }
         self.consume_lines(&buf);
         Ok(())
     }
@@ -1238,13 +1331,13 @@ fn build_list_lines<'a>(
                 .first()
                 .and_then(|w| w.repo_path.as_deref())
                 .unwrap_or(DEFAULT_REPO_KEY);
-            lines.push(ListLine::Header(format!("repo: {repo}")));
+            lines.push(ListLine::Header(format!("repo: {}", sanitize_text(repo))));
         }
         let counts = group_counts(workers, false);
         let header = if counts.is_empty() {
-            name.clone()
+            sanitize_text(name)
         } else {
-            format!("{name}  {counts}")
+            format!("{}  {counts}", sanitize_text(name))
         };
         let inner = width.saturating_sub(4).max(1);
         lines.push(ListLine::Header(truncate_visible(&header, inner)));
@@ -1353,16 +1446,22 @@ fn render_detail(
     ));
     out.push('\n');
     let mut body: Vec<String> = Vec::new();
-    body.push(format!("task: {}", entry.task.lines().next().unwrap_or("")));
+    body.push(format!(
+        "task: {}",
+        sanitize_text(entry.task.lines().next().unwrap_or(""))
+    ));
     if let Some(ref q) = entry.question {
-        body.push(format!("question: {q}"));
+        body.push(format!("question: {}", sanitize_text(q)));
     }
     if let Some(ref report) = entry.report
         && !report.is_empty()
     {
         body.push(format!(
             "report: {} | files: {} | tests: {} | risks: {}",
-            report.done, report.files, report.tests, report.risks
+            sanitize_text(&report.done),
+            sanitize_text(&report.files),
+            sanitize_text(&report.tests),
+            sanitize_text(&report.risks)
         ));
     }
     let body_height = height.saturating_sub(3).max(1);
@@ -1378,9 +1477,14 @@ fn render_detail(
             .exit_code
             .map(|c| format!(" (exit {c})"))
             .unwrap_or_default();
-        turn_lines.push(format!("#{} {}{}", turn.step, turn.command, code));
+        turn_lines.push(format!(
+            "#{} {}{}",
+            turn.step,
+            sanitize_text(&turn.command),
+            code
+        ));
         for line in &turn.output_lines {
-            turn_lines.push(format!("  {line}"));
+            turn_lines.push(format!("  {}", sanitize_text(line)));
         }
     }
     if turn_lines.is_empty() {
@@ -2327,5 +2431,209 @@ mod tests {
             format!("turn {}", MAX_TURNS_IN_MEMORY + 49)
         );
         assert_eq!(reader.turns.first().unwrap().step, 51);
+    }
+    /// The sanitizer strips every terminal command and control character a
+    /// worker's text could smuggle in, keeping only real content and layout.
+    #[test]
+    fn sanitize_text_strips_escapes_and_keeps_content() {
+        assert_eq!(
+            sanitize_text("\x1b[?1049l\x1b[2J\x1b]52;c;QUJD\x07\x1b]0;pwned\x07visible"),
+            "visible",
+            "alt-screen, clear, clipboard and title escapes must all go"
+        );
+        assert_eq!(sanitize_text("\x1bBkept"), "kept", "two-byte escape");
+        assert_eq!(sanitize_text("cut\x1b[31;"), "cut", "unterminated CSI");
+        assert_eq!(sanitize_text("cut\x1b]0;no end"), "cut", "unterminated OSC");
+        assert_eq!(
+            sanitize_text("a\tb\nc"),
+            "a\tb\nc",
+            "layout characters stay"
+        );
+        assert_eq!(
+            sanitize_text("a\u{7f}b\u{9b}c\u{1}d"),
+            "abcd",
+            "DEL, C1 and C0 controls go"
+        );
+        assert_eq!(sanitize_text("caf\u{e9}"), "caf\u{e9}", "text is untouched");
+    }
+
+    /// A hostile worker cannot inject terminal escapes into the interactive
+    /// list or detail views: its task, command, question, report and output are
+    /// all sanitized before they reach the raw-mode screen.
+    #[test]
+    fn the_tui_renders_no_escapes_from_a_worker() {
+        let hostile = "\x1b[?1049l\x1b[2J\x1b]0;pwned\x07";
+        let mut entry = Row::new("hostile1")
+            .task(&format!("do it{hostile}"))
+            .command(&format!("cargo test{hostile}"))
+            .repo("local")
+            .build();
+        entry.question = Some(format!("pause?{hostile}"));
+        entry.report = Some(crate::pool::WorkerReport {
+            done: format!("changed{hostile}"),
+            files: "src/a.rs".to_string(),
+            tests: "cargo test".to_string(),
+            risks: "none".to_string(),
+        });
+
+        // The flat view: this row is rendered on its own, not under a group
+        // header, so the `[group]` tag (absent here) would be part of it.
+        let row = compact_row(&entry, 1060, 200, false, true);
+        assert!(
+            !row.contains('\x1b'),
+            "a live row carries no styling of its own, so no escape may survive: {row:?}"
+        );
+        assert!(row.contains("ASK: pause?"), "the question must show: {row}");
+
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 1,
+            command: format!("cargo test{hostile}"),
+            exit_code: Some(0),
+            output_lines: vec![format!("out{hostile}")],
+        });
+        let detail = render_detail(&entry, &reader, &UiState::default(), 1060, 120, 24);
+        assert!(
+            !detail.contains("\x1b[?1049l") && !detail.contains("]0;pwned"),
+            "no worker-chosen escape may reach the terminal: {detail:?}"
+        );
+        assert!(
+            detail.contains("out"),
+            "the output must still show: {detail}"
+        );
+
+        // The list heading shows the group and repo the worker chose, too.
+        let mut grouped = entry;
+        grouped.group = Some("round52".to_string());
+        let grouped_slice = [grouped];
+        let (lines, _) = build_list_lines(&grouped_slice, 1060, 200, true);
+        let heading = match &lines[0] {
+            ListLine::Header(h) => h.clone(),
+            ListLine::Worker(_) => String::new(),
+        };
+        assert!(
+            !heading.contains('\x1b'),
+            "no escape may survive into a list heading: {heading:?}"
+        );
+    }
+
+    /// The first read of a long history log takes only its newest tail, so the
+    /// detail view opens fast and never parses a whole huge file.
+    #[test]
+    fn the_first_read_of_a_long_history_is_bounded_to_its_newest_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "monitor-tail-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("swe-wt-big.history.jsonl");
+
+        let turn = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "bash",
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({"command": command})).expect("args")}}]})
+            .to_string()
+        };
+        let result = serde_json::json!({"role": "tool", "tool_call_id": "c1",
+            "content": format!("COMMAND OUTPUT (exit code: 0)\n{}", "x".repeat(250_000))})
+        .to_string();
+        let mut body = String::new();
+        for i in 1..=6 {
+            body.push_str(&turn(&format!("step {i}")));
+            body.push('\n');
+            body.push_str(&result);
+            body.push('\n');
+        }
+        std::fs::write(&path, &body).expect("write the long history");
+        assert!(
+            std::fs::metadata(&path).expect("stat").len() > FIRST_READ_BYTES,
+            "the test needs a log past the bound"
+        );
+
+        let mut reader = HistoryReader::default();
+        reader.read_incremental(&path).expect("read");
+        assert!(
+            reader.turns.len() < 6,
+            "the first read must not have parsed the whole file: {} turns",
+            reader.turns.len()
+        );
+        assert_eq!(
+            reader.turns.last().map(|t| t.command.as_str()),
+            Some("step 6"),
+            "the newest turn must be the one the view ends on"
+        );
+        assert_ne!(
+            reader.turns.first().map(|t| t.command.as_str()),
+            Some("step 1"),
+            "the oldest turns are the ones the bound drops"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read that lands inside a multi-byte character must not stall the
+    /// reader: the torn character becomes a replacement and the offset still
+    /// advances, so the next read continues after it.
+    #[test]
+    fn a_torn_multi_byte_character_does_not_stall_the_reader() {
+        let dir = std::env::temp_dir().join(format!(
+            "monitor-torn-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("swe-wt-torn.history.jsonl");
+
+        let turn = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "bash",
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({"command": command})).expect("args")}}]})
+            .to_string()
+        };
+        std::fs::write(&path, format!("{}\n", turn("cargo test"))).expect("seed");
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            // Cut after the first byte of the two-byte character, so the file
+            // ends inside it.
+            let prefix = "{\"role\":\"assistant\",\"content\":\"caf\u{e9}";
+            let cut = prefix.len() - 1;
+            file.write_all(&prefix.as_bytes()[..cut])
+                .expect("torn write");
+        }
+
+        let mut reader = HistoryReader::default();
+        reader
+            .read_incremental(&path)
+            .expect("a torn read must not fail");
+        assert_eq!(reader.turns.len(), 1, "only the complete turn parses");
+        let after_torn = reader.offset;
+
+        // The rest of the line arrives; the reader moves on instead of stalling.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writeln!(file, " done\"}}").expect("finish the torn line");
+            writeln!(file, "{}", turn("cargo build")).expect("next turn");
+        }
+        reader.read_incremental(&path).expect("read on");
+        assert!(reader.offset > after_torn, "the offset must advance");
+        assert_eq!(
+            reader.turns.last().map(|t| t.command.as_str()),
+            Some("cargo build"),
+            "the turn after the torn line must be parsed: {:?}",
+            reader.turns
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

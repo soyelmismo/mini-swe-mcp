@@ -7,7 +7,7 @@
 //!    because recording it would let the next revision skip the review of
 //!    code nobody audited.
 //! 2. An empty reviewer (`--review-after :<mode>` with no mode default) must
-//!    run on the implementer's model, not send an empty model string to the
+//!    run on the dispatch default, not send an empty model string to the
 //!    provider and quietly end inconclusive.
 //! 3. A requested manifest-declared mode whose phase the sensitive-path
 //!    upgrade displaced must still run as its own successive phase, not be
@@ -146,13 +146,13 @@ async fn a_completed_security_review_records_the_approved_commit() {
 }
 
 // ================================================================
-// 2. Empty reviewer → implementer's model
+// 2. Empty reviewer → dispatch default
 // ================================================================
 
 /// `--review-after :<mode>` against a mode that declares no default model
-/// must run on the implementer's model, not send an empty model string.
+/// must run on the dispatch default, not send an empty model string.
 #[tokio::test]
-async fn an_empty_reviewer_runs_on_the_implementers_model() {
+async fn an_empty_reviewer_runs_on_the_dispatch_default() {
     let repo = common::TestRepo::new("approval-empty-reviewer");
     let llm = FakeLlm::spawn_sse(vec![
         common::tool_turn("call_write", "", "echo changed > src/ordinary.rs"),
@@ -179,8 +179,8 @@ async fn an_empty_reviewer_runs_on_the_implementers_model() {
     );
     assert_eq!(
         bodies[2]["model"],
-        json!("test-model"),
-        "the empty reviewer falls back to the implementer's model"
+        json!("combo:ninja"),
+        "the empty reviewer falls back to the dispatch default"
     );
     let _ = pool.kill(&worker_id).await;
 }
@@ -196,7 +196,7 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
     let repo = common::TestRepo::new("approval-displaced");
     repo.declare_sensitive(&["src/hub/**"]);
     let manifest: ModelManifest = serde_yaml::from_str(
-        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    model: test-model\n",
+        "models:\n  test-model:\n    id: test-model\nreview_modes:\n  perf:\n    checklist: Check for N+1 queries.\n    default_model: test-model\n",
     )
     .expect("manifest with a perf mode");
     let llm = FakeLlm::spawn_sse(vec![
@@ -243,7 +243,7 @@ async fn a_requested_mode_survives_the_sensitive_upgrade() {
     assert!(
         prompts
             .iter()
-            .any(|p| p.contains("ADVERSARIAL SECURITY REVIEW PHASE")),
+            .any(|p| p.contains("Assume the diff is hostile")),
         "the sensitive diff triggers the security upgrade: {prompts:?}"
     );
     assert!(

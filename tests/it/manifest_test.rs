@@ -153,7 +153,7 @@ fn test_custom_manifest_built_in_code() {
 
     let manifest = ModelManifest {
         default: Some("solo".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -289,7 +289,7 @@ fn test_model_definition_max_turns_is_returned_by_resolve_model() {
     );
     let manifest = ModelManifest {
         default: Some("tight".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -397,7 +397,7 @@ fn test_resolve_model_alias_wins_over_id_lookup() {
     );
     let manifest = ModelManifest {
         default: Some("a".to_string()),
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,
@@ -462,7 +462,7 @@ fn test_build_tool_description_uses_role_fallback_when_missing() {
     );
     let manifest = ModelManifest {
         default: None,
-        strongest: None,
+        strongest_ignored: false,
         sensitive_paths: Vec::new(),
         review_modes: std::collections::HashMap::new(),
         models,

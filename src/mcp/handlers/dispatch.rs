@@ -237,11 +237,11 @@ impl McpServer {
         {
             anyhow::bail!("role 'consolidate' requires 'group'");
         }
-        // `--review-after <model>[:<mode>]`: the mode suffix is split off
-        // *before* the model is resolved, so an alias (`nerd:security`) still
-        // resolves to its id and the suffix survives to the phase loop, which
-        // re-parses it against the manifest. An unknown mode is a dispatch
-        // error listing the available ones.
+        // `--review-after <mode> | <model>:<mode> | <model>`: the mode
+        // is split off *before* the model is resolved, so an alias
+        // (`nerd:security`) still resolves to its id and the mode survives to
+        // the phase loop, which re-parses it against the manifest. An unknown
+        // mode is a dispatch error listing the available ones.
         let review_after = args
             .get("review_after")
             .and_then(|v| v.as_str())
@@ -249,19 +249,26 @@ impl McpServer {
                 let (model, mode) =
                     crate::pool::ReviewMode::parse_with_manifest(s, &self.manifest)?;
                 // An empty model part uses the mode's default reviewer; the
-                // phase loop resolves it against the implementer's model.
+                // phase loop resolves it against the dispatch default.
                 let resolved = if model.trim().is_empty() {
                     model
                 } else {
                     self.manifest.resolve_model(&model).0
                 };
-                if mode.is_security() && mode.checklist.is_none() {
+                // The stored string re-parses to the same mode in the phase
+                // loop: the plain built-ins keep their short form, everything
+                // else names its mode explicitly.
+                let builtin_quality = mode.name.eq_ignore_ascii_case("quality")
+                    && self.manifest.review_mode("quality").is_none();
+                let builtin_security =
+                    mode.is_security() && self.manifest.review_mode("security").is_none();
+                if builtin_quality {
+                    Ok(resolved)
+                } else if builtin_security {
                     Ok(format!(
                         "{resolved}:{}",
                         crate::pool::ReviewMode::SECURITY_SUFFIX
                     ))
-                } else if mode.name.eq_ignore_ascii_case("quality") && mode.checklist.is_none() {
-                    Ok(resolved)
                 } else {
                     Ok(format!("{resolved}:{}", mode.name))
                 }
@@ -370,8 +377,7 @@ pub(in crate::mcp) const TASKS_DESCRIPTION: &str = "Batch {task, model?, ...}; t
 pub(in crate::mcp) const REPO_PATH_DESCRIPTION: &str =
     "Repository root (alias: 'path'). Required for 'dispatch'.";
 
-pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str =
-    "Reviewer `<model>:<mode>`; see `manifest`.";
+pub(in crate::mcp) const REVIEW_AFTER_DESCRIPTION: &str = "`<mode>`/`<model>:<mode>`; manifest.";
 
 pub(in crate::mcp) const AUTO_CONSOLIDATE_DESCRIPTION: &str =
     "Auto-consolidate the group when it stops: boolean or model.";
