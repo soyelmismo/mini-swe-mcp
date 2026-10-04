@@ -693,11 +693,17 @@ mod tests {
     #[test]
     fn the_disable_switch_reads_the_environment() {
         let off = |_: &str| Some("0".to_string());
-        assert!(!enabled_from(&off), "WORKER_DIVERGENT_VERIFY=0 disables variant B");
+        assert!(
+            !enabled_from(&off),
+            "WORKER_DIVERGENT_VERIFY=0 disables variant B"
+        );
         let on = |_: &str| Some("1".to_string());
         assert!(enabled_from(&on), "any other value leaves variant B on");
         let unset = |_: &str| None;
-        assert!(enabled_from(&unset), "an unset variable leaves variant B on");
+        assert!(
+            enabled_from(&unset),
+            "an unset variable leaves variant B on"
+        );
         // The production wrapper still answers from the real environment.
         assert!(enabled() || !enabled());
     }

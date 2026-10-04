@@ -34,11 +34,11 @@
 //! contract can be unit-tested without spawning anything, and so callers can
 //! log/inspect the child environment in a debugging story.
 
+#[allow(unused_imports)]
+use super::*;
 #[cfg(test)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
 
 /// Variables copied verbatim from the parent process into the agent's shell.
 ///
@@ -238,24 +238,6 @@ pub fn build_clean_environment_from(
         }
     }
 
-/// Backwards-compatible core used by tests that only vary `HOME`/`CARGO_HOME`:
-/// the remaining parent variables come from the process environment.
-#[cfg(test)]
-fn build_clean_environment_with(
-    repo_path: &Path,
-    worktree_path: &Path,
-    host_home: Option<&Path>,
-    explicit_cargo_home: Option<&Path>,
-) -> Vec<(String, String)> {
-    build_clean_environment_from(
-        repo_path,
-        worktree_path,
-        &|name| std::env::var_os(name),
-        host_home,
-        explicit_cargo_home,
-    )
-}
-
     // HOME is remapped, never inherited: an empty value would make many tools
     // fall back to the real home (or the passwd database), defeating the point.
     let home = isolated_home(repo_path, worktree_path);
@@ -297,7 +279,13 @@ pub fn apply_clean_environment_cmd_from(
     host_home: Option<&Path>,
     explicit_cargo_home: Option<&Path>,
 ) {
-    let env = build_clean_environment_from(repo_path, worktree_path, lookup, host_home, explicit_cargo_home);
+    let env = build_clean_environment_from(
+        repo_path,
+        worktree_path,
+        lookup,
+        host_home,
+        explicit_cargo_home,
+    );
     let _ = std::fs::create_dir_all(isolated_home(repo_path, worktree_path));
     cmd.env_clear();
     for (key, value) in env {
@@ -507,7 +495,9 @@ pub fn ambient_snapshot_from(
 ) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = vars
         .into_iter()
-        .filter_map(|(name, value)| sanitize_ambient_value(&name, &value).map(|value| (name, value)))
+        .filter_map(|(name, value)| {
+            sanitize_ambient_value(&name, &value).map(|value| (name, value))
+        })
         .collect();
     pairs.sort();
     let mut total = 0usize;
@@ -525,47 +515,29 @@ pub fn ambient_snapshot_from(
     pairs
 }
 
-/// Serializes tests that mutate the process environment.
-///
-/// `std::env::set_var` is process-global, and the harness runs unit tests on
-/// parallel threads, so a test that overrides `HOME`/`CARGO_HOME` would
-/// otherwise be observed by an unrelated test running at the same instant - in
-/// this module *and* in `exec`, which spawns real children that read the same
-/// variables. Holding this lock for the whole mutating test, rather than just
-/// around the `set_var` calls, is what makes those tests atomic against their
-/// neighbours.
-///
-/// Exposed as a crate-visible test seam because sibling modules cannot reach a
-/// test-private item.
+/// Test-only core for callers that vary just `HOME`/`CARGO_HOME`: the
+/// remaining parent variables come from the process environment. Tests that
+/// vary anything else use [`build_clean_environment_from`] with a synthetic
+/// map instead, so no test mutates process-global state.
 #[cfg(test)]
-pub(crate) static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Run `body` with exclusive access to the process environment.
-///
-/// The lock is a std `Mutex`, so `body` must be synchronous: holding it across
-/// an `.await` would park a runtime thread and can deadlock a multi-threaded
-/// runtime, which is exactly what `clippy::await_holding_lock` rejects. A test
-/// that needs both an environment override and an await therefore drives the
-/// future to completion inside this closure (see the `runtime.block_on` call in
-/// `exec`).
-#[cfg(test)]
-pub(crate) fn with_env_lock<T>(body: impl FnOnce() -> T) -> T {
-    let _guard = ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    body()
+fn build_clean_environment_with(
+    repo_path: &Path,
+    worktree_path: &Path,
+    host_home: Option<&Path>,
+    explicit_cargo_home: Option<&Path>,
+) -> Vec<(String, String)> {
+    build_clean_environment_from(
+        repo_path,
+        worktree_path,
+        &|name| std::env::var_os(name),
+        host_home,
+        explicit_cargo_home,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Acquire the environment lock for the duration of a mutating test.
-    fn env_guard() -> MutexGuard<'static, ()> {
-        ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn unique_dir(tag: &str) -> PathBuf {
         let unique_id = std::time::SystemTime::now()
@@ -651,9 +623,7 @@ mod tests {
         // Secrets present in the parent map must not reach the child env.
         let lookup = |name: &str| match name {
             "OPENAI_API_KEY" => Some(std::ffi::OsString::from("sk-test-should-not-leak")),
-            "AWS_SECRET_ACCESS_KEY" => {
-                Some(std::ffi::OsString::from("aws-test-should-not-leak"))
-            }
+            "AWS_SECRET_ACCESS_KEY" => Some(std::ffi::OsString::from("aws-test-should-not-leak")),
             "GITHUB_TOKEN" => Some(std::ffi::OsString::from("gh-test-should-not-leak")),
             "SSH_AUTH_SOCK" => Some(std::ffi::OsString::from("/tmp/agent.sock")),
             other => std::env::var_os(other),

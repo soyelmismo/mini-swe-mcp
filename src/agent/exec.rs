@@ -2857,30 +2857,37 @@ mod tests {
         let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
         let tmp = scratch.path().to_path_buf();
 
-        // Export a secret the way an operator's shell would.
-        // SAFETY: the test binary runs its tests single-threaded, and no other
-        // thread in this process reads this variable.
-        unsafe {
-            std::env::set_var("OPENAI_API_KEY", "sk-leaked-must-not-appear");
-            std::env::set_var("GITHUB_TOKEN", "ghp-leaked-must-not-appear");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear");
-            std::env::set_var("SSH_AUTH_SOCK", "/tmp/agent.sock");
-        }
-
-        let (out, code) = runner()
-            .execute_bash(
-                &tmp,
-                "echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"",
-            )
-            .await
+        // A synthetic parent environment the way an operator's shell would
+        // look: secrets present, plus a couple of benign variables. The child
+        // environment is built from this map -- never from the process
+        // environment -- and the probe child is spawned with exactly that
+        // environment, so no process-global state is mutated.
+        let parent = [
+            ("OPENAI_API_KEY", "sk-leaked-must-not-appear"),
+            ("GITHUB_TOKEN", "ghp-leaked-must-not-appear"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("PATH", "/usr/bin:/bin"),
+            ("LANG", "C.UTF-8"),
+        ];
+        let lookup = |name: &str| {
+            parent
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        };
+        let child_env =
+            crate::agent::env::build_clean_environment_from(&tmp, &tmp, &lookup, None, None);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"")
+            .env_clear()
+            .envs(child_env)
+            .output()
             .expect("a spawned command must not error");
-
-        unsafe {
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("GITHUB_TOKEN");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("SSH_AUTH_SOCK");
-        }
+        assert!(out.status.success(), "command failed with output: {out:?}");
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        let code = Some(0);
 
         assert_eq!(code, Some(0), "command failed with output: {out:?}");
         for var in [
@@ -2919,40 +2926,41 @@ mod tests {
     /// variables -- the cache must not be the sandboxed home -- is what makes the
     /// test meaningful on a host that has no `~/.cargo` at all.
     ///
-    // Deliberately *not* a `#[tokio::test]`: the spawn has to run while the
-    // process-environment lock is held, and that lock is a std `Mutex` which
-    // cannot be held across an `.await` (`clippy::await_holding_lock`). The test
-    // therefore drives its own current-thread runtime and blocks on it, which is
-    // the only way to make "mutate the environment, spawn, assert" atomic.
-    #[test]
-    fn a_spawned_command_sees_the_host_toolchain_cache() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build a current-thread runtime");
+    #[tokio::test]
+    async fn a_spawned_command_sees_the_host_toolchain_cache() {
         let scratch = crate::test_support::TestScratch::new("env-toolchain-test");
         let tmp = scratch.path().to_path_buf();
 
         // A host cache this test controls, so the expectation does not depend on
         // whatever layout the machine running the suite happens to have, and so
-        // the forwarding is exercised even on hosts with no `~/.cargo`.
+        // the forwarding is exercised even on hosts with no `~/.cargo`. The
+        // child environment is built from an explicit map -- never from the
+        // process environment -- and the probe child is spawned with exactly
+        // that environment.
         let host_cargo = tmp.join("host-cargo");
         std::fs::create_dir_all(&host_cargo).expect("create host cargo home");
-
-        // The whole spawn runs under the environment lock: the child reads
-        // `CARGO_HOME` when it is built, and a concurrent mutating test would
-        // otherwise swap the value out from under the assertion.
-        let spawned = crate::agent::env::with_env_lock(|| {
-            // SAFETY: serialized against every other test that reads or writes
-            // the process environment, including the ones in `env`.
-            unsafe { std::env::set_var("CARGO_HOME", &host_cargo) };
-            let result = runtime.block_on(
-                runner().execute_bash(&tmp, "echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\""),
-            );
-            unsafe { std::env::remove_var("CARGO_HOME") };
-            result
-        });
-        let (out, code) = spawned.expect("a spawned command must not error");
+        let host_cargo_str = host_cargo.to_string_lossy().into_owned();
+        let lookup = |name: &str| match name {
+            "CARGO_HOME" => Some(std::ffi::OsString::from(&host_cargo_str)),
+            other => std::env::var_os(other),
+        };
+        let child_env = crate::agent::env::build_clean_environment_from(
+            &tmp,
+            &tmp,
+            &lookup,
+            None,
+            Some(&host_cargo),
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"")
+            .env_clear()
+            .envs(child_env)
+            .output()
+            .expect("a spawned command must not error");
+        assert!(out.status.success(), "command failed with output: {out:?}");
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        let code = Some(0);
 
         assert_eq!(code, Some(0), "command failed with output: {out:?}");
         assert_eq!(

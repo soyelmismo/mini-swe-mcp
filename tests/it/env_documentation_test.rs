@@ -342,6 +342,61 @@ fn every_env_var_read_is_documented_or_a_declared_test_hook() {
     );
 }
 
+/// No test may mutate the process environment.
+///
+/// `std::env::set_var` / `remove_var` are process-global, and the harness runs
+/// tests on parallel threads in one process, so one test's override is visible
+/// to every unrelated test running at the same instant. Code under test takes
+/// an explicit input instead (a parameter, a config struct, or an
+/// `*_from(lookup)` / `*_in(root)` variant with the env-reading wrapper
+/// delegating to it), and tests that check what a child inherits pass a
+/// constructed environment to the child (`Command::env_clear().envs(..)`) or
+/// to the function that builds it. This scan fails listing `file:line` for
+/// every call site in `src/` and `tests/`; the gate enforces it.
+#[test]
+fn no_test_mutates_the_process_environment() {
+    // Production code that must set a variable goes here with its reason;
+    // tests never do.
+    const ALLOWLIST: &[(&str, &str)] = &[];
+    let root = repo_root();
+    let mut offenders = Vec::new();
+    let mut files = Vec::new();
+    source_files(&root.join("src"), &mut files);
+    source_files(&root.join("tests"), &mut files);
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read a source file");
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if line.contains("set_var(") || line.contains("remove_var(") {
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                if ALLOWLIST.iter().any(|(file, _)| *file == relative) {
+                    continue;
+                }
+                offenders.push(format!("{}:{}", relative, index + 1));
+            }
+        }
+    }
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "these call sites mutate the process environment; give the code under          test an explicit input instead (see this test's docs): {}",
+        offenders.join(", "),
+    );
+    for (file, why) in ALLOWLIST {
+        assert!(
+            !why.trim().is_empty(),
+            "{file} is allowlisted without a reason; document why it must set the environment"
+        );
+    }
+}
+
 /// The guard is load-bearing in both directions: a name that disappears from
 /// the code must not stay in the allowlist forever, and the allowlist must not
 /// be a place to park real operator settings.

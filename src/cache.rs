@@ -326,11 +326,7 @@ pub(crate) fn repo_key(repo: &Path) -> anyhow::Result<String> {
 /// one repository can never share a dir. The explicit base keeps tests from
 /// mutating the process-global `SWE_TEMP_DIR`; production passes
 /// [`crate::worktree::swe_base_dir`].
-pub(crate) fn build_dir_in(
-    repo: &Path,
-    base: &Path,
-    index: usize,
-) -> anyhow::Result<PathBuf> {
+pub(crate) fn build_dir_in(repo: &Path, base: &Path, index: usize) -> anyhow::Result<PathBuf> {
     Ok(base.join(format!("swe-target-{}-{index}", repo_key(repo)?)))
 }
 
