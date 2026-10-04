@@ -515,9 +515,9 @@ impl BuildDirLease {
         Self::acquire_with_cap(repo, slot_max_bytes())
     }
 
-    /// [`acquire`] against an explicit scratch `base`, so tests never have to
-    /// mutate the process-global `SWE_TEMP_DIR`. [`acquire`] delegates here
-    /// unchanged.
+    /// [`Self::acquire`] against an explicit scratch `base`, so tests never have
+    /// to mutate the process-global `SWE_TEMP_DIR`. [`Self::acquire`] delegates
+    /// here unchanged.
     pub fn acquire_in(repo: &Path, base: &Path, max_bytes: u64) -> std::io::Result<Self> {
         Self::acquire_with_cap_in(repo, base, max_bytes)
     }
