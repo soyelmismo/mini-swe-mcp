@@ -520,8 +520,8 @@ impl BuildDirLease {
     /// instead of the host's shared build root under `swe_base_dir()`, which
     /// the background sweep scans; the cap is a parameter so a test can drive
     /// the behaviour without mutating the process-global environment variable
-    /// every other test in the binary shares. [`acquire`] passes the shared
-    /// base and the value parsed from [`SLOT_MAX_GIB_ENV`].
+    /// every other test in the binary shares. [`BuildDirLease::acquire`] passes
+    /// the shared base and the value parsed from `MINI_SWE_TARGET_SLOT_MAX_GIB`.
     pub fn acquire_in(base: &Path, repo: &Path, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(base)?;
         // The sweep lock keeps eviction from removing a directory between the
@@ -959,15 +959,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_idle_slot_over_the_cap_is_emptied_when_it_is_leased() {
-        with_slot_base(|_base| {
+        with_slot_base(|base| {
             let repo = slot_cap_repo("trim");
-            let first = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
+            let first = BuildDirLease::acquire_in(base, &repo, ONE_GIB).unwrap();
             let dir = first.dir().to_path_buf();
             // The worker ends: the slot is idle again, as it is between two.
             drop(first);
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
 
-            let second = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
+            let second = BuildDirLease::acquire_in(base, &repo, ONE_GIB).unwrap();
             assert_eq!(
                 second.dir(),
                 dir.as_path(),
@@ -997,15 +997,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_slot_another_worker_holds_is_never_emptied() {
-        with_slot_base(|_base| {
+        with_slot_base(|base| {
             let repo = slot_cap_repo("held");
-            let held = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
+            let held = BuildDirLease::acquire_in(base, &repo, ONE_GIB).unwrap();
             let dir = held.dir().to_path_buf();
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
             // A second worker of the repository leases the next free slot, so the
             // cap runs over the base again: a cap that ignored the lease lock would
             // strike here instead of here alone.
-            let other = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, ONE_GIB).unwrap();
+            let other = BuildDirLease::acquire_in(base, &repo, ONE_GIB).unwrap();
             assert_ne!(other.dir(), dir);
             assert!(
                 stale.exists() && held.dir().join("debug").is_dir(),
@@ -1022,14 +1022,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_zero_cap_leaves_an_over_cap_slot_alone() {
-        with_slot_base(|_base| {
+        with_slot_base(|base| {
             let repo = slot_cap_repo("off");
-            let first = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, 0).unwrap();
+            let first = BuildDirLease::acquire_in(base, &repo, 0).unwrap();
             let dir = first.dir().to_path_buf();
             drop(first);
             let stale = seed_stale_artifact(&dir, OVER_ONE_GIB);
 
-            let second = BuildDirLease::acquire_in(&crate::worktree::swe_base_dir(), &repo, 0).unwrap();
+            let second = BuildDirLease::acquire_in(base, &repo, 0).unwrap();
             assert_eq!(second.dir(), dir.as_path());
             assert!(
                 stale.exists(),
@@ -1044,6 +1044,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sweep_evicts_legacy_slot_dirs_regardless_of_ttl() {
+        // `swe_base_dir()` follows `SWE_TEMP_DIR`, which the slot-base tests
+        // redirect under this same lock: without it this test's base can be
+        // filed under (and removed with) another test's redirection.
+        let _lock = env_guard();
         let base = crate::worktree::swe_base_dir()
             .join(format!("swe-legacy-slot-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
@@ -1086,6 +1090,9 @@ mod tests {
 
     #[test]
     fn test_cache_dirs_creation() {
+        // The shared cache root follows `SWE_TEMP_DIR`, which the slot-base
+        // tests redirect under this same lock.
+        let _lock = env_guard();
         let dirs = cache_dirs();
         assert!(dirs.root.is_dir());
         assert!(dirs.uv.is_dir());
@@ -1122,6 +1129,9 @@ mod tests {
     /// directory is ever granted beside a credential file.
     #[test]
     fn test_every_ecosystem_cache_lives_under_the_shared_root() {
+        // The shared cache root follows `SWE_TEMP_DIR`, which the slot-base
+        // tests redirect under this same lock.
+        let _lock = env_guard();
         let dirs = cache_dirs();
         for cache in [
             &dirs.kache,
