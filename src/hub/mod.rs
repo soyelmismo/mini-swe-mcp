@@ -5,7 +5,10 @@
 //! newline-delimited JSON-RPC the stdio server speaks; every connection is
 //! served by [`McpServer::serve_connection`](crate::mcp::McpServer::serve_connection)
 //! against the one shared pool. [`hub_dir`] owns the socket, the lock and the
-//! log, and refuses a directory it does not exclusively own.
+//! log, and refuses a directory it does not exclusively own. The log is bounded
+//! rather than archived: past [`LOG_ROTATE_BYTES`] it is renamed to
+//! `hub.log.1` and a fresh one takes over, so the hub directory holds at most
+//! two generations (see [`rotated_log_path`]).
 //!
 //! Because the pool is shared, each connection carries an agent identity (see
 //! [`crate::mcp::ConnectionContext::agent`]): the `MINI_SWE_AGENT_ID` of its
@@ -44,6 +47,7 @@ pub use client::{
     decode_ambient_env, proxy_stdio, reconnect_deadline, reconnect_following,
 };
 pub use daemon::{
-    HubConfig, HubEndpoint, HubPaths, HubServer, WatchTokens, connect_endpoint, hub_dir,
-    hub_dir_in, run_daemon, watch_token_identity,
+    HubConfig, HubEndpoint, HubPaths, HubServer, LOG_ROTATE_BYTES, LOG_ROTATE_INTERVAL,
+    WatchTokens, connect_endpoint, hub_dir, hub_dir_in, rotated_log_path, run_daemon,
+    watch_token_identity,
 };

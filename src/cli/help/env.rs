@@ -16,7 +16,7 @@ pub(super) const TEXT: &str = concat!(
     "\n",
     "HUB_AUTO_HANDOVER=0 stops the hub from handing over to a rebuilt executable by itself; HUB_HANDOVER_SECS (default 900, clamped to 1..=86400) is how long that handover waits for a quiet moment; MINI_SWE_HUB_EXE_POLL_MS (2000) and MINI_SWE_HUB_EXE_STABLE_MS (3000) are the watch's stat interval and its settle window, which tests shorten and production leaves alone.",
     "\n",
-    "MINI_SWE_RECONNECT_SECS (default 60, clamped to 1..=86400) bounds how long a client follows a hub that goes away; MINI_SWE_TEARDOWN_WAIT_SECS (default 60) bounds the hub's shutdown wait for live workers' teardowns; HUB_IDLE_SECS makes an idle hub exit; HUB_AUTO_RESUME=0 leaves interrupted workers interrupted after a restart; SWE_HUB_DIR overrides the hub's socket directory.",
+    "MINI_SWE_RECONNECT_SECS (default 60, clamped to 1..=86400) bounds how long a client follows a hub that goes away; MINI_SWE_TEARDOWN_WAIT_SECS (default 60) bounds the hub's shutdown wait for live workers' teardowns; HUB_IDLE_SECS makes an idle hub exit; HUB_AUTO_RESUME=0 leaves interrupted workers interrupted after a restart; SWE_HUB_DIR overrides the hub's socket directory. That directory's hub.log is capped at 8 MiB: past it the log becomes hub.log.1 (replacing the generation before) and a fresh hub.log takes over, so at most two generations are kept.",
     "\n",
     "HUB_HEAVY_IONICE picks the I/O class of a heavy command: unset (or anything else) demotes it to the bottom of the best-effort class, 0 disables the demotion, and idle (or 3) moves it to the idle class.",
     "\n",
