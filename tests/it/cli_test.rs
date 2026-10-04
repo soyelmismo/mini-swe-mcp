@@ -164,10 +164,16 @@ fn test_cli_help_workflow_topic_is_the_round_workflow() {
 /// the same topic index and topic text the CLI prints, over the tool call.
 #[test]
 fn test_mcp_help_action_returns_the_index_and_a_topic() {
-    let server = mini_swe_mcp::mcp::McpServer::new(
-        mini_swe_mcp::pool::WorkerPool::new(1, "http://localhost:1".to_string(), "k".to_string()),
-        "ninja".to_string(),
+    // The pool files its rows under a temporary scratch root, so this test
+    // never writes into the real one.
+    let root = common::TempDir::new_in_tmp("cli-help");
+    let pool = mini_swe_mcp::pool::WorkerPool::with_scratch(
+        1,
+        "http://localhost:1".to_string(),
+        "k".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(root.path()),
     );
+    let server = mini_swe_mcp::mcp::McpServer::new(pool, "ninja".to_string());
     let index = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a runtime")

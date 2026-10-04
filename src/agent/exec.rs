@@ -2999,6 +2999,9 @@ mod tests {
 
     /// Scratch worktree + target pair, removed on drop.
     struct LandlockScratch {
+        /// The unique directory this fixture created, and the scratch root its
+        /// derived companions belong to.
+        base: PathBuf,
         worktree: PathBuf,
         target: PathBuf,
     }
@@ -3017,15 +3020,29 @@ mod tests {
             let target = base.join("target");
             std::fs::create_dir_all(&worktree).expect("create worktree");
             std::fs::create_dir_all(&target).expect("create target dir");
-            Self { worktree, target }
+            Self {
+                base,
+                worktree,
+                target,
+            }
         }
     }
 
     impl Drop for LandlockScratch {
         fn drop(&mut self) {
-            if let Some(base) = self.worktree.parent() {
-                let _ = std::fs::remove_dir_all(base);
-            }
+            // A step run against either root makes the runner derive its private
+            // `swe-tmp-<leaf>` scratch next to the scratch *base*, so removing
+            // the base alone would leave a companion behind.
+            //
+            // Both leaves are the fixed names `worktree` and `target`, so the
+            // reclamation is scoped to the base this fixture created. Resolving
+            // them against the shared scratch base instead would delete a fixed,
+            // predictable `swe-tmp-worktree` / `swe-tmp-target` that a sibling
+            // agent's private scratch can occupy.
+            let root = crate::worktree::ScratchRoot::new(&self.base);
+            crate::worktree::remove_target_dirs_in(&root, &self.worktree);
+            crate::worktree::remove_target_dirs_in(&root, &self.target);
+            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
