@@ -205,3 +205,72 @@ async fn a_second_watch_call_is_covered_or_widens_the_running_one() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `consolidate: false` is the absence of a round, not a round: a dispatch that
+/// spells it out still answers with its group and its token-bound watch, so the
+/// `--quiet` reminder keeps following this caller's own workers instead of being
+/// rewritten into a round wait that will never be satisfied.
+#[tokio::test]
+async fn a_declined_consolidate_round_does_not_rewrite_the_watch_command() {
+    let base = scratch("declined-consolidate");
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).expect("create the scratch repository");
+    crate::worktree::git(&repo, "init", &["-b", "master"]).expect("init the scratch repository");
+    crate::worktree::git(&repo, "config", &["user.name", "mini-swe-test"]).expect("config");
+    crate::worktree::git(&repo, "config", &["user.email", "test@localhost"]).expect("config");
+    std::fs::write(repo.join("README.md"), "# scratch\n").expect("seed the repository");
+    crate::worktree::git(&repo, "add", &["README.md"]).expect("stage the seed");
+    crate::worktree::git(&repo, "commit", &["-m", "baseline"]).expect("commit the seed");
+
+    let server = McpServer::new(
+        WorkerPool::with_scratch(
+            4,
+            "http://localhost:1".to_string(),
+            "test-key".to_string(),
+            ScratchRoot::new(&base),
+        ),
+        "ninja".to_string(),
+    );
+    let tokens_dir = base.join("watch-tokens");
+    std::fs::create_dir_all(&tokens_dir).expect("create the token directory");
+    let mut ctx = ConnectionContext::hub_connection(1)
+        .with_watch_tokens(Arc::new(WatchTokens::new(tokens_dir)));
+    ctx.agent_id = Some("orchestrator".to_string());
+
+    let answer = server
+        .execute_tool_for(
+            "worker",
+            json!({
+                "action": "dispatch",
+                "task": "probe",
+                "repo_path": repo.to_string_lossy(),
+                "group": "round-48",
+                "consolidate": false,
+            }),
+            &ctx,
+        )
+        .await
+        .expect("a dispatch with no round requested must answer");
+    let wid = answer["worker_id"]
+        .as_str()
+        .expect("a dispatched worker")
+        .to_string();
+
+    assert_eq!(
+        answer["group"], json!("round-48"),
+        "the answer still names the group: {answer}"
+    );
+    assert!(
+        answer.get("consolidate").is_none(),
+        "no round was requested, so no answer claims one: {answer}"
+    );
+    assert_eq!(
+        crate::cli::format::format_dispatch_quiet(&answer).watch_command,
+        answer["watch_command"].as_str().expect("the hub minted a token-bound command"),
+        "a declined round keeps the command that follows this caller's workers: {answer}"
+    );
+
+    server.pool.kill(&wid).await;
+    crate::pool::remove_registry_entry_in(&ScratchRoot::new(&base), &wid);
+    let _ = std::fs::remove_dir_all(&base);
+}

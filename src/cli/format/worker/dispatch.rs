@@ -176,10 +176,15 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
 /// else's workers and never see this round. A non-consolidated dispatch keeps
 /// today's command: the token-bound one when the hub minted it, the plain
 /// `mini-swe-mcp watch` otherwise, which follows every worker the caller owns.
+///
+/// The test for "asks for consolidation" is the one the handler used, not "the
+/// key is present": `consolidate: false` is a no-op everywhere else, and reading
+/// it as a request would drop the token that binds the watch to this caller for
+/// a round that will never have a consolidator to wait for.
 fn quiet_watch_command(val: &serde_json::Value) -> String {
     let group = val.get("group").and_then(|v| v.as_str());
     if let Some(group) = group
-        && val.get("consolidate").is_some_and(|value| !value.is_null())
+        && crate::mcp::auto_consolidate::consolidate_requested(val)
     {
         let round = format!("mini-swe-mcp watch --group {} --all", shell_word(group));
         return match watch_token(val) {
@@ -321,6 +326,18 @@ mod tests {
         assert_eq!(
             tokenless.watch_command, "mini-swe-mcp watch --group round-48 --all",
             "{tokenless:?}"
+        );
+
+        // `consolidate: false` asks for no round, so it must not cost the
+        // caller the token-bound command: the hub mints the flag as a no-op and
+        // reading the key's mere presence as a request would drop the token that
+        // binds the watch to this identity.
+        let declined = format_dispatch_quiet(&v(
+            r#"{"worker_id":"w1","group":"round-48","consolidate":false,"watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert_eq!(
+            declined.watch_command, "MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch",
+            "{declined:?}"
         );
 
         // Nothing started: no watch command, so no reminder is printed.
