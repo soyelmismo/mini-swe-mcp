@@ -11,6 +11,10 @@
 //! (TIOCGWINSZ, else `COLUMNS`, else [`DEFAULT_TERMINAL_WIDTH`]); the renderer
 //! clips every line as a final safety net, whatever the content.
 //!
+//! The plain non-TTY output has no window to query, so its width comes from
+//! [`plain_width`]: `MONITOR_WIDTH`, else `COLUMNS` (which a shell exports for
+//! a redirected command too), else [`DEFAULT_TERMINAL_WIDTH`].
+//!
 //! All measurement runs on the visible (ANSI-stripped) text, never on escape
 //! sequences, so colour never shifts a column. Colour is applied only when the
 //! output is a TTY and `NO_COLOR` is unset; the plain non-TTY output uses the
@@ -25,14 +29,21 @@
 //! task headline when idle) takes whatever width the fixed columns leave and is
 //! truncated with `…`.
 //!
+//! The op is the protected column: it keeps at least 24 visible characters,
+//! and a column is dropped rather than let the op fall below that. What the
+//! glyph already shows is never repeated in the op, so a narrow row spends its
+//! columns on the work rather than on its label.
+//!
 //! # Grouping contract
 //!
 //! Rows are grouped by round/group (`WorkerRegistryEntry::group`), each group
-//! headed by one line with its per-status counts. There is no PID column here
-//! (the PID lives in the detail view), and a repository line is shown only when
-//! more than one repository is present.
+//! headed by one line with its per-status counts. A row under its header
+//! therefore carries no `[group]` tag of its own; only the flat view, which has
+//! no header above it, does. There is no PID column here (the PID lives in the
+//! detail view), and a repository line is shown only when more than one
+//! repository is present.
 
-use crate::config::env_parse;
+use crate::config::env_parse_from;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -109,8 +120,10 @@ const PROGRESS_CELLS: usize = 8;
 const BAR_WIDTH: usize = PROGRESS_CELLS + 2;
 /// Terminals at or above this width get a progress bar before `step/max`.
 const PROGRESS_THRESHOLD: usize = 100;
-/// Narrowest op column that still shows a command prefix plus its ellipsis.
-const MIN_OP_WIDTH: usize = 12;
+/// Columns the op keeps before the dropping logic starts removing columns
+/// around it: enough for a real command prefix at any usable width. A shorter
+/// op simply renders whole, so this is a floor, never a truncation target.
+const MIN_OP_WIDTH: usize = 24;
 
 // ----------
 // Text measurement helpers (width-aware, never byte-based)
@@ -341,11 +354,22 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// Prefix the review engine stamps onto a reviewing worker's command.
+const REVIEW_PREFIX: &str = "[review] ";
+
 /// The op cell: the question when the worker asks, else the last command, else
-/// the task headline. The group tag is demoted to a `[group]` prefix here.
-fn op_text(w: &WorkerRegistryEntry) -> String {
+/// the task headline.
+///
+/// The `[group]` tag is only added for a flat (ungrouped) row: a row printed
+/// under its group's header line already shows the group in the line above, so
+/// repeating it there is pure noise. The `[review] ` prefix the review engine
+/// stamps onto a command is dropped for a reviewing worker, whose glyph (`◆`)
+/// already says the same thing. Every cell is passed through [`sanitize_text`],
+/// so an escape sequence in a task headline, a question or a command can never
+/// reach the rendered row.
+fn op_text(w: &WorkerRegistryEntry, show_group: bool) -> String {
     let first_line = sanitize_text(w.task.lines().next().unwrap_or("").trim());
-    let detail = if let Some(ref q) = w.question {
+    let mut detail = if let Some(ref q) = w.question {
         format!("ASK: {}", sanitize_text(q))
     } else if !w.last_command.is_empty()
         && w.last_command != "completed"
@@ -355,8 +379,16 @@ fn op_text(w: &WorkerRegistryEntry) -> String {
     } else {
         first_line
     };
+    if w.status == RegistryStatus::Reviewing {
+        detail = detail
+            .strip_prefix(REVIEW_PREFIX)
+            .unwrap_or(&detail)
+            .to_string();
+    }
     match w.group.as_deref() {
-        Some(g) if !g.trim().is_empty() => format!("[{}] {detail}", sanitize_text(g.trim())),
+        Some(g) if show_group && !g.trim().is_empty() => {
+            format!("[{}] {detail}", sanitize_text(g.trim()))
+        }
         _ => detail,
     }
 }
@@ -368,7 +400,16 @@ fn op_text(w: &WorkerRegistryEntry) -> String {
 /// the glyph, the id and the op always stay. A progress bar precedes `step/max`
 /// only at [`PROGRESS_THRESHOLD`]+ columns. The op takes whatever the fixed
 /// columns leave and is truncated with `…`, so the row never overflows `inner`.
-fn compact_row(w: &WorkerRegistryEntry, now: u64, inner: usize, use_color: bool) -> String {
+///
+/// `show_group` prints the `[group]` tag in the op; callers pass `false` for a
+/// row printed under its own group header, which already names the group.
+fn compact_row(
+    w: &WorkerRegistryEntry,
+    now: u64,
+    inner: usize,
+    use_color: bool,
+    show_group: bool,
+) -> String {
     let glyph = status_glyph(w.status);
     let id = truncate_visible(&w.id, ID_WIDTH);
     let model = model_alias(&w.model);
@@ -379,7 +420,7 @@ fn compact_row(w: &WorkerRegistryEntry, now: u64, inner: usize, use_color: bool)
         now.saturating_sub(w.started_at)
     };
     let elapsed = format_elapsed(duration_secs);
-    let detail = op_text(w);
+    let detail = op_text(w, show_group);
 
     let show_bar = inner + 4 >= PROGRESS_THRESHOLD;
     let base = 1 + 1 + ID_WIDTH + 1;
@@ -634,7 +675,7 @@ fn list_content_lines(
         };
         lines.push(truncate_visible(&header, inner));
         for w in workers {
-            lines.push(compact_row(w, now, inner, use_color));
+            lines.push(compact_row(w, now, inner, use_color, false));
         }
     }
     lines
@@ -688,10 +729,40 @@ pub fn use_color_for_tty(is_tty: bool) -> bool {
 
 /// Best-effort terminal width in columns.
 pub fn terminal_width() -> Option<usize> {
-    if let Some(parsed) = env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0) {
+    if let Some(parsed) = monitor_width_override() {
         return Some(parsed);
     }
     terminal_size_via_tty()
+}
+
+/// Width for the plain (non-TTY) rendering.
+///
+/// A pipe has no window to ask, so the ioctl path is skipped entirely: the
+/// explicit `MONITOR_WIDTH` override wins, then `COLUMNS` (which a shell
+/// exports for a redirected command just as it does for an interactive one),
+/// then [`DEFAULT_TERMINAL_WIDTH`]. Without this, a `mini-swe monitor | less`
+/// always rendered 80 columns wide no matter what the user had set.
+pub fn plain_width() -> usize {
+    plain_width_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`plain_width`], parameterized over the environment lookup so
+/// the precedence rules can be tested without mutating process state.
+fn plain_width_from(lookup: &dyn Fn(&str) -> Option<String>) -> usize {
+    monitor_width_override_from(lookup)
+        .or_else(|| columns_env_from(lookup))
+        .unwrap_or(DEFAULT_TERMINAL_WIDTH)
+}
+
+/// The `MONITOR_WIDTH` override, ignored when unset, unparsable or zero.
+fn monitor_width_override() -> Option<usize> {
+    monitor_width_override_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`monitor_width_override`], parameterized over the environment
+/// lookup so it is testable without mutating process state.
+fn monitor_width_override_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<usize> {
+    env_parse_from::<usize>("MONITOR_WIDTH", lookup).filter(|&w| w > 0)
 }
 
 /// Terminal width from `/dev/tty` (or `COLUMNS`), if it can be read.
@@ -723,7 +794,12 @@ fn terminal_size_via_tty() -> Option<usize> {
 
 /// `COLUMNS` fallback shared by both platforms.
 fn columns_env() -> Option<usize> {
-    env_parse::<usize>("COLUMNS").filter(|c| *c > 0)
+    columns_env_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure core of [`columns_env`], parameterized over the environment lookup.
+fn columns_env_from(lookup: &dyn Fn(&str) -> Option<String>) -> Option<usize> {
+    env_parse_from::<usize>("COLUMNS", lookup).filter(|c| *c > 0)
 }
 
 // ----------
@@ -1139,9 +1215,10 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// Layout: `glyph id model step/max elapsed op`, columns dropping in the
 /// stated order as the terminal narrows. Delegates to the shared `compact_row`
 /// helper so the interactive list and the plain dashboard share one layout;
-/// plain (no ANSI codes) like the non-TTY output.
+/// plain (no ANSI codes) like the non-TTY output. This is the flat view: it
+/// keeps the `[group]` tag, since no group header precedes it.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    compact_row(w, now, width.saturating_sub(4).max(1), false)
+    compact_row(w, now, width.saturating_sub(4).max(1), false, true)
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
@@ -1328,7 +1405,7 @@ fn render_list(
         match line {
             ListLine::Header(h) => out.push_str(&box_line(h, width)),
             ListLine::Worker(w) => {
-                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color);
+                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color, false);
                 if Some(w.id.as_str()) == selected_id {
                     out.push_str(&box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
                 } else {
@@ -1626,12 +1703,15 @@ pub async fn run_monitor(once: bool) -> Result<()> {
     if once || !is_tty {
         let entries = load_all_registry_entries();
         let now = unix_timestamp();
-        let output = render_dashboard_with_width(
-            &entries,
-            now,
-            use_color_for_tty(is_tty),
-            terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH),
-        );
+        // A pipe has no window to query, so its width comes from `COLUMNS` (or
+        // `MONITOR_WIDTH`), never from an ioctl. A one-shot run on a real
+        // terminal still has a window, so it keeps the ioctl path.
+        let width = if is_tty {
+            terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH)
+        } else {
+            plain_width()
+        };
+        let output = render_dashboard_with_width(&entries, now, use_color_for_tty(is_tty), width);
         println!("{output}");
         return Ok(());
     }
@@ -1869,34 +1949,121 @@ mod tests {
         assert!(wide.contains("01m"), "elapsed missing at 120:\n{wide}");
 
         let mid = render_dashboard_with_width(&entries, 1060, false, 60);
-        // At 60 every column still fits.
+        // At 60 every column still fits beside the protected op.
         assert!(mid.contains("15/250"), "step/max missing at 60:\n{mid}");
         assert!(mid.contains("ninja"), "model alias missing at 60:\n{mid}");
         assert!(mid.contains("01m"), "elapsed missing at 60:\n{mid}");
 
+        // Elapsed drops first: at 54 the model alias still fits, the clock does not.
+        let no_elapsed = render_dashboard_with_width(&entries, 1060, false, 54);
+        assert!(
+            no_elapsed.contains("ninja"),
+            "model alias should stay at 54:\n{no_elapsed}"
+        );
+        assert!(
+            !no_elapsed.contains("01m"),
+            "elapsed should be dropped at 54:\n{no_elapsed}"
+        );
+
+        // Then the model: at 50 step/max still fits, the alias does not.
+        let no_model = render_dashboard_with_width(&entries, 1060, false, 50);
+        assert!(
+            no_model.contains("15/250"),
+            "step/max should stay at 50:\n{no_model}"
+        );
+        assert!(
+            !no_model.contains("ninja"),
+            "model should be dropped at 50:\n{no_model}"
+        );
+        assert!(
+            !no_model.contains("01m"),
+            "elapsed should be dropped at 50:\n{no_model}"
+        );
+
         let narrow = render_dashboard_with_width(&entries, 1060, false, 40);
-        // Elapsed then model drop first; step/max still fits; id + op stay.
+        // Narrower still: step/max drops too; id + op stay.
         assert!(narrow.contains("925633bb"), "id lost at 40:\n{narrow}");
         assert!(narrow.contains("CONSOLI"), "op lost at 40:\n{narrow}");
         assert!(
-            narrow.contains("15/250"),
-            "step/max should stay at 40:\n{narrow}"
+            !narrow.contains("15/250"),
+            "step/max should be dropped at 40:\n{narrow}"
         );
         assert!(
             !narrow.contains("ninja"),
             "model should be dropped at 40:\n{narrow}"
         );
-        assert!(
-            !narrow.contains("01m"),
-            "elapsed should be dropped at 40:\n{narrow}"
-        );
 
         let tiny = render_dashboard_with_width(&entries, 1060, false, 25);
-        // Narrowest: step/max drops too; glyph + id + op always stay.
+        // Narrowest: glyph + id + op always stay.
         assert!(tiny.contains("925633bb"), "id lost at 25:\n{tiny}");
         assert!(
             !tiny.contains("15/250"),
             "step/max should be dropped at 25:\n{tiny}"
+        );
+    }
+
+    /// The op is the protected column: at 50 columns it keeps at least
+    /// [`MIN_OP_WIDTH`] visible characters, so the narrow layout spends its
+    /// columns on what the worker is doing rather than on the label around it.
+    #[test]
+    fn test_op_keeps_its_minimum_width_at_50_columns() {
+        let reviewing = Row::new("925633bb")
+            .status(RegistryStatus::Reviewing)
+            .turns(38, 120)
+            .command("[review] ls -d target 2>/dev/null")
+            .task("Review the diff")
+            .group("round52")
+            .build();
+        let text = render_dashboard_with_width(&[reviewing], 1060, false, 50);
+        let row = text
+            .lines()
+            .find(|l| l.contains("925633bb"))
+            .unwrap_or_else(|| panic!("no row for the worker:\n{text}"));
+        assert!(visible_width(row) <= 50, "row overflows 50: {row:?}");
+        // The group tag and the redundant review prefix are gone; what is left
+        // is the glyph, the id, step/max and a full-width op.
+        assert!(!row.contains("round52"), "group tag kept: {row:?}");
+        assert!(!row.contains("[review]"), "review prefix kept: {row:?}");
+        assert!(row.contains("38/120"), "step/max missing: {row:?}");
+        assert!(
+            row.contains("ls -d target 2>/dev/null"),
+            "op should fit whole at 50 cols: {row:?}"
+        );
+    }
+
+    /// A row that sits under its group's header line carries no `[group]` tag:
+    /// the header above already names the group, so the tag is a repeated
+    /// column that only narrows the op.
+    #[test]
+    fn test_grouped_rows_carry_no_group_tag() {
+        let entries = sample_entries();
+        let text = render_dashboard_with_width(&entries, 1060, false, 80);
+        let mut seen_groups = 0;
+        for line in text.lines() {
+            if line.contains("925633bb") {
+                assert!(
+                    !line.contains("round52"),
+                    "grouped row repeats its group tag: {line:?}"
+                );
+            }
+            if line.contains("ccbc2be1") {
+                assert!(
+                    !line.contains("round50"),
+                    "grouped row repeats its group tag: {line:?}"
+                );
+            }
+            // The headers themselves still name the group.
+            if line.contains("round52") || line.contains("round50") {
+                seen_groups += 1;
+            }
+        }
+        assert_eq!(seen_groups, 2, "group headers lost:\n{text}");
+
+        // The flat (ungrouped) view keeps the tag: it has no header to read.
+        let flat = fit_compact_row(&entries[0], 1060, 80);
+        assert!(
+            flat.contains("[round52]"),
+            "flat view must keep the group tag: {flat:?}"
         );
     }
 
@@ -2017,6 +2184,48 @@ mod tests {
         assert!(
             two.contains("repo:"),
             "repo line missing for two repos:\n{two}"
+        );
+    }
+
+    /// The plain (non-TTY) rendering honours `COLUMNS` instead of always
+    /// falling back to 80, and `MONITOR_WIDTH` still overrides both.
+    #[test]
+    fn test_plain_width_honours_columns_without_a_tty() {
+        use std::collections::HashMap;
+        // A synthetic environment lookup, so the precedence rules are tested
+        // without mutating the process-global environment.
+        let lookup = |vars: &[(&str, &str)]| {
+            let map: HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |key: &str| map.get(key).cloned()
+        };
+
+        // COLUMNS is honoured when MONITOR_WIDTH is unset.
+        let env = lookup(&[("COLUMNS", "50")]);
+        assert_eq!(plain_width_from(&env), 50, "COLUMNS must be honoured");
+
+        // Zero and unparsable values are ignored, as they are everywhere.
+        let env = lookup(&[("COLUMNS", "0")]);
+        assert_eq!(plain_width_from(&env), DEFAULT_TERMINAL_WIDTH, "COLUMNS=0");
+        let env = lookup(&[("COLUMNS", "wide")]);
+        assert_eq!(
+            plain_width_from(&env),
+            DEFAULT_TERMINAL_WIDTH,
+            "COLUMNS=wide"
+        );
+
+        // MONITOR_WIDTH wins over COLUMNS.
+        let env = lookup(&[("COLUMNS", "50"), ("MONITOR_WIDTH", "72")]);
+        assert_eq!(plain_width_from(&env), 72, "MONITOR_WIDTH must win");
+
+        // Neither set: the default.
+        let env = lookup(&[]);
+        assert_eq!(
+            plain_width_from(&env),
+            DEFAULT_TERMINAL_WIDTH,
+            "neither set"
         );
     }
 
@@ -2273,7 +2482,9 @@ mod tests {
             risks: "none".to_string(),
         });
 
-        let row = compact_row(&entry, 1060, 200, false);
+        // The flat view: this row is rendered on its own, not under a group
+        // header, so the `[group]` tag (absent here) would be part of it.
+        let row = compact_row(&entry, 1060, 200, false, true);
         assert!(
             !row.contains('\x1b'),
             "a live row carries no styling of its own, so no escape may survive: {row:?}"
