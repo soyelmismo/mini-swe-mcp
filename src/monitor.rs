@@ -318,9 +318,11 @@ fn progress_bar(step: usize, max_turns: usize) -> String {
     bar
 }
 
-/// Human-readable elapsed time: `16m`, `01m 05s`, `01h 01m`.
+/// Human-readable elapsed time: `16m`, `05s`, `01h 05m`.
 fn format_elapsed(secs: u64) -> String {
-    if secs < 3600 {
+    if secs < 60 {
+        format!("{:02}s", secs)
+    } else if secs < 3600 {
         format!("{:02}m", secs / 60)
     } else {
         format!("{:02}h {:02}m", secs / 3600, (secs % 3600) / 60)
