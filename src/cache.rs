@@ -1047,7 +1047,9 @@ mod tests {
         // `swe_base_dir()` follows `SWE_TEMP_DIR`, which the slot-base tests
         // redirect under this same lock: without it this test's base can be
         // filed under (and removed with) another test's redirection.
-        let _lock = env_guard();
+        let _lock = crate::agent::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let base = crate::worktree::swe_base_dir()
             .join(format!("swe-legacy-slot-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
@@ -1090,10 +1092,16 @@ mod tests {
 
     #[test]
     fn test_cache_dirs_creation() {
-        // The shared cache root follows `SWE_TEMP_DIR`, which the slot-base
-        // tests redirect under this same lock.
-        let _lock = env_guard();
-        let dirs = cache_dirs();
+        // `cache_dirs()` freezes the root once per process on the first call,
+        // which a slot-base test may have filed under a redirected (and later
+        // removed) `SWE_TEMP_DIR`. Building a fresh `CacheDirs` here, under the
+        // same lock the slot-base tests redirect under, keeps this test on the
+        // stable base instead of the frozen one.
+        let _lock = crate::agent::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dirs = CacheDirs::new();
+        dirs.ensure_dirs();
         assert!(dirs.root.is_dir());
         assert!(dirs.uv.is_dir());
         assert!(dirs.pip.is_dir());
@@ -1129,10 +1137,16 @@ mod tests {
     /// directory is ever granted beside a credential file.
     #[test]
     fn test_every_ecosystem_cache_lives_under_the_shared_root() {
-        // The shared cache root follows `SWE_TEMP_DIR`, which the slot-base
-        // tests redirect under this same lock.
-        let _lock = env_guard();
-        let dirs = cache_dirs();
+        // `cache_dirs()` freezes the root once per process on the first call,
+        // which a slot-base test may have filed under a redirected (and later
+        // removed) `SWE_TEMP_DIR`. Building a fresh `CacheDirs` here, under the
+        // same lock the slot-base tests redirect under, keeps this test on the
+        // stable base instead of the frozen one.
+        let _lock = crate::agent::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dirs = CacheDirs::new();
+        dirs.ensure_dirs();
         for cache in [
             &dirs.kache,
             &dirs.uv,
