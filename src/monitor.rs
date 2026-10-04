@@ -618,13 +618,19 @@ fn list_content_lines(
                 .first()
                 .and_then(|w| w.repo_path.as_deref())
                 .unwrap_or(DEFAULT_REPO_KEY);
-            lines.push(truncate_visible(&format!("repo: {repo}"), inner));
+            // The same sanitizing the interactive list applies: a heading is
+            // drawn verbatim into a terminal, so nothing the registry row
+            // carries may carry a terminal command of its own.
+            lines.push(truncate_visible(
+                &format!("repo: {}", sanitize_text(repo)),
+                inner,
+            ));
         }
         let counts = group_counts(workers, use_color);
         let header = if counts.is_empty() {
-            name.clone()
+            sanitize_text(name)
         } else {
-            format!("{name}  {counts}")
+            format!("{}  {counts}", sanitize_text(name))
         };
         lines.push(truncate_visible(&header, inner));
         for w in workers {
@@ -2303,6 +2309,20 @@ mod tests {
         assert!(
             !heading.contains('\x1b'),
             "no escape may survive into a list heading: {heading:?}"
+        );
+
+        // The plain dashboard draws the same heading into a terminal, so the
+        // same rule holds there: the group and repo a row carries must not
+        // carry a terminal command either.
+        let grouped = &grouped_slice;
+        let plain = render_dashboard_with_width(grouped, 1060, 1060, false);
+        assert!(
+            !plain.contains('\x1b'),
+            "no escape may survive into the plain dashboard: {plain:?}"
+        );
+        assert!(
+            plain.contains("round52"),
+            "the group heading must still show: {plain}"
         );
     }
 
