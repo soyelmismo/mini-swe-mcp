@@ -29,6 +29,12 @@
 //! task headline when idle) takes whatever width the fixed columns leave and is
 //! truncated with `…`.
 //!
+//! The choice is made once per frame, not once per row: the columns shown and
+//! their widths are decided from the terminal width and the widest values in
+//! the whole frame, so every row puts its op at the same column and the table
+//! never comes out ragged. A row whose own `step/max` or elapsed cell is
+//! narrower is padded out to the frame's width, not allowed to shift the op.
+//!
 //! The op is the protected column: it keeps at least 24 visible characters,
 //! and a column is dropped rather than let the op fall below that. What the
 //! glyph already shows is never repeated in the op, so a narrow row spends its
@@ -354,6 +360,22 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// The elapsed cell for one worker: still counting while the worker lives,
+/// frozen at its last update once it is terminal.
+fn elapsed_cell(w: &WorkerRegistryEntry, now: u64) -> String {
+    let secs = if w.status.is_terminal() {
+        w.updated_at.saturating_sub(w.started_at)
+    } else {
+        now.saturating_sub(w.started_at)
+    };
+    format_elapsed(secs)
+}
+
+/// The `step/max` cell for one worker.
+fn turns_cell(w: &WorkerRegistryEntry) -> String {
+    format!("{}/{}", w.step, w.max_turns)
+}
+
 /// Prefix the review engine stamps onto a reviewing worker's command.
 const REVIEW_PREFIX: &str = "[review] ";
 
@@ -393,13 +415,81 @@ fn op_text(w: &WorkerRegistryEntry, show_group: bool) -> String {
     }
 }
 
+/// The columns a whole frame shows, and the width each one occupies.
+///
+/// Decided once per frame from the terminal width and the widest value in the
+/// frame, never per row: that is what keeps every row's op in the same column.
+#[derive(Clone, Copy)]
+struct FrameLayout {
+    show_model: bool,
+    show_turns: bool,
+    show_elapsed: bool,
+    show_bar: bool,
+    /// Width of the `step/max` column: the widest value in the frame, so
+    /// `9/9` is padded out beside `15/250` instead of shifting the op left.
+    turns_w: usize,
+    /// Width of the elapsed column: `02h 05m` is wider than `14m`, and the
+    /// narrow cell is padded to match rather than pulling its op left.
+    elapsed_w: usize,
+}
+
+impl FrameLayout {
+    /// Choose the frame's columns for `inner` visible columns of a box body.
+    ///
+    /// The fixed part is the glyph, the id and their separators. The optional
+    /// columns drop in the established order -- elapsed first, then the model
+    /// alias, then `step/max` -- and each is shown only when every column it
+    /// outranks plus a protected op of at least [`MIN_OP_WIDTH`] still fits.
+    /// The progress bar rides along with `step/max` at [`PROGRESS_THRESHOLD`]+.
+    fn for_width(inner: usize, widest_turns: usize, widest_elapsed: usize) -> Self {
+        let show_bar = inner + 4 >= PROGRESS_THRESHOLD;
+        let base = 1 + 1 + ID_WIDTH + 1;
+        let turns_w = widest_turns.max(TURNS_WIDTH);
+        let turns_cost = turns_w + 1 + if show_bar { BAR_WIDTH + 1 } else { 0 };
+        let model_cost = MODEL_WIDTH + 1;
+        let elapsed_cost = widest_elapsed + 1;
+
+        let show_turns = base + turns_cost + MIN_OP_WIDTH <= inner;
+        let show_model = show_turns && base + turns_cost + model_cost + MIN_OP_WIDTH <= inner;
+        let show_elapsed =
+            show_model && base + turns_cost + model_cost + elapsed_cost + MIN_OP_WIDTH <= inner;
+        FrameLayout {
+            show_model,
+            show_turns,
+            show_elapsed,
+            show_bar,
+            turns_w,
+            elapsed_w: widest_elapsed,
+        }
+    }
+}
+
+/// Choose the frame's columns from every row that will be drawn.
+///
+/// `rows` must be exactly the rows the frame renders, so a row it does not
+/// show never narrows the columns of the rows that remain. The scan takes the
+/// widest `step/max` and elapsed cell in the frame and hands them to
+/// [`FrameLayout::for_width`], which applies the drop order once.
+fn frame_layout_for<'a>(
+    rows: impl IntoIterator<Item = &'a WorkerRegistryEntry>,
+    now: u64,
+    inner: usize,
+) -> FrameLayout {
+    let mut widest_turns = 0usize;
+    let mut widest_elapsed = 0usize;
+    for w in rows {
+        widest_turns = widest_turns.max(visible_width(&turns_cell(w)));
+        widest_elapsed = widest_elapsed.max(visible_width(&elapsed_cell(w, now)));
+    }
+    FrameLayout::for_width(inner, widest_turns, widest_elapsed)
+}
+
 /// Fit one worker to a single compact line of at most `inner` visible columns.
 ///
-/// Layout: `glyph id model step/max elapsed op`. Columns drop, in order, as
-/// the terminal narrows: elapsed first, then the model alias, then `step/max`;
-/// the glyph, the id and the op always stay. A progress bar precedes `step/max`
-/// only at [`PROGRESS_THRESHOLD`]+ columns. The op takes whatever the fixed
-/// columns leave and is truncated with `…`, so the row never overflows `inner`.
+/// Layout: `glyph id model step/max elapsed op`, with the optional columns and
+/// their widths taken from `layout` -- the decision made once for the whole
+/// frame -- so every row of a frame starts its op at the same column. A row
+/// whose own value is narrower than the frame's column is padded out to it.
 ///
 /// `show_group` prints the `[group]` tag in the op; callers pass `false` for a
 /// row printed under its own group header, which already names the group.
@@ -409,33 +499,14 @@ fn compact_row(
     inner: usize,
     use_color: bool,
     show_group: bool,
+    layout: &FrameLayout,
 ) -> String {
     let glyph = status_glyph(w.status);
     let id = truncate_visible(&w.id, ID_WIDTH);
     let model = model_alias(&w.model);
-    let turns = format!("{}/{}", w.step, w.max_turns);
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let elapsed = format_elapsed(duration_secs);
+    let turns = turns_cell(w);
+    let elapsed = elapsed_cell(w, now);
     let detail = op_text(w, show_group);
-
-    let show_bar = inner + 4 >= PROGRESS_THRESHOLD;
-    let base = 1 + 1 + ID_WIDTH + 1;
-    let turns_w = visible_width(&turns).max(TURNS_WIDTH);
-    let turns_cost = turns_w + 1 + if show_bar { BAR_WIDTH + 1 } else { 0 };
-    let model_cost = MODEL_WIDTH + 1;
-    let elapsed_cost = visible_width(&elapsed) + 1;
-
-    // Drop order is elapsed, then model, then step/max: each column is shown
-    // only when every column it outranks still fits, and the op keeps a
-    // readable minimum width.
-    let show_turns = base + turns_cost + MIN_OP_WIDTH <= inner;
-    let show_model = show_turns && base + turns_cost + model_cost + MIN_OP_WIDTH <= inner;
-    let show_elapsed =
-        show_model && base + turns_cost + model_cost + elapsed_cost + MIN_OP_WIDTH <= inner;
 
     let mut prefix = String::new();
     if use_color {
@@ -454,7 +525,7 @@ fn compact_row(
         prefix.push_str(C_RESET);
     }
     prefix.push(' ');
-    if show_model {
+    if layout.show_model {
         if use_color {
             prefix.push_str(C_DIM);
         }
@@ -467,16 +538,16 @@ fn compact_row(
         }
         prefix.push(' ');
     }
-    if show_turns {
-        if show_bar {
+    if layout.show_turns {
+        if layout.show_bar {
             prefix.push_str(&progress_bar(w.step, w.max_turns));
             prefix.push(' ');
         }
-        prefix.push_str(&pad_visible(&turns, turns_w));
+        prefix.push_str(&pad_visible(&turns, layout.turns_w));
         prefix.push(' ');
     }
-    if show_elapsed {
-        prefix.push_str(&elapsed);
+    if layout.show_elapsed {
+        prefix.push_str(&pad_visible(&elapsed, layout.elapsed_w));
         prefix.push(' ');
     }
     let op_width = inner.saturating_sub(visible_width(&prefix));
@@ -652,6 +723,9 @@ fn list_content_lines(
         .map(|e| e.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY))
         .collect();
     let show_repo = repos.len() > 1;
+    // One decision for the whole frame: every row gets the same columns and the
+    // same column widths, so their ops all start in the same place.
+    let layout = frame_layout_for(entries.iter(), now, inner);
     let mut lines = Vec::new();
     for (name, workers) in &groups {
         if show_repo {
@@ -675,7 +749,7 @@ fn list_content_lines(
         };
         lines.push(truncate_visible(&header, inner));
         for w in workers {
-            lines.push(compact_row(w, now, inner, use_color, false));
+            lines.push(compact_row(w, now, inner, use_color, false, &layout));
         }
     }
     lines
@@ -1218,7 +1292,15 @@ pub fn parse_key(bytes: &[u8]) -> Option<Key> {
 /// plain (no ANSI codes) like the non-TTY output. This is the flat view: it
 /// keeps the `[group]` tag, since no group header precedes it.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    compact_row(w, now, width.saturating_sub(4).max(1), false, true)
+    let inner = width.saturating_sub(4).max(1);
+    compact_row(
+        w,
+        now,
+        inner,
+        false,
+        true,
+        &frame_layout_for([w], now, inner),
+    )
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
@@ -1371,6 +1453,10 @@ fn render_list(
     height: usize,
 ) -> String {
     let (lines, order) = build_list_lines(entries, now, width, state.groups_expanded);
+    // Decided once over the rows this frame shows, so the rows on screen line
+    // up with each other rather than each picking its own columns.
+    let inner = width.saturating_sub(4).max(1);
+    let layout = frame_layout_for(order.iter().copied(), now, inner);
     let selected_id = order.get(state.selection).map(|w| w.id.as_str());
     let use_color = use_color_for_tty(true);
     let mut selected_line = 0usize;
@@ -1405,7 +1491,7 @@ fn render_list(
         match line {
             ListLine::Header(h) => out.push_str(&box_line(h, width)),
             ListLine::Worker(w) => {
-                let row = compact_row(w, now, width.saturating_sub(4).max(1), use_color, false);
+                let row = compact_row(w, now, inner, use_color, false, &layout);
                 if Some(w.id.as_str()) == selected_id {
                     out.push_str(&box_line(&format!("\x1b[7m{row}\x1b[0m"), width));
                 } else {
@@ -2002,6 +2088,61 @@ mod tests {
         );
     }
 
+    /// Every row of a frame starts its op at the same column, at 40, 60, 80 and
+    /// 120: the visible columns and their widths are chosen once for the whole
+    /// frame, so a table where one row keeps a column its neighbour dropped
+    /// (a ragged table) cannot happen.
+    #[test]
+    fn test_every_row_of_a_frame_aligns_its_op_column() {
+        // Deliberately mixed rows: a wide and a narrow `step/max` value, and
+        // -- the one that mattered -- a wide (`02h 05m`) and a narrow (`01m`)
+        // elapsed cell, so a per-row column decision disagrees with its
+        // neighbour and the table comes out ragged.
+        let entries = vec![
+            Row::new("a1b2c3d4")
+                .status(RegistryStatus::Running)
+                .turns(15, 250)
+                .command("Consolidate the round in group round57")
+                .group("round57")
+                .build(),
+            Row::new("bb1a5885")
+                .status(RegistryStatus::Completed)
+                .turns(71, 150)
+                .command("Polish the monitor columns")
+                .group("round57")
+                .updated_at(1060)
+                .build(),
+            Row::new("c0ffee00")
+                .status(RegistryStatus::Failed)
+                .turns(9, 9)
+                .command("cargo test --lib monitor")
+                .group("round57")
+                .updated_at(1400)
+                .build(),
+        ];
+        // Two hours after `started_at`, so the live row's elapsed is the wide
+        // `02h 05m` cell while the frozen terminal rows keep a narrow one.
+        let now = 1000 + 2 * 3600 + 5 * 60;
+        // The op keeps at least MIN_OP_WIDTH columns, so its first 10
+        // characters survive truncation at every width and locate the column.
+        let ops: Vec<&str> = entries.iter().map(|e| &e.last_command[..10]).collect();
+        for width in [40usize, 60, 80, 120] {
+            let text = render_dashboard_with_width(&entries, now, false, width);
+            let columns: Vec<usize> = ops
+                .iter()
+                .map(|op| {
+                    text.lines()
+                        .find_map(|line| line.find(op))
+                        .unwrap_or_else(|| panic!("no row showing {op:?} at {width}:\n{text}"))
+                })
+                .collect();
+            assert!(
+                columns.windows(2).all(|w| w[0] == w[1]),
+                "rows disagree on the op column at {width}: {columns:?}\n{text}"
+            );
+        }
+    }
+
     /// The op is the protected column: at 50 columns it keeps at least
     /// [`MIN_OP_WIDTH`] visible characters, so the narrow layout spends its
     /// columns on what the worker is doing rather than on the label around it.
@@ -2484,7 +2625,8 @@ mod tests {
 
         // The flat view: this row is rendered on its own, not under a group
         // header, so the `[group]` tag (absent here) would be part of it.
-        let row = compact_row(&entry, 1060, 200, false, true);
+        let layout = frame_layout_for([&entry], 1060, 200);
+        let row = compact_row(&entry, 1060, 200, false, true, &layout);
         assert!(
             !row.contains('\x1b'),
             "a live row carries no styling of its own, so no escape may survive: {row:?}"
