@@ -186,9 +186,20 @@ impl HubPaths {
 /// exists but is not owned by this uid or is group/world accessible.
 pub fn hub_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("SWE_HUB_DIR").filter(|v| !v.is_empty()) {
-        return harden_hub_dir(PathBuf::from(dir));
+        return hub_dir_in(PathBuf::from(dir));
     }
     let dir = crate::worktree::swe_base_dir().join(format!("mini-swe-hub-{}", current_uid()));
+    hub_dir_in(dir)
+}
+
+/// [`hub_dir`] for a directory the caller names, with the same creation and
+/// refusal rules.
+///
+/// The binary resolves `$SWE_HUB_DIR` in [`hub_dir`]; this is the seam that
+/// lets an in-process caller (a test, an embedder) check a directory it holds
+/// without the process-wide variable every other test in the same process
+/// would inherit.
+pub fn hub_dir_in(dir: PathBuf) -> Result<PathBuf> {
     harden_hub_dir(dir)
 }
 

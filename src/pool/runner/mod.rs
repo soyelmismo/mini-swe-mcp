@@ -594,6 +594,26 @@ impl WorkerPool {
         // The commit that carries it is the harness's, made after this block.
         let mut security_review_tree: Option<String> = None;
         let mut security_approved = false;
+        // The implementer's loop is over but the run is not: a review phase
+        // may still be about to run, and everything below this line -- the
+        // scope probe, the touched-file probe, the git checkpoint inside the
+        // review phase -- is await-heavy. The row is marked `Reviewing` here,
+        // *before* any of it, so it can never read a settled status while a
+        // review phase is still going to run: a cross-process reader (the
+        // hub's round scheduler) treats a live row as "not ready" and waits,
+        // where a `Completed` row left over from an earlier attempt would have
+        // started a round that omits this worker. The restore below puts the
+        // implementation status back when no review phase actually runs, so
+        // the terminal write and this one never contradict each other.
+        self.save_status(
+            meta,
+            &model,
+            RegistryStatus::Reviewing,
+            step,
+            current_max_turns,
+            "preparing review phase",
+            None,
+        );
         // --- MULTI-PHASE REVIEW PIPELINE ---
         // The implementer's loop is done; hand off to the independent auditor
         // and fold its turns back into the single monotonic step counter.
@@ -725,10 +745,22 @@ impl WorkerPool {
             review_plan.push((reviewer, wanted, Vec::new()));
         }
 
-        if review_plan.is_empty()
-            && let Some(reason) = security_skip
-        {
-            info!(worker = %worker_id, "{reason}");
+        if review_plan.is_empty() {
+            // No phase will run, so the provisional `Reviewing` row above is
+            // rolled back to the implementation status: the row must never
+            // claim a review that did not happen.
+            self.save_status(
+                meta,
+                &model,
+                RegistryStatus::Running,
+                step,
+                current_max_turns,
+                "review pipeline skipped",
+                None,
+            );
+            if let Some(reason) = security_skip {
+                info!(worker = %worker_id, "{reason}");
+            }
         }
         for (reviewer_model, mode, phase_sensitive) in review_plan {
             info!(
