@@ -25,6 +25,21 @@ pub(crate) enum RoundDecision {
     Retire,
 }
 
+/// Whether `args` asks for the group to be consolidated when it stops.
+///
+/// `false` is the absence of the request, not a request for no round: it is what
+/// a caller that spelled the flag out sends, and [`McpServer::validate_auto_consolidate`]
+/// takes it as a no-op. Every decision that follows the flag reads it through
+/// here -- the cheap worker gate, the round the hub records, and the round a
+/// `--quiet` caller is told to wait on -- so a `false` can never be mistaken for
+/// a round that will get a consolidator.
+pub(crate) fn consolidate_requested(args: &Value) -> bool {
+    matches!(
+        args.get("consolidate"),
+        Some(Value::Bool(true) | Value::String(_))
+    )
+}
+
 impl McpServer {
     pub(super) fn auto_store(&self) -> Option<Arc<AutoConsolidate>> {
         self.auto_consolidate.lock().unwrap().clone()
@@ -106,10 +121,7 @@ impl McpServer {
                     .map(|e| e.id.clone())
                     .collect(),
             },
-            matches!(
-                args.get("consolidate"),
-                Some(Value::Bool(true) | Value::String(_))
-            ),
+            consolidate_requested(args),
         )
     }
 

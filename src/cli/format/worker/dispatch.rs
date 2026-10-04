@@ -167,20 +167,59 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
 
 /// The watch command a `--quiet` dispatch reminder names.
 ///
-/// Same precedence as the human-facing [`format_dispatch`]: the hub's
-/// token-bound `watch_command` when it minted one, the round command for a
-/// consolidated dispatch, and the plain `mini-swe-mcp watch` otherwise -- which
-/// follows every worker the caller owns, so it is right even with no token and
-/// no group.
+/// A consolidated round is waited on as a round: its consolidator is dispatched
+/// separately, long after these workers stopped, so the plain per-caller watch
+/// would return on the first worker and leave the rest of the round unwatched.
+/// The round command therefore wins whenever the answer names a group and asks
+/// for consolidation, and the hub's token prefix rides along when the reply
+/// carried one -- a watch started as a different caller would follow someone
+/// else's workers and never see this round. A non-consolidated dispatch keeps
+/// today's command: the token-bound one when the hub minted it, the plain
+/// `mini-swe-mcp watch` otherwise, which follows every worker the caller owns.
+///
+/// The test for "asks for consolidation" is the one the handler used, not "the
+/// key is present": `consolidate: false` is a no-op everywhere else, and reading
+/// it as a request would drop the token that binds the watch to this caller for
+/// a round that will never have a consolidator to wait for.
 fn quiet_watch_command(val: &serde_json::Value) -> String {
-    if let Some(command) = val.get("watch_command").and_then(|v| v.as_str()) {
-        return command.to_string();
+    let group = val.get("group").and_then(|v| v.as_str());
+    if let Some(group) = group
+        && crate::mcp::auto_consolidate::consolidate_requested(val)
+    {
+        let round = format!("mini-swe-mcp watch --group {} --all", shell_word(group));
+        return match watch_token(val) {
+            Some(token) => format!("{token} {round}"),
+            None => round,
+        };
     }
-    match val.get("group").and_then(|v| v.as_str()) {
-        Some(group) => {
-            format!("mini-swe-mcp watch --group {} --all", shell_word(group))
+    match val.get("watch_command").and_then(|v| v.as_str()) {
+        Some(command) => command.to_string(),
+        None => match group {
+            Some(group) => {
+                format!("mini-swe-mcp watch --group {} --all", shell_word(group))
+            }
+            None => "mini-swe-mcp watch".to_string(),
+        },
+    }
+}
+
+/// The `NAME=value` prefix of the hub's token-bound `watch_command`, when the
+/// answer carried one.
+///
+/// Only the leading assignment is reused, never the command behind it: the
+/// token is what binds the watch to this caller, and the round arguments are
+/// the part that has to change. The value is echoed as one shell word when it
+/// is not a plain token, so a hub answer that somehow carried a crafted value
+/// still reaches the operator as data and not as a second command.
+fn watch_token(val: &serde_json::Value) -> Option<String> {
+    let command = val.get("watch_command").and_then(|v| v.as_str())?;
+    let (prefix, _) = command.split_once(' ')?;
+    let (name, token) = prefix.split_once('=')?;
+    match name {
+        "MINI_SWE_WATCH_TOKEN" if !token.is_empty() => {
+            Some(format!("{name}={}", shell_word(token)))
         }
-        None => "mini-swe-mcp watch".to_string(),
+        _ => None,
     }
 }
 
@@ -263,6 +302,42 @@ mod tests {
         assert_eq!(
             round.watch_command, "mini-swe-mcp watch --group round-1 --all",
             "{round:?}"
+        );
+
+        // The round command outranks the token-bound per-caller watch, and
+        // keeps the token: the round's consolidator is dispatched separately
+        // and the plain watch would report only these workers, so a
+        // `dispatch --consolidate --group <g> --quiet` caller would read the
+        // round as finished with no merge in it. A watch started without the
+        // token would follow another identity's workers and never see it.
+        let consolidated = format_dispatch_quiet(&v(
+            r#"{"workers":[{"index":0,"worker_id":"w1"}],"group":"round-48","consolidate":"nerd","watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert_eq!(
+            consolidated.watch_command,
+            "MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch --group round-48 --all",
+            "a consolidated round is waited on as a round: {consolidated:?}"
+        );
+
+        // Without a token the round command still names the round.
+        let tokenless = format_dispatch_quiet(&v(
+            r#"{"worker_id":"w1","group":"round-48","consolidate":true}"#,
+        ));
+        assert_eq!(
+            tokenless.watch_command, "mini-swe-mcp watch --group round-48 --all",
+            "{tokenless:?}"
+        );
+
+        // `consolidate: false` asks for no round, so it must not cost the
+        // caller the token-bound command: the hub mints the flag as a no-op and
+        // reading the key's mere presence as a request would drop the token that
+        // binds the watch to this identity.
+        let declined = format_dispatch_quiet(&v(
+            r#"{"worker_id":"w1","group":"round-48","consolidate":false,"watch_command":"MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch"}"#,
+        ));
+        assert_eq!(
+            declined.watch_command, "MINI_SWE_WATCH_TOKEN=abc mini-swe-mcp watch",
+            "{declined:?}"
         );
 
         // Nothing started: no watch command, so no reminder is printed.

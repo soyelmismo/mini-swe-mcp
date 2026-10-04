@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use super::server::McpServer;
 use crate::manifest::{ModelManifest, NetworkPolicy};
+use crate::mcp::auto_consolidate;
 use crate::pool::round::first_line;
 use crate::pool::{SteerOutcome, UNATTRIBUTED_OWNER, WorkerOwner, emit_view, normalize_diff_path};
 
