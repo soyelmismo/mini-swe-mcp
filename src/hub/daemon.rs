@@ -100,6 +100,23 @@ const WATCH_TOKENS_FILE: &str = "watch-tokens.json";
 /// without limit.
 const MAX_TOKEN_ROWS: usize = 512;
 
+/// Size above which `hub.log` is rotated before it is opened for append.
+///
+/// The log only exists to answer "what did the hub do"; it is not an archive.
+/// A live hub reached 6.6 MB over 51.7k lines with nothing to stop it, so the
+/// daemon now keeps one generation: past this cap the current file becomes
+/// `hub.log.1` and a fresh `hub.log` takes its place. 8 MiB is far more than a
+/// working operator reads and small enough to keep the directory tidy.
+pub const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How often a running daemon re-checks the log's size and rotates it.
+///
+/// Rotation only helps if a long-lived daemon performs it: the cap is checked
+/// whenever the log is opened for append, and the appends a daemon makes on its
+/// own are rare compared to the tracing a worker writes to the same file
+/// continuously. Ten minutes bounds how long the file can sit past the cap.
+pub const LOG_ROTATE_INTERVAL: Duration = Duration::from_secs(600);
+
 /// The three files a hub directory holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubPaths {
@@ -168,6 +185,12 @@ impl HubPaths {
     }
 
     /// The daemon's log file.
+    ///
+    /// It is bounded, not archived: past [`LOG_ROTATE_BYTES`] it becomes
+    /// `hub.log.1` (replacing the generation before it) and a fresh
+    /// `hub.log` takes over, both when a client opens it for the daemon it
+    /// spawns and on a [`LOG_ROTATE_INTERVAL`] timer while the daemon runs. At
+    /// most two generations exist at any time.
     pub fn log(&self) -> PathBuf {
         self.dir.join("hub.log")
     }
@@ -798,6 +821,8 @@ impl HubServer {
         );
         let idle_watcher = self.clone();
         let mut idle_task = tokio::spawn(async move { idle_watcher.watch_idle().await });
+        let log_watcher = self.clone();
+        let log_task = tokio::spawn(async move { log_watcher.watch_log_rotation().await });
 
         // OTA-style handover (H17): the daemon notices its own rebuilt
         // executable and arms the planned handover itself, instead of waiting
@@ -851,6 +876,7 @@ impl HubServer {
         }
 
         idle_task.abort();
+        log_task.abort();
         auto_handover_task.abort();
         recovery_task.abort();
         reaper.abort();
@@ -909,6 +935,30 @@ impl HubServer {
             self.config.paths().log().to_path_buf(),
         )
         .await;
+    }
+
+    /// Keep the log bounded while the daemon runs.
+    ///
+    /// The cap is checked whenever anything opens the log for append, but a
+    /// quiet hub appends little and a worker's tracing writes to the same file
+    /// through the daemon's inherited stderr, so only a timer catches a log
+    /// that outgrew the cap between two hub events.
+    async fn watch_log_rotation(&self) {
+        let path = self.config.paths().log();
+        loop {
+            tokio::time::sleep(LOG_ROTATE_INTERVAL).await;
+            let path = path.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || rotate_log(&path))
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "Hub log rotation task failed");
+                        Ok(false)
+                    })
+            {
+                debug!(error = %e, "Hub log rotation failed; trying again later");
+            }
+        }
     }
 
     /// Resolve when the daemon has had no open connection and no live
@@ -994,6 +1044,106 @@ fn respawn_daemon(paths: &HubPaths) {
     }
 }
 
+/// Rotate `hub.log` once it is larger than [`LOG_ROTATE_BYTES`].
+///
+/// Called before a caller opens the log for append, and on a timer while the
+/// daemon runs. A log at or below the cap is left alone and `Ok(false)` says
+/// so; past it, the current file is renamed to `hub.log.1` -- replacing an older
+/// generation, so at most two files exist -- and `Ok(true)` says a rotation
+/// happened. The caller then opens `path`, which is now a new empty file.
+///
+/// The rename replaces the previous generation atomically, so a reader holding
+/// the old inode keeps reading it while the directory already names the newer
+/// one. Failures are the caller's to report: a hub that cannot rotate still
+/// logs, because losing the log is worse than keeping a big one.
+pub(crate) fn rotate_log(path: &Path) -> std::io::Result<bool> {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        // No log yet, or an unreadable one: nothing to rotate. The caller
+        // still opens it, which is what creates it.
+        Err(_) => return Ok(false),
+    };
+    if size <= LOG_ROTATE_BYTES {
+        return Ok(false);
+    }
+    let previous = rotated_log_path(path);
+    // Replace any earlier generation in one step. A leftover `hub.log.1` from a
+    // crash between the two calls is replaced here rather than accumulating.
+    match std::fs::rename(path, &previous) {
+        Ok(()) => {
+            info!(
+                path = %path.display(),
+                bytes = size,
+                kept = %previous.display(),
+                "Rotated an oversized hub log"
+            );
+            // Best effort: a caller whose stderr is that file (the daemon a
+            // client spawned) has to follow the rotation, or every line after
+            // it would keep filling the generation that was just retired.
+            if let Err(e) = repoint_stderr_at(path, &previous) {
+                debug!(error = %e, "Stderr was not the rotated hub log; leaving it alone");
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "Could not rotate an oversized hub log; keeping the current one"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Where [`rotate_log`] moves the log it replaces: the same directory, the same
+/// stem, one `.1` generation.
+pub fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Point this process's stderr at `fresh` when it is the file `rotated` names.
+///
+/// The daemon's tracing goes to stderr, which the client handed it as an open
+/// handle on `hub.log` (see [`crate::hub::client::spawn_daemon`]). A rename
+/// does not move that handle, so without this the log would keep growing under
+/// the name `hub.log.1` and a fresh `hub.log` would stay empty -- the cap
+/// would then be enforced by nobody.
+///
+/// Only the daemon's own stderr is redirected: a caller that logs to the
+/// terminal (an in-process daemon in a test, an embedder) leaves stderr alone,
+/// which the inode comparison below decides rather than an assumption. `fresh`
+/// is opened with the same flags and mode the client opens the log with.
+fn repoint_stderr_at(fresh: &Path, rotated: &Path) -> std::io::Result<()> {
+    // SAFETY: `fstat` fills a `stat` for a descriptor this process owns.
+    let mut stderr_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr_stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stderr_stat.st_ino as u64 != std::fs::metadata(rotated)?.ino() {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(fresh)?;
+    // SAFETY: `dup2` atomically replaces fd 2 with `file`'s descriptor. Neither
+    // is a Rust-owned handle at this point (fd 2 is inherited), and the file
+    // outlives the call.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // `dup2` clears FD_CLOEXEC on the new descriptor; the hub spawns workers,
+    // which must not inherit its log.
+    // SAFETY: `fcntl` sets a descriptor flag on fd 2, this process's stderr.
+    unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok(())
+}
+
 /// Append one timestamped line to the hub log; failures are traced, never fatal.
 pub(crate) fn append_log(path: &Path, event: &str) {
     use std::fmt::Write as _;
@@ -1004,9 +1154,13 @@ pub(crate) fn append_log(path: &Path, event: &str) {
     let mut line = String::new();
     let _ = writeln!(line, "{now} pid={} {event}", std::process::id());
     use std::io::Write as _;
+    // The open below is this function's only handle on the log, so it is where
+    // the cap is enforced: past it the append lands in a fresh file.
+    let _ = rotate_log(path);
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .and_then(|mut f| f.write_all(line.as_bytes()))
     {
