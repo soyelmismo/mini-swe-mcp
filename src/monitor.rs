@@ -5,27 +5,32 @@
 //!
 //! # Layout contract
 //!
-//! The dashboard is a table: every worker occupies exactly one *bounded* row,
-//! so a narrow terminal wraps nothing and a wide one is not filled with dead
-//! space. Bounding is driven by [`Layout`], a pure struct derived from the
-//! terminal width (see [`Layout::for_terminal_width`]). All measurement runs on
-//! the visible (ANSI-stripped) text, never on escape sequences, so colour never
-//! shifts a column.
+//! The dashboard is a bordered box: every visible line -- borders included --
+//! is at most the terminal width, so a narrow terminal wraps nothing and a wide
+//! one is not filled with dead space. The width comes from [`terminal_width`]
+//! (TIOCGWINSZ, else `COLUMNS`, else [`DEFAULT_TERMINAL_WIDTH`]); the renderer
+//! clips every line as a final safety net, whatever the content.
+//!
+//! All measurement runs on the visible (ANSI-stripped) text, never on escape
+//! sequences, so colour never shifts a column. Colour is applied only when the
+//! output is a TTY and `NO_COLOR` is unset; the plain non-TTY output uses the
+//! same layout without ANSI codes.
+//!
+//! # Row contract
+//!
+//! Each worker is one compact line: `glyph id model step/max elapsed op`. The
+//! columns drop, in order, as the terminal narrows: elapsed first, then the
+//! model alias, then `step/max`; the glyph, the id and the op always stay. A
+//! small progress bar precedes `step/max` only at 100+ columns. The op (or the
+//! task headline when idle) takes whatever width the fixed columns leave and is
+//! truncated with `…`.
 //!
 //! # Grouping contract
 //!
-//! Rows are grouped **by repository** (`WorkerRegistryEntry::repo_path`,
-//! [`DEFAULT_REPO_KEY`] when absent), never by the swarm tag: a supervisor
-//! watches *one worktree at a time*, so grouping by repository yields exactly
-//! one coherent table per repository. The optional swarm/domain tag is demoted
-//! to a `[tag]` prefix inside the task column, where it still shows but can no
-//! longer fracture the dashboard into many tiny tables.
-//!
-//! Each repository heading carries its own counters (`total`, then every
-//! non-zero state), folded in by `RepoGroup::push` on the same pass that groups
-//! the rows. The global counters above stay the cross-repository view, so one
-//! repository finishing early is visible both in its own table and in the
-//! fleet-wide strip.
+//! Rows are grouped by round/group (`WorkerRegistryEntry::group`), each group
+//! headed by one line with its per-status counts. There is no PID column here
+//! (the PID lives in the detail view), and a repository line is shown only when
+//! more than one repository is present.
 
 use crate::config::env_parse;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
@@ -98,180 +103,27 @@ fn format_duration(secs: u64) -> String {
 
 /// Width assumed when the real terminal size cannot be determined (non-tty
 /// output, `MONITOR_WIDTH` override, or a TUI that has not reported its size).
-pub const DEFAULT_TERMINAL_WIDTH: usize = 120;
-
-/// Narrowest usable terminal: below this the fixed ID/PID columns would leave
-/// nothing for the task text, so the row degrades to a two-line layout.
-pub const MIN_TERMINAL_WIDTH: usize = 60;
+pub const DEFAULT_TERMINAL_WIDTH: usize = 80;
 
 /// Grouping key used for workers whose `repo_path` was never recorded.
 pub const DEFAULT_REPO_KEY: &str = "local";
 
-/// Narrowest task column that still shows a command prefix plus its ellipsis.
-pub const MIN_OP_WIDTH: usize = 12;
-
-/// Widest task column, even on very wide terminals.
-pub const MAX_OP_WIDTH: usize = 60;
-
-/// Indent of a stacked row's continuation lines.
-const STACKED_INDENT: usize = 2;
-
 /// Visible width of the ID column (a full UUID is never shown).
 const ID_WIDTH: usize = 8;
-/// Visible width of the PID column.
-const PID_WIDTH: usize = 7;
-/// Visible width of the status column: `RUNNING  ` is 9, `◆ REVIEWING` is 11.
-const STATUS_WIDTH: usize = 11;
-/// Visible width of the model column.
-const MODEL_WIDTH: usize = 8;
-/// Visible width of the uptime column (`01m 05s` is the widest format).
-const UPTIME_WIDTH: usize = 7;
-/// Visible width of the bare `step/max` counter.
-const TURNS_BASE: usize = 9;
+/// Visible width of the model-alias column.
+const MODEL_WIDTH: usize = 7;
+/// Visible width of the `step/max` column.
+const TURNS_WIDTH: usize = 6;
 /// Filled/empty cells inside the progress bar, brackets excluded.
 const PROGRESS_CELLS: usize = 8;
 /// Width of the progress bar with its brackets.
 const BAR_WIDTH: usize = PROGRESS_CELLS + 2;
-/// Spaces between adjacent columns.
-const GAP: usize = 2;
-/// Spaces between the last column and the task text.
-const LAST_GAP: usize = 1;
+/// Terminals at or above this width get a progress bar before `step/max`.
+const PROGRESS_THRESHOLD: usize = 100;
 
-/// Fixed width of a row without the progress bar.
-const FIXED_CORE: usize = ID_WIDTH
-    + PID_WIDTH
-    + STATUS_WIDTH
-    + TURNS_BASE
-    + MODEL_WIDTH
-    + UPTIME_WIDTH
-    + 5 * GAP
-    + LAST_GAP;
-
-/// Fixed width of a row including the progress bar.
-const FIXED_FULL: usize = FIXED_CORE + BAR_WIDTH + 1;
-
-/// Whether a row is laid out on one line or as a stack of short lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowShape {
-    /// Every column on one line: `ID PID STATUS TURNS MODEL UPTIME task`.
-    Inline {
-        /// Whether the turns column carries a progress bar.
-        progress: bool,
-    },
-    /// Too narrow for one line: two label lines plus wrapped task lines.
-    Stacked,
-}
-
-/// Visible column widths, derived from the terminal width.
-///
-/// The task column is the only elastic one: it absorbs whatever the fixed
-/// columns leave behind and is clamped into [`MIN_OP_WIDTH`]..=[`MAX_OP_WIDTH`].
-/// That clamp is what makes the cap on long commands *dynamic* -- a 400-column
-/// terminal still truncates at [`MAX_OP_WIDTH`] instead of printing a 3 KB
-/// command, while an 80-column terminal truncates at ~19 characters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Layout {
-    /// Total terminal width this layout was computed for.
-    pub total: usize,
-    /// Visible width of the ID column.
-    pub id: usize,
-    /// Visible width of the PID column.
-    pub pid: usize,
-    /// Visible width of the status column.
-    pub status: usize,
-    /// Visible width of the turns column (bar included when shown).
-    pub turns: usize,
-    /// Visible width of the model column.
-    pub model: usize,
-    /// Visible width of the uptime column.
-    pub uptime: usize,
-    /// Maximum visible width of the last-op/task text.
-    pub op: usize,
-    /// How a worker row is laid out at this width.
-    pub shape: RowShape,
-}
-
-impl Layout {
-    /// Derive the responsive layout for a terminal of `term_width` columns.
-    ///
-    /// Three tiers by available width: **inline + progress bar** when both fit;
-    /// **inline, no bar** when one line still fits a usable task column (the
-    /// bar is dropped first, since `step/max` carries the same information);
-    /// **stacked** otherwise — two short label lines and a wrapped task, so no
-    /// line overflows. Never panics and never returns a zero-width task column;
-    /// widths below [`MIN_TERMINAL_WIDTH`] are raised to that floor.
-    pub fn for_terminal_width(term_width: usize) -> Self {
-        let total = term_width.max(MIN_TERMINAL_WIDTH);
-
-        // Tier 1: the progress bar is a bonus, not a requirement.
-        if total >= FIXED_FULL + MIN_OP_WIDTH {
-            return Self::inline(total, true);
-        }
-        // Tier 2: one line, counter only.
-        if total >= FIXED_CORE + MIN_OP_WIDTH {
-            return Self::inline(total, false);
-        }
-        // Tier 3: stack it; the task wraps at the full usable width.
-        Self {
-            total,
-            id: ID_WIDTH,
-            pid: PID_WIDTH,
-            status: STATUS_WIDTH,
-            turns: TURNS_BASE,
-            model: MODEL_WIDTH,
-            uptime: UPTIME_WIDTH,
-            op: total.saturating_sub(STACKED_INDENT).max(1),
-            shape: RowShape::Stacked,
-        }
-    }
-
-    /// Build an inline layout with the task column taking the slack.
-    fn inline(total: usize, progress: bool) -> Self {
-        let turns = if progress {
-            BAR_WIDTH + 1 + TURNS_BASE
-        } else {
-            TURNS_BASE
-        };
-        let fixed = FIXED_CORE + if progress { BAR_WIDTH + 1 } else { 0 };
-        Self {
-            total,
-            id: ID_WIDTH,
-            pid: PID_WIDTH,
-            status: STATUS_WIDTH,
-            turns,
-            model: MODEL_WIDTH,
-            uptime: UPTIME_WIDTH,
-            op: total
-                .saturating_sub(fixed)
-                .clamp(MIN_OP_WIDTH, MAX_OP_WIDTH),
-            shape: RowShape::Inline { progress },
-        }
-    }
-
-    /// Visible width of everything left of the task text.
-    ///
-    /// Used to draw the rule that closes the header, so the rule is exactly
-    /// as wide as the rows it sits above.
-    pub fn fixed_width(&self) -> usize {
-        self.id
-            + self.pid
-            + self.status
-            + self.turns
-            + self.model
-            + self.uptime
-            + 5 * GAP
-            + LAST_GAP
-    }
-
-    /// Whether the progress bar is rendered in the turns column.
-    pub fn shows_progress(&self) -> bool {
-        matches!(self.shape, RowShape::Inline { progress: true })
-    }
-}
-
-// ---------------------------------------------------------------------------
+// ----------
 // Text measurement helpers (width-aware, never byte-based)
-// ---------------------------------------------------------------------------
+// ----------
 
 /// Number of columns a string occupies, ignoring SGR escape sequences.
 ///
@@ -384,40 +236,75 @@ fn wrap_visible(s: &str, op_width: usize) -> Vec<String> {
     lines
 }
 
-// ---------------------------------------------------------------------------
+// ----------
 // Row cells
-// ---------------------------------------------------------------------------
+// ----------
 
-/// Visual indicator for the review phase.
-///
-/// A reviewing worker must not look like a running one: the implementer has
-/// finished and an independent reviewer is auditing the diff. `REVIEWING` is
-/// padded to the column width and, when colour is on, carries a bright marker
-/// plus the `[REVIEW]` tag that [`review_tag`] also prepends to the task.
-fn review_badge(use_color: bool) -> &'static str {
-    if use_color {
-        "\x1b[1;35m\u{25c6} REVIEWING\x1b[0m"
-    } else {
-        "\u{25c6} REVIEWING"
+/// Bold, used for worker ids.
+const C_BOLD: &str = "\x1b[1m";
+/// Green: running.
+const C_GREEN: &str = "\x1b[32m";
+/// Cyan: reviewing.
+const C_CYAN: &str = "\x1b[36m";
+/// Yellow: paused or asking.
+const C_YELLOW: &str = "\x1b[33m";
+/// Red: failed or exhausted.
+const C_RED: &str = "\x1b[31m";
+/// Dim: done, retired states, model aliases.
+const C_DIM: &str = "\x1b[2m";
+/// SGR reset.
+const C_RESET: &str = "\x1b[0m";
+
+/// The one-character status glyph for a worker.
+pub fn status_glyph(status: RegistryStatus) -> char {
+    match status {
+        RegistryStatus::Running => '\u{25cf}',
+        RegistryStatus::Paused => '\u{23f8}',
+        RegistryStatus::Reviewing => '\u{25c6}',
+        RegistryStatus::Completed => '\u{2713}',
+        RegistryStatus::Failed => '\u{2717}',
+        RegistryStatus::Exhausted => '\u{2717}',
+        RegistryStatus::Stopped => '\u{25a0}',
+        RegistryStatus::Interrupted => '\u{25b2}',
     }
 }
 
-/// Tag marking a row as being in the review phase.
-fn review_tag(use_color: bool) -> &'static str {
-    if use_color {
-        "\x1b[1;35m[REVIEW]\x1b[0m"
-    } else {
-        "[REVIEW]"
+/// SGR colour of a status glyph: running green, reviewing cyan, paused yellow,
+/// failed/exhausted red, everything terminal dim.
+fn glyph_colour(status: RegistryStatus) -> &'static str {
+    match status {
+        RegistryStatus::Running => C_GREEN,
+        RegistryStatus::Reviewing => C_CYAN,
+        RegistryStatus::Paused => C_YELLOW,
+        RegistryStatus::Failed | RegistryStatus::Exhausted => C_RED,
+        RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => {
+            C_DIM
+        }
     }
 }
 
-/// Progress indicator for the turn budget: a filled/empty bar plus `step/max`.
-///
-/// The bar makes "how far along is this worker" readable at a glance; the
-/// numbers stay for precision.
+/// A coloured `●2`-style counter, or the plain form when colour is off.
+fn glyph_count(status: RegistryStatus, count: usize, use_color: bool) -> String {
+    let glyph = status_glyph(status);
+    if use_color {
+        format!("{}{glyph}{C_RESET}{count}", glyph_colour(status))
+    } else {
+        format!("{glyph}{count}")
+    }
+}
+
+/// Model alias with any provider prefix stripped (`combo:nerd` renders `nerd`).
+fn model_alias(model: &str) -> &str {
+    match model.split_once(':') {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => model,
+    }
+}
+
+/// Progress indicator for the turn budget: a filled/empty bar.
 fn progress_bar(step: usize, max_turns: usize) -> String {
     // `checked_div` keeps a zero budget (never written by the pool, but a
-    // hand-edited registry file can hold it) from panicking the whole TUI.
+    // hand-edited registry file can hold it) from panicking the renderer.
     let filled = (step.min(max_turns) * PROGRESS_CELLS)
         .checked_div(max_turns)
         .unwrap_or(PROGRESS_CELLS)
@@ -431,140 +318,18 @@ fn progress_bar(step: usize, max_turns: usize) -> String {
     bar
 }
 
-/// The turns column: a progress bar followed by the exact `step/max` counter.
-///
-/// The bar answers "how far along" at a glance, the counter "exactly how far".
-/// The bar is dropped when the terminal is too narrow to show both without
-/// wrapping.
-fn turns_cell(step: usize, max_turns: usize, layout: &Layout) -> String {
-    let counter = format!("{step}/{max_turns}");
-    let cell = match layout.shows_progress() {
-        true => format!("{} {counter}", progress_bar(step, max_turns)),
-        false => counter,
-    };
-    if cell.chars().count() >= layout.turns {
-        return cell;
-    }
-    format!("{}{cell}", " ".repeat(layout.turns - cell.chars().count()))
-}
-
-/// Status cell for a worker: badge text plus colour, padded by the caller.
-///
-/// `reviewing` is deliberately distinct from `running`: the implementer is
-/// done and an independent reviewer is auditing the diff.
-fn status_cell(status: RegistryStatus, use_color: bool) -> &'static str {
-    if status == RegistryStatus::Reviewing {
-        return review_badge(use_color);
-    }
-    if use_color {
-        match status {
-            RegistryStatus::Running => "\x1b[1;32mRUNNING  \x1b[0m",
-            RegistryStatus::Paused => "\x1b[1;33mPAUSED  \x1b[0m",
-            RegistryStatus::Completed => "\x1b[1;34mDONE    \x1b[0m",
-            RegistryStatus::Failed => "\x1b[1;31mFAILED  \x1b[0m",
-            _ => "\x1b[2;37mSTOPPED \x1b[0m",
-        }
+/// Human-readable elapsed time: `16m`, `01m 05s`, `01h 01m`.
+fn format_elapsed(secs: u64) -> String {
+    if secs < 3600 {
+        format!("{:02}m", secs / 60)
     } else {
-        match status {
-            RegistryStatus::Running => "RUNNING ",
-            RegistryStatus::Paused => "PAUSED  ",
-            RegistryStatus::Completed => "DONE    ",
-            RegistryStatus::Failed => "FAILED  ",
-            _ => "STOPPED ",
-        }
+        format!("{:02}h {:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
-/// The fixed columns of a worker row (everything left of the task text).
-fn row_prefix(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool, now: u64) -> String {
-    let id = truncate_visible(&w.id, layout.id);
-    let pid = format!("{:<width$}", w.pid, width = PID_WIDTH);
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let uptime = format_duration(duration_secs);
-
-    let status = status_cell(w.status, use_color);
-
-    let turns = turns_cell(w.step, w.max_turns, layout);
-    let model = pad_visible(&w.model, layout.model);
-    let uptime = pad_visible(&uptime, layout.uptime);
-
-    let mut prefix = String::new();
-    prefix.push_str(&pad_visible(&id, layout.id));
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&pid);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&pad_visible(status, layout.status));
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&turns);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&model);
-    prefix.push_str(&" ".repeat(GAP));
-    prefix.push_str(&uptime);
-    prefix.push_str(&" ".repeat(LAST_GAP));
-    prefix
-}
-
-/// Lay a worker out as a stack of short lines for narrow terminals.
-///
-/// Two label lines carry the fixed columns and the task text wraps below them,
-/// so nothing is chopped to a single character and no line overflows.
-fn stack_row(
-    w: &WorkerRegistryEntry,
-    layout: &Layout,
-    use_color: bool,
-    now: u64,
-    op: &str,
-) -> String {
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let status = status_cell(w.status, use_color);
-    let first = format!(
-        "{}  {}  {}",
-        pad_visible(&truncate_visible(&w.id, layout.id), layout.id),
-        pad_visible(
-            &format!("{:<width$}", w.pid, width = layout.pid),
-            layout.pid
-        ),
-        turns_cell(w.step, w.max_turns, layout),
-    );
-    let mut second = format!(
-        "{}  {}  {}",
-        pad_visible(status, layout.status),
-        pad_visible(&w.model, layout.model),
-        pad_visible(&format_duration(duration_secs), layout.uptime),
-    );
-    // Health counters ride the label line, which has room the inline row does
-    // not — but only whole: a cell that would overflow the terminal is
-    // dropped rather than clipped, so the row stays readable.
-    let health = w.metrics.repeat_nudge_cell();
-    if visible_width(&second) + 2 + visible_width(&health) <= layout.total {
-        second = format!("{}  {health}", second.trim_end());
-    }
-    let mut out = String::new();
-    out.push_str(&first);
-    out.push('\n');
-    out.push_str(&second);
-    out.push('\n');
-    out.push_str("  ");
-    out.push_str(op);
-    out.push('\n');
-    for extra in wrap_visible(op, layout.op).into_iter().skip(1) {
-        out.push_str(&" ".repeat(STACKED_INDENT));
-        out.push_str(&extra);
-        out.push('\n');
-    }
-    out
-}
-
-/// The last-op / task cell, capped to `layout.op` visible columns.
-fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String {
+/// The op cell: the question when the worker asks, else the last command, else
+/// the task headline. The group tag is demoted to a `[group]` prefix here.
+fn op_text(w: &WorkerRegistryEntry) -> String {
     let first_line = w.task.lines().next().unwrap_or("").trim();
     let detail = if let Some(ref q) = w.question {
         format!("ASK: {q}")
@@ -572,851 +337,31 @@ fn op_cell(w: &WorkerRegistryEntry, layout: &Layout, use_color: bool) -> String 
         && w.last_command != "completed"
         && w.last_command != "initializing"
     {
-        format!("{} — {}", w.last_command, first_line)
+        w.last_command.clone()
     } else {
         first_line.to_string()
     };
-
-    let tag = if w.status == RegistryStatus::Reviewing {
-        format!("{} ", review_tag(use_color))
-    } else {
-        match w.group.as_deref() {
-            Some(g) if !g.trim().is_empty() => format!("[{}] ", g.trim()),
-            _ => String::new(),
-        }
-    };
-    let detail = format!("{tag}{detail}");
-    truncate_visible(&detail, layout.op)
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard rendering
-// ---------------------------------------------------------------------------
-
-/// One repository's slice of the dashboard: its workers plus the counters
-/// shown in its heading.
-///
-/// Counters are folded in while grouping (one pass over the entries), so the
-/// heading never needs a second scan and the row loop never needs a
-/// per-status branch of its own.
-struct RepoGroup<'a> {
-    workers: Vec<&'a WorkerRegistryEntry>,
-    active: usize,
-    paused: usize,
-    reviewing: usize,
-    completed: usize,
-    failed: usize,
-    exhausted: usize,
-    stopped: usize,
-}
-
-impl<'a> RepoGroup<'a> {
-    /// An empty group, ready for [`RepoGroup::push`].
-    fn new() -> Self {
-        Self {
-            workers: Vec::new(),
-            active: 0,
-            paused: 0,
-            reviewing: 0,
-            completed: 0,
-            failed: 0,
-            exhausted: 0,
-            stopped: 0,
-        }
-    }
-
-    /// Append one worker and fold its status into the counters.
-    fn push(&mut self, entry: &'a WorkerRegistryEntry) {
-        match entry.status {
-            RegistryStatus::Running => self.active += 1,
-            RegistryStatus::Paused => self.paused += 1,
-            RegistryStatus::Reviewing => self.reviewing += 1,
-            RegistryStatus::Completed => self.completed += 1,
-            RegistryStatus::Failed => self.failed += 1,
-            RegistryStatus::Exhausted => self.exhausted += 1,
-            RegistryStatus::Stopped => self.stopped += 1,
-            RegistryStatus::Interrupted => self.stopped += 1,
-        }
-        self.workers.push(entry);
-    }
-
-    /// Heading counters: `total` first, then every non-zero state.
-    ///
-    /// A quiet repository reads `total: 4`, a busy one
-    /// `total: 4 | active: 2 | reviewing: 1 | completed: 1`. Every state is
-    /// covered, so no worker is hidden behind a dropped counter; zeros are
-    /// dropped so an idle worktree spends its heading on `total` alone.
-    fn summary_items(&self) -> Vec<(&'static str, String, &'static str)> {
-        [
-            ("total", self.workers.len(), BOLD),
-            ("active", self.active, GREEN),
-            ("paused", self.paused, YELLOW),
-            ("reviewing", self.reviewing, MAGENTA),
-            ("completed", self.completed, BLUE),
-            ("failed", self.failed, RED),
-            ("exhausted", self.exhausted, DIM),
-            ("stopped", self.stopped, DIM),
-        ]
-        .into_iter()
-        .filter(|(_, count, _)| *count > 0)
-        .map(|(label, count, color)| (label, count.to_string(), color))
-        .collect()
-    }
-}
-
-/// Render the supervisor dashboard at the default width.
-pub fn render_dashboard(entries: &[WorkerRegistryEntry], now: u64, use_color: bool) -> String {
-    render_dashboard_with_width(entries, now, use_color, DEFAULT_TERMINAL_WIDTH)
-}
-
-/// Render the supervisor dashboard for a specific terminal width.
-///
-/// Pure: identical inputs always produce identical output, which is what makes
-/// the width-dependent behaviour unit-testable.
-pub fn render_dashboard_with_width(
-    entries: &[WorkerRegistryEntry],
-    now: u64,
-    use_color: bool,
-    term_width: usize,
-) -> String {
-    let layout = Layout::for_terminal_width(term_width);
-    let mut out = String::new();
-
-    let mut active = 0;
-    let mut paused = 0;
-    let mut completed = 0;
-    let mut failed = 0;
-    let mut exhausted = 0;
-    let mut stopped = 0;
-    let mut reviewing = 0;
-
-    // Group entries by repository path: a supervisor supervises one worktree
-    // at a time, so this yields one coherent table per repository, each with
-    // its own counters. `BTreeMap` keeps repositories in path order, so the
-    // dashboard never reshuffles between ticks.
-    let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
-    for entry in entries {
-        match entry.status {
-            RegistryStatus::Running => active += 1,
-            RegistryStatus::Paused => paused += 1,
-            RegistryStatus::Reviewing => reviewing += 1,
-            RegistryStatus::Completed => completed += 1,
-            RegistryStatus::Failed => failed += 1,
-            RegistryStatus::Exhausted => exhausted += 1,
-            RegistryStatus::Stopped => stopped += 1,
-            RegistryStatus::Interrupted => stopped += 1,
-        }
-        let repo = entry.repo_path.as_deref().unwrap_or(DEFAULT_REPO_KEY);
-        repos.entry(repo).or_insert_with(RepoGroup::new).push(entry);
-    }
-
-    let total = entries.len();
-    let time_str = {
-        let secs = now % 60;
-        let mins = (now / 60) % 60;
-        let hours = (now / 3600) % 24;
-        format!("{hours:02}:{mins:02}:{secs:02}")
-    };
-
-    // Header bar, sized to the terminal so the rule never wraps.
-    let rule_width = layout.total.min(96);
-    let title = "── MINI-SWE SWARM SUPERVISOR ";
-    let tail = format!("{time_str} ──");
-    let dashes = rule_width
-        .saturating_sub(visible_width(title))
-        .saturating_sub(visible_width(&tail));
-    let header = format!("{title}{}{tail}", "─".repeat(dashes));
-    if use_color {
-        out.push_str(&format!("\x1b[1;36m{header}\x1b[0m\n"));
-    } else {
-        out.push_str(&header);
-        out.push('\n');
-    }
-    // The counter strip folds onto as many lines as the terminal needs instead
-    // of wrapping mid-item on a narrow window.
-    out.push_str(&stats_lines(
-        &[
-            ("Active", active.to_string(), GREEN),
-            ("Paused", paused.to_string(), YELLOW),
-            ("Reviewing", reviewing.to_string(), MAGENTA),
-            ("Completed", completed.to_string(), BLUE),
-            ("Failed", failed.to_string(), RED),
-            ("Exhausted", exhausted.to_string(), DIM),
-            ("Stopped", stopped.to_string(), DIM),
-            ("Total", total.to_string(), BOLD),
-            ("Repos", repos.len().to_string(), BOLD),
-        ],
-        layout.total,
-        use_color,
-    ));
-    out.push_str(&"\u{2501}".repeat(rule_width));
-    out.push_str("\n\n");
-
-    if entries.is_empty() {
-        let reg_path = crate::pool::registry_dir();
-        out.push_str(&format!(
-            "No active or recent workers found in {}.\n",
-            reg_path.display()
-        ));
-        out.push_str("Waiting for workers to dispatch... (Press Ctrl+C to exit)\n");
-        return out;
-    }
-
-    for (repo_path, group) in repos {
-        // The heading carries the path and every per-repo counter, so the rows
-        // below it stay one clean table with no domain sub-sections. The
-        // summary is joined on one line and the whole heading is then capped to
-        // the terminal, so a long path costs counters, never a wrapped header.
-        let summary = summary_line(&group.summary_items(), use_color);
-        let heading = truncate_visible(&format!("[REPO: {repo_path}]  {summary}"), layout.total);
-        if use_color {
-            out.push_str(&format!("\x1b[1;36m{heading}\x1b[0m\n"));
-        } else {
-            out.push_str(&heading);
-            out.push('\n');
-        }
-
-        match layout.shape {
-            RowShape::Inline { .. } => {
-                out.push_str(&header_line(&layout));
-                out.push_str(&"\u{2500}".repeat(layout.fixed_width() + layout.op));
-            }
-            RowShape::Stacked => out.push_str(&stacked_header_line(&layout)),
-        }
-        out.push('\n');
-
-        for w in &group.workers {
-            let op = op_cell(w, &layout, use_color);
-            match layout.shape {
-                RowShape::Inline { .. } => {
-                    let prefix = row_prefix(w, &layout, use_color, now);
-                    out.push_str(&prefix);
-                    out.push_str(&pad_visible(&op, layout.op));
-                    out.push('\n');
-                }
-                RowShape::Stacked => {
-                    out.push_str(&stack_row(w, &layout, use_color, now, &op));
-                }
-            }
-        }
-        out.push('\n');
-    }
-
-    out.push_str("Press Ctrl+C to exit monitor.\n");
-    out
-}
-
-/// Column header matching the row layout.
-fn header_line(layout: &Layout) -> String {
-    let mut line = String::new();
-    let cols = [
-        ("ID", layout.id),
-        ("PID", layout.pid),
-        ("STATUS", layout.status),
-        ("TURNS", layout.turns),
-        ("MODEL", layout.model),
-        ("UPTIME", layout.uptime),
-    ];
-    for (i, (label, width)) in cols.iter().enumerate() {
-        line.push_str(&pad_visible(label, *width));
-        if i + 1 == cols.len() {
-            line.push_str(&" ".repeat(LAST_GAP));
-        } else {
-            line.push_str(&" ".repeat(GAP));
-        }
-    }
-    line.push_str("LAST OP / TASK\n");
-    line
-}
-
-/// Header for the stacked (narrow terminal) row shape.
-fn stacked_header_line(layout: &Layout) -> String {
-    let first = format!(
-        "{}  {}  {}",
-        pad_visible("ID", layout.id),
-        pad_visible("PID", layout.pid),
-        pad_visible("TURNS", layout.turns)
-    );
-    let second = format!(
-        "{}  {}  {}",
-        pad_visible("STATUS", layout.status),
-        pad_visible("MODEL", layout.model),
-        pad_visible("UPTIME", layout.uptime)
-    );
-    format!("{first}\n{second}\nLAST OP / TASK\n")
-}
-
-// ---------------------------------------------------------------------------
-// Colour helpers
-// ---------------------------------------------------------------------------
-
-/// Bold, used for the totals.
-const BOLD: &str = "\x1b[1m";
-/// Bold green: active work.
-const GREEN: &str = "\x1b[1;32m";
-/// Bold yellow: paused.
-const YELLOW: &str = "\x1b[1;33m";
-/// Bold magenta: reviewing.
-const MAGENTA: &str = "\x1b[1;35m";
-/// Bold blue: completed.
-const BLUE: &str = "\x1b[1;34m";
-/// Bold red: failed.
-const RED: &str = "\x1b[1;31m";
-/// Dim white: stopped.
-const DIM: &str = "\x1b[2;37m";
-
-/// Render one `label: value` item, coloured when requested.
-fn item_text(label: &str, value: &str, color: &str, use_color: bool) -> String {
-    if use_color {
-        format!("{label}: {color}{value}\x1b[0m")
-    } else {
-        format!("{label}: {value}")
-    }
-}
-
-/// Join `label: value` items onto a single line for a repository heading.
-///
-/// Unlike [`stats_lines`] this never folds and never appends a newline: the
-/// heading must stay one line so the table header sits directly under it, and
-/// the caller caps the whole heading with [`truncate_visible`] afterwards.
-fn summary_line(items: &[(&str, String, &'static str)], use_color: bool) -> String {
-    let mut out = String::new();
-    for (i, (label, value, color)) in items.iter().enumerate() {
-        if i > 0 {
-            out.push_str("  |  ");
-        }
-        out.push_str(&item_text(label, value, color, use_color));
-    }
-    out
-}
-
-/// Render the `label: value | label: value` counter strip, folded to `width`.
-///
-/// Folding keeps a narrow terminal from wrapping mid-item, which is what makes
-/// the whole header readable at any width. Measurement always runs on the plain
-/// form, so an escape never counts against the budget.
-fn stats_lines(items: &[(&str, String, &'static str)], width: usize, use_color: bool) -> String {
-    const SEP: &str = "  |  ";
-    let sep_width = visible_width(SEP);
-    let mut out = String::new();
-    let mut line_width = 0usize;
-    for (i, (label, value, color)) in items.iter().enumerate() {
-        let plain = format!("{label}: {value}");
-        let item_width = visible_width(&plain);
-        if line_width > 0 && line_width + sep_width + item_width > width {
-            out.push('\n');
-            line_width = 0;
-        }
-        if line_width > 0 {
-            out.push_str(SEP);
-            line_width += sep_width;
-        }
-        out.push_str(&item_text(label, value, color, use_color));
-        line_width += item_width;
-        if i + 1 == items.len() {
-            out.push('\n');
-        }
-    }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-/// Best-effort terminal width in columns.
-pub fn terminal_width() -> Option<usize> {
-    if let Some(parsed) = env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0) {
-        return Some(parsed);
-    }
-    terminal_size_via_tty()
-}
-
-/// Terminal width from `/dev/tty` (or `COLUMNS`), if it can be read.
-#[cfg(unix)]
-fn terminal_size_via_tty() -> Option<usize> {
-    use std::os::fd::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open("/dev/tty")
-        .ok()?;
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
-    if rc == 0 && size.ws_col > 0 {
-        return Some(size.ws_col as usize);
-    }
-    columns_env()
-}
-
-#[cfg(not(unix))]
-fn terminal_size_via_tty() -> Option<usize> {
-    columns_env()
-}
-
-/// `COLUMNS` fallback shared by both platforms.
-fn columns_env() -> Option<usize> {
-    env_parse::<usize>("COLUMNS").filter(|c| *c > 0)
-}
-
-// ----------
-// Interactive mini-TUI
-// ----------
-
-/// Maximum number of turns kept in memory per worker detail view.
-///
-/// The history log is append-only and can grow without bound over a long
-/// worker, so the detail view keeps only the newest turns in memory and trims
-/// the rest as it reads. Bounded by construction; the reader never grows past
-/// this even when the file on disk is much longer.
-pub const MAX_TURNS_IN_MEMORY: usize = 500;
-
-/// A single parsed turn of a worker's history log, as the detail view shows it.
-///
-/// One assistant turn plus its tool result (or the user-role output that
-/// answers a code-block turn) collapses into one row: the step number, the
-/// command it ran, the exit code the harness recorded, and the last few lines
-/// of output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnView {
-    /// 1-based step number this turn belongs to.
-    pub step: usize,
-    /// The bash command the assistant ran (empty for a no-command turn).
-    pub command: String,
-    /// The exit code recorded by the harness, when the output named one.
-    pub exit_code: Option<i32>,
-    /// The last few lines of the tool output, newest last.
-    pub output_lines: Vec<String>,
-}
-
-/// Incremental reader over a worker's append-only history log.
-///
-/// Remembers the byte offset it has consumed and parses only the lines that
-/// were appended since the last read, so a refresh never re-reads the whole
-/// file. Keeps at most [`MAX_TURNS_IN_MEMORY`] turns; older ones are dropped.
-/// A torn final line (a crash mid-append) is skipped and the offset advances
-/// past it, so the next read picks up after it.
-#[derive(Debug, Clone, Default)]
-pub struct HistoryReader {
-    /// Byte offset the reader has consumed so far.
-    pub offset: u64,
-    /// Parsed turns, newest last, capped at [`MAX_TURNS_IN_MEMORY`].
-    pub turns: Vec<TurnView>,
-}
-
-/// Number of output lines kept per turn.
-const TURN_TAIL_LINES: usize = 5;
-
-/// Turns one PgUp/PgDn moves the detail view: a page, not a line, so a long
-/// history stays navigable without repeating the key.
-const PAGE_TURNS: usize = 10;
-
-impl HistoryReader {
-    /// Read every line appended to `path` since the last read and fold the new
-    /// turns into `self.turns`.
-    ///
-    /// The file is opened read-only and only the bytes after `self.offset` are
-    /// read, so a refresh is proportional to what changed, never to the whole
-    /// log. A missing file (a worker with no history yet) is not an error.
-    pub fn read_incremental(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        let len = file.metadata()?.len();
-        if len < self.offset {
-            // The file shrank (a rewrite replaced the log): start over.
-            self.offset = 0;
-            self.turns.clear();
-        }
-        if len <= self.offset {
-            return Ok(());
-        }
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = String::new();
-        file.read_to_string(&mut buf)?;
-        self.offset = len;
-        self.consume_lines(&buf);
-        Ok(())
-    }
-
-    /// Fold freshly-read lines into `self.turns`, capping the memory.
-    fn consume_lines(&mut self, buf: &str) {
-        let mut pending: Option<TurnView> = None;
-        let mut step = self.turns.last().map(|t| t.step).unwrap_or(0);
-        for line in buf.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(turn) = parse_turn_line(line, step) {
-                step = turn.step;
-                if let Some(done) = pending.take() {
-                    self.turns.push(done);
-                }
-                pending = Some(turn);
-            } else if let Some(output) = parse_tool_output(line)
-                && let Some(turn) = pending.as_mut()
-            {
-                turn.exit_code = output.0;
-                turn.output_lines = output.1;
-            }
-            // A torn line (a crash mid-append) parses as neither; the offset
-            // already advanced past it, so the next read continues after it.
-        }
-        if let Some(done) = pending.take() {
-            self.turns.push(done);
-        }
-        if self.turns.len() > MAX_TURNS_IN_MEMORY {
-            let excess = self.turns.len() - MAX_TURNS_IN_MEMORY;
-            self.turns.drain(..excess);
-        }
-    }
-}
-
-/// Parse one JSONL line of a history log into a [`TurnView`], if it is a turn.
-///
-/// The metadata line (line one) and any non-turn message parse to `None`. A
-/// turn is an assistant message that ran a command: its tool result carries
-/// the `COMMAND OUTPUT (exit code: N)` prefix and the output tail. `step` is
-/// the running step counter the caller maintains; it advances only when a turn
-/// is found.
-fn parse_turn_line(line: &str, step: usize) -> Option<TurnView> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("role")?.as_str()? != "assistant" {
-        return None;
-    }
-    // The command is the first bash tool call's `command` argument, or the
-    // assistant's prose when no tool call named one.
-    let command = value
-        .get("tool_calls")
-        .and_then(|calls| calls.as_array())
-        .and_then(|calls| {
-            calls.iter().find_map(|call| {
-                if call.get("function")?.get("name")?.as_str()? != "bash" {
-                    return None;
-                }
-                let args = call.get("function")?.get("arguments")?.as_str()?;
-                serde_json::from_str::<serde_json::Value>(args)
-                    .ok()
-                    .and_then(|a| {
-                        a.get("command")
-                            .and_then(|c| c.as_str())
-                            .map(str::to_string)
-                    })
-            })
-        })
-        .unwrap_or_else(|| {
-            value
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        });
-    Some(TurnView {
-        step: step + 1,
-        command,
-        exit_code: None,
-        output_lines: Vec::new(),
-    })
-}
-
-/// Parse a tool-result line into its exit code and output tail.
-///
-/// The harness records every executed command as `COMMAND OUTPUT (exit code:
-/// N)` followed by the output; the detail view shows only the last few lines
-/// so one noisy turn cannot push the rest off screen.
-fn parse_tool_output(line: &str) -> Option<(Option<i32>, Vec<String>)> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let role = value.get("role")?.as_str()?;
-    let content = value.get("content")?.as_str()?;
-    let prefix = "COMMAND OUTPUT (exit code: ";
-    let Some(rest) = content.strip_prefix(prefix) else {
-        // A tool result without the harness prefix (an error, a block note):
-        // still worth showing under the turn, without an exit code. User-role
-        // lines are instructions, not output, so only tool lines qualify.
-        if role != "tool" {
-            return None;
-        }
-        return Some((None, tail_lines(content)));
-    };
-    let (code_text, output) = rest.split_once(')')?;
-    let exit_code = code_text.trim().parse::<i32>().ok();
-    // A code-block (prose) turn is answered by a user message carrying the
-    // same harness prefix, so both roles attach output to the pending turn.
-    if role != "tool" && role != "user" {
-        return None;
-    }
-    Some((exit_code, tail_lines(output)))
-}
-
-/// Keep the last [`TURN_TAIL_LINES`] non-blank lines of a tool output.
-fn tail_lines(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .take(TURN_TAIL_LINES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-/// A key the interactive loop can receive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    Up,
-    Down,
-    PageUp,
-    PageDown,
-    Enter,
-    Esc,
-    /// A printable character (e.g. `q`, `g`, `f`, `j`, `k`).
-    Char(char),
-}
-
-/// What a keypress does to the UI state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// Move the selection up one worker (list).
-    MoveUp,
-    /// Move the selection down one worker (list).
-    MoveDown,
-    /// Open the selected worker's detail view (list).
-    OpenDetail,
-    /// Go back to the list (detail).
-    Back,
-    /// Quit the monitor entirely (list).
-    Quit,
-    /// Toggle group collapse/expand (list).
-    ToggleGroups,
-    /// Toggle follow mode (detail).
-    ToggleFollow,
-    /// Scroll the detail view up one page.
-    ScrollUp,
-    /// Scroll the detail view down one page.
-    ScrollDown,
-    /// No state change (e.g. `g`/`f` in the wrong view).
-    None,
-}
-
-/// The two views of the mini-TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
-    List,
-    Detail,
-}
-
-/// The interactive UI state.
-#[derive(Debug, Clone)]
-pub struct UiState {
-    /// Which view is active.
-    pub view: View,
-    /// Index of the selected worker within the flat list of visible workers.
-    pub selection: usize,
-    /// Whether workers are shown under their group headings.
-    pub groups_expanded: bool,
-    /// Whether the detail view sticks to the newest turn.
-    pub follow: bool,
-    /// Scroll offset (in turns) of the detail view.
-    pub scroll: usize,
-}
-
-impl Default for UiState {
-    fn default() -> Self {
-        Self {
-            view: View::List,
-            selection: 0,
-            groups_expanded: true,
-            follow: true,
-            scroll: 0,
-        }
-    }
-}
-
-impl UiState {
-    /// Apply a key to the state and return what it did.
-    ///
-    /// Pure and deterministic: the interactive loop feeds raw keys in and the
-    /// resulting action drives the redraw. `worker_count` is the number of
-    /// visible workers in the list, used to clamp the selection.
-    pub fn apply_key(&mut self, key: Key, worker_count: usize) -> Action {
-        match self.view {
-            View::List => match key {
-                Key::Up => {
-                    if self.selection > 0 {
-                        self.selection -= 1;
-                        Action::MoveUp
-                    } else {
-                        Action::None
-                    }
-                }
-                Key::Down => {
-                    if worker_count > 0 && self.selection + 1 < worker_count {
-                        self.selection += 1;
-                        Action::MoveDown
-                    } else {
-                        Action::None
-                    }
-                }
-                Key::Enter => {
-                    if worker_count > 0 {
-                        self.view = View::Detail;
-                        self.follow = true;
-                        self.scroll = 0;
-                        Action::OpenDetail
-                    } else {
-                        Action::None
-                    }
-                }
-                Key::Esc | Key::Char('q') => Action::Quit,
-                Key::Char('g') => {
-                    self.groups_expanded = !self.groups_expanded;
-                    Action::ToggleGroups
-                }
-                _ => Action::None,
-            },
-            View::Detail => match key {
-                // Ctrl+C arrives as `q` from `read_key`: it steps back here
-                // and quits from the list, so two presses always exit.
-                Key::Esc | Key::Char('q') => {
-                    self.view = View::List;
-                    Action::Back
-                }
-                Key::PageUp => {
-                    self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
-                    Action::ScrollUp
-                }
-                Key::PageDown => {
-                    self.scroll = self.scroll.saturating_add(PAGE_TURNS);
-                    Action::ScrollDown
-                }
-                Key::Char('f') => {
-                    self.follow = !self.follow;
-                    Action::ToggleFollow
-                }
-                _ => Action::None,
-            },
-        }
-    }
-}
-
-/// Parse a raw byte sequence from the terminal into a [`Key`].
-///
-/// Handles the arrow keys and PgUp/PgDn escape sequences plus `j`/`k` as
-/// Up/Down aliases; everything else maps to its character or `None` for
-/// control bytes the UI ignores.
-pub fn parse_key(bytes: &[u8]) -> Option<Key> {
-    match bytes {
-        [0x1b, b'[', b'A'] => Some(Key::Up),
-        [0x1b, b'[', b'B'] => Some(Key::Down),
-        [0x1b, b'[', b'5', b'~'] => Some(Key::PageUp),
-        [0x1b, b'[', b'6', b'~'] => Some(Key::PageDown),
-        [b'\r'] | [b'\n'] => Some(Key::Enter),
-        [0x1b] => Some(Key::Esc),
-        [b'j'] => Some(Key::Down),
-        [b'k'] => Some(Key::Up),
-        [b] if b.is_ascii_graphic() || *b == b' ' => Some(Key::Char(*b as char)),
-        _ => None,
+    match w.group.as_deref() {
+        Some(g) if !g.trim().is_empty() => format!("[{}] {detail}", g.trim()),
+        _ => detail,
     }
 }
 
 /// Fit one worker to a single compact line of at most `width` visible columns.
 ///
-/// Layout: `glyph id model step/max elapsed op` with the group demoted to a
-/// `[group]` prefix inside the op column. The op text is truncated to whatever
-/// the fixed columns leave behind, so no line ever overflows `width`.
-/// Completed and retired-soon workers are dimmed.
+/// Layout: `glyph id model step/max elapsed op`, columns dropping in the
+/// stated order as the terminal narrows. Delegates to [`compact_row`] so the
+/// interactive list and the plain dashboard share one layout; plain (no ANSI
+/// codes) like the non-TTY output.
 pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> String {
-    let glyph = status_glyph(w.status).to_string();
-    let id = pad_visible(&truncate_visible(&w.id, 8), 8);
-    let model = pad_visible(&truncate_visible(&w.model, 8), 8);
-    let duration_secs = if w.status.is_terminal() {
-        w.updated_at.saturating_sub(w.started_at)
-    } else {
-        now.saturating_sub(w.started_at)
-    };
-    let elapsed = format_duration(duration_secs);
-    let turns = format!("{}/{}", w.step, w.max_turns);
-
-    let group = w
-        .group
-        .as_deref()
-        .filter(|g| !g.trim().is_empty())
-        .map(|g| format!("[{}] ", g.trim()));
-    let op_text = if let Some(ref q) = w.question {
-        format!("ASK: {q}")
-    } else if !w.last_command.is_empty()
-        && w.last_command != "completed"
-        && w.last_command != "initializing"
-    {
-        w.last_command.clone()
-    } else {
-        w.task.lines().next().unwrap_or("").trim().to_string()
-    };
-    let op_text = format!("{}{op_text}", group.unwrap_or_default());
-
-    let fixed = visible_width(&glyph)
-        + 1
-        + 8
-        + 1
-        + 8
-        + 1
-        + visible_width(&turns)
-        + 1
-        + visible_width(&elapsed)
-        + 1;
-    let op_width = width.saturating_sub(fixed).max(1);
-    let op = truncate_visible(&op_text, op_width);
-
-    let line = format!("{glyph} {id} {model} {turns} {elapsed} {op}");
-    if dim_worker(w, now) {
-        format!("\x1b[2m{line}\x1b[0m")
-    } else {
-        line
-    }
-}
-
-/// Whether a worker row is dimmed: terminal workers, plus live workers that
-/// stopped reporting (no update within the terminal TTL, so the sweeper will
-/// soon retire them).
-fn dim_worker(w: &WorkerRegistryEntry, now: u64) -> bool {
-    if w.status.is_terminal() {
-        return true;
-    }
-    now.saturating_sub(w.updated_at) > crate::pool::DEFAULT_TERMINAL_TTL_SECS
-}
-
-/// The one-character status glyph for a worker.
-pub fn status_glyph(status: RegistryStatus) -> char {
-    match status {
-        RegistryStatus::Running => '\u{25cf}',
-        RegistryStatus::Paused => '\u{25cb}',
-        RegistryStatus::Reviewing => '\u{25c6}',
-        RegistryStatus::Completed => '\u{2713}',
-        RegistryStatus::Failed => '\u{2717}',
-        RegistryStatus::Exhausted => '\u{26a0}',
-        RegistryStatus::Stopped => '\u{25a0}',
-        RegistryStatus::Interrupted => '\u{25b2}',
-    }
+    compact_row(w, now, width.saturating_sub(4).max(1), false)
 }
 
 /// One line of the key hint shown at the bottom of the interactive views.
 pub fn key_hint(view: View) -> &'static str {
     match view {
-        View::List => "Up/Down or j/k move - Enter detail - g groups - q quit",
-        View::Detail => "PgUp/PgDn scroll - f follow - Esc/q back",
+        View::List => "\u{2191}\u{2193} select  \u{23ce} turns  g groups  q quit",
+        View::Detail => "PgUp/PgDn scroll  f follow  Esc/q back",
     }
 }
 
