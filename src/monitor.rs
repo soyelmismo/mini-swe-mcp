@@ -1164,6 +1164,8 @@ pub enum Action {
     ToggleGroups,
     /// Toggle follow mode (detail).
     ToggleFollow,
+    /// Expand/collapse the selected turn's full output (detail).
+    ToggleExpand,
     /// Scroll the detail view up one page.
     ScrollUp,
     /// Scroll the detail view down one page.
@@ -1261,6 +1263,23 @@ impl UiState {
                 Key::Esc | Key::Char('q') => {
                     self.view = View::List;
                     Action::Back
+                }
+                Key::Up => {
+                    self.selected_turn = self.selected_turn.saturating_add(1);
+                    Action::MoveUp
+                }
+                Key::Down => {
+                    self.selected_turn = self.selected_turn.saturating_sub(1);
+                    Action::MoveDown
+                }
+                Key::Enter => {
+                    // The selected turn's step: turns are indexed newest-first,
+                    // so `selected_turn` counts back from the newest.
+                    let step = self.selected_turn.saturating_add(1);
+                    if !self.expanded.insert(step) {
+                        self.expanded.remove(&step);
+                    }
+                    Action::ToggleExpand
                 }
                 Key::PageUp => {
                     self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
@@ -1520,9 +1539,10 @@ fn render_list(
 }
 
 /// Render the detail view for one worker: its REPORT/question/status header on
-/// top, then its turns newest-last. Follow mode sticks to the newest turn;
-/// otherwise `state.scroll` turns are skipped from the end. The view is a
-/// bordered box following the same width rules as the list.
+/// top, then its turns newest-last as clearly separated blocks. Follow mode
+/// sticks to the newest turn; otherwise `state.scroll` turns are skipped from
+/// the end. The view is a bordered box following the same width rules as the
+/// list, and every line is clipped to the terminal width.
 fn render_detail(
     entry: &WorkerRegistryEntry,
     reader: &HistoryReader,
@@ -1530,7 +1550,7 @@ fn render_detail(
     now: u64,
     width: usize,
     height: usize,
-) -> String {
+) -> Vec<String> {
     let use_color = use_color_for_tty(true);
     let status_name = entry.status.display_name();
     let title = format!(
@@ -1540,74 +1560,140 @@ fn render_detail(
         status_name
     );
     let total = format!("{}/{}", entry.step, entry.max_turns);
-    let mut out = String::new();
-    out.push_str(&box_top(
+    let mut out = vec![box_top(
         &title,
         &total,
         "",
         &header_clock(now),
         width,
         use_color,
-    ));
-    out.push('\n');
-    let mut body: Vec<String> = Vec::new();
-    body.push(format!(
-        "task: {}",
-        sanitize_text(entry.task.lines().next().unwrap_or(""))
-    ));
-    if let Some(ref q) = entry.question {
-        body.push(format!("question: {}", sanitize_text(q)));
-    }
-    if let Some(ref report) = entry.report
-        && !report.is_empty()
-    {
-        body.push(format!(
-            "report: {} | files: {} | tests: {} | risks: {}",
-            sanitize_text(&report.done),
-            sanitize_text(&report.files),
-            sanitize_text(&report.tests),
-            sanitize_text(&report.risks)
-        ));
-    }
-    let body_height = height.saturating_sub(3).max(1);
+    )];
+
+    // The turns, newest last, that the view may show.
     let skip = if state.follow {
         0
     } else {
         state.scroll.min(reader.turns.len().saturating_sub(1))
     };
     let end = reader.turns.len().saturating_sub(skip);
-    let mut turn_lines: Vec<String> = Vec::new();
-    for turn in &reader.turns[..end] {
-        let code = turn
-            .exit_code
-            .map(|c| format!(" (exit {c})"))
-            .unwrap_or_default();
-        turn_lines.push(format!(
-            "#{} {}{}",
-            turn.step,
-            sanitize_text(&turn.command),
-            code
-        ));
-        for line in &turn.output_lines {
-            turn_lines.push(format!("  {}", sanitize_text(line)));
+    let turns = &reader.turns[..end];
+
+    // Render each turn's block: a separator line carrying the turn number, a
+    // coloured ✓/✗ with the exit code, the duration when known and the review
+    // phase, then the bold command and (for the tail) the dim output lines.
+    // The newest turn is at the bottom of the list, so we walk newest-last.
+    let mut blocks: Vec<String> = Vec::new();
+    for (off, turn) in turns.iter().enumerate().rev() {
+        let is_selected = off == state.selected_turn;
+        blocks.push(turn_separator(turn, width, use_color));
+        let indent = "  ";
+        let cmd = format!("{indent}$ {}{}", C_BOLD, sanitize_text(&turn.command));
+        let cmd = format!("{cmd}{C_RESET}");
+        blocks.push(box_line(&cmd, width));
+        if state.expanded.contains(&turn.step) {
+            // Fully expanded (still width-clipped): every output line.
+            for line in &turn.output_lines {
+                blocks.push(box_line(
+                    &format!("{indent}{C_DIM}{}{C_RESET}", sanitize_text(line)),
+                    width,
+                ));
+            }
+        } else {
+            // Collapsed: the newest few output lines, dim and indented.
+            let tail = turn
+                .output_lines
+                .iter()
+                .rev()
+                .take(TURN_TAIL_LINES)
+                .collect::<Vec<_>>();
+            for line in tail.into_iter().rev() {
+                blocks.push(box_line(
+                    &format!("{indent}{C_DIM}{}{C_RESET}", sanitize_text(line)),
+                    width,
+                ));
+            }
+        }
+        if is_selected {
+            // Mark the selected turn's separator so the operator can see which
+            // turn Enter will expand/collapse.
+            if let Some(last) = blocks.last_mut() {
+                *last = format!("{last}  \u{25b8}");
+            }
         }
     }
-    if turn_lines.is_empty() {
-        turn_lines.push("(no turns recorded yet)".to_string());
+    if blocks.is_empty() {
+        blocks.push(box_line("(no turns recorded yet)", width));
     }
-    let start = turn_lines.len().saturating_sub(body_height);
-    for line in turn_lines.iter().skip(start) {
-        body.push(line.clone());
+
+    // The header block (task/question/report) stays pinned at the top; the
+    // turn blocks scroll beneath it.
+    let mut header: Vec<String> = Vec::new();
+    header.push(box_line(
+        &format!("task: {}", sanitize_text(entry.task.lines().next().unwrap_or(""))),
+        width,
+    ));
+    if let Some(ref q) = entry.question {
+        header.push(box_line(&format!("question: {}", sanitize_text(q)), width));
     }
-    for line in body.iter().take(body_height) {
-        out.push_str(&box_line(line, width));
-        out.push('\n');
+    if let Some(ref report) = entry.report
+        && !report.is_empty()
+    {
+        header.push(box_line(
+            &format!(
+                "report: {} | files: {} | tests: {} | risks: {}",
+                sanitize_text(&report.done),
+                sanitize_text(&report.files),
+                sanitize_text(&report.tests),
+                sanitize_text(&report.risks)
+            ),
+            width,
+        ));
     }
-    let _ = now;
-    out.push_str(&box_bottom(key_hint(View::Detail), width, use_color));
-    out.push('\n');
+
+    let body_height = height.saturating_sub(2).max(1);
+    // The header is pinned; the turn blocks fill what remains.
+    let header_height = header.len().min(body_height);
+    for l in header.iter().take(header_height) {
+        out.push(l.clone());
+    }
+    let turn_height = body_height.saturating_sub(header_height);
+    let start = blocks.len().saturating_sub(turn_height);
+    for l in blocks.iter().skip(start).take(turn_height) {
+        out.push(l.clone());
+    }
+    out.push(box_bottom(key_hint(View::Detail), width, use_color));
     out
 }
+
+/// The separator line of one turn block: `── turn N · ✓ exit 0 · 4s ───…`.
+///
+/// Carries the turn number, a coloured ✓/✗ with the exit code, the duration
+/// when the history recorded one and `(review)` when the turn belongs to the
+/// review phase. The line is clipped to the box width like every other line.
+fn turn_separator(turn: &TurnView, width: usize, use_color: bool) -> String {
+    let mark = if turn.exit_code == Some(0) { "\u{2713}" } else { "\u{2717}" };
+    let mark = if use_color {
+        let colour = if turn.exit_code == Some(0) { C_GREEN } else { C_RED };
+        format!("{colour}{mark}{C_RESET}")
+    } else {
+        mark.to_string()
+    };
+    let code = turn
+        .exit_code
+        .map(|c| format!(" exit {c}"))
+        .unwrap_or_default();
+    let duration = turn
+        .duration_secs
+        .map(|d| format!(" \u{b7} {}", format_elapsed(d)))
+        .unwrap_or_default();
+    let review = if turn.review { " (review)" } else { "" };
+    let inner = width.saturating_sub(4).max(1);
+    let prefix = format!("── turn {} \u{b7} {mark}{code}{duration}{review}", turn.step);
+    let dashes = inner.saturating_sub(visible_width(&prefix)).max(1);
+    let line = format!("{prefix} {}", "─".repeat(dashes));
+    box_line(&line, width)
+}
+
 /// Read one keypress from stdin, gathering a full escape sequence.
 ///
 /// Arrow keys and PgUp/PgDn arrive as multi-byte sequences; after a lone ESC
@@ -1667,6 +1753,31 @@ fn terminal_height() -> usize {
     24
 }
 
+/// Write one interactive frame to the terminal without flicker.
+///
+/// The frame is a list of already-rendered lines. The cursor moves home, each
+/// line is written followed by `\x1b[K` (erase to end of line) so a shorter
+/// line never leaves a stale tail, then `\x1b[J` once at the end clears any
+/// leftover rows. The lines are joined with `\r\n` -- raw mode clears OPOST,
+/// so a bare `\n` would not return the carriage and every line would start
+/// where the previous one ended -- and the whole frame is one `write_all` plus
+/// one flush. When the frame equals the previous one nothing is written at all.
+fn write_frame(stdout: &mut dyn Write, frame: &[String], last: &mut Option<String>) {
+    let joined = frame.join("\r\n");
+    if last.as_deref() == Some(joined.as_str()) {
+        return;
+    }
+    let mut buf = String::from("\x1b[H");
+    for line in frame {
+        buf.push_str(line);
+        buf.push_str("\x1b[K\r\n");
+    }
+    buf.push_str("\x1b[J");
+    let _ = stdout.write_all(buf.as_bytes());
+    let _ = stdout.flush();
+    *last = Some(joined);
+}
+
 /// Run the interactive mini-TUI: compact list plus worker detail.
 ///
 /// Enters raw mode and the alternate screen, then redraws at most once per
@@ -1698,6 +1809,7 @@ async fn run_interactive() -> Result<()> {
     };
 
     let mut state = UiState::default();
+    let mut last_frame: Option<String> = None;
     let mut readers: std::collections::HashMap<String, HistoryReader> =
         std::collections::HashMap::new();
     // Scratch root is resolved once: history files live beside the registry.
@@ -1740,8 +1852,7 @@ async fn run_interactive() -> Result<()> {
         };
         {
             let mut stdout = std::io::stdout().lock();
-            let _ = write!(stdout, "\x1b[H\x1b[J{output}");
-            let _ = stdout.flush();
+            write_frame(&mut stdout, &output, &mut last_frame);
         }
 
         enum Wake {
@@ -1828,6 +1939,7 @@ pub async fn run_monitor(once: bool) -> Result<()> {
     let _ = std::io::stdout().flush();
     let _guard = CursorGuard;
 
+    let mut last_frame: Option<String> = None;
     loop {
         let entries = load_all_registry_entries();
         let now = unix_timestamp();
@@ -1841,8 +1953,8 @@ pub async fn run_monitor(once: bool) -> Result<()> {
 
         {
             let mut stdout = std::io::stdout().lock();
-            let _ = write!(stdout, "\x1b[H\x1b[J{output}");
-            let _ = stdout.flush();
+            let frame: Vec<String> = output.lines().map(str::to_string).collect();
+            write_frame(&mut stdout, &frame, &mut last_frame);
         }
 
         tokio::select! {
@@ -2652,8 +2764,10 @@ mod tests {
             command: format!("cargo test{hostile}"),
             exit_code: Some(0),
             output_lines: vec![format!("out{hostile}")],
+            duration_secs: None,
+            review: false,
         });
-        let detail = render_detail(&entry, &reader, &UiState::default(), 1060, 120, 24);
+        let detail = render_detail(&entry, &reader, &UiState::default(), 1060, 120, 24).join("\n");
         assert!(
             !detail.contains("\x1b[?1049l") && !detail.contains("]0;pwned"),
             "no worker-chosen escape may reach the terminal: {detail:?}"
@@ -2823,4 +2937,151 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// A counting writer so a test can assert how many times a frame is written.
+    struct CountingWriter {
+        buf: Vec<u8>,
+        writes: usize,
+    }
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(buf);
+            self.writes += 1;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The interactive frame joins its lines with `\r\n` (raw mode clears
+    /// OPOST, so a bare `\n` would not return the carriage) and an unchanged
+    /// frame produces no write at all.
+    #[test]
+    fn test_write_frame_joins_with_crlf_and_skips_unchanged() {
+        let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+        let mut last: Option<String> = None;
+        let frame = vec!["line one".to_string(), "line two".to_string()];
+
+        write_frame(&mut w, &frame, &mut last);
+        assert_eq!(w.writes, 1, "one write per changed frame");
+        let text = String::from_utf8(w.buf.clone()).expect("utf8");
+        assert!(
+            text.contains("line one\r\nline two"),
+            "frame must join lines with CRLF: {text:?}"
+        );
+        assert!(text.contains("\x1b[H"), "frame must move the cursor home");
+        assert!(text.contains("\x1b[K"), "each line erases to end of line");
+        assert!(text.contains("\x1b[J"), "one clear-to-end-of-screen at the end");
+
+        // An identical frame writes nothing.
+        write_frame(&mut w, &frame, &mut last);
+        assert_eq!(w.writes, 1, "an unchanged frame must not be written");
+
+        // A changed frame writes again.
+        let changed = vec!["line one".to_string(), "line changed".to_string()];
+        write_frame(&mut w, &changed, &mut last);
+        assert_eq!(w.writes, 2, "a changed frame must be written");
+    }
+
+    /// Every rendered line of the interactive list is within the terminal width
+    /// at 40, 60 and 100, borders included.
+    #[test]
+    fn test_interactive_list_lines_fit_width() {
+        let entries = sample_entries();
+        for width in [40usize, 60, 100] {
+            let frame = render_list(&entries, &UiState::default(), 1060, width, 20);
+            for line in &frame {
+                assert!(
+                    visible_width(line) <= width,
+                    "list line overflows {width} cols ({}): {line:?}",
+                    visible_width(line)
+                );
+            }
+        }
+    }
+
+    /// Every rendered line of the detail view is within the terminal width at
+    /// 40, 60 and 100, and a turn block carries its separator with the turn
+    /// number and exit code.
+    #[test]
+    fn test_interactive_detail_lines_fit_width_and_turn_blocks() {
+        let entry = Row::new("925633bb")
+            .status(RegistryStatus::Running)
+            .turns(15, 250)
+            .command("cargo test --lib monitor")
+            .task("Consolidate the round")
+            .group("round52")
+            .build();
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 12,
+            command: "cargo test --lib monitor 2>&1 | tail -5".to_string(),
+            exit_code: Some(0),
+            output_lines: vec![
+                "test result: ok. 41 passed; 0 failed".to_string(),
+                "another output line that is long".to_string(),
+            ],
+            duration_secs: Some(4),
+            review: false,
+        });
+        reader.turns.push(TurnView {
+            step: 13,
+            command: "cargo clippy --all-targets -- -D warnings".to_string(),
+            exit_code: Some(101),
+            output_lines: vec!["error: unused variable `width`".to_string()],
+            duration_secs: Some(2),
+            review: true,
+        });
+
+        for width in [40usize, 60, 100] {
+            let frame = render_detail(&entry, &reader, &UiState::default(), 1060, width, 24);
+            for line in &frame {
+                assert!(
+                    visible_width(line) <= width,
+                    "detail line overflows {width} cols ({}): {line:?}",
+                    visible_width(line)
+                );
+            }
+            let text = frame.join("\n");
+            assert!(
+                text.contains("turn 12") && text.contains("exit 0"),
+                "turn 12 separator must carry the number and exit code: {text}"
+            );
+            assert!(
+                text.contains("turn 13") && text.contains("exit 101"),
+                "turn 13 separator must carry the number and exit code: {text}"
+            );
+            assert!(
+                text.contains("(review)"),
+                "a review turn must be marked (review): {text}"
+            );
+            assert!(
+                text.contains("$ cargo test --lib monitor 2>&1 | tail -5"),
+                "the command must show after `$ `: {text}"
+            );
+            assert!(
+                text.contains("test result: ok. 41 passed; 0 failed"),
+                "the output tail must show: {text}"
+            );
+        }
+    }
+
+    /// Up/Down select a turn and Enter expands/collapses its full output in the
+    /// detail view; follow clamps the selection to the newest turn.
+    #[test]
+    fn test_detail_turn_selection_and_expand_collapse() {
+        let mut state = UiState::default();
+        state.view = View::Detail;
+        assert_eq!(state.apply_key(Key::Up, 0), Action::MoveUp);
+        assert_eq!(state.selected_turn, 1);
+        assert_eq!(state.apply_key(Key::Down, 0), Action::MoveDown);
+        assert_eq!(state.selected_turn, 0);
+        // Enter expands the selected turn (step 1).
+        assert_eq!(state.apply_key(Key::Enter, 0), Action::ToggleExpand);
+        assert!(state.expanded.contains(&1), "turn 1 must expand");
+        // Enter again collapses it.
+        assert_eq!(state.apply_key(Key::Enter, 0), Action::ToggleExpand);
+        assert!(!state.expanded.contains(&1), "turn 1 must collapse");
+    }
+
 }
