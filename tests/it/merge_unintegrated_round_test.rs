@@ -915,3 +915,44 @@ fn a_forced_merge_keeps_the_unintegrated_member() {
         "a member the round really carried is retired as before"
     );
 }
+
+/// An ordinary worker is not a round.
+///
+/// The provenance check enumerates a round from the consolidator's dispatch
+/// snapshot, falling back to the owner's group. An ordinary worker has no round
+/// and nothing to prove: a sibling of its group that the worker never merged is
+/// simply a different piece of work, and refusing the merge over it strands the
+/// whole group behind `--force`.
+#[test]
+fn an_ordinary_worker_of_a_group_merges_on_its_own() {
+    let f = Fixture::new("round-ordinary");
+    f.left_out_member("wa");
+    f.left_out_member("wb");
+
+    f.merge("wa", false)
+        .expect("an ordinary worker is not a round and must merge on its own");
+    assert!(f.repo().join("wa.md").exists(), "the worker must land");
+    assert!(
+        !f.repo().join("wb.md").exists(),
+        "a sibling's work must not ride in with it"
+    );
+}
+
+/// The same for the batch: `merge --approved --group <g>` is how a round's
+/// approved workers are landed with one gate, so two approved workers of one
+/// group must both land.
+#[test]
+fn the_approved_batch_lands_two_workers_of_one_group() {
+    let f = Fixture::new("round-batch-group");
+    f.left_out_member("wa");
+    f.left_out_member("wb");
+    f.approve("wa");
+    f.approve("wb");
+
+    f.merge_approved()
+        .expect("a batch of ordinary workers of one group must land");
+    assert!(
+        f.repo().join("wa.md").exists() && f.repo().join("wb.md").exists(),
+        "both workers of the group must land"
+    );
+}

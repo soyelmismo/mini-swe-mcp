@@ -1182,8 +1182,17 @@ fn branch_unresolvable(repo: &Path, branch: &str) -> bool {
 /// A consolidator dispatched before the snapshot existed -- or whose snapshot
 /// names nobody, which an interrupted or hostile write can produce -- falls back
 /// to the registry scan, the best reconstruction available for it.
+///
+/// Only a consolidator has a round. An ordinary worker is merged on its own and
+/// its group siblings are separate pieces of work it never claimed, so a
+/// non-consolidator row is asked for nothing but the ids it recorded itself:
+/// enumerating its group here would refuse the merge over work the worker was
+/// never asked to carry, and strand every grouped worker behind `--force`.
 fn round_members(root: &ScratchRoot, row: &WorkerRegistryEntry) -> Vec<String> {
     let mut members: BTreeSet<String> = row.integrated.iter().cloned().collect();
+    if row.role != WorkerRole::Consolidate {
+        return members.into_iter().collect();
+    }
     // A dispatch-time snapshot: exactly the round, as it was, in one repository.
     // A snapshot that names nobody is not a snapshot: the file is written
     // without an atomic rename, and any writer that is interrupted (or any other
