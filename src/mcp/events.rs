@@ -1820,12 +1820,48 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
         let Some(id) = row["id"].as_str() else {
             continue;
         };
-        let view = views.entry(id.to_string()).or_insert_with(|| json!({
+        let view = views.entry(id.to_string()).or_insert_with(|| {
+            if let Ok(path) = std::env::var("MINI_SWE_WATCH_DEBUG_FILE") {
+                use std::io::Write;
+                let dir = pool.scratch_root().join("swe-registry");
+                let listing = std::fs::read_dir(&dir)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter_map(|f| {
+                                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                                format!("{}:{}", f.file_name().to_string_lossy(), len)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|e| format!("read_dir failed: {e}"));
+                    let row_path = dir.join(format!("{id}.json"));
+                    let content = std::fs::read(&row_path)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                        .unwrap_or_else(|e| format!("read failed: {e}"));
+                    let parsed = serde_json::from_slice::<serde_json::Value>(
+                        std::fs::read(&row_path).as_deref().unwrap_or_default(),
+                    )
+                    .map(|v| v["status"].to_string())
+                    .unwrap_or_else(|e| format!("parse failed: {e}"));
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = writeln!(
+                        f,
+                        "skeleton for {id}: dir=[{listing}] content={content} parsed={parsed}"
+                    );
+                }
+            }
+            json!({
             "worker_id":id,"model":row["model"],"owner":row["owner"],"group":"default",
             "task":clamp_string(row["task"].as_str().unwrap_or("").lines().next().unwrap_or(""),500),
             "branch":null,"revision":0,"max_turns":0,"metrics":WorkerMetrics::default(),
             "elapsed":0,"last_step_at":now,"last_ops":[],"question":null
-        }));
+            })
+        });
         view["owner"] = row["owner"].clone();
         if let Some(progress) = pool.worker_progress(id).await {
             view["step"] = json!(progress.step);
