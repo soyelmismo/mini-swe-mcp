@@ -449,6 +449,34 @@ fn bounded_tail(output: &str, limit: usize) -> String {
     format!("...{}", &output[start..])
 }
 
+/// How many of a command's last non-empty lines a tracing line may carry.
+pub(super) const LOG_OUTPUT_LINES: usize = 5;
+
+/// Ceiling on the bytes one tracing line may spend on a command's output.
+///
+/// The hub log only has to answer "what did this run end with": a 400-byte,
+/// five-line tail does that, while a whole `cargo test` transcript per verify
+/// grew a log nobody could read (6.6 MB over 51.7k lines, ~1.7 MB of it raw
+/// gate output) and had nothing to stop it. The model still receives the full
+/// (already truncated) output through the tool result; only the log shrinks.
+pub(super) const LOG_OUTPUT_BYTES: usize = 400;
+
+/// A command's output as a tracing field: its last [`LOG_OUTPUT_LINES`]
+/// non-empty lines, bounded to [`LOG_OUTPUT_BYTES`].
+///
+/// Blank lines carry nothing, and the bound is applied after the line pick so a
+/// single very long line cannot smuggle a whole transcript into one field.
+pub(super) fn log_output_tail(output: &str) -> String {
+    let mut kept: Vec<&str> = Vec::with_capacity(LOG_OUTPUT_LINES);
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        kept.push(line);
+        if kept.len() == LOG_OUTPUT_LINES {
+            break;
+        }
+    }
+    bounded_tail(&kept.join("\n"), LOG_OUTPUT_BYTES)
+}
+
 /// The nudge a first loop detection injects: name the loop, name what the
 /// worker is not learning, and demand a different action.
 ///
@@ -2791,10 +2819,12 @@ impl<'a> TurnEngine<'a> {
         let (output_b, code_b) = self
             .run_gated_with_env(verify, AdmissionClass::Completion, divergent_env.clone())
             .await?;
+        // The exit code and the tail are what a reader needs; the output
+        // itself stays with the model through the observation.
         tracing::info!(
             worker = %self.worker_id,
             exit = ?code_b,
-            output = %crate::agent::sandbox::truncate_output(&output_b),
+            output = %log_output_tail(&output_b),
             "Divergent verify variant B finished"
         );
 
