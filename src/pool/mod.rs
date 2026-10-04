@@ -345,6 +345,12 @@ pub struct WorkerPool {
     /// Worker id -> heavy commands queued ahead of it while it waits for a
     /// build slot. Set while blocked in admission, cleared when granted.
     admission_waiting: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// A registry row to write inside a watch snapshot's load/re-read window,
+    /// so a test can land a row exactly where a concurrent status write would
+    /// and drive the skeleton path deterministically. `None` in every
+    /// non-test run, and taken (not cloned) so it fires at most once.
+    #[doc(hidden)]
+    pub __test_snapshot_race_hook: Arc<std::sync::Mutex<Option<WorkerRegistryEntry>>>,
     /// Worker id -> unix time its current bash command started. Set while
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
@@ -462,6 +468,7 @@ impl WorkerPool {
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            __test_snapshot_race_hook: Arc::new(std::sync::Mutex::new(None)),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
             harness_wait_label: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: JobTable::new(),
