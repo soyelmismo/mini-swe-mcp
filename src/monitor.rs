@@ -2002,6 +2002,68 @@ mod tests {
         );
     }
 
+    /// Every row of a frame starts its op at the same column, at 40, 60, 80 and
+    /// 120: the visible columns and their widths are decided once for the whole
+    /// frame, so a table of ragged rows (one worker keeping a column its
+    /// neighbour dropped) cannot happen.
+    #[test]
+    fn test_every_row_of_a_frame_aligns_its_op_column() {
+        // Deliberately mixed rows: wide and narrow `step/max`, a long and a
+        // short id, so a per-row decision would disagree with its neighbour.
+        let entries = vec![
+            Row::new("a1b2c3d4")
+                .status(RegistryStatus::Running)
+                .turns(15, 250)
+                .command("Consolidate the round in group round57")
+                .task("Consolidate the round in group round57")
+                .group("round57")
+                .build(),
+            Row::new("bb1a5885")
+                .status(RegistryStatus::Completed)
+                .turns(71, 150)
+                .command("Polish the monitor columns")
+                .task("Polish the monitor columns")
+                .group("round57")
+                .build(),
+            Row::new("c0ffee00")
+                .status(RegistryStatus::Failed)
+                .turns(9, 9)
+                .command("cargo test --lib monitor")
+                .task("Test the monitor")
+                .group("round57")
+                .build(),
+        ];
+        for width in [40usize, 60, 80, 120] {
+            let text = render_dashboard_with_width(&entries, 1060, false, width);
+            let mut op_columns = Vec::new();
+            for line in text.lines() {
+                let Some(rest) = line.split_once(status_glyph(RegistryStatus::Failed)) else {
+                    continue;
+                };
+                if !line.contains("a1b2c3d4") && !line.contains("bb1a5885") && !line.contains("c0ffee00")
+                {
+                    continue;
+                }
+                let _ = rest;
+                // The op is everything after the id, padded to its column width.
+                for id in ["a1b2c3d4", "bb1a5885", "c0ffee00"] {
+                    if let Some(pos) = line.find(id) {
+                        op_columns.push(pos + ID_WIDTH);
+                    }
+                }
+            }
+            assert_eq!(
+                op_columns.len(),
+                entries.len(),
+                "a worker row went missing at {width}:\n{text}"
+            );
+            assert!(
+                op_columns.windows(2).all(|w| w[0] == w[1]),
+                "rows disagree on the op column at {width}: {op_columns:?}\n{text}"
+            );
+        }
+    }
+
     /// The op is the protected column: at 50 columns it keeps at least
     /// [`MIN_OP_WIDTH`] visible characters, so the narrow layout spends its
     /// columns on what the worker is doing rather than on the label around it.
