@@ -1657,18 +1657,36 @@ fn render_detail(
         let is_selected = off == selected_idx;
         blocks.push(turn_separator(turn, width, use_color, is_selected));
         let indent = "  ";
-        // The command is bold after `$ ` and the output lines are dim, but only
-        // when colour is on: NO_COLOR must leave the frame free of escapes.
-        let cmd = if use_color {
-            format!(
-                "{indent}$ {}{}{C_RESET}",
-                C_BOLD,
-                sanitize_text(&turn.command)
-            )
+        // The command is rendered on one line: a turn whose recorded command
+        // spans several lines (a note the model wrote instead of a command)
+        // shows its first non-empty line plus ` …`, because a bare newline
+        // inside a bordered line would emit a bare LF and break the frame.
+        // The expanded view shows every line, each as its own bordered,
+        // width-clipped line. The command is bold after `$ ` and the output
+        // lines are dim, but only when colour is on: NO_COLOR must leave the
+        // frame free of escapes.
+        let cmd_lines: Vec<String> = if state.expanded.contains(&turn.step) {
+            turn.command.lines().map(sanitize_text).collect()
         } else {
-            format!("{indent}$ {}", sanitize_text(&turn.command))
+            let mut lines = turn
+                .command
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string);
+            let mut label = sanitize_text(&lines.next().unwrap_or_default());
+            if lines.next().is_some() {
+                label.push_str(" \u{2026}");
+            }
+            vec![label]
         };
-        blocks.push(box_line(&cmd, width));
+        for cmd in cmd_lines {
+            let body = if use_color {
+                format!("{indent}$ {C_BOLD}{cmd}{C_RESET}")
+            } else {
+                format!("{indent}$ {cmd}")
+            };
+            blocks.push(box_line(&body, width));
+        }
         let output_lines: Vec<String> = if state.expanded.contains(&turn.step) {
             // Fully expanded (still width-clipped): every output line.
             turn.output_lines.iter().map(|l| sanitize_text(l)).collect()
@@ -1741,22 +1759,34 @@ fn render_detail(
 ///
 /// Carries the turn number, a coloured ✓/✗ with the exit code, the duration
 /// when the history recorded one and `(review)` when the turn belongs to the
-/// review phase. The line is clipped to the box width like every other line.
+/// review phase; a turn that ran no command is a dim `· note` instead. The
+/// line is built to the box width like every other line.
 fn turn_separator(turn: &TurnView, width: usize, use_color: bool, selected: bool) -> String {
-    let mark = if turn.exit_code == Some(0) {
-        "\u{2713}"
-    } else {
-        "\u{2717}"
-    };
-    let mark = if use_color {
-        let colour = if turn.exit_code == Some(0) {
-            C_GREEN
-        } else {
-            C_RED
-        };
-        format!("{colour}{mark}{C_RESET}")
-    } else {
-        mark.to_string()
+    // A turn that ran no command has no verdict: it is a note the model wrote
+    // instead of a command, not a failure, so its separator carries a dim
+    // `· note` rather than the failure glyph.
+    let mark = match turn.exit_code {
+        None => {
+            if use_color {
+                format!("{C_DIM}\u{b7} note{C_RESET}")
+            } else {
+                "\u{b7} note".to_string()
+            }
+        }
+        Some(0) => {
+            if use_color {
+                format!("{C_GREEN}\u{2713}{C_RESET}")
+            } else {
+                "\u{2713}".to_string()
+            }
+        }
+        Some(_) => {
+            if use_color {
+                format!("{C_RED}\u{2717}{C_RESET}")
+            } else {
+                "\u{2717}".to_string()
+            }
+        }
     };
     let code = turn
         .exit_code
@@ -3513,5 +3543,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A turn whose recorded command spans several lines (a note the model
+    /// wrote instead of a command) renders on one bordered line -- its first
+    /// non-empty line plus ` …` -- so no frame line ever carries a bare LF;
+    /// expanded, every line shows as its own bordered, clipped line.
+    #[test]
+    fn test_multiline_command_renders_on_one_bordered_line() {
+        let entry = Row::new("925633bb")
+            .turns(1, 250)
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 1,
+            command: "REPORT\ndone: fixed the parser".to_string(),
+            exit_code: Some(0),
+            output_lines: Vec::new(),
+            duration_secs: None,
+            review: false,
+        });
+        let frame = render_detail(&entry, &reader, &UiState::default(), 1060, 80, 24);
+        for line in &frame {
+            assert!(
+                !line.contains('\n'),
+                "no bare LF may hide inside a frame line: {line:?}"
+            );
+        }
+        let text = strip_escapes(&frame.join("\n"));
+        assert!(
+            text.contains("$ REPORT \u{2026}"),
+            "the first line shows plus an ellipsis: {text}"
+        );
+        assert!(
+            !text.contains("done: fixed"),
+            "the collapsed view hides the remaining lines: {text}"
+        );
+
+        // Expanded, every line shows, each as its own bordered line.
+        let mut state = UiState::default();
+        state.expanded.insert(1);
+        let frame = render_detail(&entry, &reader, &state, 1060, 80, 24);
+        for line in &frame {
+            assert!(
+                !line.contains('\n'),
+                "no bare LF may hide inside a frame line: {line:?}"
+            );
+        }
+        let text = strip_escapes(&frame.join("\n"));
+        assert!(
+            text.contains("$ REPORT"),
+            "expanded shows the first line: {text}"
+        );
+        assert!(
+            text.contains("$ done: fixed the parser"),
+            "expanded shows every line: {text}"
+        );
+    }
+
+    /// A turn that ran no command is a note, not a failure: its separator
+    /// carries `· note` and never the ✗ glyph.
+    #[test]
+    fn test_note_turn_is_not_marked_as_failed() {
+        let entry = Row::new("925633bb")
+            .turns(1, 250)
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 1,
+            command: "waiting for the operator".to_string(),
+            exit_code: None,
+            output_lines: Vec::new(),
+            duration_secs: None,
+            review: false,
+        });
+        let frame = render_detail(&entry, &reader, &UiState::default(), 1060, 80, 24);
+        let text = strip_escapes(&frame.join("\n"));
+        assert!(
+            text.contains("\u{b7} note"),
+            "a no-command turn is labelled a note: {text}"
+        );
+        assert!(
+            !text.contains('\u{2717}'),
+            "a no-command turn is not a failure: {text}"
+        );
     }
 }
