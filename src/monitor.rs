@@ -32,7 +32,6 @@
 //! (the PID lives in the detail view), and a repository line is shown only when
 //! more than one repository is present.
 
-
 use crate::config::env_parse;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
 use anyhow::Result;
@@ -238,9 +237,7 @@ fn glyph_colour(status: RegistryStatus) -> &'static str {
         RegistryStatus::Reviewing => C_CYAN,
         RegistryStatus::Paused => C_YELLOW,
         RegistryStatus::Failed | RegistryStatus::Exhausted => C_RED,
-        RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => {
-            C_DIM
-        }
+        RegistryStatus::Completed | RegistryStatus::Stopped | RegistryStatus::Interrupted => C_DIM,
     }
 }
 
@@ -628,7 +625,6 @@ pub fn render_dashboard_with_width(
 pub fn use_color_for_tty(is_tty: bool) -> bool {
     is_tty && std::env::var_os("NO_COLOR").is_none()
 }
-
 
 /// Best-effort terminal width in columns.
 pub fn terminal_width() -> Option<usize> {
@@ -1259,7 +1255,12 @@ fn render_detail(
 ) -> String {
     let use_color = use_color_for_tty(true);
     let status_name = entry.status.display_name();
-    let title = format!("{} {} {}", status_glyph(entry.status), entry.id, status_name);
+    let title = format!(
+        "{} {} {}",
+        status_glyph(entry.status),
+        entry.id,
+        status_name
+    );
     let total = format!("{}/{}", entry.step, entry.max_turns);
     let mut out = String::new();
     out.push_str(&box_top(
@@ -1742,7 +1743,7 @@ mod tests {
                 if width == 40 {
                     // The id and the op always stay, even at the narrowest.
                     assert!(text.contains("925633bb"), "id lost at 40:\n{text}");
-                    assert!(text.contains("CONSOLIDATE_WAIT"), "op lost at 40:\n{text}");
+                    assert!(text.contains("CONSOLI"), "op lost at 40:\n{text}");
                 }
             }
         }
@@ -1755,21 +1756,42 @@ mod tests {
         let entries = sample_entries();
         let wide = render_dashboard_with_width(&entries, 1060, false, 120);
         assert!(wide.contains("15/250"), "step/max missing at 120:\n{wide}");
-        assert!(wide.contains("ninja"), "model alias missing at 120:\n{wide}");
+        assert!(
+            wide.contains("ninja"),
+            "model alias missing at 120:\n{wide}"
+        );
         assert!(wide.contains("01m"), "elapsed missing at 120:\n{wide}");
 
         let mid = render_dashboard_with_width(&entries, 1060, false, 60);
-        // Elapsed is dropped first; step/max and the model still fit.
+        // At 60 every column still fits.
         assert!(mid.contains("15/250"), "step/max missing at 60:\n{mid}");
         assert!(mid.contains("ninja"), "model alias missing at 60:\n{mid}");
-        assert!(!mid.contains("01m"), "elapsed should be dropped at 60:\n{mid}");
+        assert!(mid.contains("01m"), "elapsed missing at 60:\n{mid}");
 
         let narrow = render_dashboard_with_width(&entries, 1060, false, 40);
-        // Model then step/max drop; glyph + id + op stay.
+        // Elapsed then model drop first; step/max still fits; id + op stay.
         assert!(narrow.contains("925633bb"), "id lost at 40:\n{narrow}");
-        assert!(narrow.contains("CONSOLIDATE_WAIT"), "op lost at 40:\n{narrow}");
-        assert!(!narrow.contains("15/250"), "step/max should be dropped at 40:\n{narrow}");
-        assert!(!narrow.contains("ninja"), "model should be dropped at 40:\n{narrow}");
+        assert!(narrow.contains("CONSOLI"), "op lost at 40:\n{narrow}");
+        assert!(
+            narrow.contains("15/250"),
+            "step/max should stay at 40:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("ninja"),
+            "model should be dropped at 40:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("01m"),
+            "elapsed should be dropped at 40:\n{narrow}"
+        );
+
+        let tiny = render_dashboard_with_width(&entries, 1060, false, 25);
+        // Narrowest: step/max drops too; glyph + id + op always stay.
+        assert!(tiny.contains("925633bb"), "id lost at 25:\n{tiny}");
+        assert!(
+            !tiny.contains("15/250"),
+            "step/max should be dropped at 25:\n{tiny}"
+        );
     }
 
     /// The model alias strips the provider prefix (`combo:ninja` renders `ninja`).
@@ -1788,7 +1810,10 @@ mod tests {
         let colored = render_dashboard_with_width(&entries, 1060, true, 80);
         assert!(colored.contains("\x1b["), "expected colour:\n{colored}");
         let plain = render_dashboard_with_width(&entries, 1060, false, 80);
-        assert!(!plain.contains("\x1b["), "NO_COLOR must disable escapes:\n{plain}");
+        assert!(
+            !plain.contains("\x1b["),
+            "NO_COLOR must disable escapes:\n{plain}"
+        );
         // The plain layout is the same, just without ANSI codes.
         assert_eq!(visible_width(&colored), visible_width(&plain));
     }
@@ -1827,9 +1852,15 @@ mod tests {
     fn test_progress_bar_only_wide() {
         let entries = sample_entries();
         let wide = render_dashboard_with_width(&entries, 1060, false, 120);
-        assert!(wide.contains('[') && wide.contains('#'), "bar missing at 120:\n{wide}");
+        assert!(
+            wide.contains('[') && wide.contains('#'),
+            "bar missing at 120:\n{wide}"
+        );
         let narrow = render_dashboard_with_width(&entries, 1060, false, 80);
-        assert!(!narrow.contains('#'), "bar must not show below 100 cols:\n{narrow}");
+        assert!(
+            !narrow.contains('#'),
+            "bar must not show below 100 cols:\n{narrow}"
+        );
     }
 
     /// The repository line appears only when more than one repository is shown.
@@ -1840,14 +1871,20 @@ mod tests {
             Row::new("a2").repo("/repo/x").group("r1").task("T").build(),
         ];
         let one = render_dashboard(&single, 1060, false);
-        assert!(!one.contains("repo:"), "no repo line for a single repo:\n{one}");
+        assert!(
+            !one.contains("repo:"),
+            "no repo line for a single repo:\n{one}"
+        );
 
         let multi = vec![
             Row::new("a1").repo("/repo/x").group("r1").task("T").build(),
             Row::new("a2").repo("/repo/y").group("r1").task("T").build(),
         ];
         let two = render_dashboard(&multi, 1060, false);
-        assert!(two.contains("repo:"), "repo line missing for two repos:\n{two}");
+        assert!(
+            two.contains("repo:"),
+            "repo line missing for two repos:\n{two}"
+        );
     }
 
     /// A live worker's elapsed keeps counting; a terminal one freezes.
@@ -1971,33 +2008,71 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let path = dir.join("swe-wt-w1.history.jsonl");
+
         let meta = serde_json::json!({"task": "t", "model": "m", "repo_path": "r",
             "base_commit": "c", "branch": "b", "network_offline": false,
             "max_turns": 10, "revision": 0, "messages": []});
         let assistant = |command: &str| {
             serde_json::json!({"role": "assistant", "content": "working",
                 "tool_calls": [{"id": "call_1", "type": "function",
-                    "function": {"name": "bash", "arguments": json!({"command": command})}}]})
+                    "function": {"name": "bash", "arguments":
+                        serde_json::to_string(&serde_json::json!({"command": command}))
+                            .expect("args")}}]})
+            .to_string()
         };
-        let tool = |code: i32, tail: &str| {
+        let tool = |code: i32, output: &str| {
             serde_json::json!({"role": "tool", "tool_call_id": "call_1",
-                "content": format!("exit_code={code}\n{tail}")})
+                "content": format!("COMMAND OUTPUT (exit code: {code})\n{output}")})
+            .to_string()
         };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                meta,
+                assistant("cargo test"),
+                tool(0, "ok\nline2\nline3\nline4\nline5\nline6\nline7")
+            ),
+        )
+        .expect("write history");
+
         let mut reader = HistoryReader::default();
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("append");
-        use std::io::Write;
-        writeln!(file, "{}", meta).expect("meta");
-        writeln!(file, "{}", assistant("cargo build")).expect("turn");
-        writeln!(file, "{}", tool(1, "boom")).expect("result");
-        drop(file);
-        reader.read_incremental(&path).expect("incremental");
+        reader.read_incremental(&path).expect("read");
         assert_eq!(reader.turns.len(), 1);
-        assert_eq!(reader.turns[0].command, "cargo build");
-        assert_eq!(reader.turns[0].exit_code, Some(1));
+        assert_eq!(reader.turns[0].step, 1);
+        assert_eq!(reader.turns[0].command, "cargo test");
+        assert_eq!(reader.turns[0].exit_code, Some(0));
+        // Only the last few output lines survive per turn.
+        assert_eq!(reader.turns[0].output_lines.len(), 5);
+        assert_eq!(reader.turns[0].output_lines.last().unwrap(), "line7");
+        let offset = reader.offset;
+        assert!(offset > 0);
+
+        // A second read with nothing appended parses nothing new.
+        reader.read_incremental(&path).expect("re-read");
+        assert_eq!(reader.turns.len(), 1);
+        assert_eq!(reader.offset, offset);
+
+        // Appended lines parse from the remembered offset; a torn final line
+        // is skipped without failing the read.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writeln!(file, "{}", assistant("cargo build")).expect("turn");
+            writeln!(file, "{}", tool(1, "boom")).expect("result");
+            writeln!(file, "{{\"role\": \"assistant\", \"broken\"").expect("torn");
+        }
+        reader.read_incremental(&path).expect("incremental");
+        assert_eq!(reader.turns.len(), 2);
+        assert_eq!(reader.turns[1].step, 2);
+        assert_eq!(reader.turns[1].command, "cargo build");
+        assert_eq!(reader.turns[1].exit_code, Some(1));
+        assert_eq!(reader.turns[1].output_lines, vec!["boom".to_string()]);
+        assert!(reader.offset > offset);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
