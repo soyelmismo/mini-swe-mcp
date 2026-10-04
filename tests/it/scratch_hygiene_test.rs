@@ -114,3 +114,53 @@ fn a_dropped_checkout_fixture_leaves_no_checkout_and_no_companion() {
         guard_root.display()
     );
 }
+
+/// A guard created under a fixture-owned root must not reach into the real
+/// scratch base when it drops.
+///
+/// `WorktreeGuard::drop` ends in `remove_target_dirs(&self.path)`, and that
+/// helper resolves the *real* base rather than the root the checkout was made
+/// under. So a guard whose `swe-tmp-<leaf>` companion happens to sit in the
+/// real base has that companion deleted from under whatever process owns it --
+/// including a sibling agent whose private scratch has exactly that name. The
+/// checkout itself must still be reclaimed, but only the directory the guard
+/// actually owns.
+#[test]
+fn a_guard_drop_removes_only_the_companion_under_its_own_root() {
+    let repo = TestRepo::new("hygiene-drop-scope");
+    let guard_root = repo.path().with_extension("worktrees");
+    let guard = repo.guard("hygiene-drop-scope-worker");
+    let leaf = guard
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the checkout has a leaf name")
+        .to_string();
+
+    // The companion this guard's own root implies, plus one that lives in the
+    // real base under the same leaf: the guard owns the first, never the second.
+    let owned = guard_root.join(format!("swe-tmp-{leaf}"));
+    let foreign = swe_base_dir().join(format!("swe-tmp-{leaf}"));
+    assert_ne!(owned, foreign, "test assumption: the two roots differ");
+
+    std::fs::create_dir_all(&owned).expect("create the owned companion");
+    std::fs::create_dir_all(&foreign).expect("create the foreign companion");
+    let foreign_probe = foreign.join("sibling-agent-probe");
+    std::fs::write(&foreign_probe, b"another process's scratch").expect("write the probe");
+
+    drop(guard);
+
+    assert!(
+        !exists(&owned),
+        "{} outlived the guard that owned it",
+        owned.display()
+    );
+    assert!(
+        exists(&foreign_probe),
+        "{} was deleted by a guard that never owned it",
+        foreign.display()
+    );
+
+    // Clean up the stand-in the test itself planted in the real base.
+    let _ = std::fs::remove_dir_all(&foreign);
+}
