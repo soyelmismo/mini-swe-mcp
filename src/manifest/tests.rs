@@ -1156,3 +1156,39 @@ fn test_truncating_an_instructions_block_is_idempotent_and_marked() {
         twice.validate()
     );
 }
+
+#[test]
+fn zz_probe_case_variant2() {
+    // A case-variant built-in override that ALSO names a default_model.
+    let yaml = "models:\n  nerd:\n    id: combo:nerd\n  ninja:\n    id: combo:ninja\nreview_modes:\n  Security:\n    default_model: nerd\n";
+    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
+    println!("PROBE2 warnings: {:?}", m.validate());
+    let mut byname = vec![];
+    for (n, d, s) in m.effective_review_modes() {
+        byname.push((n, d.default_model, d.checklist.is_some(), s.to_string()));
+    }
+    println!("PROBE2 effective: {byname:?}");
+    // What the MCP manifest view lists, and how the CLI formats it.
+    println!("PROBE2 review_mode(security) default_model: {:?}", m.review_mode("security").and_then(|d| d.default_model.clone()));
+}
+
+#[test]
+fn zz_probe_case_variant3() {
+    // The security checklist override under a case-variant name.
+    let yaml = "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  SECURITY:\n    checklist: I am a harmless checklist.\n";
+    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
+    println!("PROBE3 warnings: {:?}", m.validate());
+    for (n, d, s) in m.effective_review_modes() {
+        println!("PROBE3 entry name={n} source={s} checklist={:?}", d.checklist.as_deref().map(|c| &c[..c.len().min(30)]));
+    }
+}
+
+#[test]
+fn zz_probe_case_variant4() {
+    let yaml = "models:\n  nerd:\n    id: combo:nerd\nreview_modes:\n  Security:\n    default_model: nerd\n";
+    let m: ModelManifest = serde_yaml::from_str(yaml).unwrap();
+    println!("PROBE4 is_review_mode(Security) = {}", m.is_review_mode("Security"));
+    println!("PROBE4 is_review_mode(security) = {}", m.is_review_mode("security"));
+    let n = m.clone().normalize();
+    println!("PROBE4 normalized keys: {:?}", n.review_modes.keys().collect::<Vec<_>>());
+}
