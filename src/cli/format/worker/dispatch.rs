@@ -125,6 +125,11 @@ pub struct QuietDispatch {
     pub worker_ids: Vec<String>,
     /// The error of every entry that never started, in payload order.
     pub errors: Vec<String>,
+    /// The watch command to use when waiting for these workers, if any.
+    /// This is computed from the payload's `watch_command` field or,
+    /// when the dispatch was consolidated (`--consolidate`), built as
+    /// `mini-swe-mcp watch --group <group> --all`.
+    pub watch_command: String,
 }
 
 /// `dispatch --quiet`: the ids to print, and the entry errors to report.
@@ -134,6 +139,11 @@ pub struct QuietDispatch {
 pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
     let mut worker_ids = Vec::new();
     let mut errors = Vec::new();
+    let mut watch_command = String::new();
+
+    // Determine if this was a consolidated dispatch
+    let is_consolidated = val.get("group").is_some();
+
     if let Some(workers) = val.get("workers").and_then(|v| v.as_array()) {
         for worker in workers {
             if let Some(wid) = worker.get("worker_id").and_then(|v| v.as_str()) {
@@ -142,10 +152,39 @@ pub fn format_dispatch_quiet(val: &serde_json::Value) -> QuietDispatch {
                 errors.push(error.to_string());
             }
         }
+        // For batch dispatch with consolidation, the watch command uses --group --all
+        if is_consolidated && !worker_ids.is_empty() {
+            if let Some(group) = val.get("group").and_then(|v| v.as_str()) {
+                watch_command = format!("mini-swe-mcp watch --group {} --all", group);
+            }
+        }
     } else if let Some(wid) = val.get("worker_id").and_then(|v| v.as_str()) {
         worker_ids.push(wid.to_string());
+        // For single dispatch with consolidation
+        if is_consolidated {
+            if let Some(group) = val.get("group").and_then(|v| v.as_str()) {
+                watch_command = format!("mini-swe-mcp watch --group {} --all", group);
+            }
+        } else {
+            // Use the watch_command from the payload, or build MINI_SWE_WATCH_TOKEN form
+            if let Some(wc) = val.get("watch_command").and_then(|v| v.as_str()) {
+                watch_command = wc.to_string();
+            } else {
+                // Build the default MINI_SWE_WATCH_TOKEN form
+                // (the token will be minted by the hub; we include the format hint)
+                watch_command = String::new();
+            }
+        }
     }
-    QuietDispatch { worker_ids, errors }
+
+    // Fallback: if no workers but payload has watch_command, carry it through
+    if watch_command.is_empty() {
+        if let Some(wc) = val.get("watch_command").and_then(|v| v.as_str()) {
+            watch_command = wc.to_string();
+        }
+    }
+
+    QuietDispatch { worker_ids, errors, watch_command }
 }
 
 #[cfg(test)]
