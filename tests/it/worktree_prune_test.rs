@@ -473,7 +473,10 @@ fn salvage_leaves_cache_and_oversized_paths_out_of_the_commit() {
     );
     // The worktree shared the repository's object database, so a refused file
     // must not have left a large blob behind for a later push to trip over.
-    let objects = run(&f.repo, &["cat-file", "--batch-all-objects", "--batch-check"]);
+    let objects = run(
+        &f.repo,
+        &["cat-file", "--batch-all-objects", "--batch-check"],
+    );
     assert!(
         !objects.lines().any(|line| {
             let size = line.split_whitespace().nth(2).unwrap_or("0");

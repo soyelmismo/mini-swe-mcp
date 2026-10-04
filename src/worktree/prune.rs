@@ -18,7 +18,9 @@
 //!   the sweep converges to the same state no matter how `read_dir` orders the
 //!   entries, and re-running it changes nothing (audit §01/§09).
 
-use super::{WorktreeGuard, force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs};
+use super::{
+    WorktreeGuard, force_remove_dir, git, pid_file_for, remove_target_dirs, swe_base_dirs,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
