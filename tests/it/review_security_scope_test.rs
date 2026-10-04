@@ -920,3 +920,83 @@ async fn an_unresolvable_base_branch_never_shrinks_the_consolidators_scope() {
         "with no resolvable base tip the base's sensitive change stays in the probe"
     );
 }
+
+/// A file name a commit carries is data, never a pattern. Git reads a pathspec
+/// that starts with `:` as magic, so a file planted as `:(exclude)<sensitive>`
+/// in the same commit as a real edit to that sensitive file must not act as an
+/// exclusion: the probe still names the sensitive path (it compares names), and
+/// the diff handed to the reviewer must still carry the sensitive change.
+#[tokio::test]
+async fn a_planted_pathspec_name_cannot_exclude_a_sensitive_change_from_the_diff() {
+    let (dir, base) = repo("scope_pathspec_plant");
+    let env_file = "src/agent/env.rs";
+    let planted = ":(exclude)src/agent/env.rs";
+    let w1 = commit(
+        dir.path(),
+        "worker-w1",
+        "src/hub/socket.rs",
+        "worker's handshake",
+    );
+
+    // The consolidator merges the approved worker, then commits its own change
+    // to the sensitive file together with a file whose *name* is the pathspec
+    // that excludes that very file.
+    common::git(dir.path(), &["checkout", "-q", "-b", "worker-c1", &base]);
+    common::git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge w1", "worker-w1"],
+    );
+    std::fs::create_dir_all(
+        dir.path()
+            .join(env_file)
+            .parent()
+            .expect("the sensitive file has a parent"),
+    )
+    .expect("create the sensitive file's directory");
+    std::fs::write(dir.path().join(env_file), "the consolidator's ENV edit")
+        .expect("write the sensitive edit");
+    std::fs::create_dir_all(
+        dir.path()
+            .join(planted)
+            .parent()
+            .expect("the planted name has a parent"),
+    )
+    .expect("create the planted file's directory");
+    std::fs::write(dir.path().join(planted), "harmless looking filler")
+        .expect("write the planted file");
+    common::git(dir.path(), &["add", "-A"]);
+    common::git(
+        dir.path(),
+        &["commit", "-q", "-m", "the consolidator's own work"],
+    );
+    let _own = common::git(dir.path(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    let scope = scope_for(
+        dir.path(),
+        "worker-c1",
+        WorkerRole::Consolidate,
+        &base,
+        None,
+        std::slice::from_ref(&w1),
+        Some("master"),
+    )
+    .await;
+
+    // The probe compares names, so the planted name cannot hide the sensitive
+    // file from it and the review still fires over the sensitive path.
+    let files = scope.reviewed_files(dir.path()).await;
+    assert!(
+        files.contains(&env_file.to_string()),
+        "the sensitive file must stay in the probe; got {files:?}"
+    );
+    // And the diff the reviewer reads must still carry the sensitive change.
+    let diff = scope.reviewed_diff(dir.path()).await;
+    assert!(
+        diff.contains("the consolidator's ENV edit"),
+        "a planted pathspec name must not exclude the sensitive change from the reviewer's \
+         diff; diff was:\n{diff}"
+    );
+    assert_eq!(scope.skip_log(), None);
+}
