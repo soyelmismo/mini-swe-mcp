@@ -34,10 +34,10 @@
 //! then hands back the plan its own task spells out (see [`edit_plan`]), and
 //! turns of reading. Only a turn whose command was a pure read counts toward
 //! it ([`is_pure_read_command`], read off the same base the loop detector
-//! normalizes): a worker that is running its experiments -- tests, builds,
-//! scripts, binaries -- leaves the worktree sample alone too, but it is not
-//! reading, and the equivalent-command loop detector is what stops one
-//! experiment repeating. It is a guard against an *implementer* that reads instead
+//! normalizes): a worker running its experiments -- tests, builds, scripts,
+//! binaries -- leaves the worktree sample alone too, but it is not reading,
+//! and the equivalent-command loop detector is what stops one experiment
+//! repeating. It is a guard against an *implementer* that reads instead
 //! of writing, so it is armed only for that role: a consolidator and the
 //! review phases both make their progress without editing (see
 //! [`TurnConfig::read_only_exempt`]). The turns the harness answers itself --
@@ -873,6 +873,18 @@ const GIT_READ_SUBCOMMANDS: &[&str] = &[
 /// a `find` carrying one of them is a write however read-only it looks.
 const FIND_ACTIONS: &[&str] = &["-delete", "-exec", "-execdir", "-fls", "-fprint", "-ok"];
 
+/// `git` options that take a value, so the subcommand is the word *after* the
+/// one that follows the option: `git -C . log` is a `log`, not a `-C`.
+const GIT_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--work-tree",
+];
+
 /// Whether `command` only inspects the repository rather than acting on it.
 ///
 /// The base is read exactly the way the loop detector reads it
@@ -898,13 +910,7 @@ fn is_pure_read_command(command: &str) -> bool {
     let name = first.rsplit('/').next().unwrap_or(first);
     let args: Vec<&str> = words.collect();
     if name == "git" {
-        // A leading flag (`git -C dir status`) is skipped rather than read as
-        // a subcommand, which leaves the command out of the streak instead of
-        // guessing at what it did.
-        return args
-            .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .is_some_and(|sub| GIT_READ_SUBCOMMANDS.binary_search(sub).is_ok());
+        return git_reads(&args);
     }
     if name == "sed" {
         return sed_prints_only(&args);
@@ -916,6 +922,30 @@ fn is_pure_read_command(command: &str) -> bool {
             .any(|word| FIND_ACTIONS.iter().any(|action| word.starts_with(action)));
     }
     READ_COMMANDS.binary_search(&name).is_ok()
+}
+
+/// Whether the `git` spelled in `args` only reads the repository.
+///
+/// The subcommand has to be found before it can be read, because a global
+/// option can stand in front of it (`git -C . log`) and an option that takes
+/// a value can stand in front of the subcommand in turn
+/// (`git --git-dir /repo status`).
+fn git_reads(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if !arg.starts_with('-') {
+            return GIT_READ_SUBCOMMANDS.binary_search(arg).is_ok();
+        }
+        // An option this list knows takes a value steps over it; any other is
+        // read as the flag it spells (`--no-pager`), which is the reading that
+        // cannot mistake a path for a subcommand.
+        i += if GIT_VALUE_OPTIONS.contains(arg) {
+            2
+        } else {
+            1
+        };
+    }
+    false
 }
 
 /// Whether `sed` is printing its input rather than editing a file in place.
@@ -1274,7 +1304,7 @@ impl ReadOnlyStreak {
     /// Start the streak over without a new repository sample: a turn the
     /// harness answered itself is progress the sample cannot see, so the
     /// counters and the nudges this streak earned are dropped and the next
-    /// unchanged turn is counted as the first of a fresh streak.
+    /// read-only turn is counted as the first of a fresh streak.
     fn restart_streak(&mut self) {
         self.read_only_turns = 0;
         self.nudged = false;
@@ -4758,6 +4788,8 @@ mod tests {
             "git log --oneline -5",
             "git show HEAD",
             "git blame src/lib.rs",
+            "git -C . log --oneline -n 5",
+            "git --no-pager diff --stat",
             "cd /tmp && ls -la",
             "/usr/bin/grep -rn x src",
         ];
@@ -4778,6 +4810,7 @@ mod tests {
             "sed 's/a/b/' lib.rs",
             "git add -N .",
             "git commit -m 'wip'",
+            "git -C . checkout other",
             "find . -name '*.rs' -delete",
             "echo hello",
             "",
