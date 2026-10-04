@@ -848,12 +848,14 @@ pub fn sweep_retired_workers_in(root: &ScratchRoot, ack_dir: Option<&Path>) -> R
         // A batched pre-pass: one `for-each-ref` proves for the whole group
         // which branches the base carries by history, so the per-worker git
         // process is only spent on the ones that needs the content proof.
-        // `None` means the probe itself failed, which is not the same as an
-        // empty set -- an empty set proves no branch is contained, while `None`
-        // proves nothing. A contained tip is still a fact the probe gave us
-        // (an ancestry proof is a proof whatever else git could not answer), so
-        // the group falls back to the shared predicate for the rest rather than
-        // retiring nothing.
+        //
+        // A failed probe is folded into the empty set on purpose. It proves
+        // nothing by itself, so it must not retire anything -- and it does not:
+        // a candidate missing from `merged` is not waved through, it is asked
+        // the whole question again below, by two further probes that each fail
+        // closed. What the fold costs is a git process per worker in a group
+        // whose `for-each-ref` could not answer; what it buys is that one
+        // unreadable group no longer strands every worker in it.
         let merged = merged_branch_tips(repo, base).unwrap_or_default();
         let ctx = RetireContext {
             repo: Some(repo.as_path()),
@@ -1049,11 +1051,23 @@ fn is_commit_sha(value: &str) -> bool {
 }
 
 /// The commit `branch` points at in `repo`, or `None` when it cannot be read.
+///
+/// Resolved under `refs/heads/` and never by the bare name: git resolves a tag
+/// before a branch, so a bare `worker-<id>` also answers for a tag a worker
+/// left under its own name. That tag names a commit the branch never pointed at,
+/// and reading it here would hand the retirement proof a tip for a branch that
+/// does not exist -- deleting the row, the conversation and the branch of a
+/// worker whose work was never integrated.
 pub(crate) fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
     let out = crate::worktree::git(
         repo,
         "rev-parse",
-        &["rev-parse", "--verify", "--quiet", branch],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            branch,
+        ],
     )
     .ok()?;
     out.status

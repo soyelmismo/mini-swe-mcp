@@ -1755,3 +1755,38 @@ fn a_tag_named_after_a_deleted_worker_branch_does_not_prove_integration() {
 fn echo_commit(repo: &std::path::Path, message: &str) {
     git(repo, &["commit", "-q", "--allow-empty", "-m", message]);
 }
+
+/// The same shadowing, with the branch still there and the work still
+/// unlanded: a worker whose `worker-<id>` branch carries a commit the base does
+/// not have must not be retired.
+///
+/// `is_ancestor` and `merge-tree` take the bare name, and git resolves the tag
+/// first, so the content and ancestry proofs were both being answered about a
+/// commit that is in the base while the branch next to it holds work nobody
+/// landed. Only `refs/heads/` can answer the question the sweep is asking.
+#[test]
+fn a_tag_shadowing_a_live_worker_branch_does_not_retire_unlanded_work() {
+    let f = Fixture::new("retire-tag-shadow-live");
+    // A real branch with a real commit that `main` does not contain.
+    f.commit_on_worker_branch("tg2", "tg2.txt", "unlanded work\n");
+    f.record_with_status("tg2", mini_swe_mcp::pool::RegistryStatus::Completed);
+    // A tag under the same name, pointing at the base: git resolves it first.
+    git(f.repo(), &["tag", "worker-tg2", "main"]);
+    assert!(
+        git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
+        "the branch must still carry the unlanded work"
+    );
+
+    let sweep = f.sweep();
+
+    assert!(
+        sweep.workers.is_empty(),
+        "a tag must not answer for the branch: {:?}",
+        sweep.workers
+    );
+    assert!(f.row_exists("tg2"), "the row must survive");
+    assert!(
+        git_ref_exists(f.repo(), "refs/heads/worker-tg2"),
+        "the branch must survive"
+    );
+}

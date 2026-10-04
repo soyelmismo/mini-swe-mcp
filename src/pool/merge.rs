@@ -1261,6 +1261,14 @@ fn read_round_members(root: &ScratchRoot, consolidator: &str) -> Option<Vec<Stri
 /// retirement sweep both add the "tip is beyond the commit the worker was
 /// dispatched from" half, so a worker that committed nothing is retired by
 /// neither.
+///
+/// `target` is the branch the merge landed on and is passed through as the
+/// caller wrote it; `branch` is named under `refs/heads/`, because the two
+/// proofs below resolve a bare name and git resolves a *tag* before a branch.
+/// A worker runs git inside the repository and can leave a tag named
+/// `worker-<its id>`, and every proof would then be a statement about the tag's
+/// commit while the branch beside it holds work nobody landed. Pinning the
+/// worker's ref is what keeps the answer about the branch.
 pub(crate) fn work_already_in(repo: &Path, target: &str, branch: &str) -> bool {
     match branch_exists(repo, branch) {
         Ok(false) => return true,
