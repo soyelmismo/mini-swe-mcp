@@ -158,21 +158,6 @@ impl ModelManifest {
         )
     }
 
-    /// Alias of the manifest's strongest tier, when the manifest marks one.
-    ///
-    /// The `strongest:` key of `models.yaml`; absent, or naming an alias the
-    /// catalog does not define, leaves the dispatch default in place.
-    /// A consolidator integrates a whole round, so it runs on the deepest model
-    /// the manifest declares rather than on the fast executor the dispatch
-    /// default names. `None` when the manifest marks none (or names an alias it
-    /// does not define), which leaves the dispatch default in place.
-    pub fn strongest_alias(&self) -> Option<&str> {
-        self.strongest
-            .as_deref()
-            .map(str::trim)
-            .filter(|alias| self.models.contains_key(*alias))
-    }
-
     /// The declared review mode `name`, or `None` when no such mode exists.
     ///
     /// The built-in modes `quality` and `security` are always available even
@@ -228,6 +213,70 @@ impl ModelManifest {
         declared.sort();
         modes.extend(declared);
         modes
+    }
+
+    /// The built-in checklist for `name` (`quality`/`security`), else `None`.
+    pub fn builtin_review_checklist(name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("quality") {
+            Some(super::types::QUALITY_CHECKLIST.to_string())
+        } else if name.eq_ignore_ascii_case("security") {
+            Some(super::types::SECURITY_CHECKLIST.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Every review mode the catalog offers, built-ins included, in stable
+    /// order: `quality`, `security`, then the manifest-declared modes sorted
+    /// by name.
+    ///
+    /// Each entry is the mode name, its effective definition (a declared
+    /// entry wins over the built-in of the same name; a declared entry for a
+    /// built-in name that sets only `default_model` keeps the built-in
+    /// checklist), and its source: `"built-in"` when the manifest does not
+    /// declare the name, `"models.yaml"` when it does.
+    pub fn effective_review_modes(&self) -> Vec<(String, ReviewModeDefinition, &'static str)> {
+        let mut out = Vec::new();
+        for builtin in ["quality", "security"] {
+            match self
+                .review_modes
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(builtin))
+            {
+                Some((name, def)) => {
+                    let mut def = def.clone();
+                    if def
+                        .checklist
+                        .as_deref()
+                        .is_none_or(|c| c.trim().is_empty())
+                    {
+                        def.checklist = Self::builtin_review_checklist(builtin);
+                    }
+                    out.push((name.clone(), def, "models.yaml"));
+                }
+                None => out.push((
+                    builtin.to_string(),
+                    ReviewModeDefinition {
+                        checklist: Self::builtin_review_checklist(builtin),
+                        default_model: None,
+                        model_key_deprecated: false,
+                    },
+                    "built-in",
+                )),
+            }
+        }
+        let mut extra: Vec<(&String, &ReviewModeDefinition)> = self
+            .review_modes
+            .iter()
+            .filter(|(name, _)| {
+                !name.eq_ignore_ascii_case("quality") && !name.eq_ignore_ascii_case("security")
+            })
+            .collect();
+        extra.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (name, def) in extra {
+            out.push((name.clone(), def.clone(), "models.yaml"));
+        }
+        out
     }
 
     /// Resolve the *alias* that owns `model`, whether `model` is already an alias
@@ -295,6 +344,14 @@ impl ModelManifest {
     /// from the same YAML. Every user-visible derivation (catalog rendering,
     /// id resolution, warnings) goes through this helper so the output is
     /// reproducible.
+    /// Every model alias in stable (sorted) order, for error messages that
+    /// list what `--review-after` accepts.
+    pub fn sorted_model_aliases(&self) -> Vec<String> {
+        let mut aliases: Vec<String> = self.models.keys().cloned().collect();
+        aliases.sort();
+        aliases
+    }
+
     fn sorted_models(&self) -> Vec<(&str, &ModelDefinition)> {
         let mut entries: Vec<(&str, &ModelDefinition)> = self
             .models

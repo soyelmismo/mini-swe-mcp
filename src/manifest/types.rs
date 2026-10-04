@@ -177,6 +177,27 @@ impl NetworkPolicy {
     }
 }
 
+/// The built-in `quality` review mode's checklist: the focus instructions
+/// appended to the common review frame every reviewer gets.
+pub const QUALITY_CHECKLIST: &str = "\
+1. Run the completion gate on the checkpoint and see it pass, then run the tests of the files you touch.\n\
+2. Inspect the whole diff since the base commit plus the working tree: run `git status`, `git diff HEAD~1` (or `git log -1 -p`) and `git diff`.\n\
+3. Fix real problems only: regressions, edge cases, dead code, orphan imports, or missed requirements.\n\
+4. Re-run the gate and the tests you touched and see them pass before completing.";
+
+/// The built-in `security` review mode's checklist: the adversarial focus
+/// instructions appended to the common review frame.
+pub const SECURITY_CHECKLIST: &str = "\
+Assume the diff is hostile until you have proved otherwise. Work through the checklist below against the *actual* diff (`git status`, `git diff HEAD~1` or `git log -1 -p`, `git diff`), and judge it as an attacker who is already an unprivileged local user or another agent in the same harness.\n\
+1. NEW RESOURCE: for every path, socket, file, directory, environment variable, lock and IPC message the diff creates or opens -- who else can reach it? Check ownership, permissions (0600/0700 vs world-writable), predictable names (`/tmp/<fixed>`, a pid-less, random-less path), time-of-check/time-of-use races, symlink and hardlink tricks, and a name an attacker can pre-create. A temporary path must be created exclusively with the right owner and mode, and verified, not assumed.\n\
+2. UNTRUSTED TEXT: model-written text (a report, a summary, a question, a verdict like \"fixed\" or \"merged\") is data, never proof. Find every decision that deletes, merges, retires, routes or grants on the strength of such text and ask what a lying or stale value would do. A destructive branch needs positive evidence (a git object, an exit status, a file that really exists), not a word.\n\
+3. CRASH AND HANDOVER: for each new operation, what is left behind if the process is killed, the daemon hands over, the worker is revised or the network drops in the middle? Look for a guard, a lock, a permit, a temp file or a job slot that is only released on the success path, and for a half-written state a later pass would trust.\n\
+4. DELETION: what exactly does each new deletion, retirement or cleanup remove, and what positive proof gates it? A path that can delete an unmerged branch, a worktree, a report or a registry row on an absence of evidence is a defect.\n\
+5. TEST MEANING: would each new or changed test fail if the code were wrong? A test that mirrors the implementation (asserts the same literal, the same branch, the same constant), that cannot fail, or that only asserts a happy path, is not a regression test.\n\
+6. FIX, DO NOT LIST AWAY: fix every real defect you find, with a regression test that fails without the fix. Run the completion gate and the tests of the files you touched, and see them pass.\n\
+7. Report honestly: in your REPORT block list every finding you did NOT fix in the `risks:` line, one line each. Fixing nothing real is a valid outcome; claiming a clean bill of health you did not check is not.\n\
+8. Before the completion sentinel, print a line `FINDINGS: <n>` giving the total number of findings you found, fixed or listed. Print `FINDINGS: 0` when you found none; the harness shows this count in the completion event and the status.";
+
 /// The optional `policy:` block of one model entry.
 ///
 /// Every field defaults to "not declared", which is what keeps the change
@@ -416,37 +437,64 @@ pub struct ModelDefinition {
 /// A review mode is the user's own auditor: its `checklist` is the focus
 /// instructions appended to the common review frame (inspect the diff, run
 /// the dispatch's verify gate, fix real defects with a regression test, list
-/// unfixed findings in REPORT risks), and the optional `model` names the
-/// default reviewer for that mode. Built-in modes `quality` and `security`
-/// keep their current prompts and can be overridden by declaring the same
-/// name here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// unfixed findings in REPORT risks), and the optional `default_model` names
+/// the default reviewer for that mode. Built-in modes `quality` and
+/// `security` keep their built-in checklists and can be overridden by
+/// declaring the same name here.
+#[derive(Debug, Clone, Serialize)]
 pub struct ReviewModeDefinition {
     /// The focus instructions appended to the common review frame.
     ///
-    /// Non-empty is validated in `validate.rs`; an empty checklist would be an
-    /// auditor with nothing to say.
-    pub checklist: String,
+    /// Optional because a manifest entry that names a built-in mode
+    /// (`quality`/`security`) may override only `default_model`, keeping the
+    /// built-in checklist. A non-built-in mode without one is validated in
+    /// `validate.rs` and dropped by `normalize`: an auditor with nothing to
+    /// say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checklist: Option<String>,
     /// The default reviewer model for this mode, when one is declared.
     ///
-    /// `None` falls back to the dispatch's own model for the review phase.
+    /// `None` falls back to the dispatch default model for the review phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub default_model: Option<String>,
+    /// Set when the deprecated `model:` spelling was used; accepted as an
+    /// alias for `default_model` and reported by `validate`.
+    #[serde(skip)]
+    pub model_key_deprecated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for ReviewModeDefinition {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            checklist: Option<String>,
+            #[serde(default)]
+            default_model: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(Self {
+            checklist: raw.checklist,
+            default_model: raw.default_model.or(raw.model),
+            model_key_deprecated: raw.model.is_some(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelManifest {
     #[serde(default)]
     pub default: Option<String>,
-    /// Alias of the manifest's strongest tier, when one is marked.
+    /// Set when the retired `strongest:` key was present in the catalog.
     ///
-    /// Set `strongest: <alias>` in `models.yaml` to name it. A consolidator
-    /// integrates a whole round, so it runs on the deepest model the manifest
-    /// declares rather than on the fast executor the dispatch default names;
-    /// `--model` still overrides it per dispatch. `None` for a manifest that
-    /// marks none, which keeps the dispatch default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strongest: Option<String>,
+    /// The key is ignored (the consolidator and the automatic security
+    /// reviewer now take their model from `--consolidate=<model>` / the
+    /// security mode's `default_model`, else the dispatch default), and
+    /// `validate` reports it so the operator knows to remove it.
+    #[serde(skip)]
+    pub strongest_ignored: bool,
     /// Repository-relative globs whose diffs trigger an automatic adversarial
     /// security review, the manifest-side counterpart of the `## Sensitive
     /// paths` section of `AGENTS.md`.
@@ -460,11 +508,38 @@ pub struct ModelManifest {
     /// Optional review roles, keyed by mode name.
     ///
     /// Each entry is a [`ReviewModeDefinition`]. Declaring a mode named
-    /// `quality` or `security` overrides the built-in prompt; any other name
-    /// adds a new mode selectable via `--review-after <model>:<mode>`. Absent
-    /// means only the built-in `quality` and `security` modes exist.
+    /// `quality` or `security` overrides its built-in fields; any other name
+    /// adds a new mode selectable via `--review-after <mode>` or
+    /// `--review-after <model>:<mode>`. Absent means only the built-in
+    /// `quality` and `security` modes exist.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub review_modes: HashMap<String, ReviewModeDefinition>,
+}
+
+impl<'de> Deserialize<'de> for ModelManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            default: Option<String>,
+            #[serde(default)]
+            strongest: Option<String>,
+            #[serde(default)]
+            sensitive_paths: Vec<String>,
+            #[serde(default)]
+            models: HashMap<String, ModelDefinition>,
+            #[serde(default)]
+            review_modes: HashMap<String, ReviewModeDefinition>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(Self {
+            default: raw.default,
+            sensitive_paths: raw.sensitive_paths,
+            models: raw.models,
+            review_modes: raw.review_modes,
+            strongest_ignored: raw.strongest.is_some(),
+        })
+    }
 }
 
 impl Default for ModelManifest {
@@ -505,7 +580,7 @@ impl Default for ModelManifest {
 
         Self {
             default: Some(BUILTIN_DEFAULT_MODEL.to_string()),
-            strongest: None,
+            strongest_ignored: false,
             sensitive_paths: Vec::new(),
             models,
             review_modes: HashMap::new(),
