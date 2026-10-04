@@ -69,10 +69,14 @@ fn a_dropped_test_repository_takes_its_private_scratch_with_it() {
 /// A checkout made through [`TestRepo::guard`] leaves nothing behind.
 ///
 /// The seam builds the checkout under a scratch root the fixture owns, rather
-/// than the real base `WorktreeGuard::new` resolves. Dropping the fixture must
-/// take that root, the checkout in it, and the companions derived from both --
-/// otherwise a suite that guards a worktree per test accumulates one checkout
-/// and one `swe-tmp-<leaf>` in the operator's scratch directory per run.
+/// than the real base `WorktreeGuard::new` resolves. Dropping the guard must
+/// take that root's companion with the checkout, and dropping the fixture must
+/// take the root itself -- otherwise a suite that guards a worktree per test
+/// accumulates one checkout per run in the operator's scratch directory.
+///
+/// The guard deliberately reclaims the companion under *its own* root only; a
+/// `swe-tmp-<leaf>` that sits in the real base belongs to whoever made it, and
+/// [`a_guard_drop_removes_only_the_companion_under_its_own_root`] pins that.
 #[test]
 fn a_dropped_checkout_fixture_leaves_no_checkout_and_no_companion() {
     let repo = TestRepo::new("hygiene-guard");
@@ -85,16 +89,17 @@ fn a_dropped_checkout_fixture_leaves_no_checkout_and_no_companion() {
         .and_then(|n| n.to_str())
         .expect("the checkout has a leaf name")
         .to_string();
-    let companions = companions_of(&leaf);
+    let owned = guard_root.join(format!("swe-tmp-{leaf}"));
     let checkout = guard.path.clone();
 
-    // The sandbox derives the private scratch from the checkout path itself.
-    std::fs::create_dir_all(&companions[0]).expect("create the derived scratch");
-    assert!(exists(&companions[0]), "precondition: the companion exists");
+    // The guard's own root is where the companion it is entitled to reclaim
+    // lives; a step against the checkout derives it there.
+    std::fs::create_dir_all(&owned).expect("create the derived scratch");
+    assert!(exists(&owned), "precondition: the companion exists");
     assert!(exists(&checkout), "precondition: the checkout exists");
     drop(guard);
 
-    for path in &companions {
+    for path in [&owned, &checkout] {
         assert!(
             !exists(path),
             "{} outlived the fixture that derived it",
@@ -150,15 +155,18 @@ fn a_guard_drop_removes_only_the_companion_under_its_own_root() {
 
     drop(guard);
 
-    assert!(
-        !exists(&owned),
-        "{} outlived the guard that owned it",
-        owned.display()
-    );
+    // The security property first: a guard must never reach outside its own
+    // root. Asserting it after the owned-companion check would let a failure of
+    // that check mask this one, which is the one that matters.
     assert!(
         exists(&foreign_probe),
         "{} was deleted by a guard that never owned it",
         foreign.display()
+    );
+    assert!(
+        !exists(&owned),
+        "{} outlived the guard that owned it",
+        owned.display()
     );
 
     // Clean up the stand-in the test itself planted in the real base.

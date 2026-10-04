@@ -27,7 +27,8 @@
 //! never collateral damage: the recovery is scoped to one worker's own path.
 
 use super::{
-    ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents, remove_target_dirs,
+    ScratchRoot, force_remove_dir, git, pid_file_for, prune::pid_file_contents,
+    remove_target_dirs_in,
 };
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -286,6 +287,14 @@ pub struct WorktreeGuard {
     pub path: PathBuf,
     pub branch: String,
     pub repo_root: PathBuf,
+    /// The root this guard's checkout was filed under.
+    ///
+    /// The checkout path alone does not say where its private `swe-tmp-<leaf>`
+    /// scratch lives: the runner derives that from the scratch *base*, so a
+    /// guard built under an injected root must reclaim the companion under that
+    /// root. Holding the root also keeps [`Drop`] from reaching into the real
+    /// base, where a sibling agent's identically named scratch lives.
+    scratch_root: ScratchRoot,
     /// This worker's exclusive build directory, leased on its first heavy
     /// command and held until the guard drops.
     build_dir: Option<crate::cache::BuildDirLease>,
@@ -507,6 +516,7 @@ impl WorktreeGuard {
             path,
             branch: branch.to_string(),
             repo_root: repo_root.to_path_buf(),
+            scratch_root: root.clone(),
             build_dir: None,
             base_commit: base_commit.to_string(),
             base_branch: None,
@@ -1355,7 +1365,7 @@ impl Drop for WorktreeGuard {
         // (audit §13: stale worktree registrations).
         unregister_worktree(&self.repo_root, &self.path);
         let _ = std::fs::remove_file(&pid_file);
-        remove_target_dirs(&self.path);
+        remove_target_dirs_in(&self.scratch_root, &self.path);
     }
 }
 
@@ -1654,6 +1664,7 @@ mod tests {
             path: repo.join("worktree"),
             branch: "worker-test".to_string(),
             repo_root: repo.to_path_buf(),
+            scratch_root: ScratchRoot::from_env(),
             build_dir: None,
             base_commit: String::new(),
             base_branch: None,
