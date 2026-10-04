@@ -2848,44 +2848,42 @@ mod tests {
     /// environment is invisible to the command the model runs, and the command
     /// sees the remapped, isolated `HOME` instead of the operator's.
     ///
-    /// The parent environment arrives as an explicit map rather than the
-    /// process environment (no test may write the latter), and the probe child
-    /// is spawned with `env_clear` plus exactly the environment the builder
-    /// produced -- the same two steps the real spawn path performs -- so a bug
-    /// that dropped the allow-list's redaction or the `env_clear` is still
-    /// caught here rather than only by the pure helper's own unit tests.
+    /// The operator's environment reaches the child the way production hands it
+    /// over -- inherited by the fresh `Command` -- and is then sanitized by the
+    /// same function `execute_bash` calls. It is applied to the child rather
+    /// than to this process, so no test writes the process environment while
+    /// both halves of the guarantee stay covered: a bug that dropped the
+    /// `env_clear` or the allow-list's redaction leaves a secret readable here,
+    /// not only in the pure helper's own unit tests.
     #[tokio::test]
     async fn a_spawned_command_cannot_read_the_operators_secrets() {
         let scratch = crate::test_support::TestScratch::new("env-sanitize-test");
         let tmp = scratch.path().to_path_buf();
 
-        // A synthetic parent environment the way an operator's shell would
-        // look: secrets present, plus a couple of benign variables. The child
-        // environment is built from this map -- never from the process
-        // environment -- and the probe child is spawned with exactly that
-        // environment, so no process-global state is mutated.
-        let parent = [
+        // The operator's environment, as a fresh `Command` inherits it in
+        // production. It is applied to the child itself rather than to this
+        // process, so no process-global state is mutated while the test still
+        // runs the whole real spawn path: `apply_sanitized_environment` is what
+        // `execute_bash` calls, and it must both clear what the child inherited
+        // and rebuild from the allow-list. Dropping either step leaves one of
+        // the names below readable in the child.
+        let inherited = [
             ("OPENAI_API_KEY", "sk-leaked-must-not-appear"),
             ("GITHUB_TOKEN", "ghp-leaked-must-not-appear"),
             ("AWS_SECRET_ACCESS_KEY", "aws-leaked-must-not-appear"),
             ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
-            ("PATH", "/usr/bin:/bin"),
-            ("LANG", "C.UTF-8"),
         ];
-        let lookup = |name: &str| {
-            parent
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| std::ffi::OsString::from(value))
-        };
-        let child_env =
-            crate::agent::env::build_clean_environment_from(&tmp, &tmp, &lookup, None, None);
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"")
-            .env_clear()
-            .envs(child_env)
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(
+            "echo \"key=[$OPENAI_API_KEY] gh=[$GITHUB_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] ssh=[$SSH_AUTH_SOCK] home=[$HOME]\"",
+        );
+        for (name, value) in inherited {
+            cmd.env(name, value);
+        }
+        super::apply_sanitized_environment(&mut cmd, &tmp);
+        let out = cmd
             .output()
+            .await
             .expect("a spawned command must not error");
         assert!(out.status.success(), "command failed with output: {out:?}");
         let out = String::from_utf8_lossy(&out.stdout).into_owned();
