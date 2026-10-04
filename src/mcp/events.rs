@@ -1820,13 +1820,8 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
     // re-read but not to that load, so it takes the skeleton path below. A
     // test needs to land a row in exactly that window to exercise it; without
     // one the snapshot must never stop to ask.
-    if let Some(path) = pool
-        .__test_snapshot_race_hook
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        crate::pool::save_registry_entry_in(pool.scratch_root(), &path);
+    if let Some(entry) = pool.take_snapshot_race_row() {
+        crate::pool::save_registry_entry_in(pool.scratch_root(), &entry);
     }
     for row in pool.list_workers().await {
         let Some(id) = row["id"].as_str() else {
@@ -1856,18 +1851,21 @@ async fn watch_snapshot(pool: &WorkerPool) -> crate::cli::watch::Snapshot {
             if let Some(last) = row["state"]["last_command"].as_str() {
                 view["last_ops"] = json!([clamp_string(last, 256)]);
             }
-            // The seeded status re-arms the terminal transitions, so this
-            // skeleton must face the same replay-suppression proof the rows
-            // loaded above do: a completion whose branch is already merged or
-            // gone is never replayed. The guard needs the registry entry (the
-            // branch is derived from its id, and the repository and base ref
-            // from its row), which the summary payload does not carry, so it
-            // is read back here rather than guessed from the summary.
-            if crate::pool::load_registry_entry_in(pool.scratch_root(), id)
-                .as_ref()
-                .is_some_and(branch_replay_suppressed)
-            {
-                view[BRANCH_GONE_OR_MERGED] = json!(true);
+            // The summary payload carries no revision, and the skeleton must
+            // not report one it guessed: the dedupe key and the persisted ack
+            // are both `(worker, revision, kind)`, so an event filed under
+            // revision 0 would be delivered again when the same transition is
+            // reported at its real revision. The row is read back whole, which
+            // is also what the replay suppression below needs.
+            if let Some(entry) = crate::pool::load_registry_entry_in(pool.scratch_root(), id) {
+                view["revision"] = json!(entry.revision);
+                // The seeded status re-arms the terminal transitions, so this
+                // skeleton must face the same replay-suppression proof the
+                // rows loaded above do: a completion whose branch is already
+                // merged or gone is never replayed.
+                if branch_replay_suppressed(&entry) {
+                    view[BRANCH_GONE_OR_MERGED] = json!(true);
+                }
             }
             view
         });
@@ -2662,10 +2660,7 @@ mod snapshot_race_suppression_tests {
             // The row lands after the snapshot's registry load and before its
             // `list_workers` re-read, which is the only way a worker reaches
             // the skeleton path.
-            *pool
-                .__test_snapshot_race_hook
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
+            pool.__test_park_snapshot_race_row(entry);
 
             let mut router = EventRouter::default();
             let mut ctx = super::super::server::ConnectionContext::hub_connection(1);
@@ -2674,6 +2669,11 @@ mod snapshot_race_suppression_tests {
             assert_eq!(
                 snap["w0"]["status"], "completed",
                 "the skeleton must still report the terminal status it recovered: {snap:?}"
+            );
+            assert_eq!(
+                snap["w0"]["revision"],
+                json!(1),
+                "the skeleton must report the row's real revision, not a guessed one: {snap:?}"
             );
             router.observe_watch(snap);
             let reply = router

@@ -345,12 +345,11 @@ pub struct WorkerPool {
     /// Worker id -> heavy commands queued ahead of it while it waits for a
     /// build slot. Set while blocked in admission, cleared when granted.
     admission_waiting: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// A registry row to write inside a watch snapshot's load/re-read window,
-    /// so a test can land a row exactly where a concurrent status write would
-    /// and drive the skeleton path deterministically. `None` in every
-    /// non-test run, and taken (not cloned) so it fires at most once.
-    #[doc(hidden)]
-    pub __test_snapshot_race_hook: Arc<std::sync::Mutex<Option<WorkerRegistryEntry>>>,
+    /// A registry row a test parked for the next watch snapshot to write
+    /// between its registry load and its `list_workers` re-read, which is the
+    /// only way a worker reaches that snapshot's skeleton path. `None` in
+    /// every non-test run, and taken (not cloned) so it fires at most once.
+    snapshot_race_hook: Arc<std::sync::Mutex<Option<WorkerRegistryEntry>>>,
     /// Worker id -> unix time its current bash command started. Set while
     /// `execute_bash` runs and cleared when it returns, so the stall detector
     /// can tell a long command from worker inactivity.
@@ -468,7 +467,7 @@ impl WorkerPool {
             bash_semaphore: Arc::new(Semaphore::new(bash_slots)),
             admission,
             admission_waiting: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            __test_snapshot_race_hook: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_race_hook: Arc::new(std::sync::Mutex::new(None)),
             command_running: Arc::new(std::sync::Mutex::new(HashMap::new())),
             harness_wait_label: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: JobTable::new(),
@@ -1216,6 +1215,31 @@ impl WorkerPool {
         question: Option<String>,
     ) {
         self.save_status(meta, model, status, step, max_turns, last_command, question);
+    }
+
+    /// Park a registry row for the next watch snapshot to write inside its
+    /// load/re-read window (test support).
+    ///
+    /// A row written by a concurrent status save is invisible to the snapshot's
+    /// first registry load yet present in its `list_workers` re-read; parking
+    /// one here lets a test land a row in exactly that window without sleeping
+    /// for it, so the snapshot's skeleton path is reached deterministically.
+    #[doc(hidden)]
+    pub fn __test_park_snapshot_race_row(&self, entry: WorkerRegistryEntry) {
+        *self
+            .snapshot_race_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry);
+    }
+
+    /// Take the row a test parked for the snapshot's load/re-read window, if
+    /// any. Taking it means the hook fires at most once, so a snapshot that
+    /// runs twice cannot replay the same parked row.
+    pub(crate) fn take_snapshot_race_row(&self) -> Option<WorkerRegistryEntry> {
+        self.snapshot_race_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Forget the last-write timestamp of `id`'s row (test support).
