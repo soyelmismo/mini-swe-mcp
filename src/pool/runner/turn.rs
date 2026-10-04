@@ -450,7 +450,10 @@ fn bounded_tail(output: &str, limit: usize) -> String {
     if output.len() <= limit {
         return output.to_string();
     }
-    let start = output.floor_char_boundary(output.len() - limit);
+    // The marker counts towards the limit, or the returned string would be
+    // `limit + marker.len()` bytes and the ceiling it documents would be a lie.
+    let keep = limit.saturating_sub(TRUNCATION_MARKER.len());
+    let start = output.floor_char_boundary(output.len() - keep);
     format!("{TRUNCATION_MARKER}{}", &output[start..])
 }
 
@@ -3701,8 +3704,8 @@ mod tests {
         LoopDetector, LoopVerdict, MAX_TURNS_LIMIT, ProgressSummary, ProgressWatch,
         READ_ONLY_NUDGE_TURNS, REPEAT_BLOCK_LIMIT, REPORT_SCAN_BYTES, ReadOnlyNudge,
         ReadOnlyStreak, ReadOnlyThresholds, STAGNATION_SAMPLE_TURNS, TASK_QUESTION_BYTES,
-        TRUNCATION_MARKER, append_report_text, edit_plan, edit_plan_text, extension_budget, grant_extension,
-        isolation_block, log_output_tail, loop_nudge_text, loop_pause_question,
+        TRUNCATION_MARKER, append_report_text, edit_plan, edit_plan_text, extension_budget,
+        grant_extension, isolation_block, log_output_tail, loop_nudge_text, loop_pause_question,
         named_file_defaults, normalize_command_base, output_digest, parse_shortstat,
         parse_threshold, read_only_nudge_text, read_only_pause_question, read_only_plan_text,
         read_only_thresholds, summarized_task, task_names_files,
