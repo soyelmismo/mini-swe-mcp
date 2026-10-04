@@ -450,8 +450,7 @@ fn bounded_tail(output: &str, limit: usize) -> String {
     if output.len() <= limit {
         return output.to_string();
     }
-    let keep = limit.saturating_sub(TRUNCATION_MARKER.len());
-    let start = output.floor_char_boundary(output.len() - keep);
+    let start = output.floor_char_boundary(output.len() - limit);
     format!("{TRUNCATION_MARKER}{}", &output[start..])
 }
 
@@ -485,7 +484,7 @@ pub(super) fn log_output_tail(output: &str) -> String {
     }
     bounded_tail(
         &kept.into_iter().collect::<Vec<_>>().join("\n"),
-        LOG_OUTPUT_BYTES.saturating_sub(TRUNCATION_MARKER.len()),
+        LOG_OUTPUT_BYTES,
     )
 }
 
