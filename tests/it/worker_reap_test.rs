@@ -11,7 +11,7 @@
 use crate::common;
 use mini_swe_mcp::agent::AgentRunner;
 use mini_swe_mcp::agent::reap::processes_in_dirs;
-use mini_swe_mcp::worktree::{WorktreeGuard, swe_base_dir};
+use mini_swe_mcp::worktree::swe_base_dir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,13 +81,34 @@ impl TestRepo {
     fn path(&self) -> &Path {
         &self.dir
     }
+
+    /// A worker checkout of this repository under an isolated scratch root.
+    ///
+    /// `WorktreeGuard::new` files the checkout, and the private
+    /// `swe-tmp-<leaf>` scratch the runner derives from it, in the real scratch
+    /// base; this seam keeps both in a directory [`Drop`] removes.
+    fn guard(&self, worker_id: &str) -> mini_swe_mcp::worktree::WorktreeGuard {
+        let root = self.dir.with_extension("worktrees");
+        std::fs::create_dir_all(&root).expect("create worktree scratch root");
+        mini_swe_mcp::worktree::WorktreeGuard::new_in(
+            &mini_swe_mcp::worktree::ScratchRoot::new(root),
+            &self.dir,
+            worker_id,
+        )
+        .expect("worktree must be created")
+    }
 }
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        // A worker leases build directories keyed by this repo's hash; they are
-        // filed next to the scratch base, so removing the repo has to take them.
+        // A worker leases build directories keyed by this repo's hash, and a
+        // step derives a private `swe-tmp-<leaf>`; both are filed next to the
+        // scratch base, so removing the repository has to take them.
+        mini_swe_mcp::worktree::remove_target_dirs(&self.dir);
         mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(
+            &self.dir.with_extension("worktrees"),
+        );
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -156,7 +177,7 @@ async fn a_detached_job_survives_the_step_and_dies_at_worker_end() {
     let repo = TestRepo::new("detached");
     let id = format!("reap-detached-{}", std::process::id());
     let worktree = {
-        let guard = WorktreeGuard::new(repo.path(), &id).expect("worktree must be created");
+        let guard = repo.guard(&id);
         // The settle is what makes the assertion deterministic: the step's
         // teardown signals the group the instant the shell exits, and a
         // `setsid` that has not run yet is still a member of that group.
@@ -201,7 +222,7 @@ async fn the_worker_end_sweep_never_signals_a_process_outside_the_workers_direct
     await_process_in(&outside).await;
 
     let worktree = {
-        let guard = WorktreeGuard::new(repo.path(), &id).expect("worktree must be created");
+        let guard = repo.guard(&id);
         guard.path.clone()
     };
 
