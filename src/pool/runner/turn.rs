@@ -4894,6 +4894,49 @@ mod tests {
                 let _ = std::fs::remove_file(&outside);
             }
 
+            /// The byte bound is the edge the harness reads at, so both sides of
+            /// it are pinned here: a file of exactly the bound is shown whole,
+            /// down to its last line, and one byte more keeps its own output.
+            ///
+            /// The whole-file answer claims to be the whole file, so the read must
+            /// be complete; a file at the bound is the case where an off-by-one
+            /// would hand the model a truncated file under a header that says it
+            /// is complete.
+            #[test]
+            fn the_byte_bound_is_inclusive_and_complete() {
+                let tree = Tree::new("bound");
+                let bound = 48 * 1024;
+                let path = tree.path().join("at.rs");
+                // `n
+` lines: exactly `bound` bytes, with a known last line.
+                let mut body = String::new();
+                while body.len() + 4 <= bound {
+                    body.push_str("ab\n");
+                }
+                while body.len() < bound {
+                    body.push('x');
+                }
+                assert_eq!(body.len(), bound, "the fixture must sit exactly on the bound");
+                let last = format!("last{}\n", "y".repeat(bound - body.len() - 6));
+                std::fs::write(&path, &body).unwrap();
+                std::fs::write(tree.path().join("over.rs"), format!("{body}z")).unwrap();
+
+                let mut guard = WholeFileGuard::default();
+                let at_bound = reply(&tree, &mut guard, 1, "sed -n '1,2p' at.rs");
+                assert!(
+                    at_bound.contains(&last.trim_end()),
+                    "a file of exactly the bound must be shown whole: {:?}",
+                    &at_bound[at_bound.len().saturating_sub(80)..]
+                );
+
+                let mut guard = WholeFileGuard::default();
+                assert_eq!(
+                    whole_file_reply("sed -n '1,2p' over.rs", tree.path(), &mut guard, 1),
+                    WholeFileReply::Keep,
+                    "one byte past the bound must keep its own output"
+                );
+            }
+
             /// A second slice of an unchanged file keeps the range and says where
             /// the whole file was already shown, so the payload is paid once.
             #[test]

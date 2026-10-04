@@ -363,9 +363,23 @@ fn read_small_regular_file(root: &Path, path: &Path) -> Option<(FileStamp, Strin
     // `read_to_string` fails on invalid UTF-8, which is what keeps binary
     // content out of a whole-file answer: the model's own command would have
     // printed something, but the harness must not guess at what that was.
-    file.take(WHOLE_FILE_MAX_BYTES + 1)
+    let read = file
+        .take(WHOLE_FILE_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .ok()?;
+    // A whole-file answer must be the whole file. A file that grew between the
+    // size check and the read is cut short by the bound above, and answering
+    // with the prefix would tell the model it has seen a file it has not, so a
+    // short read is refused rather than passed off as complete.
+    if read != meta.len() {
+        warn!(
+            file = %path.display(),
+            expected = meta.len(),
+            read,
+            "Refusing a range read: the file changed while it was being read"
+        );
+        return None;
+    }
     Some((FileStamp::of(&meta), text))
 }
 
