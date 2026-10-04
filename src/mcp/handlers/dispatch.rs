@@ -137,6 +137,9 @@ impl McpServer {
         if let Some(group) = Self::batch_round_group(args, tasks) {
             payload["group"] = json!(group);
         }
+        if auto_consolidate::consolidate_requested(args) {
+            payload["consolidate"] = args["consolidate"].clone();
+        }
         self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
@@ -285,10 +288,8 @@ impl McpServer {
                     })?
                     .to_string(),
             ),
-            None if matches!(
-                args.get("consolidate"),
-                Some(Value::Bool(true) | Value::String(_))
-            ) && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
+            None if auto_consolidate::consolidate_requested(args)
+                && args.get("role").and_then(Value::as_str) != Some("consolidate") =>
             {
                 crate::pool::detect_cheap_verify_command(&repo_path)
             }
@@ -338,6 +339,11 @@ impl McpServer {
 
         // Dispatch never blocks: the worker id is the whole handle, and the
         // event the caller actually wants arrives through `watch`.
+        //
+        // `group` and `consolidate` ride along because they are what a
+        // `--quiet` caller waits on: a consolidated round is only finished when
+        // its consolidator has run, and only `watch --group <g> --all` waits
+        // for that.
         let mut payload = json!({
             "worker_id": wid,
             "owner": agent,
@@ -345,6 +351,12 @@ impl McpServer {
             "network": if network_offline { "offline" } else { crate::mcp::schema::NETWORK_DEFAULT },
             "message": "Remember to keep a watch running: worker is executing in isolated worktree in background. Use 'watch' (or mini-swe-mcp watch) to wait for its next event."
         });
+        if let Some(group) = args.get("group").and_then(Value::as_str) {
+            payload["group"] = json!(group);
+        }
+        if auto_consolidate::consolidate_requested(args) {
+            payload["consolidate"] = args["consolidate"].clone();
+        }
         self.with_watch_command(&mut payload, ctx).await;
         Ok(payload)
     }
