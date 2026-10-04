@@ -30,5 +30,5 @@ pub(super) const TEXT: &str = concat!(
     "\n",
     "Build target slots are bounded twice over: MINI_SWE_TARGET_SLOT_MAX_GIB (default 4, 0 disables) empties a slot that grew past it and is idle, which costs one rebuild of your crate because the compiler cache restores the dependencies, while HUB_TARGET_TTL_HOURS (24) and HUB_TARGET_MAX_GB (40) bound the whole swept set.",
     "\n",
-    "MONITOR_WIDTH (120) and COLUMNS override the width of the monitor view; RUST_LOG sets the tracing filter; ENV_FILE and XDG_CONFIG_HOME move the .env and models.yaml lookups. Test-only hooks exist but are deliberately not listed here; they are not operator settings.",
+    "MONITOR_WIDTH (80) and COLUMNS override the width of the monitor view, and NO_COLOR disables its colour; RUST_LOG sets the tracing filter; ENV_FILE and XDG_CONFIG_HOME move the .env and models.yaml lookups. Test-only hooks exist but are deliberately not listed here; they are not operator settings.",
 );
