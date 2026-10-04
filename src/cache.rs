@@ -909,14 +909,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    /// A repository of this test's own, so the pool of build dirs keyed to it
-    /// is this test's alone.
+    /// Where a test repository's build dirs live: its own private base, so the
+    /// pool keyed to it is this test's alone.
     fn slot_cap_base(repo: &Path) -> PathBuf {
         repo.parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir)
     }
 
+    /// A repository of this test's own, under a base it alone knows.
     fn slot_cap_repo(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "swe-slot-cap-base-{tag}-{}",

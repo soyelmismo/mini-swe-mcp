@@ -351,46 +351,38 @@ fn every_env_var_read_is_documented_or_a_declared_test_hook() {
 /// `*_from(lookup)` / `*_in(root)` variant with the env-reading wrapper
 /// delegating to it), and tests that check what a child inherits pass a
 /// constructed environment to the child (`Command::env_clear().envs(..)`) or
-/// to the function that builds it. This scan fails listing `file:line` for
-/// every call site in `src/` and `tests/`; the gate enforces it.
+/// to the function that builds it. This scan walks the whole crate tree and
+/// fails listing `file:line` for every call site it finds; the gate enforces
+/// it.
 #[test]
 fn no_test_mutates_the_process_environment() {
     // Production code that must set a variable goes here with its reason;
     // tests never do.
     const ALLOWLIST: &[(&str, &str)] = &[];
     let root = repo_root();
-    let mut offenders = Vec::new();
+    // Both halves of the tree are load-bearing: a missing directory would make
+    // the scan pass over nothing at all.
+    for required in ["src", "tests"] {
+        assert!(
+            root.join(required).is_dir(),
+            "{required}/ must exist for the scan to mean anything"
+        );
+    }
+    // The whole tree, so a call site cannot hide in a directory the scan does
+    // not name: `examples/`, `benches/`, a build script, a module added beside
+    // `tests/it`.
     let mut files = Vec::new();
-    source_files(&root.join("src"), &mut files);
-    source_files(&root.join("tests"), &mut files);
+    rust_sources(&root, &mut files);
+    assert!(!files.is_empty(), "the scan must see the crate's sources");
+
+    let mut offenders = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path).expect("read a source file");
         for (index, line) in source.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("//") {
+            if line.trim().starts_with("//") {
                 continue;
             }
-            // String literals are not call sites: this file's own matcher
-            // below names both calls inside quotes, and must not flag itself.
-            let mut code = String::new();
-            let mut in_string = false;
-            let mut escaped = false;
-            for ch in line.chars() {
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-                match ch {
-                    // Inside a literal a backslash escapes the next character,
-                    // so `"ends with \""` closes where a quote count alone
-                    // would say it stays open and hide the rest of the line.
-                    '\\' if in_string => escaped = true,
-                    '"' => in_string = !in_string,
-                    _ if !in_string => code.push(ch),
-                    _ => {}
-                }
-            }
-            if code.contains("set_var(") || code.contains("remove_var(") {
+            if is_env_mutation(&without_string_literals(line)) {
                 let relative = path
                     .strip_prefix(&root)
                     .unwrap_or(&path)
@@ -415,6 +407,101 @@ fn no_test_mutates_the_process_environment() {
             "{file} is allowlisted without a reason; document why it must set the environment"
         );
     }
+    // The matcher has to fire: a scan whose predicate matched nothing could
+    // never fail, so pin it to a real call site and to a mention that is only
+    // prose.
+    assert!(
+        is_env_mutation(&without_string_literals(
+            "unsafe { std::env::set_var(\"K\", \"v\") };"
+        )),
+        "the scan must recognise a real set_var call site"
+    );
+    assert!(
+        is_env_mutation(&without_string_literals("env::remove_var(\"K\");")),
+        "the scan must recognise a real remove_var call site"
+    );
+    assert!(
+        !is_env_mutation(&without_string_literals(
+            "let _ = \"call set_var( in prose\";"
+        )),
+        "a mention inside a string literal is not a call site"
+    );
+    assert!(
+        !is_env_mutation(&without_string_literals("let reset_var = 1; reset_var;")),
+        "an identifier that merely contains the name is not a call site"
+    );
+}
+
+/// Whether `code` calls `set_var` / `remove_var`.
+///
+/// The `(` is part of the needle, and the character before the name must not
+/// continue an identifier, so `reset_var(` is not read as `set_var(` while
+/// `env::set_var(` and `.set_var(` both are.
+fn is_env_mutation(code: &str) -> bool {
+    const NEEDLES: &[&str] = &["set_var(", "set_var (", "remove_var(", "remove_var ("];
+    NEEDLES.iter().any(|needle| {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let at = from + at;
+            let continues_ident = code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if !continues_ident {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    })
+}
+
+/// `line` with the inside of every `"..."` literal removed.
+///
+/// String literals are data, not call sites: this file names both calls inside
+/// quotes and must not flag itself. A backslash escapes the next character, so
+/// `"ends with \""` closes where a quote count alone would say it stays open
+/// and hide the rest of the line.
+fn without_string_literals(line: &str) -> String {
+    let mut code = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ if !in_string => code.push(ch),
+            _ => {}
+        }
+    }
+    code
+}
+
+/// Every `.rs` file under `root`, sorted so a failure names the same first file
+/// on every run.
+///
+/// Build output (`target`) and hidden directories (`.git`, a worktree's private
+/// metadata) hold no sources of this crate.
+fn rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        std::fs::read_dir(root).unwrap_or_else(|e| panic!("read {}: {e}", root.display()));
+    for entry in entries {
+        let path = entry.expect("read a directory entry").path();
+        let name = path.file_name().and_then(|name| name.to_str());
+        if path.is_dir() {
+            let skipped = name == Some("target") || name.is_some_and(|n| n.starts_with('.'));
+            if !skipped {
+                rust_sources(&path, out);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out.sort();
 }
 
 /// The guard is load-bearing in both directions: a name that disappears from

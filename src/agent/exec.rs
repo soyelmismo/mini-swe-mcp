@@ -2944,7 +2944,8 @@ mod tests {
             other => std::env::var_os(other),
         };
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"");
+        cmd.arg("-c")
+            .arg("echo \"home=[$HOME] cargo_home=[$CARGO_HOME]\"");
         // What a fresh `Command` inherits in production: a `CARGO_HOME` the
         // sanitizer has to clear before it rebuilds the allow-list, so a decoy
         // that survived the clear is visible in the child's output.
@@ -2957,7 +2958,10 @@ mod tests {
             None,
             Some(&host_cargo),
         );
-        let out = cmd.output().await.expect("a spawned command must not error");
+        let out = cmd
+            .output()
+            .await
+            .expect("a spawned command must not error");
         assert!(out.status.success(), "command failed with output: {out:?}");
         let out = String::from_utf8_lossy(&out.stdout).into_owned();
         assert_eq!(
