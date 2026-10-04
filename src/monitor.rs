@@ -1593,10 +1593,15 @@ pub async fn run_monitor(once: bool) -> Result<()> {
     if once || !is_tty {
         let entries = load_all_registry_entries();
         let now = unix_timestamp();
-        // A pipe or a one-shot run has no window to query, so the width comes
-        // from `COLUMNS` (or `MONITOR_WIDTH`), never from an ioctl.
-        let output =
-            render_dashboard_with_width(&entries, now, use_color_for_tty(is_tty), plain_width());
+        // A pipe has no window to query, so its width comes from `COLUMNS` (or
+        // `MONITOR_WIDTH`), never from an ioctl. A one-shot run on a real
+        // terminal still has a window, so it keeps the ioctl path.
+        let width = if is_tty {
+            terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH)
+        } else {
+            plain_width()
+        };
+        let output = render_dashboard_with_width(&entries, now, use_color_for_tty(is_tty), width);
         println!("{output}");
         return Ok(());
     }

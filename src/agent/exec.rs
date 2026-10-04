@@ -2910,6 +2910,21 @@ mod tests {
             std::env::var("HOME").is_ok_and(|real| !out.contains(&real)),
             "the real HOME must not be visible to the child: {out:?}"
         );
+
+        // The wiring, not only the helper: `execute_bash` is the path the
+        // model's commands actually take, so it must call the sanitizer too.
+        // The isolated `HOME` is the observable -- a run that skipped it would
+        // hand the child this process's `HOME`, which is never the worktree
+        // scratch directory.
+        let (home, code) = runner()
+            .execute_bash(&tmp, "printf '%s' \"$HOME\"")
+            .await
+            .expect("execute_bash must run");
+        assert_eq!(code, Some(0), "execute_bash failed: {home:?}");
+        assert!(
+            home.contains("target/home"),
+            "execute_bash must sanitize the child environment (isolated HOME), got: {home:?}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
