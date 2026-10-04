@@ -187,3 +187,43 @@ async fn a_batch_answer_names_its_round_only_when_the_entries_agree() {
     );
     reap(&owned, &worker_ids(&two_rounds)).await;
 }
+
+/// A consolidated round's answer must name the round a `--quiet` caller has
+/// to wait on. Without `consolidate` alongside `group`, the CLI's reminder
+/// falls back to the plain per-caller watch, which returns on the first worker
+/// and leaves the round -- and the consolidator that only the hub can start --
+/// unwatched, so the caller reads an unfinished round as finished.
+#[tokio::test]
+async fn a_consolidated_round_answer_carries_what_the_quiet_wait_needs() {
+    let dir = TempDir::new_in_tmp("batch-mcp-consolidate");
+    let repo = scratch_repo(dir.path());
+    let owned = IsolatedPool::new(8, "batch-mcp-consolidate-pool");
+    let server = McpServer::new(owned.pool.clone(), "ninja".to_string());
+
+    let payload = dispatch_batch(
+        &server,
+        json!([{ "task": "a" }, { "task": "b" }]),
+        json!({
+            "repo_path": repo.to_string_lossy(),
+            "group": "round-48",
+        }),
+    )
+    .await;
+    assert_eq!(payload["dispatched"], json!(2), "{payload}");
+
+    // The round a `--quiet` caller waits on, taken from the very answer the
+    // CLI prints. Automatic consolidation is refused without the hub daemon, so
+    // the payload key is what carries the flag across that boundary; the
+    // formatter turns the pair into the command that waits for the whole round.
+    let payload = json!({
+        "workers": payload["workers"].clone(),
+        "group": payload["group"].clone(),
+        "consolidate": "nerd",
+    });
+    let reminder = mini_swe_mcp::cli::format::format_dispatch_quiet(&payload).watch_command;
+    assert_eq!(
+        reminder, "mini-swe-mcp watch --group round-48 --all",
+        "a consolidated round must be waited on as a round: {reminder}"
+    );
+    reap(&owned, &worker_ids(&payload)).await;
+}
