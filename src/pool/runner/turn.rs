@@ -450,7 +450,10 @@ fn bounded_tail(output: &str, limit: usize) -> String {
     if output.len() <= limit {
         return output.to_string();
     }
-    let start = output.floor_char_boundary(output.len() - limit);
+    // The marker counts towards the limit, or the returned string would be
+    // `limit + marker.len()` bytes and the ceiling it documents would be a lie.
+    let keep = limit.saturating_sub(TRUNCATION_MARKER.len());
+    let start = output.floor_char_boundary(output.len() - keep);
     format!("{TRUNCATION_MARKER}{}", &output[start..])
 }
 
