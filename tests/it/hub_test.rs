@@ -1132,7 +1132,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     let mut first = command()
         .arg("daemon")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -1217,7 +1217,7 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     let mut second = command()
         .arg("daemon")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .env("HUB_AUTO_RESUME", "0")
         .kill_on_drop(true)
         .spawn()
@@ -1281,15 +1281,6 @@ async fn a_checkpointed_worker_survives_hub_sigkill_and_revision() {
     .await
     .expect("revision watch must finish")
     .unwrap();
-    eprintln!("DEBUG watch status={:?} stdout=<<<{}>>> stderr=<<<{}>>>", watched.status, String::from_utf8_lossy(&watched.stdout), String::from_utf8_lossy(&watched.stderr));
-    let dbg_row = read_registry_row(&swe.join("swe-registry"), wid);
-    eprintln!("DEBUG row after watch: status={:?} step={} max_turns={} last_command=<<<{}>>>", dbg_row.status, dbg_row.step, dbg_row.max_turns, dbg_row.last_command);
-    if let Ok(log) = std::fs::read_to_string(hub.join("hub.log")) {
-        let tail: Vec<&str> = log.lines().rev().take(40).collect();
-        eprintln!("DEBUG hub.log tail:\n{}", tail.iter().rev().cloned().collect::<Vec<_>>().join("\n"));
-    } else {
-        eprintln!("DEBUG no hub.log");
-    }
     assert!(
         watched.status.success(),
         "{}",

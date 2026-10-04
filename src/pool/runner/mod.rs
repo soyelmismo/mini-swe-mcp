@@ -268,9 +268,7 @@ impl WorkerPool {
         } = config;
 
         let repo_path_str = repo_path.to_string_lossy().to_string();
-        eprintln!("DBG run_worker entry wid={worker_id}");
         let _permit = self.worker_slots.acquire(&meta.owner).await;
-        eprintln!("DBG slot acquired wid={worker_id}");
         let revision = resume_base_commit.is_some();
         info!(worker = %worker_id, model = %model, revision, "Starting worker execution");
 
@@ -322,7 +320,6 @@ impl WorkerPool {
             })
             .await
             .context("Worktree checkout task failed")??;
-        eprintln!("DBG worktree ready wid={worker_id} initial_sync={:?}", initial_sync);
         // A kill must not lose what this worker leaves uncommitted, and the
         // guard that owns the checkout dies with the task a kill aborts, so the
         // pool keeps the path and commits through it (see `WorkerPool::kill`).
@@ -463,7 +460,6 @@ impl WorkerPool {
         worktree: &mut WorktreeGuard,
         messages: &mut Vec<ChatMessage>,
     ) -> Result<()> {
-        eprintln!("DBG run_phases entry wid={worker_id} resume_step={}", config.resume_step);
         let task = config.task.to_string();
         let model = config.model.to_string();
         let default_model = config.default_model.to_string();
@@ -535,7 +531,6 @@ impl WorkerPool {
                     review_after: review_after.as_deref(),
                     network_offline,
                 };
-                eprintln!("DBG before run_turn wid={worker_id} step={step} of max={current_max_turns}");
                 let mut engine = TurnEngine {
                     pool: self,
                     worktree,
@@ -557,9 +552,7 @@ impl WorkerPool {
                     report_text: &mut report_text,
                     verdicts: &mut verdicts,
                 };
-                let turn_result = engine.run_turn(&turn_config).await;
-                eprintln!("DBG after run_turn wid={worker_id} step={step} completed={:?}", turn_result.as_ref().map(|o| matches!(o, TurnOutcome::Completed { .. })));
-                match turn_result? {
+                match engine.run_turn(&turn_config).await? {
                     TurnOutcome::Completed { verified: v } => {
                         // Flush the completion turn too: a reused verify pushes its
                         // disclosure note here, and a crash must not lose it.
