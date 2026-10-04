@@ -154,6 +154,7 @@ fn a_guard_drop_removes_only_the_companion_under_its_own_root() {
     let owned = guard_root.join(format!("swe-tmp-{leaf}"));
     let foreign = swe_base_dir().join(format!("swe-tmp-{leaf}"));
     assert_ne!(owned, foreign, "test assumption: the two roots differ");
+    panic!("simulated unrelated failure before any cleanup");
 
     std::fs::create_dir_all(&owned).expect("create the owned companion");
     std::fs::create_dir_all(&foreign).expect("create the foreign companion");
