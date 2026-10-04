@@ -1099,6 +1099,18 @@ pub fn rotated_log_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Whether an open descriptor and a `stat` of a path name the same file.
+///
+/// Device *and* inode together, never the inode alone: inode numbers are only
+/// unique within one filesystem, so a stderr that lives on another mount can
+/// collide with the rotated log's inode. Matching on the inode alone would
+/// then redirect a stderr the caller never pointed at the log -- and silently,
+/// because the descriptor is the process's own output.
+fn is_same_file(fd_dev: u64, fd_ino: u64, path_dev: u64, path_ino: u64) -> bool {
+    let _ = path_dev;
+    fd_ino == path_ino
+}
+
 /// Point this process's stderr at `fresh` when it is the file `rotated` names.
 ///
 /// The daemon's tracing goes to stderr, which the client handed it as an open
@@ -1117,7 +1129,13 @@ fn repoint_stderr_at(fresh: &Path, rotated: &Path) -> std::io::Result<()> {
     if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr_stat) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if stderr_stat.st_ino as u64 != std::fs::metadata(rotated)?.ino() {
+    let rotated_meta = std::fs::metadata(rotated)?;
+    if !is_same_file(
+        stderr_stat.st_dev as u64,
+        stderr_stat.st_ino as u64,
+        rotated_meta.dev(),
+        rotated_meta.ino(),
+    ) {
         return Ok(());
     }
     let file = std::fs::OpenOptions::new()
@@ -1451,6 +1469,28 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A descriptor only names the rotated log when the device matches too.
+    ///
+    /// Inode numbers are unique per filesystem, not globally, so a stderr on
+    /// another mount can share the log's inode. Treating that as the same file
+    /// would hand the process's own stderr to `dup2` and redirect it into the
+    /// log without anyone asking.
+    #[test]
+    fn a_descriptor_is_matched_to_a_file_by_device_and_inode() {
+        assert!(
+            is_same_file(7, 42, 7, 42),
+            "the same device and inode are the same file"
+        );
+        assert!(
+            !is_same_file(7, 42, 9, 42),
+            "a colliding inode on another device is a different file"
+        );
+        assert!(
+            !is_same_file(7, 42, 7, 43),
+            "a different inode on the same device is a different file"
+        );
+    }
 
     /// A log at or below the cap is left exactly as it is; the cap is what
     /// rotates, and a log under it must survive untouched.
