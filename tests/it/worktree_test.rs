@@ -1003,7 +1003,11 @@ fn checkpoint_refuses_oversized_and_cache_paths_but_commits_the_edit() {
     std::fs::write(guard.path.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
     let home = guard.path.join(".envcheck/home");
     std::fs::create_dir_all(home.join(".cache/kache/store/blobs")).unwrap();
-    std::fs::write(home.join(".cache/kache/store/blobs/abcd"), "cache payload\n").unwrap();
+    std::fs::write(
+        home.join(".cache/kache/store/blobs/abcd"),
+        "cache payload\n",
+    )
+    .unwrap();
 
     let report = guard.commit_changes("worker: checkpoint").unwrap();
     assert!(
@@ -1055,7 +1059,10 @@ fn checkpoint_refuses_oversized_and_cache_paths_but_commits_the_edit() {
     );
     // The refused content never reached the object database either, so a later
     // push cannot trip over it.
-    let objects = run(&guard.path, &["cat-file", "--batch-all-objects", "--batch-check"]);
+    let objects = run(
+        &guard.path,
+        &["cat-file", "--batch-all-objects", "--batch-check"],
+    );
     assert!(
         !objects.lines().any(|line| {
             let size = line.split_whitespace().nth(2).unwrap_or("0");
@@ -1084,12 +1091,19 @@ fn checkpoint_still_commits_a_large_file_the_base_tracks() {
 
     let id = unique_worker_id("commit-tracked");
     let mut guard = test_repo.guard(&id);
-    std::fs::write(guard.path.join("fixtures/large.bin"), vec![1u8; 20 * 1024 * 1024]).unwrap();
+    std::fs::write(
+        guard.path.join("fixtures/large.bin"),
+        vec![1u8; 20 * 1024 * 1024],
+    )
+    .unwrap();
     std::fs::create_dir_all(guard.path.join(".cache/kache")).unwrap();
     std::fs::write(guard.path.join(".cache/kache/blob"), "cache\n").unwrap();
 
     let report = guard.commit_changes("worker: checkpoint").unwrap();
-    assert!(report.committed(), "the tracked fixture must still be committed");
+    assert!(
+        report.committed(),
+        "the tracked fixture must still be committed"
+    );
     assert!(
         report.skipped.iter().any(|s| s.path == ".cache/kache/blob"),
         "the cache path was not refused: {:?}",
@@ -1097,7 +1111,12 @@ fn checkpoint_still_commits_a_large_file_the_base_tracks() {
     );
     let committed = run(
         repo,
-        &["ls-tree", "-r", "--name-only", &format!("refs/heads/{}", guard.branch)],
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
     );
     assert!(
         committed.contains("fixtures/large.bin"),
@@ -1118,7 +1137,9 @@ fn a_zero_commit_cap_disables_the_size_limit() {
     std::fs::write(guard.path.join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
 
     // The default cap refuses it...
-    let refused = guard.commit_changes_capped("worker: capped", 10 * 1024 * 1024).unwrap();
+    let refused = guard
+        .commit_changes_capped("worker: capped", 10 * 1024 * 1024)
+        .unwrap();
     assert!(
         refused
             .skipped
@@ -1137,7 +1158,12 @@ fn a_zero_commit_cap_disables_the_size_limit() {
     );
     let committed = run(
         test_repo.path(),
-        &["ls-tree", "-r", "--name-only", &format!("refs/heads/{}", guard.branch)],
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
     );
     assert!(
         committed.contains("big.bin"),
@@ -1163,7 +1189,10 @@ fn checkpoint_refuses_everything_under_a_throwaway_tool_home() {
     std::fs::write(guard.path.join("keep.rs"), "fn kept() {}\n").unwrap();
 
     let report = guard.commit_changes("worker: checkpoint").unwrap();
-    assert!(report.committed(), "the source edit must still be committed");
+    assert!(
+        report.committed(),
+        "the source edit must still be committed"
+    );
     let skipped: Vec<&str> = report.skipped.iter().map(|s| s.path.as_str()).collect();
     assert!(
         skipped.contains(&".envcheck/home/tool-state.json"),
@@ -1171,7 +1200,12 @@ fn checkpoint_refuses_everything_under_a_throwaway_tool_home() {
     );
     let committed = run(
         test_repo.path(),
-        &["ls-tree", "-r", "--name-only", &format!("refs/heads/{}", guard.branch)],
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("refs/heads/{}", guard.branch),
+        ],
     );
     assert!(
         committed.contains("keep.rs") && !committed.contains(".envcheck/"),

@@ -1129,13 +1129,17 @@ impl WorktreeGuard {
     /// Every harness commit goes through here, so the staging rules of
     /// [`stage_commitable_changes_at`] hold for auto-checkpoints, the final
     /// commit and the checkpoint before a merge alike.
-    pub(crate) fn commit_all(path: &Path, base_commit: &str, message: &str) -> Result<CommitReport> {
+    pub(crate) fn commit_all(
+        path: &Path,
+        base_commit: &str,
+        message: &str,
+    ) -> Result<CommitReport> {
         Self::commit_all_capped(path, base_commit, commit_file_cap_bytes(), message)
     }
 
     /// [`WorktreeGuard::commit_all`] with the per-file cap in bytes supplied
-    /// instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can lower it
-    /// without touching process state. `0` disables the cap.
+    /// instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test can lower
+    /// it without touching process state. `0` disables the cap.
     fn commit_all_capped(
         path: &Path,
         base_commit: &str,
@@ -1194,8 +1198,8 @@ impl WorktreeGuard {
     }
 
     /// [`WorktreeGuard::commit_changes`] with the per-file cap in bytes
-    /// supplied instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can
-    /// lower it without touching process state. `0` disables the cap.
+    /// supplied instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test
+    /// can lower it without touching process state. `0` disables the cap.
     pub fn commit_changes_capped(&mut self, message: &str, cap_bytes: u64) -> Result<CommitReport> {
         let report = Self::commit_changes_capped_at(
             &self.path,
@@ -1233,8 +1237,8 @@ impl WorktreeGuard {
     }
 
     /// [`WorktreeGuard::commit_changes_at`] with the per-file cap in bytes
-    /// supplied instead of read from [`MAX_COMMIT_FILE_MB_ENV`], so a test can
-    /// lower it without touching process state. `0` disables the cap.
+    /// supplied instead of read from `MINI_SWE_MAX_COMMIT_FILE_MB`, so a test
+    /// can lower it without touching process state. `0` disables the cap.
     pub fn commit_changes_capped_at(
         path: &Path,
         repo_root: &Path,
