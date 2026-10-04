@@ -1130,29 +1130,43 @@ fn parse_turn_line(line: &str, step: usize) -> Option<TurnView> {
 /// so one noisy turn cannot push the rest off screen.
 fn parse_tool_output(line: &str) -> Option<(Option<i32>, Vec<String>)> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("role")?.as_str()? != "tool" {
-        return None;
-    }
+    let role = value.get("role")?.as_str()?;
     let content = value.get("content")?.as_str()?;
     let prefix = "COMMAND OUTPUT (exit code: ";
-    let rest = content.strip_prefix(prefix)?;
+    let Some(rest) = content.strip_prefix(prefix) else {
+        // A tool result without the harness prefix (an error, a block note):
+        // still worth showing under the turn, without an exit code. User-role
+        // lines are instructions, not output, so only tool lines qualify.
+        if role != "tool" {
+            return None;
+        }
+        return Some((None, tail_lines(content)));
+    };
     let (code_text, output) = rest.split_once(')')?;
     let exit_code = code_text.trim().parse::<i32>().ok();
-    let tail: Vec<String> = output
+    // A code-block (prose) turn is answered by a user message carrying the
+    // same harness prefix, so both roles attach output to the pending turn.
+    if role != "tool" && role != "user" {
+        return None;
+    }
+    Some((exit_code, tail_lines(output)))
+}
+
+/// Keep the last [`TURN_TAIL_LINES`] non-blank lines of a tool output.
+fn tail_lines(output: &str) -> Vec<String> {
+    output
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
-        .collect();
-    let tail = tail
+        .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .take(TURN_TAIL_LINES)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .collect();
-    Some((exit_code, tail))
+        .collect()
 }
 
 /// A key the interactive loop can receive.
@@ -1359,16 +1373,14 @@ pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> Strin
     }
 }
 
-/// Whether a worker row is dimmed: terminal, or within its retired grace.
+/// Whether a worker row is dimmed: terminal workers, plus live workers that
+/// stopped reporting (no update within the terminal TTL, so the sweeper will
+/// soon retire them).
 fn dim_worker(w: &WorkerRegistryEntry, now: u64) -> bool {
     if w.status.is_terminal() {
         return true;
     }
-    crate::pool::within_retired_grace(
-        w.updated_at,
-        crate::pool::worker_retired_grace_secs(),
-        now,
-    )
+    now.saturating_sub(w.updated_at) > crate::pool::DEFAULT_TERMINAL_TTL_SECS
 }
 
 /// The one-character status glyph for a worker.
@@ -1574,11 +1586,21 @@ fn render_detail(
     let mut out = String::new();
     let status_name = entry.status.display_name();
     out.push_str(&truncate_visible(
-        &format!("{} {} {} {}/{}", status_glyph(entry.status), entry.id, status_name, entry.step, entry.max_turns),
+        &format!(
+            "{} {} {} {}/{}",
+            status_glyph(entry.status),
+            entry.id,
+            status_name,
+            entry.step,
+            entry.max_turns
+        ),
         width,
     ));
     out.push('\n');
-    out.push_str(&truncate_visible(&format!("task: {}", entry.task.lines().next().unwrap_or("")), width));
+    out.push_str(&truncate_visible(
+        &format!("task: {}", entry.task.lines().next().unwrap_or("")),
+        width,
+    ));
     out.push('\n');
     if let Some(ref q) = entry.question {
         out.push_str(&truncate_visible(&format!("question: {q}"), width));
@@ -1605,7 +1627,10 @@ fn render_detail(
             .exit_code
             .map(|c| format!(" (exit {c})"))
             .unwrap_or_default();
-        turn_lines.push(truncate_visible(&format!("#{} {}{}", turn.step, turn.command, code), width));
+        turn_lines.push(truncate_visible(
+            &format!("#{} {}{}", turn.step, turn.command, code),
+            width,
+        ));
         for line in &turn.output_lines {
             turn_lines.push(truncate_visible(&format!("  {line}"), width));
         }
@@ -1747,8 +1772,7 @@ async fn run_interactive() -> Result<()> {
                         if state.follow {
                             state.scroll = 0;
                         } else {
-                            state.scroll =
-                                state.scroll.min(reader.turns.len().saturating_sub(1));
+                            state.scroll = state.scroll.min(reader.turns.len().saturating_sub(1));
                         }
                         render_detail(entry, reader, &state, now, width, height)
                     }
@@ -1772,23 +1796,23 @@ async fn run_interactive() -> Result<()> {
                 if let Some(sig) = sigterm.as_mut() {
                     tokio::select! {
                         biased;
-                        _ = sig.recv() => return Wake::Done,
-                        _ = tokio::signal::ctrl_c() => return Wake::Done,
+                        _ = sig.recv() => Wake::Done,
+                        _ = tokio::signal::ctrl_c() => Wake::Done,
                         key = rx.recv() => match key {
-                            Some(k) => return Wake::Key(k),
-                            None => return Wake::Done,
+                            Some(k) => Wake::Key(k),
+                            None => Wake::Done,
                         },
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => return Wake::Tick,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => Wake::Tick,
                     }
                 } else {
                     tokio::select! {
                         biased;
-                        _ = tokio::signal::ctrl_c() => return Wake::Done,
+                        _ = tokio::signal::ctrl_c() => Wake::Done,
                         key = rx.recv() => match key {
-                            Some(k) => return Wake::Key(k),
-                            None => return Wake::Done,
+                            Some(k) => Wake::Key(k),
+                            None => Wake::Done,
                         },
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => return Wake::Tick,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => Wake::Tick,
                     }
                 }
             }
@@ -1798,8 +1822,7 @@ async fn run_interactive() -> Result<()> {
             Wake::Tick => {}
             Wake::Key(key) => {
                 // Ctrl+C arrives as `q` from `read_key`; quit from any view.
-                let (_, order) =
-                    build_list_lines(&entries, now, width, state.groups_expanded);
+                let (_, order) = build_list_lines(&entries, now, width, state.groups_expanded);
                 let action = state.apply_key(key, order.len());
                 match action {
                     Action::Quit => break,
@@ -2533,6 +2556,232 @@ mod tests {
         assert!(
             text.contains("cargo test --all"),
             "command must survive:\n{text}"
+        );
+    }
+
+    /// The list/detail/back/quit/scroll/follow state machine answers every key
+    /// with the action its view owns and ignores the keys of the other view.
+    #[test]
+    fn test_key_state_machine_covers_list_detail_back_quit_scroll_follow() {
+        let mut state = UiState::default();
+        assert_eq!(state.view, View::List);
+
+        // List: move within bounds, clamp at both ends.
+        assert_eq!(state.apply_key(Key::Down, 3), Action::MoveDown);
+        assert_eq!(state.selection, 1);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::MoveUp);
+        assert_eq!(state.selection, 0);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
+        state.selection = 2;
+        assert_eq!(state.apply_key(Key::Down, 3), Action::None);
+
+        // List: groups toggle, follow/scroll keys are ignored.
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert!(!state.groups_expanded);
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert!(state.groups_expanded);
+        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::None);
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::None);
+
+        // List: Enter opens the detail, Esc/q quit; Enter with no workers does
+        // nothing.
+        assert_eq!(state.apply_key(Key::Enter, 0), Action::None);
+        assert_eq!(state.apply_key(Key::Enter, 3), Action::OpenDetail);
+        assert_eq!(state.view, View::Detail);
+        assert!(state.follow);
+        assert_eq!(state.scroll, 0);
+
+        // Detail: scroll pages, follow toggles, movement keys are ignored.
+        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
+        assert_eq!(state.scroll, 1);
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.apply_key(Key::PageUp, 3), Action::ScrollUp);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.apply_key(Key::Char('f'), 3), Action::ToggleFollow);
+        assert!(!state.follow);
+        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
+        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::None);
+
+        // Detail: Esc/q go back; list: Esc/q quit.
+        assert_eq!(state.apply_key(Key::Esc, 3), Action::Back);
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.apply_key(Key::Char('q'), 3), Action::Quit);
+        let mut detail = UiState {
+            view: View::Detail,
+            ..UiState::default()
+        };
+        assert_eq!(detail.apply_key(Key::Char('q'), 3), Action::Back);
+    }
+
+    /// Raw terminal bytes map to keys: arrows, PgUp/PgDn, Enter, Esc, j/k as
+    /// Up/Down aliases, and control bytes map to nothing.
+    #[test]
+    fn test_parse_key_maps_sequences_and_aliases() {
+        assert_eq!(parse_key(&[0x1b, b'[', b'A']), Some(Key::Up));
+        assert_eq!(parse_key(&[0x1b, b'[', b'B']), Some(Key::Down));
+        assert_eq!(parse_key(&[0x1b, b'[', b'5', b'~']), Some(Key::PageUp));
+        assert_eq!(parse_key(&[0x1b, b'[', b'6', b'~']), Some(Key::PageDown));
+        assert_eq!(parse_key(b"\r"), Some(Key::Enter));
+        assert_eq!(parse_key(&[0x1b]), Some(Key::Esc));
+        assert_eq!(parse_key(b"j"), Some(Key::Up));
+        assert_eq!(parse_key(b"k"), Some(Key::Down));
+        assert_eq!(parse_key(b"q"), Some(Key::Char('q')));
+        assert_eq!(parse_key(&[0x03]), None);
+        assert_eq!(parse_key(&[0x1b, b'[', b'Z']), None);
+    }
+
+    /// History lines fold into turns: an assistant tool call opens a turn and
+    /// the tool result attaches its exit code plus the output tail.
+    #[test]
+    fn test_history_reader_parses_turns_incrementally() {
+        let dir = std::env::temp_dir().join(format!(
+            "monitor-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("swe-wt-w1.history.jsonl");
+
+        let meta = serde_json::json!({"task": "t", "model": "m", "repo_path": "r",
+            "base_commit": "c", "branch": "b", "network_offline": false,
+            "max_turns": 10, "revision": 0, "messages": []});
+        let assistant = |command: &str| {
+            serde_json::json!({"role": "assistant", "content": "working",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "bash", "arguments":
+                        serde_json::to_string(&serde_json::json!({"command": command}))
+                            .expect("args")}}]})
+            .to_string()
+        };
+        let tool = |code: i32, output: &str| {
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1",
+                "content": format!("COMMAND OUTPUT (exit code: {code})\n{output}")})
+            .to_string()
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                meta,
+                assistant("cargo test"),
+                tool(0, "ok\nline2\nline3\nline4\nline5\nline6\nline7")
+            ),
+        )
+        .expect("write history");
+
+        let mut reader = HistoryReader::default();
+        reader.read_incremental(&path).expect("read");
+        assert_eq!(reader.turns.len(), 1);
+        assert_eq!(reader.turns[0].step, 1);
+        assert_eq!(reader.turns[0].command, "cargo test");
+        assert_eq!(reader.turns[0].exit_code, Some(0));
+        // Only the last few output lines survive per turn.
+        assert_eq!(reader.turns[0].output_lines.len(), 5);
+        assert_eq!(reader.turns[0].output_lines.last().unwrap(), "line7");
+        let offset = reader.offset;
+        assert!(offset > 0);
+
+        // A second read with nothing appended parses nothing new.
+        reader.read_incremental(&path).expect("re-read");
+        assert_eq!(reader.turns.len(), 1);
+        assert_eq!(reader.offset, offset);
+
+        // Appended lines parse from the remembered offset; a torn final line
+        // is skipped without failing the read.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("append");
+            writeln!(file, "{}", assistant("cargo build")).expect("turn");
+            writeln!(file, "{}", tool(1, "boom")).expect("result");
+            writeln!(file, "{{\"role\": \"assistant\", \"broken\"").expect("torn");
+        }
+        reader.read_incremental(&path).expect("incremental");
+        assert_eq!(reader.turns.len(), 2);
+        assert_eq!(reader.turns[1].step, 2);
+        assert_eq!(reader.turns[1].command, "cargo build");
+        assert_eq!(reader.turns[1].exit_code, Some(1));
+        assert_eq!(reader.turns[1].output_lines, vec!["boom".to_string()]);
+        assert!(reader.offset > offset);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reader caps its memory: far more turns than fit stay on disk.
+    #[test]
+    fn test_history_reader_keeps_at_most_the_last_500_turns() {
+        let mut reader = HistoryReader::default();
+        let mut buf = String::new();
+        for i in 0..(MAX_TURNS_IN_MEMORY + 50) {
+            buf.push_str(
+                &serde_json::json!({"role": "assistant", "content": format!("turn {i}")})
+                    .to_string(),
+            );
+            buf.push('\n');
+        }
+        reader.consume_lines(&buf);
+        assert_eq!(reader.turns.len(), MAX_TURNS_IN_MEMORY);
+        assert_eq!(
+            reader.turns.last().unwrap().command,
+            format!("turn {}", MAX_TURNS_IN_MEMORY + 49)
+        );
+        assert_eq!(reader.turns.first().unwrap().step, 51);
+    }
+
+    /// One worker fits one line at any width: the op column absorbs the slack
+    /// and the line never overflows, dimmed for terminal workers.
+    #[test]
+    fn test_compact_row_fits_any_width() {
+        let live = Row::new("a1b2c3d4")
+            .task("Refactor the authentication middleware into smaller pieces")
+            .command("cargo test --all --verbose -- --nocapture")
+            .turns(37, 250)
+            .group("audits")
+            .build();
+        let done = Row::new("d4e5f6a7b8")
+            .status(RegistryStatus::Completed)
+            .task("Finished work")
+            .command("completed")
+            .turns(9, 100)
+            .build();
+
+        for width in [40usize, 60, 80, 120, 200] {
+            let row = fit_compact_row(&live, 1060, width);
+            assert!(
+                visible_width(&row) <= width,
+                "live row overflows {width}: {row:?}"
+            );
+            assert!(row.contains("a1b2c3d4"), "id lost:\n{row}");
+            assert!(row.contains("37/250"), "step/max lost:\n{row}");
+            if width >= 80 {
+                assert!(row.contains("[audits]"), "group lost:\n{row}");
+            }
+
+            let finished = fit_compact_row(&done, 1060, width);
+            assert!(
+                visible_width(&finished) <= width,
+                "done row overflows {width}: {finished:?}"
+            );
+            assert!(
+                finished.starts_with("\x1b[2m"),
+                "completed workers must dim:\n{finished:?}"
+            );
+        }
+        // The live row carries no dimming, but a live worker that stopped
+        // reporting (retired-soon) dims like a terminal one.
+        assert!(!fit_compact_row(&live, 1060, 120).starts_with("\x1b[2m"));
+        let stale = Row::new("stale001")
+            .task("Gone quiet")
+            .command("cargo test")
+            .turns(3, 100)
+            .updated_at(100)
+            .build();
+        assert!(
+            fit_compact_row(&stale, 10_000, 120).starts_with("\x1b[2m"),
+            "a worker quiet past the TTL must dim"
         );
     }
 }
