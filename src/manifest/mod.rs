@@ -163,19 +163,35 @@ impl ModelManifest {
     /// The built-in modes `quality` and `security` are always available even
     /// when the manifest does not declare them; a manifest-declared entry of
     /// the same name overrides the built-in prompt. A built-in override is
-    /// found case-insensitively (exact match first, then a scan for
-    /// `quality`/`security`), so a `Security:` entry still overrides the
-    /// built-in; any other name resolves only on an exact match.
-    pub fn review_mode(&self, name: &str) -> Option<&ReviewModeDefinition> {
+    /// found case-insensitively (exact match first, then the
+    /// lexicographically first spelling that names the same built-in), so a
+    /// `Security:` entry still overrides the built-in; any other name resolves
+    /// only on an exact match.
+    pub fn review_mode<'a>(&'a self, name: &'a str) -> Option<&'a ReviewModeDefinition> {
+        self.declared_review_mode(name).map(|(_, def)| def)
+    }
+
+    /// The declared entry that answers a [`Self::review_mode`] lookup, with the
+    /// key it is declared under.
+    ///
+    /// A built-in name is matched case-insensitively, and the winner among
+    /// several spellings is the lexicographically first: `self.review_modes` is
+    /// a `HashMap` with a randomly seeded order, so "the first match" of an
+    /// unordered scan would make the reviewer -- and the `manifest` listing --
+    /// a run-to-run lottery when a catalog declares two spellings of one
+    /// built-in mode. [`ModelManifest::validate`] names that collision.
+    fn declared_review_mode<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Option<(&'a str, &'a ReviewModeDefinition)> {
         if let Some(def) = self.review_modes.get(name) {
-            return Some(def);
+            return Some((name, def));
         }
         if name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security") {
             return self
-                .review_modes
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, def)| def);
+                .sorted_review_modes()
+                .into_iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name));
         }
         None
     }
@@ -250,17 +266,13 @@ impl ModelManifest {
     pub fn effective_review_modes(&self) -> Vec<(String, ReviewModeDefinition, &'static str)> {
         let mut out = Vec::new();
         for builtin in ["quality", "security"] {
-            match self
-                .review_modes
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(builtin))
-            {
+            match self.declared_review_mode(builtin) {
                 Some((name, def)) => {
                     let mut def = def.clone();
                     if def.checklist.as_deref().is_none_or(|c| c.trim().is_empty()) {
                         def.checklist = Self::builtin_review_checklist(builtin);
                     }
-                    out.push((name.clone(), def, "models.yaml"));
+                    out.push(((*name).to_string(), def, "models.yaml"));
                 }
                 None => out.push((
                     builtin.to_string(),

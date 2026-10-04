@@ -495,14 +495,17 @@ fn two_case_variants_of_a_builtin_mode_warn_and_resolve_deterministically() {
             .any(|w| w.contains("Security") && w.contains("SECURITY")),
         "two spellings of one built-in mode must warn: {warnings:?}"
     );
-    // The scan picks the lexicographically first spelling, every run.
-    let (_, mode) = ReviewMode::parse_with_manifest("security", &manifest).expect("security mode");
+    // The scan picks the lexicographically first spelling ("SECURITY" sorts
+    // before "Security"), every run, so the reviewer it names is fixed.
     assert_eq!(
-        mode.name, "Security",
+        manifest
+            .review_mode("security")
+            .and_then(|def| def.default_model.clone()),
+        Some("weak".to_string()),
         "the case-insensitive lookup must not depend on HashMap order"
     );
     let (reviewer, _) = ReviewMode::parse_with_manifest("security", &manifest).expect("security");
-    assert_eq!(reviewer, "nerd");
+    assert_eq!(reviewer, "weak");
 }
 
 /// A mode name that cannot survive the dispatch -> review-phase round trip

@@ -128,6 +128,28 @@ impl ModelManifest {
             }
         }
 
+        // Two spellings of one built-in mode are one mode to every lookup, and
+        // which of them wins is fixed (the lexicographically first, see
+        // `declared_review_mode`), but the catalog is still ambiguous and the
+        // operator should keep one.
+        for builtin in ["quality", "security"] {
+            let spellings: Vec<&str> = self
+                .review_modes
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case(builtin))
+                .map(String::as_str)
+                .collect();
+            if spellings.len() > 1 {
+                let mut sorted = spellings;
+                sorted.sort();
+                warnings.push(format!(
+                    "review modes {} all name the built-in `{builtin}`; only \"{}\" is used",
+                    join_known(&sorted),
+                    sorted[0]
+                ));
+            }
+        }
+
         // Review modes are iterated in sorted name order so the output is
         // stable across runs. A non-built-in mode with no checklist is an
         // auditor with nothing to say, so it is reported and dropped by
@@ -144,6 +166,18 @@ impl ModelManifest {
                     "review mode \"{name}\" has an empty checklist; it will be ignored"
                 )),
                 _ => {}
+            }
+            // A mode name no `--review-after` spelling can reach is dead
+            // config: the dispatch stores `<model>:<mode>`, split at the last
+            // colon, so a name holding a colon (or none at all) is accepted by
+            // the bare `<mode>` form and then fails to re-parse in the review
+            // phase -- after the implementation has already run. It is dropped
+            // by `normalize`, so the dispatch rejects the spelling instead.
+            if name.trim().is_empty() || name.contains(':') {
+                warnings.push(format!(
+                    "review mode \"{name}\" cannot be selected by `--review-after` because its \
+                     name is empty or holds a colon; it will be ignored"
+                ));
             }
             if def.model_key_deprecated {
                 warnings.push(format!(
@@ -312,13 +346,18 @@ impl ModelManifest {
             }
         }
         self.review_modes.retain(|name, def| {
+            // A name the `--review-after` round trip cannot carry is dropped
+            // with the warning that names it, so a dispatch rejects the
+            // spelling instead of failing the worker's review phase.
+            let selectable = !name.trim().is_empty() && !name.contains(':');
             let builtin =
                 name.eq_ignore_ascii_case("quality") || name.eq_ignore_ascii_case("security");
-            builtin
-                || def
-                    .checklist
-                    .as_deref()
-                    .is_some_and(|c| !c.trim().is_empty())
+            selectable
+                && (builtin
+                    || def
+                        .checklist
+                        .as_deref()
+                        .is_some_and(|c| !c.trim().is_empty()))
         });
 
         self
