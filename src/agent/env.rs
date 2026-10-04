@@ -468,12 +468,24 @@ pub fn sanitize_ambient_value(name: &str, value: &str) -> Option<String> {
 /// orchestrator's shell, and it is what the differential verify gate layers on
 /// top of the canonical sandbox environment.
 pub fn ambient_environment_snapshot() -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            let name = name.to_string_lossy().into_owned();
-            let value = value.to_string_lossy().into_owned();
-            sanitize_ambient_value(&name, &value).map(|value| (name, value))
-        })
+    ambient_snapshot_from(std::env::vars_os().map(|(name, value)| {
+        (
+            name.to_string_lossy().into_owned(),
+            value.to_string_lossy().into_owned(),
+        )
+    }))
+}
+
+/// [`ambient_environment_snapshot`] over an explicit `vars` iterator, so tests
+/// drive filtering, redaction and truncation against a synthetic map instead
+/// of mutating process-global state. [`ambient_environment_snapshot`]
+/// delegates here unchanged.
+pub fn ambient_snapshot_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = vars
+        .into_iter()
+        .filter_map(|(name, value)| sanitize_ambient_value(&name, &value).map(|value| (name, value)))
         .collect();
     pairs.sort();
     let mut total = 0usize;
@@ -691,7 +703,6 @@ mod tests {
 
     #[test]
     fn apply_clean_environment_clears_and_sets_isolated_home() {
-        let _guard = env_guard();
         let dir = unique_dir("apply");
         let mut cmd = tokio::process::Command::new("true");
         // Seed with a secret so env_clear has something to remove.
@@ -834,25 +845,21 @@ mod tests {
 
     #[test]
     fn ambient_snapshot_never_carries_secrets() {
-        let _guard = env_guard();
-        // SAFETY: serialized against every other test that reads the process
-        // environment.
-        unsafe {
-            std::env::set_var("SWE_AMBIENT_PLAIN_TEST", "hello");
-            std::env::set_var("SWE_AMBIENT_SECRET_TOKEN_TEST", "must-not-travel");
-            std::env::set_var(
-                "SWE_AMBIENT_URL_TEST",
-                "postgres://app:hunter2@db.internal:5432/prod",
-            );
-            std::env::set_var("http_proxy", "http://user:s3cret@proxy.internal:8080");
-        }
-        let snapshot = ambient_environment_snapshot();
-        unsafe {
-            std::env::remove_var("SWE_AMBIENT_PLAIN_TEST");
-            std::env::remove_var("SWE_AMBIENT_SECRET_TOKEN_TEST");
-            std::env::remove_var("SWE_AMBIENT_URL_TEST");
-            std::env::remove_var("http_proxy");
-        }
+        let snapshot = ambient_snapshot_from([
+            ("SWE_AMBIENT_PLAIN_TEST".to_string(), "hello".to_string()),
+            (
+                "SWE_AMBIENT_SECRET_TOKEN_TEST".to_string(),
+                "must-not-travel".to_string(),
+            ),
+            (
+                "SWE_AMBIENT_URL_TEST".to_string(),
+                "postgres://app:hunter2@db.internal:5432/prod".to_string(),
+            ),
+            (
+                "http_proxy".to_string(),
+                "http://user:s3cret@proxy.internal:8080".to_string(),
+            ),
+        ]);
         assert!(
             snapshot
                 .iter()
@@ -883,15 +890,16 @@ mod tests {
     /// forwarded verbatim, so a non-default install layout keeps working.
     #[test]
     fn an_explicit_cargo_home_is_forwarded_verbatim() {
-        let _guard = env_guard();
         let dir = unique_dir("cargo-home-explicit");
         let custom = dir.join("custom-cargo");
         std::fs::create_dir_all(&custom).expect("create custom cargo home");
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe { std::env::set_var("CARGO_HOME", &custom) };
-        let env = build_clean_environment(&dir, &dir);
-        unsafe { std::env::remove_var("CARGO_HOME") };
+        let env = build_clean_environment_from(
+            &dir,
+            &dir,
+            &|name| std::env::var_os(name),
+            None,
+            Some(&custom),
+        );
 
         assert_eq!(
             env.iter()
@@ -908,14 +916,17 @@ mod tests {
     /// fallback, because a host with no toolchain manager is not an error).
     #[test]
     fn rustup_home_is_forwarded_when_set_and_absent_otherwise() {
-        let _guard = env_guard();
         let dir = unique_dir("rustup-home");
-        // SAFETY: serialized against every other test that reads or writes the
-        // process environment.
-        unsafe { std::env::set_var("RUSTUP_HOME", "/opt/rustup") };
-        let set_env = build_clean_environment(&dir, &dir);
-        unsafe { std::env::remove_var("RUSTUP_HOME") };
-        let unset_env = build_clean_environment(&dir, &dir);
+        let set_lookup = |name: &str| match name {
+            "RUSTUP_HOME" => Some(std::ffi::OsString::from("/opt/rustup")),
+            other => std::env::var_os(other),
+        };
+        let set_env = build_clean_environment_from(&dir, &dir, &set_lookup, None, None);
+        let unset_lookup = |name: &str| match name {
+            "RUSTUP_HOME" => None,
+            other => std::env::var_os(other),
+        };
+        let unset_env = build_clean_environment_from(&dir, &dir, &unset_lookup, None, None);
 
         assert_eq!(
             set_env

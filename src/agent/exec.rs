@@ -2335,13 +2335,11 @@ mod tests {
     /// from variant A.
     #[test]
     fn extra_env_reaches_the_child() {
-        crate::agent::env::with_env_lock(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            rt.block_on(extra_env_probe());
-        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(extra_env_probe());
     }
 
     async fn extra_env_probe() {
