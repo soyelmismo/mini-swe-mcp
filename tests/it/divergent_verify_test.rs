@@ -165,7 +165,7 @@ async fn wait_for_terminal(pool: &WorkerPool, worker_id: &str) -> WorkerState {
 /// carries it even while the worker keeps running.
 async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> String {
     for _ in 0..600 {
-        let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
+        let path = mini_swe_mcp::pool::history_log_path_in(pool.scratch_root(), worker_id);
         if let Ok(raw) = std::fs::read_to_string(&path) {
             for line in raw.lines() {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -184,7 +184,8 @@ async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> S
                 WorkerState::Completed { .. } | WorkerState::Failed { .. }
             )
         {
-            let path = mini_swe_mcp::pool::revision::history_log_path(worker_id);
+            let path =
+                mini_swe_mcp::pool::history_log_path_in(pool.scratch_root(), worker_id);
             let raw = std::fs::read_to_string(&path).unwrap_or_default();
             panic!(
                 "worker {worker_id} finished before refusing with {needle:?}: {state:?}\n--- log ---\n{raw}"
@@ -196,13 +197,24 @@ async fn wait_for_refusal(pool: &WorkerPool, worker_id: &str, needle: &str) -> S
 }
 
 /// Dispatch one worker with an explicit verify command and ambient snapshot.
+///
+/// The worker runs against a pool whose scratch root is a temporary directory,
+/// so its checkout, history log, mailbox and steer log never reach the real
+/// scratch base. The root is owned here and returned with the pool, so it
+/// outlives every worker the pool is still running.
 async fn dispatch_verify(
     base_url: &str,
     repo: &Path,
     verify: &str,
     client_env: Vec<(String, String)>,
-) -> (WorkerPool, String) {
-    let pool = WorkerPool::new(1, base_url.to_string(), "test-key".to_string());
+) -> (common::TempDir, WorkerPool, String) {
+    let root = common::TempDir::new_in_tmp("divergent-verify");
+    let pool = WorkerPool::with_scratch(
+        1,
+        base_url.to_string(),
+        "test-key".to_string(),
+        mini_swe_mcp::worktree::ScratchRoot::new(root.path()),
+    );
     let worker_id = pool
         .dispatch(
             TEST_OWNER.to_string(),
@@ -219,7 +231,7 @@ async fn dispatch_verify(
         )
         .await
         .expect("dispatch the worker");
-    (pool, worker_id)
+    (root, pool, worker_id)
 }
 
 /// A suite that fails when an ambient variable is set is refused, with the
@@ -231,7 +243,7 @@ async fn an_ambient_variable_failure_is_refused_with_the_variable_named() {
     // Passes in the canonical environment (the variable is absent there) and
     // fails in variant B (where the dispatcher's value is layered on top).
     let verify = "test -z \"$SWE_DIVERGENT_PROBE_VAR\"";
-    let (pool, worker_id) = dispatch_verify(
+    let (_root, pool, worker_id) = dispatch_verify(
         &server.base_url,
         repo.path(),
         verify,
@@ -255,7 +267,7 @@ async fn a_timezone_dependent_suite_is_refused() {
     // The canonical environment keeps the host's own zone; variant B shifts it
     // to one of the two far zones, so the suite passes in A and fails in B.
     let verify = "test \"$TZ\" != \"Pacific/Kiritimati\" && test \"$TZ\" != \"Etc/GMT+12\"";
-    let (pool, worker_id) =
+    let (_root, pool, worker_id) =
         dispatch_verify(&server.base_url, repo.path(), verify, Vec::new()).await;
     let refusal = wait_for_refusal(&pool, &worker_id, "clean environment").await;
     assert!(
@@ -270,7 +282,7 @@ async fn a_timezone_dependent_suite_is_refused() {
 async fn a_hermetic_suite_completes_verified() {
     let repo = TestRepo::new("hermetic");
     let server = SentinelServer::spawn().await;
-    let (pool, worker_id) = dispatch_verify(
+    let (_root, pool, worker_id) = dispatch_verify(
         &server.base_url,
         repo.path(),
         "echo hermetic-ok",
@@ -349,7 +361,7 @@ async fn secrets_never_reach_variant_b() {
     let repo = TestRepo::new("secret");
     let server = SentinelServer::spawn().await;
     let verify = "test -z \"$SWE_DIVERGENT_API_TOKEN_CHECK\"";
-    let (pool, worker_id) = dispatch_verify(
+    let (_root, pool, worker_id) = dispatch_verify(
         &server.base_url,
         repo.path(),
         verify,

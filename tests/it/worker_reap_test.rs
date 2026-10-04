@@ -102,9 +102,9 @@ impl Drop for TestRepo {
         // scratch base, so removing the repository has to take them.
         mini_swe_mcp::worktree::remove_target_dirs(&self.dir);
         mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
-        mini_swe_mcp::worktree::remove_scratch_root_worktrees(
-            &self.dir.with_extension("worktrees"),
-        );
+        let worktrees = self.dir.with_extension("worktrees");
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&worktrees);
+        let _ = std::fs::remove_dir_all(&worktrees);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

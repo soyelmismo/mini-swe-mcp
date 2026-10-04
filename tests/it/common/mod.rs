@@ -547,9 +547,9 @@ impl Drop for TestRepo {
         mini_swe_mcp::cache::remove_build_dir_leases(&self.dir);
         // The checkouts [`Self::guard`] created, and their companions, live in
         // a sibling root this repository owns.
-        mini_swe_mcp::worktree::remove_scratch_root_worktrees(
-            &self.dir.with_extension("worktrees"),
-        );
+        let worktrees = self.dir.with_extension("worktrees");
+        mini_swe_mcp::worktree::remove_scratch_root_worktrees(&worktrees);
+        let _ = std::fs::remove_dir_all(&worktrees);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
