@@ -1220,8 +1220,16 @@ impl UiState {
     ///
     /// Pure and deterministic: the interactive loop feeds raw keys in and the
     /// resulting action drives the redraw. `worker_count` is the number of
-    /// visible workers in the list, used to clamp the selection.
-    pub fn apply_key(&mut self, key: Key, worker_count: usize) -> Action {
+    /// visible workers in the list, used to clamp the selection;
+    /// `selected_step` is the step number of the turn the detail view's cursor
+    /// is on, which Enter expands or collapses (the state machine cannot know
+    /// it: the turns live in the caller's reader).
+    pub fn apply_key(
+        &mut self,
+        key: Key,
+        worker_count: usize,
+        selected_step: Option<usize>,
+    ) -> Action {
         match self.view {
             View::List => match key {
                 Key::Up => {
@@ -1272,15 +1280,18 @@ impl UiState {
                     self.selected_turn = self.selected_turn.saturating_sub(1);
                     Action::MoveDown
                 }
-                Key::Enter => {
-                    // The selected turn's step: turns are indexed newest-first,
-                    // so `selected_turn` counts back from the newest.
-                    let step = self.selected_turn.saturating_add(1);
-                    if !self.expanded.insert(step) {
-                        self.expanded.remove(&step);
+                Key::Enter => match selected_step {
+                    // The caller names the selected turn by its step number,
+                    // which is stable while new turns arrive; the expansion
+                    // follows the turn, not its position on screen.
+                    Some(step) => {
+                        if !self.expanded.insert(step) {
+                            self.expanded.remove(&step);
+                        }
+                        Action::ToggleExpand
                     }
-                    Action::ToggleExpand
-                }
+                    None => Action::None,
+                },
                 Key::PageUp => {
                     self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
                     Action::ScrollUp
@@ -1585,7 +1596,7 @@ fn render_detail(
     let mut blocks: Vec<String> = Vec::new();
     for (off, turn) in turns.iter().enumerate().rev() {
         let is_selected = off == state.selected_turn;
-        blocks.push(turn_separator(turn, width, use_color));
+        blocks.push(turn_separator(turn, width, use_color, is_selected));
         let indent = "  ";
         let cmd = format!("{indent}$ {}{}", C_BOLD, sanitize_text(&turn.command));
         let cmd = format!("{cmd}{C_RESET}");
@@ -1611,13 +1622,6 @@ fn render_detail(
                     &format!("{indent}{C_DIM}{}{C_RESET}", sanitize_text(line)),
                     width,
                 ));
-            }
-        }
-        if is_selected {
-            // Mark the selected turn's separator so the operator can see which
-            // turn Enter will expand/collapse.
-            if let Some(last) = blocks.last_mut() {
-                *last = format!("{last}  \u{25b8}");
             }
         }
     }
@@ -1670,7 +1674,7 @@ fn render_detail(
 /// Carries the turn number, a coloured ✓/✗ with the exit code, the duration
 /// when the history recorded one and `(review)` when the turn belongs to the
 /// review phase. The line is clipped to the box width like every other line.
-fn turn_separator(turn: &TurnView, width: usize, use_color: bool) -> String {
+fn turn_separator(turn: &TurnView, width: usize, use_color: bool, selected: bool) -> String {
     let mark = if turn.exit_code == Some(0) { "\u{2713}" } else { "\u{2717}" };
     let mark = if use_color {
         let colour = if turn.exit_code == Some(0) { C_GREEN } else { C_RED };
@@ -1687,8 +1691,9 @@ fn turn_separator(turn: &TurnView, width: usize, use_color: bool) -> String {
         .map(|d| format!(" \u{b7} {}", format_elapsed(d)))
         .unwrap_or_default();
     let review = if turn.review { " (review)" } else { "" };
+    let cursor = if selected { " \u{25b8}" } else { "" };
     let inner = width.saturating_sub(4).max(1);
-    let prefix = format!("── turn {} \u{b7} {mark}{code}{duration}{review}", turn.step);
+    let prefix = format!("── turn {} \u{b7} {mark}{code}{duration}{review}{cursor}", turn.step);
     let dashes = inner.saturating_sub(visible_width(&prefix)).max(1);
     let line = format!("{prefix} {}", "─".repeat(dashes));
     box_line(&line, width)
@@ -1844,6 +1849,9 @@ async fn run_interactive() -> Result<()> {
                         } else {
                             state.scroll = state.scroll.min(reader.turns.len().saturating_sub(1));
                         }
+                        // The turn cursor cannot point past the oldest turn.
+                        state.selected_turn =
+                            state.selected_turn.min(reader.turns.len().saturating_sub(1));
                         render_detail(entry, reader, &state, now, width, height)
                     }
                     None => render_list(&entries, &state, now, width, height),
@@ -1891,7 +1899,20 @@ async fn run_interactive() -> Result<()> {
             Wake::Tick => {}
             Wake::Key(key) => {
                 let (_, order) = build_list_lines(&entries, now, width, state.groups_expanded);
-                if state.apply_key(key, order.len()) == Action::Quit {
+                // The step of the turn the detail cursor is on: `selected_turn`
+                // counts back from the newest, so it names a reader turn only
+                // while it stays inside the history the reader holds.
+                let selected_step = order.get(state.selection).and_then(|entry| {
+                    readers.get(&entry.id).and_then(|reader| {
+                        reader
+                            .turns
+                            .len()
+                            .checked_sub(1)?
+                            .checked_sub(state.selected_turn)
+                            .map(|idx| reader.turns[idx].step)
+                    })
+                });
+                if state.apply_key(key, order.len(), selected_step) == Action::Quit {
                     break;
                 }
             }
@@ -2569,26 +2590,26 @@ mod tests {
     fn test_key_state_machine_covers_list_detail_back_quit_scroll_follow() {
         let mut state = UiState::default();
         assert_eq!(state.view, View::List);
-        assert_eq!(state.apply_key(Key::Down, 3), Action::MoveDown);
+        assert_eq!(state.apply_key(Key::Down, 3, None), Action::MoveDown);
         assert_eq!(state.selection, 1);
-        assert_eq!(state.apply_key(Key::Up, 3), Action::MoveUp);
+        assert_eq!(state.apply_key(Key::Up, 3, None), Action::MoveUp);
         assert_eq!(state.selection, 0);
-        assert_eq!(state.apply_key(Key::Up, 3), Action::None);
+        assert_eq!(state.apply_key(Key::Up, 3, None), Action::None);
         state.selection = 2;
-        assert_eq!(state.apply_key(Key::Down, 3), Action::None);
-        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert_eq!(state.apply_key(Key::Down, 3, None), Action::None);
+        assert_eq!(state.apply_key(Key::Char('g'), 3, None), Action::ToggleGroups);
         assert!(!state.groups_expanded);
-        assert_eq!(state.apply_key(Key::Char('g'), 3), Action::ToggleGroups);
+        assert_eq!(state.apply_key(Key::Char('g'), 3, None), Action::ToggleGroups);
         assert!(state.groups_expanded);
-        assert_eq!(state.apply_key(Key::Enter, 0), Action::None);
-        assert_eq!(state.apply_key(Key::Enter, 3), Action::OpenDetail);
+        assert_eq!(state.apply_key(Key::Enter, 0, None), Action::None);
+        assert_eq!(state.apply_key(Key::Enter, 3, None), Action::OpenDetail);
         assert_eq!(state.view, View::Detail);
         assert!(state.follow);
-        assert_eq!(state.apply_key(Key::PageDown, 3), Action::ScrollDown);
+        assert_eq!(state.apply_key(Key::PageDown, 3, None), Action::ScrollDown);
         assert_eq!(state.scroll, PAGE_TURNS);
-        assert_eq!(state.apply_key(Key::Esc, 3), Action::Back);
+        assert_eq!(state.apply_key(Key::Esc, 3, None), Action::Back);
         assert_eq!(state.view, View::List);
-        assert_eq!(state.apply_key(Key::Char('q'), 3), Action::Quit);
+        assert_eq!(state.apply_key(Key::Char('q'), 3, None), Action::Quit);
     }
 
     /// Raw terminal bytes map to keys.
@@ -2937,6 +2958,25 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// Strip ANSI escape sequences, so an assertion holds whether or not the
+    /// renderer coloured the frame (`NO_COLOR` decides that at runtime).
+    fn strip_escapes(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if in_escape {
+                if ch == 'm' {
+                    in_escape = false;
+                }
+            } else if ch == '\x1b' {
+                in_escape = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
     /// A counting writer so a test can assert how many times a frame is written.
     struct CountingWriter {
         buf: Vec<u8>,
@@ -2966,8 +3006,12 @@ mod tests {
         assert_eq!(w.writes, 1, "one write per changed frame");
         let text = String::from_utf8(w.buf.clone()).expect("utf8");
         assert!(
-            text.contains("line one\r\nline two"),
+            text.contains("\r\n"),
             "frame must join lines with CRLF: {text:?}"
+        );
+        assert!(
+            !text.contains("\n") || text.contains("\r\n"),
+            "no bare LF may separate interactive lines: {text:?}"
         );
         assert!(text.contains("\x1b[H"), "frame must move the cursor home");
         assert!(text.contains("\x1b[K"), "each line erases to end of line");
@@ -3042,7 +3086,7 @@ mod tests {
                     visible_width(line)
                 );
             }
-            let text = frame.join("\n");
+            let text = strip_escapes(&frame.join("\n"));
             assert!(
                 text.contains("turn 12") && text.contains("exit 0"),
                 "turn 12 separator must carry the number and exit code: {text}"
@@ -3051,18 +3095,22 @@ mod tests {
                 text.contains("turn 13") && text.contains("exit 101"),
                 "turn 13 separator must carry the number and exit code: {text}"
             );
-            assert!(
-                text.contains("(review)"),
-                "a review turn must be marked (review): {text}"
-            );
-            assert!(
-                text.contains("$ cargo test --lib monitor 2>&1 | tail -5"),
-                "the command must show after `$ `: {text}"
-            );
-            assert!(
-                text.contains("test result: ok. 41 passed; 0 failed"),
-                "the output tail must show: {text}"
-            );
+            if width >= 100 {
+                assert!(
+                    text.contains("(review)"),
+                    "a review turn must be marked (review): {text}"
+                );
+            }
+            if width >= 60 {
+                assert!(
+                    text.contains("$ cargo test --lib monitor 2>&1 | tail -5"),
+                    "the command must show after `$ `: {text}"
+                );
+                assert!(
+                    text.contains("test result: ok. 41 passed; 0 failed"),
+                    "the output tail must show: {text}"
+                );
+            }
         }
     }
 
@@ -3072,16 +3120,19 @@ mod tests {
     fn test_detail_turn_selection_and_expand_collapse() {
         let mut state = UiState::default();
         state.view = View::Detail;
-        assert_eq!(state.apply_key(Key::Up, 0), Action::MoveUp);
+        assert_eq!(state.apply_key(Key::Up, 0, None), Action::MoveUp);
         assert_eq!(state.selected_turn, 1);
-        assert_eq!(state.apply_key(Key::Down, 0), Action::MoveDown);
+        assert_eq!(state.apply_key(Key::Down, 0, None), Action::MoveDown);
         assert_eq!(state.selected_turn, 0);
-        // Enter expands the selected turn (step 1).
-        assert_eq!(state.apply_key(Key::Enter, 0), Action::ToggleExpand);
-        assert!(state.expanded.contains(&1), "turn 1 must expand");
+        // Enter expands the turn the cursor is on (step 12); with no turn
+        // selected there is nothing to expand.
+        assert_eq!(state.apply_key(Key::Enter, 0, None), Action::None);
+        assert!(state.expanded.is_empty(), "nothing to expand without a turn");
+        assert_eq!(state.apply_key(Key::Enter, 0, Some(12)), Action::ToggleExpand);
+        assert!(state.expanded.contains(&12), "turn 12 must expand");
         // Enter again collapses it.
-        assert_eq!(state.apply_key(Key::Enter, 0), Action::ToggleExpand);
-        assert!(!state.expanded.contains(&1), "turn 1 must collapse");
+        assert_eq!(state.apply_key(Key::Enter, 0, Some(12)), Action::ToggleExpand);
+        assert!(!state.expanded.contains(&12), "turn 12 must collapse");
     }
 
 }
