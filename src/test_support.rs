@@ -128,3 +128,38 @@ impl Drop for TestScratch {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+/// A `swe-*` entry in `dir` whose name mentions `needle`.
+///
+/// Scoped to the exact name the guard under test derives, never the whole base:
+/// a test binary runs its tests in parallel and sibling tests legitimately
+/// create entries beside it, so a base-wide scan would be both racy and
+/// unfalsifiable. Both callers assert a *named* leak is gone, which is what
+/// makes the assertion specific enough to fail.
+#[cfg(test)]
+pub(crate) fn swe_entry_for(dir: &Path, needle: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("swe-") && name.contains(needle))
+        })
+}
+
+/// Run `body` and report whether it unwound, with the default hook silenced so a
+/// deliberate panic does not print a backtrace that reads like a real failure.
+///
+/// Scratch hygiene is only observable on the failure path -- a `Drop` guard is
+/// indistinguishable from a sequential cleanup that happens to run -- so a test
+/// that pins it has to make the fixture actually unwind.
+#[cfg(test)]
+pub(crate) fn panics<F: FnOnce()>(body: F) -> bool {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
+    std::panic::set_hook(previous);
+    unwound
+}

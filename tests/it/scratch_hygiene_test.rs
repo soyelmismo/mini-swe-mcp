@@ -14,6 +14,15 @@
 //!
 //! A pool's own scratch root is a different property, covered where the pool is
 //! built: `consolidate_steer_log_hardening_test` and the `IsolatedPool` seam.
+//!
+//! The library's own unit tests leak the same way -- a build-slot base and a
+//! variant-B private scratch, both filed under a `swe-*` name -- so that half is
+//! covered at the lib level, next to the fixtures that create them, rather than
+//! by shelling out to `cargo test --lib` from here: a nested cargo run inside a
+//! test would rebuild the crate under test and could not be fast or hermetic.
+//! See `a_panicking_slot_cap_test_leaves_no_base_and_no_slots_behind` in
+//! `src/cache.rs` and `a_panicking_environment_test_leaves_no_private_scratch_behind`
+//! in `src/pool/runner/divergent.rs`.
 
 use crate::common::{TempDir, TestRepo};
 use mini_swe_mcp::worktree::swe_base_dir;

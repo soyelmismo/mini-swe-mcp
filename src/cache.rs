@@ -947,34 +947,6 @@ mod tests {
         (crate::test_support::TestScratch::own(base), repo)
     }
 
-    /// A `swe-*` entry in `dir` whose name mentions `needle`.
-    ///
-    /// Scoped to the exact name the guard under test derives, never the whole
-    /// base: this binary runs tests in parallel and siblings legitimately create
-    /// entries beside it, so a base-wide scan would be racy and unfalsifiable.
-    fn swe_entry_for(dir: &Path, needle: &str) -> Option<PathBuf> {
-        std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("swe-") && name.contains(needle))
-            })
-    }
-
-    /// Run `body` and report whether it unwound, with the default hook silenced
-    /// so a deliberate panic does not print a backtrace that looks like a
-    /// failure.
-    fn panics<F: FnOnce()>(body: F) -> bool {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err();
-        std::panic::set_hook(previous);
-        unwound
-    }
-
     /// The three cap tests above lease real slots under a base they build
     /// themselves, so that base -- and every `swe-target-<key>-<n>` in it --
     /// belongs to the test. A sequential `remove_dir_all` at the tail of the
@@ -988,7 +960,7 @@ mod tests {
         let (guard, repo) = slot_cap_repo("hygiene-panic");
         let base = slot_cap_base(&repo);
 
-        let unwound = panics(|| {
+        let unwound = crate::test_support::panics(|| {
             let _lease = BuildDirLease::acquire_in(&repo, &base, 0)
                 .expect("lease a build slot under the test's own base");
             panic!("the failing assertion this fixture exists to provoke");
@@ -996,11 +968,14 @@ mod tests {
         assert!(unwound, "the fixture must unwind, or nothing was proven");
 
         drop(guard);
+        // The base is a `swe-slot-cap-base-*` entry in the temp dir, so the
+        // scan looks in the temp dir, not inside the base it is checking for.
+        let parent = base.parent().expect("the base has a parent").to_path_buf();
         assert_eq!(
-            swe_entry_for(&base, "swe-slot-cap-base-hygiene-panic"),
+            crate::test_support::swe_entry_for(&parent, "swe-slot-cap-base-hygiene-panic"),
             None,
-            "{} outlived the test that created it",
-            base.display()
+            "a panicking slot-cap test left a base in {}",
+            parent.display()
         );
         assert!(
             !base.exists(),
