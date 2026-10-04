@@ -787,3 +787,91 @@ async fn a_finished_workers_revision_still_gets_a_fresh_budget() {
     let _ = std::fs::remove_dir_all(&repo);
     drop(scratch);
 }
+
+/// A corrupted or inflated row cannot grant an unbounded budget.
+///
+/// The resumed ceiling is read off the registry row with no validation, so a
+/// row whose `max_turns` is nonsense -- a torn write, a hand-edited file --
+/// must not become the run's ceiling: it is clamped to the same
+/// `MAX_TURNS_LIMIT` every dispatch is.
+#[tokio::test]
+async fn an_inflated_interrupted_row_is_clamped_to_the_turn_limit() {
+    let scratch = Scratch::new("resume-clamp");
+    let root = scratch.root();
+    let id = "rclm1";
+    let repo = repo_with_branch("resume-clamp", id);
+
+    let mut meta = history(id, &repo);
+    meta.max_turns = 250;
+    for message in &meta.messages {
+        append_history_message_in(&root, id, &meta, message).expect("seed the history log");
+    }
+    // A row no run could ever have been dispatched with: the ceiling is far
+    // past the limit every budget is clamped to.
+    let mut interrupted = row(id, &repo, RegistryStatus::Interrupted);
+    interrupted.max_turns = 100_000;
+    interrupted.step = 30;
+    save_registry_entry_in(&root, &interrupted);
+
+    // No LLM: the continuation fails on its first turn, which is fine -- the
+    // budget is on the log before the run starts.
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".to_string(), root.clone());
+    pool.continue_worker(id, "pick up where you left off".to_string(), None)
+        .await
+        .expect("an interrupted worker with a history is continued");
+
+    assert_eq!(
+        load_worker_history_in(&root, id)
+            .expect("history")
+            .max_turns,
+        mini_swe_mcp::manifest::MAX_TURNS_LIMIT,
+        "the resumed ceiling is clamped to the turn limit, not the row's inflated number"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    drop(scratch);
+}
+
+/// A run interrupted near its ceiling still gets turns to finish.
+///
+/// Resuming 248 of 250 under the same absolute ceiling would leave two turns,
+/// which is not enough to run a gate and REPORT; the continuation gets a
+/// floor of ten turns past the step it was interrupted at, so a handover near
+/// the end of a run does not kill it mid-gate.
+#[tokio::test]
+async fn a_run_interrupted_near_its_ceiling_resumes_with_a_floor() {
+    let scratch = Scratch::new("resume-floor");
+    let root = scratch.root();
+    let id = "rflr1";
+    let repo = repo_with_branch("resume-floor", id);
+
+    let mut meta = history(id, &repo);
+    meta.max_turns = 250;
+    for message in &meta.messages {
+        append_history_message_in(&root, id, &meta, message).expect("seed the history log");
+    }
+    // Two turns from the ceiling: resuming under it alone would leave the
+    // worker unable to finish its gate.
+    let mut interrupted = row(id, &repo, RegistryStatus::Interrupted);
+    interrupted.max_turns = 250;
+    interrupted.step = 248;
+    save_registry_entry_in(&root, &interrupted);
+
+    // No LLM: the continuation fails on its first turn, which is fine -- the
+    // budget is on the log before the run starts.
+    let pool = WorkerPool::with_scratch(1, "http://x".into(), "k".to_string(), root.clone());
+    pool.continue_worker(id, "pick up where you left off".to_string(), None)
+        .await
+        .expect("an interrupted worker with a history is continued");
+
+    assert_eq!(
+        load_worker_history_in(&root, id)
+            .expect("history")
+            .max_turns,
+        258,
+        "the resumed ceiling is at least ten turns past the interrupted step, not the two it had left"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    drop(scratch);
+}

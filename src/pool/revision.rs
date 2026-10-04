@@ -1470,6 +1470,13 @@ pub(crate) struct ResumedTurns {
     pub step: usize,
 }
 
+/// Turns a resumed run gets past the step it was interrupted at, at minimum.
+///
+/// A run interrupted near its ceiling -- 248 of 250, say -- would otherwise
+/// resume with almost nothing left and die `exhausted` mid-gate; the floor
+/// keeps it able to finish and REPORT.
+const RESUME_FLOOR_TURNS: usize = 10;
+
 impl ResumedTurns {
     /// The budget of an interrupted run, off the row that run kept current.
     ///
@@ -1486,6 +1493,19 @@ impl ResumedTurns {
             max_turns: entry.max_turns,
             step: entry.step,
         })
+    }
+
+    /// The ceiling the resumed run continues under.
+    ///
+    /// The row's own ceiling, but never below `step` +
+    /// [`RESUME_FLOOR_TURNS`] -- a run interrupted near its ceiling would
+    /// otherwise resume with almost nothing left -- and never above
+    /// [`MAX_TURNS_LIMIT`], so a corrupt or inflated row cannot grant an
+    /// unbounded budget.
+    pub(crate) fn ceiling(&self) -> usize {
+        self.max_turns
+            .max(self.step.saturating_add(RESUME_FLOOR_TURNS))
+            .min(crate::manifest::MAX_TURNS_LIMIT)
     }
 }
 
