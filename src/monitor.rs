@@ -1319,11 +1319,16 @@ impl UiState {
                     None => Action::None,
                 },
                 Key::PageUp => {
-                    self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
+                    // `scroll` is the window's distance from the newest turn,
+                    // so paging up means stepping to older turns; it also
+                    // leaves follow mode, where the window is pinned to the
+                    // newest turn and the offset would be ignored.
+                    self.follow = false;
+                    self.scroll = self.scroll.saturating_add(PAGE_TURNS);
                     Action::ScrollUp
                 }
                 Key::PageDown => {
-                    self.scroll = self.scroll.saturating_add(PAGE_TURNS);
+                    self.scroll = self.scroll.saturating_sub(PAGE_TURNS);
                     Action::ScrollDown
                 }
                 Key::Char('f') => {
@@ -1377,20 +1382,20 @@ pub fn fit_compact_row(w: &WorkerRegistryEntry, now: u64, width: usize) -> Strin
 
 /// One line of the key hint shown at the bottom of the interactive views.
 ///
-/// The hint is shortened to fit `width` so the bottom border is never clipped:
-/// `box_bottom` truncates with an ellipsis, which would eat the right border,
-/// so a narrow terminal gets a compact hint instead.
-pub fn key_hint(view: View, width: usize) -> String {
-    let hint = match view {
-        View::List => "\u{2191}\u{2193} select  \u{23ce} turns  g groups  q quit",
-        View::Detail => {
+/// The hint is chosen for the terminal width: `box_bottom` frames it with
+/// `╰─ ` and ` ─…╯`, so the hint itself must leave room for that frame plus at
+/// least one dash. A hint that is too wide would be clipped and take the
+/// right border with it, so a narrow terminal gets the compact keys instead
+/// of the full sentence.
+pub fn key_hint(view: View, width: usize) -> &'static str {
+    match view {
+        View::List if width >= 44 => "\u{2191}\u{2193} select  \u{23ce} turns  g groups  q quit",
+        View::List => "\u{2191}\u{2193} \u{23ce} g q",
+        View::Detail if width >= 64 => {
             "\u{2191}\u{2193} turn  \u{23ce} expand  PgUp/PgDn scroll  f follow  Esc/q back"
         }
-    };
-    // `╰─ ` and ` ─╯` take four columns around the hint; anything beyond the
-    // inner width is dropped so the border survives at any width.
-    let budget = width.saturating_sub(4).max(1);
-    truncate_visible(hint, budget)
+        View::Detail => "\u{2191}\u{2193} \u{23ce} PgUp/Dn f Esc",
+    }
 }
 
 // ----------
@@ -1588,7 +1593,7 @@ fn render_list(
             }
         }
     }
-    out.push(box_bottom(&key_hint(View::List, width), width, use_color));
+    out.push(box_bottom(key_hint(View::List, width), width, use_color));
     out
 }
 
@@ -1728,7 +1733,7 @@ fn render_detail(
     for l in blocks.iter().skip(start).take(turn_height) {
         out.push(l.clone());
     }
-    out.push(box_bottom(&key_hint(View::Detail, width), width, use_color));
+    out.push(box_bottom(key_hint(View::Detail, width), width, use_color));
     out
 }
 
@@ -2697,8 +2702,13 @@ mod tests {
         assert_eq!(state.apply_key(Key::Enter, 3, None), Action::OpenDetail);
         assert_eq!(state.view, View::Detail);
         assert!(state.follow);
-        assert_eq!(state.apply_key(Key::PageDown, 3, None), Action::ScrollDown);
+        // Paging up steps to older turns and leaves follow mode, where the
+        // window is pinned to the newest turn.
+        assert_eq!(state.apply_key(Key::PageUp, 3, None), Action::ScrollUp);
         assert_eq!(state.scroll, PAGE_TURNS);
+        assert!(!state.follow);
+        assert_eq!(state.apply_key(Key::PageDown, 3, None), Action::ScrollDown);
+        assert_eq!(state.scroll, 0);
         assert_eq!(state.apply_key(Key::Esc, 3, None), Action::Back);
         assert_eq!(state.view, View::List);
         assert_eq!(state.apply_key(Key::Char('q'), 3, None), Action::Quit);
@@ -3334,5 +3344,174 @@ mod tests {
             !strip_escapes(oldest).contains('\u{25b8}'),
             "the cursor must not mark the oldest turn: {oldest:?}"
         );
+    }
+
+    /// Turns are listed oldest-first so the newest lands at the bottom of the
+    /// detail view, the chronological reading order the operator expects.
+    #[test]
+    fn test_detail_turns_are_ascending_newest_at_bottom() {
+        let entry = Row::new("925633bb")
+            .turns(3, 250)
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        for step in 1..=3 {
+            reader.turns.push(TurnView {
+                step,
+                command: format!("cmd {step}"),
+                exit_code: Some(0),
+                output_lines: vec![format!("out {step}")],
+                duration_secs: None,
+                review: false,
+            });
+        }
+        let frame = render_detail(&entry, &reader, &UiState::default(), 1060, 80, 24);
+        let pos = |step: usize| {
+            frame
+                .iter()
+                .position(|l| strip_escapes(l).contains(&format!("turn {step} \u{b7}")))
+                .unwrap_or_else(|| panic!("turn {step} missing: {frame:?}"))
+        };
+        assert!(
+            pos(1) < pos(2) && pos(2) < pos(3),
+            "turns must ascend with the newest at the bottom: {frame:?}"
+        );
+    }
+
+    /// Opening the detail view (follow mode by default) shows the newest
+    /// turns, not the oldest ones, even when the history is far longer than
+    /// the terminal is tall; paging up then steps the window to older turns.
+    #[test]
+    fn test_detail_opens_at_the_newest_turns_in_follow_mode() {
+        let entry = Row::new("925633bb")
+            .turns(20, 250)
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        for step in 1..=20 {
+            reader.turns.push(TurnView {
+                step,
+                command: format!("cmd {step}"),
+                exit_code: Some(0),
+                output_lines: vec![format!("out {step}")],
+                duration_secs: None,
+                review: false,
+            });
+        }
+        let frame = render_detail(&entry, &reader, &UiState::default(), 1060, 80, 24);
+        let text = strip_escapes(&frame.join("\n"));
+        assert!(text.contains("turn 20 \u{b7}"), "newest must show: {text}");
+        assert!(
+            !text.contains("turn 1 \u{b7}"),
+            "the oldest must be hidden while following: {text}"
+        );
+
+        // Paging up leaves follow mode and moves the window to older turns.
+        let mut state = UiState {
+            view: View::Detail,
+            ..UiState::default()
+        };
+        assert_eq!(state.apply_key(Key::PageUp, 0, None), Action::ScrollUp);
+        let frame = render_detail(&entry, &reader, &state, 1060, 80, 24);
+        let text = strip_escapes(&frame.join("\n"));
+        assert!(
+            !text.contains("turn 20 \u{b7}"),
+            "paging up must leave the newest turns: {text}"
+        );
+        assert!(text.contains("turn 10 \u{b7}"), "older turns show: {text}");
+    }
+
+    /// Markdown fence lines (the history wraps command output in ``` fences)
+    /// are framing, not output: they never reach a turn's output lines.
+    #[test]
+    fn test_markdown_fence_lines_are_dropped_from_output() {
+        let line = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "COMMAND OUTPUT (exit code: 0)\n```\nok\nline2\n```"
+        })
+        .to_string();
+        let (code, lines) = parse_tool_output(&line).expect("parsed");
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            lines,
+            vec!["ok".to_string(), "line2".to_string()],
+            "fence lines must be dropped"
+        );
+    }
+
+    /// The turn separator is built to exactly the inner width: it is never
+    /// clipped, so the dash run and the right border survive at any width.
+    #[test]
+    fn test_turn_separator_fits_exactly_and_keeps_its_border() {
+        let turn = TurnView {
+            step: 13,
+            command: "cargo clippy".to_string(),
+            exit_code: Some(101),
+            output_lines: Vec::new(),
+            duration_secs: Some(2),
+            review: true,
+        };
+        for width in [40usize, 60, 100] {
+            for use_color in [false, true] {
+                let line = turn_separator(&turn, width, use_color, true);
+                assert_eq!(
+                    visible_width(&line),
+                    width,
+                    "the separator must fill the width exactly at {width}"
+                );
+                assert!(
+                    line.ends_with('\u{2502}'),
+                    "the right border must survive at {width}: {line:?}"
+                );
+                if width >= 60 {
+                    assert!(
+                        !line.contains('\u{2026}'),
+                        "a fitting separator is never clipped at {width}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The footer hint is shortened to the terminal width, so the bottom
+    /// border and its right corner are intact at narrow terminals.
+    #[test]
+    fn test_footer_hint_keeps_the_bottom_border_at_narrow_widths() {
+        let entries = sample_entries();
+        let entry = Row::new("925633bb")
+            .turns(1, 250)
+            .task("T")
+            .group("g")
+            .build();
+        let mut reader = HistoryReader::default();
+        reader.turns.push(TurnView {
+            step: 1,
+            command: "cargo test".to_string(),
+            exit_code: Some(0),
+            output_lines: vec!["ok".to_string()],
+            duration_secs: None,
+            review: false,
+        });
+        for width in [40usize, 60, 100] {
+            let frames = [
+                render_list(&entries, &UiState::default(), 1060, width, 20),
+                render_detail(&entry, &reader, &UiState::default(), 1060, width, 24),
+            ];
+            for frame in frames {
+                let last = strip_escapes(frame.last().expect("footer line"));
+                assert!(
+                    last.ends_with('\u{256f}'),
+                    "the bottom-right corner must survive at {width}: {last:?}"
+                );
+                assert_eq!(
+                    visible_width(&last),
+                    width,
+                    "the footer must fill the width exactly at {width}"
+                );
+            }
+        }
     }
 }
