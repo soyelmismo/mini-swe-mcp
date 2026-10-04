@@ -11,6 +11,10 @@
 //! (TIOCGWINSZ, else `COLUMNS`, else [`DEFAULT_TERMINAL_WIDTH`]); the renderer
 //! clips every line as a final safety net, whatever the content.
 //!
+//! The plain non-TTY output has no window to query, so its width comes from
+//! [`plain_width`]: `MONITOR_WIDTH`, else `COLUMNS` (which a shell exports for
+//! a redirected command too), else [`DEFAULT_TERMINAL_WIDTH`].
+//!
 //! All measurement runs on the visible (ANSI-stripped) text, never on escape
 //! sequences, so colour never shifts a column. Colour is applied only when the
 //! output is a TTY and `NO_COLOR` is unset; the plain non-TTY output uses the
@@ -25,12 +29,19 @@
 //! task headline when idle) takes whatever width the fixed columns leave and is
 //! truncated with `…`.
 //!
+//! The op is the protected column: it keeps at least 24 visible characters,
+//! and a column is dropped rather than let the op fall below that. What the
+//! glyph already shows is never repeated in the op, so a narrow row spends its
+//! columns on the work rather than on its label.
+//!
 //! # Grouping contract
 //!
 //! Rows are grouped by round/group (`WorkerRegistryEntry::group`), each group
-//! headed by one line with its per-status counts. There is no PID column here
-//! (the PID lives in the detail view), and a repository line is shown only when
-//! more than one repository is present.
+//! headed by one line with its per-status counts. A row under its header
+//! therefore carries no `[group]` tag of its own; only the flat view, which has
+//! no header above it, does. There is no PID column here (the PID lives in the
+//! detail view), and a repository line is shown only when more than one
+//! repository is present.
 
 use crate::config::env_parse;
 use crate::pool::{RegistryStatus, WorkerRegistryEntry, load_all_registry_entries, unix_timestamp};
@@ -654,10 +665,28 @@ pub fn use_color_for_tty(is_tty: bool) -> bool {
 
 /// Best-effort terminal width in columns.
 pub fn terminal_width() -> Option<usize> {
-    if let Some(parsed) = env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0) {
+    if let Some(parsed) = monitor_width_override() {
         return Some(parsed);
     }
     terminal_size_via_tty()
+}
+
+/// Width for the plain (non-TTY) rendering.
+///
+/// A pipe has no window to ask, so the ioctl path is skipped entirely: the
+/// explicit `MONITOR_WIDTH` override wins, then `COLUMNS` (which a shell
+/// exports for a redirected command just as it does for an interactive one),
+/// then [`DEFAULT_TERMINAL_WIDTH`]. Without this, a `mini-swe monitor | less`
+/// always rendered 80 columns wide no matter what the user had set.
+pub fn plain_width() -> usize {
+    monitor_width_override()
+        .or_else(columns_env)
+        .unwrap_or(DEFAULT_TERMINAL_WIDTH)
+}
+
+/// The `MONITOR_WIDTH` override, ignored when unset, unparsable or zero.
+fn monitor_width_override() -> Option<usize> {
+    env_parse::<usize>("MONITOR_WIDTH").filter(|&w| w > 0)
 }
 
 /// Terminal width from `/dev/tty` (or `COLUMNS`), if it can be read.
@@ -1547,12 +1576,10 @@ pub async fn run_monitor(once: bool) -> Result<()> {
     if once || !is_tty {
         let entries = load_all_registry_entries();
         let now = unix_timestamp();
-        let output = render_dashboard_with_width(
-            &entries,
-            now,
-            use_color_for_tty(is_tty),
-            terminal_width().unwrap_or(DEFAULT_TERMINAL_WIDTH),
-        );
+        // A pipe or a one-shot run has no window to query, so the width comes
+        // from `COLUMNS` (or `MONITOR_WIDTH`), never from an ioctl.
+        let output =
+            render_dashboard_with_width(&entries, now, use_color_for_tty(is_tty), plain_width());
         println!("{output}");
         return Ok(());
     }
@@ -2026,6 +2053,35 @@ mod tests {
             two.contains("repo:"),
             "repo line missing for two repos:\n{two}"
         );
+    }
+
+    /// The plain (non-TTY) rendering honours `COLUMNS` instead of always
+    /// falling back to 80, and `MONITOR_WIDTH` still overrides both.
+    #[test]
+    fn test_plain_width_honours_columns_without_a_tty() {
+        // `set_var` is process-global: hold the shared lock for the whole test
+        // so no parallel test observes the overrides.
+        crate::agent::env::with_env_lock(|| {
+            unsafe {
+                std::env::set_var("COLUMNS", "50");
+                std::env::remove_var("MONITOR_WIDTH");
+            }
+            assert_eq!(plain_width(), 50, "COLUMNS must be honoured");
+
+            // Zero and unparsable values are ignored, as they are everywhere.
+            unsafe { std::env::set_var("COLUMNS", "0") };
+            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "COLUMNS=0");
+            unsafe { std::env::set_var("COLUMNS", "wide") };
+            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "COLUMNS=wide");
+
+            unsafe {
+                std::env::remove_var("COLUMNS");
+                std::env::set_var("MONITOR_WIDTH", "72");
+            }
+            assert_eq!(plain_width(), 72, "MONITOR_WIDTH must win");
+            unsafe { std::env::remove_var("MONITOR_WIDTH") };
+            assert_eq!(plain_width(), DEFAULT_TERMINAL_WIDTH, "neither set");
+        });
     }
 
     /// A live worker's elapsed keeps counting; a terminal one freezes.
