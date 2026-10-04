@@ -381,8 +381,13 @@ fn test_commit_changes_preserves_branch_on_drop() {
     let id = unique_worker_id("commit");
     let branch = format!("worker-{id}");
 
-    {
+    let path = {
         let mut guard = test_repo.guard(&id);
+        // The checkout this guard really made, so the cleanup assertion below
+        // names a path that exists until the guard drops. Deriving it from the
+        // real scratch base instead would pass vacuously, because the checkout
+        // is filed under the fixture's own root.
+        let path = guard.path.clone();
         let new_file = guard.path.join("preserved_feature.txt");
         std::fs::write(&new_file, "Preserved code from subagent\n").expect("write file");
 
@@ -391,11 +396,12 @@ fn test_commit_changes_preserves_branch_on_drop() {
             .expect("commit failed");
         assert_eq!(committed_branch, Some(branch.clone()));
         assert!(guard.preserve_branch);
+        assert!(path.exists(), "precondition: the checkout exists");
         // Guard drops here
-    }
+        path
+    };
 
     // Worktree directory and registration are gone
-    let path = mini_swe_mcp::worktree::swe_base_dir().join(format!("swe-wt-{id}"));
     assert!(!path.exists(), "worktree dir should be cleaned up");
     assert!(!worktree_is_registered(repo, &path));
 
