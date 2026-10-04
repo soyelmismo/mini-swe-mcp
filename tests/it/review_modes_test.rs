@@ -531,7 +531,11 @@ fn a_mode_name_with_a_colon_is_dropped_with_a_warning() {
         ReviewMode::parse_with_manifest("a:b", &normalized).is_err(),
         "the dispatch must reject it instead of failing the worker's review phase"
     );
-    assert!(normalized.validate().is_empty(), "{:?}", normalized.validate());
+    assert!(
+        normalized.validate().is_empty(),
+        "{:?}",
+        normalized.validate()
+    );
 }
 
 /// An empty or blank mode name is the same defect: the dispatch accepts it
